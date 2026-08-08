@@ -9341,33 +9341,47 @@ pub fn avg_pool2d_backward_f64(
         return avg_pool2d_backward_2x2s2_f64(dout, batch, ch, ih, iw, oh, ow);
     }
     let mut dp = vec![0.0f64; batch * ch * ph * pw];
-    dp.par_chunks_mut(ph * pw)
-        .enumerate()
-        .for_each(|(plane, dprow)| {
-            let dbase = plane * oh * ow;
-            for oy in 0..oh {
-                let rs = oy * sh;
-                let re = (rs + kh).min(ph);
-                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-                for ox in 0..ow {
-                    let cs = ox * sw;
-                    let ce = (cs + kw).min(pw);
-                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                    let div = if count_include_pad {
-                        ((re - rs) * (ce - cs)) as f64
-                    } else {
-                        (vrlen * vclen) as f64
-                    };
-                    let g = dout[dbase + oy * ow + ox] / div;
-                    for r in rs..re {
-                        let irow = r * pw;
-                        for c in cs..ce {
-                            dprow[irow + c] += g;
-                        }
+    // frankentorch-o5t00 — DO NOT GATE. The L3-residency serial gate that gives
+    // 1.4-2.2x on the max_pool SCATTER backwards was measured here and is a LOSS:
+    // control-normalised 1.266 (i.e. ~1.27x SLOWER), 95% CI [1.108, 1.502], entirely
+    // above 1.0. The anchor kernel (max_pool3d_backward_from_indices_f64) reconfirmed
+    // 1.96x in the same run, so this is the kernel and not a bad window.
+    //
+    // WHY, and it refines the boundary: the max_pool scatters write ONE value per
+    // output element — 1-in-8 of the buffer — so they touch every cache line while
+    // doing almost no work, and one core keeps the whole thing L3-resident. avg_pool
+    // backward spreads each output over its whole kh*kw window, so it writes EVERY
+    // element with arithmetic attached. That is enough work to pay for the threads.
+    // The vein is SPARSE scatter, not "dense write". See
+    // artifacts/perf/frankentorch-o5t00/avgpool_prediction.md.
+    let spread_plane = |plane: usize, dprow: &mut [f64]| {
+        let dbase = plane * oh * ow;
+        for oy in 0..oh {
+            let rs = oy * sh;
+            let re = (rs + kh).min(ph);
+            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+            for ox in 0..ow {
+                let cs = ox * sw;
+                let ce = (cs + kw).min(pw);
+                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                let div = if count_include_pad {
+                    ((re - rs) * (ce - cs)) as f64
+                } else {
+                    (vrlen * vclen) as f64
+                };
+                let g = dout[dbase + oy * ow + ox] / div;
+                for r in rs..re {
+                    let irow = r * pw;
+                    for c in cs..ce {
+                        dprow[irow + c] += g;
                     }
                 }
             }
-        });
+        }
+    };
+    dp.par_chunks_mut(ph * pw)
+        .enumerate()
+        .for_each(|(plane, dprow)| spread_plane(plane, dprow));
     dp
 }
 
@@ -9639,19 +9653,33 @@ pub fn avg_pool1d_backward_f64(
     stride: usize,
 ) -> Vec<f64> {
     let mut din = vec![0.0f64; batch * ch * len];
+    // frankentorch-o5t00 — DO NOT GATE. The L3-residency serial gate that gives
+    // 1.4-2.2x on the max_pool SCATTER backwards was measured here and is a LOSS:
+    // control-normalised 1.266 (i.e. ~1.27x SLOWER), 95% CI [1.108, 1.502], entirely
+    // above 1.0. The anchor kernel (max_pool3d_backward_from_indices_f64) reconfirmed
+    // 1.96x in the same run, so this is the kernel and not a bad window.
+    //
+    // WHY, and it refines the boundary: the max_pool scatters write ONE value per
+    // output element — 1-in-8 of the buffer — so they touch every cache line while
+    // doing almost no work, and one core keeps the whole thing L3-resident. avg_pool
+    // backward spreads each output over its whole kh*kw window, so it writes EVERY
+    // element with arithmetic attached. That is enough work to pay for the threads.
+    // The vein is SPARSE scatter, not "dense write". See
+    // artifacts/perf/frankentorch-o5t00/avgpool_prediction.md (1-D: 1.289, CI [1.185, 1.646]).
+    let spread_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * output_len;
+        let div = kernel as f64;
+        for ox in 0..output_len {
+            let g = dout[dbase + ox] / div;
+            let start = ox * stride;
+            for kx in 0..kernel {
+                drow[start + kx] += g;
+            }
+        }
+    };
     din.par_chunks_mut(len)
         .enumerate()
-        .for_each(|(plane, drow)| {
-            let dbase = plane * output_len;
-            let div = kernel as f64;
-            for ox in 0..output_len {
-                let g = dout[dbase + ox] / div;
-                let start = ox * stride;
-                for kx in 0..kernel {
-                    drow[start + kx] += g;
-                }
-            }
-        });
+        .for_each(|(plane, drow)| spread_plane(plane, drow));
     din
 }
 

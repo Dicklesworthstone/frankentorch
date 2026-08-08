@@ -127,7 +127,7 @@ const P1_C: usize = 64;
 const P1_L: usize = 2048;
 const P1_OL: usize = P1_L / 2;
 
-const LANES: [&str; 14] = [
+const LANES: [&str; 16] = [
     "alloc_only",
     "alloc_only_AA",
     "serial_fill",
@@ -147,6 +147,14 @@ const LANES: [&str; 14] = [
     "sib_maxpool3d_scalar",
     "sib_maxpool2d_indices",
     "sib_maxpool1d_indices",
+    // frankentorch-o5t00: the avg_pool prediction. un3os claimed these should behave
+    // like 2x2s2 (no effect) because each output spreads over a kh*kw window. That
+    // rationale is worth doubting: 2x2s2's extra cost is RE-READING the input plane to
+    // recompute an 8-way max, and avg_pool backward reads no second array at all — it
+    // divides and writes. So these may well behave like the winners. Measured, not
+    // assumed, either way.
+    "avg_pool2d_backward",
+    "avg_pool1d_backward",
 ];
 
 /// Every lane allocates its own fresh buffer, exactly as the kernel does. Reusing
@@ -277,7 +285,7 @@ fn run_lane(idx: usize, ctx: &Ctx) -> f64 {
             black_box(&v);
             v[0]
         }
-        _ => {
+        13 => {
             let v = ft_kernel_cpu::max_pool1d_backward_from_indices_f64(
                 &ctx.dout1d,
                 &ctx.arg1d,
@@ -286,6 +294,34 @@ fn run_lane(idx: usize, ctx: &Ctx) -> f64 {
                 P1_L,
                 P1_OL,
             );
+            black_box(&v);
+            v[0]
+        }
+        14 => {
+            let v = ft_kernel_cpu::avg_pool2d_backward_f64(
+                &ctx.dout2d,
+                P2_N,
+                P2_C,
+                P2_H,
+                P2_W,
+                2,
+                2,
+                P2_OH,
+                P2_OW,
+                2,
+                2,
+                0,
+                0,
+                P2_H,
+                P2_W,
+                true,
+            );
+            black_box(&v);
+            v[0]
+        }
+        _ => {
+            let v =
+                ft_kernel_cpu::avg_pool1d_backward_f64(&ctx.dout1d, P1_N, P1_C, P1_L, 2, P1_OL, 2);
             black_box(&v);
             v[0]
         }
