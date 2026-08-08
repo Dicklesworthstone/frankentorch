@@ -31083,8 +31083,20 @@ print(json.dumps({"results": out}, sort_keys=True))
             (f64::INFINITY, 0.5),
             (f64::NEG_INFINITY, 0.5),
         ];
-        let pow_inputs: Vec<(f64, f64)> =
-            vec![(0.0, 0.0), (2.0, 3.0), (3.0, 2.0), (4.0, 0.5), (0.0, 1.0)];
+        // frankentorch-r2ayl: negative bases with INTEGER exponents added. torch.pow(-2, 3) = -8;
+        // any implementation routing through ln(x) yields NaN for x<0, so this row separates a
+        // real pow from an exp(e·ln x) stand-in. The set had no negative base at all, which is a
+        // conspicuous gap for a test named "ieee754 unary EDGE cases".
+        let pow_inputs: Vec<(f64, f64)> = vec![
+            (0.0, 0.0),
+            (2.0, 3.0),
+            (3.0, 2.0),
+            (4.0, 0.5),
+            (0.0, 1.0),
+            (-2.0, 3.0),
+            (-2.0, 2.0),
+            (-8.0, 1.0),
+        ];
         let signbit_inputs: Vec<f64> = vec![
             1.0,
             -1.0,
@@ -31112,6 +31124,22 @@ def encode_scalar(v):
         return "inf" if v > 0 else "-inf"
     return v
 
+def decode_scalar(v):
+    # frankentorch-r2ayl: the INBOUND direction needs the same tags. It used to
+    # receive raw floats, but serde_json cannot represent non-finite values, so
+    # every infinity arrived as JSON null and torch.tensor(None) raised — which
+    # is why this test could never run.
+    if isinstance(v, str):
+        if v == "nan":
+            return float("nan")
+        if v == "inf":
+            return float("inf")
+        if v == "-inf":
+            return float("-inf")
+        if v == "-0.0":
+            return -0.0
+    return float(v)
+
 def torch_copysign(m, s):
     return torch.copysign(torch.tensor(m, dtype=torch.float64),
                           torch.tensor(s, dtype=torch.float64)).item()
@@ -31128,21 +31156,45 @@ def torch_signbit(x):
     return 1.0 if torch.signbit(torch.tensor(x, dtype=torch.float64)).item() else 0.0
 
 print(json.dumps({
-    "copysign": [encode_scalar(torch_copysign(m, s)) for m, s in payload["copysign"]],
-    "heaviside": [encode_scalar(torch_heaviside(x, v)) for x, v in payload["heaviside"]],
-    "pow": [encode_scalar(torch_pow(x, e)) for x, e in payload["pow"]],
-    "signbit": [encode_scalar(torch_signbit(x)) for x in payload["signbit"]],
+    "copysign": [encode_scalar(torch_copysign(decode_scalar(m), decode_scalar(s)))
+                 for m, s in payload["copysign"]],
+    "heaviside": [encode_scalar(torch_heaviside(decode_scalar(x), decode_scalar(v)))
+                  for x, v in payload["heaviside"]],
+    "pow": [encode_scalar(torch_pow(decode_scalar(x), decode_scalar(e)))
+            for x, e in payload["pow"]],
+    "signbit": [encode_scalar(torch_signbit(decode_scalar(x))) for x in payload["signbit"]],
 }, sort_keys=True))
 "#;
 
+        // frankentorch-r2ayl: these used to be raw f64. serde_json cannot represent a non-finite
+        // float, so every f64::INFINITY/NAN in the input sets serialized to JSON `null`, Python
+        // received None, and torch.tensor(None) raised — the oracle crashed on every invocation
+        // and the test had never once executed. The response direction already used tagged
+        // strings; the request direction simply never did. Same convention both ways now.
+        fn encode_input(value: f64) -> Value {
+            if value.is_nan() {
+                Value::String("nan".to_string())
+            } else if value == f64::INFINITY {
+                Value::String("inf".to_string())
+            } else if value == f64::NEG_INFINITY {
+                Value::String("-inf".to_string())
+            } else if value.to_bits() == (-0.0f64).to_bits() {
+                // Not strictly required (JSON round-trips -0.0), but tagging it keeps the sign of
+                // zero explicit rather than dependent on two JSON implementations agreeing.
+                Value::String("-0.0".to_string())
+            } else {
+                json!(value)
+            }
+        }
+
         let payload = json!({
             "copysign": copysign_inputs.iter()
-                .map(|(m, s)| vec![*m, *s]).collect::<Vec<_>>(),
+                .map(|(m, s)| vec![encode_input(*m), encode_input(*s)]).collect::<Vec<_>>(),
             "heaviside": heaviside_inputs.iter()
-                .map(|(x, v)| vec![*x, *v]).collect::<Vec<_>>(),
+                .map(|(x, v)| vec![encode_input(*x), encode_input(*v)]).collect::<Vec<_>>(),
             "pow": pow_inputs.iter()
-                .map(|(x, e)| vec![*x, *e]).collect::<Vec<_>>(),
-            "signbit": signbit_inputs.clone(),
+                .map(|(x, e)| vec![encode_input(*x), encode_input(*e)]).collect::<Vec<_>>(),
+            "signbit": signbit_inputs.iter().copied().map(encode_input).collect::<Vec<_>>(),
         });
 
         let oracle = super::run_legacy_oracle_script(&config, script, &payload)
@@ -31222,16 +31274,29 @@ print(json.dumps({
                 "heaviside case {i} ({x}, {v}): got {got}, torch {expected}"
             );
         }
+        // frankentorch-r2ayl: collect EVERY divergence instead of dying on the first. A panic on
+        // case 1 hides whatever cases 2..n would have said, and the shape of the full set is what
+        // identifies the mechanism — one rounding-off row reads as an ULP nit, while "every
+        // negative base is NaN" identifies an ln-based implementation immediately.
+        let mut pow_mismatches: Vec<String> = Vec::new();
         for (i, ((x, e), expected)) in pow_inputs.iter().zip(oracle_pow.iter()).enumerate() {
             let xt = session.tensor_variable(vec![*x], vec![1], false).unwrap();
             let et = session.tensor_variable(vec![*e], vec![1], false).unwrap();
             let out = session.tensor_pow_tensor(xt, et).unwrap();
             let got = session.tensor_values(out).unwrap()[0];
-            assert!(
-                ieee_bit_equal(got, *expected),
-                "pow case {i} ({x}, {e}): got {got}, torch {expected}"
-            );
+            if !ieee_bit_equal(got, *expected) {
+                pow_mismatches.push(format!(
+                    "  case {i} ({x}, {e}): got {got}, torch {expected}"
+                ));
+            }
         }
+        assert!(
+            pow_mismatches.is_empty(),
+            "tensor_pow_tensor diverges from torch on {} of {} cases:\n{}",
+            pow_mismatches.len(),
+            pow_inputs.len(),
+            pow_mismatches.join("\n")
+        );
         for (i, (x, expected)) in signbit_inputs.iter().zip(oracle_signbit.iter()).enumerate() {
             let xt = session.tensor_variable(vec![*x], vec![1], false).unwrap();
             let out = session.tensor_signbit(xt).unwrap();
