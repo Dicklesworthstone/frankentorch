@@ -295,6 +295,78 @@ fn main() {
          below the noise of these medians is NOT attributable; treat only the large terms.\n"
     );
 
+    // ── frankentorch-87sz8: max_pool3d session decomposition, conditioned ───
+    // uufyp decomposed avg_pool2d only. max_pool3d is the P1 lane and its kernels are
+    // now measured at ~1.27 ms against a 4.78x-slower lane, so the same question
+    // applies: where does the rest go? Same cumulative-difference method, same
+    // conditioning, and an A/A pair so the chain cannot measure its own order.
+    {
+        let m_numel = M_N * M_C * M_D * M_H * M_W;
+        let m_shape = vec![M_N, M_C, M_D, M_H, M_W];
+        // `m_in` is a &Vec so the inner `move` copies the reference rather than the
+        // 8 MiB buffer — the later kernel lanes still need `m_input`.
+        let m_in = &m_input;
+        let mk = |stage: u8| {
+            let m_shape = m_shape.clone();
+            move || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                if stage == 0 {
+                    std::hint::black_box(&session);
+                    return;
+                }
+                let x = session
+                    .tensor_variable(m_in.clone(), m_shape.clone(), true)
+                    .expect("leaf");
+                if stage == 1 {
+                    std::hint::black_box((&session, x));
+                    return;
+                }
+                let out = session
+                    .functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+                    .expect("max_pool3d");
+                if stage == 2 {
+                    std::hint::black_box((&session, out));
+                    return;
+                }
+                let loss = session.tensor_sum(out).expect("sum");
+                if stage == 3 {
+                    std::hint::black_box((&session, loss));
+                    return;
+                }
+                let rep = session.tensor_backward(loss).expect("backward");
+                if stage == 4 {
+                    std::hint::black_box((&session, &rep));
+                    return;
+                }
+                std::hint::black_box(rep.gradient(x).expect("grad").iter().sum::<f64>());
+            }
+        };
+        let aa_early = time_it_conditioned(m_numel, mk(3));
+        let c0 = time_it_conditioned(m_numel, mk(0));
+        let c1 = time_it_conditioned(m_numel, mk(1));
+        let c2 = time_it_conditioned(m_numel, mk(2));
+        let c3 = time_it_conditioned(m_numel, mk(3));
+        let c4 = time_it_conditioned(m_numel, mk(4));
+        let c5 = time_it_conditioned(m_numel, mk(5));
+        println!("max_pool3d SESSION DECOMPOSITION (frankentorch-87sz8, CONDITIONED)");
+        println!(
+            "  A/A NULL on the through-sum lane: early={aa_early:.3} late={c3:.3} -> {:.1}% apart",
+            100.0 * (c3 / aa_early.max(f64::MIN_POSITIVE) - 1.0).abs()
+        );
+        println!(
+            "  per stage:   session_new={c0:6.3}  leaf_build={:6.3}  forward={:6.3}  sum={:6.3}  backward={:6.3}  grad_fetch_sum={:6.3}  total={c5:6.3}",
+            c1 - c0,
+            c2 - c1,
+            c3 - c2,
+            c4 - c3,
+            c5 - c4
+        );
+        println!(
+            "  conditioned raw kernels for this lane are ~1.27 ms; anything the stages attribute\n\
+             beyond that is engine, not kernel.\n"
+        );
+    }
+
     // ── frankentorch-87sz8: the raw KERNEL lanes, allocator-conditioned ─────
     // 87sz8 records FT's max_pool3d kernels at 2.0-3.2x PyTorch's WHOLE op, which is
     // the opposite of avg_pool2d and makes it a live kernel bead. That comparison
