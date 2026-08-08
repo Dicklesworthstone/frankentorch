@@ -8776,20 +8776,9 @@ fn max_pool3d_backward_2x2s2_f64(
     let out_plane_len = od * oh * ow;
     let depth_stride = ih * iw;
     let mut din = vec![0.0f64; batch * ch * plane_len];
-    // frankentorch-zoqws: `vec![0.0; n]` is `alloc_zeroed`, so at this size it is
-    // fresh `mmap` zero pages that nothing has touched yet. If the parallel pass
-    // below is what first touches them, 64 rayon threads fault the same fresh
-    // mapping simultaneously and contend on the kernel's page-table/mmap locks —
-    // measured at 6.39 GiB/s, and unmoved by chunk size (16 KiB..2 MiB) or store
-    // width (scalar, `fill`, `f64x4`). One thread doing the dumbest possible
-    // `fill` faults the same pages with no contention at 36.70 GiB/s, 5.7x
-    // faster (artifacts/perf/frankentorch-zoqws/).
-    //
-    // So pay the first touch serially here. The scatter below then writes to
-    // already-faulted pages and keeps its parallelism. Writing zeros over
-    // already-zero memory cannot change a single output bit; this is a
-    // page-fault scheduling change, not an arithmetic one.
-    din.fill(0.0);
+    // frankentorch-zoqws: do NOT insert a serial `din.fill(0.0)` here to "pay the
+    // first touch cheaply". That was tried and MEASURED AS A REGRESSION — see the
+    // note on `max_pool3d_backward_from_indices_f64` below for the numbers.
     din.par_chunks_mut(plane_len)
         .enumerate()
         .for_each(|(plane, drow)| {
@@ -8884,12 +8873,26 @@ pub fn max_pool3d_backward_from_indices_f64(
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
     let mut din = vec![0.0f64; batch * ch * plane_len];
-    // frankentorch-zoqws: serialize the first touch — see the note in
-    // `max_pool3d_backward_2x2s2_f64`. This path is the profiled one
-    // (`87sz8` backward attribution: 84% of the backward is materialising this
-    // dense gradient, at 6.39 GiB/s, against 36.70 GiB/s for a serial fill).
-    // Zeros over already-zero memory cannot change an output bit.
-    din.fill(0.0);
+    // frankentorch-zoqws — REFUTED LEVER, DO NOT RE-LAND. A serial `din.fill(0.0)`
+    // between this `vec![0.0; n]` and the scatter below was landed on the theory
+    // that `alloc_zeroed` hands back fresh `mmap` pages and that 64 rayon threads
+    // faulting them contend on the kernel's page-table locks, so paying the first
+    // touch on one thread would be ~5.7x cheaper (the standalone-buffer ladder in
+    // artifacts/perf/frankentorch-zoqws/ measured 6.39 vs 36.70 GiB/s).
+    //
+    // Measured in situ, that inverts: the fill is a ~10% SLOWDOWN of this kernel.
+    // Interleaved two-ELF A/B, 12 paired rounds, `alloc_zeroed`+scatter vs
+    // fill+scatter: paired median 1.118x SLOWER, bootstrap 95% CI [1.050, 1.183],
+    // 11/12 rounds slower, +0.152 ms absolute. Two controls compiled identically
+    // into both ELFs stayed flat (1.007, 1.009), so it is the lever and not host
+    // drift. Full write-up: artifacts/perf/frankentorch-zoqws/in_situ_ab.md.
+    //
+    // The reason the ladder did not transfer: +0.152 ms is almost exactly the cost
+    // of ONE serial 8 MiB write (the ladder's own warm-construction row was
+    // 0.123 ms). The fill therefore bought no reduction in the parallel pass at
+    // all — it was pure added work. Whatever the parallel pass spends its ~1.2 ms
+    // on at this call site, a preceding serial touch does not remove it, so the
+    // "contended first-touch faults" model does not describe this kernel.
     din.par_chunks_mut(plane_len)
         .enumerate()
         .for_each(|(plane, drow)| {
