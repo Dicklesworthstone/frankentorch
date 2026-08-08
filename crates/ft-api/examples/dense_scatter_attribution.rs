@@ -302,10 +302,80 @@ fn main() {
         "\nA/A NULL: alloc_only={aa_lo:.3} vs alloc_only_AA={aa_hi:.3} -> {aa_spread:.1}% apart.\n\
          Two lanes closer than this are NOT distinguishable by this harness."
     );
+    size_sweep();
+
     println!(
         "\nload_after={}",
         std::fs::read_to_string("/proc/loadavg")
             .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
             .unwrap_or_else(|_| "unknown".to_string())
+    );
+}
+
+/// Does serial keep winning as the buffer grows?
+///
+/// The lane table above says serial beats 64-task parallel at the gauntlet's 8 MiB
+/// shape. That alone does NOT license serialising the kernel outright — it licenses
+/// serialising it *at that size*. A gate needs to know where, if anywhere, the
+/// crossover is. This sweeps the same 1-in-8 scatter shape across buffer sizes and
+/// reports the parallel/serial ratio at each; >1.0 means serial wins.
+///
+/// Same conditioning and interleaving discipline as the main table: the two arms
+/// alternate within each rep, and the allocator is conditioned before every timed
+/// region.
+fn size_sweep() {
+    println!("\nSIZE SWEEP — parallel vs serial scatter, same 1-in-8 shape");
+    println!(
+        "{:>10}{:>12}{:>12}{:>10}",
+        "MiB", "par (ms)", "serial (ms)", "par/ser"
+    );
+    // 1 MiB .. 256 MiB. The gauntlet lane is 8 MiB.
+    for &mib in &[1usize, 4, 8, 12, 16, 24, 32, 128, 256] {
+        let n = mib * 1024 * 1024 / 8;
+        let chunk = (n / 64).max(8);
+
+        let reps = if mib >= 128 { 5 } else { 11 };
+        let (mut par, mut ser) = (Vec::with_capacity(reps), Vec::with_capacity(reps));
+        for rep in 0..=reps {
+            for arm in 0..2 {
+                // Alternate which arm leads, as in the two-ELF A/B.
+                let serial = (arm + rep) % 2 == 1;
+                let mut w = vec![0.0f64; n];
+                w.fill(1.0);
+                black_box(&w);
+                drop(w);
+
+                let started = Instant::now();
+                let mut v = vec![0.0f64; n];
+                // One scattered element per 64-byte cache line (1-in-8 f64), matching
+                // the kernel's density, so every line of the output is touched once.
+                if serial {
+                    for c in v.chunks_mut(chunk) {
+                        for j in 0..c.len() / 8 {
+                            c[j * 8] += 1.0;
+                        }
+                    }
+                } else {
+                    v.par_chunks_mut(chunk).for_each(|c| {
+                        for j in 0..c.len() / 8 {
+                            c[j * 8] += 1.0;
+                        }
+                    });
+                }
+                let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                black_box(&v);
+                // Discard rep 0: it is the warm-up for this size.
+                if rep > 0 {
+                    if serial { &mut ser } else { &mut par }.push(elapsed);
+                }
+            }
+        }
+        let (mp, ms) = (median(&par), median(&ser));
+        println!("{mib:>10}{mp:12.3}{ms:12.3}{:>10.2}", mp / ms);
+    }
+    println!(
+        "  par/ser > 1.0 means the SERIAL arm is faster. NOTE this sweep's inner loop\n\
+         scans all offsets per chunk, so its absolute times are not comparable to the\n\
+         kernel above — only the par/ser RATIO within a row is meaningful."
     );
 }

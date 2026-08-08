@@ -2532,6 +2532,40 @@ const POOL_FWD_PARALLEL_MIN: usize = 1 << 21; // ~2.1M input reads
 // protects: at 784 reads per plane they fail it by 5x.
 const POOL_FWD_PARALLEL_PER_PLANE_MIN: usize = 1 << 12; // 4096 input reads per plane
 
+// The BACKWARD side gates the OPPOSITE way to the forward above: parallelise only
+// when the dense gradient is too big to stay in one core's L3 slice.
+//
+// frankentorch-un3os. `87sz8` read this term as contended first-touch page faults;
+// `zoqws` refuted that in situ. The attribution
+// (artifacts/perf/frankentorch-un3os/attribution.md) found the cost is the
+// PARALLELISM itself: at the gauntlet's 8 MiB shape one thread running the identical
+// scatter body is 1.97-2.21x FASTER than 64 rayon tasks, and neither the
+// accumulate's read nor the per-element f64->usize cast is measurable against it.
+//
+// A size sweep of the same 1-in-8 scatter shape shows a sharp crossover, and it is
+// a CACHE crossover, not a NUMA one (this host reports a single NUMA node):
+//
+//     MiB     1      4      8     12     16     24  |    32    128    256
+//   par/ser  12.5   5.27   3.16   2.88   2.29   1.35 |  0.17   0.15   0.15
+//
+// >1 means serial wins. The cliff between 24 and 32 MiB is the per-CCD L3 slice —
+// this box is a Threadripper PRO 5975WX whose 128 MiB of L3 is 4 INSTANCES of
+// 32 MiB, so a single thread effectively has 32 MiB. Below that the buffer is
+// L3-resident and one thread runs at cache speed while spreading it over four CCDs
+// only adds cross-CCD traffic; above it, no single core can cover the footprint and
+// many cores are needed to pull DRAM bandwidth.
+//
+// THE GATE SITS AT 16 MiB, NOT AT THE 24-32 MiB CROSSOVER, BECAUSE THE RISK IS
+// ASYMMETRIC: at 24 MiB serial wins only 1.35x, but at 32 MiB serial LOSES 5.9x.
+// Being early costs a little; being late costs a lot. 16 MiB still carries a
+// measured 2.29x and leaves margin for hosts with smaller L3 slices than this one.
+const DENSE_SCATTER_PARALLEL_MIN_BYTES: usize = 16 * 1024 * 1024;
+
+#[inline]
+fn dense_scatter_should_parallelize(numel: usize) -> bool {
+    numel * size_of::<f64>() >= DENSE_SCATTER_PARALLEL_MIN_BYTES
+}
+
 #[inline]
 fn pool_fwd_should_parallelize(total_reads: usize, planes: usize) -> bool {
     total_reads >= POOL_FWD_PARALLEL_MIN
@@ -8893,20 +8927,36 @@ pub fn max_pool3d_backward_from_indices_f64(
     // all — it was pure added work. Whatever the parallel pass spends its ~1.2 ms
     // on at this call site, a preceding serial touch does not remove it, so the
     // "contended first-touch faults" model does not describe this kernel.
-    din.par_chunks_mut(plane_len)
-        .enumerate()
-        .for_each(|(plane, drow)| {
-            let dbase = plane * out_plane_len;
-            for oz in 0..od {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let oidx = dbase + (oz * oh + oy) * ow + ox;
-                        let arg = arg_offsets[oidx] as usize;
-                        drow[arg] += dout[oidx];
-                    }
+    //
+    // frankentorch-un3os found what DOES describe it: below the per-core L3 slice,
+    // running this scatter on ONE thread beats running it on 64. See
+    // `DENSE_SCATTER_PARALLEL_MIN_BYTES` for the crossover data and why the gate sits
+    // where it does.
+    //
+    // ONE body, two drivers, so the arms cannot drift and the serial path stays
+    // BIT-IDENTICAL: planes are disjoint, each plane's accumulation order is
+    // unchanged, and no value crosses a plane boundary.
+    let scatter_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * out_plane_len;
+        for oz in 0..od {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let oidx = dbase + (oz * oh + oy) * ow + ox;
+                    let arg = arg_offsets[oidx] as usize;
+                    drow[arg] += dout[oidx];
                 }
             }
-        });
+        }
+    };
+    if dense_scatter_should_parallelize(din.len()) {
+        din.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    } else {
+        din.chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    }
     din
 }
 
@@ -38907,6 +38957,96 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    // frankentorch-un3os. `max_pool3d_backward_from_indices_f64` now picks a serial or
+    // a parallel driver by output size, because below the per-core L3 slice one thread
+    // beats 64 (measured 4.24x in situ). The whole change rests on the two drivers
+    // producing IDENTICAL BITS, so that is what this asserts — directly, by running the
+    // parallel driver by hand over the same inputs and comparing bit patterns.
+    //
+    // Not a tautology: if someone "optimises" the serial path into a different
+    // accumulation order, or lets the two bodies drift apart, this fails.
+    #[test]
+    fn max_pool3d_backward_from_indices_serial_and_parallel_drivers_are_bit_identical() {
+        use rayon::prelude::*;
+
+        let (batch, ch, id, ih, iw) = (2usize, 3usize, 4usize, 6usize, 6usize);
+        let (kd, kh, kw, sd, sh, sw) = (2usize, 2usize, 2usize, 2usize, 2usize, 2usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let n = batch * ch * id * ih * iw;
+        // Deliberately full of exact ties, so any reordering of the accumulation or of
+        // the argmax choice shows up rather than being masked by distinct maxima.
+        let input: Vec<f64> = (0..n).map(|i| ((i % 5) as f64) - 2.0).collect();
+        let (_, arg_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        // Include a negative zero: -0.0 + 0.0 == +0.0, so a dropped accumulate would
+        // change the sign bit here even though the value compares equal.
+        let mut dout: Vec<f64> = (0..batch * ch * od * oh * ow)
+            .map(|i| ((i % 7) as f64) * 0.25 - 0.75)
+            .collect();
+        dout[0] = -0.0;
+
+        let plane_len = id * ih * iw;
+        let out_plane_len = od * oh * ow;
+        let mut expected = vec![0.0f64; batch * ch * plane_len];
+        expected
+            .par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| {
+                let dbase = plane * out_plane_len;
+                for oz in 0..od {
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let oidx = dbase + (oz * oh + oy) * ow + ox;
+                            drow[arg_offsets[oidx] as usize] += dout[oidx];
+                        }
+                    }
+                }
+            });
+
+        // This shape is far below DENSE_SCATTER_PARALLEL_MIN_BYTES, so the kernel takes
+        // the SERIAL driver — that is the point of the comparison.
+        assert!(
+            !super::dense_scatter_should_parallelize(batch * ch * plane_len),
+            "shape must be below the gate for this test to exercise the serial driver"
+        );
+        let got = super::max_pool3d_backward_from_indices_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "serial driver must be bit-identical to the parallel one"
+        );
+    }
+
+    // Locks WHERE the gate sits. The crossover it encodes is asymmetric — serial wins
+    // only ~1.35x just below it but loses ~5.9x just above — so a silent drift upward
+    // is far more expensive than a drift downward, and neither should happen unnoticed.
+    #[test]
+    fn dense_scatter_gate_sits_at_sixteen_mib() {
+        let f64s_in_16mib = 16 * 1024 * 1024 / size_of::<f64>();
+        assert!(!super::dense_scatter_should_parallelize(f64s_in_16mib - 1));
+        assert!(super::dense_scatter_should_parallelize(f64s_in_16mib));
+        // The gauntlet's max_pool3d lane: [2,32,16,32,32] = 8 MiB, must stay serial.
+        assert!(!super::dense_scatter_should_parallelize(
+            2 * 32 * 16 * 32 * 32
+        ));
+        // 32 MiB is past the measured cliff and must parallelise.
+        assert!(super::dense_scatter_should_parallelize(
+            32 * 1024 * 1024 / size_of::<f64>()
+        ));
     }
 
     #[test]
