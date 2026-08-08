@@ -32,34 +32,64 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn chain_products(buf: &[i8], passes: u64) -> (u64, i32) {
-    const NACC: usize = 8;
-    let ones = _mm256_set1_epi16(1);
-    let mut acc = [_mm256_setzero_si256(); NACC];
-    let vecs = buf.len() / 32; // 32-byte AVX2 vectors in the buffer
-    let base = buf.as_ptr();
-    let mut products = 0u64;
-    for _ in 0..passes {
-        let mut j = 0usize;
-        // one maddubs+widen+accumulate per (a,b) pair pulled from the buffer; NACC lanes unrolled
-        while j + 2 * NACC <= vecs {
-            for a_i in acc.iter_mut() {
-                let a = _mm256_loadu_si256(base.add(j * 32).cast()); // uint8 operand
-                let b = _mm256_loadu_si256(base.add((j + 1) * 32).cast()); // int8 operand
-                let p16 = _mm256_maddubs_epi16(a, b);
-                let p32 = _mm256_madd_epi16(p16, ones);
-                *a_i = _mm256_add_epi32(*a_i, p32);
-                j += 2;
+    // SAFETY: this whole body is one audited island. Edition 2024 no longer
+    // treats an `unsafe fn` body as an implicit unsafe block
+    // (`unsafe_op_in_unsafe_fn`), so the obligations have to be discharged in
+    // writing rather than assumed. They are:
+    //
+    // 1. TARGET FEATURE. Every intrinsic here is AVX2 and the fn carries
+    //    `#[target_feature(enable = "avx2")]`. `main` returns early unless
+    //    `is_x86_feature_detected!("avx2")`, and both call sites are inside that
+    //    guard, so AVX2 is present whenever this executes. The whole file is
+    //    `#[cfg(target_arch = "x86_64")]`-gated, so it does not exist elsewhere.
+    //
+    // 2. POINTER ARITHMETIC IS IN BOUNDS. `vecs = buf.len() / 32`, so bytes
+    //    `[0, vecs * 32)` are inside `buf`. The outer guard is
+    //    `j + 2 * NACC <= vecs`, and the inner loop runs exactly NACC times
+    //    advancing `j` by 2 each time, so on iteration k (0-based) it reads
+    //    vectors `j0 + 2k` and `j0 + 2k + 1`, the largest being
+    //    `j0 + 2 * NACC - 1 <= vecs - 1`. The highest byte touched is therefore
+    //    `vecs * 32 - 1`, inside the allocation. `base` derives from
+    //    `buf.as_ptr()` and `buf` outlives every use.
+    //
+    // 3. NO ALIGNMENT PRECONDITION. `_mm256_loadu_si256` / `_mm256_storeu_si256`
+    //    are the UNALIGNED forms, which is why they are used on a `&[i8]` whose
+    //    alignment is 1.
+    //
+    // 4. THE STORE FITS. `out` is `[i32; 8]` = 32 bytes = exactly one `__m256i`.
+    //
+    // 5. NO ALIASING. `buf` is borrowed shared and only read; `out` is a local
+    //    written once.
+    unsafe {
+        const NACC: usize = 8;
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_si256(); NACC];
+        let vecs = buf.len() / 32; // 32-byte AVX2 vectors in the buffer
+        let base = buf.as_ptr();
+        let mut products = 0u64;
+        for _ in 0..passes {
+            let mut j = 0usize;
+            // one maddubs+widen+accumulate per (a,b) pair pulled from the buffer; NACC lanes unrolled
+            while j + 2 * NACC <= vecs {
+                for a_i in acc.iter_mut() {
+                    let a = _mm256_loadu_si256(base.add(j * 32).cast()); // uint8 operand
+                    let b = _mm256_loadu_si256(base.add((j + 1) * 32).cast()); // int8 operand
+                    let p16 = _mm256_maddubs_epi16(a, b);
+                    let p32 = _mm256_madd_epi16(p16, ones);
+                    *a_i = _mm256_add_epi32(*a_i, p32);
+                    j += 2;
+                }
+                products += NACC as u64 * 32;
             }
-            products += NACC as u64 * 32;
         }
+        let mut sm = _mm256_setzero_si256();
+        for a_i in acc {
+            sm = _mm256_add_epi32(sm, a_i);
+        }
+        let mut out = [0i32; 8];
+        _mm256_storeu_si256(out.as_mut_ptr().cast(), sm);
+        (products, out.iter().sum())
     }
-    let mut sm = _mm256_setzero_si256();
-    for a_i in acc {
-        sm = _mm256_add_epi32(sm, a_i);
-    }
-    let mut out = [0i32; 8];
-    _mm256_storeu_si256(out.as_mut_ptr().cast(), sm);
-    (products, out.iter().sum())
 }
 
 fn main() {
