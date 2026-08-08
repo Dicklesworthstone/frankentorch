@@ -10199,6 +10199,124 @@ fn default_oracle_python(repo_root: &Path) -> Option<PathBuf> {
     Some(PathBuf::from("python3"))
 }
 
+/// Decides whether an unavailable oracle is an honest skip or a silent false pass.
+///
+/// frankentorch-imtpq / frankentorch-fl87u. Every oracle-backed conformance test here guards on a
+/// `torch_available()` probe and returns early when it fails. That early return is a NORMAL
+/// RETURN, so cargo reports `test result: ok. 1 passed` — a PASS, not a skip and not an ignore.
+/// That is the correct outcome on a machine that genuinely has no torch, and the wrong outcome
+/// entirely on a machine that has one and was merely not asked.
+///
+/// The distinguishing signal is whether the caller NAMED an interpreter. `FT_LEGACY_ORACLE_PYTHON`
+/// is only ever set deliberately, so setting it is a statement that an oracle run is expected. If
+/// it is set and the oracle still does not answer, silently passing hides a broken measurement —
+/// which is how running an oracle test under `rch exec` (where the local venv does not exist on
+/// the worker) reports success having never spoken to torch.
+///
+/// Pure and total so it is testable without mutating process environment: the env read lives in
+/// [`oracle_skip_verdict`] and the decision lives here.
+#[must_use]
+pub fn classify_oracle_skip(explicitly_requested: bool, available: bool) -> OracleSkip {
+    match (explicitly_requested, available) {
+        (_, true) => OracleSkip::OracleUsable,
+        (false, false) => OracleSkip::HonestSkip,
+        (true, false) => OracleSkip::RequestedButUnusable,
+    }
+}
+
+/// Outcome of [`classify_oracle_skip`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleSkip {
+    /// The oracle answered; run the comparison.
+    OracleUsable,
+    /// No oracle was asked for and none is present. Skipping is truthful.
+    HonestSkip,
+    /// An oracle was explicitly named but did not answer. Passing here would be a false green.
+    RequestedButUnusable,
+}
+
+/// Env-reading wrapper over [`classify_oracle_skip`].
+#[must_use]
+pub fn oracle_skip_verdict(available: bool) -> OracleSkip {
+    classify_oracle_skip(
+        std::env::var_os("FT_LEGACY_ORACLE_PYTHON").is_some(),
+        available,
+    )
+}
+
+/// Returns `true` when the caller should proceed with the oracle comparison, `false` for an honest
+/// skip, and PANICS when an oracle was explicitly requested but is unusable.
+///
+/// Panicking is the point: a test that cannot reach the oracle it was told to use must not report
+/// success. Callers that genuinely want the old always-skip behaviour simply do not set
+/// `FT_LEGACY_ORACLE_PYTHON`.
+#[must_use]
+pub fn oracle_required_or_skip(test_name: &str, available: bool) -> bool {
+    match oracle_skip_verdict(available) {
+        OracleSkip::OracleUsable => true,
+        OracleSkip::HonestSkip => {
+            eprintln!("{test_name}: torch unavailable and none requested, skipping");
+            false
+        }
+        OracleSkip::RequestedButUnusable => panic!(
+            "{test_name}: FT_LEGACY_ORACLE_PYTHON is set but the torch oracle did not answer. \
+             Refusing to pass silently — a skipped oracle test reports `1 passed` and would \
+             certify a comparison that never happened (frankentorch-imtpq). Common cause: running \
+             under `rch exec`, which executes on a worker where the local oracle venv does not \
+             exist (frankentorch-fl87u); build and run oracle tests LOCALLY. Unset the variable \
+             if you intend to skip."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod oracle_skip_tests {
+    use super::{OracleSkip, classify_oracle_skip};
+
+    #[test]
+    fn available_oracle_always_runs() {
+        assert_eq!(
+            classify_oracle_skip(true, true),
+            OracleSkip::OracleUsable,
+            "an answering oracle must be used whether or not it was explicitly requested"
+        );
+        assert_eq!(classify_oracle_skip(false, true), OracleSkip::OracleUsable);
+    }
+
+    #[test]
+    fn unrequested_and_absent_is_an_honest_skip() {
+        // The torch-less machine. This must stay a skip, or every such checkout goes red for a
+        // dependency it was never asked to have.
+        assert_eq!(
+            classify_oracle_skip(false, false),
+            OracleSkip::HonestSkip,
+            "no oracle asked for and none present is truthful, not a failure"
+        );
+    }
+
+    #[test]
+    fn requested_but_absent_is_a_false_green() {
+        // The whole point: this is the case that currently reports `1 passed`.
+        assert_eq!(
+            classify_oracle_skip(true, false),
+            OracleSkip::RequestedButUnusable,
+            "an oracle that was asked for and did not answer must not pass silently"
+        );
+    }
+
+    #[test]
+    fn requested_is_not_conflated_with_available() {
+        // Guards the wiring, not the table: if the two booleans were ever swapped at a call site,
+        // the torch-less machine would start failing and the false green would start passing —
+        // the exact inversion of the intent. These two disagree, so a swap is detectable.
+        assert_ne!(
+            classify_oracle_skip(true, false),
+            classify_oracle_skip(false, true),
+            "requested-but-absent and available-but-unrequested must not collapse together"
+        );
+    }
+}
+
 fn default_oracle_root(repo_root: &Path) -> PathBuf {
     default_oracle_root_from_override(
         repo_root,

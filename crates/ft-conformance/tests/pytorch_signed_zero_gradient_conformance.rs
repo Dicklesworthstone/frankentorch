@@ -13,7 +13,7 @@
 //! is meant to backstop.
 
 use ft_api::FrankenTorchSession;
-use ft_conformance::{HarnessConfig, run_legacy_oracle_script};
+use ft_conformance::{HarnessConfig, oracle_required_or_skip, run_legacy_oracle_script};
 use ft_core::ExecutionMode;
 use serde_json::{Value, json};
 
@@ -137,8 +137,14 @@ print(json.dumps({"ok": True}, sort_keys=True))
 }
 
 fn query_torch_gradients(cases: &[GradCase]) -> Option<Value> {
-    if !torch_available() {
-        eprintln!("pytorch_signed_zero_gradient_conformance: torch unavailable, skipping");
+    // frankentorch-imtpq: a plain `if !torch_available() { return None }` reports `1 passed` when
+    // the oracle is missing. This panics instead when FT_LEGACY_ORACLE_PYTHON was explicitly set,
+    // so asking for the oracle and not getting it can no longer certify a comparison that never
+    // happened; an unset variable still skips honestly on a torch-less machine.
+    if !oracle_required_or_skip(
+        "pytorch_signed_zero_gradient_conformance",
+        torch_available(),
+    ) {
         return None;
     }
 
