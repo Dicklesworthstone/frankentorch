@@ -255,8 +255,10 @@ LANES = {
 "#;
     let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
 
+    // `-c`, never `-`: the latter reads the program from stdin until EOF, which
+    // deadlocks a co-process whose stdin must stay open for requests.
     let mut child = Command::new(&python)
-        .arg("-")
+        .args(ft_api::harness_interleave::interpreter_args(&py))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -267,16 +269,16 @@ LANES = {
                  vs-PyTorch claim."
             )
         })?;
-    let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?;
     let mut reader = BufReader::new(
         child
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("no stdout"))?,
     );
-    stdin.write_all(py.as_bytes())?;
-    stdin.flush()?;
-
     // Block until the arm has imported torch, built its tensors and warmed every
     // lane. Anything it prints before that (version line, warnings) is preamble.
     let mut preamble = String::new();

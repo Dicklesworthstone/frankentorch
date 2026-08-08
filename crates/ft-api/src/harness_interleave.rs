@@ -126,6 +126,23 @@ pub fn parse_sample_line(line: &str) -> Option<IncumbentSample<'_>> {
     })
 }
 
+/// Arguments for launching the incumbent co-process with `script`.
+///
+/// # Why this exists rather than a literal in the harness
+///
+/// **`python -` deadlocks this protocol.** That mode reads the *program* from
+/// stdin until EOF, so an interpreter launched that way blocks forever waiting
+/// for a close that can never come — stdin has to stay open to carry sample
+/// requests. A block-mode harness gets away with `-` precisely because it closes
+/// stdin immediately and never talks to the child again; converting it to a
+/// co-process without changing the launcher hangs with no output and no error.
+///
+/// This returns the `-c` form, which leaves the child's stdin free.
+#[must_use]
+pub fn interpreter_args(script: &str) -> [&str; 2] {
+    ["-c", script]
+}
+
 /// The incumbent co-process request loop, in Python.
 ///
 /// Lives beside the parser for the same reason [`crate::harness_provenance`]
@@ -254,8 +271,8 @@ mod tests {
 
     #[test]
     fn tolerates_surrounding_whitespace() {
-        let sample =
-            parse_sample_line("   PT_SAMPLE conv3d 5.5 -9.9  \n").expect("must tolerate whitespace");
+        let sample = parse_sample_line("   PT_SAMPLE conv3d 5.5 -9.9  \n")
+            .expect("must tolerate whitespace");
         assert_eq!(sample.lane, "conv3d");
     }
 
@@ -322,12 +339,35 @@ mod tests {
         );
     }
 
+    /// NEGATIVE CASE: the deadlock that actually happened. Launching the child as
+    /// `python -` makes the interpreter read its program from stdin until EOF, so
+    /// it never starts serving while the driver waits for `PT_READY` — the whole
+    /// harness hangs with no output and no error. The launcher must keep stdin
+    /// free for requests.
+    #[test]
+    fn interpreter_is_launched_in_a_mode_that_leaves_stdin_free() {
+        let args = interpreter_args("print(1)");
+        assert_eq!(args[0], "-c", "must pass the program as an argument");
+        assert_ne!(
+            args[0], "-",
+            "`python -` reads the program from stdin until EOF and deadlocks the request loop"
+        );
+        assert_eq!(args[1], "print(1)");
+        assert!(
+            !args.contains(&"-"),
+            "no argument may put the interpreter in read-program-from-stdin mode"
+        );
+    }
+
     /// A line the Python loop actually formats must round-trip through the
     /// parser — testing the two halves separately can leave a format mismatch.
     #[test]
     fn python_format_string_round_trips_through_the_parser() {
         // The exact format the loop uses, rendered as Python would render it.
-        let rendered = format!("PT_SAMPLE {} {:.6} {:.12}", "max_pool3d", 7.25_f64, -1.5_f64);
+        let rendered = format!(
+            "PT_SAMPLE {} {:.6} {:.12}",
+            "max_pool3d", 7.25_f64, -1.5_f64
+        );
         let sample = parse_sample_line(&rendered).expect("the loop's own format must parse");
         assert_eq!(sample.lane, "max_pool3d");
         assert!((sample.milliseconds - 7.25).abs() < 1e-9);
