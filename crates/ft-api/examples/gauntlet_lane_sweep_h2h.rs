@@ -48,8 +48,9 @@ use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
-    MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, adjudicate_null, incumbent_sample_rounds,
-    parse_sample_line, sample_request,
+    MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS, TIMED_STEPS_MARKER,
+    adjudicate_null, incumbent_sample_rounds, parse_sample_line, parse_timed_steps, sample_request,
+    timed_region_disagreement,
 };
 use ft_core::ExecutionMode;
 
@@ -168,8 +169,17 @@ where
     let out = build(&mut session, x);
     let loss = session.tensor_sum(out).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
+    // frankentorch-574cu: STOP THE CLOCK HERE. The timed region is exactly
+    // `harness_interleave::TIMED_STEPS` — forward, loss_sum, backward — which is
+    // what the PyTorch arm times. The gradient checksum below is teardown: it
+    // proves both sides computed the same thing, and on the avg_pool2d lane it
+    // cost 1.599 ms (a serial dependent-add chain over 2M f64, 24% of that
+    // lane's session) that the incumbent's timer never paid. Timing it on one arm
+    // only biased every repetition in the same direction, which repetition cannot
+    // average out.
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
-    (started.elapsed().as_secs_f64() * 1_000.0, checksum)
+    (elapsed, checksum)
 }
 
 /// Ask the incumbent co-process for exactly one timed sample of `lane`.
@@ -241,12 +251,19 @@ ap2=seq(8*64*64*64).reshape(8,64,64,64)
 c3x=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 c3w=seq(32*32*3*3*3).reshape(32,32,3,3,3)
 mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
+# frankentorch-574cu: this arm declares the region it times, so a change to
+# `run` below that is not mirrored here fails the run instead of silently
+# biasing every ratio. Written as an independent literal rather than generated
+# from the Rust constant, which would make the agreement check tautological.
+print('PT_TIMED_STEPS forward,loss_sum,backward', flush=True)
 def run(base, fn):
     # leaf built OUTSIDE the timed region, matching the FrankenTorch side
     x=base.detach().clone().requires_grad_(True)
     s=time.perf_counter()
-    fn(x).sum().backward()
-    return (time.perf_counter()-s)*1e3, x.grad.sum().item()
+    fn(x).sum().backward()          # <- forward, loss_sum, backward: the timed region
+    elapsed=(time.perf_counter()-s)*1e3
+    # teardown, deliberately AFTER the clock stops on BOTH arms
+    return elapsed, x.grad.sum().item()
 LANES = {
     "max_pool1d": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
     "avg_pool2d": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
@@ -302,6 +319,19 @@ LANES = {
     // frankentorch-wnku0: hard-fails if the arm did not self-report, so this
     // harness cannot emit ratios without the version they were measured against.
     let torch_version = ft_api::harness_provenance::require_reported_version(&preamble)?;
+
+    // frankentorch-574cu: both arms must have timed the SAME region, or the
+    // ratios below are biased in one direction in every repetition and nothing
+    // here is quotable. Fail the run rather than print a caveat nobody reads.
+    let incumbent_steps = parse_timed_steps(&preamble).ok_or_else(|| {
+        format!(
+            "the PyTorch arm did not declare its timed region: no `{TIMED_STEPS_MARKER}` line. \
+             Without it there is no evidence the two arms measured the same work."
+        )
+    })?;
+    if let Some(message) = timed_region_disagreement(TIMED_STEPS, &incumbent_steps) {
+        return Err(message.into());
+    }
 
     println!("executing_elf_sha256={}", executable_sha256());
     println!(

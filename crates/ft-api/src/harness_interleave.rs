@@ -209,6 +209,74 @@ pub fn adjudicate_null(low: f64, high: f64, max_width: f64) -> NullVerdict {
     }
 }
 
+/// The steps a timed region covers, in order (`frankentorch-574cu`).
+///
+/// # Why this is a shared constant and not a comment in each arm
+///
+/// The gauntlet harness used to stop its FrankenTorch timer AFTER computing the
+/// gradient checksum, while the PyTorch arm stopped BEFORE its equivalent —
+/// `return (time.perf_counter()-s)*1e3, x.grad.sum().item()` evaluates the
+/// elapsed term first, so torch's grad sum was outside its measurement. The two
+/// arms were therefore not timing the same work. On the `avg_pool2d` lane that
+/// checksum — a serial dependent-add chain over 2M f64 — was 1.599 ms, 24% of a
+/// 6.562 ms session, and every lane paid a term like it on one arm only.
+///
+/// A bias present in every repetition of ONE arm does not average out. So the
+/// region is named here, both arms declare what they timed, and
+/// [`timed_region_disagreement`] fails the run if they disagree.
+pub const TIMED_STEPS: &[&str] = &["forward", "loss_sum", "backward"];
+
+/// Work that must sit OUTSIDE the timer on both arms.
+///
+/// The checksum exists to prove the two sides computed the same thing; it is
+/// verification, not op work, and timing it on one side measures a reduction
+/// nobody is comparing.
+pub const UNTIMED_TEARDOWN: &[&str] = &["gradient_checksum"];
+
+/// The line the incumbent prints to declare the region it timed.
+pub const TIMED_STEPS_MARKER: &str = "PT_TIMED_STEPS ";
+
+/// Parse the incumbent's declared timed region.
+#[must_use]
+pub fn parse_timed_steps(stdout: &str) -> Option<Vec<&str>> {
+    stdout.lines().find_map(|line| {
+        let value = line.trim().strip_prefix(TIMED_STEPS_MARKER)?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        Some(value.split(',').map(str::trim).collect())
+    })
+}
+
+/// Check that both arms timed the same region.
+///
+/// Order matters: two arms that time the same steps in a different order are not
+/// obviously comparable either, and saying so costs nothing.
+///
+/// Returns `None` when they agree, or the message to fail with when they do not.
+#[must_use]
+pub fn timed_region_disagreement(ours: &[&str], incumbent: &[&str]) -> Option<String> {
+    if ours == incumbent {
+        return None;
+    }
+    let extra_ours: Vec<&str> = ours
+        .iter()
+        .filter(|s| !incumbent.contains(*s))
+        .copied()
+        .collect();
+    let extra_theirs: Vec<&str> = incumbent
+        .iter()
+        .filter(|s| !ours.contains(*s))
+        .copied()
+        .collect();
+    Some(format!(
+        "the two arms did not time the same region: ours timed {ours:?}, the incumbent timed \
+         {incumbent:?} (only ours: {extra_ours:?}; only theirs: {extra_theirs:?}). A step timed on \
+         one arm and not the other biases every repetition in the same direction, so no ratio from \
+         this run is quotable."
+    ))
+}
+
 /// Arguments for launching the incumbent co-process with `script`.
 ///
 /// # Why this exists rather than a literal in the harness
@@ -551,6 +619,95 @@ mod tests {
         assert_eq!(NullVerdict::Calm.label(), "PASS");
         assert_eq!(NullVerdict::TooWide.label(), "WIDE");
         assert_eq!(NullVerdict::OffCentre.label(), "FAIL");
+    }
+
+    /// **THE PLANTED ASYMMETRY (`frankentorch-574cu`).** This is the exact
+    /// pre-fix configuration: the FrankenTorch arm timed the gradient checksum,
+    /// the PyTorch arm did not. Run against the code as it stood before the fix,
+    /// this case is what the harness actually did — so it must be rejected, and
+    /// the message must name the offending step or it is not actionable.
+    #[test]
+    fn the_pre_fix_asymmetric_region_is_rejected() {
+        let ours_pre_fix = ["forward", "loss_sum", "backward", "gradient_checksum"];
+        let incumbent = ["forward", "loss_sum", "backward"];
+        let message = timed_region_disagreement(&ours_pre_fix, &incumbent)
+            .expect("the pre-fix asymmetry MUST be caught");
+        assert!(
+            message.contains("gradient_checksum"),
+            "must name the offending step: {message}"
+        );
+        assert!(message.contains("quotable"), "{message}");
+    }
+
+    /// The shipped configuration must agree with itself — this is the assertion
+    /// that flips from FAIL to PASS with the fix, because `TIMED_STEPS` no longer
+    /// contains the checksum.
+    #[test]
+    fn the_shipped_timed_region_excludes_teardown() {
+        for step in UNTIMED_TEARDOWN {
+            assert!(
+                !TIMED_STEPS.contains(step),
+                "`{step}` is teardown and must not be inside the timed region: {TIMED_STEPS:?}"
+            );
+        }
+        assert_eq!(TIMED_STEPS, &["forward", "loss_sum", "backward"]);
+        assert!(timed_region_disagreement(TIMED_STEPS, TIMED_STEPS).is_none());
+    }
+
+    /// NEGATIVE CASE: an incumbent that times MORE than us is just as wrong, and
+    /// biases the ratio the other way. The check must not be one-sided.
+    #[test]
+    fn an_incumbent_timing_extra_work_is_also_a_disagreement() {
+        let message = timed_region_disagreement(
+            &["forward", "loss_sum", "backward"],
+            &["forward", "loss_sum", "backward", "gradient_checksum"],
+        )
+        .expect("an incumbent timing extra work must be caught too");
+        assert!(message.contains("gradient_checksum"), "{message}");
+    }
+
+    /// Same steps in a different order are not obviously comparable either.
+    #[test]
+    fn reordered_steps_are_a_disagreement() {
+        assert!(
+            timed_region_disagreement(
+                &["forward", "loss_sum", "backward"],
+                &["forward", "backward", "loss_sum"],
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn parses_the_incumbents_declared_region() {
+        let stdout = "PT_TORCH_VERSION 2.12.1+cpu\nPT_TIMED_STEPS forward,loss_sum,backward\n";
+        assert_eq!(
+            parse_timed_steps(stdout),
+            Some(vec!["forward", "loss_sum", "backward"])
+        );
+        // Whitespace around the separators must not fabricate a disagreement.
+        assert_eq!(
+            parse_timed_steps("PT_TIMED_STEPS  forward , loss_sum , backward \n"),
+            Some(vec!["forward", "loss_sum", "backward"])
+        );
+    }
+
+    /// NEGATIVE CASE: an arm that never declares its region must not be treated
+    /// as agreeing. Silence is not symmetry.
+    #[test]
+    fn an_undeclared_region_is_none_not_agreement() {
+        assert_eq!(parse_timed_steps("PT_TORCH_VERSION 2.12.1\n"), None);
+        assert_eq!(parse_timed_steps("PT_TIMED_STEPS \n"), None);
+        assert_eq!(parse_timed_steps(""), None);
+    }
+
+    /// The declaration the Python arm emits must round-trip into agreement with
+    /// the Rust constant, or every run hard-fails on a formatting difference.
+    #[test]
+    fn the_python_declaration_agrees_with_the_rust_constant() {
+        let declared = format!("{TIMED_STEPS_MARKER}{}", TIMED_STEPS.join(","));
+        let parsed = parse_timed_steps(&declared).expect("our own declaration must parse");
+        assert!(timed_region_disagreement(TIMED_STEPS, &parsed).is_none());
     }
 
     /// NEGATIVE CASE: the deadlock that actually happened. Launching the child as
