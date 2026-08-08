@@ -178,7 +178,7 @@ fn run_lane(idx: usize, ctx: &Ctx) -> f64 {
             black_box(&v);
             v[0]
         }
-        3 | 4 | 5 => {
+        3..=5 => {
             let chunk = match idx {
                 3 => PLANE_LEN,   // 64 tasks, exactly the kernel's partitioning
                 4 => DIN_LEN / 8, // 8 tasks

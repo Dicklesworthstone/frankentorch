@@ -427,7 +427,7 @@ fn main() {
         let mut opts_on = BackwardOptions::strict_default();
         opts_on.create_graph = true;
 
-        let mut timed = |opts: BackwardOptions| -> f64 {
+        let timed = |opts: BackwardOptions| -> f64 {
             time_it_conditioned(a_numel, || {
                 let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
                 let x = session
