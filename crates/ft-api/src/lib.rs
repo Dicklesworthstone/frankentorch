@@ -33235,9 +33235,14 @@ impl FrankenTorchSession {
 
         if !self.tensor_tape.tensor_requires_grad(input)? {
             let value = {
-                let pv = self.tensor_values(padded)?;
+                // frankentorch-we7ry: borrowed read, same defect and same fix as
+                // the plain forward path — `tensor_values` returns an owned Vec,
+                // so this copied the whole padded activation before pooling it.
+                // The enclosing block already scopes the borrow away from the
+                // `&mut self` call below.
+                let pv = self.tensor_tape.values_borrowed(padded)?;
                 let out = ft_kernel_cpu::avg_pool2d_forward_f64(
-                    &pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
+                    pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
                 );
                 ft_kernel_cpu::sum_tensor_contiguous_f64(&out, &out_meta)
                     .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?

@@ -154,6 +154,26 @@ fn main() {
         std::hint::black_box(out);
     }
 
+    // --- no-grad sum shortcut: tensor_sum(avg_pool2d(x)) ---------------------
+    // frankentorch-we7ry: the fused *_sum path has its own no-grad branch, which
+    // reads the padded activation OWNED. Timed here as a straight before/after of
+    // that one edit — no raw-kernel control needed, because the edit is the only
+    // variable between the two runs of this phase.
+    let mut nograd_sum = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(input.clone(), vec![N, C, H, W], false)
+            .expect("leaf");
+        let started = Instant::now();
+        let out = session
+            .functional_avg_pool2d(x, (KH, KW), (SH, SW), (0, 0), false, true)
+            .expect("avg_pool2d");
+        let s = session.tensor_sum(out).expect("sum");
+        nograd_sum.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(s);
+    }
+
     // --- full session forward+backward, exactly as the H2H harness times it -
     //
     // Also split into its four steps. Callgrind is useless for naming the frame
@@ -203,6 +223,7 @@ fn main() {
     report("nograd fwd", &mut nograd);
     report("raw fwd f32", &mut raw_f32);
     report("nograd fwd f32", &mut nograd_f32);
+    report("nograd sum", &mut nograd_sum);
     report("session", &mut session_ms);
     println!("\n  session broken down:");
     report("  fwd call", &mut t_fwd);
