@@ -136,21 +136,6 @@ fn median_ratio_ci(numerator: &[f64], denominator: &[f64]) -> (f64, f64, f64) {
     )
 }
 
-fn executable_sha256() -> String {
-    let executable = std::env::current_exe().expect("current executable must be available");
-    let output = Command::new("sha256sum")
-        .arg(executable)
-        .output()
-        .expect("sha256sum must be available");
-    assert!(output.status.success(), "sha256sum failed");
-    String::from_utf8(output.stdout)
-        .expect("sha256sum output must be UTF-8")
-        .split_whitespace()
-        .next()
-        .expect("sha256sum must print a digest")
-        .to_owned()
-}
-
 fn seq(n: usize) -> Vec<f64> {
     (0..n).map(|i| ((i % 251) as f64) * 0.001 - 0.12).collect()
 }
@@ -337,7 +322,10 @@ LANES = {
         return Err(message.into());
     }
 
-    println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "executing_elf_sha256={}",
+        ft_api::harness_provenance::executing_elf_sha256()
+    );
     println!(
         "{}",
         ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)

@@ -134,6 +134,70 @@ impl std::fmt::Display for MissingIncumbentVersion {
 
 impl std::error::Error for MissingIncumbentVersion {}
 
+/// SHA-256 of the binary that is executing right now (`frankentorch-fl87u`).
+///
+/// # Why a harness reports the digest of its own ELF
+///
+/// Because a build can report success and still leave the OLD binary in place,
+/// and nothing else in the pipeline notices. Two rch modes do exactly that:
+/// `rch exec -- sh -c "... cargo build ..."` compiles remotely, prints
+/// `Finished`, exits 0, and never syncs the artifact back; and a stale per-worker
+/// sync manifest can make a build fail or serve old bytes for a file that exists
+/// locally. Retrieval can also land the artifact somewhere other than the path
+/// you then run — a worker-scoped `CARGO_TARGET_DIR` rewrite leaves
+/// `target/release/...` untouched while the build genuinely succeeded elsewhere.
+///
+/// The failure is silent and it is worst exactly where it matters: a self-A/B
+/// that rebuilds one arm and re-runs it measures the SAME binary twice and
+/// prints a perfectly plausible "no change" row. The executing-ELF digest is what
+/// catches that, which is why it is printed beside every ratio this repo quotes.
+///
+/// # Panics
+///
+/// Panics if the current executable path or `sha256sum` is unavailable — a
+/// harness that cannot identify its own binary must not go on to print ratios.
+#[must_use]
+pub fn executing_elf_sha256() -> String {
+    let executable = std::env::current_exe().expect("current executable must be available");
+    let output = std::process::Command::new("sha256sum")
+        .arg(executable)
+        .output()
+        .expect("sha256sum must be available");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("sha256sum output must be UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("sha256sum must print a digest")
+        .to_owned()
+}
+
+/// Catch an A/B whose two arms are the same binary.
+///
+/// This is the `frankentorch-fl87u` trap in one check. If a rebuild silently
+/// failed to reach the path being run, both arms execute identical code, the
+/// deltas come out near zero (or wherever the noise lands), and the row reads as
+/// a clean result rather than a broken experiment. Comparing the two arms'
+/// executing-ELF digests is the cheapest way to know, and it is only useful if
+/// something actually compares them — hence a function rather than a convention.
+///
+/// Returns `None` when the arms genuinely differ, or the message to fail with
+/// when they do not.
+#[must_use]
+pub fn identical_arm_digests(before: &str, after: &str) -> Option<String> {
+    if before.trim() != after.trim() || before.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "both A/B arms executed the SAME binary (executing_elf_sha256={}). The rebuild did not \
+         reach the path being run, so this measured one binary twice and any delta is noise. See \
+         frankentorch-fl87u: use a BARE `rch exec -- cargo build ...` with no `sh -c` and no \
+         pipes, check where a worker-scoped CARGO_TARGET_DIR retrieved the artifact, and \
+         `rch sync --worker <id> --force` if a stale manifest is suspected.",
+        before.trim()
+    ))
+}
+
 /// Render the provenance rows that carry the incumbent's identity.
 ///
 /// Kept as one function so the three live-torch harnesses cannot drift into
@@ -296,6 +360,67 @@ mod tests {
             block.contains("is NOT a win"),
             "the incumbent-moved rule must travel with the block: {block}"
         );
+    }
+
+    /// The digest must be a real SHA-256 and stable within a process, or it
+    /// cannot identify anything.
+    #[test]
+    fn executing_elf_digest_is_a_stable_sha256() {
+        let digest = executing_elf_sha256();
+        assert_eq!(digest.len(), 64, "not a SHA-256: {digest}");
+        assert!(
+            digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "not hex: {digest}"
+        );
+        assert_eq!(digest, executing_elf_sha256(), "digest must be stable");
+    }
+
+    /// **THE `frankentorch-fl87u` TRAP.** Two arms with the same digest means the
+    /// rebuild never reached the binary being run, so the experiment measured one
+    /// binary twice. That must be caught, and the message must say what to do.
+    #[test]
+    fn identical_arm_digests_are_caught_and_the_message_is_actionable() {
+        let digest = "7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c";
+        let message = identical_arm_digests(digest, digest)
+            .expect("an A/B that ran one binary twice must be caught");
+        assert!(message.contains(digest), "must name the digest: {message}");
+        assert!(message.contains("SAME binary"), "{message}");
+        assert!(
+            message.contains("fl87u"),
+            "must point at the bead: {message}"
+        );
+        assert!(
+            message.contains("sh -c"),
+            "must name the known cause: {message}"
+        );
+    }
+
+    /// Whitespace differences are formatting, not a different binary.
+    #[test]
+    fn digests_differing_only_in_whitespace_are_still_identical() {
+        assert!(identical_arm_digests(" abc123 ", "abc123\n").is_some());
+    }
+
+    /// NEGATIVE CASE: a genuine A/B must not be flagged, or the guard is noise
+    /// and gets ignored.
+    #[test]
+    fn genuinely_different_arms_are_not_flagged() {
+        assert_eq!(
+            identical_arm_digests(
+                "7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c",
+                "c96e881e99e0f5b9b560898596a02876573d8868a1f4b29553921ea4496afc33",
+            ),
+            None
+        );
+    }
+
+    /// NEGATIVE CASE: two MISSING digests are not evidence that one binary ran
+    /// twice — they are evidence of nothing, and must not produce a confident
+    /// accusation.
+    #[test]
+    fn two_empty_digests_are_not_an_identical_arm_claim() {
+        assert_eq!(identical_arm_digests("", ""), None);
+        assert_eq!(identical_arm_digests("  ", "\n"), None);
     }
 
     /// The Python probe and the Rust parser must agree on the marker, or the
