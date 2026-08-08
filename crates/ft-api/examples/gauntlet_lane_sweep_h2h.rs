@@ -13,6 +13,26 @@
 //! OUTSIDE the timed region on both sides. That is the number that says whether a
 //! kernel is competitive, and it is the one a lever could actually move.
 //!
+//! WHY THE ARMS INTERLEAVE (`frankentorch-6atx2`). This harness used to run its
+//! ENTIRE PyTorch arm to completion before the first FrankenTorch lane started,
+//! so the two arms were sampled tens of seconds apart and any load shift in that
+//! gap landed entirely, and undetectably, in the ratio. The contention preflight
+//! could not cover it: it certifies only that nothing heavy sat on the placement
+//! CPUs at the instant sampling began, not one second later. Repetition plus a
+//! median averaged that effect down; nothing bounded it.
+//!
+//! The incumbent is therefore driven as a **co-process** — it sets up, warms up,
+//! announces readiness, then returns exactly one timed sample per request — and
+//! each round takes an incumbent sample immediately beside our samples for the
+//! same lane. See `ft_api::harness_interleave` for the protocol and the schedule.
+//!
+//! THE INCUMBENT'S ESTIMATOR IS UNCHANGED. Interleaving alters *when* samples are
+//! taken, not how many or which statistic summarises them. PyTorch is still
+//! min-of-`PT_SAMPLES` after 4 warmups; those samples are merely spread evenly
+//! across the rounds instead of taken in one block. Had this also switched to
+//! min-of-16 the ratio's level would have moved for reasons unrelated to
+//! interleaving, and the before/after set could not isolate this change.
+//!
 //! Four lanes, shapes copied from `pytorch_gauntlet_bench` so the two describe the
 //! same workloads: `max_pool1d`, `avg_pool2d`, `conv3d`, `max_pool3d`.
 //!
@@ -22,15 +42,18 @@
 //!   cargo run --release -p ft-api --features fair-alloc --example gauntlet_lane_sweep_h2h
 //! ```
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
+use ft_api::harness_interleave::{
+    QUIT_REQUEST, READY_MARKER, incumbent_sample_rounds, parse_sample_line, sample_request,
+};
 use ft_core::ExecutionMode;
 
-/// MUST BE EVEN (`frankentorch-svabf`). Each iteration runs two timed calls and
-/// assigns them to the A/A arms by iteration parity, which cancels a constant
+/// MUST BE EVEN (`frankentorch-svabf`). Each round runs two timed calls and
+/// assigns them to the A/A arms by round parity, which cancels a constant
 /// first-call-vs-second-call offset *only if the two positions are used equally
 /// often*. At the previous odd value of 15, arm `a` took the first position 8
 /// times and the second 7 — a 1-in-15 imbalance that leaks the position effect
@@ -38,6 +61,10 @@ use ft_core::ExecutionMode;
 /// report A/A CIs excluding 1.0 (`[0.843,0.986]`, `[0.770,0.992]`) on a busy host
 /// while identical code ran in both arms.
 const REPS: usize = 16;
+/// Incumbent samples per lane. Held at 7 to keep PyTorch's estimator exactly the
+/// min-of-7 the banked non-interleaved set used — see the module note on why the
+/// estimator must not move in the same change that introduces interleaving.
+const PT_SAMPLES: usize = 7;
 const BOOTSTRAP_REPS: usize = 2_000;
 
 // Shapes lifted verbatim from pytorch_gauntlet_bench.
@@ -64,9 +91,17 @@ const MP3_D: usize = 16;
 const MP3_H: usize = 32;
 const MP3_W: usize = 32;
 
+/// One FrankenTorch lane: runs a single timed forward+backward, returning
+/// (milliseconds, gradient checksum).
+type LaneRun<'a> = Box<dyn Fn() -> (f64, f64) + 'a>;
+
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
+}
+
+fn minimum(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
 fn next_random(state: &mut u64) -> u64 {
@@ -136,6 +171,38 @@ where
     (started.elapsed().as_secs_f64() * 1_000.0, checksum)
 }
 
+/// Ask the incumbent co-process for exactly one timed sample of `lane`.
+///
+/// Chatter the child may emit (warnings, notices) is skipped rather than parsed,
+/// but a closed stdout is a hard failure: a silently-short arm would otherwise
+/// leave the lane's remaining rounds measuring only our side.
+fn incumbent_sample(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+    lane: &str,
+) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+    writeln!(stdin, "{}", sample_request(lane))?;
+    stdin.flush()?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(format!(
+                "the PyTorch co-process closed its stdout while lane `{lane}` was being sampled; \
+                 a partially-measured arm cannot carry a vs-PyTorch claim"
+            )
+            .into());
+        }
+        if let Some(sample) = parse_sample_line(&line) {
+            assert_eq!(
+                sample.lane, lane,
+                "co-process answered for the wrong lane; replies would be misfiled"
+            );
+            return Ok((sample.milliseconds, sample.gradient_checksum));
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The A/A null gate is only meaningful if the two arms use the first- and
     // second-call positions equally often; see the note on REPS.
@@ -143,6 +210,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         REPS.is_multiple_of(2),
         "REPS must be even or the A/A arms are position-imbalanced and the null gate leaks bias"
     );
+    // Compile-time: the incumbent cannot take more samples than there are rounds
+    // to spread them across, or the schedule would clamp and silently change the
+    // estimator this harness is careful to hold fixed.
+    const {
+        assert!(PT_SAMPLES <= REPS);
+    }
 
     let mp1 = seq(MP1_N * MP1_C * MP1_L);
     let ap2 = seq(AP2_N * AP2_C * AP2_H * AP2_W);
@@ -151,7 +224,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
 
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let py = r#"
+    // Setup only. The request/serve/quit loop is appended from the library so the
+    // protocol markers cannot drift away from the parser that reads them.
+    let py_setup = r#"
 import time, torch
 import torch.nn.functional as Fn
 # frankentorch-wnku0: the arm self-reports its version, in this same invocation,
@@ -171,57 +246,59 @@ def run(base, fn):
     s=time.perf_counter()
     fn(x).sum().backward()
     return (time.perf_counter()-s)*1e3, x.grad.sum().item()
-def t(base, fn, n=7):
-    for _ in range(4): run(base, fn)
-    ts=[]
-    for _ in range(n):
-        ms,g = run(base, fn); ts.append(ms)
-    return min(ts), g
-for name, base, fn in [
-    ("max_pool1d", mp1, lambda x: Fn.max_pool1d(x,2,2)),
-    ("avg_pool2d", ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
-    ("conv3d",     c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
-    ("max_pool3d", mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
-]:
-    ms,g = t(base, fn)
-    print("PT %s %.4f %.12g"%(name, ms, g))
+LANES = {
+    "max_pool1d": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
+    "avg_pool2d": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
+    "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
+    "max_pool3d": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
+}
 "#;
+    let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
+
     let mut child = Command::new(&python)
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| std::io::Error::other("no stdin"))?
-        .write_all(py.as_bytes())?;
-    let out = child.wait_with_output();
-    let pt = out
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    assert!(
-        !pt.is_empty(),
-        "the PyTorch arm must run in this same invocation; set PYTORCH_PYTHON to an \
-         interpreter with torch installed. A FrankenTorch-only run cannot carry a \
-         vs-PyTorch claim."
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "could not start the PyTorch arm (`{python}`): {error}. Set PYTORCH_PYTHON to an \
+                 interpreter with torch installed; a FrankenTorch-only run cannot carry a \
+                 vs-PyTorch claim."
+            )
+        })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
+    let mut reader = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout"))?,
     );
-    let pt_row = |name: &str| -> Option<(f64, f64)> {
-        pt.lines().find_map(|line| {
-            let mut it = line.strip_prefix("PT ")?.split_whitespace();
-            if it.next()? == name {
-                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-            } else {
-                None
-            }
-        })
-    };
+    stdin.write_all(py.as_bytes())?;
+    stdin.flush()?;
+
+    // Block until the arm has imported torch, built its tensors and warmed every
+    // lane. Anything it prints before that (version line, warnings) is preamble.
+    let mut preamble = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(format!(
+                "the PyTorch arm exited before announcing `{READY_MARKER}`; set PYTORCH_PYTHON to \
+                 an interpreter with torch installed. A FrankenTorch-only run cannot carry a \
+                 vs-PyTorch claim. Its output was:\n{preamble}"
+            )
+            .into());
+        }
+        if line.trim() == READY_MARKER {
+            break;
+        }
+        preamble.push_str(&line);
+    }
 
     // frankentorch-wnku0: hard-fails if the arm did not self-report, so this
     // harness cannot emit ratios without the version they were measured against.
-    let torch_version = ft_api::harness_provenance::require_reported_version(&pt)?;
+    let torch_version = ft_api::harness_provenance::require_reported_version(&preamble)?;
 
     println!("executing_elf_sha256={}", executable_sha256());
     println!(
@@ -239,114 +316,113 @@ for name, base, fn in [
     println!(
         "measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)"
     );
-    println!("reps={REPS}, PyTorch min-of-7 after 4 warmups, torch threads=8\n");
+    println!(
+        "sampling=INTERLEAVED per round (frankentorch-6atx2); PyTorch min-of-{PT_SAMPLES} after 4 \
+         warmups, spread evenly across {REPS} rounds, torch threads=8\n"
+    );
     println!("lane          FT(ms)    PT(ms)   standing            A/A gate           parity");
 
-    let mut lanes: Vec<(&str, Vec<f64>, f64)> = Vec::new();
-
-    macro_rules! lane {
-        ($name:literal, $values:expr, $shape:expr, $build:expr) => {{
-            let build = $build;
-            let mut warm = 0.0;
-            for _ in 0..3 {
-                warm += timed_op(&$values, $shape, &build).0;
-            }
-            std::hint::black_box(warm);
-            let mut a = Vec::with_capacity(REPS);
-            let mut b = Vec::with_capacity(REPS);
-            let mut checksum = 0.0;
-            for i in 0..REPS {
-                let (t1, c) = timed_op(&$values, $shape, &build);
-                let (t2, _) = timed_op(&$values, $shape, &build);
-                checksum = c;
-                if i % 2 == 0 {
-                    a.push(t1);
-                    b.push(t2);
-                } else {
-                    b.push(t1);
-                    a.push(t2);
-                }
-            }
-            let (nr, nlo, nhi) = median_ratio_ci(&a, &b);
-            let null_pass = nlo <= 1.0 && nhi >= 1.0;
-            let ft_ms = median(a.iter().chain(b.iter()).copied().collect());
-            lanes.push((
-                $name,
-                vec![ft_ms, nr, nlo, nhi, f64::from(u8::from(null_pass))],
-                checksum,
-            ));
-        }};
-    }
-
-    lane!(
-        "max_pool1d",
-        mp1,
-        vec![MP1_N, MP1_C, MP1_L],
-        |s: &mut FrankenTorchSession, x| s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
-    );
-    lane!(
-        "avg_pool2d",
-        ap2,
-        vec![AP2_N, AP2_C, AP2_H, AP2_W],
-        |s: &mut FrankenTorchSession, x| s
-            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
-            .expect("avg_pool2d")
-    );
-    lane!(
-        "max_pool3d",
-        mp3,
-        vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W],
-        |s: &mut FrankenTorchSession, x| s
-            .functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
-            .expect("max_pool3d")
-    );
-
-    // conv3d needs a second leaf, so it does not fit the single-input macro.
-    {
-        let build_conv = |session: &mut FrankenTorchSession, x: ft_autograd::TensorNodeId| {
-            let w = session
-                .tensor_variable(c3w.clone(), vec![C3_CO, C3_CI, C3_K, C3_K, C3_K], false)
-                .expect("weight");
-            session
-                .functional_conv3d(x, w, None, (1, 1, 1), (1, 1, 1))
-                .expect("conv3d")
-        };
-        let shape = vec![C3_N, C3_CI, C3_D, C3_H, C3_W];
-        for _ in 0..3 {
-            std::hint::black_box(timed_op(&c3x, shape.clone(), build_conv).0);
-        }
-        let mut a = Vec::with_capacity(REPS);
-        let mut b = Vec::with_capacity(REPS);
-        let mut checksum = 0.0;
-        for i in 0..REPS {
-            let (t1, c) = timed_op(&c3x, shape.clone(), build_conv);
-            let (t2, _) = timed_op(&c3x, shape.clone(), build_conv);
-            checksum = c;
-            if i % 2 == 0 {
-                a.push(t1);
-                b.push(t2);
-            } else {
-                b.push(t1);
-                a.push(t2);
-            }
-        }
-        let (nr, nlo, nhi) = median_ratio_ci(&a, &b);
-        let null_pass = nlo <= 1.0 && nhi >= 1.0;
-        let ft_ms = median(a.iter().chain(b.iter()).copied().collect());
-        lanes.push((
+    let lanes: Vec<(&str, LaneRun<'_>)> = vec![
+        (
+            "max_pool1d",
+            Box::new(|| {
+                timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+                })
+            }),
+        ),
+        (
+            "avg_pool2d",
+            Box::new(|| {
+                timed_op(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
+                    s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                        .expect("avg_pool2d")
+                })
+            }),
+        ),
+        (
+            "max_pool3d",
+            Box::new(|| {
+                timed_op(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
+                    s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+                        .expect("max_pool3d")
+                })
+            }),
+        ),
+        (
             "conv3d",
-            vec![ft_ms, nr, nlo, nhi, f64::from(u8::from(null_pass))],
-            checksum,
-        ));
+            Box::new(|| {
+                timed_op(&c3x, vec![C3_N, C3_CI, C3_D, C3_H, C3_W], |s, x| {
+                    let w = s
+                        .tensor_variable(c3w.clone(), vec![C3_CO, C3_CI, C3_K, C3_K, C3_K], false)
+                        .expect("weight");
+                    s.functional_conv3d(x, w, None, (1, 1, 1), (1, 1, 1))
+                        .expect("conv3d")
+                })
+            }),
+        ),
+    ];
+
+    // Our side warms here; the incumbent warmed itself before announcing ready.
+    for (_, run_lane) in &lanes {
+        let mut warm = 0.0;
+        for _ in 0..3 {
+            warm += run_lane().0;
+        }
+        std::hint::black_box(warm);
     }
 
-    for (name, stats, checksum) in &lanes {
-        let (ft_ms, nr, nlo, nhi, null_pass) =
-            (stats[0], stats[1], stats[2], stats[3], stats[4] != 0.0);
-        let Some((pt_ms, pt_grad)) = pt_row(name) else {
+    let schedule = incumbent_sample_rounds(REPS, PT_SAMPLES);
+    let mut arm_a: Vec<Vec<f64>> = vec![Vec::with_capacity(REPS); lanes.len()];
+    let mut arm_b: Vec<Vec<f64>> = vec![Vec::with_capacity(REPS); lanes.len()];
+    let mut pt_times: Vec<Vec<f64>> = vec![Vec::with_capacity(PT_SAMPLES); lanes.len()];
+    let mut pt_grads: Vec<Option<f64>> = vec![None; lanes.len()];
+    let mut checksums: Vec<f64> = vec![0.0; lanes.len()];
+
+    for round in 0..REPS {
+        let incumbent_round = schedule.binary_search(&round).is_ok();
+        for (index, (name, run_lane)) in lanes.iter().enumerate() {
+            // The incumbent sample sits immediately beside our samples for the
+            // SAME lane, so both arms see the same instant of machine state.
+            if incumbent_round {
+                let (ms, grad) = incumbent_sample(&mut stdin, &mut reader, name)?;
+                pt_times[index].push(ms);
+                pt_grads[index] = Some(grad);
+            }
+            let (first, checksum) = run_lane();
+            let (second, _) = run_lane();
+            checksums[index] = checksum;
+            if round.is_multiple_of(2) {
+                arm_a[index].push(first);
+                arm_b[index].push(second);
+            } else {
+                arm_b[index].push(first);
+                arm_a[index].push(second);
+            }
+        }
+    }
+
+    writeln!(stdin, "{QUIT_REQUEST}")?;
+    stdin.flush()?;
+    drop(stdin);
+    child.wait()?;
+
+    for (index, (name, _)) in lanes.iter().enumerate() {
+        let (nr, nlo, nhi) = median_ratio_ci(&arm_a[index], &arm_b[index]);
+        let null_pass = nlo <= 1.0 && nhi >= 1.0;
+        let ft_ms = median(
+            arm_a[index]
+                .iter()
+                .chain(arm_b[index].iter())
+                .copied()
+                .collect(),
+        );
+        let (Some(pt_grad), false) = (pt_grads[index], pt_times[index].is_empty()) else {
             println!("  {name:<12} {ft_ms:8.3}       --   PyTorch row missing");
             continue;
         };
+        // Estimator preserved from the banked set: min over the lane's samples.
+        let pt_ms = minimum(&pt_times[index]);
         let ratio = pt_ms / ft_ms;
         let standing = if ratio >= 1.0 {
             format!("FT {ratio:.2}x FASTER")
@@ -355,7 +431,7 @@ for name, base, fn in [
         };
         // Gradient-sum agreement: the two sides must be computing the same thing.
         let tolerance = 1e-6 * pt_grad.abs().max(1.0);
-        let parity = if (checksum - pt_grad).abs() <= tolerance {
+        let parity = if (checksums[index] - pt_grad).abs() <= tolerance {
             "match"
         } else {
             "MISMATCH"

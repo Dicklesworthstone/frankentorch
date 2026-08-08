@@ -31,6 +31,12 @@
 #[doc(hidden)]
 pub mod harness_provenance;
 
+/// Arm-interleaving helpers for the head-to-head harnesses (`frankentorch-6atx2`).
+/// Not part of the tensor API surface; lives here so the sampling schedule and
+/// the incumbent co-process protocol are unit-tested rather than trusted.
+#[doc(hidden)]
+pub mod harness_interleave;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
