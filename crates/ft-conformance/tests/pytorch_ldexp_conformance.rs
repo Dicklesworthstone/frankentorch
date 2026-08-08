@@ -1,5 +1,5 @@
 use ft_api::FrankenTorchSession;
-use ft_conformance::{HarnessConfig, run_legacy_oracle_script};
+use ft_conformance::{HarnessConfig, oracle_required_or_skip, run_legacy_oracle_script};
 use ft_core::ExecutionMode;
 use serde_json::{Value, json};
 
@@ -80,8 +80,10 @@ print(json.dumps({"ok": True}, sort_keys=True))
 }
 
 fn query_torch_ldexp(cases: &[LdexpCase]) -> Option<Value> {
-    if !torch_available() {
-        eprintln!("pytorch_ldexp_subprocess_conformance: torch unavailable, skipping");
+    // frankentorch-imtpq: the bare early return reported `1 passed` when the oracle was missing.
+    // Now an oracle that was explicitly requested (FT_LEGACY_ORACLE_PYTHON set) and did not answer
+    // fails instead of certifying a comparison that never ran; unset still skips honestly.
+    if !oracle_required_or_skip("pytorch_ldexp_subprocess_conformance", torch_available()) {
         return None;
     }
 
