@@ -1,24 +1,42 @@
-//! Where does `avg_pool2d`'s op work actually go? — `frankentorch-k1h8g`.
+//! Where does op work actually go inside the session? — `frankentorch-k1h8g`,
+//! `frankentorch-we7ry`.
 //!
-//! The lane measures 4-6x slower than PyTorch on `[8,64,64,64]` k(2,2) s(2,2)
-//! f64, forward+backward, leaf built outside the timer. The f64 path is already
-//! a single fused custom op (one windowed-mean forward, a geometry-only
-//! backward, no saved input), so "compose overhead" is not the explanation and
-//! the cost has to be partitioned before any lever is chosen.
+//! Started as an `avg_pool2d` partition (hence the file name) and grew into the
+//! measurement bench for the no-grad borrow vein. It is an INTERNAL partition,
+//! never a head-to-head: no PyTorch arm, and nothing it prints is a vs-upstream
+//! ratio.
 //!
-//! This splits the same workload into the pieces that can actually be blamed:
+//! # What it times
 //!
-//!   raw fwd      `avg_pool2d_forward_f64` alone, on an already-materialised slice
-//!   raw bwd      `avg_pool2d_backward_f64` alone
-//!   raw fwd+bwd  the two kernels back to back — the floor a perfect tape would hit
-//!   session      the full `FrankenTorchSession` forward+backward the harness times
+//! | phase | what it isolates |
+//! |---|---|
+//! | `raw fwd` / `raw bwd` / `raw fwd+bwd` | the pooling kernels alone, on an already-materialised slice |
+//! | `nograd fwd` | the same kernel through the session with the tape skipped — `nograd fwd - raw fwd` is the session wrapper |
+//! | `raw fwd f32` / `nograd fwd f32` | the same question one dtype over, with its own control |
+//! | `nograd sum` | the fused `tensor_sum(avg_pool2d(x))` shortcut |
+//! | `bn raw` / `bn raw cold` / `bn nograd` | BatchNorm2d, with TWO raw controls — see the allocator note |
+//! | `tensor_variable` | materialising a fresh 16 MiB node, alone |
+//! | `bn1sum raw` / `bn1sum nograd` | `batch_norm1d_sum`, a cheap reduction over a large activation |
+//! | `session` + its four steps | the full forward+backward, split fwd / loss_sum / backward / grad fetch |
 //!
-//! `session - (raw fwd + raw bwd)` is tape/`apply_function` overhead: input
-//! clones, node allocation, gradient plumbing. If that term dominates, the lever
-//! is in ft-api; if the raw kernels dominate, it is in ft-kernel-cpu. Reporting
-//! both stops a lever being aimed at the wrong crate.
+//! # Two traps this harness exists to avoid, both of which caught me
 //!
-//! Run (local; no PyTorch needed — this is an internal partition, not a H2H):
+//! **The grad checksum is teardown, not op work** (`frankentorch-574cu`). It is
+//! reported separately and excluded from the op-work total; counting it inflated
+//! a published lane ratio.
+//!
+//! **`min` is the wrong statistic when the arms differ in allocation
+//! behaviour.** `bn raw` drops its 16 MiB output each iteration so the allocator
+//! recycles warm pages; `bn raw cold` keeps every output alive, which is the
+//! session's real pattern. They are indistinguishable at the MINIMUM (1.82 vs
+//! 1.81 ms) and differ 3x at the MEDIAN (2.98 vs 8.83 ms). So:
+//!
+//! - for a BORROW A/B — one phase against itself, a single edit as the only
+//!   variable — `min` is fine, because both arms share an allocation pattern;
+//! - for a session-minus-kernel DECOMPOSITION, use the median and match the
+//!   allocation pattern, or the wrapper term is inflated by the allocator.
+//!
+//! Run (local; no PyTorch needed):
 //! ```text
 //! cargo run --release -p ft-api --features fair-alloc --example avgpool2d_profile
 //! ```
