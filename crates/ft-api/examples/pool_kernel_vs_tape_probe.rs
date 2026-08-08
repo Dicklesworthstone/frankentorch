@@ -233,6 +233,72 @@ fn main() {
          below the noise of these medians is NOT attributable; treat only the large terms.\n"
     );
 
+    // ── frankentorch-27aci: does the backward STAGE scale with numel? ───────
+    // uufyp put ~11 ms in the engine between "backward called" and "kernel returns",
+    // against a 0.32 ms kernel. That is either DATA MOVEMENT (extra full-size passes)
+    // or FIXED per-backward machinery, and the two want completely different levers.
+    // Sweeping numel separates them in one run: linear => movement, flat => fixed.
+    //
+    // Each size reports the backward stage as (cumulative-through-backward minus
+    // cumulative-through-sum), the same differencing the decomposition above uses,
+    // plus the raw kernel at that size so the ratio is visible.
+    println!("BACKWARD-STAGE NUMEL SWEEP (frankentorch-27aci)");
+    println!(
+        "{:>6}{:>9}{:>11}{:>11}{:>10}{:>9}",
+        "N", "MiB", "bwd_stage", "raw_bwd", "ratio", "ms/MiB"
+    );
+    for &n in &[1usize, 2, 4, 8, 16] {
+        let h = A_H;
+        let w = A_W;
+        let oh = h / 2;
+        let ow = w / 2;
+        let numel = n * A_C * h * w;
+        let mib = (numel * 8) as f64 / (1024.0 * 1024.0);
+        let inp = seq(numel);
+        let shape = vec![n, A_C, h, w];
+        let dout = vec![1.0f64; n * A_C * oh * ow];
+
+        let through_sum = time_it(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(inp.clone(), shape.clone(), true)
+                .expect("leaf");
+            let out = session
+                .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                .expect("avg_pool2d");
+            let loss = session.tensor_sum(out).expect("sum");
+            std::hint::black_box((&session, loss));
+        });
+        let through_bwd = time_it(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(inp.clone(), shape.clone(), true)
+                .expect("leaf");
+            let out = session
+                .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                .expect("avg_pool2d");
+            let loss = session.tensor_sum(out).expect("sum");
+            let rep = session.tensor_backward(loss).expect("backward");
+            std::hint::black_box((&session, &rep));
+        });
+        let raw = time_it(|| {
+            std::hint::black_box(ft_kernel_cpu::avg_pool2d_backward_f64(
+                &dout, n, A_C, h, w, 2, 2, oh, ow, 2, 2, 0, 0, h, w, true,
+            ));
+        });
+        let stage = through_bwd - through_sum;
+        println!(
+            "{n:>6}{mib:>9.0}{stage:>11.3}{raw:>11.3}{:>10.1}x{:>9.3}",
+            stage / raw.max(f64::MIN_POSITIVE),
+            stage / mib
+        );
+    }
+    println!(
+        "  ms/MiB roughly CONSTANT => the stage is DATA MOVEMENT and the count of full-size\n\
+         passes is the thing to hunt. ms/MiB falling as size grows => a FIXED per-backward\n\
+         cost dominating at small sizes. Neither => look again before choosing a lever.\n"
+    );
+
     // ── the parallel gate ───────────────────────────────────────────────────
     // POOL_FWD_PARALLEL_MIN is 1<<21 = 2_097_152 "input reads", and the gate is
     // `out.len() * kd*kh*kw`. The lane above computes 131072*8 = 1_048_576 —
