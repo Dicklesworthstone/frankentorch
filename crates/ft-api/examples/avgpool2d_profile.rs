@@ -104,6 +104,26 @@ fn main() {
         std::hint::black_box((&out, &dp));
     }
 
+    // --- no-grad session forward: the SAME kernel through the session, but the
+    // tape is skipped entirely (functional_avg_pool2d takes its no-grad fast
+    // path). session_nograd - raw_fwd is therefore the cost of the session
+    // wrapper alone, and fwd_call - session_nograd is what the autograd GRAPH
+    // adds on top. Without this split "tape overhead" is one undifferentiated
+    // number and a lever cannot be aimed.
+    let mut nograd = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(input.clone(), vec![N, C, H, W], false)
+            .expect("leaf");
+        let started = Instant::now();
+        let out = session
+            .functional_avg_pool2d(x, (KH, KW), (SH, SW), (0, 0), false, true)
+            .expect("avg_pool2d");
+        nograd.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(out);
+    }
+
     // --- full session forward+backward, exactly as the H2H harness times it -
     //
     // Also split into its four steps. Callgrind is useless for naming the frame
@@ -150,6 +170,7 @@ fn main() {
     report("raw fwd", &mut fwd);
     report("raw bwd", &mut bwd);
     report("raw fwd+bwd", &mut raw_both);
+    report("nograd fwd", &mut nograd);
     report("session", &mut session_ms);
     println!("\n  session broken down:");
     report("  fwd call", &mut t_fwd);
@@ -157,15 +178,37 @@ fn main() {
     report("  backward", &mut t_bwd);
     report("  grad fetch", &mut t_grad);
 
+    // frankentorch-574cu: the gradient checksum is TEARDOWN, not op work — the
+    // PyTorch arm never times its equivalent. Op work is forward + loss_sum +
+    // backward, so the overhead accounting below excludes the fetch. Counting it
+    // was what inflated this lane's published ratio in the first place.
     let raw_floor = raw_both[0];
-    let session_min = session_ms[0];
+    let op_work = t_fwd[0] + t_sum[0] + t_bwd[0];
+    println!("\n  op work (fwd+sum+backward, checksum EXCLUDED) = {op_work:.3} ms");
     println!(
-        "\n  tape/apply_function overhead = session - raw = {:.3} ms ({:.0}% of session)",
-        session_min - raw_floor,
-        (session_min - raw_floor) / session_min * 100.0
+        "  raw kernels           = {:.3} ms ({:.0}% of op work)",
+        raw_floor,
+        raw_floor / op_work * 100.0
     );
     println!(
-        "  raw kernels = {:.0}% of session",
-        raw_floor / session_min * 100.0
+        "  session+tape overhead = {:.3} ms ({:.0}% of op work)",
+        op_work - raw_floor,
+        (op_work - raw_floor) / op_work * 100.0
+    );
+    println!(
+        "    of which session wrapper (nograd fwd - raw fwd) = {:.3} ms",
+        nograd[0] - fwd[0]
+    );
+    println!(
+        "    of which autograd graph, forward side (fwd call - nograd fwd) = {:.3} ms",
+        t_fwd[0] - nograd[0]
+    );
+    println!(
+        "    of which backward side (backward - raw bwd) = {:.3} ms",
+        t_bwd[0] - bwd[0]
+    );
+    println!(
+        "\n  grad fetch (teardown, NOT op work) = {:.3} ms — excluded above",
+        t_grad[0]
     );
 }

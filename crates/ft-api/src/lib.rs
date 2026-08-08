@@ -33377,10 +33377,24 @@ impl FrankenTorchSession {
                 (kernel_h, kernel_w, output_h, output_w, stride_h, stride_w);
             let (pdh, pdw, ih_, iw_) = (padding_h, padding_w, input_h, input_w);
             if !self.tensor_tape.tensor_requires_grad(input)? {
-                let pv = self.tensor_values(padded)?;
-                let out = ft_kernel_cpu::avg_pool2d_forward_f64(
-                    &pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
-                );
+                // frankentorch-k1h8g: read the input BORROWED. `tensor_values`
+                // returns an owned Vec, so this "fast path" was copying the whole
+                // input before pooling it — and the grad path right below does
+                // NOT, because apply_function hands its closure borrowed slices.
+                // Measured on [8,64,64,64] f64: the no-grad forward was 8.081 ms
+                // against the grad path's 1.659 ms for the same kernel, i.e. the
+                // inference path was ~5x SLOWER than the training path.
+                //
+                // The borrow is scoped so it ends before `tensor_variable` needs
+                // `&mut self`; taking a `to_vec()` to dodge that borrow is what
+                // created the copy in the first place.
+                let out = {
+                    let pv = self.tensor_tape.values_borrowed(padded)?;
+                    ft_kernel_cpu::avg_pool2d_forward_f64(
+                        pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_,
+                        cip,
+                    )
+                };
                 return self.tensor_variable(out, out_shape, false);
             }
             return self.tensor_apply_function_with_create_graph(
