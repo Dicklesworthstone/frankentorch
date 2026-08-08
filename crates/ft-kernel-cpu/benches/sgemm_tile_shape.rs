@@ -45,7 +45,10 @@ fn grid_orig(t: usize) -> (usize, usize) {
 }
 fn grid_balanced(t: usize) -> (usize, usize) {
     let lim = (t as f64).sqrt().floor().max(1.0) as usize;
-    let p = (1..=lim).filter(|c| t % c == 0).max().unwrap_or(1);
+    let p = (1..=lim)
+        .filter(|c| t.is_multiple_of(*c))
+        .max()
+        .unwrap_or(1);
     (p, t / p)
 }
 fn tiles(m: usize, n: usize, (p, q): (usize, usize)) -> usize {
@@ -135,7 +138,7 @@ fn alternating(t: usize, label: &str) {
         let mut cb = vec![0.0f32; m * n];
         let (mut vo, mut vb, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
         for r in 0..(reps + warm) {
-            let mut run = |bal: bool, c: &mut Vec<f32>| {
+            let run = |bal: bool, c: &mut Vec<f32>| {
                 let t0 = Instant::now();
                 pool.install(|| ft_mm(bal, &a, &b, c, m, k, n));
                 black_box(&c[0]);

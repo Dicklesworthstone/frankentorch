@@ -56,6 +56,12 @@ fn consume(v: &[f32]) -> f32 {
     black_box(a)
 }
 
+// frankentorch-nx7fu: the arguments are the SDPA problem shape (nbh, sq, sk, d),
+// its three input buffers, the tile parameter under test and the scale. Bundling
+// them into a struct would add a type whose only purpose is to satisfy a lint,
+// and would obscure that `br` is the single independent variable this bench
+// sweeps. The library does the same thing at 99 sites in ft-kernel-cpu.
+#[allow(clippy::too_many_arguments)]
 fn run(
     br: usize,
     q: &[f32],

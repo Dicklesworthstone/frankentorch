@@ -94,6 +94,12 @@ fn tile_count(m: usize, n: usize, mb: usize, nb: usize) -> usize {
 }
 
 /// f32 mirror of `gemm::sgemm_2d_parallel` with an explicit (mb, nb)
+///
+/// frankentorch-nx7fu: the arguments are the three GEMM buffers, the problem
+/// shape (m, k, n) and the tile shape (mb, nb) under test. Bundling them would
+/// add a type that exists only to satisfy a lint and would hide that (mb, nb) is
+/// what this A/B sweeps.
+#[allow(clippy::too_many_arguments)]
 fn tiled(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, mb: usize, nb: usize) {
     let cp = TilePtr(c.as_mut_ptr());
     let mut tiles: Vec<(usize, usize)> = Vec::new();
@@ -149,7 +155,7 @@ fn fill(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn stat(v: &mut Vec<f64>) -> (f64, f64) {
+fn stat(v: &mut [f64]) -> (f64, f64) {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let min = v[0];
     let mean = v.iter().sum::<f64>() / v.len() as f64;
@@ -261,10 +267,10 @@ fn main() {
         };
 
         // warmup
-        for arm in 0..n_arms {
-            let mut tmp = std::mem::take(&mut bufs[arm]);
+        for (arm, buf) in bufs.iter_mut().enumerate().take(n_arms) {
+            let mut tmp = std::mem::take(buf);
             run(arm, &mut tmp);
-            bufs[arm] = tmp;
+            *buf = tmp;
         }
 
         let mut samples: Vec<Vec<f64>> = vec![Vec::new(); n_arms];
