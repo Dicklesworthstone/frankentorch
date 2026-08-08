@@ -64,6 +64,15 @@ fn seq(n: usize) -> Vec<f64> {
     (0..n).map(|i| ((i % 251) as f64) * 0.001 - 0.12).collect()
 }
 
+/// Median of an ALREADY-SORTED sample vector.
+///
+/// Every caller runs after that vector's `report()`, which sorts in place. Kept
+/// separate from `report` so the derived subtractions below read as medians at
+/// the call site rather than as an opaque `[len/2]`.
+fn med(sorted: &[f64]) -> f64 {
+    sorted[sorted.len() / 2]
+}
+
 fn report(label: &str, samples: &mut [f64]) {
     samples.sort_by(f64::total_cmp);
     println!(
@@ -388,12 +397,12 @@ fn main() {
     report("bn1sum raw", &mut bn1_raw);
     report("bn1sum nograd", &mut bn1_nograd);
     println!(
-        "  BN1sum wrapper (nograd - raw) = {:.3} ms",
-        bn1_nograd[0] - bn1_raw[0]
+        "  BN1sum wrapper (nograd - raw) = {:.3} ms (median)",
+        med(&bn1_nograd) - med(&bn1_raw)
     );
     println!(
-        "  BN wrapper (bn nograd - bn raw) = {:.3} ms\n",
-        bn_nograd[0] - bn_raw[0]
+        "  BN wrapper (bn nograd - bn raw) = {:.3} ms (median)\n",
+        med(&bn_nograd) - med(&bn_raw)
     );
     report("session", &mut session_ms);
     println!("\n  session broken down:");
@@ -406,9 +415,17 @@ fn main() {
     // PyTorch arm never times its equivalent. Op work is forward + loss_sum +
     // backward, so the overhead accounting below excludes the fetch. Counting it
     // was what inflated this lane's published ratio in the first place.
-    let raw_floor = raw_both[0];
-    let op_work = t_fwd[0] + t_sum[0] + t_bwd[0];
-    println!("\n  op work (fwd+sum+backward, checksum EXCLUDED) = {op_work:.3} ms");
+    //
+    // MEDIAN, not min, for every derived term below. These are
+    // session-minus-kernel decompositions, whose two arms differ in allocation
+    // behaviour, and min systematically selects the iteration where the allocator
+    // recycled a warm block — see the module header. The per-phase rows above
+    // still print both statistics; it is only the SUBTRACTIONS that must not use
+    // min, and this harness previously did exactly that while its own header
+    // warned against it.
+    let raw_floor = med(&raw_both);
+    let op_work = med(&t_fwd) + med(&t_sum) + med(&t_bwd);
+    println!("\n  op work (fwd+sum+backward, checksum EXCLUDED) = {op_work:.3} ms (medians)");
     println!(
         "  raw kernels           = {:.3} ms ({:.0}% of op work)",
         raw_floor,
@@ -421,18 +438,18 @@ fn main() {
     );
     println!(
         "    of which session wrapper (nograd fwd - raw fwd) = {:.3} ms",
-        nograd[0] - fwd[0]
+        med(&nograd) - med(&fwd)
     );
     println!(
         "    of which autograd graph, forward side (fwd call - nograd fwd) = {:.3} ms",
-        t_fwd[0] - nograd[0]
+        med(&t_fwd) - med(&nograd)
     );
     println!(
         "    of which backward side (backward - raw bwd) = {:.3} ms",
-        t_bwd[0] - bwd[0]
+        med(&t_bwd) - med(&bwd)
     );
     println!(
-        "\n  grad fetch (teardown, NOT op work) = {:.3} ms — excluded above",
-        t_grad[0]
+        "\n  grad fetch (teardown, NOT op work) = {:.3} ms (median) — excluded above",
+        med(&t_grad)
     );
 }
