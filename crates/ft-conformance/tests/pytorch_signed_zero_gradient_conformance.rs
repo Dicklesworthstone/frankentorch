@@ -138,13 +138,17 @@ print(json.dumps({"ok": True}, sort_keys=True))
 
 fn query_torch_gradients(cases: &[GradCase]) -> Option<Value> {
     // frankentorch-imtpq: a plain `if !torch_available() { return None }` reports `1 passed` when
-    // the oracle is missing. This panics instead when FT_LEGACY_ORACLE_PYTHON was explicitly set,
+    // the oracle is missing. This FAILS instead when FT_LEGACY_ORACLE_PYTHON was explicitly set,
     // so asking for the oracle and not getting it can no longer certify a comparison that never
-    // happened; an unset variable still skips honestly on a torch-less machine.
+    // happened; an unset variable still skips honestly on a torch-less machine. The helper returns
+    // a Result and the failure happens here at `.expect` — frankentorch-gfhyp, production code in
+    // this repo may not use the `panic!` macro.
     if !oracle_required_or_skip(
         "pytorch_signed_zero_gradient_conformance",
         torch_available(),
-    ) {
+    )
+    .expect("torch oracle requested but unavailable")
+    {
         return None;
     }
 

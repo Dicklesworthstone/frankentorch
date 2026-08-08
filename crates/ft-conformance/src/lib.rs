@@ -10244,28 +10244,35 @@ pub fn oracle_skip_verdict(available: bool) -> OracleSkip {
     )
 }
 
-/// Returns `true` when the caller should proceed with the oracle comparison, `false` for an honest
-/// skip, and PANICS when an oracle was explicitly requested but is unusable.
+/// `Ok(true)` to proceed with the oracle comparison, `Ok(false)` for an honest skip, and `Err`
+/// when an oracle was explicitly requested but is unusable.
 ///
-/// Panicking is the point: a test that cannot reach the oracle it was told to use must not report
-/// success. Callers that genuinely want the old always-skip behaviour simply do not set
-/// `FT_LEGACY_ORACLE_PYTHON`.
-#[must_use]
-pub fn oracle_required_or_skip(test_name: &str, available: bool) -> bool {
+/// # Errors
+///
+/// Returns the operator-facing explanation when `FT_LEGACY_ORACLE_PYTHON` is set and the oracle
+/// did not answer. Callers are tests, and every one of them turns this into a failure with
+/// `.expect(..)`; a test that cannot reach the oracle it was told to use must not report success.
+///
+/// frankentorch-gfhyp: this used to `panic!` here directly, which read well but put an explicit
+/// panic in PRODUCTION source and broke the repo's forbidden-macro guard
+/// (`production_code_contains_no_forbidden_stub_or_panic_macros`). Returning the message and
+/// letting the test decide is both the repo's rule and the better factoring — the decision stays
+/// pure and testable, and the process-ending behaviour lives with the caller that wants it.
+pub fn oracle_required_or_skip(test_name: &str, available: bool) -> Result<bool, String> {
     match oracle_skip_verdict(available) {
-        OracleSkip::OracleUsable => true,
+        OracleSkip::OracleUsable => Ok(true),
         OracleSkip::HonestSkip => {
             eprintln!("{test_name}: torch unavailable and none requested, skipping");
-            false
+            Ok(false)
         }
-        OracleSkip::RequestedButUnusable => panic!(
+        OracleSkip::RequestedButUnusable => Err(format!(
             "{test_name}: FT_LEGACY_ORACLE_PYTHON is set but the torch oracle did not answer. \
              Refusing to pass silently — a skipped oracle test reports `1 passed` and would \
              certify a comparison that never happened (frankentorch-imtpq). Common cause: running \
              under `rch exec`, which executes on a worker where the local oracle venv does not \
              exist (frankentorch-fl87u); build and run oracle tests LOCALLY. Unset the variable \
              if you intend to skip."
-        ),
+        )),
     }
 }
 
@@ -27144,7 +27151,9 @@ json.loads(sys.stdin.read())
         if !crate::oracle_required_or_skip(
             "torch_shape_ops_preserve_float32_dtype_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27470,7 +27479,9 @@ print(json.dumps({
         if !crate::oracle_required_or_skip(
             "torch_max_pool2d_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27598,7 +27609,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_conv_transpose1d_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27700,7 +27713,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_conv_transpose3d_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27823,7 +27838,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_layernorm_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27914,7 +27931,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_conv1d_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28005,7 +28024,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_conv3d_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28104,7 +28125,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_conv2d_f32_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28239,7 +28262,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_conv_transpose2d_output_shape_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28379,7 +28404,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_clamp_tensor_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28523,7 +28550,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_special_i1_i1e_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28666,7 +28695,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_special_i0_i0e_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28816,7 +28847,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_logaddexp2_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28952,6 +28985,7 @@ print(json.dumps({"results": results}, sort_keys=True))
             .map(|status| status.success())
             .unwrap_or(false);
         if !crate::oracle_required_or_skip("torch_windows_subprocess_conformance", torch_available)
+            .expect("torch oracle requested but unavailable")
         {
             return;
         }
@@ -29062,7 +29096,9 @@ print(json.dumps({
         if !crate::oracle_required_or_skip(
             "torch_special_ndtri_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29185,7 +29221,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_nan_to_num_f32_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29328,7 +29366,9 @@ print(json.dumps({"forward": forward, "grad": grad}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_special_log_ndtr_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29465,7 +29505,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_special_ndtr_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29589,7 +29631,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_threshold_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29743,7 +29787,9 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !crate::oracle_required_or_skip("torch_angle_subprocess_conformance", torch_available) {
+        if !crate::oracle_required_or_skip("torch_angle_subprocess_conformance", torch_available)
+            .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29890,7 +29936,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_fmax_fmin_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30065,7 +30113,9 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !crate::oracle_required_or_skip("torch_frac_subprocess_conformance", torch_available) {
+        if !crate::oracle_required_or_skip("torch_frac_subprocess_conformance", torch_available)
+            .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30252,7 +30302,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_round_decimals_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30420,7 +30472,9 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !crate::oracle_required_or_skip("torch_exp10_subprocess_conformance", torch_available) {
+        if !crate::oracle_required_or_skip("torch_exp10_subprocess_conformance", torch_available)
+            .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30584,7 +30638,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_nextafter_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30750,7 +30806,9 @@ print(json.dumps({"results": results}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_floor_divide_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30882,7 +30940,9 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !crate::oracle_required_or_skip("torch_diag_subprocess_conformance", torch_available) {
+        if !crate::oracle_required_or_skip("torch_diag_subprocess_conformance", torch_available)
+            .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -31036,7 +31096,9 @@ print(json.dumps({"results": out}, sort_keys=True))
         if !crate::oracle_required_or_skip(
             "torch_ieee754_unary_edge_cases_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         // Torch internally falls back to numpy for some tensor
@@ -31407,7 +31469,9 @@ print(json.dumps({
         if !crate::oracle_required_or_skip(
             "torch_float_power_subprocess_conformance",
             torch_available,
-        ) {
+        )
+        .expect("torch oracle requested but unavailable")
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);

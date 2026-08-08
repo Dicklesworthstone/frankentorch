@@ -82,8 +82,11 @@ print(json.dumps({"ok": True}, sort_keys=True))
 fn query_torch_ldexp(cases: &[LdexpCase]) -> Option<Value> {
     // frankentorch-imtpq: the bare early return reported `1 passed` when the oracle was missing.
     // Now an oracle that was explicitly requested (FT_LEGACY_ORACLE_PYTHON set) and did not answer
-    // fails instead of certifying a comparison that never ran; unset still skips honestly.
-    if !oracle_required_or_skip("pytorch_ldexp_subprocess_conformance", torch_available()) {
+    // fails instead of certifying a comparison that never ran; unset still skips honestly. The
+    // failure happens here at `.expect` rather than inside the helper — frankentorch-gfhyp.
+    if !oracle_required_or_skip("pytorch_ldexp_subprocess_conformance", torch_available())
+        .expect("torch oracle requested but unavailable")
+    {
         return None;
     }
 
