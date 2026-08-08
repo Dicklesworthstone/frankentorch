@@ -277,6 +277,64 @@ pub fn timed_region_disagreement(ours: &[&str], incumbent: &[&str]) -> Option<St
     ))
 }
 
+/// Env var that re-enables the legacy block-arm ordering (`frankentorch-6atx2`).
+///
+/// # Why a bespoke name rather than the repo's generic `FT_ORIG`
+///
+/// `FT_ORIG` is this repo's usual "run the pre-change path" A/B gate, and using
+/// it here would be consistent. It is also a footgun *here specifically*: this
+/// harness is the one that publishes campaign vs-PyTorch ratios, and `FT_ORIG`
+/// left exported in a shell for some other example's A/B would silently
+/// downgrade it to the arm ordering this bead exists to remove — producing
+/// numbers that look normal and are biased. The name is therefore unmistakable
+/// and names this harness.
+pub const LEGACY_BLOCK_ARMS_ENV: &str = "FT_H2H_LEGACY_BLOCK_ARMS";
+
+/// How the two arms are ordered against each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmOrdering {
+    /// Each round takes an incumbent sample immediately beside ours for the same
+    /// lane. The default, and the only ordering whose ratios are quotable.
+    Interleaved,
+    /// The whole incumbent arm runs to completion before our first lane — the
+    /// pre-`6atx2` behaviour, kept ONLY so the two orderings can be measured
+    /// against each other in one window on identical code.
+    LegacyBlock,
+}
+
+impl ArmOrdering {
+    /// Label for the harness's provenance block.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Interleaved => "INTERLEAVED per round (default)",
+            Self::LegacyBlock => "LEGACY BLOCK — whole incumbent arm first (NOT quotable)",
+        }
+    }
+
+    /// Whether ratios from this ordering may be quoted.
+    #[must_use]
+    pub fn is_quotable(self) -> bool {
+        matches!(self, Self::Interleaved)
+    }
+}
+
+/// Decide the arm ordering from [`LEGACY_BLOCK_ARMS_ENV`]'s value.
+///
+/// Interleaved is the default and every ambiguous input resolves to it: the
+/// legacy ordering is a deliberate opt-in, so an unset, empty, negative or
+/// unrecognised value must never silently select the biased mode. A typo'd
+/// `FT_H2H_LEGACY_BLOCK_ARMS=ture` gets the correct ordering, not the broken one.
+#[must_use]
+pub fn arm_ordering_from_env(value: Option<&str>) -> ArmOrdering {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("1") => ArmOrdering::LegacyBlock,
+        Some(v) if v.eq_ignore_ascii_case("true") => ArmOrdering::LegacyBlock,
+        Some(v) if v.eq_ignore_ascii_case("yes") => ArmOrdering::LegacyBlock,
+        _ => ArmOrdering::Interleaved,
+    }
+}
+
 /// Arguments for launching the incumbent co-process with `script`.
 ///
 /// # Why this exists rather than a literal in the harness
@@ -708,6 +766,80 @@ mod tests {
         let declared = format!("{TIMED_STEPS_MARKER}{}", TIMED_STEPS.join(","));
         let parsed = parse_timed_steps(&declared).expect("our own declaration must parse");
         assert!(timed_region_disagreement(TIMED_STEPS, &parsed).is_none());
+    }
+
+    /// **THE DEFAULT MUST BE INTERLEAVED.** An unset variable is the case that
+    /// covers every ordinary run of this harness, including CI and anyone who
+    /// just types the command from the module header.
+    #[test]
+    fn the_default_ordering_is_interleaved() {
+        assert_eq!(arm_ordering_from_env(None), ArmOrdering::Interleaved);
+        assert!(arm_ordering_from_env(None).is_quotable());
+    }
+
+    /// The legacy ordering requires an EXPLICIT affirmative. Everything else —
+    /// empty, negative, or unrecognised — resolves to interleaved, because the
+    /// biased mode must never be reachable by accident.
+    #[test]
+    fn only_an_explicit_affirmative_selects_the_legacy_ordering() {
+        for on in ["1", "true", "TRUE", "True", "yes", "YES", " 1 ", "  true  "] {
+            assert_eq!(
+                arm_ordering_from_env(Some(on)),
+                ArmOrdering::LegacyBlock,
+                "{on:?} should opt in"
+            );
+        }
+        for off in [
+            "",
+            "  ",
+            "0",
+            "false",
+            "no",
+            "off",
+            "ture",
+            "2",
+            "interleaved",
+            "-1",
+        ] {
+            assert_eq!(
+                arm_ordering_from_env(Some(off)),
+                ArmOrdering::Interleaved,
+                "{off:?} must NOT select the biased ordering"
+            );
+        }
+    }
+
+    /// NEGATIVE CASE: a typo must not silently buy the biased ordering. This is
+    /// the whole reason the match is an allowlist rather than "anything truthy".
+    #[test]
+    fn a_typo_does_not_select_the_legacy_ordering() {
+        assert_eq!(
+            arm_ordering_from_env(Some("ture")),
+            ArmOrdering::Interleaved
+        );
+        assert_eq!(
+            arm_ordering_from_env(Some("yess")),
+            ArmOrdering::Interleaved
+        );
+        assert_eq!(arm_ordering_from_env(Some("1 1")), ArmOrdering::Interleaved);
+    }
+
+    /// Only the interleaved ordering may be quoted, and the legacy label has to
+    /// say so where a reader will see it.
+    #[test]
+    fn the_legacy_ordering_is_labelled_unquotable() {
+        assert!(!ArmOrdering::LegacyBlock.is_quotable());
+        assert!(ArmOrdering::LegacyBlock.label().contains("NOT quotable"));
+        assert!(ArmOrdering::Interleaved.label().contains("INTERLEAVED"));
+    }
+
+    /// The gate must not collide with the repo's generic `FT_ORIG` A/B variable,
+    /// or an unrelated example's A/B session silently downgrades the harness that
+    /// publishes campaign ratios.
+    #[test]
+    fn the_gate_does_not_reuse_the_generic_ab_variable() {
+        assert_ne!(LEGACY_BLOCK_ARMS_ENV, "FT_ORIG");
+        assert!(LEGACY_BLOCK_ARMS_ENV.contains("LEGACY"));
     }
 
     /// NEGATIVE CASE: the deadlock that actually happened. Launching the child as

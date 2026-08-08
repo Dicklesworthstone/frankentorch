@@ -48,9 +48,9 @@ use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
-    MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS, TIMED_STEPS_MARKER,
-    adjudicate_null, incumbent_sample_rounds, parse_sample_line, parse_timed_steps, sample_request,
-    timed_region_disagreement,
+    ArmOrdering, LEGACY_BLOCK_ARMS_ENV, MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS,
+    TIMED_STEPS_MARKER, adjudicate_null, arm_ordering_from_env, incumbent_sample_rounds,
+    parse_sample_line, parse_timed_steps, sample_request, timed_region_disagreement,
 };
 use ft_core::ExecutionMode;
 
@@ -234,6 +234,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c3w = seq(C3_CO * C3_CI * C3_K * C3_K * C3_K);
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
 
+    // Interleaved is the default; the legacy block ordering is an explicit opt-in.
+    let legacy_env = std::env::var(LEGACY_BLOCK_ARMS_ENV).ok();
+    let ordering = arm_ordering_from_env(legacy_env.as_deref());
+
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     // Setup only. The request/serve/quit loop is appended from the library so the
     // protocol markers cannot drift away from the parser that reads them.
@@ -350,9 +354,18 @@ LANES = {
         "measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)"
     );
     println!(
-        "sampling=INTERLEAVED per round (frankentorch-6atx2); PyTorch min-of-{PT_SAMPLES} after 4 \
-         warmups, spread evenly across {REPS} rounds, torch threads=8\n"
+        "sampling={} (frankentorch-6atx2); PyTorch min-of-{PT_SAMPLES} after 4 warmups, spread \
+         evenly across {REPS} rounds, torch threads=8",
+        ordering.label()
     );
+    if !ordering.is_quotable() {
+        println!(
+            "WARNING: {LEGACY_BLOCK_ARMS_ENV} is set, so the whole PyTorch arm ran before the first\n\
+             FrankenTorch lane. Any load shift in that gap lands entirely in the ratio. These rows\n\
+             exist to be compared against a default run, NOT to be quoted."
+        );
+    }
+    println!();
     println!("lane          FT(ms)    PT(ms)   standing            A/A gate           parity");
 
     let lanes: Vec<(&str, LaneRun<'_>)> = vec![
@@ -412,8 +425,25 @@ LANES = {
     let mut pt_grads: Vec<Option<f64>> = vec![None; lanes.len()];
     let mut checksums: Vec<f64> = vec![0.0; lanes.len()];
 
+    // frankentorch-6atx2 option (a): under the legacy ordering the ENTIRE
+    // incumbent arm is drained up front, exactly as this harness behaved before
+    // interleaving. Sample counts, estimator and lane order are identical to the
+    // interleaved path — only WHEN the incumbent is sampled differs — so a
+    // BEFORE/AFTER pair of one binary in one window isolates arm ordering and
+    // nothing else. That is the comparison the banked set can no longer support.
+    if ordering == ArmOrdering::LegacyBlock {
+        for (index, (name, _)) in lanes.iter().enumerate() {
+            for _ in 0..PT_SAMPLES {
+                let (ms, grad) = incumbent_sample(&mut stdin, &mut reader, name)?;
+                pt_times[index].push(ms);
+                pt_grads[index] = Some(grad);
+            }
+        }
+    }
+
     for round in 0..REPS {
-        let incumbent_round = schedule.binary_search(&round).is_ok();
+        let incumbent_round =
+            ordering == ArmOrdering::Interleaved && schedule.binary_search(&round).is_ok();
         for (index, (name, run_lane)) in lanes.iter().enumerate() {
             // The incumbent sample sits immediately beside our samples for the
             // SAME lane, so both arms see the same instant of machine state.
