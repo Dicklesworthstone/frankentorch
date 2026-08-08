@@ -295,6 +295,54 @@ fn main() {
          below the noise of these medians is NOT attributable; treat only the large terms.\n"
     );
 
+    // ── frankentorch-87sz8: the raw KERNEL lanes, allocator-conditioned ─────
+    // 87sz8 records FT's max_pool3d kernels at 2.0-3.2x PyTorch's WHOLE op, which is
+    // the opposite of avg_pool2d and makes it a live kernel bead. That comparison
+    // carried a caveat: the raw lanes above are NOT conditioned, and 27aci showed an
+    // unconditioned lane can be ~2x inflated by first-touch on a not-yet-seen size —
+    // and these allocate a fresh output buffer per call. This removes that caveat by
+    // measuring the same kernels with condition_allocator() before every rep, and
+    // prints both so the conditioning delta is visible rather than assumed.
+    {
+        let m_numel = M_N * M_C * M_D * M_H * M_W;
+        let a_out_numel = A_N * A_C * A_OH * A_OW;
+        let m_fwd_c = time_it_conditioned(m_numel, || {
+            std::hint::black_box(ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
+                &m_input, M_N, M_C, M_D, M_H, M_W, 2, 2, 2, M_OD, M_OH, M_OW, 2, 2, 2,
+            ));
+        });
+        let m_bwd_c = time_it_conditioned(m_numel, || {
+            std::hint::black_box(ft_kernel_cpu::max_pool3d_backward_from_indices_f64(
+                &m_dout, &m_args, M_N, M_C, M_D, M_H, M_W, M_OD, M_OH, M_OW,
+            ));
+        });
+        let a_fwd_c = time_it_conditioned(a_out_numel, || {
+            std::hint::black_box(ft_kernel_cpu::avg_pool2d_forward_f64(
+                &a_input, A_N, A_C, A_H, A_W, 2, 2, A_OH, A_OW, 2, 2, 0, 0, A_H, A_W, true,
+            ));
+        });
+        let a_bwd_c = time_it_conditioned(a_numel, || {
+            std::hint::black_box(ft_kernel_cpu::avg_pool2d_backward_f64(
+                &a_dout, A_N, A_C, A_H, A_W, 2, 2, A_OH, A_OW, 2, 2, 0, 0, A_H, A_W, true,
+            ));
+        });
+        println!("CONDITIONED RAW KERNELS (frankentorch-87sz8)");
+        println!(
+            "  max_pool3d  fwd {m_fwd_c:6.3} (uncond {m_raw_fwd:6.3})  bwd {m_bwd_c:6.3} (uncond {m_raw_bwd:6.3})  kernels {:6.3}",
+            m_fwd_c + m_bwd_c
+        );
+        println!(
+            "  avg_pool2d  fwd {a_fwd_c:6.3} (uncond {a_raw_fwd:6.3})  bwd {a_bwd_c:6.3} (uncond {a_raw_bwd:6.3})  kernels {:6.3}",
+            a_fwd_c + a_bwd_c
+        );
+        println!(
+            "  PyTorch WHOLE op, same shapes, from the h2h runs in artifacts/perf/frankentorch-87sz8:\n\
+             max_pool3d 0.906/1.164 ms, avg_pool2d 1.701/2.705 ms. STILL CROSS-HARNESS — the torch\n\
+             figures come from a different invocation, so these ratios remain indicative of DIRECTION\n\
+             and are not a certified same-run comparison.\n"
+        );
+    }
+
     // ── frankentorch-27aci step 3b: is it the create_graph dispatch? ────────
     // The last named candidate. If building the differentiable second-order graph is
     // what the ~5.6 ms buys, backward with create_graph=false must be markedly cheaper
