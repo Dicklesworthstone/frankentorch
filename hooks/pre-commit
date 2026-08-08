@@ -6,6 +6,71 @@
 
 set -e
 
+# --- parsing helpers, shared by the gate and by --self-test ------------------
+# Defined once so the self-test exercises the SAME code the gate runs. A test
+# that reimplements the parser proves only that the test agrees with itself.
+
+# Number on the last `Critical:` line, or empty if ubs printed none.
+ubs_critical_count() {
+    printf '%s\n' "$1" | sed -n 's/^Critical:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1
+}
+
+# "yes" when the scanner reported it looked at zero files.
+ubs_scanned_nothing() {
+    case "$1" in
+        *"Files: 0"*) echo yes ;;
+        *) echo no ;;
+    esac
+}
+
+# --- self-test: `hooks/pre-commit --self-test` -------------------------------
+# frankentorch-imtpq. Runs in well under a second, needs no repo state, no ubs
+# and no network, so it is runnable anywhere.
+if [ "$1" = "--self-test" ]; then
+    st_fail=0
+    st_check() {
+        if [ "$2" = "$3" ]; then
+            echo "ok   $1"
+        else
+            echo "FAIL $1: expected [$2] got [$3]"
+            st_fail=1
+        fi
+    }
+
+    st_check "critical: zero parsed" "0" \
+        "$(ubs_critical_count 'Files: 3
+Critical: 0
+Warning: 2')"
+    st_check "critical: nonzero parsed" "7" \
+        "$(ubs_critical_count 'Files: 3
+Critical: 7
+Warning: 2')"
+    st_check "critical: multi-digit parsed" "12" \
+        "$(ubs_critical_count 'Critical: 12')"
+    # NEGATIVE: no Critical line at all must yield empty, NOT zero — "absent" and
+    # "zero findings" are different claims and the gate must not conflate them.
+    st_check "critical: absent is empty" "" \
+        "$(ubs_critical_count 'Files: 3
+Warning: 2')"
+    # NEGATIVE: a Critical line that is not at line start (e.g. quoted inside a
+    # finding body) must not be picked up as the summary.
+    st_check "critical: indented line ignored" "" \
+        "$(ubs_critical_count '    Critical: 9')"
+
+    st_check "zero-files: detected" "yes" "$(ubs_scanned_nothing 'Files: 0
+Critical: 0')"
+    st_check "zero-files: nonzero not flagged" "no" "$(ubs_scanned_nothing 'Files: 7
+Critical: 0')"
+    # NEGATIVE: the substring must not match a larger count such as "Files: 01"
+    # only by accident — 70 files is a real scan and must not read as zero.
+    st_check "zero-files: 70 is not zero" "no" "$(ubs_scanned_nothing 'Files: 70')"
+
+    if [ "$st_fail" -eq 0 ]; then
+        echo "pre-commit self-test: all checks passed"
+    fi
+    exit "$st_fail"
+fi
+
 # Skip if UBS not installed
 if ! command -v ubs >/dev/null 2>&1; then
     echo "ubs: not found, skipping security scan"
@@ -26,8 +91,22 @@ fi
 run_ubs_staged() {
     timeout_seconds=$1
 
+    # frankentorch-imtpq: NO `--quiet`. That flag is why this gate scanned
+    # nothing — it suppresses the scan itself, not just the output. Isolated in a
+    # one-file throwaway repo, changing ONE variable at a time:
+    #     ubs --staged --only=rust --quiet   -> "1 detected", Files: 0   <- broken
+    #     ubs --staged --only=rust           -> "1 detected", Files: 1   <- scans
+    #     ubs --only=rust <path> --quiet     -> Files: 0                 <- broken
+    #     ubs --only=rust <path>             -> Files: 1                 <- scans
+    # `--staged` is fine; `--quiet` is the bug, on both invocation shapes.
+    #
+    # `--staged` is kept deliberately: it scans the staged BLOB, which is what a
+    # pre-commit gate should judge. Passing explicit paths would scan the working
+    # tree instead, so a file with unstaged edits would be judged in the wrong
+    # form. The cost of dropping `--quiet` is a noisier commit; that is a fair
+    # price for a gate that runs.
     set +e
-    UBS_OUTPUT=$(timeout "$timeout_seconds" ubs --staged --only=rust --quiet 2>&1)
+    UBS_OUTPUT=$(timeout "$timeout_seconds" ubs --staged --only=rust 2>&1)
     code=$?
     set -e
 
@@ -46,8 +125,18 @@ run_ubs_staged() {
         # So check the POSITIVE evidence (a file count) rather than trusting the
         # status alone, exactly as that bead argues: "prefer POSITIVE execution
         # evidence over exit codes where it exists".
-        case "$UBS_OUTPUT" in
-            *"Files: 0"*)
+        # ubs exits 0 even WITH findings unless --fail-on-warning, so the status
+        # is weak evidence on its own. Read the Critical line, which AGENTS.md
+        # classes as always-fix (memory safety, races, injection).
+        critical=$(ubs_critical_count "$UBS_OUTPUT")
+        if [ -n "$critical" ] && [ "$critical" -gt 0 ]; then
+            echo "ubs: $critical CRITICAL finding(s) in staged Rust - failing the commit."
+            echo "ubs: these are the always-fix class; if it is a false positive, UBS_SKIP=1."
+            return 1
+        fi
+
+        case "$(ubs_scanned_nothing "$UBS_OUTPUT")" in
+            yes)
                 echo "ubs: WARNING - exited 0 but reported 'Files: 0' while Rust files were staged."
                 echo "ubs: this commit was NOT scanned. The gate passed on an exit code, not on evidence."
                 echo "ubs: staged:$STAGED_RS"
