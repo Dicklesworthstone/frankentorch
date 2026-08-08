@@ -18580,13 +18580,36 @@ mod tests {
                 .zip(a_vals.iter().zip(b_vals.iter()))
                 .enumerate()
             {
-                // Contract 1: closed-form match.
-                let want = (a / b).floor();
-                prop_assert_eq!(
-                    g.to_bits(), want.to_bits(),
-                    "floor_divide({}, {})[{}] = {} != floor(a/b) = {}",
-                    a, b, i, g, want
-                );
+                // Contract 1: q is the unique integer bracketing a/b.
+                //
+                // frankentorch-oo3pd: this asserted `g == (a/b).floor()` BIT-EXACT, which is not
+                // what torch does and is not what FrankenTorch has done since a70e44df
+                // (frankentorch-bh6bh) — torch uses aten's fmod-based div_floor_floating. When
+                // `a / b` rounds UP to an exact integer the naive floor is one too large:
+                // a = -6.705882352941177, b = 0.058823529411764705 gives torch -115 and naive
+                // -114. So this contract asserted the pre-fix behaviour and would have failed a
+                // correct implementation forever.
+                //
+                // Replaced with the DEFINING property rather than any closed form: q is the
+                // integer with q*b <= a < (q+1)*b (reversed for negative b). That is
+                // implementation-independent, so unlike re-deriving div_floor_floating here it
+                // cannot mirror a bug in the thing under test — the failure mode recorded on
+                // frankentorch-n4bi2, where a self-referential test shared the impl's rounding bug.
+                if g.is_finite() && a.is_finite() && b.is_finite() && b != 0.0 {
+                    let lo = g * b;
+                    let hi = (g + 1.0) * b;
+                    let tol = 8.0 * f64::EPSILON * a.abs().max(lo.abs()).max(hi.abs()).max(1.0);
+                    let brackets = if b > 0.0 {
+                        lo <= a + tol && a < hi + tol
+                    } else {
+                        lo >= a - tol && a > hi - tol
+                    };
+                    prop_assert!(
+                        brackets,
+                        "floor_divide({}, {})[{}] = {} does not bracket a: q*b = {}, (q+1)*b = {}",
+                        a, b, i, g, lo, hi
+                    );
+                }
 
                 // Contract 2: integer-valued (modulo NaN/inf which
                 // are technically not finite ints).
@@ -19262,9 +19285,17 @@ mod tests {
             let shape = s.tensor_shape(c).expect("cov shape");
             let v = s.tensor_values(c).expect("cov vals");
 
-            // Contract 1: shape.
-            prop_assert_eq!(shape, vec![n, n],
-                "cov shape must be (N, N) = ({}, {})", n, n);
+            // Contract 1: shape. torch.cov SQUEEZES the single-variable case to a 0-d scalar
+            // rather than returning (1, 1).
+            //
+            // frankentorch-oo3pd: this asserted (N, N) unconditionally, so n = 1 always failed.
+            // Measured on torch 2.12.0+cpu: torch.cov of a [1, 2] input returns shape [] with the
+            // variance as a scalar (0.5 for [[1.0, 2.0]]). FrankenTorch already returns [] and was
+            // being failed for agreeing with torch.
+            let expected_shape = if n == 1 { Vec::new() } else { vec![n, n] };
+            prop_assert_eq!(shape, expected_shape,
+                "cov shape for N = {} must be {:?} (torch squeezes the single-variable case)",
+                n, if n == 1 { "[]".to_string() } else { format!("[{n}, {n}]") });
             prop_assert_eq!(v.len(), n * n);
 
             // Contract 2: symmetry bit-exact.
@@ -22073,11 +22104,33 @@ mod tests {
             let out = s.tensor_elu(x).expect("elu");
             let got = s.tensor_values(out).expect("got vals");
 
-            // Closed-form bit-exact match.
+            // Closed-form match. Bit-exact on the identity branch, near-exact on the exp branch.
+            //
+            // frankentorch-oo3pd: this demanded BIT-EXACT equality with `exp(x) - 1` on the
+            // negative branch, which was never a valid claim — torch's elu is not that expression
+            // to the last bit either. Measured on torch 2.12.0+cpu, x = -0.5882352941176471:
+            // torch gives -0.44469362699804943 and `exp(x) - 1` gives -0.4446936269980495, one ULP
+            // apart. FrankenTorch matches TORCH exactly, so the contract was failing the correct
+            // implementation for agreeing with the reference instead of with the algebra.
+            //
+            // The x > 0 branch stays BIT-EXACT: elu is the identity there, and there is no
+            // rounding to excuse. Only the transcendental branch is given ULP room, and 4 ULP is
+            // tight enough that a genuine formula error (wrong branch, missing -1, wrong alpha)
+            // still fails loudly. Bit-exactness against TORCH belongs in an oracle test, not in a
+            // metamorphic property that has no torch to compare against.
             for (i, (&g, &xi)) in got.iter().zip(input.iter()).enumerate() {
                 let expected = if xi > 0.0 { xi } else { xi.exp() - 1.0 };
-                prop_assert_eq!(
-                    g.to_bits(), expected.to_bits(),
+                if xi > 0.0 {
+                    prop_assert_eq!(
+                        g.to_bits(), expected.to_bits(),
+                        "elu[{}] = {} != x = {} on the identity branch (bit-exact required)",
+                        i, g, xi
+                    );
+                    continue;
+                }
+                let ulp_tol = 4.0 * f64::EPSILON * expected.abs().max(1.0);
+                prop_assert!(
+                    (g - expected).abs() <= ulp_tol,
                     "elu[{}] = {} (bits 0x{:x}) != closed-form {} (bits 0x{:x}) for x = {}",
                     i, g, g.to_bits(), expected, expected.to_bits(), xi
                 );
@@ -23414,9 +23467,15 @@ mod tests {
 
             for (i, (&original, &got)) in input.iter().zip(v.iter()).enumerate() {
                 if original.is_nan() {
-                    prop_assert!(
-                        got.is_nan(),
-                        "sign(NaN)[{}] = {}, expected NaN",
+                    // frankentorch-oo3pd: this asserted sign(NaN) == NaN, which is the behaviour
+                    // FrankenTorch deliberately STOPPED doing in 6a6e7dd1 (frankentorch-z6bl1).
+                    // torch.sign is (0 < x) - (x < 0), and both comparisons are false for NaN, so
+                    // torch returns 0. Measured on torch 2.12.0+cpu: torch.sign(nan) == 0.0.
+                    // The contract asserted the pre-fix behaviour and would have failed a correct
+                    // implementation forever.
+                    prop_assert_eq!(
+                        got.to_bits(), 0.0_f64.to_bits(),
+                        "sign(NaN)[{}] = {}, expected +0.0 (torch.sign = (0<x)-(x<0), both false for NaN)",
                         i, got
                     );
                     continue;
