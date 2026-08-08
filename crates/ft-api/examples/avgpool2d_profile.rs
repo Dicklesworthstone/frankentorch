@@ -184,6 +184,13 @@ fn main() {
     let bn_w: Vec<f64> = (0..bn_c).map(|j| 1.0 + (j as f64) * 0.01).collect();
     let bn_b: Vec<f64> = (0..bn_c).map(|j| (j as f64) * 0.02 - 0.3).collect();
 
+    // Two raw controls, because the allocator makes them differ. `bn raw (warm)`
+    // drops its 16 MiB output each iteration, so the allocator hands the same
+    // block back and the pages are already faulted in. `bn raw (cold)` KEEPS every
+    // output alive, forcing a fresh mapping per call — which is the allocation
+    // pattern the session path actually has, since it holds the input and output
+    // live at once. Comparing the session against the warm control alone
+    // overstates the wrapper by exactly this difference.
     let mut bn_raw = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let started = Instant::now();
@@ -203,6 +210,27 @@ fn main() {
         std::hint::black_box(&out);
     }
 
+    let mut bn_raw_cold = Vec::with_capacity(REPS);
+    let mut kept: Vec<Vec<f64>> = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let started = Instant::now();
+        let (mean, var) = ft_kernel_cpu::batch_norm_stats_f64(&input, N, bn_c, bn_spatial);
+        let out = ft_kernel_cpu::batch_norm_apply_f64(
+            &input,
+            &mean,
+            &var,
+            Some(&bn_w),
+            Some(&bn_b),
+            N,
+            bn_c,
+            bn_spatial,
+            1e-5,
+        );
+        bn_raw_cold.push(started.elapsed().as_secs_f64() * 1e3);
+        kept.push(out);
+    }
+    std::hint::black_box(&kept);
+
     let mut bn_nograd = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -221,6 +249,25 @@ fn main() {
             .expect("batch_norm2d");
         bn_nograd.push(started.elapsed().as_secs_f64() * 1e3);
         std::hint::black_box(out);
+    }
+
+    // --- what IS the BatchNorm2d residual wrapper? --------------------------
+    // The borrow removed the input copy but left ~6.4 ms of wrapper on a 2.2 ms
+    // kernel. Leading hypothesis: the OUTPUT node. batch_norm_apply_f64 already
+    // allocates and fills a 16 MiB Vec (that cost is inside `bn raw`); handing it
+    // to `tensor_variable` may pay a SECOND 16 MiB write into tape storage. Timed
+    // alone here, on a freshly-built Vec each iteration so the allocation is not
+    // recycled — which is what makes it a cold-page cost rather than a memcpy.
+    let mut mk_var = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let fresh = seq(N * C * H * W);
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let started = Instant::now();
+        let t = session
+            .tensor_variable(fresh, vec![N, C, H, W], false)
+            .expect("materialise");
+        mk_var.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(t);
     }
 
     // --- no-grad batch_norm1d_sum: same 16 MiB buffer viewed as [N, C, L] ----
@@ -317,7 +364,9 @@ fn main() {
     report("nograd fwd f32", &mut nograd_f32);
     report("nograd sum", &mut nograd_sum);
     report("bn raw", &mut bn_raw);
+    report("bn raw cold", &mut bn_raw_cold);
     report("bn nograd", &mut bn_nograd);
+    report("tensor_variable", &mut mk_var);
     report("bn1sum raw", &mut bn1_raw);
     report("bn1sum nograd", &mut bn1_nograd);
     println!(
