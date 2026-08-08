@@ -36834,7 +36834,11 @@ mod tests {
         for i in 0..200 {
             xs.push((i as f64 - 100.0) * 0.07);
         }
-        let cases: [(&str, fn(f64) -> f64, fn(f64x4) -> f64x4); 3] = [
+        // Named so the array annotation stays readable (and inside clippy's
+        // type-complexity budget): a case is a label plus the scalar and SIMD
+        // implementations that must agree lane-for-lane.
+        type SimdCase = (&'static str, fn(f64) -> f64, fn(f64x4) -> f64x4);
+        let cases: [SimdCase; 3] = [
             ("hardswish", super::hardswish_value, {
                 fn s(a: f64x4) -> f64x4 {
                     let three = f64x4::splat(3.0);
@@ -36917,7 +36921,9 @@ mod tests {
         for i in 0..200 {
             xs.push((i as f32 - 100.0) * 0.07);
         }
-        let cases: [(&str, fn(f32) -> f32, fn(f32x8) -> f32x8); 3] = [
+        // Same shape as the f64 sweep above, at f32 lane width.
+        type SimdCase = (&'static str, fn(f32) -> f32, fn(f32x8) -> f32x8);
+        let cases: [SimdCase; 3] = [
             ("hardswish", super::hardswish_value_f32, {
                 fn s(a: f32x8) -> f32x8 {
                     let three = f32x8::splat(3.0f32);
