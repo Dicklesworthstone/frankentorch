@@ -7,15 +7,18 @@ phases, measure each, and aim at the largest one.** This is the single most
 transferable finding in this ledger, and it is at the top because every entry
 below inherits it.
 
-It is stated as a rule because it has now been paid for three times in one
-lineage, each time by a target that looked obvious in the code and turned out to
-be the *smaller half*:
+It is stated as a rule because it has now been paid for four times in one
+lineage. The first three were a target that looked obvious in the code and turned
+out to be the *smaller half*. The fourth is different and is the reason point 4
+below exists — the phase was split correctly and the largest one was chosen, and
+the lever still had to be reverted:
 
 | the obvious target | what a phase split actually found | bead |
 |---|---|---|
 | "the `avg_pool1d` pooling kernel is slow" | the pooling forward was **10–14%** of the step | `ujw3g` |
 | "then it's leaf materialisation, 57% of the step" | that phase was **100% the caller's buffer copy and 0% FrankenTorch** — `tensor_variable` costs 5 µs | `ujw3g` |
 | "then it's the `max_pool3d` backward scatter loop" | the scatter is **16%** of the backward; 84% is materialising the dense gradient | `87sz8` |
+| "then it's the dense write — serialise it, 4.24x on the kernel" | **correct phase, wrong framing**: 1.13x SLOWER at the lane, n=31 | `8obhh` |
 
 Each of those was a plausible reading of real code. Each would have produced a
 correct, well-tested, carefully-benchmarked change to something that was not the
@@ -36,7 +39,24 @@ Practical form of the rule:
    optimum. Say which. `zoqws` records ~6.3 GB/s as the floor for *a* dense-write
    pattern, not as an inherent limit — establishing the true achievable number is
    the first step of that bead, before any kernel is touched.
-4. **Attribution beats intuition even when intuition is expert.** The prior in
+
+4. **SPLITTING THE PHASE IS NOT ENOUGH — SPLIT IT IN THE FRAMING YOU INTEND TO
+   SHIP INTO.** This is the fourth payment above and the newest part of the rule.
+   `un3os` split kernel-vs-tape correctly, aimed at the largest phase, and
+   measured its lever at **4.24x with flat controls** — all of steps 1–3 done
+   properly. It was still reverted, because that 4.24x was measured on the phase
+   *in isolation*, and in a real session the autograd tape holds a working set the
+   isolated probe does not. At the lane the same change was **1.13x SLOWER**
+   (n=31, CI `[1.042, 1.198]`, 31/31 rounds, clean negative control).
+   The specific trap: the lever gated on **buffer size** as a proxy for cache
+   residency, and residency is a property of the whole live working set, not of
+   one buffer. **A size gate cannot see the tape.** Generally: any lever whose
+   benefit depends on what else is resident must be A/B'd end-to-end — two ELFs
+   against one upstream arm, plus a lane the change cannot touch as a negative
+   control — before it is believed. An isolated phase win with clean controls is
+   necessary and *not* sufficient.
+
+5. **Attribution beats intuition even when intuition is expert.** The prior in
    this repo that "avg/max pool are bandwidth-bound, <2x" was reasonable and
    wrong for 3-D shapes; a gate calibrated on 2-D feature maps stranded
    `max_pool3d` at half its threshold and ran it single-threaded.
