@@ -37371,7 +37371,10 @@ impl FrankenTorchSession {
             && rv_f64
             && (training || (running_mean.is_some() && running_var.is_some()))
         {
-            let x = self.tensor_values(input)?;
+            // frankentorch-we7ry: `weight`/`bias` are per-CHANNEL and stay owned —
+            // copying a few hundred floats is not worth restructuring for. The
+            // input is the whole [N,C,H,W] activation, so it is read BORROWED,
+            // scoped so each borrow ends before the `&mut self` call that follows.
             let wv = match weight {
                 Some(w) => Some(self.tensor_values(w)?),
                 None => None,
@@ -37381,19 +37384,23 @@ impl FrankenTorchSession {
                 None => None,
             };
             if training {
-                let (mean, var) =
-                    ft_kernel_cpu::batch_norm_stats_f64(&x, batch_size, channels, spatial);
-                let out = ft_kernel_cpu::batch_norm_apply_f64(
-                    &x,
-                    &mean,
-                    &var,
-                    wv.as_deref(),
-                    bv.as_deref(),
-                    batch_size,
-                    channels,
-                    spatial,
-                    eps,
-                );
+                let (mean, var, out) = {
+                    let x = self.tensor_tape.values_borrowed(input)?;
+                    let (mean, var) =
+                        ft_kernel_cpu::batch_norm_stats_f64(x, batch_size, channels, spatial);
+                    let out = ft_kernel_cpu::batch_norm_apply_f64(
+                        x,
+                        &mean,
+                        &var,
+                        wv.as_deref(),
+                        bv.as_deref(),
+                        batch_size,
+                        channels,
+                        spatial,
+                        eps,
+                    );
+                    (mean, var, out)
+                };
                 let out_t = self.tensor_variable(out, input_shape.to_vec(), false)?;
                 let updated_mean = match running_mean {
                     Some(rm) => {
@@ -37428,17 +37435,20 @@ impl FrankenTorchSession {
             }
             let rmv = self.tensor_values(running_mean.unwrap())?;
             let rvv = self.tensor_values(running_var.unwrap())?;
-            let out = ft_kernel_cpu::batch_norm_apply_f64(
-                &x,
-                &rmv,
-                &rvv,
-                wv.as_deref(),
-                bv.as_deref(),
-                batch_size,
-                channels,
-                spatial,
-                eps,
-            );
+            let out = {
+                let x = self.tensor_tape.values_borrowed(input)?;
+                ft_kernel_cpu::batch_norm_apply_f64(
+                    x,
+                    &rmv,
+                    &rvv,
+                    wv.as_deref(),
+                    bv.as_deref(),
+                    batch_size,
+                    channels,
+                    spatial,
+                    eps,
+                )
+            };
             let out_t = self.tensor_variable(out, input_shape.to_vec(), false)?;
             return Ok(Some((out_t, None, None)));
         }
@@ -143041,6 +143051,148 @@ mod tests {
         assert_close(&got_x, &want_x, "dx");
         assert_bits(&got_w, &want_w, "dweight");
         assert_bits(&got_b, &want_b, "dbias");
+    }
+
+    /// `frankentorch-we7ry`: the fused no-grad BatchNorm path reads its INPUT
+    /// borrowed rather than cloning the whole `[N,C,H,W]` activation. The borrow
+    /// is what this pins: an independent scalar reference, computed here from the
+    /// same numbers, must reproduce the output and the momentum-updated running
+    /// statistics exactly enough that a wrong slice, a wrong length, or a stale
+    /// node could not survive.
+    ///
+    /// Deliberately not a comparison against another FrankenTorch path — that
+    /// would pass if both read the same wrong tensor.
+    #[test]
+    fn fused_batch_norm2d_no_grad_matches_an_independent_scalar_reference() {
+        let (n, c, h, w) = (2usize, 3usize, 4usize, 4usize);
+        let spatial = h * w;
+        let numel = n * c * spatial;
+        let x: Vec<f64> = (0..numel)
+            .map(|i| ((i * 37 % 101) as f64 - 50.0) * 0.015_625)
+            .collect();
+        let weight: Vec<f64> = (0..c).map(|j| 1.0 + (j as f64) * 0.25).collect();
+        let bias: Vec<f64> = (0..c).map(|j| (j as f64) * 0.5 - 0.5).collect();
+        let run_mean: Vec<f64> = (0..c).map(|j| (j as f64) * 0.1).collect();
+        let run_var: Vec<f64> = (0..c).map(|j| 1.0 + (j as f64) * 0.2).collect();
+        let (momentum, eps) = (0.1_f64, 1e-5_f64);
+
+        // --- independent reference, written from the definition ---------------
+        let mut ref_mean = vec![0.0f64; c];
+        let mut ref_var = vec![0.0f64; c];
+        for (ch, (m, v)) in ref_mean.iter_mut().zip(ref_var.iter_mut()).enumerate() {
+            let mut acc = 0.0;
+            for b in 0..n {
+                for s in 0..spatial {
+                    acc += x[(b * c + ch) * spatial + s];
+                }
+            }
+            let count = (n * spatial) as f64;
+            *m = acc / count;
+            let mut sq = 0.0;
+            for b in 0..n {
+                for s in 0..spatial {
+                    let d = x[(b * c + ch) * spatial + s] - *m;
+                    sq += d * d;
+                }
+            }
+            *v = sq / count;
+        }
+        let train_ref: Vec<f64> = (0..numel)
+            .map(|i| {
+                let ch = (i / spatial) % c;
+                (x[i] - ref_mean[ch]) / (ref_var[ch] + eps).sqrt() * weight[ch] + bias[ch]
+            })
+            .collect();
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = session
+            .tensor_variable(x.clone(), vec![n, c, h, w], false)
+            .expect("input");
+        let wt = session
+            .tensor_variable(weight.clone(), vec![c], false)
+            .expect("weight");
+        let bt = session
+            .tensor_variable(bias.clone(), vec![c], false)
+            .expect("bias");
+        let rmt = session
+            .tensor_variable(run_mean.clone(), vec![c], false)
+            .expect("running mean");
+        let rvt = session
+            .tensor_variable(run_var.clone(), vec![c], false)
+            .expect("running var");
+
+        // --- training: output, and the momentum-updated running stats ---------
+        let (out, new_mean, new_var) = session
+            .functional_batch_norm2d(
+                xt,
+                Some(rmt),
+                Some(rvt),
+                Some(wt),
+                Some(bt),
+                true,
+                momentum,
+                eps,
+            )
+            .expect("batch_norm2d training");
+        let got = session.tensor_values(out).expect("training output");
+        assert_eq!(got.len(), numel, "output length");
+        for (i, (g, r)) in got.iter().zip(train_ref.iter()).enumerate() {
+            assert!(
+                (g - r).abs() <= 1e-12 * r.abs().max(1.0),
+                "training element {i}: got {g}, reference {r}"
+            );
+        }
+
+        let count = (n * spatial) as f64;
+        let bessel = count / (count - 1.0);
+        let got_mean = session
+            .tensor_values(new_mean.expect("updated running mean"))
+            .expect("mean values");
+        let got_var = session
+            .tensor_values(new_var.expect("updated running var"))
+            .expect("var values");
+        for ch in 0..c {
+            let want_m = (1.0 - momentum) * run_mean[ch] + momentum * ref_mean[ch];
+            let want_v = (1.0 - momentum) * run_var[ch] + momentum * ref_var[ch] * bessel;
+            assert!(
+                (got_mean[ch] - want_m).abs() <= 1e-12 * want_m.abs().max(1.0),
+                "running mean {ch}: got {}, want {want_m}",
+                got_mean[ch]
+            );
+            assert!(
+                (got_var[ch] - want_v).abs() <= 1e-12 * want_v.abs().max(1.0),
+                "running var {ch}: got {}, want {want_v}",
+                got_var[ch]
+            );
+        }
+
+        // --- inference: the OTHER branch, which borrows separately ------------
+        let eval_ref: Vec<f64> = (0..numel)
+            .map(|i| {
+                let ch = (i / spatial) % c;
+                (x[i] - run_mean[ch]) / (run_var[ch] + eps).sqrt() * weight[ch] + bias[ch]
+            })
+            .collect();
+        let (out_eval, _, _) = session
+            .functional_batch_norm2d(
+                xt,
+                Some(rmt),
+                Some(rvt),
+                Some(wt),
+                Some(bt),
+                false,
+                momentum,
+                eps,
+            )
+            .expect("batch_norm2d eval");
+        let got_eval = session.tensor_values(out_eval).expect("eval output");
+        assert_eq!(got_eval.len(), numel, "eval output length");
+        for (i, (g, r)) in got_eval.iter().zip(eval_ref.iter()).enumerate() {
+            assert!(
+                (g - r).abs() <= 1e-12 * r.abs().max(1.0),
+                "eval element {i}: got {g}, reference {r}"
+            );
+        }
     }
 
     #[test]
