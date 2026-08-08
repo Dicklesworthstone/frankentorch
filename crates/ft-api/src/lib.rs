@@ -97525,7 +97525,11 @@ fn bessel_y1_scalar(x: f64) -> f64 {
 // (frankentorch-4ixyt); the Cephes B-tables fix that to ~1e-16 (verified vs
 // mpmath@30dp over x∈[2,30]: worst rel 1.9e-16 K0 / 4.3e-16 K1). K_SPLIT=2
 // matches Cephes's own domain boundary. Reuses the Cephes i0/i1 + cephes_chbevl.
-const EULER_GAMMA: f64 = 0.577_215_664_901_532_86;
+// frankentorch-y8lv8: was the literal 0.577_215_664_901_532_86. That literal IS the
+// correctly-rounded f64 — verified bit-identical to this constant at 0x3fe2788cfc6fb619 —
+// so this swap is value-neutral and exists to keep clippy::approx_constant from holding the
+// crate gate red. Sourcing it from std also means it cannot drift from the true value.
+const EULER_GAMMA: f64 = std::f64::consts::EULER_GAMMA;
 const K_SPLIT: f64 = 2.0;
 
 /// Cephes Chebyshev coefficients for exp(x)·sqrt(x)·K0(x) on [2, ∞),

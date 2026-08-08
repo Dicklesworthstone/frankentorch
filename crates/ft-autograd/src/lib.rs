@@ -20931,7 +20931,7 @@ mod tests {
         .expect("accumulate");
         assert_eq!(
             slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vec![-0.0f64, 0.0, -0.0, 1.5]
+            [-0.0f64, 0.0, -0.0, 1.5]
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
@@ -20963,10 +20963,7 @@ mod tests {
         .expect("zip_map");
         assert_eq!(
             slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vec![-0.0f64; 3]
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
+            [-0.0f64; 3].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "zip_map accumulator must PRESERVE -0.0, matching PyTorch"
         );
     }
@@ -20979,10 +20976,7 @@ mod tests {
             .expect("par_with");
         assert_eq!(
             slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vec![-0.0f64; 3]
-                .iter()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
+            [-0.0f64; 3].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "par_with accumulator must PRESERVE -0.0, matching PyTorch"
         );
     }

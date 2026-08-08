@@ -1364,10 +1364,8 @@ fn read_f64_payload(
         ]);
     }
     let mut values = Vec::with_capacity(numel);
-    for chunk in payload.chunks_exact(8) {
-        values.push(f64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]));
+    for chunk in payload.as_chunks::<8>().0 {
+        values.push(f64::from_le_bytes(*chunk));
     }
     Ok(values)
 }
@@ -1420,8 +1418,8 @@ fn read_f32_payload(
 ) -> Result<Vec<f32>, TensorIOError> {
     let payload = native_payload(data, pos, numel, 4, "f32", key, "truncated f32 data")?;
     let mut values = Vec::with_capacity(numel);
-    for chunk in payload.chunks_exact(4) {
-        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in payload.as_chunks::<4>().0 {
+        values.push(f32::from_le_bytes(*chunk));
     }
     Ok(values)
 }
@@ -1434,8 +1432,8 @@ fn read_f16_payload(
 ) -> Result<Vec<Float16>, TensorIOError> {
     let payload = native_payload(data, pos, numel, 2, "f16", key, "truncated f16 data")?;
     let mut values = Vec::with_capacity(numel);
-    for chunk in payload.chunks_exact(2) {
-        values.push(Float16::from_le_bytes([chunk[0], chunk[1]]));
+    for chunk in payload.as_chunks::<2>().0 {
+        values.push(Float16::from_le_bytes(*chunk));
     }
     Ok(values)
 }
@@ -1448,8 +1446,8 @@ fn read_bf16_payload(
 ) -> Result<Vec<BFloat16>, TensorIOError> {
     let payload = native_payload(data, pos, numel, 2, "bf16", key, "truncated bf16 data")?;
     let mut values = Vec::with_capacity(numel);
-    for chunk in payload.chunks_exact(2) {
-        values.push(BFloat16::from_le_bytes([chunk[0], chunk[1]]));
+    for chunk in payload.as_chunks::<2>().0 {
+        values.push(BFloat16::from_le_bytes(*chunk));
     }
     Ok(values)
 }
@@ -2196,12 +2194,8 @@ pub fn load_safetensors_from_bytes(
             DType::F64 => {
                 let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 8)?;
                 let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.chunks_exact(8) {
-                    let bytes = bytes_to_array::<8>(
-                        chunk,
-                        &format!("invalid f64 payload width in SafeTensors tensor '{name}'"),
-                    )?;
-                    values.push(f64::from_le_bytes(bytes));
+                for chunk in raw_data.as_chunks::<8>().0 {
+                    values.push(f64::from_le_bytes(*chunk));
                 }
                 let meta = TensorMeta::from_shape(shape, DType::F64, Device::Cpu);
                 DenseTensor::from_storage(meta, values)?
@@ -2209,12 +2203,8 @@ pub fn load_safetensors_from_bytes(
             DType::F32 => {
                 let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 4)?;
                 let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.chunks_exact(4) {
-                    let bytes = bytes_to_array::<4>(
-                        chunk,
-                        &format!("invalid f32 payload width in SafeTensors tensor '{name}'"),
-                    )?;
-                    values.push(f32::from_le_bytes(bytes));
+                for chunk in raw_data.as_chunks::<4>().0 {
+                    values.push(f32::from_le_bytes(*chunk));
                 }
                 let meta = TensorMeta::from_shape(shape, DType::F32, Device::Cpu);
                 DenseTensor::from_storage_f32(meta, values)?
@@ -2222,12 +2212,8 @@ pub fn load_safetensors_from_bytes(
             DType::F16 => {
                 let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 2)?;
                 let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.chunks_exact(2) {
-                    let bytes = bytes_to_array::<2>(
-                        chunk,
-                        &format!("invalid f16 payload width in SafeTensors tensor '{name}'"),
-                    )?;
-                    values.push(ft_core::Float16::from_le_bytes(bytes));
+                for chunk in raw_data.as_chunks::<2>().0 {
+                    values.push(ft_core::Float16::from_le_bytes(*chunk));
                 }
                 let meta = TensorMeta::from_shape(shape, DType::F16, Device::Cpu);
                 DenseTensor::from_storage_f16(meta, values)?
@@ -2235,12 +2221,8 @@ pub fn load_safetensors_from_bytes(
             DType::BF16 => {
                 let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 2)?;
                 let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.chunks_exact(2) {
-                    let bytes = bytes_to_array::<2>(
-                        chunk,
-                        &format!("invalid bf16 payload width in SafeTensors tensor '{name}'"),
-                    )?;
-                    values.push(ft_core::BFloat16::from_le_bytes(bytes));
+                for chunk in raw_data.as_chunks::<2>().0 {
+                    values.push(ft_core::BFloat16::from_le_bytes(*chunk));
                 }
                 let meta = TensorMeta::from_shape(shape, DType::BF16, Device::Cpu);
                 DenseTensor::from_storage_bf16(meta, values)?

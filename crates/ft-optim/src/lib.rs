@@ -11739,13 +11739,14 @@ mod tests {
             0.014286057143,
             4e-07,
         ];
-        for i in 0..10 {
+        // frankentorch-y8lv8: `.take(10)` preserves the original `0..10` bound exactly rather
+        // than silently widening the loop to the array's length.
+        for (i, want) in want_lr_lin.iter().enumerate().take(10) {
             sched2.step(&mut opt2, None);
             assert!(
-                (opt2.get_lr() - want_lr_lin[i]).abs() < 1e-9,
-                "onecycle linear lr step {i}: got {}, want {}",
+                (opt2.get_lr() - want).abs() < 1e-9,
+                "onecycle linear lr step {i}: got {}, want {want}",
                 opt2.get_lr(),
-                want_lr_lin[i]
             );
         }
     }
