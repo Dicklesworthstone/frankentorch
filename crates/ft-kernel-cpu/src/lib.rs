@@ -2532,39 +2532,31 @@ const POOL_FWD_PARALLEL_MIN: usize = 1 << 21; // ~2.1M input reads
 // protects: at 784 reads per plane they fail it by 5x.
 const POOL_FWD_PARALLEL_PER_PLANE_MIN: usize = 1 << 12; // 4096 input reads per plane
 
-// The BACKWARD side gates the OPPOSITE way to the forward above: parallelise only
-// when the dense gradient is too big to stay in one core's L3 slice.
+// frankentorch-8obhh — A SIZE GATE ON THE DENSE-GRADIENT SCATTER WAS TRIED AND
+// REVERTED. Recording it here because the mechanism is real and the next reader will
+// otherwise re-derive the same wrong lever.
 //
-// frankentorch-un3os. `87sz8` read this term as contended first-touch page faults;
-// `zoqws` refuted that in situ. The attribution
-// (artifacts/perf/frankentorch-un3os/attribution.md) found the cost is the
-// PARALLELISM itself: at the gauntlet's 8 MiB shape one thread running the identical
-// scatter body is 1.97-2.21x FASTER than 64 rayon tasks, and neither the
-// accumulate's read nor the per-element f64->usize cast is measurable against it.
-//
-// A size sweep of the same 1-in-8 scatter shape shows a sharp crossover, and it is
-// a CACHE crossover, not a NUMA one (this host reports a single NUMA node):
-//
+// frankentorch-un3os measured, correctly, that below the per-CCD L3 slice one thread
+// beats 64 on these scatters: a size sweep of the 1-in-8 shape gave
 //     MiB     1      4      8     12     16     24  |    32    128    256
 //   par/ser  12.5   5.27   3.16   2.88   2.29   1.35 |  0.17   0.15   0.15
+// (>1 = serial wins; the cliff at 24-32 MiB is this box's 4x32 MiB L3). Gating the
+// four max_pool backward scatters to serial below 16 MiB was 1.4-2.2x faster per
+// kernel, and 4.24x on the profiled one, with flat controls.
 //
-// >1 means serial wins. The cliff between 24 and 32 MiB is the per-CCD L3 slice —
-// this box is a Threadripper PRO 5975WX whose 128 MiB of L3 is 4 INSTANCES of
-// 32 MiB, so a single thread effectively has 32 MiB. Below that the buffer is
-// L3-resident and one thread runs at cache speed while spreading it over four CCDs
-// only adds cross-CCD traffic; above it, no single core can cover the footprint and
-// many cores are needed to pull DRAM bandwidth.
+// IT DID NOT SURVIVE AT THE LANE. Two 16-round A/Bs of two FT ELFs against the same
+// PyTorch arm (artifacts/perf/frankentorch-87sz8/gate_lane_ab_DECIDED.md) put the
+// gated build 1.13x SLOWER on the max_pool3d lane — pooled n=31, CI [1.042, 1.198],
+// 31 of 31 rounds slower — with conv3d as a negative control at 1.002 [0.963, 1.032].
 //
-// THE GATE SITS AT 16 MiB, NOT AT THE 24-32 MiB CROSSOVER, BECAUSE THE RISK IS
-// ASYMMETRIC: at 24 MiB serial wins only 1.35x, but at 32 MiB serial LOSES 5.9x.
-// Being early costs a little; being late costs a lot. 16 MiB still carries a
-// measured 2.29x and leaves margin for hosts with smaller L3 slices than this one.
-const DENSE_SCATTER_PARALLEL_MIN_BYTES: usize = 16 * 1024 * 1024;
-
-#[inline]
-fn dense_scatter_should_parallelize(numel: usize) -> bool {
-    numel * size_of::<f64>() >= DENSE_SCATTER_PARALLEL_MIN_BYTES
-}
+// WHY, and this is the transferable part: the gate keyed on BUFFER SIZE as a proxy
+// for L3 residency. In an isolated kernel probe the buffer effectively owns L3, so
+// the proxy holds. In a real session the AUTOGRAD TAPE holds many other live tensors
+// and the same buffer is NOT resident — which is the regime where the sweep above
+// says PARALLEL wins. The crossover data is right; the predictor is wrong.
+// A SIZE GATE CANNOT SEE THE TAPE. Any future residency lever needs a working-set
+// signal, not a numel threshold, and must be A/B'd at the LANE and not just the
+// kernel.
 
 #[inline]
 fn pool_fwd_should_parallelize(total_reads: usize, planes: usize) -> bool {
@@ -8941,8 +8933,8 @@ pub fn max_pool3d_backward_from_indices_f64(
     //
     // frankentorch-un3os found what DOES describe it: below the per-core L3 slice,
     // running this scatter on ONE thread beats running it on 64. See
-    // `DENSE_SCATTER_PARALLEL_MIN_BYTES` for the crossover data and why the gate sits
-    // where it does.
+    // the revert note near `POOL_FWD_PARALLEL_PER_PLANE_MIN` for the crossover data
+    // and why a size gate here was reverted (frankentorch-8obhh).
     //
     // ONE body, two drivers, so the arms cannot drift and the serial path stays
     // BIT-IDENTICAL: planes are disjoint, each plane's accumulation order is
@@ -8959,15 +8951,9 @@ pub fn max_pool3d_backward_from_indices_f64(
             }
         }
     };
-    if dense_scatter_should_parallelize(din.len()) {
-        din.par_chunks_mut(plane_len)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    } else {
-        din.chunks_mut(plane_len)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    }
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| scatter_plane(plane, drow));
     din
 }
 
@@ -9002,15 +8988,9 @@ pub fn max_pool3d_backward_from_indices_scalar_f64(
             drow[arg] += upstream;
         }
     };
-    if dense_scatter_should_parallelize(din.len()) {
-        din.par_chunks_mut(plane_len)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    } else {
-        din.chunks_mut(plane_len)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    }
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| scatter_plane(plane, drow));
     din
 }
 
@@ -9931,15 +9911,9 @@ pub fn max_pool1d_backward_from_indices_f64(
             drow[arg] += dout[oidx];
         }
     };
-    if dense_scatter_should_parallelize(din.len()) {
-        din.par_chunks_mut(len)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    } else {
-        din.chunks_mut(len)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    }
+    din.par_chunks_mut(len)
+        .enumerate()
+        .for_each(|(plane, drow)| scatter_plane(plane, drow));
     din
 }
 
@@ -10266,15 +10240,9 @@ pub fn max_pool2d_backward_from_indices_f64(
             }
         }
     };
-    if dense_scatter_should_parallelize(din.len()) {
-        din.par_chunks_mut(ih * iw)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    } else {
-        din.chunks_mut(ih * iw)
-            .enumerate()
-            .for_each(|(plane, drow)| scatter_plane(plane, drow));
-    }
+    din.par_chunks_mut(ih * iw)
+        .enumerate()
+        .for_each(|(plane, drow)| scatter_plane(plane, drow));
     din
 }
 
@@ -39070,12 +39038,9 @@ mod tests {
                 }
             });
 
-        // This shape is far below DENSE_SCATTER_PARALLEL_MIN_BYTES, so the kernel takes
-        // the SERIAL driver — that is the point of the comparison.
-        assert!(
-            !super::dense_scatter_should_parallelize(batch * ch * plane_len),
-            "shape must be below the gate for this test to exercise the serial driver"
-        );
+        // The size gate this once exercised was reverted (frankentorch-8obhh); the
+        // comparison still checks the kernel against an independent transcription of
+        // the same scatter, which is what catches an indexing or argmax change.
         let got = super::max_pool3d_backward_from_indices_f64(
             &dout,
             &arg_offsets,
@@ -39133,9 +39098,6 @@ mod tests {
                 }
             });
 
-        assert!(!super::dense_scatter_should_parallelize(
-            batch * ch * plane_len
-        ));
         let got = super::max_pool3d_backward_from_indices_scalar_f64(
             upstream,
             &arg_offsets,
@@ -39186,9 +39148,6 @@ mod tests {
                 }
             });
 
-        assert!(!super::dense_scatter_should_parallelize(
-            batch * ch * plane_len
-        ));
         let got = super::max_pool2d_backward_from_indices_f64(
             &dout,
             &arg_offsets,
@@ -39233,7 +39192,6 @@ mod tests {
                 }
             });
 
-        assert!(!super::dense_scatter_should_parallelize(batch * ch * len));
         let got = super::max_pool1d_backward_from_indices_f64(
             &dout,
             &arg_offsets,
@@ -39247,24 +39205,6 @@ mod tests {
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "1-D serial driver must be bit-identical to the parallel one"
         );
-    }
-
-    // Locks WHERE the gate sits. The crossover it encodes is asymmetric — serial wins
-    // only ~1.35x just below it but loses ~5.9x just above — so a silent drift upward
-    // is far more expensive than a drift downward, and neither should happen unnoticed.
-    #[test]
-    fn dense_scatter_gate_sits_at_sixteen_mib() {
-        let f64s_in_16mib = 16 * 1024 * 1024 / size_of::<f64>();
-        assert!(!super::dense_scatter_should_parallelize(f64s_in_16mib - 1));
-        assert!(super::dense_scatter_should_parallelize(f64s_in_16mib));
-        // The gauntlet's max_pool3d lane: [2,32,16,32,32] = 8 MiB, must stay serial.
-        assert!(!super::dense_scatter_should_parallelize(
-            2 * 32 * 16 * 32 * 32
-        ));
-        // 32 MiB is past the measured cliff and must parallelise.
-        assert!(super::dense_scatter_should_parallelize(
-            32 * 1024 * 1024 / size_of::<f64>()
-        ));
     }
 
     #[test]
