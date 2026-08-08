@@ -155,6 +155,84 @@ fn main() {
         std::hint::black_box(rep.gradient(x).expect("grad").iter().sum::<f64>());
     });
 
+    // ── frankentorch-uufyp: split `tape_overhead` into its parts ────────────
+    // k1h8g found 91-93% of avg_pool2d's session arm sits outside the kernels. That
+    // single number covers at least four different costs, and attacking it as a unit
+    // would repeat 8obhh's mistake of attacking "the dense write" as a unit.
+    //
+    // CUMULATIVE lanes: each adds one stage to the previous one, so successive
+    // DIFFERENCES attribute that stage. Reported as differences below.
+    let a_shape = vec![A_N, A_C, A_H, A_W];
+    let t_sess = time_it(|| {
+        let session = FrankenTorchSession::new(ExecutionMode::Strict);
+        std::hint::black_box(&session);
+    });
+    let t_leaf = time_it(|| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        std::hint::black_box((&session, x));
+    });
+    let t_fwd = time_it(|| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        let out = session
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d");
+        std::hint::black_box((&session, out));
+    });
+    let t_sum = time_it(|| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        let out = session
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d");
+        let loss = session.tensor_sum(out).expect("sum");
+        std::hint::black_box((&session, loss));
+    });
+    let t_bwd = time_it(|| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        let out = session
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d");
+        let loss = session.tensor_sum(out).expect("sum");
+        let rep = session.tensor_backward(loss).expect("backward");
+        std::hint::black_box((&session, &rep));
+    });
+    // A control the decomposition needs: how much of `leaf` is just cloning 16 MiB
+    // of input, as opposed to anything the session does with it?
+    let t_clone = time_it(|| {
+        std::hint::black_box(a_input.clone());
+    });
+    println!("avg_pool2d SESSION DECOMPOSITION (frankentorch-uufyp), cumulative then differenced");
+    println!(
+        "  cumulative:  session={t_sess:6.3}  +leaf={t_leaf:6.3}  +fwd={t_fwd:6.3}  +sum={t_sum:6.3}  +bwd={t_bwd:6.3}  +grad_fetch_sum={a_session:6.3}"
+    );
+    println!(
+        "  per stage:   session_new={t_sess:6.3}  leaf_build={:6.3}  forward={:6.3}  sum={:6.3}  backward={:6.3}  grad_fetch_sum={:6.3}",
+        t_leaf - t_sess,
+        t_fwd - t_leaf,
+        t_sum - t_fwd,
+        t_bwd - t_sum,
+        a_session - t_bwd,
+    );
+    println!(
+        "  of which leaf_build is a bare 16 MiB input clone: {t_clone:.3} ms ({:.0}% of leaf_build)",
+        100.0 * t_clone / (t_leaf - t_sess).max(f64::MIN_POSITIVE)
+    );
+    println!(
+        "  raw kernels for reference: fwd={a_raw_fwd:.3} bwd={a_raw_bwd:.3}. A stage difference at or\n\
+         below the noise of these medians is NOT attributable; treat only the large terms.\n"
+    );
+
     // ── the parallel gate ───────────────────────────────────────────────────
     // POOL_FWD_PARALLEL_MIN is 1<<21 = 2_097_152 "input reads", and the gate is
     // `out.len() * kd*kh*kw`. The lane above computes 131072*8 = 1_048_576 —
