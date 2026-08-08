@@ -36,6 +36,28 @@ run_ubs_staged() {
     fi
 
     if [ "$code" -eq 0 ]; then
+        # frankentorch-imtpq: exit 0 is NOT evidence the scanner looked at
+        # anything. ubs prepares a shadow workspace from the staged files and can
+        # report "Files: 0" while still exiting 0 — which turns this gate into a
+        # no-op that reads as a pass. Observed on every commit of a 2026-08-08
+        # session, including one staging crates/ft-kernel-cpu/src/lib.rs, where
+        # the hook printed "large file(s) staged" and ubs then scanned 0 files.
+        #
+        # So check the POSITIVE evidence (a file count) rather than trusting the
+        # status alone, exactly as that bead argues: "prefer POSITIVE execution
+        # evidence over exit codes where it exists".
+        case "$UBS_OUTPUT" in
+            *"Files: 0"*)
+                echo "ubs: WARNING - exited 0 but reported 'Files: 0' while Rust files were staged."
+                echo "ubs: this commit was NOT scanned. The gate passed on an exit code, not on evidence."
+                echo "ubs: staged:$STAGED_RS"
+                echo "ubs: see frankentorch-imtpq. Set UBS_REQUIRE_SCAN=1 to make this FAIL the commit."
+                if [ -n "$UBS_REQUIRE_SCAN" ]; then
+                    echo "ubs: UBS_REQUIRE_SCAN set - failing the commit."
+                    return 1
+                fi
+                ;;
+        esac
         return 0
     fi
 
