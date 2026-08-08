@@ -18,7 +18,7 @@ fn old_remainder(t: &[f64], o: &[f64]) -> Vec<f64> {
     let ov = o.to_vec();
     tv.iter()
         .zip(ov.iter())
-        .map(|(&a, &b)| a - (a / b).floor() * b)
+        .map(|(&a, &b)| ft_kernel_cpu::remainder_torch_f64(a, b))
         .collect()
 }
 fn old_xlogy(t: &[f64], o: &[f64]) -> Vec<f64> {

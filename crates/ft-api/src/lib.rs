@@ -23839,9 +23839,12 @@ impl FrankenTorchSession {
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
-        if self
-            .try_inplace_binary_f64(target, other, "remainder_", |a, b| a - (a / b).floor() * b)?
-        {
+        if self.try_inplace_binary_f64(
+            target,
+            other,
+            "remainder_",
+            ft_kernel_cpu::remainder_torch_f64,
+        )? {
             return Ok(());
         }
         let target_vals = self.tensor_values_lossy_f64(target)?;
@@ -23857,7 +23860,7 @@ impl FrankenTorchSession {
         let result: Vec<f64> = target_vals
             .iter()
             .zip(other_vals.iter())
-            .map(|(&a, &b)| a - (a / b).floor() * b)
+            .map(|(&a, &b)| ft_kernel_cpu::remainder_torch_f64(a, b))
             .collect();
         self.update_tensor_values_for_float(target, result, INPLACE_FLOAT_REASON)?;
         self.record_tensor_in_place_operation("remainder_", target, None);

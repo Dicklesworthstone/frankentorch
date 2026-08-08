@@ -2050,7 +2050,48 @@ pub fn remainder_scalar(
     ensure_compatible(lhs, rhs)?;
     let a = lhs.value();
     let b = rhs.value();
-    Ok(lhs.with_value(a - (a / b).floor() * b))
+    Ok(lhs.with_value(remainder_torch_f64(a, b)))
+}
+
+/// `torch.remainder` for floats, bit-for-bit.
+///
+/// frankentorch-5jwh8. Every remainder path here computed `a - (a / b).floor() * b`, which is the
+/// textbook identity and NOT what torch does. aten computes it from `fmod`, and the difference is
+/// observable in two ways:
+///
+/// 1. PRECISION. `a / b` can round UP to an exact integer when the true quotient is just below it.
+///    For a = 24.352941176470587, b = 0.5294117647058824, `a / b` is exactly 46.0 in f64 while the
+///    true quotient is slightly less, so the naive form subtracts 46·b and returns 0 where torch
+///    returns 0.5294117647058808 — an error of a whole `b`. FrankenTorch's own `floor_divide`
+///    already returns 45 for that input (it was fixed for this exact reason in a70e44df,
+///    frankentorch-bh6bh), so the two ops disagreed with each other: `a == q*b + r` did not hold.
+///
+/// 2. SIGN OF ZERO. torch gives `-7.5 % 2.5 == -0.0` and `-3.0 % 3.0 == -0.0`; the naive form
+///    gives `+0.0` for both. `m != 0.0` is false for `-0.0` (IEEE equality), so returning `m`
+///    unchanged preserves the sign, which is what torch does. Cf. frankentorch-dtyiz.
+///
+/// Verified against torch 2.12.0+cpu on 14 cases spanning both signs, exact quotients, signed
+/// zeros and the two failing fuzz inputs: fmod-based matches on all 14, naive on 10.
+#[must_use]
+pub fn remainder_torch_f64(a: f64, b: f64) -> f64 {
+    // `%` on f64 is fmod (truncated toward zero), matching C.
+    let m = a % b;
+    if m != 0.0 && ((b < 0.0) != (m < 0.0)) {
+        m + b
+    } else {
+        m
+    }
+}
+
+/// f32 sibling of [`remainder_torch_f64`]; see there for the rationale.
+#[must_use]
+pub fn remainder_torch_f32(a: f32, b: f32) -> f32 {
+    let m = a % b;
+    if m != 0.0 && ((b < 0.0) != (m < 0.0)) {
+        m + b
+    } else {
+        m
+    }
 }
 
 fn ensure_dtype_device_and_layout(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), KernelError> {
@@ -3522,7 +3563,9 @@ pub fn remainder_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_f64(lhs, rhs, lhs_meta, rhs_meta, |a, b| a - (a / b).floor() * b)
+    elementwise_f64(lhs, rhs, lhs_meta, rhs_meta, |a, b| {
+        remainder_torch_f64(a, b)
+    })
 }
 
 pub fn eq_tensor_contiguous_f64(
@@ -31228,8 +31271,9 @@ define_binary_f32!(
     PARALLEL_THRESHOLD
 );
 define_binary_f32!(fmod_tensor_contiguous_f32, |a: f32, b: f32| a % b);
-define_binary_f32!(remainder_tensor_contiguous_f32, |a: f32, b: f32| a
-    - (a / b).floor() * b);
+define_binary_f32!(remainder_tensor_contiguous_f32, |a: f32, b: f32| {
+    remainder_torch_f32(a, b)
+});
 
 // ── Comparison ops f32 ──────────────────────────────────────────────────
 
