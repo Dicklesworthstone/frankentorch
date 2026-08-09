@@ -59,8 +59,16 @@ target-local/
 
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
-proptest-regressions/
 test_meminfo
+
+# proptest-regressions/ is deliberately NOT ignored (frankentorch-wly7k). It was filed under
+# "test detritus" above, which is backwards: those files are the durable record of every
+# counterexample proptest has ever found, and proptest re-runs them BEFORE generating novel
+# cases. The file's own generated header says "It is recommended to check this file in to
+# source control so that everyone who runs the test benefits from these saved cases."
+# Ignoring it meant eleven accumulated seeds were replayed for one checkout and invisible to
+# every other agent and to a fresh clone — which is precisely how a lucky-seed discovery fails
+# to become a permanent regression case (see frankentorch-jabbh).
 
 # Agent session ephemeral files
 SESSION_TODO.md

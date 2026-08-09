@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 899c9750f2cb4247df13f5cc553a3880805ce45f9652cb66310f205dfdf8fde0 # shrinks to samples = [374, 671, 831, 947, 1]
+cc 8a4518dc306afcf47b7ad6464f58aa04f3746dd9f8bd303c32d0c54302892ebb # shrinks to pairs = [(-281, -281)]
+cc 68e63f508c123c51901077897cf4fa3ada14f0c38ff2e7741ca0a80c003d204d # shrinks to raw = [32, -64, -104, -95, -71, 143, -231, 175, 48, -123, -60, -31]
+cc dfb7c355cbcb9fc99737f670216a0e63ec487213fbc472aa4a068e5f7017c79e # shrinks to (a_raw, b_raw) = ([0, 0, 0, 251, 0, 0, 0, 0], [0, 0, 0, -23, 0, 0, 0, 0])
+cc 294a3a25f4ca63c8882fd0cdb16965a3002899cc209423cca6073ec639573066 # shrinks to (n, m, raw) = (1, 2, [0, 0])
+cc 20c3ed91cdc83530d3a3bd0e9a1e26a1147758287080538db07bf0013134c22e # shrinks to raw = [-10]
+cc d4876acdd11d3dde1fabe2b04d3eaf0d0d9d55e82ecc3326127947f20f0c73a4 # shrinks to (a_raw, b_raw) = ([-114], [1])
+cc c364c79beefaf3aa3cfb8ec38dcc003b2a4d4004cac555e16337480dbbd5269b # shrinks to (a_raw, b_raw) = ([0, 0, 0, 0, 414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+cc 0b468484c2f291ee5c3551732838cb10b192928eeb7d85569ad979a06b10cc0a # shrinks to (n, m, raw) = (2, 1, [35, 33])
+cc 59cb3cb9d7e769c958a9376a10634e2827820d4a47d3fb389bf74d2234c61edb # shrinks to (raw, perm_seed) = ([-708, 0, -219, -105, -652, 549, -576, -379, 785, 797, 925, -385], 3322650827576328173)
+cc 22e9e76bdf6072b96d26502eaea1d0b199b7695a40b330ed88ae5269eccb728b # shrinks to raw = [-58, -23, -204, 147, -202, 24, 237]
