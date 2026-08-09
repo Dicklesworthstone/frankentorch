@@ -26679,6 +26679,179 @@ mod tests {
         );
     }
 
+    /// frankentorch-v8f5k. The bug this primitive exists to fix, pinned directly.
+    ///
+    /// tensor_pow_tensor used to compute x^e as exp(e·ln x). `ln` is NaN below zero, so EVERY
+    /// negative base returned NaN. The conformance oracle covers this too, but only when a torch
+    /// interpreter is present — this asserts it unconditionally, in the crate that owns the op.
+    #[test]
+    fn pow_tensor_negative_bases_match_powf_not_exp_ln() {
+        let mut tape = TensorTape::new();
+        let bases = vec![-2.0, -2.0, -8.0, 2.0, 3.0];
+        let exps = vec![3.0, 2.0, 1.0, 3.0, 2.0];
+        let x = tape.leaf(bases.clone(), vec![5], false).expect("x");
+        let e = tape.leaf(exps.clone(), vec![5], false).expect("e");
+        let y = tape
+            .pow_tensor(x, e, ExecutionMode::Strict)
+            .expect("pow_tensor");
+        let got = tape
+            .node(y)
+            .expect("out node")
+            .tensor
+            .contiguous_values_as_f64()
+            .expect("vals");
+
+        for (i, (&b, &p)) in bases.iter().zip(exps.iter()).enumerate() {
+            let want = b.powf(p);
+            assert_eq!(
+                got[i].to_bits(),
+                want.to_bits(),
+                "pow_tensor({b}, {p}) = {} (bits {:#018x}), want {want} (bits {:#018x}) — \
+                 the exp(e*ln x) form returns NaN here",
+                got[i],
+                got[i].to_bits(),
+                want.to_bits()
+            );
+            assert!(!got[i].is_nan(), "pow_tensor({b}, {p}) must not be NaN");
+        }
+    }
+
+    /// 0^0 == 1, the rule the old composed path applied via a where-mask. Kept explicit so the
+    /// mask's removal cannot silently change it.
+    #[test]
+    fn pow_tensor_zero_to_the_zero_is_one() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![0.0, 0.0], vec![2], false).expect("x");
+        let e = tape.leaf(vec![0.0, 2.0], vec![2], false).expect("e");
+        let y = tape
+            .pow_tensor(x, e, ExecutionMode::Strict)
+            .expect("pow_tensor");
+        let got = tape
+            .node(y)
+            .expect("out")
+            .tensor
+            .contiguous_values_as_f64()
+            .expect("vals");
+        assert_eq!(
+            got[0].to_bits(),
+            1.0_f64.to_bits(),
+            "0^0 must be 1, got {}",
+            got[0]
+        );
+        assert_eq!(
+            got[1].to_bits(),
+            0.0_f64.to_bits(),
+            "0^2 must be 0, got {}",
+            got[1]
+        );
+    }
+
+    /// First-order backward w.r.t. BOTH inputs: d/dx = e·x^(e-1), d/de = x^e·ln(x).
+    #[test]
+    fn pow_tensor_backward_matches_both_analytic_partials() {
+        // x = 3, e = 2  ->  y = 9,  dy/dx = 2*3 = 6,  dy/de = 9*ln 3
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![3.0], vec![1], true).expect("x");
+        let e = tape.leaf(vec![2.0], vec![1], true).expect("e");
+        let y = tape
+            .pow_tensor(x, e, ExecutionMode::Strict)
+            .expect("pow_tensor");
+        let report = tape.backward(y).expect("backward");
+
+        let gx = report.gradient(x).expect("dx");
+        assert!(
+            (gx[0] - 6.0).abs() < 1e-12,
+            "dy/dx should be 6, got {}",
+            gx[0]
+        );
+
+        let ge = report.gradient(e).expect("de");
+        let want_de = 9.0_f64 * 3.0_f64.ln();
+        assert!(
+            (ge[0] - want_de).abs() < 1e-12,
+            "dy/de should be {want_de}, got {}",
+            ge[0]
+        );
+    }
+
+    /// The create_graph closure is the part that could NOT be skipped: the composed path this
+    /// replaced supported second order already, so shipping without it would have been a
+    /// regression rather than a gap. f(x) = x^3 via pow_tensor, f''(2) = 6x = 12.
+    #[test]
+    fn pow_tensor_second_derivative_flows_through_create_graph() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0], vec![1], true).expect("x");
+        let e = tape.leaf(vec![3.0], vec![1], false).expect("e");
+        let y = tape
+            .pow_tensor(x, e, ExecutionMode::Strict)
+            .expect("pow_tensor");
+
+        let report1 = tape
+            .backward_with_options(
+                y,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        let g1 = report1.gradient(x).expect("first grad");
+        assert!(
+            (g1[0] - 12.0).abs() < 1e-10,
+            "f'(2) should be 12, got {}",
+            g1[0]
+        );
+
+        let dx_node = report1.gradient_node(x).expect("gradient node");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let g2 = report2.gradient(x).expect("second grad");
+        assert!(
+            (g2[0] - 12.0).abs() < 1e-10,
+            "f''(2) should be 6x = 12, got {} — a create_graph closure built from exp/log would \
+             give NaN or a wrong value here",
+            g2[0]
+        );
+    }
+
+    /// The create_graph hazard, guarded directly: for f(x) = x^3 at x = -2, f'' = 6x = -12. A
+    /// create_graph closure that rebuilt x^(e-1) from exp/log would yield NaN here while the
+    /// positive-base test above still passed — which is exactly how the original bug hid in the
+    /// forward path. frankentorch-v8f5k.
+    #[test]
+    fn pow_tensor_second_derivative_survives_a_negative_base() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![-2.0], vec![1], true).expect("x");
+        let e = tape.leaf(vec![3.0], vec![1], false).expect("e");
+        let y = tape
+            .pow_tensor(x, e, ExecutionMode::Strict)
+            .expect("pow_tensor");
+
+        let report1 = tape
+            .backward_with_options(
+                y,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        let g1 = report1.gradient(x).expect("first grad");
+        assert!(
+            (g1[0] - 12.0).abs() < 1e-10,
+            "f'(-2) = 3x^2 = 12, got {} (NaN means the backward went through ln of a negative)",
+            g1[0]
+        );
+
+        let dx_node = report1.gradient_node(x).expect("gradient node");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let g2 = report2.gradient(x).expect("second grad");
+        assert!(
+            (g2[0] + 12.0).abs() < 1e-10,
+            "f''(-2) = 6x = -12, got {} (NaN means create_graph rebuilt the power via exp/log)",
+            g2[0]
+        );
+    }
+
     #[test]
     fn create_graph_second_derivative_x_cubed() {
         // f(x) = x^3, f'(x) = 3x^2, f''(x) = 6x
