@@ -12946,77 +12946,23 @@ impl FrankenTorchSession {
         // in one GEMM + a parallel upper-triangle assembly: gram = X·Xᵀ (raw kernel), per-row ‖·‖²,
         // then condensed out = sqrt(max(nx[i]+nx[j]−2·gram[i,j], 0)) for i<j. Same math → bit-exact.
         // frankentorch-cdist-p2-fused.
-        if p == 2.0
-            && m > 0
-            && out_len > 0
-            && self.tensor_dtype(input)? == DType::F64
-            && !self.tensor_tape.tensor_requires_grad(input)?
-            && self.tensor_tape.tensor(input)?.meta().is_contiguous()
-        {
-            use rayon::prelude::*;
-            let vals = self.tensor_values(input)?;
-            let xnorm: Vec<f64> = (0..n)
-                .map(|i| {
-                    let r = &vals[i * m..i * m + m];
-                    let mut s = 0.0;
-                    for &v in r {
-                        s += v * v;
-                    }
-                    s
-                })
-                .collect();
-            let gram =
-                ft_kernel_cpu::matmul_rhs_transposed_contiguous_f64(n, m, n, &vals, &vals)
-                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
-            let rows: Vec<Vec<f64>> = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let nxi = xnorm[i];
-                    let base = i * n;
-                    ((i + 1)..n)
-                        .map(|j| (nxi + xnorm[j] - 2.0 * gram[base + j]).max(0.0).sqrt())
-                        .collect()
-                })
-                .collect();
-            let out: Vec<f64> = rows.into_iter().flatten().collect();
-            return self.tensor_variable(out, vec![out_len], false);
-        }
-
-        if p == 2.0
-            && m > 0
-            && out_len > 0
-            && self.tensor_dtype(input)? == DType::F32
-            && !self.tensor_tape.tensor_requires_grad(input)?
-            && self.tensor_tape.tensor(input)?.meta().is_contiguous()
-        {
-            let vals = self.tensor_values_f32(input)?;
-            let xnorm: Vec<f32> = (0..n)
-                .map(|i| {
-                    let r = &vals[i * m..i * m + m];
-                    let mut s = 0.0_f32;
-                    for &v in r {
-                        s += v * v;
-                    }
-                    s
-                })
-                .collect();
-            let gram =
-                ft_kernel_cpu::matmul_rhs_transposed_contiguous_f32(n, m, n, &vals, &vals)
-                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
-            let mut out = Vec::with_capacity(out_len);
-            for i in 0..n {
-                let nxi = xnorm[i];
-                let base = i * n;
-                for j in (i + 1)..n {
-                    out.push(
-                        (nxi + xnorm[j] - 2.0_f32 * gram[base + j])
-                            .max(0.0_f32)
-                            .sqrt(),
-                    );
-                }
-            }
-            return self.tensor_variable_f32(out, vec![out_len], false);
-        }
+        // frankentorch-a1nz2: the two p == 2 fused matmul-identity fast paths that used to sit
+        // here (f64 and f32, both no-grad) are GONE. They computed
+        // sqrt(max(nx_i + nx_j - 2*gram_ij, 0)), which catastrophically cancels for nearby
+        // points, and they ran BEFORE the exact kernel path below, so pdist never reached it.
+        //
+        // torch's pdist never uses the mm identity at ANY size — unlike cdist, which switches
+        // above 25 rows (frankentorch-bei5w). So there is no threshold to replicate here and
+        // the paths are removed outright rather than gated. p == 2 now falls through to the
+        // apply_function path below, whose forward is ft_kernel_cpu::pdist_forward_f64 — proven
+        // exact for a two-point 1-D case in 81c1c099 — and which is autograd-aware; f32 falls to
+        // its general-p fused path, which upcasts through the same kernel.
+        //
+        // HOW THIS WAS FOUND, because I got it wrong twice first: I removed a LATER Gram block
+        // and the value did not move, then retracted the mechanism (793a5563). A sentinel return
+        // proved that block never executed, and a second sentinel proved the block after it did
+        // not either — the live code was these two paths, earlier in the same function, which I
+        // had never read. Reading a long function from the middle finds the wrong `if`.
 
         // Fused p=2 grad path (F64): the compose below materialises FOUR [n,n]
         // intermediates (gram/norm_sum/d2/d2_clamped) + their backward. Instead route
