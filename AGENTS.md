@@ -180,6 +180,26 @@ rch exec -- cargo test -p ft-data
 rch exec -- cargo test --workspace --all-features
 ```
 
+**`--all-features` is not optional polish — it is the ONLY command that runs the metamorphic fuzz
+suite** (ft-conformance's `fuzz` feature). Nothing else builds those properties, so a green
+`--lib` or `--workspace --tests` says nothing whatsoever about them.
+
+That suite sat RED and unnoticed long enough to accumulate wrong expectations. When it was finally
+run (2026-08-08, frankentorch-oo3pd) it had 6 failures: **2 were real parity bugs** — `remainder`
+using the naive `a - (a/b).floor()*b` instead of torch's fmod-based form (frankentorch-5jwh8), and
+`pdist` using a cancelling matmul identity torch never uses (frankentorch-a1nz2) — and **4 were
+properties asserting behaviour that shipped parity fixes had deliberately removed**, i.e. they
+encoded the pre-fix world and would have failed any correct implementation forever. It is now
+green (241/0).
+
+A test suite that is never run does not merely fail to catch regressions; it accumulates
+anti-knowledge. Run this one.
+
+Related scope trap, same shape: `--lib` excludes `--tests`, for **both** `cargo test` and `cargo
+clippy`. A `-p <crate> --lib` gate does not build `crates/*/tests/*.rs` at all, which is how a
+`panic!` in production source survived six commits behind a green gate (frankentorch-gfhyp). State
+the exact command you ran; "the tests pass" names a scope, not the codebase.
+
 ### Test Categories
 
 | Crate | Focus Areas |
