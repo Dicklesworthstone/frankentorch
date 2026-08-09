@@ -12399,7 +12399,28 @@ impl FrankenTorchSession {
         // fused trick at 2-D). This does the SAME trick per batch in one GEMM + one fused assembly pass:
         // cross = X1·X2ᵀ (raw kernel), per-row ‖·‖², then out[i,j]=sqrt(max(nx[i]+ny[j]−2·cross[i,j],0)).
         // Same math as the composed path. frankentorch-cdist-p2-fused.
+        // frankentorch-bei5w: the mm/expanded trick is gated on ROW COUNT, matching torch's
+        // `compute_mode = use_mm_for_euclid_dist_if_necessary` default, which takes the mm path
+        // only when `x1.size(-2) > 25 || x2.size(-2) > 25`.
+        //
+        // ‖a‖² + ‖b‖² − 2a·b catastrophically cancels when the two points coincide, leaving a
+        // tiny positive residue that sqrt amplifies: cdist(x, x, p=2) returned 5.96e-8 on its
+        // DIAGONAL instead of 0. A point's distance to itself being exactly zero is load-bearing
+        // for knn (a point must be its own nearest neighbour at distance 0) and for clustering.
+        //
+        // Measured on torch 2.12.0+cpu: the diagonal is exactly 0.0 at 1/5/25 rows and 4.2e-8 at
+        // 26/40, and `compute_mode='donot_use_mm_for_euclid_dist'` is 0.0 at 40. The OR over both
+        // operands was verified separately (26x5, 5x26, 25x26 and 26x25 all take the mm path;
+        // 25x25 does not).
+        //
+        // Deliberately NOT "always use the direct form". That would be MORE accurate than torch
+        // and therefore divergent in the other direction — the exact trap frankentorch-9rvxq
+        // turned out to be, where FrankenTorch's extra precision WAS the parity bug. Above the
+        // threshold FrankenTorch keeps the fused GEMM and reproduces torch's own cancellation.
+        const TORCH_MM_ROW_THRESHOLD: usize = 25;
+        let torch_uses_mm = p_dim > TORCH_MM_ROW_THRESHOLD || r_dim > TORCH_MM_ROW_THRESHOLD;
         if p == 2.0
+            && torch_uses_mm
             && m > 0
             && batch * p_dim * r_dim > 0
             && self.tensor_dtype(x1)? == DType::F64
@@ -12454,6 +12475,7 @@ impl FrankenTorchSession {
         }
 
         if p == 2.0
+            && torch_uses_mm
             && m > 0
             && batch * p_dim * r_dim > 0
             && self.tensor_dtype(x1)? == DType::F32
@@ -12669,7 +12691,12 @@ impl FrankenTorchSession {
             );
         }
 
-        if p == 2.0 && m > 0 && batch * p_dim * r_dim > 0 {
+        // frankentorch-bei5w: same row-count gate as the fused paths. Gating only the
+        // no-grad ones would leave requires_grad cdist on the cancelling expanded form
+        // while no-grad used the direct one — two paths disagreeing on one value, which
+        // is frankentorch-dtyiz's rule. Below the threshold this falls through to the
+        // generic composed path, which is also autograd-aware.
+        if p == 2.0 && torch_uses_mm && m > 0 && batch * p_dim * r_dim > 0 {
             let x1_sq = self.tensor_mul(x1, x1)?;
             let x2_sq = self.tensor_mul(x2, x2)?;
             let (cross, x1_norm_b, x2_norm_b, out_shape) = if batched {
