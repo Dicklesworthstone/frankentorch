@@ -23281,14 +23281,22 @@ mod tests {
         // depth) × max(|a|, |b+c|) × EPSILON. frankentorch-rqph.
         #[test]
         fn fuzz_metamorphic_mul_distributes_over_add(
-            (a_raw, b_raw, c_raw) in (
-                prop::collection::vec(-128i16..128i16, 1..16),
-                prop::collection::vec(-128i16..128i16, 1..16),
-                prop::collection::vec(-128i16..128i16, 1..16),
-            ).prop_filter(
-                "all same length",
-                |(a, b, c)| a.len() == b.len() && b.len() == c.len(),
-            )
+            // frankentorch-q37ra: this used to draw THREE independent vec(1..16) and then
+            // prop_filter for equal lengths. Three free lengths agree about 1 time in 225, so
+            // ~99.6% of draws were rejected and a run could exhaust proptest's reject budget
+            // before reaching its case target — "Too many local rejects: 65536 times at all same
+            // length" after 247 successes. That is a GENERATOR abort, not a property failure, but
+            // it reads exactly like a real regression and lands at random.
+            //
+            // Draw ONE length and build all three vectors at it, so the reject path is never
+            // taken. Raising the budget would only have moved the threshold.
+            (a_raw, b_raw, c_raw) in (1usize..16).prop_flat_map(|n| {
+                (
+                    prop::collection::vec(-128i16..128i16, n),
+                    prop::collection::vec(-128i16..128i16, n),
+                    prop::collection::vec(-128i16..128i16, n),
+                )
+            })
         ) {
             use ft_api::FrankenTorchSession;
 
