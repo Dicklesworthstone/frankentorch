@@ -22349,7 +22349,11 @@ mod tests {
         ) {
             use ft_api::FrankenTorchSession;
 
-            let src_vals: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            // frankentorch-jabbh: was `/ 23.0`, not exactly representable, so the sum-preservation
+            // identity held only up to rounding and its tolerance was a guess (it missed by ~2%).
+            // `/ 32.0` makes every src value an exact multiple of 1/32; input_vals are already
+            // multiples of 1/4, so every sum below is exact and the identity is bit-exact.
+            let src_vals: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 32.0).collect();
             let n = src_vals.len();
             // Use a distinct input so contract 1 doesn't degenerate.
             let input_vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5 - 1.25).collect();
@@ -22368,10 +22372,9 @@ mod tests {
 
             let actual_sum: f64 = out_vals.iter().sum();
             let diff = (actual_sum - expected_sum).abs();
-            let scale = actual_sum.abs().max(expected_sum.abs()).max(1.0);
-            // Summing n elements can accumulate O(n) ULP of rounding error;
-            // allow 2n ULP to account for different summation orders.
-            let tol = (2.0 * n as f64) * f64::EPSILON * scale;
+            // frankentorch-jabbh: BIT-EXACT now. With dyadic inputs every partial sum is exact,
+            // so the identity holds in any summation order and there is no rounding budget to spend.
+            let tol = 0.0_f64;
             prop_assert!(
                 diff <= tol,
                 "sum(index_add) = {} but sum(input) + sum(src) = {} (diff = {:e}, tol = {:e})",
@@ -24504,7 +24507,13 @@ mod tests {
         ) {
             use ft_api::FrankenTorchSession;
 
-            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 31.0).collect();
+            // frankentorch-jabbh: was `/ 31.0`. 31 is not a power of two, so v/31 is not exactly
+            // representable and the sum genuinely depends on addition order -- this property was
+            // asserting something FALSE and passed only on seeds that missed a counterexample.
+            // `/ 32.0` is an exponent shift, so every value is an exact multiple of 1/32; at most
+            // 16 of them with |v| <= 1000 sum to K/32 with |K| <= 16000, far inside f64's exact
+            // integer range. That sum is EXACT in any order, so the invariance genuinely holds.
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 32.0).collect();
             let n = input.len();
 
             // Create a deterministic permutation from the seed
@@ -24529,10 +24538,15 @@ mod tests {
 
             prop_assert_eq!(v1.len(), 1);
             prop_assert_eq!(v2.len(), 1);
-            // Allow small ULP difference due to different addition order
-            let diff = (v1[0] - v2[0]).abs();
-            let tol = v1[0].abs() * 1e-14 + 1e-14;
-            prop_assert!(diff <= tol, "sum permutation invariance: {} vs {}, diff={}", v1[0], v2[0], diff);
+            // frankentorch-jabbh: BIT-EXACT now, not a tolerance. With dyadic inputs the sum is
+            // exact in any order, so even one ULP of difference is a real defect rather than
+            // accumulated rounding. The old tolerance missed by only ~5%, which is exactly how such
+            // a check rots: widening it would have hidden the distinction permanently.
+            prop_assert_eq!(
+                v1[0].to_bits(), v2[0].to_bits(),
+                "sum permutation invariance: {} vs {} (bits {:#018x} vs {:#018x})",
+                v1[0], v2[0], v1[0].to_bits(), v2[0].to_bits()
+            );
         }
 
         // Detach stops gradient: gradient through detached path should be zero,
