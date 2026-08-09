@@ -43003,6 +43003,34 @@ mod tests {
         }
     }
 
+    /// frankentorch-a1nz2. Isolates the pdist KERNEL from the ft-api layer.
+    ///
+    /// A metamorphic fuzz property reported pdist and cdist disagreeing on two 1-D points by
+    /// 6.6e-15, with pdist the inaccurate side. I first blamed a Gram-form fast path in ft-api,
+    /// removed it, and the value did not move — so the error is either in this kernel or in a
+    /// path I had not identified. This test answers that in one run instead of by reading source.
+    ///
+    /// For two 1-D points the answer is exactly |a - b| and there is nothing to approximate:
+    /// squaring and re-rooting round-trips exactly here (sqrt(d*d) == d for this d), so any
+    /// deviation is the kernel doing something other than sqrt(sum of squared differences).
+    #[test]
+    fn pdist_forward_f64_two_points_1d_is_exactly_the_abs_difference() {
+        let a = 35.0 / 17.0;
+        let b = 33.0 / 17.0;
+        let out = super::pdist_forward_f64(&[a, b], 2, 1, 2.0);
+        assert_eq!(out.len(), 1);
+        let want = (a - b).abs();
+        assert_eq!(
+            out[0].to_bits(),
+            want.to_bits(),
+            "pdist_forward_f64 two-point 1-D: got {} (bits {:#018x}), want |a-b| = {} (bits {:#018x})",
+            out[0],
+            out[0].to_bits(),
+            want,
+            want.to_bits()
+        );
+    }
+
     #[test]
     fn matmul_tensor_contiguous_rejects_rank_mismatch() {
         let lhs_meta = TensorMeta::from_shape(vec![6], DType::F64, Device::Cpu);
