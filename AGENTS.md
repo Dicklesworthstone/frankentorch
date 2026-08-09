@@ -229,6 +229,14 @@ clippy`. A `-p <crate> --lib` gate does not build `crates/*/tests/*.rs` at all, 
 `panic!` in production source survived six commits behind a green gate (frankentorch-gfhyp). State
 the exact command you ran; "the tests pass" names a scope, not the codebase.
 
+**The ubs pre-commit hook scans 41% of this workspace.** ubs skips files over 50,000 lines, and
+measured on 2026-08-09 that is 220,514 of 372,393 `crates/*/src/lib.rs` lines — 59.2% — comprising
+exactly two files: `ft-api/src/lib.rs` (167,287) and `ft-kernel-cpu/src/lib.rs` (53,227). Those are
+the op surface and the kernels, i.e. where parity bugs actually live. A commit touching only ft-api
+prints `ubs: every staged Rust file is too large to scan; nothing was examined` and passes. The hook
+says so out loud rather than passing silently, which is deliberate — but a green commit here does
+**not** mean scanned code. Tracked as frankentorch-0o6ai.
+
 ### Test Categories
 
 | Crate | Focus Areas |
