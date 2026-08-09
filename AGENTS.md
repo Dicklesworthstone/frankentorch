@@ -140,6 +140,35 @@ rch exec -- cargo fmt --check
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
+### Before fixing a hot path: prove which path actually executes
+
+Reading a long function to decide where a bug lives is unreliable, and this codebase has functions
+long enough to make it actively misleading — `tensor_pdist` and `tensor_cdist` each carry several
+`if p == 2.0` fast paths, gated on dtype, contiguity and `requires_grad`, in a body spanning
+hundreds of lines. **Grepping to a match and assuming it is the live one is how you fix dead code.**
+
+On frankentorch-a1nz2 that cost three wrong turns: a mechanism was asserted on a bead, the
+"fix" changed nothing, the mechanism was retracted, and a kernel-level test then exonerated the
+kernel — all before anyone looked at the top of the function, where the live paths were.
+
+**Insert a sentinel and re-run.** Make the candidate return a poison value:
+
+```rust
+if p == 2.0 && /* ... */ {
+    return self.tensor_variable(vec![-4242.0; out_len], vec![out_len], false); // TEMPORARY
+```
+
+If the observed number changes, the block is live. If it does not, it is not — and no amount of
+re-reading will change that. One run, unarguable, and it cannot be talked out of. This resolved
+a1nz2 and then re-scoped frankentorch-v8f5k, where it showed every failing case flowing through a
+single closure that source reading had put elsewhere.
+
+Corollary, also from a1nz2: **after deleting a code path, check what the tests named for it now
+compare.** A test called `*_fused_nograd_matches_composed_path` can quietly become
+composed-vs-composed and pass forever while measuring nothing. Reading that test is what exposed a
+dtype gate leaving f32-with-grad still on the buggy path, one commit after the op was declared
+fixed.
+
 ---
 
 ## Testing
