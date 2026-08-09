@@ -1,9 +1,5 @@
-// `stdarch_neon_dotprod` gates the aarch64 NEON `vdotq_s32` intrinsics used by the int8 dot
-// kernel (all behind `#[cfg(target_arch = "aarch64")]`). Enabling the unstable feature
-// unconditionally makes the whole crate fail to compile on x86 toolchains that don't carry that
-// feature name (E0635), which breaks the non-ARM half of the build/bench fleet. Gate it to
-// aarch64 so x86 never references the feature; ARM behaviour is unchanged.
-#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_dotprod))]
+// The aarch64 NEON dot-product intrinsics used below are stable on the pinned
+// toolchain; the architecture-specific implementations remain cfg-gated.
 #![deny(unsafe_code)]
 
 use std::fmt;
