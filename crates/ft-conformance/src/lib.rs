@@ -14805,10 +14805,15 @@ mod tests {
         // NaN drops both sides to 0. frankentorch-ubh2.
         #[test]
         fn fuzz_metamorphic_ge_is_complement_of_lt(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-512i16..=512i16, 1..24),
-                prop::collection::vec(-512i16..=512i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-512i16..=512i16, n),
+                        prop::collection::vec(-512i16..=512i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -14845,10 +14850,15 @@ mod tests {
         // frankentorch-17hr.
         #[test]
         fn fuzz_metamorphic_le_equals_lt_or_eq(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-512i16..=512i16, 1..24),
-                prop::collection::vec(-512i16..=512i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-512i16..=512i16, n),
+                        prop::collection::vec(-512i16..=512i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -14890,10 +14900,15 @@ mod tests {
         // and the sum is 0. frankentorch-1h48.
         #[test]
         fn fuzz_metamorphic_lt_gt_eq_trichotomy(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-512i16..=512i16, 1..24),
-                prop::collection::vec(-512i16..=512i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-512i16..=512i16, n),
+                        prop::collection::vec(-512i16..=512i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -14943,10 +14958,15 @@ mod tests {
         // equals 1. frankentorch-i2sm.
         #[test]
         fn fuzz_metamorphic_ne_is_complement_of_eq(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-512i16..=512i16, 1..24),
-                prop::collection::vec(-512i16..=512i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-512i16..=512i16, n),
+                        prop::collection::vec(-512i16..=512i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -15053,10 +15073,15 @@ mod tests {
         // frankentorch-m6tz.
         #[test]
         fn fuzz_metamorphic_max_min_pair_identities(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-1024i16..=1024i16, 1..24),
-                prop::collection::vec(-1024i16..=1024i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-1024i16..=1024i16, n),
+                        prop::collection::vec(-1024i16..=1024i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -15106,10 +15131,15 @@ mod tests {
         // small rounding. frankentorch-f96u.
         #[test]
         fn fuzz_metamorphic_remainder_quotient_identity(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-512i16..=512i16, 1..24),
-                prop::collection::vec(-512i16..=512i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-512i16..=512i16, n),
+                        prop::collection::vec(-512i16..=512i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -15205,10 +15235,15 @@ mod tests {
         // branch. frankentorch-ombw.
         #[test]
         fn fuzz_metamorphic_atan2_equals_atan_of_ratio_pos_x(
-            (y_raw, x_raw) in (
-                prop::collection::vec(-2048i16..=2048i16, 1..24),
-                prop::collection::vec(1i16..=2048i16, 1..24),
-            ).prop_filter("same length", |(y, x)| y.len() == x.len())
+            (y_raw, x_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-2048i16..=2048i16, n),
+                        prop::collection::vec(1i16..=2048i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -15398,10 +15433,15 @@ mod tests {
         // precision drift. frankentorch-95bj.
         #[test]
         fn fuzz_metamorphic_exp_of_sum_equals_product_of_exps(
-            (a_raw, b_raw) in (
-                prop::collection::vec(-500i16..=500i16, 1..24),
-                prop::collection::vec(-500i16..=500i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-500i16..=500i16, n),
+                        prop::collection::vec(-500i16..=500i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -15443,10 +15483,15 @@ mod tests {
         // path divergence. frankentorch-3zzx.
         #[test]
         fn fuzz_metamorphic_log_of_product_equals_sum_of_logs(
-            (a_raw, b_raw) in (
-                prop::collection::vec(1i16..=2048i16, 1..24),
-                prop::collection::vec(1i16..=2048i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            (a_raw, b_raw) in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(1i16..=2048i16, n),
+                        prop::collection::vec(1i16..=2048i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -23108,10 +23153,15 @@ mod tests {
         // frankentorch-rhi1.
         #[test]
         fn fuzz_metamorphic_div_equals_mul_reciprocal(
-            samples in (
-                prop::collection::vec(-512i16..512i16, 1..24),
-                prop::collection::vec(-512i16..512i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            samples in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-512i16..512i16, n),
+                        prop::collection::vec(-512i16..512i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
@@ -23161,10 +23211,15 @@ mod tests {
         // frankentorch-9ta7.
         #[test]
         fn fuzz_metamorphic_sub_equals_add_neg(
-            samples in (
-                prop::collection::vec(-1024i16..1024i16, 1..24),
-                prop::collection::vec(-1024i16..1024i16, 1..24),
-            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+            samples in (1usize..24)
+                // frankentorch-z11ev: build same-length inputs rather than drawing two free
+                // lengths and filtering for agreement (~93% of draws were rejected).
+                .prop_flat_map(|n| {
+                    (
+                        prop::collection::vec(-1024i16..1024i16, n),
+                        prop::collection::vec(-1024i16..1024i16, n),
+                    )
+                })
         ) {
             use ft_api::FrankenTorchSession;
 
