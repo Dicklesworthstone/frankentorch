@@ -3,6 +3,8 @@ name = "ft-core"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
+description = "Memory-safe tensor types and scalar semantics for FrankenTorch"
+repository = "https://github.com/Dicklesworthstone/frankentorch"
 
 [dependencies]
 half = { version = "2.7", features = ["bytemuck"] }

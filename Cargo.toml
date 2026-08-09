@@ -20,9 +20,10 @@ members = [
 edition = "2024"
 version = "0.1.0"
 license-file = "LICENSE"
+repository = "https://github.com/Dicklesworthstone/frankentorch"
 
 [workspace.dependencies]
-ft-core = { path = "crates/ft-core" }
+ft-core = { version = "0.1.0", path = "crates/ft-core" }
 ft-dispatch = { path = "crates/ft-dispatch" }
 ft-kernel-cpu = { path = "crates/ft-kernel-cpu" }
 ft-autograd = { path = "crates/ft-autograd" }
