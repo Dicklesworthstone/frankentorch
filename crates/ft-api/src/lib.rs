@@ -22910,14 +22910,13 @@ impl FrankenTorchSession {
         }
         // torch.pow / float_power broadcast base and exponent; expand to the
         // common shape (autograd-aware, so gradients sum back over expanded dims).
-        let (input, exponent, in_shape) = if in_shape == exp_shape {
-            (input, exponent, in_shape)
+        let (input, exponent) = if in_shape == exp_shape {
+            (input, exponent)
         } else {
             let out = Self::broadcast_shape(&in_shape, &exp_shape)?;
             (
                 self.tensor_broadcast_to(input, out.clone())?,
-                self.tensor_broadcast_to(exponent, out.clone())?,
-                out,
+                self.tensor_broadcast_to(exponent, out)?,
             )
         };
         // frankentorch-v8f5k: this used to build exp(e·ln x) as a tape graph, plus a where-mask
@@ -22930,7 +22929,6 @@ impl FrankenTorchSession {
         // requires_grad cannot disagree on a value (frankentorch-dtyiz). pow_tensor carries its
         // own create_graph closure, so second order still works — the composed graph supported it
         // and losing that would have been a regression, not a gap.
-        let _ = &in_shape;
         self.tensor_tape.pow_tensor(input, exponent, self.mode())
     }
 
