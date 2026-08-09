@@ -232,7 +232,30 @@ run_ubs_staged() {
 # hang the gate and — under the old timeout branch — FAIL the commit. That would
 # make the repo's largest crate uncommittable, so the huge files are separated out
 # and named rather than allowed to sink the whole scan.
-LARGE_FILE_THRESHOLD=50000
+# frankentorch-av6oc: DERIVED from the 120s standard budget below, not guessed.
+#
+# Measured ubs scan time on single files (no local cargo contention):
+#     ft-optim      13,594 lines ->  52s
+#     ft-autograd   31,705 lines -> 132s   (TIMED OUT against the 120s budget)
+#     ft-kernel-cpu 53,227 lines -> 208s
+# Linear at ~3.94 ms/line with ~zero intercept, so 120s buys about 30,900 lines.
+#
+# At the old value of 50000 every file between ~31k and 50k was admitted to the
+# scan under a budget that could not finish it — ft-conformance (~169s), ft-nn
+# (~147s) and ft-autograd (132s) each burned the full 120s and examined NOTHING,
+# then printed "unexpected". It was not unexpected; it was 50000 being ~1.6x the
+# budget's real capacity.
+#
+# 25000 leaves ~20% headroom for machine load (25k * 3.94ms ~= 98s of 120s).
+# Files above it are excluded and NAMED, which is the same coverage as timing out
+# but costs no time and does not report a mystery.
+#
+# ★ This constant selects BOTH the exclusion set AND which budget applies (a
+# staged over-threshold file switches the rest to the 300s extended path), so it
+# cannot be retuned independently of those timeouts — raising it to admit a big
+# file would simultaneously DROP that file to the 120s budget. See
+# frankentorch-0o6ai.
+LARGE_FILE_THRESHOLD=25000
 SCANNABLE_RS=""
 UNSCANNABLE_RS=""
 
