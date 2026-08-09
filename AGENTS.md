@@ -235,7 +235,17 @@ exactly two files: `ft-api/src/lib.rs` (167,287) and `ft-kernel-cpu/src/lib.rs` 
 the op surface and the kernels, i.e. where parity bugs actually live. A commit touching only ft-api
 prints `ubs: every staged Rust file is too large to scan; nothing was examined` and passes. The hook
 says so out loud rather than passing silently, which is deliberate — but a green commit here does
-**not** mean scanned code. Tracked as frankentorch-0o6ai.
+**not** mean scanned code.
+
+**That blind spot was scanned out-of-band and it hides nothing** (frankentorch-0o6ai, closed).
+`ft-kernel-cpu` scans in 208s with **Critical: 0**. `ft-api` scans only with `UBS_MODULE_TIMEOUT`
+raised well past its 300s default, and reports **1432 Criticals of which 1432 are false positives**:
+1430 are one rule, *"Secret, signature, or token compared with ==/!="*, firing on `dtype ==
+DType::Complex64` and `real_meta.shape() != imag_meta.shape()`; the other 2 flag `Instant::now()` in
+a benchmark as "security token generated with non-cryptographic randomness". Security rules
+misapplied to a numerics library. **Do not spend effort closing this coverage gap** — and do not
+raise `LARGE_FILE_THRESHOLD`, which also selects the timeout budget, so admitting a file drops it
+from the 300s extended path to the 120s standard one and it times out having scanned nothing.
 
 ### Test Categories
 
