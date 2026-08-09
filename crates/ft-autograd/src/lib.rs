@@ -6735,6 +6735,86 @@ impl TensorTape {
         ))
     }
 
+    /// `base ^ exponent` with a TENSOR exponent, matching `torch.pow`.
+    ///
+    /// frankentorch-v8f5k. ft-api's `tensor_pow_tensor` computed `x^e` as `exp(e * ln x)` on BOTH
+    /// its fused and composed paths. `ln` is NaN below zero, so the whole negative half-line
+    /// returned NaN where torch gives `(-2)^3 == -8`, and small integer powers were off by an ULP
+    /// (`2^3 -> 7.999999999999998`). This is the torch-correct primitive both paths route through.
+    ///
+    /// Built on [`Self::apply_function_with_create_graph`] rather than a new `TensorNodeOp`: the
+    /// composed path this replaces supports second order TODAY, so shipping without a create_graph
+    /// closure would be a capability REGRESSION rather than a gap.
+    ///
+    /// The create_graph closure calls this method RECURSIVELY for `x^(e-1)`. That is not circular:
+    /// it only runs when a second backward is actually taken, and each level adds one node. It is
+    /// also the only route available — the closure receives the INPUT nodes and never the output,
+    /// so the `x^(e-1) == y/x` shortcut is unusable, and rebuilding it from `exp`/`log` would
+    /// silently reintroduce the very bug being fixed, in the second derivative.
+    pub fn pow_tensor(
+        &mut self,
+        base: TensorNodeId,
+        exponent: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.apply_function_with_create_graph(
+            &[base, exponent],
+            |ctx, inputs| {
+                let (x_vals, x_shape) = inputs[0];
+                let (e_vals, _) = inputs[1];
+                if ctx.needs_input_grad().iter().any(|&g| g) {
+                    ctx.save_for_backward(x_vals.to_vec(), x_shape.to_vec());
+                    ctx.save_for_backward(e_vals.to_vec(), x_shape.to_vec());
+                }
+                // 0^0 -> 1, the rule the previous composed path applied via a where-mask.
+                let out: Vec<f64> = x_vals
+                    .iter()
+                    .zip(e_vals.iter())
+                    .map(|(&x, &e)| if x == 0.0 && e == 0.0 { 1.0 } else { x.powf(e) })
+                    .collect();
+                Ok((out, x_shape.to_vec()))
+            },
+            |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let (x_vals, e_vals) = (&saved[0], &saved[1]);
+                let needs = ctx.needs_input_grad();
+                // d(x^e)/dx = e * x^(e-1);  d(x^e)/de = x^e * ln(x).
+                let grad_base = needs[0].then(|| {
+                    grad_out
+                        .iter()
+                        .zip(x_vals.iter().zip(e_vals.iter()))
+                        .map(|(&g, (&x, &e))| g * e * x.powf(e - 1.0))
+                        .collect::<Vec<f64>>()
+                });
+                let grad_exp = needs[1].then(|| {
+                    grad_out
+                        .iter()
+                        .zip(x_vals.iter().zip(e_vals.iter()))
+                        .map(|(&g, (&x, &e))| g * x.powf(e) * x.ln())
+                        .collect::<Vec<f64>>()
+                });
+                Ok(vec![grad_base, grad_exp])
+            },
+            move |_ctx, grad_outs, inputs, tape| {
+                let (x, e) = (inputs[0], inputs[1]);
+                let shape = tape.node(x)?.tensor.meta().shape().to_vec();
+                let numel = Self::checked_shape_numel(&shape, "pow_tensor create_graph overflow")?;
+                // TensorTape has no add_scalar, so e-1 comes from a constant leaf.
+                let minus_one = tape.leaf(vec![-1.0; numel], shape, false)?;
+                let e_minus_one = tape.add(e, minus_one, mode)?.0;
+                let x_pow_e_minus_one = tape.pow_tensor(x, e_minus_one, mode)?;
+                let d_base = tape.mul(e, x_pow_e_minus_one, mode)?.0;
+                let grad_base = tape.mul(grad_outs[0], d_base, mode)?.0;
+                let y = tape.pow_tensor(x, e, mode)?;
+                let ln_x = tape.log(x, mode)?.0;
+                let d_exp = tape.mul(y, ln_x, mode)?.0;
+                let grad_exp = tape.mul(grad_outs[0], d_exp, mode)?.0;
+                Ok(vec![Some(grad_base), Some(grad_exp)])
+            },
+        )
+    }
+
     pub fn pow(
         &mut self,
         input: TensorNodeId,

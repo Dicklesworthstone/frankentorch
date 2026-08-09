@@ -22890,7 +22890,9 @@ impl FrankenTorchSession {
                                 if x == 0.0 && e == 0.0 {
                                     1.0
                                 } else {
-                                    (e * x.ln()).exp()
+                                    // frankentorch-v8f5k: was (e * x.ln()).exp(), which is NaN for
+                                    // every negative base and an ULP off on small integer powers.
+                                    x.powf(e)
                                 }
                             })
                             .collect();
@@ -22918,20 +22920,18 @@ impl FrankenTorchSession {
                 out,
             )
         };
-        let log_x = self.tensor_log(input)?;
-        let exp_times_log = self.tensor_mul(exponent, log_x)?;
-        let raw_result = self.tensor_exp(exp_times_log)?;
-
-        // 0^0 → 1 via where-mask. Both masks are non-grad boolean
-        // tensors; their elementwise product is the logical AND. One
-        // zero constant shared between the two equality comparisons
-        // (frankentorch-cc2o) — eq only reads its comparand.
-        let zeros = self.full(in_shape.clone(), 0.0, false)?;
-        let ones_const = self.full(in_shape, 1.0, false)?;
-        let x_eq_zero = self.tensor_eq(input, zeros)?;
-        let e_eq_zero = self.tensor_eq(exponent, zeros)?;
-        let both_zero = self.tensor_mul(x_eq_zero, e_eq_zero)?;
-        self.tensor_where(both_zero, ones_const, raw_result)
+        // frankentorch-v8f5k: this used to build exp(e·ln x) as a tape graph, plus a where-mask
+        // for 0^0. `ln` is NaN below zero, so it returned NaN for EVERY negative base where torch
+        // gives (-2)^3 == -8, and it was an ULP off on small integer powers. The fused no-grad
+        // path above was bit-exact to THIS, which is why a fused==composed lock test passed while
+        // both were wrong — the trap recorded on frankentorch-lerp-fma-parity.
+        //
+        // Both paths now route through the same torch-correct primitive, so no-grad and
+        // requires_grad cannot disagree on a value (frankentorch-dtyiz). pow_tensor carries its
+        // own create_graph closure, so second order still works — the composed graph supported it
+        // and losing that would have been a regression, not a gap.
+        let _ = &in_shape;
+        self.tensor_tape.pow_tensor(input, exponent, self.mode())
     }
 
     pub fn tensor_min(
