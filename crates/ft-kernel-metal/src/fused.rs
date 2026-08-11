@@ -83,6 +83,51 @@ kernel void matmul_bias_sg(
         if (gr<M&&gc<N){float v=Cs[r*SGN+c]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}
 }
 
+// Same simdgroup GEMM with the weight operand ALREADY half (uploaded once as
+// f16 — identical bits to the per-tile f32->f16 conversion the f32-B kernel
+// performs, so results are bit-identical while halving weight bandwidth and
+// skipping the per-window conversion).
+kernel void matmul_bias_sgh(
+    device const float* A [[buffer(0)]], device const half* B [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* C [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],   // M,K,N,has_bias
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint M=dims.x,K=dims.y,N=dims.z; const uint hb=dims.w;
+    threadgroup half As[SGM*SGK];
+    threadgroup half Bs[SGK*SGN];
+    threadgroup float Cs[SGM*SGN];
+    const uint rowBase=gid.y*SGM, colBase=gid.x*SGN;
+    simdgroup_float8x8 acc[8];
+    for (uint i=0;i<8;i++) acc[i]=make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    for (uint k0=0;k0<K;k0+=SGK) {
+        for (uint i=lid;i<SGM*SGK;i+=SGTHREADS){uint m=i/SGK,k=i%SGK;uint gr=rowBase+m,gk=k0+k;
+            half hv=half(A[min(gr,M-1)*K+min(gk,K-1)]);
+            As[m*SGK+k]=(gr<M&&gk<K)?hv:half(0.0f);}
+        for (uint i=lid;i<SGK*SGN;i+=SGTHREADS){uint k=i/SGN,n=i%SGN;uint gk=k0+k,gc=colBase+n;
+            half hv=B[min(gk,K-1)*N+min(gc,N-1)];
+            Bs[k*SGN+n]=(gk<K&&gc<N)?hv:half(0.0f);}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kb=0;kb<SGK/8;kb++) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, As + (sgid*8)*SGK + kb*8, SGK);
+            for (uint cb=0;cb<8;cb++) {
+                simdgroup_half8x8 b;
+                simdgroup_load(b, Bs + (kb*8)*SGN + cb*8, SGN);
+                simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint cb=0;cb<8;cb++)
+        simdgroup_store(acc[cb], Cs + (sgid*8)*SGN + cb*8, SGN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i=lid;i<SGM*SGN;i+=SGTHREADS){uint r=i/SGN,c=i%SGN;uint gr=rowBase+r,gc=colBase+c;
+        if (gr<M&&gc<N){float v=Cs[r*SGN+c]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}
+}
+
 #define BM 64
 #define BN 64
 #define BK 16
@@ -106,6 +151,39 @@ kernel void matmul_bias(
             As[k][m]=(gr<M&&gk<K)?A[gr*K+gk]:0.0f;}
         for (uint i=lid;i<BK*BN;i+=256){uint k=i/BN,n=i%BN;uint gk=k0+k,gc=colBase+n;
             Bs[k][n]=(gk<K&&gc<N)?B[gk*N+gc]:0.0f;}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k=0;k<BK;k++){float aReg[TM],bReg[TN];
+            for (uint i=0;i<TM;i++) aReg[i]=As[k][tRow*TM+i];
+            for (uint j=0;j<TN;j++) bReg[j]=Bs[k][tCol*TN+j];
+            for (uint i=0;i<TM;i++) for (uint j=0;j<TN;j++) acc[i][j]+=aReg[i]*bReg[j];}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i=0;i<TM;i++){uint gr=rowBase+tRow*TM+i; if(gr>=M) continue;
+        for (uint j=0;j<TN;j++){uint gc=colBase+tCol*TN+j; if(gc<N){
+            float v=acc[i][j]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}}
+}
+
+// v1 hand-tiled kernel with a half weight operand (rollback arm for the f16
+// weight path when FT_METAL_SG_GEMM=0): identical to matmul_bias except the
+// B tile widens half->float on load.
+kernel void matmul_bias_h(
+    device const float* A [[buffer(0)]], device const half* B [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* C [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],
+    uint2 gid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]])
+{
+    const uint M=dims.x,K=dims.y,N=dims.z; const uint hb=dims.w;
+    threadgroup float As[BK][BM]; threadgroup float Bs[BK][BN];
+    const uint tRow=lid/(BN/TN), tCol=lid%(BN/TN);
+    const uint rowBase=gid.y*BM, colBase=gid.x*BN;
+    float acc[TM][TN]; for (uint i=0;i<TM;i++) for (uint j=0;j<TN;j++) acc[i][j]=0.0f;
+    for (uint k0=0;k0<K;k0+=BK) {
+        for (uint i=lid;i<BM*BK;i+=256){uint m=i/BK,k=i%BK;uint gr=rowBase+m,gk=k0+k;
+            float v=float(A[min(gr,M-1)*K+min(gk,K-1)]);
+            As[k][m]=(gr<M&&gk<K)?v:0.0f;}
+        for (uint i=lid;i<BK*BN;i+=256){uint k=i/BN,n=i%BN;uint gk=k0+k,gc=colBase+n;
+            float v=float(B[min(gk,K-1)*N+min(gc,N-1)]);
+            Bs[k][n]=(gk<K&&gc<N)?v:0.0f;}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint k=0;k<BK;k++){float aReg[TM],bReg[TN];
             for (uint i=0;i<TM;i++) aReg[i]=As[k][tRow*TM+i];
@@ -322,6 +400,8 @@ struct Pipes {
     queue: metal::CommandQueue,
     matmul_bias: ComputePipelineState,
     matmul_bias_sg: ComputePipelineState,
+    matmul_bias_sgh: ComputePipelineState,
+    matmul_bias_h: ComputePipelineState,
     layernorm: ComputePipelineState,
     gelu: ComputePipelineState,
     addv: ComputePipelineState,
@@ -354,6 +434,8 @@ fn pipes() -> Option<&'static Pipes> {
             Some(Pipes {
                 matmul_bias: p("matmul_bias")?,
                 matmul_bias_sg: p("matmul_bias_sg")?,
+                matmul_bias_sgh: p("matmul_bias_sgh")?,
+                matmul_bias_h: p("matmul_bias_h")?,
                 layernorm: p("layernorm")?,
                 gelu: p("gelu")?,
                 addv: p("addv")?,
@@ -410,6 +492,42 @@ impl GpuTensor {
         let n = self.rows * self.cols;
         let out = unsafe { std::slice::from_raw_parts(self.buf.contents() as *const f32, n) };
         out.to_vec()
+    }
+}
+
+/// A `[rows, cols]` row-major **f16** tensor resident in GPU memory, for
+/// weights: uploaded once via f32→f16 conversion (bit-identical to the
+/// per-tile conversion the f32-operand kernels perform), halving resident
+/// weight bytes and per-window weight bandwidth.
+pub struct GpuWeightF16 {
+    buf: Buffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl GpuWeightF16 {
+    /// Convert a row-major f32 slice to f16 and upload it once.
+    pub fn upload(data: &[f32], rows: usize, cols: usize) -> Result<GpuWeightF16, Error> {
+        let p = pipes().ok_or(Error::Unavailable)?;
+        if data.len() != rows * cols {
+            return Err(Error::Kernel(format!(
+                "upload_f16 shape: {} != {rows}x{cols}",
+                data.len()
+            )));
+        }
+        let h: Vec<u16> = data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        Ok(GpuWeightF16 {
+            buf: p.device.new_buffer_with_data(
+                h.as_ptr() as *const _,
+                (h.len() * 2).max(4) as u64,
+                SHARED,
+            ),
+            rows,
+            cols,
+        })
     }
 }
 
@@ -478,6 +596,38 @@ impl<'a> Batch<'a> {
         enc.set_buffer(3, Some(&out.buf), 0);
         enc.set_buffer(4, Some(&dims), 0);
         // Both kernels use 64x64 output tiles with 256-thread threadgroups.
+        let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+        enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        out
+    }
+
+    /// `matmul_bias` with a resident **f16** weight operand: bit-identical to
+    /// the f32-weight kernels (they convert B to f16 per tile anyway) at half
+    /// the weight bandwidth. `FT_METAL_SG_GEMM=0` selects the v1-layout arm.
+    pub fn matmul_bias_w16(
+        &self,
+        a: &GpuTensor,
+        w: &GpuWeightF16,
+        bias: Option<&GpuTensor>,
+    ) -> GpuTensor {
+        let (m, k, n) = (a.rows, a.cols, w.cols);
+        let out = GpuTensor::new_uninit(&self.p.device, m, n);
+        let dims = self.u32buf(&[m as u32, k as u32, n as u32, bias.is_some() as u32]);
+        let zero = self.p.device.new_buffer(4, SHARED);
+        let bb = bias.map_or(&zero, |b| &b.buf);
+        let v1 = matches!(std::env::var("FT_METAL_SG_GEMM").ok().as_deref(), Some("0"));
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(if v1 {
+            &self.p.matmul_bias_h
+        } else {
+            &self.p.matmul_bias_sgh
+        });
+        enc.set_buffer(0, Some(&a.buf), 0);
+        enc.set_buffer(1, Some(&w.buf), 0);
+        enc.set_buffer(2, Some(bb), 0);
+        enc.set_buffer(3, Some(&out.buf), 0);
+        enc.set_buffer(4, Some(&dims), 0);
         let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
         enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
         enc.end_encoding();
@@ -639,18 +789,22 @@ pub const LN_EPS: f32 = 1e-5;
 struct LayerWeightsGpu {
     ln1_g: GpuTensor,
     ln1_b: GpuTensor,
-    wq: GpuTensor,
+    // The six large projection weights are resident as f16 (bit-identical to
+    // the per-tile f32->f16 conversion the GEMM kernels perform, at half the
+    // resident bytes and per-window bandwidth). Norm params and biases stay
+    // f32 — they participate in f32 arithmetic.
+    wq: GpuWeightF16,
     bq: GpuTensor,
-    wk: GpuTensor,
-    wv: GpuTensor,
+    wk: GpuWeightF16,
+    wv: GpuWeightF16,
     bv: GpuTensor,
-    wo: GpuTensor,
+    wo: GpuWeightF16,
     bo: GpuTensor,
     ln2_g: GpuTensor,
     ln2_b: GpuTensor,
-    w1: GpuTensor,
+    w1: GpuWeightF16,
     b1: GpuTensor,
-    w2: GpuTensor,
+    w2: GpuWeightF16,
     b2: GpuTensor,
 }
 
@@ -707,18 +861,18 @@ impl EncoderGpu {
             gl.push(LayerWeightsGpu {
                 ln1_g: GpuTensor::upload(l.ln1_g, 1, d_model)?,
                 ln1_b: GpuTensor::upload(l.ln1_b, 1, d_model)?,
-                wq: GpuTensor::upload(l.wq, d_model, d_model)?,
+                wq: GpuWeightF16::upload(l.wq, d_model, d_model)?,
                 bq: GpuTensor::upload(l.bq, 1, d_model)?,
-                wk: GpuTensor::upload(l.wk, d_model, d_model)?,
-                wv: GpuTensor::upload(l.wv, d_model, d_model)?,
+                wk: GpuWeightF16::upload(l.wk, d_model, d_model)?,
+                wv: GpuWeightF16::upload(l.wv, d_model, d_model)?,
                 bv: GpuTensor::upload(l.bv, 1, d_model)?,
-                wo: GpuTensor::upload(l.wo, d_model, d_model)?,
+                wo: GpuWeightF16::upload(l.wo, d_model, d_model)?,
                 bo: GpuTensor::upload(l.bo, 1, d_model)?,
                 ln2_g: GpuTensor::upload(l.ln2_g, 1, d_model)?,
                 ln2_b: GpuTensor::upload(l.ln2_b, 1, d_model)?,
-                w1: GpuTensor::upload(l.w1, d_model, d_ff)?,
+                w1: GpuWeightF16::upload(l.w1, d_model, d_ff)?,
                 b1: GpuTensor::upload(l.b1, 1, d_ff)?,
-                w2: GpuTensor::upload(l.w2, d_ff, d_model)?,
+                w2: GpuWeightF16::upload(l.w2, d_ff, d_model)?,
                 b2: GpuTensor::upload(l.b2, 1, d_model)?,
             });
         }
@@ -761,16 +915,16 @@ impl EncoderGpu {
             let mut keep: Vec<GpuTensor> = Vec::with_capacity(layers.len() * 12);
             for l in layers {
                 let n1 = b.layernorm(&x, &l.ln1_g, &l.ln1_b, LN_EPS);
-                let q = b.matmul_bias(&n1, &l.wq, Some(&l.bq));
-                let k = b.matmul_bias(&n1, &l.wk, None);
-                let v = b.matmul_bias(&n1, &l.wv, Some(&l.bv));
+                let q = b.matmul_bias_w16(&n1, &l.wq, Some(&l.bq));
+                let k = b.matmul_bias_w16(&n1, &l.wk, None);
+                let v = b.matmul_bias_w16(&n1, &l.wv, Some(&l.bv));
                 let attn = b.mha(&q, &k, &v, self.n_heads);
-                let ao = b.matmul_bias(&attn, &l.wo, Some(&l.bo));
+                let ao = b.matmul_bias_w16(&attn, &l.wo, Some(&l.bo));
                 let x1 = b.add(&x, &ao);
                 let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
-                let fc = b.matmul_bias(&n2, &l.w1, Some(&l.b1));
+                let fc = b.matmul_bias_w16(&n2, &l.w1, Some(&l.b1));
                 let g = b.gelu(&fc);
-                let proj = b.matmul_bias(&g, &l.w2, Some(&l.b2));
+                let proj = b.matmul_bias_w16(&g, &l.w2, Some(&l.b2));
                 let x2 = b.add(&x1, &proj);
                 keep.extend([n1, q, k, v, attn, ao, x1, n2, fc, g, proj]);
                 let prev = std::mem::replace(&mut x, x2);
