@@ -733,26 +733,36 @@ impl EncoderGpu {
                 self.d_model
             )));
         }
-        let mut x = GpuTensor::upload(input, seq, self.d_model)?;
+        let x0 = GpuTensor::upload(input, seq, self.d_model)?;
+        // ONE command buffer for the whole stack: Metal hazard-tracks the shared
+        // buffers, so all 32 layers pipeline back-to-back with a single
+        // commit+wait instead of 32 (each per-layer sync costs scheduling gaps
+        // on both sides). Intermediates are kept alive until `finish` — the
+        // encoders reference their buffers until the command buffer completes.
+        let b = Batch::new()?;
+        let mut keep: Vec<GpuTensor> = Vec::with_capacity(self.layers.len() * 12 + 1);
+        let mut x_idx = 0usize;
+        keep.push(x0);
         for l in &self.layers {
-            // One command buffer per layer: all ops chain GPU-resident, one sync.
-            let b = Batch::new()?;
-            let n1 = b.layernorm(&x, &l.ln1_g, &l.ln1_b, LN_EPS);
+            let x = &keep[x_idx];
+            let n1 = b.layernorm(x, &l.ln1_g, &l.ln1_b, LN_EPS);
             let q = b.matmul_bias(&n1, &l.wq, Some(&l.bq));
             let k = b.matmul_bias(&n1, &l.wk, None);
             let v = b.matmul_bias(&n1, &l.wv, Some(&l.bv));
             let attn = b.mha(&q, &k, &v, self.n_heads);
             let ao = b.matmul_bias(&attn, &l.wo, Some(&l.bo));
-            let x1 = b.add(&x, &ao);
+            let x1 = b.add(x, &ao);
             let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
             let fc = b.matmul_bias(&n2, &l.w1, Some(&l.b1));
             let g = b.gelu(&fc);
             let proj = b.matmul_bias(&g, &l.w2, Some(&l.b2));
             let x2 = b.add(&x1, &proj);
-            b.finish();
-            x = x2; // resident output carried to the next layer
+            keep.extend([n1, q, k, v, attn, ao, x1, n2, fc, g, proj]);
+            keep.push(x2);
+            x_idx = keep.len() - 1;
         }
-        Ok(x.download())
+        b.finish();
+        Ok(keep[x_idx].download())
     }
 }
 
