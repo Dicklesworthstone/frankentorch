@@ -55,10 +55,15 @@ kernel void matmul_bias_sg(
     simdgroup_float8x8 acc[8];
     for (uint i=0;i<8;i++) acc[i]=make_filled_simdgroup_matrix<float,8,8>(0.0f);
     for (uint k0=0;k0<K;k0+=SGK) {
+        // Edge tiles: clamp the source index so the device load is always
+        // in-bounds, then select zero. A guarded-ternary OOB address can
+        // still be speculated by the compiler.
         for (uint i=lid;i<SGM*SGK;i+=SGTHREADS){uint m=i/SGK,k=i%SGK;uint gr=rowBase+m,gk=k0+k;
-            As[m*SGK+k]=(gr<M&&gk<K)?half(A[gr*K+gk]):half(0.0f);}
+            half hv=half(A[min(gr,M-1)*K+min(gk,K-1)]);
+            As[m*SGK+k]=(gr<M&&gk<K)?hv:half(0.0f);}
         for (uint i=lid;i<SGK*SGN;i+=SGTHREADS){uint k=i/SGN,n=i%SGN;uint gk=k0+k,gc=colBase+n;
-            Bs[k*SGN+n]=(gk<K&&gc<N)?half(B[gk*N+gc]):half(0.0f);}
+            half hv=half(B[min(gk,K-1)*N+min(gc,N-1)]);
+            Bs[k*SGN+n]=(gk<K&&gc<N)?hv:half(0.0f);}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kb=0;kb<SGK/8;kb++) {
             simdgroup_half8x8 a;
@@ -249,17 +254,22 @@ kernel void attn_flash2(
     const uint seq=dims.x, d=dims.y; const uint h=tg.y; const uint qi=tg.x*F2Q+lid;
     device const float4* Q4 = (device const float4*)(Q);
     const uint d4 = d/4;
+    // Clamp source rows so edge-threadgroup device loads stay in-bounds
+    // (a guarded-ternary OOB address can still be speculated), then zero.
+    const uint qr = min(qi, seq-1);
     float4 q[16];
-    for (uint e=0;e<16;e++) q[e]=(qi<seq)?Q4[qi*d4 + (h*FHD)/4 + e]:float4(0.0f);
+    for (uint e=0;e<16;e++){float4 v=Q4[qr*d4 + (h*FHD)/4 + e]; q[e]=(qi<seq)?v:float4(0.0f);}
     float m=-INFINITY, l=0.0f; float4 acc[16]; for (uint e=0;e<16;e++) acc[e]=float4(0.0f);
     threadgroup float4 Ks[F2K][16]; threadgroup float4 Vs[F2K][16];
     device const float4* K4 = (device const float4*)(K);
     device const float4* V4 = (device const float4*)(V);
     for (uint k0=0;k0<seq;k0+=F2K) {
         for (uint idx=lid; idx<F2K*16; idx+=F2Q) {
-            uint kk=idx/16, e=idx%16; uint kj=k0+kk;
-            Ks[kk][e]=(kj<seq)?K4[kj*d4 + (h*FHD)/4 + e]:float4(0.0f);
-            Vs[kk][e]=(kj<seq)?V4[kj*d4 + (h*FHD)/4 + e]:float4(0.0f);
+            uint kk=idx/16, e=idx%16; uint kj=k0+kk; uint kr=min(kj,seq-1);
+            float4 kv=K4[kr*d4 + (h*FHD)/4 + e];
+            float4 vv=V4[kr*d4 + (h*FHD)/4 + e];
+            Ks[kk][e]=(kj<seq)?kv:float4(0.0f);
+            Vs[kk][e]=(kj<seq)?vv:float4(0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint kmax=min((uint)F2K, seq-k0);
@@ -729,36 +739,46 @@ impl EncoderGpu {
                 self.d_model
             )));
         }
-        let x0 = GpuTensor::upload(input, seq, self.d_model)?;
-        // ONE command buffer for the whole stack: Metal hazard-tracks the shared
-        // buffers, so all 32 layers pipeline back-to-back with a single
-        // commit+wait instead of 32 (each per-layer sync costs scheduling gaps
-        // on both sides). Intermediates are kept alive until `finish` — the
-        // encoders reference their buffers until the command buffer completes.
-        let b = Batch::new()?;
-        let mut keep: Vec<GpuTensor> = Vec::with_capacity(self.layers.len() * 12 + 1);
-        let mut x_idx = 0usize;
-        keep.push(x0);
-        for l in &self.layers {
-            let x = &keep[x_idx];
-            let n1 = b.layernorm(x, &l.ln1_g, &l.ln1_b, LN_EPS);
-            let q = b.matmul_bias(&n1, &l.wq, Some(&l.bq));
-            let k = b.matmul_bias(&n1, &l.wk, None);
-            let v = b.matmul_bias(&n1, &l.wv, Some(&l.bv));
-            let attn = b.mha(&q, &k, &v, self.n_heads);
-            let ao = b.matmul_bias(&attn, &l.wo, Some(&l.bo));
-            let x1 = b.add(x, &ao);
-            let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
-            let fc = b.matmul_bias(&n2, &l.w1, Some(&l.b1));
-            let g = b.gelu(&fc);
-            let proj = b.matmul_bias(&g, &l.w2, Some(&l.b2));
-            let x2 = b.add(&x1, &proj);
-            keep.extend([n1, q, k, v, attn, ao, x1, n2, fc, g, proj]);
-            keep.push(x2);
-            x_idx = keep.len() - 1;
+        let mut x = GpuTensor::upload(input, seq, self.d_model)?;
+        // Layers are encoded in CHUNKS of command buffers (default 8 layers per
+        // buffer, `FT_METAL_ENC_CHUNK` overrides). One buffer for the whole
+        // stack minimizes syncs but commits every intermediate at once — Metal
+        // retains each encoded buffer until its command buffer completes, and
+        // at turbo shape (seq 1500, d 1280) 32 layers of intermediates are
+        // ~4.2 GB of live unified memory: a paging/jetsam hazard on smaller
+        // machines. Chunking bounds that to ~chunk/32 of the stack (~1 GB at
+        // the default) while keeping the sync count at layers/chunk instead
+        // of one per layer.
+        let chunk = std::env::var("FT_METAL_ENC_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|c| *c >= 1)
+            .unwrap_or(8);
+        for layers in self.layers.chunks(chunk) {
+            let b = Batch::new()?;
+            // Chunk-local intermediates stay alive until this chunk's `finish`,
+            // then drop — releasing their buffers before the next chunk encodes.
+            let mut keep: Vec<GpuTensor> = Vec::with_capacity(layers.len() * 12);
+            for l in layers {
+                let n1 = b.layernorm(&x, &l.ln1_g, &l.ln1_b, LN_EPS);
+                let q = b.matmul_bias(&n1, &l.wq, Some(&l.bq));
+                let k = b.matmul_bias(&n1, &l.wk, None);
+                let v = b.matmul_bias(&n1, &l.wv, Some(&l.bv));
+                let attn = b.mha(&q, &k, &v, self.n_heads);
+                let ao = b.matmul_bias(&attn, &l.wo, Some(&l.bo));
+                let x1 = b.add(&x, &ao);
+                let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
+                let fc = b.matmul_bias(&n2, &l.w1, Some(&l.b1));
+                let g = b.gelu(&fc);
+                let proj = b.matmul_bias(&g, &l.w2, Some(&l.b2));
+                let x2 = b.add(&x1, &proj);
+                keep.extend([n1, q, k, v, attn, ao, x1, n2, fc, g, proj]);
+                let prev = std::mem::replace(&mut x, x2);
+                keep.push(prev);
+            }
+            b.finish();
         }
-        b.finish();
-        Ok(keep[x_idx].download())
+        Ok(x.download())
     }
 }
 
