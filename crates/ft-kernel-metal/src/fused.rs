@@ -455,10 +455,7 @@ impl<'a> Batch<'a> {
         let dims = self.u32buf(&[m as u32, k as u32, n as u32, bias.is_some() as u32]);
         let zero = self.p.device.new_buffer(4, SHARED);
         let bb = bias.map_or(&zero, |b| &b.buf);
-        let v1 = matches!(
-            std::env::var("FT_METAL_SG_GEMM").ok().as_deref(),
-            Some("0")
-        );
+        let v1 = matches!(std::env::var("FT_METAL_SG_GEMM").ok().as_deref(), Some("0"));
         let enc = self.cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(if v1 {
             &self.p.matmul_bias

@@ -9,7 +9,9 @@
 use ft_kernel_metal::fused::{Batch, GpuTensor};
 
 fn bench_shape(m: usize, k: usize, n: usize, reps: usize) {
-    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.05).collect();
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.05)
+        .collect();
     let w: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32) * 0.02 - 0.06).collect();
     let bias: Vec<f32> = (0..n).map(|i| (i % 3) as f32 * 0.1).collect();
     let ga = GpuTensor::upload(&a, m, k).expect("upload a");
