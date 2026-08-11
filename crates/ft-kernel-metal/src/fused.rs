@@ -455,10 +455,7 @@ impl<'a> Batch<'a> {
         let dims = self.u32buf(&[m as u32, k as u32, n as u32, bias.is_some() as u32]);
         let zero = self.p.device.new_buffer(4, SHARED);
         let bb = bias.map_or(&zero, |b| &b.buf);
-        let v1 = matches!(
-            std::env::var("FT_METAL_SG_GEMM").ok().as_deref(),
-            Some("0")
-        );
+        let v1 = matches!(std::env::var("FT_METAL_SG_GEMM").ok().as_deref(), Some("0"));
         let enc = self.cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(if v1 {
             &self.p.matmul_bias
@@ -470,13 +467,9 @@ impl<'a> Batch<'a> {
         enc.set_buffer(2, Some(bb), 0);
         enc.set_buffer(3, Some(&out.buf), 0);
         enc.set_buffer(4, Some(&dims), 0);
-        if v1 {
-            let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
-            enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
-        } else {
-            let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
-            enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
-        }
+        // Both kernels use 64x64 output tiles with 256-thread threadgroups.
+        let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+        enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
         enc.end_encoding();
         out
     }

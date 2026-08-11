@@ -64,7 +64,10 @@ fn main() {
         b.finish();
         best_all = best_all.min(t.elapsed().as_secs_f64() * 1e3);
     }
-    println!("whole layer (1 batch, 1 sync): best {best_all:8.2} ms  -> x32 layers = {:7.2} s", best_all * 32.0 / 1e3);
+    println!(
+        "whole layer (1 batch, 1 sync): best {best_all:8.2} ms  -> x32 layers = {:7.2} s",
+        best_all * 32.0 / 1e3
+    );
 
     // Per-op attribution (separate batch + sync per op class; sync overhead
     // inflates each row a little, so rows can sum above the whole-layer time).
@@ -92,15 +95,25 @@ fn main() {
 
     println!("per-op (separate sync each):");
     let mut sum = 0.0;
-    sum += time_op("layernorm [1500x1280]", &|b| b.layernorm(&x, &ln_g, &ln_b, LN_EPS));
-    sum += time_op("matmul q [1280->1280]", &|b| b.matmul_bias(&n1, &wq, Some(&bq)));
+    sum += time_op("layernorm [1500x1280]", &|b| {
+        b.layernorm(&x, &ln_g, &ln_b, LN_EPS)
+    });
+    sum += time_op("matmul q [1280->1280]", &|b| {
+        b.matmul_bias(&n1, &wq, Some(&bq))
+    });
     sum += 2.0 * time_op("matmul k/v (x2)", &|b| b.matmul_bias(&n1, &wk, None));
     sum += time_op("mha flash (20 heads)", &|b| b.mha(&q, &k, &vv, NH));
-    sum += time_op("matmul out [1280->1280]", &|b| b.matmul_bias(&q, &wo, Some(&bo)));
+    sum += time_op("matmul out [1280->1280]", &|b| {
+        b.matmul_bias(&q, &wo, Some(&bo))
+    });
     sum += 2.0 * time_op("residual add (x2)", &|b| b.add(&x, &q));
     sum += time_op("layernorm2", &|b| b.layernorm(&x, &ln_g, &ln_b, LN_EPS));
-    sum += time_op("matmul fc [1280->5120]", &|b| b.matmul_bias(&n1, &w1, Some(&b1)));
+    sum += time_op("matmul fc [1280->5120]", &|b| {
+        b.matmul_bias(&n1, &w1, Some(&b1))
+    });
     sum += time_op("gelu [1500x5120]", &|b| b.gelu(&fc));
-    sum += time_op("matmul proj [5120->1280]", &|b| b.matmul_bias(&fc, &w2, Some(&b2)));
+    sum += time_op("matmul proj [5120->1280]", &|b| {
+        b.matmul_bias(&fc, &w2, Some(&b2))
+    });
     println!("  {:<28} sum  {sum:8.2} ms", "(op rows)");
 }
