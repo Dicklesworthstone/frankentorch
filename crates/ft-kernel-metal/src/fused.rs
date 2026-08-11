@@ -25,7 +25,58 @@ const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 
 const SRC: &str = r#"
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
+
+// simdgroup_matrix GEMM: C[M,N] = A[M,K] * B[K,N] (+ bias[N] if HAS_BIAS).
+// 128 threads = 4 simdgroups per TG; each simdgroup owns an 8-row block and
+// accumulates 8x(8x8) tiles across a 64-column strip. A/B stream through
+// threadgroup memory; the C tile stages back through threadgroup memory so
+// edge rows/cols get bounds-checked scalar writes.
+#define SGM 64
+#define SGN 64
+#define SGK 32
+#define SGTHREADS 256
+kernel void matmul_bias_sg(
+    device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* C [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],   // M,K,N,has_bias
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint M=dims.x,K=dims.y,N=dims.z; const uint hb=dims.w;
+    // Tiles stage as HALF (the ggml checkpoint stores f16 weights, and this is
+    // whisper.cpp's Metal GEMM precision) with f32 simdgroup accumulators.
+    threadgroup half As[SGM*SGK];
+    threadgroup half Bs[SGK*SGN];
+    threadgroup float Cs[SGM*SGN];
+    const uint rowBase=gid.y*SGM, colBase=gid.x*SGN;
+    simdgroup_float8x8 acc[8];
+    for (uint i=0;i<8;i++) acc[i]=make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    for (uint k0=0;k0<K;k0+=SGK) {
+        for (uint i=lid;i<SGM*SGK;i+=SGTHREADS){uint m=i/SGK,k=i%SGK;uint gr=rowBase+m,gk=k0+k;
+            As[m*SGK+k]=(gr<M&&gk<K)?half(A[gr*K+gk]):half(0.0f);}
+        for (uint i=lid;i<SGK*SGN;i+=SGTHREADS){uint k=i/SGN,n=i%SGN;uint gk=k0+k,gc=colBase+n;
+            Bs[k*SGN+n]=(gk<K&&gc<N)?half(B[gk*N+gc]):half(0.0f);}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kb=0;kb<SGK/8;kb++) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, As + (sgid*8)*SGK + kb*8, SGK);
+            for (uint cb=0;cb<8;cb++) {
+                simdgroup_half8x8 b;
+                simdgroup_load(b, Bs + (kb*8)*SGN + cb*8, SGN);
+                simdgroup_multiply_accumulate(acc[cb], a, b, acc[cb]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint cb=0;cb<8;cb++)
+        simdgroup_store(acc[cb], Cs + (sgid*8)*SGN + cb*8, SGN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i=lid;i<SGM*SGN;i+=SGTHREADS){uint r=i/SGN,c=i%SGN;uint gr=rowBase+r,gc=colBase+c;
+        if (gr<M&&gc<N){float v=Cs[r*SGN+c]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}
+}
 
 #define BM 64
 #define BN 64
@@ -183,12 +234,84 @@ kernel void attn_flash(
     }
     if (qi<seq){ float inv=(l>0.0f)?1.0f/l:0.0f; for (uint e=0;e<FHD;e++) O[qi*d+h*FHD+e]=acc[e]*inv; }
 }
+
+// FlashAttention v2 (head_dim = 64): float4-vectorized q/K/V with a wider
+// threadgroup (64 queries per TG) for occupancy. Same online-softmax math as
+// attn_flash; per-thread state is float4[16] q + float4[16] acc.
+#define F2Q 64
+#define F2K 32
+kernel void attn_flash2(
+    device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]], device float* O [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]], constant float& scale [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]])
+{
+    const uint seq=dims.x, d=dims.y; const uint h=tg.y; const uint qi=tg.x*F2Q+lid;
+    device const float4* Q4 = (device const float4*)(Q);
+    const uint d4 = d/4;
+    float4 q[16];
+    for (uint e=0;e<16;e++) q[e]=(qi<seq)?Q4[qi*d4 + (h*FHD)/4 + e]:float4(0.0f);
+    float m=-INFINITY, l=0.0f; float4 acc[16]; for (uint e=0;e<16;e++) acc[e]=float4(0.0f);
+    threadgroup float4 Ks[F2K][16]; threadgroup float4 Vs[F2K][16];
+    device const float4* K4 = (device const float4*)(K);
+    device const float4* V4 = (device const float4*)(V);
+    for (uint k0=0;k0<seq;k0+=F2K) {
+        for (uint idx=lid; idx<F2K*16; idx+=F2Q) {
+            uint kk=idx/16, e=idx%16; uint kj=k0+kk;
+            Ks[kk][e]=(kj<seq)?K4[kj*d4 + (h*FHD)/4 + e]:float4(0.0f);
+            Vs[kk][e]=(kj<seq)?V4[kj*d4 + (h*FHD)/4 + e]:float4(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint kmax=min((uint)F2K, seq-k0);
+        // Block-online softmax: score 4 keys, then rescale the accumulator
+        // ONCE for the block — the per-key rescale (16 float4 FMAs each) is
+        // the serial dependency that starves the ALUs otherwise.
+        uint kk=0;
+        for (; kk+4<=kmax; kk+=4) {
+            float s[4];
+            for (uint u=0;u<4;u++) {
+                float4 s4=float4(0.0f);
+                for (uint e=0;e<16;e++) s4=fma(q[e],Ks[kk+u][e],s4);
+                s[u]=(s4.x+s4.y+s4.z+s4.w)*scale;
+            }
+            float bm=max(max(s[0],s[1]),max(s[2],s[3]));
+            float mn=max(m,bm); float corr=exp(m-mn);
+            float p0=exp(s[0]-mn),p1=exp(s[1]-mn),p2=exp(s[2]-mn),p3=exp(s[3]-mn);
+            l=l*corr+p0+p1+p2+p3;
+            for (uint e=0;e<16;e++) {
+                float4 a=acc[e]*corr;
+                a=fma(float4(p0),Vs[kk][e],a);
+                a=fma(float4(p1),Vs[kk+1][e],a);
+                a=fma(float4(p2),Vs[kk+2][e],a);
+                a=fma(float4(p3),Vs[kk+3][e],a);
+                acc[e]=a;
+            }
+            m=mn;
+        }
+        for (; kk<kmax; kk++) {
+            float4 s4=float4(0.0f);
+            for (uint e=0;e<16;e++) s4=fma(q[e],Ks[kk][e],s4);
+            float s=(s4.x+s4.y+s4.z+s4.w)*scale;
+            float mn=max(m,s); float p=exp(s-mn); float corr=exp(m-mn);
+            l=l*corr+p;
+            for (uint e=0;e<16;e++) acc[e]=acc[e]*corr+p*Vs[kk][e];
+            m=mn;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (qi<seq){
+        float inv=(l>0.0f)?1.0f/l:0.0f;
+        device float4* O4=(device float4*)(O);
+        for (uint e=0;e<16;e++) O4[qi*d4 + (h*FHD)/4 + e]=acc[e]*inv;
+    }
+}
 "#;
 
 struct Pipes {
     device: Device,
     queue: metal::CommandQueue,
     matmul_bias: ComputePipelineState,
+    matmul_bias_sg: ComputePipelineState,
     layernorm: ComputePipelineState,
     gelu: ComputePipelineState,
     addv: ComputePipelineState,
@@ -196,6 +319,7 @@ struct Pipes {
     attn_scores: ComputePipelineState,
     attn_context: ComputePipelineState,
     attn_flash: ComputePipelineState,
+    attn_flash2: ComputePipelineState,
 }
 unsafe impl Send for Pipes {}
 unsafe impl Sync for Pipes {}
@@ -219,6 +343,7 @@ fn pipes() -> Option<&'static Pipes> {
             };
             Some(Pipes {
                 matmul_bias: p("matmul_bias")?,
+                matmul_bias_sg: p("matmul_bias_sg")?,
                 layernorm: p("layernorm")?,
                 gelu: p("gelu")?,
                 addv: p("addv")?,
@@ -226,6 +351,7 @@ fn pipes() -> Option<&'static Pipes> {
                 attn_scores: p("attn_scores")?,
                 attn_context: p("attn_context")?,
                 attn_flash: p("attn_flash")?,
+                attn_flash2: p("attn_flash2")?,
                 queue: device.new_command_queue(),
                 device,
             })
@@ -320,21 +446,37 @@ impl<'a> Batch<'a> {
     }
 
     /// `out[rows_a, cols_b] = a[rows_a, cols_a] · w[cols_a, cols_b] (+ bias)`.
+    ///
+    /// Dispatches the `simdgroup_matrix` kernel by default; the hand-tiled v1
+    /// kernel stays behind `FT_METAL_SG_GEMM=0` for A/B and rollback.
     pub fn matmul_bias(&self, a: &GpuTensor, w: &GpuTensor, bias: Option<&GpuTensor>) -> GpuTensor {
         let (m, k, n) = (a.rows, a.cols, w.cols);
         let out = GpuTensor::new_uninit(&self.p.device, m, n);
         let dims = self.u32buf(&[m as u32, k as u32, n as u32, bias.is_some() as u32]);
         let zero = self.p.device.new_buffer(4, SHARED);
         let bb = bias.map_or(&zero, |b| &b.buf);
+        let v1 = matches!(
+            std::env::var("FT_METAL_SG_GEMM").ok().as_deref(),
+            Some("0")
+        );
         let enc = self.cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&self.p.matmul_bias);
+        enc.set_compute_pipeline_state(if v1 {
+            &self.p.matmul_bias
+        } else {
+            &self.p.matmul_bias_sg
+        });
         enc.set_buffer(0, Some(&a.buf), 0);
         enc.set_buffer(1, Some(&w.buf), 0);
         enc.set_buffer(2, Some(bb), 0);
         enc.set_buffer(3, Some(&out.buf), 0);
         enc.set_buffer(4, Some(&dims), 0);
-        let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
-        enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
+        if v1 {
+            let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+            enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
+        } else {
+            let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+            enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
+        }
         enc.end_encoding();
         out
     }
@@ -419,18 +561,29 @@ impl<'a> Batch<'a> {
                 .new_buffer_with_data((&scale as *const f32) as *const _, 4, SHARED);
         // FlashAttention fast path (whisper head_dim = 64): one fused dispatch that
         // streams K/V with an online softmax — the scores matrix is never materialized.
+        // v2 (float4-vectorized, 64-query threadgroups) is the default; the scalar
+        // v1 kernel stays behind `FT_METAL_FLASH_V1=1` for A/B and rollback.
         if hd == 64 {
+            let v1 = matches!(
+                std::env::var("FT_METAL_FLASH_V1").ok().as_deref(),
+                Some("1")
+            );
             let out = GpuTensor::new_uninit(&self.p.device, seq, d);
             let enc = self.cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.p.attn_flash);
+            enc.set_compute_pipeline_state(if v1 {
+                &self.p.attn_flash
+            } else {
+                &self.p.attn_flash2
+            });
             enc.set_buffer(0, Some(&q.buf), 0);
             enc.set_buffer(1, Some(&k.buf), 0);
             enc.set_buffer(2, Some(&v.buf), 0);
             enc.set_buffer(3, Some(&out.buf), 0);
             enc.set_buffer(4, Some(&dims), 0);
             enc.set_buffer(5, Some(&scaleb), 0);
-            let tg = MTLSize::new(seq.div_ceil(32) as u64, n_heads as u64, 1);
-            enc.dispatch_thread_groups(tg, MTLSize::new(32, 1, 1));
+            let (block, tgw) = if v1 { (32u64, 32u64) } else { (64, 64) };
+            let tg = MTLSize::new((seq as u64).div_ceil(block), n_heads as u64, 1);
+            enc.dispatch_thread_groups(tg, MTLSize::new(tgw, 1, 1));
             enc.end_encoding();
             return out;
         }
