@@ -163,6 +163,66 @@ kernel void matmul_bias(
             float v=acc[i][j]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}}
 }
 
+// Wide-tile variant of matmul_bias_sgh: 128x64 output tiles, 256 threads =
+// 8 simdgroups x TWO 8-row blocks each, so every B-tile load feeds 128 output
+// rows (vs 64). Satisfies the graveyard retry predicate for the two-row-block
+// idea (>=256 threads/TG). C stages back through threadgroup memory in two
+// 64-row halves to stay inside the 32 KB threadgroup budget.
+#define WGM 128
+#define WGN 64
+#define WGK 32
+kernel void matmul_bias_sgh_wide(
+    device const float* A [[buffer(0)]], device const half* B [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* C [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint M=dims.x,K=dims.y,N=dims.z; const uint hb=dims.w;
+    threadgroup half As[WGM*WGK];      // 8 KB
+    threadgroup half Bs[WGK*WGN];      // 4 KB
+    threadgroup float Cs[64*WGN];      // 16 KB (one 64-row half at a time)
+    const uint rowBase=gid.y*WGM, colBase=gid.x*WGN;
+    simdgroup_float8x8 acc[2][8];
+    for (uint r=0;r<2;r++) for (uint i=0;i<8;i++) acc[r][i]=make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    for (uint k0=0;k0<K;k0+=WGK) {
+        for (uint i=lid;i<WGM*WGK;i+=256){uint m=i/WGK,k=i%WGK;uint gr=rowBase+m,gk=k0+k;
+            half hv=half(A[min(gr,M-1)*K+min(gk,K-1)]);
+            As[m*WGK+k]=(gr<M&&gk<K)?hv:half(0.0f);}
+        for (uint i=lid;i<WGK*WGN;i+=256){uint k=i/WGN,n=i%WGN;uint gk=k0+k,gc=colBase+n;
+            half hv=B[min(gk,K-1)*N+min(gc,N-1)];
+            Bs[k*WGN+n]=(gk<K&&gc<N)?hv:half(0.0f);}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kb=0;kb<WGK/8;kb++) {
+            simdgroup_half8x8 a0, a1;
+            simdgroup_load(a0, As + (sgid*16)*WGK + kb*8, WGK);
+            simdgroup_load(a1, As + (sgid*16+8)*WGK + kb*8, WGK);
+            for (uint cb=0;cb<8;cb++) {
+                simdgroup_half8x8 b;
+                simdgroup_load(b, Bs + (kb*8)*WGN + cb*8, WGN);
+                simdgroup_multiply_accumulate(acc[0][cb], a0, b, acc[0][cb]);
+                simdgroup_multiply_accumulate(acc[1][cb], a1, b, acc[1][cb]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Write the two row-block halves through the 64-row staging tile.
+    // Half r covers global rows rowBase + sgid*16 + r*8 .. +8, staged at
+    // Cs rows sgid*8 .. +8.
+    for (uint r=0;r<2;r++) {
+        for (uint cb=0;cb<8;cb++)
+            simdgroup_store(acc[r][cb], Cs + (sgid*8)*WGN + cb*8, WGN);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i=lid;i<64*WGN;i+=256){
+            uint cr=i/WGN,c=i%WGN;
+            uint sg=cr/8, within=cr%8;
+            uint gr=rowBase+sg*16+r*8+within, gc=colBase+c;
+            if (gr<M&&gc<N){float v=Cs[cr*WGN+c]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // v1 hand-tiled kernel with a half weight operand (rollback arm for the f16
 // weight path when FT_METAL_SG_GEMM=0): identical to matmul_bias except the
 // B tile widens half->float on load.
@@ -422,6 +482,7 @@ struct Pipes {
     matmul_bias: ComputePipelineState,
     matmul_bias_sg: ComputePipelineState,
     matmul_bias_sgh: ComputePipelineState,
+    matmul_bias_sgh_wide: ComputePipelineState,
     matmul_bias_h: ComputePipelineState,
     layernorm: ComputePipelineState,
     gelu: ComputePipelineState,
@@ -457,6 +518,7 @@ fn pipes() -> Option<&'static Pipes> {
                 matmul_bias: p("matmul_bias")?,
                 matmul_bias_sg: p("matmul_bias_sg")?,
                 matmul_bias_sgh: p("matmul_bias_sgh")?,
+                matmul_bias_sgh_wide: p("matmul_bias_sgh_wide")?,
                 matmul_bias_h: p("matmul_bias_h")?,
                 layernorm: p("layernorm")?,
                 gelu: p("gelu")?,
@@ -554,6 +616,17 @@ impl GpuWeightF16 {
     }
 }
 
+/// Which w16 GEMM kernel to encode (see [`Batch::matmul_bias_w16`]).
+#[derive(Clone, Copy, PartialEq)]
+enum W16Kernel {
+    /// simdgroup 64x64 tiles (shipped default).
+    Sgh,
+    /// simdgroup 128x64 wide tiles (experiment, `FT_METAL_SG_WIDE=1`).
+    Wide,
+    /// v1 hand-tiled layout (rollback, `FT_METAL_SG_GEMM=0`).
+    V1,
+}
+
 /// True iff the fused-op pipelines are available (Apple Silicon macOS).
 pub fn is_available() -> bool {
     pipes().is_some()
@@ -640,21 +713,53 @@ impl<'a> Batch<'a> {
         let zero = self.p.device.new_buffer(4, SHARED);
         let bb = bias.map_or(&zero, |b| &b.buf);
         let v1 = matches!(std::env::var("FT_METAL_SG_GEMM").ok().as_deref(), Some("0"));
-        let enc = self.cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(if v1 {
-            &self.p.matmul_bias_h
+        // Wide 128x64 tile experiment (graveyard retry predicate: >=256
+        // threads/TG with wider per-simdgroup output). Opt-in until measured.
+        let wide = !v1 && matches!(std::env::var("FT_METAL_SG_WIDE").ok().as_deref(), Some("1"));
+        let kernel = if v1 {
+            W16Kernel::V1
+        } else if wide {
+            W16Kernel::Wide
         } else {
-            &self.p.matmul_bias_sgh
+            W16Kernel::Sgh
+        };
+        self.matmul_bias_w16_with(a, w, bias, kernel, &out, &dims, bb);
+        out
+    }
+
+    /// Encode one w16 GEMM with an explicit kernel choice (testable without
+    /// process-global env mutation).
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_bias_w16_with(
+        &self,
+        a: &GpuTensor,
+        w: &GpuWeightF16,
+        _bias: Option<&GpuTensor>,
+        kernel: W16Kernel,
+        out: &GpuTensor,
+        dims: &Buffer,
+        bb: &Buffer,
+    ) {
+        let (m, n) = (a.rows, w.cols);
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(match kernel {
+            W16Kernel::V1 => &self.p.matmul_bias_h,
+            W16Kernel::Wide => &self.p.matmul_bias_sgh_wide,
+            W16Kernel::Sgh => &self.p.matmul_bias_sgh,
         });
         enc.set_buffer(0, Some(&a.buf), 0);
         enc.set_buffer(1, Some(&w.buf), 0);
         enc.set_buffer(2, Some(bb), 0);
         enc.set_buffer(3, Some(&out.buf), 0);
-        enc.set_buffer(4, Some(&dims), 0);
-        let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+        enc.set_buffer(4, Some(dims), 0);
+        let rows_per_tg = if matches!(kernel, W16Kernel::Wide) {
+            128
+        } else {
+            64
+        };
+        let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(rows_per_tg) as u64, 1);
         enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
         enc.end_encoding();
-        out
     }
 
     /// im2col for a 1-D convolution over time: `x[t_in, cin]` →
@@ -1194,6 +1299,39 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn wide_w16_kernel_matches_sgh_bitwise_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        // Edge-heavy shape: M not a multiple of 128, N not a multiple of 64.
+        let (m, k, n) = (150usize, 96usize, 100usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32) * 0.07 - 0.3).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| ((i % 9) as f32) * 0.05 - 0.2).collect();
+        let bias: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        let ga = GpuTensor::upload(&a, m, k).unwrap();
+        let gw = GpuWeightF16::upload(&w, k, n).unwrap();
+        let gb = GpuTensor::upload(&bias, 1, n).unwrap();
+        let run = |kernel: W16Kernel| -> Vec<f32> {
+            let b = Batch::new().unwrap();
+            let out = GpuTensor::new_uninit(&b.p.device, m, n);
+            let dims = b.u32buf(&[m as u32, k as u32, n as u32, 1]);
+            b.matmul_bias_w16_with(&ga, &gw, Some(&gb), kernel, &out, &dims, &gb.buf);
+            b.finish();
+            out.download()
+        };
+        let sgh = run(W16Kernel::Sgh);
+        let wide = run(W16Kernel::Wide);
+        // Same f16 operands, same f32 simdgroup accumulate order within each
+        // 8x8 K-step chain -> identical results expected.
+        for (i, (s, wv)) in sgh.iter().zip(&wide).enumerate() {
+            assert!(
+                s.to_bits() == wv.to_bits(),
+                "wide vs sgh mismatch at {i}: {s} vs {wv}"
+            );
+        }
     }
 
     #[test]
