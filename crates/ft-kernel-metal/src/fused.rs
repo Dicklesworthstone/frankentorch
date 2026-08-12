@@ -196,6 +196,27 @@ kernel void matmul_bias_h(
             float v=acc[i][j]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}}
 }
 
+// im2col for 1-D convolution over time: X[t_in, cin] -> Y[t_out, cin*k] with
+// column index ci*k + kk (matches franken_whisper's nn::conv1d_wt gather).
+// dims = (t_in, cin, stride, k); dims2 = (pad, t_out). grid = (cin*k, t_out).
+kernel void im2col(
+    device const float* X [[buffer(0)]], device float* Y [[buffer(1)]],
+    constant uint4& dims [[buffer(2)]], constant uint2& dims2 [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint t_in=dims.x, cin=dims.y, stride=dims.z, k=dims.w;
+    const uint pad=dims2.x, t_out=dims2.y;
+    const uint col=gid.x, o=gid.y;
+    if (col>=cin*k || o>=t_out) return;
+    const uint ci=col/k, kk=col%k;
+    const uint p=o*stride+kk;               // position in the padded input
+    const bool left_ok = p>=pad;
+    const uint ti = left_ok ? (p-pad) : 0;  // clamped: load stays in-bounds
+    const bool ok = left_ok && ti<t_in;
+    float v = X[min(ti, t_in-1)*cin + ci];
+    Y[o*(cin*k)+col] = ok ? v : 0.0f;
+}
+
 // Row layernorm over `cols`, affine: y = (x-mean)/sqrt(var+eps)*gamma + beta. One threadgroup per row.
 kernel void layernorm(
     device const float* X [[buffer(0)]], device const float* gamma [[buffer(1)]],
@@ -322,7 +343,7 @@ kernel void attn_flash(
 // threadgroup (64 queries per TG) for occupancy. Same online-softmax math as
 // attn_flash; per-thread state is float4[16] q + float4[16] acc.
 #define F2Q 64
-#define F2K 32
+#define F2K 64
 kernel void attn_flash2(
     device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
     device const float* V [[buffer(2)]], device float* O [[buffer(3)]],
@@ -338,7 +359,7 @@ kernel void attn_flash2(
     float4 q[16];
     for (uint e=0;e<16;e++){float4 v=Q4[qr*d4 + (h*FHD)/4 + e]; q[e]=(qi<seq)?v:float4(0.0f);}
     float m=-INFINITY, l=0.0f; float4 acc[16]; for (uint e=0;e<16;e++) acc[e]=float4(0.0f);
-    threadgroup float4 Ks[F2K][16]; threadgroup float4 Vs[F2K][16];
+    threadgroup half4 Ks[F2K][16]; threadgroup half4 Vs[F2K][16];
     device const float4* K4 = (device const float4*)(K);
     device const float4* V4 = (device const float4*)(V);
     for (uint k0=0;k0<seq;k0+=F2K) {
@@ -346,8 +367,8 @@ kernel void attn_flash2(
             uint kk=idx/16, e=idx%16; uint kj=k0+kk; uint kr=min(kj,seq-1);
             float4 kv=K4[kr*d4 + (h*FHD)/4 + e];
             float4 vv=V4[kr*d4 + (h*FHD)/4 + e];
-            Ks[kk][e]=(kj<seq)?kv:float4(0.0f);
-            Vs[kk][e]=(kj<seq)?vv:float4(0.0f);
+            Ks[kk][e]=(kj<seq)?half4(kv):half4(0.0h);
+            Vs[kk][e]=(kj<seq)?half4(vv):half4(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint kmax=min((uint)F2K, seq-k0);
@@ -359,7 +380,7 @@ kernel void attn_flash2(
             float s[4];
             for (uint u=0;u<4;u++) {
                 float4 s4=float4(0.0f);
-                for (uint e=0;e<16;e++) s4=fma(q[e],Ks[kk+u][e],s4);
+                for (uint e=0;e<16;e++) s4=fma(q[e],float4(Ks[kk+u][e]),s4);
                 s[u]=(s4.x+s4.y+s4.z+s4.w)*scale;
             }
             float bm=max(max(s[0],s[1]),max(s[2],s[3]));
@@ -368,21 +389,21 @@ kernel void attn_flash2(
             l=l*corr+p0+p1+p2+p3;
             for (uint e=0;e<16;e++) {
                 float4 a=acc[e]*corr;
-                a=fma(float4(p0),Vs[kk][e],a);
-                a=fma(float4(p1),Vs[kk+1][e],a);
-                a=fma(float4(p2),Vs[kk+2][e],a);
-                a=fma(float4(p3),Vs[kk+3][e],a);
+                a=fma(float4(p0),float4(Vs[kk][e]),a);
+                a=fma(float4(p1),float4(Vs[kk+1][e]),a);
+                a=fma(float4(p2),float4(Vs[kk+2][e]),a);
+                a=fma(float4(p3),float4(Vs[kk+3][e]),a);
                 acc[e]=a;
             }
             m=mn;
         }
         for (; kk<kmax; kk++) {
             float4 s4=float4(0.0f);
-            for (uint e=0;e<16;e++) s4=fma(q[e],Ks[kk][e],s4);
+            for (uint e=0;e<16;e++) s4=fma(q[e],float4(Ks[kk][e]),s4);
             float s=(s4.x+s4.y+s4.z+s4.w)*scale;
             float mn=max(m,s); float p=exp(s-mn); float corr=exp(m-mn);
             l=l*corr+p;
-            for (uint e=0;e<16;e++) acc[e]=acc[e]*corr+p*Vs[kk][e];
+            for (uint e=0;e<16;e++) acc[e]=acc[e]*corr+p*float4(Vs[kk][e]);
             m=mn;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -410,6 +431,7 @@ struct Pipes {
     attn_context: ComputePipelineState,
     attn_flash: ComputePipelineState,
     attn_flash2: ComputePipelineState,
+    im2col: ComputePipelineState,
 }
 unsafe impl Send for Pipes {}
 unsafe impl Sync for Pipes {}
@@ -444,6 +466,7 @@ fn pipes() -> Option<&'static Pipes> {
                 attn_context: p("attn_context")?,
                 attn_flash: p("attn_flash")?,
                 attn_flash2: p("attn_flash2")?,
+                im2col: p("im2col")?,
                 queue: device.new_command_queue(),
                 device,
             })
@@ -630,6 +653,29 @@ impl<'a> Batch<'a> {
         enc.set_buffer(4, Some(&dims), 0);
         let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
         enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        out
+    }
+
+    /// im2col for a 1-D convolution over time: `x[t_in, cin]` →
+    /// `[t_out, cin*k]` with column index `ci*k + kk` (the layout
+    /// `matmul_bias*` consume as A), zero-padded by `pad` on both sides.
+    pub fn im2col(&self, x: &GpuTensor, k: usize, stride: usize, pad: usize) -> GpuTensor {
+        let (t_in, cin) = (x.rows, x.cols);
+        let t_out = (t_in + 2 * pad - k) / stride + 1;
+        let out = GpuTensor::new_uninit(&self.p.device, t_out, cin * k);
+        let dims = self.u32buf(&[t_in as u32, cin as u32, stride as u32, k as u32]);
+        let dims2 = self.u32buf(&[pad as u32, t_out as u32]);
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.p.im2col);
+        enc.set_buffer(0, Some(&x.buf), 0);
+        enc.set_buffer(1, Some(&out.buf), 0);
+        enc.set_buffer(2, Some(&dims), 0);
+        enc.set_buffer(3, Some(&dims2), 0);
+        enc.dispatch_threads(
+            MTLSize::new((cin * k) as u64, t_out as u64, 1),
+            MTLSize::new(32, 8, 1),
+        );
         enc.end_encoding();
         out
     }
@@ -836,6 +882,29 @@ pub struct EncoderGpu {
     layers: Vec<LayerWeightsGpu>,
     d_model: usize,
     n_heads: usize,
+    stem: Option<StemGpu>,
+}
+
+/// Borrowed conv-stem + positional-embedding weights (whisper encoder front).
+/// Conv weights are PRE-TRANSPOSED `[cin*3, cout]` (the `nn::conv1d_wt`
+/// layout); `pos_emb` is `[n_ctx_cap, d_model]`.
+pub struct StemWeightsRef<'a> {
+    pub conv1_wt: &'a [f32],
+    pub conv1_b: &'a [f32],
+    pub conv2_wt: &'a [f32],
+    pub conv2_b: &'a [f32],
+    pub pos_emb: &'a [f32],
+}
+
+/// GPU-resident conv stem: conv weights as f16, biases + pos embedding f32.
+struct StemGpu {
+    n_mels: usize,
+    n_ctx_cap: usize,
+    conv1_wt: GpuWeightF16,
+    conv1_b: GpuTensor,
+    conv2_wt: GpuWeightF16,
+    conv2_b: GpuTensor,
+    pos_emb: GpuTensor,
 }
 
 // The resident weight buffers are immutable after upload (GPU read-only), the
@@ -880,7 +949,81 @@ impl EncoderGpu {
             layers: gl,
             d_model,
             n_heads,
+            stem: None,
         })
+    }
+
+    /// Upload the conv stem + positional embedding so
+    /// [`forward_from_mel`](EncoderGpu::forward_from_mel) can run the whole
+    /// encoder front on the GPU. `n_ctx_cap` is the positional-embedding row
+    /// capacity (`hparams.n_audio_ctx`).
+    pub fn attach_stem(
+        &mut self,
+        stem: &StemWeightsRef,
+        n_mels: usize,
+        n_ctx_cap: usize,
+    ) -> Result<(), Error> {
+        let d = self.d_model;
+        self.stem = Some(StemGpu {
+            n_mels,
+            n_ctx_cap,
+            conv1_wt: GpuWeightF16::upload(stem.conv1_wt, n_mels * 3, d)?,
+            conv1_b: GpuTensor::upload(stem.conv1_b, 1, d)?,
+            conv2_wt: GpuWeightF16::upload(stem.conv2_wt, d * 3, d)?,
+            conv2_b: GpuTensor::upload(stem.conv2_b, 1, d)?,
+            pos_emb: GpuTensor::upload(stem.pos_emb, n_ctx_cap, d)?,
+        });
+        Ok(())
+    }
+
+    /// Whether a conv stem is attached (forward_from_mel usable).
+    #[must_use]
+    pub fn has_stem(&self) -> bool {
+        self.stem.is_some()
+    }
+
+    /// Run the WHOLE encoder front on the GPU from the mel spectrogram:
+    /// conv1(k3,s1,p1)+gelu → conv2(k3,s2,p1)+gelu → +pos_emb → transformer
+    /// stack. `mel` is `[t_in, n_mels]` row-major. Returns the pre-`ln_post`
+    /// activations and their row count. Errors if no stem is attached or the
+    /// conv output exceeds the positional capacity.
+    pub fn forward_from_mel(&self, mel: &[f32], t_in: usize) -> Result<(Vec<f32>, usize), Error> {
+        let stem = self.stem.as_ref().ok_or(Error::Unavailable)?;
+        if t_in == 0 || mel.len() != t_in * stem.n_mels {
+            return Err(Error::Kernel(format!(
+                "forward_from_mel input {} != {t_in}x{}",
+                mel.len(),
+                stem.n_mels
+            )));
+        }
+        // k=3, pad=1: conv1 (stride 1) preserves rows; conv2 (stride 2) halves.
+        let t1 = (t_in + 2 - 3) + 1;
+        let t2 = (t1 + 2 - 3) / 2 + 1;
+        if t2 > stem.n_ctx_cap {
+            return Err(Error::Kernel(format!(
+                "forward_from_mel: conv output {t2} rows > positional capacity {}",
+                stem.n_ctx_cap
+            )));
+        }
+        let mel_gpu = GpuTensor::upload(mel, t_in, stem.n_mels)?;
+        let x;
+        {
+            let b = Batch::new()?;
+            let c1 = b.im2col(&mel_gpu, 3, 1, 1);
+            let h1 = b.matmul_bias_w16(&c1, &stem.conv1_wt, Some(&stem.conv1_b));
+            let g1 = b.gelu(&h1);
+            let c2 = b.im2col(&g1, 3, 2, 1);
+            let h2 = b.matmul_bias_w16(&c2, &stem.conv2_wt, Some(&stem.conv2_b));
+            let g2 = b.gelu(&h2);
+            // pos_emb rows are a contiguous prefix, so the elementwise add over
+            // g2's length reads exactly rows 0..t2 of the embedding.
+            x = b.add(&g2, &stem.pos_emb);
+            b.finish();
+        }
+        let seq = x.rows;
+        debug_assert_eq!(seq, t2);
+        let out = self.forward_stack(x)?;
+        Ok((out, seq))
     }
 
     /// Run every layer on the GPU. `input` is `[seq, d_model]` row-major; returns
@@ -893,7 +1036,12 @@ impl EncoderGpu {
                 self.d_model
             )));
         }
-        let mut x = GpuTensor::upload(input, seq, self.d_model)?;
+        let x = GpuTensor::upload(input, seq, self.d_model)?;
+        self.forward_stack(x)
+    }
+
+    /// The chunked transformer stack over an already-resident activation.
+    fn forward_stack(&self, mut x: GpuTensor) -> Result<Vec<f32>, Error> {
         // Layers are encoded in CHUNKS of command buffers (default 8 layers per
         // buffer, `FT_METAL_ENC_CHUNK` overrides). One buffer for the whole
         // stack minimizes syncs but commits every intermediate at once — Metal
