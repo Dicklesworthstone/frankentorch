@@ -1179,6 +1179,26 @@ pub struct TensorBackwardReport {
     pub telemetry: TensorSchedulerTelemetry,
 }
 
+/// frankentorch-9pafs: a report owns the largest buffers a backward produces —
+/// one full-numel gradient per reachable leaf. When it dies (end of a training
+/// iteration, typically) those buffers go back to the recycling pool rather than
+/// to the system allocator, so the next iteration's backward finds committed
+/// pages instead of re-faulting several MiB.
+///
+/// `Arc::try_unwrap` is what makes this correct rather than merely fast: a leaf
+/// gradient is Arc-shared with the tape's `persistent_grads` (frankentorch-05upk),
+/// and only the last owner may recycle. When the tape still holds it, this drop
+/// leaves it alone and [`TensorTape`]'s own drop parks it later.
+impl Drop for TensorBackwardReport {
+    fn drop(&mut self) {
+        for gradient in self.gradients.drain(..).flatten() {
+            if let Ok(values) = Arc::try_unwrap(gradient) {
+                ft_core::buffer_pool::recycle(values);
+            }
+        }
+    }
+}
+
 impl TensorBackwardReport {
     #[must_use]
     pub fn gradient(&self, node: TensorNodeId) -> Option<&[f64]> {
@@ -4212,6 +4232,20 @@ impl Tape {
     }
 }
 
+/// frankentorch-9pafs: the other end of the report's recycling. A leaf gradient
+/// is Arc-shared between the report and `persistent_grads`; whichever of the two
+/// outlives the other is the one that can park the buffer, so both sides drop
+/// through the pool and `Arc::try_unwrap` decides which one actually does.
+impl Drop for TensorTape {
+    fn drop(&mut self) {
+        for gradient in std::mem::take(&mut self.persistent_grads).into_values() {
+            if let Ok(values) = Arc::try_unwrap(gradient) {
+                ft_core::buffer_pool::recycle(values);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TensorTape {
     nodes: Vec<TensorNode>,
@@ -4241,6 +4275,14 @@ impl TensorGradientSlot {
         Self {
             values: Vec::new(),
             expected_len,
+        }
+    }
+
+    /// Materialize the implicit all-zero gradient without returning its backing
+    /// pages to the system allocator between backward passes.
+    fn materialize_zeroed(&mut self) {
+        if self.values.is_empty() && self.expected_len > 0 {
+            self.values = ft_core::buffer_pool::take_zeroed(self.expected_len);
         }
     }
 }
@@ -11606,7 +11648,11 @@ impl TensorTape {
             .iter()
             .map(|node| TensorGradientSlot::new(Self::tensor_gradient_buffer_len(node)))
             .collect::<Vec<_>>();
-        grads[root.0].values = vec![1.0; self.nodes[root.0].tensor.meta().numel()];
+        // frankentorch-9pafs: the seed is one full-numel buffer per backward, and in a
+        // training loop the previous pass just freed one exactly like it. Take it from
+        // the recycling pool — `take_filled` is observably identical to `vec![1.0; n]`.
+        grads[root.0].values =
+            ft_core::buffer_pool::take_filled(self.nodes[root.0].tensor.meta().numel(), 1.0);
         // Tracks IndexSelect inputs that requested a sparse-gradient surfacing.
         // Populated at the end with a SparseCOOTensor extracted from the
         // dense gradient (sparse_dim=1, dim=0).
@@ -11633,7 +11679,7 @@ impl TensorTape {
             // per-node ~numel f64 clones that capped through-tape throughput.)
             let mut incoming = std::mem::take(&mut grads[node_id.0].values);
             if incoming.is_empty() && grads[node_id.0].expected_len > 0 {
-                incoming.resize(grads[node_id.0].expected_len, 0.0);
+                incoming = ft_core::buffer_pool::take_zeroed(grads[node_id.0].expected_len);
             }
             let incoming = self.apply_tensor_hooks(node_id, incoming)?;
             execution_order.push(node_id);
@@ -15381,11 +15427,14 @@ impl TensorTape {
             .enumerate()
             .map(|(idx, mut grad)| {
                 if self.nodes[idx].requires_grad && reachable[idx] {
-                    if grad.values.is_empty() && grad.expected_len > 0 {
-                        grad.values.resize(grad.expected_len, 0.0);
-                    }
+                    grad.materialize_zeroed();
                     Some(Arc::new(grad.values))
                 } else {
+                    // frankentorch-9pafs: this gradient is not going into the report,
+                    // so its buffer dies here. Park it instead of handing a
+                    // multi-megabyte block back to the system allocator, which would
+                    // unmap it and make the next backward re-fault every page.
+                    ft_core::buffer_pool::recycle(grad.values);
                     None
                 }
             })
@@ -20988,6 +21037,66 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    static BUFFER_POOL_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn dropping_an_unshared_backward_report_recycles_its_large_gradient() {
+        let guard = BUFFER_POOL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = ft_core::buffer_pool::MIN_POOLED_LEN;
+        ft_core::buffer_pool::clear();
+        ft_core::buffer_pool::set_enabled(true);
+
+        let report = super::TensorBackwardReport {
+            gradients: vec![Some(Arc::new(vec![7.5; len]))],
+            sparse_gradients: Vec::new(),
+            gradient_nodes: Vec::new(),
+            steps: Vec::new(),
+            telemetry: super::TensorSchedulerTelemetry {
+                execution_order: Vec::new(),
+                queue_pushes: 0,
+                queue_pops: 0,
+                max_queue_len: 0,
+                dependency_snapshot: Vec::new(),
+                reentrant_depth: 0,
+                reentrant_guard_triggered: false,
+                hardened_fallback_used: false,
+            },
+        };
+        drop(report);
+
+        assert_eq!(ft_core::buffer_pool::stats().parked_buffers, 1);
+        let recycled = ft_core::buffer_pool::take_zeroed(len);
+        assert!(recycled.iter().all(|value| *value == 0.0));
+        assert_eq!(ft_core::buffer_pool::stats().hits, 1);
+
+        drop(recycled);
+        ft_core::buffer_pool::clear();
+        drop(guard);
+    }
+
+    #[test]
+    fn zero_materialized_gradient_slot_takes_a_recycled_buffer() {
+        let guard = BUFFER_POOL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = ft_core::buffer_pool::MIN_POOLED_LEN;
+        ft_core::buffer_pool::clear();
+        ft_core::buffer_pool::set_enabled(true);
+        ft_core::buffer_pool::recycle(vec![9.0; len]);
+
+        let mut slot = super::TensorGradientSlot::new(len);
+        slot.materialize_zeroed();
+
+        assert!(slot.values.iter().all(|value| *value == 0.0));
+        assert_eq!(ft_core::buffer_pool::stats().hits, 1);
+
+        ft_core::buffer_pool::recycle(slot.values);
+        ft_core::buffer_pool::clear();
+        drop(guard);
+    }
+
     // frankentorch-dtyiz. These lock the SIGN OF ZERO in gradient accumulation and
     // assert PRESERVATION, because that is what PyTorch does: measured on torch
     // 2.12.1, `sum(x * -0.0)` gives `x.grad == -0.0`, and two -0.0 contributions
@@ -21449,6 +21558,71 @@ mod tests {
         ];
         lines.sort();
         lines.join("\n")
+    }
+
+    /// frankentorch-9pafs: the recycling pool must be invisible in the gradients
+    /// and visible only in where the buffers came from.
+    ///
+    /// Two claims, because either one alone would let a broken pool through. The
+    /// bit-for-bit comparison against a pool-disabled run is the parity claim — a
+    /// pool that handed back an unscrubbed buffer would fail it, since a second
+    /// backward over the same graph writes the same positions and would inherit
+    /// the first pass's values everywhere else. The hit count is the *executes*
+    /// claim: without it this test would still pass with every pool call
+    /// short-circuited, and it would be proving nothing at all (the sentinel
+    /// discipline in AGENTS.md, applied to a lever rather than a bug).
+    #[test]
+    fn backward_gradients_are_bit_identical_with_and_without_the_buffer_pool() {
+        // The pool declines anything below MIN_POOLED_LEN, so the graph has to be
+        // wide enough to reach it.
+        let len = ft_core::buffer_pool::MIN_POOLED_LEN;
+        let left: Vec<f64> = (0..len).map(|i| (i % 17) as f64 * 0.25 - 2.0).collect();
+        let right: Vec<f64> = (0..len).map(|i| (i % 11) as f64 * 0.125 - 0.5).collect();
+
+        let run_once = || {
+            let mut tape = TensorTape::new();
+            let a = tape.leaf(left.clone(), vec![len], true).expect("leaf a");
+            let b = tape.leaf(right.clone(), vec![len], true).expect("leaf b");
+            let (sum, _) = tape.add(a, b, ExecutionMode::Strict).expect("add");
+            let (root, _) = tape.mul(sum, a, ExecutionMode::Strict).expect("mul");
+            let report = tape.backward(root).expect("backward");
+            let grad_a = report.gradient(a).expect("grad a").to_vec();
+            let grad_b = report.gradient(b).expect("grad b").to_vec();
+            (grad_a, grad_b)
+        };
+
+        ft_core::buffer_pool::set_enabled(false);
+        let (unpooled_a, unpooled_b) = run_once();
+
+        ft_core::buffer_pool::set_enabled(true);
+        ft_core::buffer_pool::clear();
+        // First pass fills the pool from its own teardown; second pass is the one
+        // that can hit it.
+        let _ = run_once();
+        let hits_before = ft_core::buffer_pool::stats().hits;
+        let (pooled_a, pooled_b) = run_once();
+        let hits_after = ft_core::buffer_pool::stats().hits;
+
+        for (index, (pooled, plain)) in pooled_a.iter().zip(unpooled_a.iter()).enumerate() {
+            assert_eq!(
+                pooled.to_bits(),
+                plain.to_bits(),
+                "pooled backward diverged on grad a[{index}]"
+            );
+        }
+        for (index, (pooled, plain)) in pooled_b.iter().zip(unpooled_b.iter()).enumerate() {
+            assert_eq!(
+                pooled.to_bits(),
+                plain.to_bits(),
+                "pooled backward diverged on grad b[{index}]"
+            );
+        }
+        assert!(
+            hits_after > hits_before,
+            "the recycle loop never closed: a backward pass parked no buffer the next \
+             pass could take (hits {hits_before} -> {hits_after})"
+        );
+        ft_core::buffer_pool::clear();
     }
 
     #[test]

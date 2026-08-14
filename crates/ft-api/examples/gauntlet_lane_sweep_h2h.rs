@@ -258,6 +258,13 @@ LANES = {
     "avg_pool2d": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
     "max_pool3d": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
+    # frankentorch-9pafs: the same torch op under a second name. The FrankenTorch
+    # side runs this lane with its buffer pool DISABLED, so the pair isolates the
+    # pool against one live incumbent inside one invocation. Because the incumbent
+    # code is byte-identical for the two names, PT(max_pool3d_nopool)/PT(max_pool3d)
+    # is a free control that must come out ~1.0; if it does not, the host moved
+    # during the run and the FT comparison is not readable either.
+    "max_pool3d_nopool": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
 }
 "#;
     let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
@@ -384,6 +391,24 @@ LANES = {
             }),
         ),
         (
+            // frankentorch-9pafs: the SAME lane with `ft_core::buffer_pool` off.
+            // Two things make this the readable form of the comparison. It is one
+            // binary, so the two arms cannot differ by a compilation; and both are
+            // sampled against one live incumbent inside one invocation, so the
+            // ratio-of-ratios against `max_pool3d` is immune to the host drift
+            // that makes cross-run ratios unquotable here.
+            "max_pool3d_nopool",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
+                    s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+                        .expect("max_pool3d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
+            }),
+        ),
+        (
             "conv3d",
             Box::new(|| {
                 timed_op(&c3x, vec![C3_N, C3_CI, C3_D, C3_H, C3_W], |s, x| {
@@ -502,5 +527,79 @@ LANES = {
          undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT\n\
          comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild."
     );
+
+    // frankentorch-v92uh: prove the pool was actually SERVING this run rather than
+    // sitting inert. Without this line a pooled/unpooled A/B that came out flat
+    // would be indistinguishable from one where every `take` missed, and the
+    // paired verdict below would be reporting on a lever that never engaged.
+    // Requests below `MIN_POOLED_LEN`, and every request made while the pool is
+    // disabled, are not counted at all — so these are pooled-lane numbers.
+    let pool = ft_core::buffer_pool::stats();
+    println!(
+        "\nbuffer_pool: hits={} misses={} parked={} buffers / {:.1} MiB",
+        pool.hits,
+        pool.misses,
+        pool.parked_buffers,
+        pool.parked_bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    // ── frankentorch-v92uh: PAIRED analysis for `X` vs `X_nopool` ───────────
+    //
+    // The table above compares two lanes through their independent medians, and
+    // on a shared host that is the weakest reading available: a load excursion
+    // lands in one lane's median and not the other's, and the CI has to be wide
+    // enough to cover that. The pair is sampled ADJACENTLY inside each round, so
+    // the excursion is very nearly common to both — differencing per round
+    // cancels it, and only then is a busy host survivable.
+    //
+    // Per round the lane's two calls are reduced by MIN, not mean: under peer
+    // load the fast sample is the one that measured the work and the slow one
+    // measured the interference (frankentorch peer-bench contention note).
+    //
+    // Reported as `nopool / pooled`, so > 1.0 means the pool is FASTER. The
+    // incumbent rows carry their own control: PT is byte-identical code under
+    // both names, so PT(nopool)/PT(pooled) must land near 1.0 or the run is not
+    // readable at all.
+    for (index, (name, _)) in lanes.iter().enumerate() {
+        let Some(base) = name.strip_suffix("_nopool") else {
+            continue;
+        };
+        let Some(base_index) = lanes.iter().position(|(other, _)| *other == base) else {
+            continue;
+        };
+        let rounds = arm_a[index].len().min(arm_a[base_index].len());
+        let mut treated = Vec::with_capacity(rounds);
+        let mut control = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            control.push(arm_a[index][round].min(arm_b[index][round]));
+            treated.push(arm_a[base_index][round].min(arm_b[base_index][round]));
+        }
+        let paired: Vec<f64> = control
+            .iter()
+            .zip(treated.iter())
+            .map(|(off, on)| off / on)
+            .collect();
+        let (point, lo, hi) = median_ratio_ci(&control, &treated);
+        let wins = paired.iter().filter(|ratio| **ratio > 1.0).count();
+        let pt_control = match (pt_times[index].is_empty(), pt_times[base_index].is_empty()) {
+            (false, false) => minimum(&pt_times[index]) / minimum(&pt_times[base_index]),
+            _ => f64::NAN,
+        };
+        println!(
+            "\nPAIRED {base}: pool ON vs OFF, one binary, one invocation, per-round min-of-2\n  \
+             ratio (off/on) = {point:.3}x  95% CI [{lo:.3},{hi:.3}]  {wins}/{rounds} rounds faster with the pool\n  \
+             incumbent control PT(off)/PT(on) = {pt_control:.3} (must be ~1.0; the arm is identical code)\n  \
+             verdict: {}",
+            if !pt_control.is_finite() || (pt_control - 1.0).abs() >= 0.05 {
+                "UNREADABLE — the incumbent control moved, so the host shifted between the two lanes"
+            } else if lo > 1.0 {
+                "the pool is FASTER by the paired CI"
+            } else if hi < 1.0 {
+                "the pool is SLOWER by the paired CI"
+            } else {
+                "UNDECIDED — the paired CI brackets 1.0"
+            }
+        );
+    }
     Ok(())
 }

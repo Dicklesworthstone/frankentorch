@@ -1,0 +1,84 @@
+##### RUN 1 load=59.55
+  max_pool3d      4.307    1.040   FT 4.14x SLOWER     WIDE [0.823,1.737] 1.282 match
+  max_pool3d_nopool    4.995    1.105   FT 4.52x SLOWER     WIDE [0.764,1.708] 1.040 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.248x  95% CI [1.013,1.411]  11/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.063 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 2 load=62.87
+  max_pool3d      4.537    1.091   FT 4.16x SLOWER     WIDE [0.758,1.633] 0.982 match
+  max_pool3d_nopool    5.271    0.989   FT 5.33x SLOWER     WIDE [0.589,1.489] 0.902 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.100x  95% CI [0.966,1.427]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.906 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 3 load=64.16
+  max_pool3d      3.992    1.080   FT 3.70x SLOWER     WIDE [0.815,2.073] 1.120 match
+  max_pool3d_nopool    5.379    1.072   FT 5.02x SLOWER     WIDE [0.494,1.582] 0.908 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.213x  95% CI [1.063,1.626]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.992 (must be ~1.0; the arm is identical code)
+  verdict: the pool is FASTER by the paired CI
+##### RUN 4 load=67.99
+  max_pool3d      4.507    1.052   FT 4.28x SLOWER     WIDE [0.579,1.680] 1.089 match
+  max_pool3d_nopool    5.982    1.055   FT 5.67x SLOWER     WIDE [0.784,1.484] 0.971 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.459x  95% CI [1.149,1.743]  14/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.002 (must be ~1.0; the arm is identical code)
+  verdict: the pool is FASTER by the paired CI
+##### RUN 5 load=67.27
+  max_pool3d      4.961    1.082   FT 4.58x SLOWER     WIDE [0.548,1.663] 1.144 match
+  max_pool3d_nopool    5.033    1.184   FT 4.25x SLOWER     WIDE [0.733,1.793] 1.081 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.219x  95% CI [0.877,1.510]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.094 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 6 load=65.89
+  max_pool3d      4.626    1.094   FT 4.23x SLOWER     WIDE [0.620,1.273] 1.002 match
+  max_pool3d_nopool    5.847    1.067   FT 5.48x SLOWER     WIDE [0.619,1.504] 0.788 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.292x  95% CI [0.955,1.623]  11/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.975 (must be ~1.0; the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+##### RUN 7 load=65.60
+  max_pool3d      4.442    1.089   FT 4.08x SLOWER     WIDE [0.510,1.124] 0.774 match
+  max_pool3d_nopool    5.905    1.147   FT 5.15x SLOWER     PASS [0.645,1.242] 0.773 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.297x  95% CI [0.971,1.733]  11/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.053 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 8 load=64.43
+  max_pool3d      5.789    1.081   FT 5.36x SLOWER     WIDE [0.704,2.138] 1.516 match
+  max_pool3d_nopool    6.371    1.142   FT 5.58x SLOWER     WIDE [0.565,2.138] 0.766 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.172x  95% CI [0.885,2.066]  11/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.057 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 9 load=65.12
+  max_pool3d      4.803    1.062   FT 4.52x SLOWER     WIDE [0.455,1.413] 0.676 match
+  max_pool3d_nopool    5.185    1.075   FT 4.82x SLOWER     WIDE [0.552,1.289] 0.693 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.123x  95% CI [0.953,1.376]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.013 (must be ~1.0; the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+##### RUN 10 load=63.51
+  max_pool3d      5.144    1.062   FT 4.84x SLOWER     WIDE [0.579,1.510] 0.889 match
+  max_pool3d_nopool    5.914    1.063   FT 5.56x SLOWER     WIDE [0.842,1.794] 1.366 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.040x  95% CI [0.880,1.465]  11/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.001 (must be ~1.0; the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+##### RUN 11 load=64.35
+  max_pool3d      5.931    1.107   FT 5.36x SLOWER     WIDE [0.587,1.222] 0.781 match
+  max_pool3d_nopool    6.122    1.178   FT 5.19x SLOWER     WIDE [0.769,1.495] 1.088 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.053x  95% CI [0.799,1.532]  9/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.064 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 12 load=64.51
+  max_pool3d      4.982    1.078   FT 4.62x SLOWER     WIDE [0.705,1.647] 1.012 match
+  max_pool3d_nopool    6.040    1.097   FT 5.50x SLOWER     PASS [0.611,1.175] 0.873 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+  ratio (off/on) = 1.242x  95% CI [0.856,1.517]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.018 (must be ~1.0; the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0

@@ -19188,3 +19188,29 @@ Recorded because each survived review-by-plausibility:
 **Also: an A/A PASS does not license a CROSS-RUN comparison.** It certifies
 within-invocation resolution only. Two h2h runs at load 28.9 and 86 are not a
 delta, however green both gates are.
+
+**7. REFUTED PRIOR — "the many-thread write loses because of NUMA"
+(`frankentorch-un3os` → `frankentorch-v92uh`).** `un3os` closed its unexplained
+term with "most plausibly NUMA: the recycled block was faulted by whichever thread
+touched it last, so writers on other nodes pay remote bandwidth. **Not
+measured.**" It is now measured, and it is wrong: this host has **one NUMA node**
+(`numactl --hardware` → `available: 1 nodes (0)`, all 64 CPUs on node 0, one
+distance entry `10`). There is no remote node for a writer to sit on. Cost of
+checking: one command. **The lesson is the cost — a hypothesis about machine
+topology can be confirmed or killed by reading the topology, and this one sat in
+the ledger as "plausible" for six days instead.** What actually costs the
+many-thread write is still open; one candidate is now closed rather than pending.
+
+**8. WHAT DID PAY on this lineage — recycling, not scheduling
+(`frankentorch-v92uh`).** After a size gate (2), an avg_pool gate (3) and a serial
+pre-touch (1) all failed, the lever that worked attacked neither the thread count
+nor the write pattern but **where the pages came from**: `ft_core::buffer_pool`
+parks the dense gradient at `Drop` and hands it back to the next backward, so the
+pages are already committed. Paired, one binary, one live torch arm, per-round
+min-of-2: **12 of 12 invocations above 1.0** (median `1.138`, range
+`1.026–1.283`), 143 of 192 rounds, and `1.108x [1.050, 1.383]` / `1.114x
+[1.018, 1.281]` on the two invocations whose incumbent control also held within
+5%. Recorded here, in the ledger of things that did not work, because it is the
+answer to the four that did not: **the phase was correctly identified as the dense
+materialisation every time; every rejected lever tried to make the write cheaper,
+and the one that paid removed the fault instead.**

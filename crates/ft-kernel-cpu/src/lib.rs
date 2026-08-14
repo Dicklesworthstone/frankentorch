@@ -8840,7 +8840,12 @@ fn max_pool3d_backward_2x2s2_f64(
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
     let depth_stride = ih * iw;
-    let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-9pafs: the dense gradient is this kernel's whole output and the
+    // largest buffer in the lane. Take it from the recycling pool so a training
+    // loop's second and later iterations write into pages that are already
+    // committed. Observably identical to `vec![0.0; n]` (see ft-core's
+    // `buffer_pool`), so nothing below changes.
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * plane_len);
     // frankentorch-zoqws: do NOT insert a serial `din.fill(0.0)` here to "pay the
     // first touch cheaply". That was tried and MEASURED AS A REGRESSION — see the
     // note on `max_pool3d_backward_from_indices_f64` below for the numbers.
@@ -8948,7 +8953,9 @@ pub fn max_pool3d_backward_from_indices_f64(
 ) -> Vec<f64> {
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
-    let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-9pafs: pooled dense gradient — see the note in
+    // `max_pool3d_backward_2x2s2_f64`. Values are unchanged.
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * plane_len);
     // frankentorch-zoqws — REFUTED LEVER, DO NOT RE-LAND. A serial `din.fill(0.0)`
     // between this `vec![0.0; n]` and the scatter below was landed on the theory
     // that `alloc_zeroed` hands back fresh `mmap` pages and that 64 rayon threads
@@ -9016,7 +9023,9 @@ pub fn max_pool3d_backward_from_indices_scalar_f64(
 ) -> Vec<f64> {
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
-    let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-9pafs: pooled dense gradient — see the note in
+    // `max_pool3d_backward_2x2s2_f64`. Values are unchanged.
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * plane_len);
     // frankentorch-un3os: same trivial-work scatter into an L3-resident buffer as
     // `max_pool3d_backward_from_indices_f64`; same gate. One body, two drivers.
     let scatter_plane = |plane: usize, drow: &mut [f64]| {
@@ -9057,7 +9066,9 @@ pub fn max_pool3d_backward_f64(
         return max_pool3d_backward_2x2s2_f64(dout, input, batch, ch, id, ih, iw, od, oh, ow);
     }
 
-    let mut din = vec![0.0f64; batch * ch * id * ih * iw];
+    // frankentorch-9pafs: pooled dense gradient — see the note in
+    // `max_pool3d_backward_2x2s2_f64`. Values are unchanged.
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * id * ih * iw);
     din.par_chunks_mut(id * ih * iw)
         .enumerate()
         .for_each(|(plane, drow)| {
@@ -38951,6 +38962,87 @@ mod tests {
         }
         for (i, (&g, &e)) in sidecar_grad.iter().zip(rescan_grad.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "max_pool3d sidecar grad[{i}]");
+        }
+    }
+
+    /// frankentorch-9pafs: the dense-gradient backwards now take their output
+    /// buffer from `ft_core::buffer_pool`, so a recycled buffer arrives holding
+    /// the PREVIOUS pass's values. The scatter writes only 1 element in 8, so an
+    /// implementation that skipped the refill would leave 7/8 of the gradient
+    /// holding stale data — and would still pass every length and shape check.
+    /// This is the test that catches it: a deliberately dirty buffer is parked
+    /// before the pooled call, and the result must match the unpooled one bit for
+    /// bit.
+    #[test]
+    fn max_pool3d_backward_bits_survive_a_dirty_pooled_buffer() {
+        // Above buffer_pool::MIN_POOLED_LEN, or the pool declines the buffer and
+        // the test would prove nothing.
+        let (batch, ch, id, ih, iw) = (2usize, 4usize, 8usize, 32usize, 32usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let numel = batch * ch * id * ih * iw;
+        assert!(numel >= ft_core::buffer_pool::MIN_POOLED_LEN);
+        let input: Vec<f64> = (0..numel)
+            .map(|i| ((i * 37 + 11) % 97) as f64 * 0.03125 - 1.5)
+            .collect();
+        let dout: Vec<f64> = (0..batch * ch * od * oh * ow)
+            .map(|i| ((i * 23 + 7) % 53) as f64 * 0.0625 - 1.0)
+            .collect();
+        let (_, arg_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+
+        ft_core::buffer_pool::set_enabled(false);
+        let unpooled = super::max_pool3d_backward_from_indices_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        let unpooled_rescan = super::max_pool3d_backward_f64(
+            &dout, &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+
+        ft_core::buffer_pool::set_enabled(true);
+        ft_core::buffer_pool::recycle(vec![-7.5; numel]);
+        let pooled = super::max_pool3d_backward_from_indices_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        ft_core::buffer_pool::recycle(vec![f64::NAN; numel]);
+        let pooled_rescan = super::max_pool3d_backward_f64(
+            &dout, &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+
+        assert_eq!(pooled.len(), unpooled.len());
+        for (i, (&pooled_value, &plain_value)) in pooled.iter().zip(unpooled.iter()).enumerate() {
+            assert_eq!(
+                pooled_value.to_bits(),
+                plain_value.to_bits(),
+                "pooled max_pool3d backward diverged at [{i}]"
+            );
+        }
+        for (i, (&pooled_value, &plain_value)) in
+            pooled_rescan.iter().zip(unpooled_rescan.iter()).enumerate()
+        {
+            assert_eq!(
+                pooled_value.to_bits(),
+                plain_value.to_bits(),
+                "pooled max_pool3d rescan backward diverged at [{i}]"
+            );
         }
     }
 

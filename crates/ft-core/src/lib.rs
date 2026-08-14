@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod buffer_pool;
+
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;

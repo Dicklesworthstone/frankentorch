@@ -1,0 +1,20 @@
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=01cb66b434592479f36b6aa140519e8687820ef9e96336a1816d2f02a59a0e40
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+incumbent_rule=a delta whose incumbent arm moved (version, build, or measured time) is NOT a win
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+sampling=INTERLEAVED per round (default) (frankentorch-6atx2); PyTorch min-of-7 after 4 warmups, spread evenly across 16 rounds, torch threads=8
+
+lane          FT(ms)    PT(ms)   standing            A/A gate           parity
+  max_pool1d     15.968    6.453   FT 2.47x SLOWER     WIDE [0.946,1.615] 1.130 match
+  avg_pool2d      5.514    2.113   FT 2.61x SLOWER     WIDE [0.766,1.977] 1.252 match
+  max_pool3d      6.098    0.919   FT 6.64x SLOWER     WIDE [0.701,1.392] 0.870 match
+  max_pool3d_nopool    6.957    0.951   FT 7.32x SLOWER     FAIL [0.682,0.960] 0.818 match
+  conv3d         27.772    6.778   FT 4.10x SLOWER     PASS [0.864,1.027] 0.957 match
+
+Quote a lane only if its A/A gate says PASS and parity is `match`. WIDE means the null's
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.

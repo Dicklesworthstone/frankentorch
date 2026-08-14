@@ -1,0 +1,84 @@
+##### RUN 1 load=19.72
+  max_pool3d      3.703    0.773   FT 4.79x SLOWER     PASS [0.794,1.224] 1.024 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.198x  95% CI [1.024,1.404]  13/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.192 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 2 load=20.15
+  max_pool3d      3.864    0.786   FT 4.92x SLOWER     PASS [0.932,1.257] 1.076 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.028x  95% CI [0.941,1.217]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.067 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 3 load=19.97
+  max_pool3d      3.857    0.875   FT 4.41x SLOWER     PASS [0.853,1.201] 1.063 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.026x  95% CI [0.861,1.415]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.913 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 4 load=19.97
+  max_pool3d      3.743    0.949   FT 3.95x SLOWER     PASS [0.923,1.239] 1.133 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.216x  95% CI [1.061,1.377]  13/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.783 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 5 load=19.98
+  max_pool3d      4.053    0.907   FT 4.47x SLOWER     WIDE [0.940,1.568] 1.229 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.108x  95% CI [1.050,1.383]  12/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.009 (must be ~1.0; the arm is identical code)
+  verdict: the pool is FASTER by the paired CI
+##### RUN 6 load=20.38
+  max_pool3d      3.453    0.856   FT 4.04x SLOWER     PASS [0.900,1.187] 1.066 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.130x  95% CI [0.979,1.246]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.970 (must be ~1.0; the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+##### RUN 7 load=20.43
+  max_pool3d      3.280    0.823   FT 3.99x SLOWER     PASS [0.776,1.205] 1.020 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.257x  95% CI [1.073,1.453]  13/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.816 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 8 load=20.07
+  max_pool3d      3.802    0.884   FT 4.30x SLOWER     PASS [0.761,1.141] 0.886 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.138x  95% CI [1.029,1.372]  13/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.212 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 9 load=22.47
+  max_pool3d      3.448    0.880   FT 3.92x SLOWER     PASS [0.836,1.392] 1.062 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.114x  95% CI [1.018,1.281]  13/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 1.020 (must be ~1.0; the arm is identical code)
+  verdict: the pool is FASTER by the paired CI
+##### RUN 10 load=22.47
+  max_pool3d      3.507    0.888   FT 3.95x SLOWER     PASS [0.871,1.174] 1.029 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.241x  95% CI [1.053,1.404]  12/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.908 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 11 load=22.75
+  max_pool3d      3.595    0.891   FT 4.03x SLOWER     PASS [0.794,1.333] 1.009 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.283x  95% CI [1.121,1.434]  14/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.921 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+##### RUN 12 load=22.21
+  max_pool3d      3.845    0.975   FT 3.94x SLOWER     PASS [0.753,1.176] 0.949 match
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round min-of-2
+  ratio (off/on) = 1.152x  95% CI [0.980,1.293]  10/16 rounds faster with the pool
+  incumbent control PT(off)/PT(on) = 0.838 (must be ~1.0; the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
