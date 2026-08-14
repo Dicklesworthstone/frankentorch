@@ -376,7 +376,7 @@ LANES = {
             "avg_pool2d",
             Box::new(|| {
                 timed_op(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
-                    s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                    s.functional_avg_pool2d_sum(x, (2, 2), (2, 2), (0, 0), false, true)
                         .expect("avg_pool2d")
                 })
             }),
