@@ -117,7 +117,12 @@ type LaneRun<'a> = Box<dyn Fn() -> (f64, f64) + 'a>;
 
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
-    values[values.len() / 2]
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    }
 }
 
 /// `statistics.median` in the sanctioned Python balanced-square harness returns
@@ -131,7 +136,13 @@ fn paired_slot_median(mut values: [f64; 2]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::paired_slot_median;
+    use super::{median, paired_slot_median};
+
+    #[test]
+    fn balanced_square_overall_median_matches_python_statistics_median() {
+        assert_eq!(median(vec![9.0, 1.0, 3.0, 7.0]), 5.0);
+        assert_eq!(median(vec![9.0, 1.0, 3.0]), 3.0);
+    }
 
     #[test]
     fn balanced_square_pair_median_matches_python_statistics_median() {
