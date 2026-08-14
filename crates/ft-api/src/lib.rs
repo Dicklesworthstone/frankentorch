@@ -13085,60 +13085,77 @@ impl FrankenTorchSession {
             && out_len > 0
             && (p == f64::INFINITY || (p.is_finite() && p > 0.0))
         {
-            let vals = self.tensor_values_lossy_f64(input)?;
             if p == 2.0 {
                 // The f64 kernel's row-owned representation allocates one Vec per
-                // input row and then flattens all of them. For f32 pdist p=2 we
-                // can retain its f64 accumulation and final sqrt,
-                // while assigning balanced, disjoint ranges of the condensed
-                // output directly to Rayon workers. This is deliberately not the
-                // rejected f32x8 path: it preserves the current f64 arithmetic
-                // before the existing f32 narrowing step. frankentorch-pmbb6.
-                fn pair_at(condensed_idx: usize, n: usize) -> (usize, usize) {
-                    let mut lo = 0usize;
-                    let mut hi = n - 1;
-                    while lo < hi {
-                        let mid = lo + (hi - lo).div_ceil(2);
-                        let before_mid = mid * n - mid * (mid + 1) / 2;
-                        if before_mid <= condensed_idx {
-                            lo = mid;
-                        } else {
-                            hi = mid - 1;
+                // input row and then flattens all of them. Assign balanced,
+                // disjoint condensed-output ranges directly to Rayon workers
+                // instead. For the normal contiguous f32 case, borrow the input
+                // storage and widen each operand at the use site: f32 -> f64 is
+                // exact, so this retains the established f64 accumulation without
+                // allocating and faulting a second, twice-as-wide input buffer.
+                // Noncontiguous views retain the established materializing read.
+                // frankentorch-pmbb6.
+                fn direct_p2<T, F>(values: &[T], n: usize, m: usize, value: F) -> Vec<f32>
+                where
+                    T: Sync,
+                    F: Fn(&T) -> f64 + Sync,
+                {
+                    fn pair_at(condensed_idx: usize, n: usize) -> (usize, usize) {
+                        let mut lo = 0usize;
+                        let mut hi = n - 1;
+                        while lo < hi {
+                            let mid = lo + (hi - lo).div_ceil(2);
+                            let before_mid = mid * n - mid * (mid + 1) / 2;
+                            if before_mid <= condensed_idx {
+                                lo = mid;
+                            } else {
+                                hi = mid - 1;
+                            }
                         }
+                        let before_i = lo * n - lo * (lo + 1) / 2;
+                        (lo, lo + 1 + condensed_idx - before_i)
                     }
-                    let before_i = lo * n - lo * (lo + 1) / 2;
-                    (lo, lo + 1 + condensed_idx - before_i)
+
+                    const PAIRS_PER_CHUNK: usize = 2_048;
+                    use rayon::prelude::*;
+                    let mut out = vec![0.0_f32; n * (n - 1) / 2];
+                    out.par_chunks_mut(PAIRS_PER_CHUNK).enumerate().for_each(
+                        |(chunk_idx, chunk)| {
+                            let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
+                            for slot in chunk {
+                                let i_base = i * m;
+                                let j_base = j * m;
+                                let mut squared_distance = 0.0_f64;
+                                for k in 0..m {
+                                    let diff =
+                                        value(&values[i_base + k]) - value(&values[j_base + k]);
+                                    squared_distance += diff * diff;
+                                }
+                                // Squared distances are non-negative. `sqrt` is
+                                // the p=2 operation directly; `powf(0.5)` would
+                                // dispatch a generic exponent routine per pair.
+                                *slot = squared_distance.sqrt() as f32;
+                                j += 1;
+                                if j == n {
+                                    i += 1;
+                                    j = i + 1;
+                                }
+                            }
+                        },
+                    );
+                    out
                 }
 
-                const PAIRS_PER_CHUNK: usize = 2_048;
-                use rayon::prelude::*;
-                let mut out = vec![0.0_f32; out_len];
-                out.par_chunks_mut(PAIRS_PER_CHUNK)
-                    .enumerate()
-                    .for_each(|(chunk_idx, chunk)| {
-                        let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
-                        for slot in chunk {
-                            let i_base = i * m;
-                            let j_base = j * m;
-                            let mut squared_distance = 0.0_f64;
-                            for k in 0..m {
-                                let diff = vals[i_base + k] - vals[j_base + k];
-                                squared_distance += diff * diff;
-                            }
-                            // Squared distances are non-negative. `sqrt` is the
-                            // p=2 operation directly; `powf(0.5)` dispatched a
-                            // substantially heavier generic exponent routine for
-                            // every condensed pair. frankentorch-pmbb6.
-                            *slot = squared_distance.sqrt() as f32;
-                            j += 1;
-                            if j == n {
-                                i += 1;
-                                j = i + 1;
-                            }
-                        }
-                    });
+                let out = if self.tensor_tape.tensor(input)?.meta().is_contiguous() {
+                    let values = self.tensor_values_f32_borrowed(input)?;
+                    direct_p2(values, n, m, |&value| f64::from(value))
+                } else {
+                    let values = self.tensor_values_lossy_f64(input)?;
+                    direct_p2(&values, n, m, |&value| value)
+                };
                 return self.tensor_variable_f32(out, vec![out_len], false);
             }
+            let vals = self.tensor_values_lossy_f64(input)?;
             let result = ft_kernel_cpu::pdist_forward_f64(&vals, n, m, p);
             use rayon::prelude::*;
             let out: Vec<f32> = result.par_iter().map(|&v| v as f32).collect();
@@ -127360,6 +127377,40 @@ mod tests {
                 (got - want).abs() <= tolerance,
                 "pdist f32 p=2 @{idx}: got {got}, want {want}, tolerance {tolerance}"
             );
+        }
+    }
+
+    #[test]
+    fn pdist_p2_f32_contiguous_borrow_matches_noncontiguous_fallback() {
+        // The contiguous no-grad route borrows f32 storage and widens operands
+        // at use, whereas a permuted [N, C] view retains the materializing f64
+        // fallback. Both must preserve the exact p=2 pair ordering and values.
+        let compact = vec![
+            1.0_f32, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0, 4.0, 8.0, 12.0,
+        ];
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let contiguous = session
+            .tensor_variable_f32(compact, vec![4, 3], false)
+            .unwrap();
+        let expected = session.tensor_pdist(contiguous, 2.0).unwrap();
+        let expected_values = session.tensor_values_f32(expected).unwrap();
+
+        let base = session
+            .tensor_variable_f32(
+                vec![
+                    1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+                vec![3, 4],
+                false,
+            )
+            .unwrap();
+        let noncontiguous = session.tensor_permute(base, vec![1, 0]).unwrap();
+        let actual = session.tensor_pdist(noncontiguous, 2.0).unwrap();
+        let actual_values = session.tensor_values_f32(actual).unwrap();
+
+        assert_eq!(actual_values.len(), expected_values.len());
+        for (idx, (&got, &want)) in actual_values.iter().zip(expected_values.iter()).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "pdist p=2 pair {idx}");
         }
     }
 
