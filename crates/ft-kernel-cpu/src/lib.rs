@@ -11878,6 +11878,53 @@ pub fn batch_norm_stats_f64(
     let cs = channels * spatial;
     let mut mean = vec![0.0f64; channels];
     let mut var = vec![0.0f64; channels];
+
+    // BatchNorm1d's native [N, C, L] layout is cache-hostile for the old
+    // one-channel-per-task traversal: every task advances one whole NCL row
+    // between successive samples. Keep each channel's n-then-spatial addition
+    // order intact, but give a task a small adjacent-channel tile so each row
+    // visit is contiguous. The spatial==1 case keeps its established row path.
+    const NCL_CHANNEL_BLOCK: usize = 8;
+    if spatial > 1 && channels >= NCL_CHANNEL_BLOCK {
+        mean.par_chunks_mut(NCL_CHANNEL_BLOCK)
+            .zip(var.par_chunks_mut(NCL_CHANNEL_BLOCK))
+            .enumerate()
+            .for_each(|(block, (mean_block, var_block))| {
+                let first_channel = block * NCL_CHANNEL_BLOCK;
+                let width = mean_block.len();
+                let mut sums = [0.0f64; NCL_CHANNEL_BLOCK];
+                for n in 0..batch {
+                    let row = n * cs + first_channel * spatial;
+                    for (channel_offset, sum) in sums[..width].iter_mut().enumerate() {
+                        for &value in
+                            &x[row + channel_offset * spatial..row + (channel_offset + 1) * spatial]
+                        {
+                            *sum += value;
+                        }
+                    }
+                }
+                for (channel_offset, mean) in mean_block.iter_mut().enumerate() {
+                    *mean = sums[channel_offset] * inv_n;
+                }
+                for n in 0..batch {
+                    let row = n * cs + first_channel * spatial;
+                    for (channel_offset, variance) in var_block.iter_mut().enumerate() {
+                        let mean = mean_block[channel_offset];
+                        for &value in
+                            &x[row + channel_offset * spatial..row + (channel_offset + 1) * spatial]
+                        {
+                            let delta = value - mean;
+                            *variance += delta * delta;
+                        }
+                    }
+                }
+                for variance in var_block {
+                    *variance *= inv_n;
+                }
+            });
+        return (mean, var);
+    }
+
     mean.par_iter_mut()
         .zip(var.par_iter_mut())
         .enumerate()
@@ -52415,6 +52462,71 @@ mod tests {
         }
         for (got, expected) in db.iter().zip(ref_db.iter()) {
             assert_eq!(got.to_bits(), expected.to_bits(), "dbias mismatch");
+        }
+    }
+
+    #[test]
+    fn batch_norm_f64_ncl_channel_tiles_match_serial_stats_and_output_bits() {
+        let (batch, channels, spatial) = (16usize, 128usize, 256usize);
+        let x: Vec<f64> = (0..batch * channels * spatial)
+            .map(|i| ((i * 31 % 1_009) as f64 - 504.0) * 0.00390625)
+            .collect();
+        let weight: Vec<f64> = (0..channels)
+            .map(|c| 0.5 + (c % 17) as f64 * 0.03125)
+            .collect();
+        let bias: Vec<f64> = (0..channels)
+            .map(|c| -0.25 + (c % 11) as f64 * 0.015625)
+            .collect();
+        let (mean, var) = crate::batch_norm_stats_f64(&x, batch, channels, spatial);
+        let mut mean_ref = vec![0.0f64; channels];
+        let mut var_ref = vec![0.0f64; channels];
+        let inv_n = 1.0 / (batch * spatial) as f64;
+        for c in 0..channels {
+            for n in 0..batch {
+                let base = (n * channels + c) * spatial;
+                for s in 0..spatial {
+                    mean_ref[c] += x[base + s];
+                }
+            }
+            mean_ref[c] *= inv_n;
+            for n in 0..batch {
+                let base = (n * channels + c) * spatial;
+                for s in 0..spatial {
+                    let delta = x[base + s] - mean_ref[c];
+                    var_ref[c] += delta * delta;
+                }
+            }
+            var_ref[c] *= inv_n;
+        }
+        for c in 0..channels {
+            assert_eq!(mean[c].to_bits(), mean_ref[c].to_bits(), "mean[{c}]");
+            assert_eq!(var[c].to_bits(), var_ref[c].to_bits(), "var[{c}]");
+        }
+
+        let out = crate::batch_norm_apply_f64(
+            &x,
+            &mean,
+            &var,
+            Some(&weight),
+            Some(&bias),
+            batch,
+            channels,
+            spatial,
+            1e-5,
+        );
+        for n in 0..batch {
+            for c in 0..channels {
+                let scale = weight[c] / (var_ref[c] + 1e-5).sqrt();
+                let shift = bias[c] - mean_ref[c] * scale;
+                let base = (n * channels + c) * spatial;
+                for s in 0..spatial {
+                    assert_eq!(
+                        out[base + s].to_bits(),
+                        (x[base + s] * scale + shift).to_bits(),
+                        "output[{n}, {c}, {s}]"
+                    );
+                }
+            }
         }
     }
 
