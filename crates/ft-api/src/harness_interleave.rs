@@ -51,6 +51,14 @@ pub const REQUEST_PREFIX: &str = "SAMPLE ";
 /// The line that asks the co-process to exit its request loop.
 pub const QUIT_REQUEST: &str = "QUIT";
 
+/// One balanced-square round: incumbent (`true`) and FrankenTorch (`false`).
+///
+/// Every arm occupies two slots in each half and every slot position equally,
+/// so a monotonic drift or a transient peer load is common-mode rather than a
+/// bias toward either implementation.  Consumers still gate each arm's
+/// first-half/second-half A/A null before quoting the paired ratio.
+pub const BALANCED_SQUARE: [bool; 8] = [true, false, false, true, true, false, false, true];
+
 /// One timed measurement returned by the incumbent arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IncumbentSample<'a> {
@@ -381,6 +389,19 @@ for _line in sys.stdin:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balanced_square_gives_each_arm_every_half_and_slot_position_equally() {
+        let incumbent_slots = BALANCED_SQUARE
+            .iter()
+            .enumerate()
+            .filter_map(|(index, incumbent)| incumbent.then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(incumbent_slots, vec![0, 3, 4, 7]);
+        assert_eq!(BALANCED_SQUARE[..4].iter().filter(|slot| **slot).count(), 2);
+        assert_eq!(BALANCED_SQUARE[4..].iter().filter(|slot| **slot).count(), 2);
+        assert_eq!(BALANCED_SQUARE.iter().filter(|slot| !**slot).count(), 4);
+    }
 
     #[test]
     fn schedule_returns_exactly_the_requested_sample_count() {
