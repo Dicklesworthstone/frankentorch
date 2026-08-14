@@ -86,6 +86,11 @@ fn reps() -> usize {
 }
 
 const BOOTSTRAP_REPS: usize = 2_000;
+/// The balanced-square reference harness refuses a row unless each arm's A/A
+/// point estimate stays within two percent of unity.  A CI that happens to
+/// cover 1.0 is not enough: it can be broad, or centred away from unity, while
+/// still passing the generic width gate.
+const BALANCED_NULL_MAX_DEVIATION: f64 = 0.02;
 
 // Shapes lifted verbatim from pytorch_gauntlet_bench.
 const MP1_N: usize = 8;
@@ -134,9 +139,19 @@ fn paired_slot_median(mut values: [f64; 2]) -> f64 {
     (values[0] + values[1]) * 0.5
 }
 
+/// Whether an arm's balanced-square A/A point estimate is centred at unity.
+///
+/// This is deliberately a second condition beside `adjudicate_null`: the
+/// shared helper rejects broad or non-overlapping confidence intervals, while
+/// the ported balanced-square protocol also requires the observed median to
+/// land within its fixed +/-2% null band.
+fn balanced_null_is_centered(point: f64) -> bool {
+    point.is_finite() && (point - 1.0).abs() <= BALANCED_NULL_MAX_DEVIATION
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{median, paired_slot_median};
+    use super::{balanced_null_is_centered, median, paired_slot_median};
 
     #[test]
     fn balanced_square_overall_median_matches_python_statistics_median() {
@@ -148,6 +163,14 @@ mod tests {
     fn balanced_square_pair_median_matches_python_statistics_median() {
         assert_eq!(paired_slot_median([9.0, 1.0]), 5.0);
         assert_eq!(paired_slot_median([3.0, 3.0]), 3.0);
+    }
+
+    #[test]
+    fn balanced_square_null_requires_a_centred_point_estimate() {
+        assert!(balanced_null_is_centered(1.0));
+        assert!(balanced_null_is_centered(1.019));
+        assert!(!balanced_null_is_centered(1.021));
+        assert!(!balanced_null_is_centered(f64::NAN));
     }
 }
 
@@ -540,6 +563,18 @@ LANES = {
             median_ratio_ci(&ft_first_half[index], &ft_second_half[index]);
         let pt_null = adjudicate_null(pt_null_lo, pt_null_hi, MAX_NULL_CI_WIDTH);
         let ft_null = adjudicate_null(ft_null_lo, ft_null_hi, MAX_NULL_CI_WIDTH);
+        let pt_null_quotable = pt_null.is_quotable() && balanced_null_is_centered(pt_null_ratio);
+        let ft_null_quotable = ft_null.is_quotable() && balanced_null_is_centered(ft_null_ratio);
+        let pt_null_label = if pt_null.is_quotable() && !pt_null_quotable {
+            "OFFSET"
+        } else {
+            pt_null.label()
+        };
+        let ft_null_label = if ft_null.is_quotable() && !ft_null_quotable {
+            "OFFSET"
+        } else {
+            ft_null.label()
+        };
         let ft_ms = median(ft_times[index].clone());
         let (Some(pt_grad), false) = (pt_grads[index], pt_times[index].is_empty()) else {
             println!("  {name:<12} {ft_ms:8.3}       --   PyTorch row missing");
@@ -560,17 +595,16 @@ LANES = {
         };
         println!(
             "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}",
-            pt_null.label(),
-            ft_null.label(),
+            pt_null_label, ft_null_label,
         );
-        if !(pt_null.is_quotable() && ft_null.is_quotable()) {
+        if !(pt_null_quotable && ft_null_quotable) {
             println!(
-                "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; do not quote this row"
+                "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must be within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0 and carry a calm CI; do not quote this row"
             );
         }
     }
     println!(
-        "\nQuote a lane only if its A/A gate says PASS and parity is `match`. WIDE means the null's\n\
+        "\nQuote a lane only if both A/A gates say PASS, their point estimates are within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0, and parity is `match`. WIDE means the null's\n\
          CI exceeded {MAX_NULL_CI_WIDTH:.2} — the sample was too noisy to support ANY verdict, so the row is\n\
          undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT\n\
          comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild."
