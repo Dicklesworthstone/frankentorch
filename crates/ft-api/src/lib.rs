@@ -36545,7 +36545,8 @@ impl FrankenTorchSession {
             grouped_shape.clone(),
             false,
         )?;
-        let r = tape.rsqrt(tape.add(var, eps_leaf, mode)?.0, mode)?.0;
+        let var_eps = tape.add(var, eps_leaf, mode)?.0;
+        let r = tape.rsqrt(var_eps, mode)?.0;
         let xhat = tape.mul(diff, r, mode)?.0;
 
         let dn_mean = tape.mean_dim(dn, 2, mode)?.0;
@@ -36558,7 +36559,8 @@ impl FrankenTorchSession {
         let centered = tape.sub(dn, dn_mean, mode)?.0;
         let xhat_scaled = tape.mul(xhat, dnxhat_mean, mode)?.0;
         let inner = tape.sub(centered, xhat_scaled, mode)?.0;
-        let dx = tape.reshape(tape.mul(r, inner, mode)?.0, input_shape.to_vec())?;
+        let dx_grouped = tape.mul(r, inner, mode)?.0;
+        let dx = tape.reshape(dx_grouped, input_shape.to_vec())?;
 
         Ok(vec![need.first().copied().unwrap_or(false).then_some(dx)])
     }
@@ -127334,7 +127336,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tensor = session.tensor_variable_f32(input, vec![n, m], false).unwrap();
+        let tensor = session
+            .tensor_variable_f32(input, vec![n, m], false)
+            .unwrap();
         let output = session.tensor_pdist(tensor, 2.0).unwrap();
         assert_eq!(session.tensor_dtype(output).unwrap(), DType::F32);
         let actual = session.tensor_values_f32(output).unwrap();
@@ -142277,6 +142281,29 @@ mod tests {
     }
 
     #[test]
+    fn functional_group_norm_no_affine_double_backward_builds_a_hessian() {
+        // This takes the no-affine custom create_graph backward, whose tape
+        // operations must be sequenced through locals so each mutable tape
+        // borrow completes before the next operation starts.
+        let values: Vec<f64> = (0..16)
+            .map(|index| (index % 7) as f64 * 0.1 - 0.3)
+            .collect();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(values, vec![1, 4, 2, 2], true)
+            .unwrap();
+        let output = session
+            .functional_group_norm(input, 2, None, None, 1e-5)
+            .unwrap();
+        let squared = session.tensor_mul(output, output).unwrap();
+        let loss = session.tensor_sum(squared).unwrap();
+        let hessian = session.tensor_functional_hessian(loss, input).unwrap();
+
+        assert_eq!(hessian.len(), 16 * 16);
+        assert!(hessian.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn functional_group_norm_applies_affine() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
@@ -142784,9 +142811,7 @@ mod tests {
 
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s.tensor_variable(xv.clone(), vec![n, c, sp], true).unwrap();
-        let out = s
-            .functional_group_norm(x, groups, None, None, eps)
-            .unwrap();
+        let out = s.functional_group_norm(x, groups, None, None, eps).unwrap();
         assert_eq!(
             s.tensor_grad_fn(out).unwrap().as_deref(),
             Some("CustomFunction"),

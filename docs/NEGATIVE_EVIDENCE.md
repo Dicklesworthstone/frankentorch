@@ -19227,3 +19227,5 @@ min-of-2: **12 of 12 invocations above 1.0** (median `1.138`, range
 answer to the four that did not: **the phase was correctly identified as the dense
 materialisation every time; every rejected lever tried to make the write cheaper,
 and the one that paid removed the fault instead.**
+
+**9. UNDECIDABLE LIVE ROW (`2026-08-14`).** Same-invocation, interleaved PyTorch 2.12.1+cpu with in-process ELF `1b803535bed2ac3e0cd699646a11861dd10101f961cbd92824cf45c3bce0065c`: `max_pool3d` read FT 3.886 ms vs PT 0.759 ms = **5.12x slower**, parity `match`, but A/A was **WIDE** `[0.578,1.441]`; the pool ON/OFF pair was also unreadable because its identical-PyTorch control was `0.759`. This row is recorded, not certified or differenceable.
