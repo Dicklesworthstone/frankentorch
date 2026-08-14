@@ -205,17 +205,27 @@ pub fn take_filled(len: usize, value: f64) -> Vec<f64> {
 /// one. That difference is exactly why the poisoned-buffer test is mandatory.
 #[must_use]
 pub fn build_overwritten(len: usize, fill: impl FnOnce(&mut [f64])) -> Vec<f64> {
-    let mut buffer = take_exact(len);
+    let mut buffer = try_take_exact(len).unwrap_or_else(|| vec![0.0; len]);
     fill(&mut buffer);
     buffer
 }
 
-/// A buffer of exactly `len` elements whose contents are unspecified but
-/// initialized. Private because handing out stale values is only sound practice
-/// behind [`build_overwritten`]'s documented contract.
-fn take_exact(len: usize) -> Vec<f64> {
+/// A parked buffer of exactly `len` elements, or `None` if the pool cannot serve
+/// one. Contents are unspecified but initialized.
+///
+/// **Callers that have a cheaper miss path than `vec![0.0; len]` must use this
+/// rather than [`build_overwritten`], and this is not a micro-optimization — it
+/// was a measured regression.** `ft_kernel_cpu::build_uninit` allocates without
+/// zeroing at all, so routing it through `build_overwritten` traded a zero pass
+/// it never paid for a pool hit it does not always get. On 2026-08-14, with the
+/// take side widened to seven pooling backwards, the hit rate fell to 45/134 and
+/// `avg_pool2d`'s pooled arm went 4-9% SLOWER than its unpooled arm across five
+/// invocations — the misses were each paying a fresh 16 MiB memset. Returning
+/// `Option` lets the caller keep its own miss path, so the pool can only help.
+#[must_use]
+pub fn try_take_exact(len: usize) -> Option<Vec<f64>> {
     if len < MIN_POOLED_LEN || !is_enabled() {
-        return vec![0.0; len];
+        return None;
     }
     // Only an EXACT length match avoids all work: a longer parked buffer would
     // have to be truncated (free) and a shorter one grown (a memset over the new
@@ -228,11 +238,11 @@ fn take_exact(len: usize) -> Vec<f64> {
         Some(buffer) => {
             PARKED_BYTES.fetch_sub(buffer.capacity() * size_of::<f64>(), Ordering::Relaxed);
             HITS.fetch_add(1, Ordering::Relaxed);
-            buffer
+            Some(buffer)
         }
         None => {
             MISSES.fetch_add(1, Ordering::Relaxed);
-            vec![0.0; len]
+            None
         }
     }
 }

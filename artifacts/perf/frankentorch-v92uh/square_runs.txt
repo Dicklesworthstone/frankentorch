@@ -1,0 +1,29 @@
+##### RUN 1 load=9.17
+  max_pool3d      3.478    0.916   FT 3.80x SLOWER     PT OFFSET [0.936,1.239] FT OFFSET [0.802,1.014] ratio 0.263 [0.233,0.288] match
+  max_pool3d_nopool    3.579    0.863   FT 4.14x SLOWER     PT OFFSET [0.863,1.102] FT PASS [0.905,1.175] ratio 0.241 [0.217,0.271] match
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+  ratio (off/on) = 1.029x  95% CI [0.936,1.121]  11/16 rounds faster with the pool
+  ratio (off/on) = 0.962x  95% CI [0.840,1.083]  6/16 rounds faster with the pool
+  ratio (off/on) = 1.014x  95% CI [0.959,1.063]  7/16 rounds faster with the pool
+##### RUN 2 load=9.89
+  max_pool3d      7.070    0.962   FT 7.35x SLOWER     PT OFFSET [0.887,1.033] FT PASS [0.821,1.210] ratio 0.136 [0.125,0.190] match
+  max_pool3d_nopool    7.435    1.038   FT 7.16x SLOWER     PT OFFSET [0.992,1.167] FT OFFSET [0.922,1.268] ratio 0.140 [0.116,0.184] match
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+  ratio (off/on) = 1.052x  95% CI [0.891,1.281]  10/16 rounds faster with the pool
+  ratio (off/on) = 0.989x  95% CI [0.904,1.063]  5/16 rounds faster with the pool
+  ratio (off/on) = 1.163x  95% CI [0.912,1.429]  7/16 rounds faster with the pool
+##### RUN 3 load=11.09
+  max_pool3d      3.946    0.878   FT 4.49x SLOWER     PT FAIL [1.019,1.152] FT FAIL [0.823,0.992] ratio 0.222 [0.205,0.242] match
+  max_pool3d_nopool    4.291    0.875   FT 4.91x SLOWER     PT OFFSET [0.996,1.272] FT OFFSET [0.817,1.187] ratio 0.204 [0.188,0.249] match
+  max_pool1d_nopool   11.199    6.803   FT 1.65x SLOWER     PT PASS [0.890,1.081] FT PASS [0.934,1.082] ratio 0.608 [0.539,0.639] match
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+  ratio (off/on) = 1.087x  95% CI [0.920,1.189]  8/16 rounds faster with the pool
+  ratio (off/on) = 0.912x  95% CI [0.862,1.058]  7/16 rounds faster with the pool
+  ratio (off/on) = 1.020x  95% CI [0.947,1.099]  7/16 rounds faster with the pool
+##### RUN 4 load=15.52
+  max_pool3d      5.125    1.040   FT 4.93x SLOWER     PT PASS [0.896,1.104] FT OFFSET [0.731,1.248] ratio 0.203 [0.154,0.226] match
+  max_pool3d_nopool    5.806    1.021   FT 5.68x SLOWER     PT OFFSET [0.836,1.014] FT OFFSET [0.764,1.091] ratio 0.176 [0.152,0.206] match
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+  ratio (off/on) = 1.133x  95% CI [0.838,1.296]  10/16 rounds faster with the pool
+  ratio (off/on) = 0.954x  95% CI [0.796,1.079]  5/16 rounds faster with the pool
+  ratio (off/on) = 0.971x  95% CI [0.852,1.533]  10/16 rounds faster with the pool

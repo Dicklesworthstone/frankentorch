@@ -9453,7 +9453,17 @@ fn avg_pool2d_backward_2x2s2_f64(
         // `numel` of them. `avg_pool2d_backward_pooled_matches_unpooled_bits` parks
         // a NaN-filled buffer first, so a gap in that coverage fails a bit-pattern
         // comparison instead of silently shipping stale gradients.
-        return ft_core::buffer_pool::build_overwritten(numel, |dp| {
+        // frankentorch-7zqbc, CORRECTED after measurement: take the pooled buffer
+        // when there is one, but fall back to `build_uninit` — NOT to a zeroed
+        // allocation. The first version called `buffer_pool::build_overwritten`,
+        // whose miss path is `vec![0.0; len]`, which handed this site a fresh
+        // 16 MiB memset that `build_uninit` never paid. Measured: with seven
+        // pooling backwards taking from a 64-buffer pool the hit rate fell to
+        // 45/134, and avg_pool2d's pooled arm ran 4-9% SLOWER than its unpooled
+        // arm across five invocations. With `try_take_exact` the pool can only
+        // help: a hit skips the zero pass and the faults, a miss is exactly the
+        // code that was here before.
+        let fill = |dp: &mut [f64]| {
             dp.par_chunks_mut(ih * iw)
                 .enumerate()
                 .for_each(|(plane, drow)| {
@@ -9476,7 +9486,14 @@ fn avg_pool2d_backward_2x2s2_f64(
                         }
                     }
                 });
-        });
+        };
+        return match ft_core::buffer_pool::try_take_exact(numel) {
+            Some(mut pooled) => {
+                fill(&mut pooled);
+                pooled
+            }
+            None => build_uninit(numel, fill),
+        };
     }
     let mut dp = vec![0.0f64; numel];
     dp.par_chunks_mut(ih * iw)

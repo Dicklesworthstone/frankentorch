@@ -19214,6 +19214,31 @@ slower** (1 PASS row). Raw: `artifacts/perf/frankentorch-v92uh/vs_pytorch_rows.t
 invocations, different host load, and that arithmetic has already produced a false
 40% on this very lane. It is the standing, not a delta.
 
+**7c. SELF-INFLICTED REGRESSION, found by measuring my own commit
+(`frankentorch-7zqbc`, 2026-08-14).** Widening the buffer pool's take side from
+one kernel to seven looked free — same one-line hook, same bit-exact tests, all
+green. Measured with the balanced square, it made things WORSE in two ways, both
+invisible to the test suite:
+
+- **Hit rate collapsed from 31/35 to 45/134**, identical in all five
+  invocations (deterministic, not noise). Seven lanes of different sizes compete
+  for a 64-buffer cap, and `build_overwritten` needs an EXACT length match, so
+  the lanes evict each other.
+- **`avg_pool2d`'s pooled arm ran 4-9% SLOWER than its unpooled arm** (paired
+  ratios 0.962/0.989/0.912/0.954/1.004). Cause: `build_overwritten`'s miss path
+  is `vec![0.0; len]`, but the site it replaced was `build_uninit`, which does
+  **no zeroing at all**. Every miss therefore bought a fresh 16 MiB memset that
+  the old code never paid.
+- `max_pool3d`'s own paired ratio fell from 1.138/1.213 (pre-widening) to ~1.05.
+
+Fixed by `try_take_exact() -> Option<Vec<f64>>`, so a caller with a cheaper miss
+path keeps it and the pool can only help. **The transferable rule: a pooled
+allocation is only free if the MISS path is no worse than what it replaced —
+compare against the code you are deleting, not against a naive `vec![0.0; n]`.**
+And the reason this was caught at all is that the widening was measured
+separately from the thing it was widening; "same mechanism, more sites" is a
+hypothesis, not an inheritance.
+
 **8. WHAT DID PAY on this lineage — recycling, not scheduling
 (`frankentorch-v92uh`).** After a size gate (2), an avg_pool gate (3) and a serial
 pre-touch (1) all failed, the lever that worked attacked neither the thread count
