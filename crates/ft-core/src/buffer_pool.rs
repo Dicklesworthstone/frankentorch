@@ -264,10 +264,31 @@ pub fn recycle(buffer: Vec<f64>) {
     }
     let bytes = capacity * size_of::<f64>();
     with_pool(|pool| {
-        if pool.len() >= MAX_PARKED_BUFFERS
-            || PARKED_BYTES.load(Ordering::Relaxed) + bytes > MAX_PARKED_BYTES
-        {
+        if PARKED_BYTES.load(Ordering::Relaxed) + bytes > MAX_PARKED_BYTES {
             return;
+        }
+        if pool.len() >= MAX_PARKED_BUFFERS {
+            // frankentorch-7zqbc: KEEP THE LARGEST, evict the smallest — do not
+            // simply refuse. Measured cause of a 34% hit rate: with seven lanes
+            // parking, the 64 slots filled to only 69.8 MiB, an average of
+            // 1.1 MiB per slot. Small intermediate gradients were crowding out
+            // the multi-MiB leaf gradients, which is exactly backwards — the
+            // saving is the page faults avoided, so it scales with buffer SIZE,
+            // and a 1 MiB slot displacing an 8 MiB one trades an 8x saving for a
+            // 1x one. Refusing outright had the same effect, just silently.
+            let Some(smallest) = pool
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, parked)| parked.capacity())
+                .map(|(index, _)| index)
+            else {
+                return;
+            };
+            if pool[smallest].capacity() >= capacity {
+                return;
+            }
+            let evicted = pool.swap_remove(smallest);
+            PARKED_BYTES.fetch_sub(evicted.capacity() * size_of::<f64>(), Ordering::Relaxed);
         }
         PARKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
         pool.push(buffer);
@@ -469,6 +490,56 @@ mod tests {
             }
             assert_eq!(stats().parked_buffers, MAX_PARKED_BUFFERS);
             assert!(stats().parked_bytes <= MAX_PARKED_BYTES);
+        });
+    }
+
+    #[test]
+    fn a_full_pool_evicts_its_smallest_for_a_larger_buffer() {
+        // The saving a parked buffer represents is the page faults it avoids, so
+        // it scales with SIZE. A full pool must therefore hold the LARGEST
+        // buffers, not the ones that happened to arrive first — measured cause of
+        // a 34% hit rate: 64 slots holding 69.8 MiB, i.e. 1.1 MiB each, while the
+        // lanes that mattered wanted 8-32 MiB.
+        guarded(|| {
+            for _ in 0..MAX_PARKED_BUFFERS {
+                recycle(vec![0.0; MIN_POOLED_LEN]);
+            }
+            assert_eq!(stats().parked_buffers, MAX_PARKED_BUFFERS);
+            let before = stats().parked_bytes;
+
+            recycle(vec![0.0; MIN_POOLED_LEN * 8]);
+            assert_eq!(
+                stats().parked_buffers,
+                MAX_PARKED_BUFFERS,
+                "eviction must keep the count at the cap, not grow past it"
+            );
+            assert!(
+                stats().parked_bytes > before,
+                "a larger buffer displacing a smaller one must raise parked bytes"
+            );
+            // And it is actually servable now, which is the whole point.
+            let taken = take_zeroed(MIN_POOLED_LEN * 8);
+            assert_eq!(taken.len(), MIN_POOLED_LEN * 8);
+            assert_eq!(stats().hits, 1);
+        });
+    }
+
+    #[test]
+    fn a_full_pool_refuses_a_buffer_no_larger_than_its_smallest() {
+        // The mirror case. Without it, eviction would churn the pool on every
+        // same-sized recycle and could evict a buffer a caller is about to want.
+        guarded(|| {
+            for _ in 0..MAX_PARKED_BUFFERS {
+                recycle(vec![0.0; MIN_POOLED_LEN * 2]);
+            }
+            let before = stats().parked_bytes;
+            recycle(vec![0.0; MIN_POOLED_LEN]);
+            assert_eq!(stats().parked_buffers, MAX_PARKED_BUFFERS);
+            assert_eq!(
+                stats().parked_bytes,
+                before,
+                "a smaller buffer must not displace a larger one"
+            );
         });
     }
 
