@@ -181,18 +181,78 @@ pub fn take_filled(len: usize, value: f64) -> Vec<f64> {
     }
 }
 
+/// Build a buffer of `len` elements by writing every one of them.
+///
+/// This is the pooled counterpart of `ft_kernel_cpu::build_uninit`, for the
+/// kernels that already establish they overwrite their whole output: it skips
+/// the zero-fill *and* the page faults, where [`take_zeroed`] only skips the
+/// faults. On a pool hit the buffer arrives at exactly the right length with its
+/// pages already committed, so `fill` does the first touch and nothing else
+/// touches the memory at all.
+///
+/// # Contract
+///
+/// `fill` MUST write every element of the slice before reading it. A parked
+/// buffer arrives holding the PREVIOUS user's values — never uninitialized
+/// memory, so a violation is a wrong number rather than undefined behaviour, and
+/// this stays inside `#![forbid(unsafe_code)]` — but it is still wrong. Kernels
+/// using this must carry a test that parks a poisoned buffer and compares bit
+/// patterns against the unpooled result; that is what proves the coverage claim
+/// rather than assuming it.
+///
+/// If the pool cannot serve the request the buffer is freshly zeroed, so a
+/// partial `fill` shows up as zeros on a cold pool and as stale values on a warm
+/// one. That difference is exactly why the poisoned-buffer test is mandatory.
+#[must_use]
+pub fn build_overwritten(len: usize, fill: impl FnOnce(&mut [f64])) -> Vec<f64> {
+    let mut buffer = take_exact(len);
+    fill(&mut buffer);
+    buffer
+}
+
+/// A buffer of exactly `len` elements whose contents are unspecified but
+/// initialized. Private because handing out stale values is only sound practice
+/// behind [`build_overwritten`]'s documented contract.
+fn take_exact(len: usize) -> Vec<f64> {
+    if len < MIN_POOLED_LEN || !is_enabled() {
+        return vec![0.0; len];
+    }
+    // Only an EXACT length match avoids all work: a longer parked buffer would
+    // have to be truncated (free) and a shorter one grown (a memset over the new
+    // region), and at that point `take_filled` is the honest call.
+    let recycled = with_pool(|pool| {
+        let index = pool.iter().position(|buffer| buffer.len() == len)?;
+        Some(pool.swap_remove(index))
+    });
+    match recycled {
+        Some(buffer) => {
+            PARKED_BYTES.fetch_sub(buffer.capacity() * size_of::<f64>(), Ordering::Relaxed);
+            HITS.fetch_add(1, Ordering::Relaxed);
+            buffer
+        }
+        None => {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            vec![0.0; len]
+        }
+    }
+}
+
 /// Offer a buffer back to the pool.
 ///
 /// Buffers below [`MIN_POOLED_LEN`] capacity, and those that would push the pool
 /// past its ceilings, are dropped instead of parked. Always safe to call — the
 /// caller gives up ownership either way, exactly as a plain drop would.
-pub fn recycle(mut buffer: Vec<f64>) {
+///
+/// The buffer is parked at its CURRENT length rather than cleared, which is what
+/// lets [`build_overwritten`] hand back a right-sized buffer with no fill at all.
+/// [`take_filled`] clears and refills regardless, so it cannot observe the
+/// difference.
+pub fn recycle(buffer: Vec<f64>) {
     let capacity = buffer.capacity();
     if capacity < MIN_POOLED_LEN || !is_enabled() {
         return;
     }
     let bytes = capacity * size_of::<f64>();
-    buffer.clear();
     with_pool(|pool| {
         if pool.len() >= MAX_PARKED_BUFFERS
             || PARKED_BYTES.load(Ordering::Relaxed) + bytes > MAX_PARKED_BYTES
@@ -243,6 +303,75 @@ mod tests {
                 "recycled buffer was handed back without being re-zeroed"
             );
             assert_eq!(stats().hits, 1, "the buffer should have been reused");
+        });
+    }
+
+    #[test]
+    fn build_overwritten_reuses_an_exact_length_buffer_with_no_fill() {
+        guarded(|| {
+            recycle(vec![7.5; MIN_POOLED_LEN]);
+            let built = build_overwritten(MIN_POOLED_LEN, |slice| {
+                assert_eq!(slice.len(), MIN_POOLED_LEN);
+                // The whole point: what arrives is the PREVIOUS user's data, not
+                // zeros — nobody paid to clear it.
+                assert!(slice.iter().all(|value| *value == 7.5));
+                for (index, value) in slice.iter_mut().enumerate() {
+                    *value = index as f64;
+                }
+            });
+            assert_eq!(stats().hits, 1);
+            assert_eq!(built.len(), MIN_POOLED_LEN);
+            assert!(
+                built
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| *value == index as f64)
+            );
+        });
+    }
+
+    #[test]
+    fn build_overwritten_hands_out_zeros_when_the_pool_is_cold() {
+        guarded(|| {
+            let built = build_overwritten(MIN_POOLED_LEN, |slice| {
+                assert!(
+                    slice.iter().all(|value| *value == 0.0),
+                    "a cold-pool buffer must be zeroed, so a partial fill degrades \
+                     to the old behaviour rather than to garbage"
+                );
+                slice[0] = 1.0;
+            });
+            assert_eq!(stats().hits, 0);
+            assert_eq!(built[0], 1.0);
+            assert!(built[1..].iter().all(|value| *value == 0.0));
+        });
+    }
+
+    #[test]
+    fn build_overwritten_declines_a_mismatched_length() {
+        guarded(|| {
+            // A buffer of a DIFFERENT length must not be stretched or truncated
+            // into service: both cost a memset or a free, which is what
+            // `take_filled` is for.
+            recycle(vec![1.0; MIN_POOLED_LEN * 2]);
+            let built = build_overwritten(MIN_POOLED_LEN, |slice| slice.fill(3.0));
+            assert_eq!(built.len(), MIN_POOLED_LEN);
+            assert_eq!(stats().hits, 0);
+            assert!(built.iter().all(|value| *value == 3.0));
+        });
+    }
+
+    #[test]
+    fn take_filled_scrubs_a_buffer_parked_at_full_length() {
+        // `recycle` parks at the buffer's current LENGTH now, so `take_filled`
+        // receives a full, dirty buffer rather than an empty one. It must still
+        // return exactly the requested fill — this is the interaction between the
+        // two take paths, and it is where a length/contents mix-up would hide.
+        guarded(|| {
+            recycle(vec![f64::NAN; MIN_POOLED_LEN]);
+            let taken = take_filled(MIN_POOLED_LEN, 2.5);
+            assert_eq!(taken.len(), MIN_POOLED_LEN);
+            assert!(taken.iter().all(|value| *value == 2.5));
         });
     }
 
