@@ -13086,6 +13086,55 @@ impl FrankenTorchSession {
             && (p == f64::INFINITY || (p.is_finite() && p > 0.0))
         {
             let vals = self.tensor_values_lossy_f64(input)?;
+            if p == 2.0 {
+                // The f64 kernel's row-owned representation allocates one Vec per
+                // input row and then flattens all of them. For f32 pdist p=2 we
+                // can retain its f64 accumulation and final powf(0.5),
+                // while assigning balanced, disjoint ranges of the condensed
+                // output directly to Rayon workers. This is deliberately not the
+                // rejected f32x8 path: it preserves the current f64 arithmetic
+                // before the existing f32 narrowing step. frankentorch-pmbb6.
+                fn pair_at(condensed_idx: usize, n: usize) -> (usize, usize) {
+                    let mut lo = 0usize;
+                    let mut hi = n - 1;
+                    while lo < hi {
+                        let mid = lo + (hi - lo).div_ceil(2);
+                        let before_mid = mid * n - mid * (mid + 1) / 2;
+                        if before_mid <= condensed_idx {
+                            lo = mid;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    let before_i = lo * n - lo * (lo + 1) / 2;
+                    (lo, lo + 1 + condensed_idx - before_i)
+                }
+
+                const PAIRS_PER_CHUNK: usize = 2_048;
+                use rayon::prelude::*;
+                let mut out = vec![0.0_f32; out_len];
+                out.par_chunks_mut(PAIRS_PER_CHUNK)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
+                        for slot in chunk {
+                            let i_base = i * m;
+                            let j_base = j * m;
+                            let mut squared_distance = 0.0_f64;
+                            for k in 0..m {
+                                let diff = vals[i_base + k] - vals[j_base + k];
+                                squared_distance += diff * diff;
+                            }
+                            *slot = squared_distance.powf(0.5) as f32;
+                            j += 1;
+                            if j == n {
+                                i += 1;
+                                j = i + 1;
+                            }
+                        }
+                    });
+                return self.tensor_variable_f32(out, vec![out_len], false);
+            }
             let result = ft_kernel_cpu::pdist_forward_f64(&vals, n, m, p);
             use rayon::prelude::*;
             let out: Vec<f32> = result.par_iter().map(|&v| v as f32).collect();
@@ -36459,6 +36508,61 @@ impl FrankenTorchSession {
         self.tensor_sum(output)
     }
 
+    /// create_graph (double-backward) for the fused no-affine GroupNorm op.
+    ///
+    /// With no affine parameters the upstream gradient is already `dn` in the
+    /// standard GroupNorm input-adjoint formula. Keep this as a one-input
+    /// custom op instead of materializing the composed normalization graph.
+    #[allow(clippy::too_many_arguments)]
+    fn group_norm_no_affine_create_graph_backward(
+        tape: &mut TensorTape,
+        mode: ExecutionMode,
+        dy_id: TensorNodeId,
+        x_id: TensorNodeId,
+        batch_size: usize,
+        num_groups: usize,
+        channels_per_group: usize,
+        spatial: usize,
+        eps: f64,
+        input_shape: &[usize],
+        need: &[bool],
+    ) -> Result<Vec<Option<TensorNodeId>>, AutogradError> {
+        let group_numel = channels_per_group * spatial;
+        let grouped_shape = vec![batch_size, num_groups, group_numel];
+
+        let xg = tape.reshape(x_id, grouped_shape.clone())?;
+        let dn = tape.reshape(dy_id, grouped_shape.clone())?;
+        let mean = tape.mean_dim(xg, 2, mode)?.0;
+        let mean = tape.unsqueeze(mean, 2)?;
+        let mean = tape.expand(mean, grouped_shape.clone())?;
+        let diff = tape.sub(xg, mean, mode)?.0;
+        let diff_sq = tape.mul(diff, diff, mode)?.0;
+        let var = tape.mean_dim(diff_sq, 2, mode)?.0;
+        let var = tape.unsqueeze(var, 2)?;
+        let var = tape.expand(var, grouped_shape.clone())?;
+        let eps_leaf = tape.leaf(
+            vec![eps; batch_size * num_groups * group_numel],
+            grouped_shape.clone(),
+            false,
+        )?;
+        let r = tape.rsqrt(tape.add(var, eps_leaf, mode)?.0, mode)?.0;
+        let xhat = tape.mul(diff, r, mode)?.0;
+
+        let dn_mean = tape.mean_dim(dn, 2, mode)?.0;
+        let dn_mean = tape.unsqueeze(dn_mean, 2)?;
+        let dn_mean = tape.expand(dn_mean, grouped_shape.clone())?;
+        let dnxhat = tape.mul(dn, xhat, mode)?.0;
+        let dnxhat_mean = tape.mean_dim(dnxhat, 2, mode)?.0;
+        let dnxhat_mean = tape.unsqueeze(dnxhat_mean, 2)?;
+        let dnxhat_mean = tape.expand(dnxhat_mean, grouped_shape)?;
+        let centered = tape.sub(dn, dn_mean, mode)?.0;
+        let xhat_scaled = tape.mul(xhat, dnxhat_mean, mode)?.0;
+        let inner = tape.sub(centered, xhat_scaled, mode)?.0;
+        let dx = tape.reshape(tape.mul(r, inner, mode)?.0, input_shape.to_vec())?;
+
+        Ok(vec![need.first().copied().unwrap_or(false).then_some(dx)])
+    }
+
     /// create_graph (double-backward) for the fused affine GroupNorm op
     /// (frankentorch-vz3o6). Per group, with `m = channels_per_group * spatial`:
     /// `xhat = (x - mean(x)) * rsqrt(var(x)+eps)`, `dn = dy * weight`, and
@@ -36903,6 +37007,61 @@ impl FrankenTorchSession {
                 )
             };
             return self.tensor_variable_f32(out, input_shape, false);
+        }
+        // No-affine f64 GroupNorm only differentiates with respect to input.
+        // Its existing kernel already accepts absent affine parameters, so use
+        // the same borrowed-input custom-op route as the affine f64 fast path
+        // instead of constructing the generic normalization graph.
+        if self.tensor_tape.tensor_requires_grad(input)?
+            && input_f64
+            && weight.is_none()
+            && bias.is_none()
+        {
+            let (bsz, ng, cpg, sp, eps_c) =
+                (batch_size, num_groups, channels_per_group, spatial, eps);
+            let ishape = input_shape.clone();
+            let ishape_cg = input_shape.clone();
+            let mode = self.mode();
+            return self
+                .tensor_tape
+                .apply_function_with_create_graph_borrowed_inputs(
+                    &[input],
+                    move |_ctx, ins| {
+                        let (xv, _) = ins[0];
+                        let out = ft_kernel_cpu::group_norm_forward_f64(
+                            xv, None, None, bsz, ng, cpg, sp, eps_c,
+                        );
+                        Ok((out, ishape.clone()))
+                    },
+                    move |_ctx, grad_outputs, borrowed| {
+                        let (dx, _, _) = ft_kernel_cpu::group_norm_backward_f64(
+                            grad_outputs[0],
+                            borrowed[0].0,
+                            None,
+                            bsz,
+                            ng,
+                            cpg,
+                            sp,
+                            eps_c,
+                        );
+                        Ok(vec![Some(dx)])
+                    },
+                    move |ctx, grad_outs, fn_inputs, tape| {
+                        Self::group_norm_no_affine_create_graph_backward(
+                            tape,
+                            mode,
+                            grad_outs[0],
+                            fn_inputs[0],
+                            bsz,
+                            ng,
+                            cpg,
+                            sp,
+                            eps_c,
+                            &ishape_cg,
+                            ctx.needs_input_grad(),
+                        )
+                    },
+                );
         }
         if let (Some(w), Some(bs)) = (weight, bias) {
             if (self.tensor_tape.tensor_requires_grad(input)? || w_grad || b_grad)
@@ -127160,6 +127319,36 @@ mod tests {
     }
 
     #[test]
+    fn pdist_p2_f32_chunked_output_matches_f64_kernel_narrowing() {
+        // Exercise multiple balanced condensed-output chunks. The f32 fast path
+        // deliberately retains the f64 kernel's per-feature arithmetic and
+        // final powf(0.5), then narrows each distance once.
+        let (n, m) = (97usize, 19usize);
+        let input: Vec<f32> = (0..n * m)
+            .map(|idx| ((idx * 37 % 211) as f32 - 105.0) * 0.0078125)
+            .collect();
+        let reference_input: Vec<f64> = input.iter().map(|&value| value as f64).collect();
+        let expected = ft_kernel_cpu::pdist_forward_f64(&reference_input, n, m, 2.0)
+            .into_iter()
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = session.tensor_variable_f32(input, vec![n, m], false).unwrap();
+        let output = session.tensor_pdist(tensor, 2.0).unwrap();
+        assert_eq!(session.tensor_dtype(output).unwrap(), DType::F32);
+        let actual = session.tensor_values_f32(output).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
+            let tolerance = 2.0e-5_f32 + 2.0e-5_f32 * want.abs();
+            assert!(
+                (got - want).abs() <= tolerance,
+                "pdist f32 p=2 @{idx}: got {got}, want {want}, tolerance {tolerance}"
+            );
+        }
+    }
+
+    #[test]
     fn cdist_l2_propagates_gradient_through_both_inputs() {
         // Regression test for frankentorch-tdqo. tensor_cdist used to
         // extract values, compute distances in plain f64, and rebuild
@@ -142579,6 +142768,63 @@ mod tests {
             bm[j] -= h;
             let fdb = (loss_fn(&xv, &wv, &bp) - loss_fn(&xv, &wv, &bm)) / (2.0 * h);
             check(gb[j], fdb, "dbias", j);
+        }
+    }
+
+    #[test]
+    fn functional_group_norm_no_affine_grad_matches_finite_diff() {
+        let (n, c, sp, groups) = (2usize, 4usize, 3usize, 2usize);
+        let xv: Vec<f64> = (0..n * c * sp)
+            .map(|i| ((i % 7) as f64 - 3.0) * 0.35 + (i as f64) * 0.02)
+            .collect();
+        let coefficients: Vec<f64> = (0..n * c * sp)
+            .map(|i| 0.2 + (i % 5) as f64 * 0.13)
+            .collect();
+        let eps = 1e-5;
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, c, sp], true).unwrap();
+        let out = s
+            .functional_group_norm(x, groups, None, None, eps)
+            .unwrap();
+        assert_eq!(
+            s.tensor_grad_fn(out).unwrap().as_deref(),
+            Some("CustomFunction"),
+            "f64 no-affine GroupNorm should use the fused custom op"
+        );
+        let coefficient = s
+            .tensor_variable(coefficients.clone(), vec![n, c, sp], false)
+            .unwrap();
+        let weighted = s.tensor_mul(out, coefficient).unwrap();
+        let loss = s.tensor_sum(weighted).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+
+        let loss_fn = |xs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2
+                .tensor_variable(xs.to_vec(), vec![n, c, sp], false)
+                .unwrap();
+            let coefficient = s2
+                .tensor_variable(coefficients.clone(), vec![n, c, sp], false)
+                .unwrap();
+            let out = s2
+                .functional_group_norm(xi, groups, None, None, eps)
+                .unwrap();
+            let loss = s2.tensor_mul(out, coefficient).unwrap();
+            s2.tensor_values(loss).unwrap().iter().sum()
+        };
+        let h = 1e-6;
+        for i in 0..xv.len() {
+            let (mut xp, mut xm) = (xv.clone(), xv.clone());
+            xp[i] += h;
+            xm[i] -= h;
+            let finite_difference = (loss_fn(&xp) - loss_fn(&xm)) / (2.0 * h);
+            assert!(
+                (gx[i] - finite_difference).abs() <= 1e-4 + 1e-4 * finite_difference.abs(),
+                "dx[{i}]: analytic {} vs finite-diff {finite_difference}",
+                gx[i]
+            );
         }
     }
 
