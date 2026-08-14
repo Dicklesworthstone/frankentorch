@@ -26,12 +26,11 @@
 //! each round takes an incumbent sample immediately beside our samples for the
 //! same lane. See `ft_api::harness_interleave` for the protocol and the schedule.
 //!
-//! THE INCUMBENT'S ESTIMATOR IS UNCHANGED. Interleaving alters *when* samples are
-//! taken, not how many or which statistic summarises them. PyTorch is still
-//! min-of-`PT_SAMPLES` after 4 warmups; those samples are merely spread evenly
-//! across the rounds instead of taken in one block. Had this also switched to
-//! min-of-16 the ratio's level would have moved for reasons unrelated to
-//! interleaving, and the before/after set could not isolate this change.
+//! THE ESTIMATOR IS PER-ROUND MEDIAN. The balanced square deliberately changes
+//! the old min-of-seven estimator: every row now uses the median of four live
+//! samples from each arm inside every round, then a median-ratio bootstrap over
+//! those round medians. That is not comparable to the banked rows, but it is the
+//! necessary cost of a paired comparison that remains valid on a shared host.
 //!
 //! Four lanes, shapes copied from `pytorch_gauntlet_bench` so the two describe the
 //! same workloads: `max_pool1d`, `avg_pool2d`, `conv3d`, `max_pool3d`.
@@ -48,25 +47,44 @@ use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
-    ArmOrdering, LEGACY_BLOCK_ARMS_ENV, MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS,
-    TIMED_STEPS_MARKER, adjudicate_null, arm_ordering_from_env, incumbent_sample_rounds,
-    parse_sample_line, parse_timed_steps, sample_request, timed_region_disagreement,
+    BALANCED_SQUARE, MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS,
+    TIMED_STEPS_MARKER, adjudicate_null, parse_sample_line, parse_timed_steps, sample_request,
+    timed_region_disagreement,
 };
 use ft_core::ExecutionMode;
 
-/// MUST BE EVEN (`frankentorch-svabf`). Each round runs two timed calls and
-/// assigns them to the A/A arms by round parity, which cancels a constant
-/// first-call-vs-second-call offset *only if the two positions are used equally
-/// often*. At the previous odd value of 15, arm `a` took the first position 8
-/// times and the second 7 — a 1-in-15 imbalance that leaks the position effect
-/// straight into the null ratio. That is what made `max_pool1d` and `conv3d`
-/// report A/A CIs excluding 1.0 (`[0.843,0.986]`, `[0.770,0.992]`) on a busy host
-/// while identical code ran in both arms.
-const REPS: usize = 16;
-/// Incumbent samples per lane. Held at 7 to keep PyTorch's estimator exactly the
-/// min-of-7 the banked non-interleaved set used — see the module note on why the
-/// estimator must not move in the same change that introduces interleaving.
-const PT_SAMPLES: usize = 7;
+/// Every balanced-square round has four samples from each arm, so every arm
+/// occupies two positions in each half even when the number of rounds is odd.
+const DEFAULT_REPS: usize = 16;
+
+/// Rounds for this run: `DEFAULT_REPS` unless `FT_H2H_REPS` overrides it.
+///
+/// The default is deliberately untouched, so an unadorned run is byte-comparable
+/// with every banked one. The override exists because of what the 2026-08-14
+/// session measured about this host: at load ~21, `max_pool3d`'s A/A gate came
+/// back PASS in only 4 of 8 invocations and `avg_pool2d`'s in 1 of 8 — the other
+/// rows were WIDE, i.e. undecidable, and an undecidable row cannot carry a
+/// standing however many times it is repeated. More rounds is the only knob that
+/// narrows a null CI without touching the estimator, so a measurement session on
+/// a busy host can buy decidability with wall-clock instead of waiting for a
+/// quiet machine that never arrives.
+///
+/// The floor gives the bootstrap enough independent round medians to resample.
+fn reps() -> usize {
+    let Ok(raw) = std::env::var("FT_H2H_REPS") else {
+        return DEFAULT_REPS;
+    };
+    let Ok(parsed) = raw.trim().parse::<usize>() else {
+        eprintln!("FT_H2H_REPS={raw:?} is not a number; using {DEFAULT_REPS}");
+        return DEFAULT_REPS;
+    };
+    if parsed < 8 {
+        eprintln!("FT_H2H_REPS={parsed} is below the floor of 8; using {DEFAULT_REPS}");
+        return DEFAULT_REPS;
+    }
+    parsed
+}
+
 const BOOTSTRAP_REPS: usize = 2_000;
 
 // Shapes lifted verbatim from pytorch_gauntlet_bench.
@@ -102,8 +120,24 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
-fn minimum(values: &[f64]) -> f64 {
-    values.iter().copied().fold(f64::INFINITY, f64::min)
+/// `statistics.median` in the sanctioned Python balanced-square harness returns
+/// the mean for an even pair. Keep that definition for each arm's two slots in
+/// a half; selecting the upper value would manufacture a direction from slot
+/// order before either A/A gate can detect it.
+fn paired_slot_median(mut values: [f64; 2]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    (values[0] + values[1]) * 0.5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paired_slot_median;
+
+    #[test]
+    fn balanced_square_pair_median_matches_python_statistics_median() {
+        assert_eq!(paired_slot_median([9.0, 1.0]), 5.0);
+        assert_eq!(paired_slot_median([3.0, 3.0]), 3.0);
+    }
 }
 
 fn next_random(state: &mut u64) -> u64 {
@@ -200,28 +234,13 @@ fn incumbent_sample(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // The A/A null gate is only meaningful if the two arms use the first- and
-    // second-call positions equally often; see the note on REPS.
-    assert!(
-        REPS.is_multiple_of(2),
-        "REPS must be even or the A/A arms are position-imbalanced and the null gate leaks bias"
-    );
-    // Compile-time: the incumbent cannot take more samples than there are rounds
-    // to spread them across, or the schedule would clamp and silently change the
-    // estimator this harness is careful to hold fixed.
-    const {
-        assert!(PT_SAMPLES <= REPS);
-    }
+    let reps = reps();
 
     let mp1 = seq(MP1_N * MP1_C * MP1_L);
     let ap2 = seq(AP2_N * AP2_C * AP2_H * AP2_W);
     let c3x = seq(C3_N * C3_CI * C3_D * C3_H * C3_W);
     let c3w = seq(C3_CO * C3_CI * C3_K * C3_K * C3_K);
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
-
-    // Interleaved is the default; the legacy block ordering is an explicit opt-in.
-    let legacy_env = std::env::var(LEGACY_BLOCK_ARMS_ENV).ok();
-    let ordering = arm_ordering_from_env(legacy_env.as_deref());
 
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     // Setup only. The request/serve/quit loop is appended from the library so the
@@ -265,6 +284,10 @@ LANES = {
     # is a free control that must come out ~1.0; if it does not, the host moved
     # during the run and the FT comparison is not readable either.
     "max_pool3d_nopool": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
+    # frankentorch-7zqbc: same pairing for the two other lanes whose backward now
+    # takes from the pool.
+    "avg_pool2d_nopool": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
+    "max_pool1d_nopool": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
 }
 "#;
     let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
@@ -349,19 +372,18 @@ LANES = {
         "measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)"
     );
     println!(
-        "sampling={} (frankentorch-6atx2); PyTorch min-of-{PT_SAMPLES} after 4 warmups, spread \
-         evenly across {REPS} rounds, torch threads=8",
-        ordering.label()
+        "sampling=balanced-square {} (frankentorch-xdw0h); {} rounds, four live samples per arm \
+         per round, torch threads=8",
+        BALANCED_SQUARE
+            .iter()
+            .map(|incumbent| if *incumbent { 'A' } else { 'B' })
+            .collect::<String>(),
+        reps,
     );
-    if !ordering.is_quotable() {
-        println!(
-            "WARNING: {LEGACY_BLOCK_ARMS_ENV} is set, so the whole PyTorch arm ran before the first\n\
-             FrankenTorch lane. Any load shift in that gap lands entirely in the ratio. These rows\n\
-             exist to be compared against a default run, NOT to be quoted."
-        );
-    }
     println!();
-    println!("lane          FT(ms)    PT(ms)   standing            A/A gate           parity");
+    println!(
+        "lane          FT(ms)    PT(ms)   standing            PT/FT A/A gates and ratio CI                 parity"
+    );
 
     let lanes: Vec<(&str, LaneRun<'_>)> = vec![
         (
@@ -409,6 +431,29 @@ LANES = {
             }),
         ),
         (
+            "avg_pool2d_nopool",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
+                    s.functional_avg_pool2d_sum(x, (2, 2), (2, 2), (0, 0), false, true)
+                        .expect("avg_pool2d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
+            }),
+        ),
+        (
+            "max_pool1d_nopool",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
+            }),
+        ),
+        (
             "conv3d",
             Box::new(|| {
                 timed_op(&c3x, vec![C3_N, C3_CI, C3_D, C3_H, C3_W], |s, x| {
@@ -431,50 +476,43 @@ LANES = {
         std::hint::black_box(warm);
     }
 
-    let schedule = incumbent_sample_rounds(REPS, PT_SAMPLES);
-    let mut arm_a: Vec<Vec<f64>> = vec![Vec::with_capacity(REPS); lanes.len()];
-    let mut arm_b: Vec<Vec<f64>> = vec![Vec::with_capacity(REPS); lanes.len()];
-    let mut pt_times: Vec<Vec<f64>> = vec![Vec::with_capacity(PT_SAMPLES); lanes.len()];
+    let mut ft_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut pt_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut ft_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut ft_second_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut pt_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut pt_second_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut pt_grads: Vec<Option<f64>> = vec![None; lanes.len()];
     let mut checksums: Vec<f64> = vec![0.0; lanes.len()];
 
-    // frankentorch-6atx2 option (a): under the legacy ordering the ENTIRE
-    // incumbent arm is drained up front, exactly as this harness behaved before
-    // interleaving. Sample counts, estimator and lane order are identical to the
-    // interleaved path — only WHEN the incumbent is sampled differs — so a
-    // BEFORE/AFTER pair of one binary in one window isolates arm ordering and
-    // nothing else. That is the comparison the banked set can no longer support.
-    if ordering == ArmOrdering::LegacyBlock {
-        for (index, (name, _)) in lanes.iter().enumerate() {
-            for _ in 0..PT_SAMPLES {
-                let (ms, grad) = incumbent_sample(&mut stdin, &mut reader, name)?;
-                pt_times[index].push(ms);
-                pt_grads[index] = Some(grad);
-            }
-        }
-    }
+    // Ported from franken_networkx `balanced_square_ab.py` @72761094c. Its
+    // `ABBAABBA` order gives each arm every half and slot position equally, so
+    // host drift and peer work are common-mode instead of a precondition that
+    // every CPU must be idle. Each arm's own half-vs-half A/A null remains a
+    // mandatory gate; a failed row is refused rather than averaged into a ratio.
 
-    for round in 0..REPS {
-        let incumbent_round =
-            ordering == ArmOrdering::Interleaved && schedule.binary_search(&round).is_ok();
+    for _ in 0..reps {
         for (index, (name, run_lane)) in lanes.iter().enumerate() {
-            // The incumbent sample sits immediately beside our samples for the
-            // SAME lane, so both arms see the same instant of machine state.
-            if incumbent_round {
-                let (ms, grad) = incumbent_sample(&mut stdin, &mut reader, name)?;
-                pt_times[index].push(ms);
-                pt_grads[index] = Some(grad);
+            let mut incumbent_slots = Vec::with_capacity(4);
+            let mut ft_slots = Vec::with_capacity(4);
+            for incumbent_slot in BALANCED_SQUARE {
+                if incumbent_slot {
+                    let (ms, grad) = incumbent_sample(&mut stdin, &mut reader, name)?;
+                    incumbent_slots.push(ms);
+                    pt_grads[index] = Some(grad);
+                } else {
+                    let (ms, checksum) = run_lane();
+                    ft_slots.push(ms);
+                    checksums[index] = checksum;
+                }
             }
-            let (first, checksum) = run_lane();
-            let (second, _) = run_lane();
-            checksums[index] = checksum;
-            if round.is_multiple_of(2) {
-                arm_a[index].push(first);
-                arm_b[index].push(second);
-            } else {
-                arm_b[index].push(first);
-                arm_a[index].push(second);
-            }
+            pt_first_half[index].push(paired_slot_median([incumbent_slots[0], incumbent_slots[1]]));
+            pt_second_half[index]
+                .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));
+            ft_first_half[index].push(paired_slot_median([ft_slots[0], ft_slots[1]]));
+            ft_second_half[index].push(paired_slot_median([ft_slots[2], ft_slots[3]]));
+            pt_times[index].push(median(incumbent_slots));
+            ft_times[index].push(median(ft_slots));
         }
     }
 
@@ -484,25 +522,19 @@ LANES = {
     child.wait()?;
 
     for (index, (name, _)) in lanes.iter().enumerate() {
-        let (nr, nlo, nhi) = median_ratio_ci(&arm_a[index], &arm_b[index]);
-        // frankentorch-8ieqm: bracketing 1.0 is not enough — contention WIDENS
-        // the null's CI, and a wider CI brackets 1.0 more easily, so the old
-        // gate got easier to pass exactly when the host got noisier.
-        let null = adjudicate_null(nlo, nhi, MAX_NULL_CI_WIDTH);
-        let ft_ms = median(
-            arm_a[index]
-                .iter()
-                .chain(arm_b[index].iter())
-                .copied()
-                .collect(),
-        );
+        let (ratio, ratio_lo, ratio_hi) = median_ratio_ci(&pt_times[index], &ft_times[index]);
+        let (pt_null_ratio, pt_null_lo, pt_null_hi) =
+            median_ratio_ci(&pt_first_half[index], &pt_second_half[index]);
+        let (ft_null_ratio, ft_null_lo, ft_null_hi) =
+            median_ratio_ci(&ft_first_half[index], &ft_second_half[index]);
+        let pt_null = adjudicate_null(pt_null_lo, pt_null_hi, MAX_NULL_CI_WIDTH);
+        let ft_null = adjudicate_null(ft_null_lo, ft_null_hi, MAX_NULL_CI_WIDTH);
+        let ft_ms = median(ft_times[index].clone());
         let (Some(pt_grad), false) = (pt_grads[index], pt_times[index].is_empty()) else {
             println!("  {name:<12} {ft_ms:8.3}       --   PyTorch row missing");
             continue;
         };
-        // Estimator preserved from the banked set: min over the lane's samples.
-        let pt_ms = minimum(&pt_times[index]);
-        let ratio = pt_ms / ft_ms;
+        let pt_ms = median(pt_times[index].clone());
         let standing = if ratio >= 1.0 {
             format!("FT {ratio:.2}x FASTER")
         } else {
@@ -516,10 +548,15 @@ LANES = {
             "MISMATCH"
         };
         println!(
-            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} {} [{nlo:.3},{nhi:.3}] {:<5} {parity}",
-            null.label(),
-            format!("{nr:.3}"),
+            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}",
+            pt_null.label(),
+            ft_null.label(),
         );
+        if !(pt_null.is_quotable() && ft_null.is_quotable()) {
+            println!(
+                "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; do not quote this row"
+            );
+        }
     }
     println!(
         "\nQuote a lane only if its A/A gate says PASS and parity is `match`. WIDE means the null's\n\
@@ -552,9 +589,9 @@ LANES = {
     // the excursion is very nearly common to both — differencing per round
     // cancels it, and only then is a busy host survivable.
     //
-    // Per round the lane's two calls are reduced by MIN, not mean: under peer
-    // load the fast sample is the one that measured the work and the slow one
-    // measured the interference (frankentorch peer-bench contention note).
+    // Per round each arm is reduced by its balanced-square median. That keeps
+    // every arm's estimator paired to the same host window and matches the row
+    // estimator above.
     //
     // Reported as `nopool / pooled`, so > 1.0 means the pool is FASTER. The
     // incumbent rows carry their own control: PT is byte-identical code under
@@ -567,12 +604,12 @@ LANES = {
         let Some(base_index) = lanes.iter().position(|(other, _)| *other == base) else {
             continue;
         };
-        let rounds = arm_a[index].len().min(arm_a[base_index].len());
+        let rounds = ft_times[index].len().min(ft_times[base_index].len());
         let mut treated = Vec::with_capacity(rounds);
         let mut control = Vec::with_capacity(rounds);
         for round in 0..rounds {
-            control.push(arm_a[index][round].min(arm_b[index][round]));
-            treated.push(arm_a[base_index][round].min(arm_b[base_index][round]));
+            control.push(ft_times[index][round]);
+            treated.push(ft_times[base_index][round]);
         }
         let paired: Vec<f64> = control
             .iter()
@@ -581,14 +618,31 @@ LANES = {
             .collect();
         let (point, lo, hi) = median_ratio_ci(&control, &treated);
         let wins = paired.iter().filter(|ratio| **ratio > 1.0).count();
-        let pt_control = match (pt_times[index].is_empty(), pt_times[base_index].is_empty()) {
-            (false, false) => minimum(&pt_times[index]) / minimum(&pt_times[base_index]),
-            _ => f64::NAN,
+        // The control is PAIRED BY SAMPLE INDEX, not min-over-lane / min-over-lane.
+        // On an incumbent round every lane is sampled, so `pt_times[a][k]` and
+        // `pt_times[b][k]` were taken seconds apart in the SAME round and their
+        // ratio cancels the host state they share. Two independent minima do not:
+        // each picks whichever round happened to be quietest for that lane, and
+        // those can be different rounds. Measured cost of getting this wrong on
+        // 2026-08-14: the min/min control moved more than 5% in 10 of 12
+        // invocations and vetoed rows whose FrankenTorch arms were clean, purely
+        // because torch's own samples are noisy on this host.
+        let pt_control = {
+            let samples = pt_times[index].len().min(pt_times[base_index].len());
+            if samples == 0 {
+                f64::NAN
+            } else {
+                median(
+                    (0..samples)
+                        .map(|k| pt_times[index][k] / pt_times[base_index][k])
+                        .collect(),
+                )
+            }
         };
         println!(
-            "\nPAIRED {base}: pool ON vs OFF, one binary, one invocation, per-round min-of-2\n  \
+            "\nPAIRED {base}: pool ON vs OFF, one binary, one invocation, per-round square medians\n  \
              ratio (off/on) = {point:.3}x  95% CI [{lo:.3},{hi:.3}]  {wins}/{rounds} rounds faster with the pool\n  \
-             incumbent control PT(off)/PT(on) = {pt_control:.3} (must be ~1.0; the arm is identical code)\n  \
+             incumbent control PT(off)/PT(on) = {pt_control:.3} (paired by sample index; must be ~1.0, the arm is identical code)\n  \
              verdict: {}",
             if !pt_control.is_finite() || (pt_control - 1.0).abs() >= 0.05 {
                 "UNREADABLE — the incumbent control moved, so the host shifted between the two lanes"
