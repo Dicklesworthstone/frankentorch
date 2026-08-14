@@ -52516,7 +52516,8 @@ mod tests {
         );
         for n in 0..batch {
             for c in 0..channels {
-                let scale = weight[c] / (var_ref[c] + 1e-5).sqrt();
+                let rstd = 1.0 / (var_ref[c] + 1e-5).sqrt();
+                let scale = rstd * weight[c];
                 let shift = bias[c] - mean_ref[c] * scale;
                 let base = (n * channels + c) * spatial;
                 for s in 0..spatial {
