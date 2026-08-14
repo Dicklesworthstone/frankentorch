@@ -6,8 +6,10 @@
 //!
 //! Usage: cargo run --release -p ft-kernel-metal --example gemm_bench [reps]
 
+#[cfg(target_os = "macos")]
 use ft_kernel_metal::fused::{Batch, GpuTensor};
 
+#[cfg(target_os = "macos")]
 fn bench_shape_w16(m: usize, k: usize, n: usize, reps: usize) {
     use ft_kernel_metal::fused::GpuWeightF16;
     let a: Vec<f32> = (0..m * k)
@@ -56,6 +58,7 @@ fn bench_shape_w16(m: usize, k: usize, n: usize, reps: usize) {
     );
 }
 
+#[cfg(target_os = "macos")]
 fn bench_shape(m: usize, k: usize, n: usize, reps: usize) {
     let a: Vec<f32> = (0..m * k)
         .map(|i| ((i % 13) as f32) * 0.01 - 0.05)
@@ -101,6 +104,7 @@ fn bench_shape(m: usize, k: usize, n: usize, reps: usize) {
     );
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let reps: usize = std::env::args()
         .nth(1)
@@ -120,4 +124,9 @@ fn main() {
     bench_shape_w16(1500, 1280, 1280, reps);
     bench_shape_w16(1500, 1280, 5120, reps);
     bench_shape_w16(1500, 5120, 1280, reps);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("gemm_bench requires macOS and a Metal device");
 }

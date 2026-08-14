@@ -339,4 +339,15 @@ mod tests {
         }
         Ok(())
     }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_stub_is_explicitly_unavailable() {
+        assert!(!is_available());
+        let mut output = [0.0_f32];
+        assert_eq!(
+            sgemm(&[1.0], &[1.0], &mut output, 1, 1, 1),
+            Err(Error::Unavailable)
+        );
+    }
 }

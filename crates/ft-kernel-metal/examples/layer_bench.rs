@@ -7,17 +7,24 @@
 //!
 //! Usage: cargo run --release -p ft-kernel-metal --example layer_bench [reps]
 
+#[cfg(target_os = "macos")]
 use ft_kernel_metal::fused::{Batch, GpuTensor, LN_EPS};
 
+#[cfg(target_os = "macos")]
 const SEQ: usize = 1500;
+#[cfg(target_os = "macos")]
 const D: usize = 1280;
+#[cfg(target_os = "macos")]
 const NH: usize = 20;
+#[cfg(target_os = "macos")]
 const DFF: usize = 5120;
 
+#[cfg(target_os = "macos")]
 fn v(n: usize, s: f32, o: f32) -> Vec<f32> {
     (0..n).map(|i| ((i % 13) as f32) * s - o).collect()
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let reps: usize = std::env::args()
         .nth(1)
@@ -116,4 +123,9 @@ fn main() {
         b.matmul_bias(&fc, &w2, Some(&b2))
     });
     println!("  {:<28} sum  {sum:8.2} ms", "(op rows)");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("layer_bench requires macOS and a Metal device");
 }
