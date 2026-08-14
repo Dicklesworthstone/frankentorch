@@ -13089,7 +13089,7 @@ impl FrankenTorchSession {
             if p == 2.0 {
                 // The f64 kernel's row-owned representation allocates one Vec per
                 // input row and then flattens all of them. For f32 pdist p=2 we
-                // can retain its f64 accumulation and final powf(0.5),
+                // can retain its f64 accumulation and final sqrt,
                 // while assigning balanced, disjoint ranges of the condensed
                 // output directly to Rayon workers. This is deliberately not the
                 // rejected f32x8 path: it preserves the current f64 arithmetic
@@ -13125,7 +13125,11 @@ impl FrankenTorchSession {
                                 let diff = vals[i_base + k] - vals[j_base + k];
                                 squared_distance += diff * diff;
                             }
-                            *slot = squared_distance.powf(0.5) as f32;
+                            // Squared distances are non-negative. `sqrt` is the
+                            // p=2 operation directly; `powf(0.5)` dispatched a
+                            // substantially heavier generic exponent routine for
+                            // every condensed pair. frankentorch-pmbb6.
+                            *slot = squared_distance.sqrt() as f32;
                             j += 1;
                             if j == n {
                                 i += 1;
@@ -127321,19 +127325,26 @@ mod tests {
     }
 
     #[test]
-    fn pdist_p2_f32_chunked_output_matches_f64_kernel_narrowing() {
+    fn pdist_p2_f32_chunked_output_matches_direct_sqrt_reference() {
         // Exercise multiple balanced condensed-output chunks. The f32 fast path
-        // deliberately retains the f64 kernel's per-feature arithmetic and
-        // final powf(0.5), then narrows each distance once.
+        // retains f64 per-feature accumulation, computes the nonnegative p=2
+        // square root directly, then narrows each distance once.
         let (n, m) = (97usize, 19usize);
         let input: Vec<f32> = (0..n * m)
             .map(|idx| ((idx * 37 % 211) as f32 - 105.0) * 0.0078125)
             .collect();
         let reference_input: Vec<f64> = input.iter().map(|&value| value as f64).collect();
-        let expected = ft_kernel_cpu::pdist_forward_f64(&reference_input, n, m, 2.0)
-            .into_iter()
-            .map(|value| value as f32)
-            .collect::<Vec<_>>();
+        let mut expected = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut squared_distance = 0.0_f64;
+                for k in 0..m {
+                    let difference = reference_input[i * m + k] - reference_input[j * m + k];
+                    squared_distance += difference * difference;
+                }
+                expected.push(squared_distance.sqrt() as f32);
+            }
+        }
 
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let tensor = session
