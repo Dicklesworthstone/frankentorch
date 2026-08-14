@@ -19201,6 +19201,19 @@ topology can be confirmed or killed by reading the topology, and this one sat in
 the ledger as "plausible" for six days instead.** What actually costs the
 many-thread write is still open; one candidate is now closed rather than pending.
 
+**7b. CERTIFIED LOSS, recorded as a loss (`frankentorch-v92uh`, 2026-08-14).**
+`max_pool3d` op work vs a LIVE PyTorch 2.12.1+cpu arm in the same invocation, A/A
+gate PASS and parity `match` on all four rows, ELF
+`ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405`, load ~21,
+torch threads 8, 64 rayon threads, governor `performance`, mimalloc: **5.37x,
+5.94x, 6.10x, 6.80x SLOWER** (FT 4.574/4.949/5.659/5.986 ms vs PT
+0.851/0.833/0.927/0.880 ms). Same run, same gates: conv3d **3.42–4.10x slower**
+(8 PASS rows), max_pool1d **1.66–2.61x slower** (6 PASS rows), avg_pool2d **2.60x
+slower** (1 PASS row). Raw: `artifacts/perf/frankentorch-v92uh/vs_pytorch_rows.txt`.
+**This is NOT differenceable against 87sz8's 9.39x or 7.31x** — different
+invocations, different host load, and that arithmetic has already produced a false
+40% on this very lane. It is the standing, not a delta.
+
 **8. WHAT DID PAY on this lineage — recycling, not scheduling
 (`frankentorch-v92uh`).** After a size gate (2), an avg_pool gate (3) and a serial
 pre-touch (1) all failed, the lever that worked attacked neither the thread count

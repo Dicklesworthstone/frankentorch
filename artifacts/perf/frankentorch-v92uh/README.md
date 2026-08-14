@@ -110,6 +110,53 @@ the warmups and the first timed call, then serves every subsequent one. A flat A
 where every take had missed would look identical in the timings and completely
 different here, which is the point of printing it.
 
+## Certified vs-PyTorch standings (this is the row that counts)
+
+The pool table above is FrankenTorch against itself. This section is the thing
+campaign law calls a row: **FrankenTorch against a live PyTorch arm sampled in the
+same invocation**, A/A gate PASS, parity `match`, ELF SHA-256 self-reported from
+inside the process. Raw output: `vs_pytorch_rows.txt`, 8 invocations, load average
+21–22, ELF `ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405`,
+incumbent PyTorch 2.12.1+cpu (torch threads 8), 64 rayon threads observed,
+governor `performance`, mimalloc.
+
+Only PASS-gated, parity-matched rows are listed. Op work = forward + backward with
+the leaf built outside the timer on both sides.
+
+| lane | FT (ms) | PT (ms) | standing | A/A null CI |
+|---|---|---|---|---|
+| **max_pool3d** | 4.574 | 0.851 | **5.37x SLOWER** | [0.898, 1.349] |
+| **max_pool3d** | 4.949 | 0.833 | **5.94x SLOWER** | [0.729, 1.037] |
+| **max_pool3d** | 5.659 | 0.927 | **6.10x SLOWER** | [0.795, 1.384] |
+| **max_pool3d** | 5.986 | 0.880 | **6.80x SLOWER** | [0.663, 1.183] |
+| conv3d | 22.077 | 5.944 | 3.71x SLOWER | [0.906, 1.040] |
+| conv3d | 22.355 | 6.542 | 3.42x SLOWER | [0.885, 1.055] |
+| conv3d | 23.685 | 6.711 | 3.53x SLOWER | [0.792, 1.189] |
+| conv3d | 23.906 | 6.753 | 3.54x SLOWER | [0.857, 1.060] |
+| conv3d | 24.145 | 6.285 | 3.84x SLOWER | [0.820, 1.102] |
+| conv3d | 24.998 | 6.413 | 3.90x SLOWER | [0.906, 1.128] |
+| conv3d | 25.640 | 6.250 | 4.10x SLOWER | [0.874, 1.063] |
+| conv3d | 26.386 | 6.679 | 3.95x SLOWER | [0.894, 1.133] |
+| max_pool1d | 13.981 | 8.430 | 1.66x SLOWER | [0.824, 1.423] |
+| max_pool1d | 12.982 | 6.135 | 2.12x SLOWER | [0.831, 1.290] |
+| max_pool1d | 13.774 | 6.167 | 2.23x SLOWER | [0.753, 1.109] |
+| max_pool1d | 14.319 | 6.190 | 2.31x SLOWER | [0.888, 1.301] |
+| max_pool1d | 15.148 | 5.890 | 2.57x SLOWER | [0.656, 1.107] |
+| max_pool1d | 14.034 | 5.376 | 2.61x SLOWER | [0.951, 1.534] |
+| avg_pool2d | 4.537 | 1.747 | 2.60x SLOWER | [0.803, 1.187] |
+
+**These are losses, and they are the point.** `max_pool3d` sits at **5.4–6.8x
+slower than PyTorch** on op work as of ELF `ec0c88bb`. That is the campaign's
+largest confirmed gap and it is still a gap.
+
+**Do not difference this against the 9.39x or 7.31x on `frankentorch-87sz8`.**
+Those are different invocations at a different host load, and this repo has already
+been burned by exactly that arithmetic (`frankentorch-87sz8`'s own measurement
+caution: an untouched avg_pool2d lane moved 1.833 → 1.155 ms between two sweeps,
+making its ratio look 40% better for free). 5.4–6.8x is the standing *now*; the only
+licensed statement about the pool's contribution is the paired within-invocation
+ratio above.
+
 ## What did NOT hold up
 
 **un3os's NUMA hypothesis is refuted, for free.** `un3os` left the many-thread write

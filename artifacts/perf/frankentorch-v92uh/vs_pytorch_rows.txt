@@ -1,0 +1,72 @@
+########## RUN 1 17:53:16 load=21.84
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     13.774    6.167   FT 2.23x SLOWER     PASS [0.753,1.109] 0.865 match
+  avg_pool2d      5.666    1.839   FT 3.08x SLOWER     WIDE [0.566,1.504] 0.874 match
+  max_pool3d      5.659    0.927   FT 6.10x SLOWER     PASS [0.795,1.384] 1.072 match
+  conv3d         23.906    6.753   FT 3.54x SLOWER     PASS [0.857,1.060] 0.929 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 2 17:53:21 load=22.74
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     12.982    6.135   FT 2.12x SLOWER     PASS [0.831,1.290] 1.028 match
+  avg_pool2d      4.322    1.992   FT 2.17x SLOWER     WIDE [0.662,1.270] 0.922 match
+  max_pool3d      3.963    0.889   FT 4.46x SLOWER     WIDE [0.582,1.263] 0.809 match
+  conv3d         22.355    6.542   FT 3.42x SLOWER     PASS [0.885,1.055] 0.950 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 3 17:53:25 load=22.28
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     14.319    6.190   FT 2.31x SLOWER     PASS [0.888,1.301] 1.135 match
+  avg_pool2d      4.537    1.747   FT 2.60x SLOWER     PASS [0.803,1.187] 0.933 match
+  max_pool3d      4.949    0.833   FT 5.94x SLOWER     PASS [0.729,1.037] 0.794 match
+  conv3d         24.145    6.285   FT 3.84x SLOWER     PASS [0.820,1.102] 1.048 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 4 17:53:30 load=21.53
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     15.148    5.890   FT 2.57x SLOWER     PASS [0.656,1.107] 0.901 match
+  avg_pool2d      5.465    2.001   FT 2.73x SLOWER     WIDE [0.679,1.496] 1.114 match
+  max_pool3d      5.562    0.875   FT 6.35x SLOWER     WIDE [0.628,1.349] 0.946 match
+  conv3d         26.386    6.679   FT 3.95x SLOWER     PASS [0.894,1.133] 0.983 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 5 17:53:35 load=21.41
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     16.764    9.398   FT 1.78x SLOWER     FAIL [1.073,1.617] 1.402 match
+  avg_pool2d      4.983    2.578   FT 1.93x SLOWER     WIDE [0.561,1.349] 0.923 match
+  max_pool3d      5.986    0.880   FT 6.80x SLOWER     PASS [0.663,1.183] 0.895 match
+  conv3d         25.640    6.250   FT 4.10x SLOWER     PASS [0.874,1.063] 0.968 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 6 17:53:40 load=21.94
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     14.034    5.376   FT 2.61x SLOWER     PASS [0.951,1.534] 1.124 match
+  avg_pool2d      5.646    2.102   FT 2.69x SLOWER     WIDE [0.612,1.512] 1.207 match
+  max_pool3d      5.961    0.815   FT 7.32x SLOWER     WIDE [0.695,1.454] 1.035 match
+  conv3d         23.685    6.711   FT 3.53x SLOWER     PASS [0.792,1.189] 0.885 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 7 17:53:44 load=22.18
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     13.981    8.430   FT 1.66x SLOWER     PASS [0.824,1.423] 0.942 match
+  avg_pool2d      4.505    2.394   FT 1.88x SLOWER     WIDE [0.729,1.873] 1.079 match
+  max_pool3d      4.574    0.851   FT 5.37x SLOWER     PASS [0.898,1.349] 1.070 match
+  conv3d         22.077    5.944   FT 3.71x SLOWER     PASS [0.906,1.040] 1.008 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
+########## RUN 8 17:53:49 load=21.29
+executing_elf_sha256=ec0c88bb6f26bbb0740687309c6bdccee22ccc01e432b3ad67b1a3fe90160405
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+allocator=mimalloc (--features fair-alloc)
+  max_pool1d     13.654    6.028   FT 2.27x SLOWER     WIDE [0.730,1.471] 0.797 match
+  avg_pool2d      5.288    2.061   FT 2.57x SLOWER     WIDE [0.976,1.772] 1.329 match
+  max_pool3d      4.799    0.874   FT 5.49x SLOWER     WIDE [0.622,1.229] 0.932 match
+  conv3d         24.998    6.413   FT 3.90x SLOWER     PASS [0.906,1.128] 0.999 match
+buffer_pool: hits=31 misses=4 parked=64 buffers / 90.8 MiB
