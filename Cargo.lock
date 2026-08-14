@@ -808,15 +808,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "ft-api"
+name = "frankentorch-api"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ft-autograd",
- "ft-core",
- "ft-dispatch",
- "ft-kernel-cpu",
- "ft-runtime",
+ "frankentorch-autograd",
+ "frankentorch-core",
+ "frankentorch-dispatch",
+ "frankentorch-kernel-cpu",
+ "frankentorch-runtime",
  "libm",
  "mimalloc",
  "rayon",
@@ -824,13 +824,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ft-autograd"
+name = "frankentorch-autograd"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ft-core",
- "ft-dispatch",
- "ft-kernel-cpu",
+ "frankentorch-core",
+ "frankentorch-dispatch",
+ "frankentorch-kernel-cpu",
  "insta",
  "libm",
  "proptest",
@@ -838,26 +838,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ft-conformance"
-version = "0.1.0"
-dependencies = [
- "allocation-counter",
- "ft-api",
- "ft-autograd",
- "ft-core",
- "ft-data",
- "ft-dispatch",
- "ft-nn",
- "ft-optim",
- "ft-runtime",
- "ft-serialize",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ft-core"
+name = "frankentorch-core"
 version = "0.1.0"
 dependencies = [
  "criterion",
@@ -867,14 +848,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankentorch-dispatch"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "frankentorch-core",
+ "frankentorch-kernel-cpu",
+ "insta",
+ "proptest",
+]
+
+[[package]]
+name = "frankentorch-kernel-cpu"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "frankentorch-core",
+ "insta",
+ "libm",
+ "matrixmultiply",
+ "proptest",
+ "rayon",
+ "wide",
+]
+
+[[package]]
+name = "frankentorch-runtime"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "criterion",
+ "frankentorch-core",
+ "ft-serialize",
+ "ftui",
+ "insta",
+]
+
+[[package]]
+name = "ft-conformance"
+version = "0.1.0"
+dependencies = [
+ "allocation-counter",
+ "frankentorch-api",
+ "frankentorch-autograd",
+ "frankentorch-core",
+ "frankentorch-dispatch",
+ "frankentorch-runtime",
+ "ft-data",
+ "ft-nn",
+ "ft-optim",
+ "ft-serialize",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ft-data"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ft-api",
- "ft-autograd",
- "ft-core",
- "ft-dispatch",
+ "frankentorch-api",
+ "frankentorch-autograd",
+ "frankentorch-core",
+ "frankentorch-dispatch",
 ]
 
 [[package]]
@@ -882,32 +919,7 @@ name = "ft-device"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ft-core",
-]
-
-[[package]]
-name = "ft-dispatch"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "ft-core",
- "ft-kernel-cpu",
- "insta",
- "proptest",
-]
-
-[[package]]
-name = "ft-kernel-cpu"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "ft-core",
- "insta",
- "libm",
- "matrixmultiply",
- "proptest",
- "rayon",
- "wide",
+ "frankentorch-core",
 ]
 
 [[package]]
@@ -926,11 +938,11 @@ name = "ft-nn"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ft-api",
- "ft-autograd",
- "ft-core",
- "ft-dispatch",
- "ft-kernel-cpu",
+ "frankentorch-api",
+ "frankentorch-autograd",
+ "frankentorch-core",
+ "frankentorch-dispatch",
+ "frankentorch-kernel-cpu",
  "ft-serialize",
  "insta",
  "rayon",
@@ -941,24 +953,12 @@ name = "ft-optim"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ft-api",
- "ft-autograd",
- "ft-core",
- "ft-dispatch",
+ "frankentorch-api",
+ "frankentorch-autograd",
+ "frankentorch-core",
+ "frankentorch-dispatch",
  "ft-nn",
  "rayon",
-]
-
-[[package]]
-name = "ft-runtime"
-version = "0.1.0"
-dependencies = [
- "asupersync",
- "criterion",
- "ft-core",
- "ft-serialize",
- "ftui",
- "insta",
 ]
 
 [[package]]
@@ -968,7 +968,7 @@ dependencies = [
  "asupersync",
  "bytemuck",
  "criterion",
- "ft-core",
+ "frankentorch-core",
  "insta",
  "proptest",
  "safetensors",

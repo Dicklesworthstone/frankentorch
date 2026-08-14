@@ -1,8 +1,15 @@
 [package]
-name = "ft-autograd"
+name = "frankentorch-autograd"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
+description = "Deterministic autograd graph execution for FrankenTorch"
+repository = "https://github.com/Dicklesworthstone/frankentorch"
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml"]
+
+[lib]
+name = "ft_autograd"
 
 [dependencies]
 ft-core = { workspace = true }

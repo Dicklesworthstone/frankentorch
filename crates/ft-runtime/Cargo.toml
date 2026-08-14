@@ -1,8 +1,15 @@
 [package]
-name = "ft-runtime"
+name = "frankentorch-runtime"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
+description = "Deterministic runtime evidence integration for FrankenTorch"
+repository = "https://github.com/Dicklesworthstone/frankentorch"
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml"]
+
+[lib]
+name = "ft_runtime"
 
 [features]
 default = []

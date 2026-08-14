@@ -1,10 +1,15 @@
 [package]
-name = "ft-kernel-cpu"
+name = "frankentorch-kernel-cpu"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
 description = "Portable and SIMD-accelerated CPU kernels for FrankenTorch"
 repository = "https://github.com/Dicklesworthstone/frankentorch"
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml"]
+
+[lib]
+name = "ft_kernel_cpu"
 
 [dependencies]
 ft-core = { workspace = true }

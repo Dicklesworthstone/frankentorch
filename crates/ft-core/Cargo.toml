@@ -1,10 +1,15 @@
 [package]
-name = "ft-core"
+name = "frankentorch-core"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
 description = "Memory-safe tensor types and scalar semantics for FrankenTorch"
 repository = "https://github.com/Dicklesworthstone/frankentorch"
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml"]
+
+[lib]
+name = "ft_core"
 
 [dependencies]
 half = { version = "2.7", features = ["bytemuck"] }

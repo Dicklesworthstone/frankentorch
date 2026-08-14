@@ -1,8 +1,15 @@
 [package]
-name = "ft-dispatch"
+name = "frankentorch-dispatch"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
+description = "Tensor operation dispatch and CPU-kernel routing for FrankenTorch"
+repository = "https://github.com/Dicklesworthstone/frankentorch"
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml"]
+
+[lib]
+name = "ft_dispatch"
 
 [dependencies]
 ft-core = { workspace = true }

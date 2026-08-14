@@ -1,8 +1,15 @@
 [package]
-name = "ft-api"
+name = "frankentorch-api"
 version = "0.1.0"
 edition = "2024"
 license-file = "../../LICENSE"
+description = "Public tensor API for FrankenTorch"
+repository = "https://github.com/Dicklesworthstone/frankentorch"
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml"]
+
+[lib]
+name = "ft_api"
 
 [dependencies]
 ft-autograd = { workspace = true }
