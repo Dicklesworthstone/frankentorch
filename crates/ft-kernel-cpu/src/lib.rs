@@ -9370,7 +9370,9 @@ pub fn avg_pool2d_backward_f64(
     {
         return avg_pool2d_backward_2x2s2_f64(dout, batch, ch, ih, iw, oh, ow);
     }
-    let mut dp = vec![0.0f64; batch * ch * ph * pw];
+    // frankentorch-7zqbc: pooled dense gradient. Zeros are still zeros — this
+    // route accumulates into the buffer and relies on them.
+    let mut dp = ft_core::buffer_pool::take_zeroed(batch * ch * ph * pw);
     // frankentorch-o5t00 — DO NOT GATE. The L3-residency serial gate that gives
     // 1.4-2.2x on the max_pool SCATTER backwards was measured here and is a LOSS:
     // control-normalised 1.266 (i.e. ~1.27x SLOWER), 95% CI [1.108, 1.502], entirely
@@ -9438,7 +9440,20 @@ fn avg_pool2d_backward_2x2s2_f64(
     // assumed: for odd `ih`, `oh = ih/2` truncates and the final row would never be
     // written, which against an uninitialized buffer is garbage rather than zeros.
     if ih == 2 * oh && iw == 2 * ow {
-        return build_uninit(numel, |dp| {
+        // frankentorch-7zqbc: `build_overwritten` is `build_uninit` plus recycling.
+        // The uninit trick already removed the zero pass; it could not remove the
+        // PAGE FAULTS, because a fresh allocation of this size is fresh `mmap` and
+        // every one of its pages faults on first touch no matter who writes them.
+        // A parked buffer of exactly this length arrives with its pages committed,
+        // so the parallel fill below is the only thing that touches the memory.
+        //
+        // The coverage argument the uninit path already needed is the same one this
+        // needs, and it is checked above rather than assumed: with exact 2x tiling
+        // every input element belongs to exactly one window, so the loop writes all
+        // `numel` of them. `avg_pool2d_backward_pooled_matches_unpooled_bits` parks
+        // a NaN-filled buffer first, so a gap in that coverage fails a bit-pattern
+        // comparison instead of silently shipping stale gradients.
+        return ft_core::buffer_pool::build_overwritten(numel, |dp| {
             dp.par_chunks_mut(ih * iw)
                 .enumerate()
                 .for_each(|(plane, drow)| {
@@ -9522,7 +9537,9 @@ pub fn avg_pool2d_backward_scalar_f64(
     {
         return avg_pool2d_backward_scalar_2x2s2_f64(upstream, batch, ch, ih, iw, oh, ow);
     }
-    let mut dp = vec![0.0f64; batch * ch * ph * pw];
+    // frankentorch-7zqbc: pooled dense gradient; the spread below accumulates, so
+    // the zeros are load-bearing and `take_zeroed` supplies them.
+    let mut dp = ft_core::buffer_pool::take_zeroed(batch * ch * ph * pw);
     dp.par_chunks_mut(ph * pw).for_each(|dprow| {
         for oy in 0..oh {
             let rs = oy * sh;
@@ -9682,7 +9699,8 @@ pub fn avg_pool1d_backward_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
-    let mut din = vec![0.0f64; batch * ch * len];
+    // frankentorch-7zqbc: pooled dense gradient (accumulating route — zeros kept).
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
     // frankentorch-o5t00 — DO NOT GATE. The L3-residency serial gate that gives
     // 1.4-2.2x on the max_pool SCATTER backwards was measured here and is a LOSS:
     // control-normalised 1.266 (i.e. ~1.27x SLOWER), 95% CI [1.108, 1.502], entirely
@@ -9840,7 +9858,8 @@ pub fn avg_pool1d_backward_scalar_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
-    let mut din = vec![0.0f64; batch * ch * len];
+    // frankentorch-7zqbc: pooled dense gradient (accumulating route — zeros kept).
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
     din.par_chunks_mut(len).for_each(|drow| {
         let g = upstream / kernel as f64;
         for ox in 0..output_len {
@@ -9951,7 +9970,9 @@ pub fn max_pool1d_backward_from_indices_f64(
     len: usize,
     output_len: usize,
 ) -> Vec<f64> {
-    let mut din = vec![0.0f64; batch * ch * len];
+    // frankentorch-7zqbc: pooled dense gradient. A scatter writes 1 element per
+    // output window, so the untouched majority MUST be zeros — `take_zeroed`.
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
     // frankentorch-un3os: same trivial-work scatter shape, same gate.
     let scatter_plane = |plane: usize, drow: &mut [f64]| {
         let dbase = plane * output_len;
@@ -10234,7 +10255,9 @@ pub fn max_pool2d_backward_f64(
     sh: usize,
     sw: usize,
 ) -> Vec<f64> {
-    let mut din = vec![0.0f64; batch * ch * ih * iw];
+    // frankentorch-7zqbc: pooled dense gradient (scatter — untouched elements must
+    // stay zero, so this is `take_zeroed` and not `build_overwritten`).
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * ih * iw);
     din.par_chunks_mut(ih * iw)
         .enumerate()
         .for_each(|(plane, drow)| {
@@ -10278,7 +10301,8 @@ pub fn max_pool2d_backward_from_indices_f64(
     oh: usize,
     ow: usize,
 ) -> Vec<f64> {
-    let mut din = vec![0.0f64; batch * ch * ih * iw];
+    // frankentorch-7zqbc: pooled dense gradient (scatter — zeros load-bearing).
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * ih * iw);
     // frankentorch-un3os: same trivial-work scatter shape, same gate.
     let scatter_plane = |plane: usize, drow: &mut [f64]| {
         let dbase = plane * oh * ow;
@@ -39009,6 +39033,53 @@ mod tests {
         }
         for (i, (&g, &e)) in sidecar_grad.iter().zip(rescan_grad.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "max_pool3d sidecar grad[{i}]");
+        }
+    }
+
+    /// frankentorch-7zqbc: `avg_pool2d`'s 2x2-stride-2 backward is the ONE pooled
+    /// site that does not zero its buffer — it uses `build_overwritten`, whose
+    /// whole benefit is skipping the fill, and which is therefore only correct if
+    /// the scatter writes every single element.
+    ///
+    /// That coverage claim is exactly what this test attacks. A NaN-filled buffer
+    /// of the same length is parked first, so any element the kernel fails to
+    /// write comes back NaN and the bit comparison fails. NaN is chosen
+    /// deliberately over a plain number: it also fails an `==` comparison against
+    /// itself, so a sloppier assertion than `to_bits()` would still catch it.
+    #[test]
+    fn avg_pool2d_2x2s2_backward_bits_survive_a_dirty_pooled_buffer() {
+        // 2*32*32*32 = 65536, comfortably above MIN_POOLED_LEN. The assert is not
+        // decoration: the first version of this test used ch=8 for 16384 elements,
+        // which is BELOW the threshold, so the pool declined every request and the
+        // test compared two identical unpooled runs. It would have passed forever
+        // while exercising nothing. The assert caught that on the first run.
+        let (batch, ch, ih, iw) = (2usize, 32usize, 32usize, 32usize);
+        let (oh, ow) = (ih / 2, iw / 2);
+        let numel = batch * ch * ih * iw;
+        assert!(numel >= ft_core::buffer_pool::MIN_POOLED_LEN);
+        let dout: Vec<f64> = (0..batch * ch * oh * ow)
+            .map(|i| ((i * 31 + 13) % 71) as f64 * 0.03125 - 1.0)
+            .collect();
+
+        ft_core::buffer_pool::set_enabled(false);
+        let unpooled = super::avg_pool2d_backward_f64(
+            &dout, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+        );
+
+        ft_core::buffer_pool::set_enabled(true);
+        ft_core::buffer_pool::recycle(vec![f64::NAN; numel]);
+        let pooled = super::avg_pool2d_backward_f64(
+            &dout, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+        );
+
+        assert_eq!(pooled.len(), unpooled.len());
+        for (index, (pooled_value, plain_value)) in pooled.iter().zip(unpooled.iter()).enumerate() {
+            assert_eq!(
+                pooled_value.to_bits(),
+                plain_value.to_bits(),
+                "pooled avg_pool2d backward diverged at [{index}] — a stale element \
+                 survived, so the fill does not cover the whole buffer"
+            );
         }
     }
 
