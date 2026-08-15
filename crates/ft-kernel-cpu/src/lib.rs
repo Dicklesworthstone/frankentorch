@@ -11170,8 +11170,9 @@ fn conv3d_forward_direct_3x3s1_f64(
             let width = out_block.len() / patch_count;
             let batch_offset = n * in_ch * pd * ph * pw;
             let mut weight_offsets = [0usize; OUT_CHANNEL_BLOCK];
-            for channel_offset in 0..width {
-                weight_offsets[channel_offset] = (first_channel + channel_offset) * patch_width;
+            for (channel_offset, weight_offset) in weight_offsets.iter_mut().enumerate().take(width)
+            {
+                *weight_offset = (first_channel + channel_offset) * patch_width;
             }
             for oz in 0..od {
                 for oy in 0..oh {
