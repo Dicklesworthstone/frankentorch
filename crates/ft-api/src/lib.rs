@@ -399,7 +399,7 @@ struct AvgPool1dSumShortcut {
 /// following `tensor_sum` can avoid materialising its dense output-gradient
 /// buffer. The pooled activation remains observable until the reduction, so the
 /// shortcut declines when callers retain it or attach a hook.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MaxPool3dSumShortcut {
     input: TensorNodeId,
     batch: usize,
@@ -416,6 +416,11 @@ struct MaxPool3dSumShortcut {
     stride_d: usize,
     stride_h: usize,
     stride_w: usize,
+    /// The ordinary pool node already computed these first-argmax offsets for
+    /// its own backward. Keep a shortcut-owned copy so `tensor_sum(pool(x))`
+    /// can move the sidecar into its scalar backward instead of scanning every
+    /// pooling window a second time.
+    arg_offsets: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -25424,14 +25429,23 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<Option<TensorNodeId>, AutogradError> {
-        let Some(shortcut) = self.max_pool3d_sum_shortcuts.get(&input.0).copied() else {
+        if !self.max_pool3d_sum_shortcuts.contains_key(&input.0) {
             return Ok(None);
-        };
+        }
         if self.tensor_tape.tensor_retains_grad(input)?
             || self.tensor_tape.tensor_has_hooks(input)?
         {
             return Ok(None);
         }
+
+        // The scalar loss owns the replacement backward edge. Moving the
+        // precomputed offsets out of the short-lived pool registration avoids
+        // the second complete pool scan the initial shortcut needed solely to
+        // recreate this sidecar.
+        let shortcut = self
+            .max_pool3d_sum_shortcuts
+            .remove(&input.0)
+            .ok_or_else(|| Self::incompatible_tensor_args("max_pool3d scalar shortcut vanished"))?;
 
         let sum = {
             let tensor = self.tensor_tape.tensor(input)?;
@@ -25457,15 +25471,11 @@ impl FrankenTorchSession {
             stride_d,
             stride_h,
             stride_w,
+            arg_offsets,
         } = shortcut;
         let out = self.tensor_apply_function_f64_borrowed_forward(
             &[source],
-            move |ctx, ins| {
-                let (values, _) = ins[0];
-                let (_, arg_offsets) = ft_kernel_cpu::max_pool3d_sum_forward_with_indices_f64(
-                    values, batch, channels, input_d, input_h, input_w, kernel_d, kernel_h,
-                    kernel_w, output_d, output_h, output_w, stride_d, stride_h, stride_w,
-                );
+            move |ctx, _ins| {
                 ctx.save_for_backward(
                     arg_offsets,
                     vec![batch, channels, output_d, output_h, output_w],
@@ -33914,6 +33924,8 @@ impl FrankenTorchSession {
                 };
                 return self.tensor_variable(out, out_shape, false);
             }
+            let shortcut_arg_offsets = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let shortcut_arg_offsets_for_forward = std::rc::Rc::clone(&shortcut_arg_offsets);
             let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
                 move |ctx, ins| {
@@ -33921,6 +33933,7 @@ impl FrankenTorchSession {
                     let (out, arg_offsets) = ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
                         iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
                     );
+                    *shortcut_arg_offsets_for_forward.borrow_mut() = Some(arg_offsets.clone());
                     ctx.save_for_backward(arg_offsets, vec![b_, ch_, od_, oh_, ow_]);
                     Ok((out, vec![b_, ch_, od_, oh_, ow_]))
                 },
@@ -33933,6 +33946,9 @@ impl FrankenTorchSession {
                     Ok(vec![Some(di)])
                 },
             )?;
+            let arg_offsets = shortcut_arg_offsets.borrow_mut().take().ok_or_else(|| {
+                Self::incompatible_tensor_args("max_pool3d forward did not save argmax offsets")
+            })?;
             self.max_pool3d_sum_shortcuts.insert(
                 pooled.0,
                 MaxPool3dSumShortcut {
@@ -33951,6 +33967,7 @@ impl FrankenTorchSession {
                     stride_d: sd_,
                     stride_h: sh_,
                     stride_w: sw_,
+                    arg_offsets,
                 },
             );
             return Ok(pooled);
@@ -141207,7 +141224,21 @@ mod tests {
         let out_ref = reference
             .functional_max_pool3d(x_ref, (3, 2, 2), (1, 2, 2))
             .unwrap();
+        assert_eq!(
+            reference
+                .max_pool3d_sum_shortcuts
+                .get(&out_ref.0)
+                .expect("fused MaxPool3d output registers its argmax sidecar")
+                .arg_offsets
+                .len(),
+            n * c * 3 * 2 * 2,
+            "scalar shortcut must retain the ordinary forward's argmax sidecar"
+        );
         let loss_ref = reference.tensor_sum(out_ref).unwrap();
+        assert!(
+            !reference.max_pool3d_sum_shortcuts.contains_key(&out_ref.0),
+            "scalar loss must consume, rather than clone, the cached argmax sidecar"
+        );
         assert!(
             reference.evidence().iter().any(|entry| {
                 entry.kind == EvidenceKind::Dispatch
