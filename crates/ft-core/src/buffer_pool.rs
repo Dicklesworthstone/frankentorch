@@ -20,11 +20,12 @@
 //!
 //! # What it is
 //!
-//! A process-global, bounded free list of `Vec<f64>`, keyed by capacity. It is a
-//! *cache*, never a source of truth: [`take_zeroed`] and [`take_filled`] always
-//! return a buffer whose contents are exactly what the caller asked for, whether
-//! it came from the pool or from a fresh allocation. Callers therefore cannot
-//! observe whether a recycle happened — only how long it took.
+//! A bounded, per-thread free list of `Vec<f64>`, with process-global capacity
+//! accounting. It is a *cache*, never a source of truth: [`take_zeroed`] and
+//! [`take_filled`] always return a buffer whose contents are exactly what the
+//! caller asked for, whether it came from the pool or from a fresh allocation.
+//! Callers therefore cannot observe whether a recycle happened — only how long
+//! it took.
 //!
 //! # Bounds
 //!
@@ -35,7 +36,7 @@
 //! dropped, so steady-state memory is bounded by that ceiling rather than by the
 //! workload.
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Smallest buffer worth parking: 32768 f64 = 256 KiB.
@@ -62,7 +63,33 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static PARKED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
-static POOL: Mutex<Vec<Vec<f64>>> = Mutex::new(Vec::new());
+// A backward pass allocates and releases its gradient buffers on the caller's
+// thread. Keeping the cache local to that thread removes a global mutex from
+// the default allocation/recycle path while preserving the process-wide memory
+// ceiling below. Cross-thread reuse would make a hot Rayon worker contend with
+// an unrelated session for pages that are overwhelmingly reused by their owner.
+#[derive(Default)]
+struct LocalPool {
+    buffers: Vec<Vec<f64>>,
+}
+
+impl Drop for LocalPool {
+    fn drop(&mut self) {
+        let buffers = self.buffers.len();
+        let bytes = self
+            .buffers
+            .iter()
+            .map(|buffer| buffer.capacity() * size_of::<f64>())
+            .sum();
+        PARKED_BUFFERS.fetch_sub(buffers, Ordering::Relaxed);
+        PARKED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    static POOL: RefCell<LocalPool> = RefCell::new(LocalPool::default());
+}
+static PARKED_BUFFERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Pool counters, for tests and for probes that need to prove a lane actually hit
 /// the pool rather than assuming it did.
@@ -78,15 +105,50 @@ pub struct PoolStats {
     pub parked_bytes: usize,
 }
 
-/// Guard against a poisoned lock taking the pool out of service: the pool holds
-/// no invariant that a panic could break (it is a list of plain `Vec<f64>`), so
-/// the sane recovery is to keep using it.
+/// Access the current thread's free list without making unrelated backwards
+/// serialize on a process-global allocator lock.
 fn with_pool<R>(f: impl FnOnce(&mut Vec<Vec<f64>>) -> R) -> R {
-    let mut guard = match POOL.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut guard)
+    POOL.with(|pool| f(&mut pool.borrow_mut().buffers))
+}
+
+fn release_parked(capacity: usize) {
+    PARKED_BYTES.fetch_sub(capacity * size_of::<f64>(), Ordering::Relaxed);
+    PARKED_BUFFERS.fetch_sub(1, Ordering::Relaxed);
+}
+
+fn reserve_parked(bytes: usize) -> bool {
+    let mut buffers = PARKED_BUFFERS.load(Ordering::Relaxed);
+    loop {
+        if buffers >= MAX_PARKED_BUFFERS {
+            return false;
+        }
+        match PARKED_BUFFERS.compare_exchange_weak(
+            buffers,
+            buffers + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => buffers = actual,
+        }
+    }
+
+    let mut parked_bytes = PARKED_BYTES.load(Ordering::Relaxed);
+    loop {
+        if bytes > MAX_PARKED_BYTES.saturating_sub(parked_bytes) {
+            PARKED_BUFFERS.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        match PARKED_BYTES.compare_exchange_weak(
+            parked_bytes,
+            parked_bytes + bytes,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => parked_bytes = actual,
+        }
+    }
 }
 
 /// Whether recycling is currently active.
@@ -108,24 +170,31 @@ pub fn set_enabled(enabled: bool) {
 /// Current counters.
 #[must_use]
 pub fn stats() -> PoolStats {
-    let parked_buffers = with_pool(|pool| pool.len());
     PoolStats {
         hits: HITS.load(Ordering::Relaxed),
         misses: MISSES.load(Ordering::Relaxed),
-        parked_buffers,
+        parked_buffers: PARKED_BUFFERS.load(Ordering::Relaxed),
         parked_bytes: PARKED_BYTES.load(Ordering::Relaxed),
     }
 }
 
-/// Drop every parked buffer and zero the counters.
+/// Drop every buffer parked by the calling thread and zero the counters.
+///
+/// The pool is intentionally thread-local, so a caller cannot synchronously
+/// reclaim another live thread's cache. The aggregate budget still accounts for
+/// every thread's parked capacity.
 pub fn clear() {
-    with_pool(|pool| {
+    let (buffers, bytes) = with_pool(|pool| {
+        let buffers = pool.len();
+        let bytes = pool
+            .iter()
+            .map(|buffer| buffer.capacity() * size_of::<f64>())
+            .sum();
         pool.clear();
-        // Keep this coupled to the list mutation. Otherwise a concurrent
-        // recycle can park a buffer between `clear` dropping the lock and this
-        // store, leaving the pool nonempty with zero accounted bytes.
-        PARKED_BYTES.store(0, Ordering::Relaxed);
+        (buffers, bytes)
     });
+    PARKED_BUFFERS.fetch_sub(buffers, Ordering::Relaxed);
+    PARKED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
     HITS.store(0, Ordering::Relaxed);
     MISSES.store(0, Ordering::Relaxed);
 }
@@ -168,7 +237,7 @@ pub fn take_filled(len: usize, value: f64) -> Vec<f64> {
     });
     match recycled {
         Some(mut buffer) => {
-            PARKED_BYTES.fetch_sub(buffer.capacity() * size_of::<f64>(), Ordering::Relaxed);
+            release_parked(buffer.capacity());
             HITS.fetch_add(1, Ordering::Relaxed);
             buffer.clear();
             buffer.resize(len, value);
@@ -236,7 +305,7 @@ pub fn try_take_exact(len: usize) -> Option<Vec<f64>> {
     });
     match recycled {
         Some(buffer) => {
-            PARKED_BYTES.fetch_sub(buffer.capacity() * size_of::<f64>(), Ordering::Relaxed);
+            release_parked(buffer.capacity());
             HITS.fetch_add(1, Ordering::Relaxed);
             Some(buffer)
         }
@@ -270,10 +339,10 @@ pub fn recycle(buffer: Vec<f64>) {
         return;
     }
     let bytes = capacity * size_of::<f64>();
+    if !reserve_parked(bytes) {
+        return;
+    }
     with_pool(|pool| {
-        if PARKED_BYTES.load(Ordering::Relaxed) + bytes > MAX_PARKED_BYTES {
-            return;
-        }
         // frankentorch-7zqbc — REFUTED LEVER, DO NOT RE-LAND WITHOUT NEW EVIDENCE.
         // A full pool simply refuses. The obvious improvement — evict the SMALLEST
         // parked buffer when a larger one arrives, on the theory that the saving
@@ -286,10 +355,6 @@ pub fn recycle(buffer: Vec<f64>) {
         // ceiling then binds instead of the count. Reverted: 440 MiB of RSS for a
         // measured zero. The finding underneath is the useful part — in the
         // seven-lane configuration this pool's HIT RATE is not what limits it.
-        if pool.len() >= MAX_PARKED_BUFFERS {
-            return;
-        }
-        PARKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
         pool.push(buffer);
     });
 }
@@ -297,10 +362,10 @@ pub fn recycle(buffer: Vec<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    /// Tests share one process-global pool, so they must not run concurrently
-    /// against it. Each test takes this lock rather than relying on
-    /// `--test-threads=1`.
+    /// Tests share process-global accounting and counters, so they must not run
+    /// concurrently even though each cache itself is thread-local.
     static TEST_GUARD: Mutex<()> = Mutex::new(());
 
     fn guarded<R>(body: impl FnOnce() -> R) -> R {
@@ -337,6 +402,28 @@ mod tests {
     }
 
     #[test]
+    fn recycled_buffers_remain_with_the_thread_that_parked_them() {
+        guarded(|| {
+            recycle(vec![7.5; MIN_POOLED_LEN]);
+
+            // A different session thread must not steal the caller's warm pages.
+            // That is the contention this pool removes from concurrent backwards.
+            std::thread::spawn(|| {
+                let fresh = take_zeroed(MIN_POOLED_LEN);
+                assert!(fresh.iter().all(|value| *value == 0.0));
+            })
+            .join()
+            .expect("buffer-pool probe thread panicked");
+
+            let reused = take_zeroed(MIN_POOLED_LEN);
+            assert!(reused.iter().all(|value| *value == 0.0));
+            let pool = stats();
+            assert_eq!(pool.hits, 1, "owner thread should retain its cached buffer");
+            assert_eq!(pool.misses, 1, "foreign thread must allocate independently");
+        });
+    }
+
+    #[test]
     fn build_overwritten_reuses_an_exact_length_buffer_with_no_fill() {
         guarded(|| {
             recycle(vec![7.5; MIN_POOLED_LEN]);
@@ -351,12 +438,10 @@ mod tests {
             });
             assert_eq!(stats().hits, 1);
             assert_eq!(built.len(), MIN_POOLED_LEN);
-            assert!(
-                built
-                    .iter()
-                    .enumerate()
-                    .all(|(index, value)| *value == index as f64)
-            );
+            assert!(built
+                .iter()
+                .enumerate()
+                .all(|(index, value)| *value == index as f64));
         });
     }
 
