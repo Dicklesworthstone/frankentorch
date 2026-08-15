@@ -253,7 +253,12 @@ where
     // only biased every repetition in the same direction, which repetition cannot
     // average out.
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
     (elapsed, checksum)
 }
 
@@ -283,7 +288,12 @@ fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f
     let loss = session.tensor_sum(out).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
     (elapsed, checksum)
 }
 
@@ -334,7 +344,7 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
         1e-5,
     );
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-    let checksum = f64::from(dx.iter().sum::<f32>());
+    let checksum = f64::from(dx.iter().map(|g| g.abs()).sum::<f32>());
     (elapsed, checksum)
 }
 
@@ -365,7 +375,12 @@ fn timed_conv3d(
     let loss = session.tensor_sum(out).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
     (elapsed, checksum)
 }
 
@@ -465,7 +480,7 @@ def run(base, fn):
     fn(x).sum().backward()          # <- forward, loss_sum, backward: the timed region
     elapsed=(time.perf_counter()-s)*1e3
     # teardown, deliberately AFTER the clock stops on BOTH arms
-    return elapsed, x.grad.sum().item()
+    return elapsed, x.grad.abs().sum().item()
 LANES = {
     "max_pool1d": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
     "avg_pool2d": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
