@@ -8508,6 +8508,59 @@ pub fn supcon_loss_forward_f64(
     }
 }
 
+/// Does `candidate` displace the running max of a max-pool window?
+///
+/// This is ATen's rule, and it is NOT `candidate > current`:
+///
+/// ```text
+/// if ((val > maxval) || std::isnan(val)) { maxval = val; maxindex = ...; }
+/// ```
+///
+/// Two consequences, both of which FrankenTorch got wrong until
+/// `frankentorch-fmmns`, and neither of which a comparison between two of our
+/// own routes can catch — they were wrong in the same direction:
+///
+/// 1. **NaN propagates.** `NaN > x` is false, so a bare `>` seeded at
+///    `NEG_INFINITY` skips NaN entirely: a window `[NaN, 4.0]` returned 4.0 where
+///    torch returns NaN, and an all-NaN window returned `NEG_INFINITY` — a value
+///    that appears nowhere in the input.
+/// 2. **The tie rule is not uniform.** Ordinary ties keep the FIRST maximal
+///    element, because `>` is strict. NaNs keep the LAST one, because every NaN
+///    re-triggers the assignment. For `[NaN, NaN]` at offsets 6 and 7 torch
+///    reports **7**, so "first argmax" reasoning applied to NaN reproduces 6 and
+///    is still wrong.
+///
+/// Also note `!(candidate <= current)` is not a valid shortcut: once `current` is
+/// NaN it admits any later finite value, which ATen does not.
+///
+/// Verified against torch 2.12.0+cpu on this host: `max_pool1d` over
+/// `[1.0, 1.0, NaN, 4.0, 5.0, NaN, NaN, NaN, -0.0, 0.0]` with kernel 2 stride 2
+/// gives values `[1.0, nan, nan, nan, -0.0]` and indices `[0, 2, 5, 7, 8]`.
+#[inline]
+fn pool_max_beats<T: PoolMaxCandidate>(candidate: T, current: T) -> bool {
+    candidate > current || candidate.pool_is_nan()
+}
+
+/// The float types the max-pool kernels scan. Generic so that every site reads
+/// identically in f32 and f64 and a future audit can grep one name.
+trait PoolMaxCandidate: Copy + PartialOrd {
+    fn pool_is_nan(self) -> bool;
+}
+
+impl PoolMaxCandidate for f64 {
+    #[inline]
+    fn pool_is_nan(self) -> bool {
+        self.is_nan()
+    }
+}
+
+impl PoolMaxCandidate for f32 {
+    #[inline]
+    fn pool_is_nan(self) -> bool {
+        self.is_nan()
+    }
+}
+
 /// Fused max-pool3d forward (f64): per output, the max over its `kd×kh×kw`
 /// window of `[batch, ch, id, ih, iw]`. Parallel over `(batch,ch)` volumes.
 #[allow(clippy::too_many_arguments)]
@@ -8555,35 +8608,35 @@ pub fn max_pool3d_forward_f64(
 
                         let mut max_value = f64::NEG_INFINITY;
                         let candidate = input[loc000];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc001];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc010];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc011];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc100];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc101];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc110];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         let candidate = input[loc111];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                         }
                         orow[(oz * oh + oy) * ow + ox] = max_value;
@@ -8617,7 +8670,7 @@ pub fn max_pool3d_forward_f64(
                             let irow = dz + (bh + kr) * iw + bw;
                             for kc in 0..kw {
                                 let v = input[irow + kc];
-                                if v > m {
+                                if pool_max_beats(v, m) {
                                     m = v;
                                 }
                             }
@@ -8688,44 +8741,48 @@ pub fn max_pool3d_forward_with_indices_f64(
                         let loc111 = loc110 + 1;
 
                         let mut max_value = f64::NEG_INFINITY;
-                        let mut arg = 0usize;
+                        // The window's FIRST element, which is what torch reports
+                        // when nothing displaces the seed (an all -inf window):
+                        // max_pool1d over [1.0, 2.0, -inf, -inf] gives index 2,
+                        // the window start, not 0. frankentorch-fmmns.
+                        let mut arg = loc000;
                         let candidate = input[ibase + loc000];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc000;
                         }
                         let candidate = input[ibase + loc001];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc001;
                         }
                         let candidate = input[ibase + loc010];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc010;
                         }
                         let candidate = input[ibase + loc011];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc011;
                         }
                         let candidate = input[ibase + loc100];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc100;
                         }
                         let candidate = input[ibase + loc101];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc101;
                         }
                         let candidate = input[ibase + loc110];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc110;
                         }
                         let candidate = input[ibase + loc111];
-                        if candidate > max_value {
+                        if pool_max_beats(candidate, max_value) {
                             max_value = candidate;
                             arg = loc111;
                         }
@@ -8758,14 +8815,16 @@ pub fn max_pool3d_forward_with_indices_f64(
                 for ox in 0..ow {
                     let bw = ox * sw;
                     let mut m = f64::NEG_INFINITY;
-                    let mut arg = 0usize;
+                    // Window start: what torch reports when nothing displaces the
+                    // seed (all -inf). frankentorch-fmmns.
+                    let mut arg = bd * ih * iw + bh * iw + bw;
                     for kdd in 0..kd {
                         let dz = (bd + kdd) * ih * iw;
                         for kr in 0..kh {
                             let loc = dz + (bh + kr) * iw + bw;
                             for kc in 0..kw {
                                 let v = input[ibase + loc + kc];
-                                if v > m {
+                                if pool_max_beats(v, m) {
                                     m = v;
                                     arg = loc + kc;
                                 }
@@ -8842,7 +8901,9 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
         let bh = oy * sh;
         let bw = ox * sw;
         let mut max_value = f64::NEG_INFINITY;
-        let mut arg = 0usize;
+        // Window start: what torch reports when nothing displaces the seed
+        // (all -inf). frankentorch-fmmns.
+        let mut arg = bd * ih * iw + bh * iw + bw;
         for kdd in 0..kd {
             let dz = (bd + kdd) * ih * iw;
             for kr in 0..kh {
@@ -8850,7 +8911,7 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
                 for kc in 0..kw {
                     let candidate_arg = loc + kc;
                     let v = input[ibase + candidate_arg];
-                    if v > max_value {
+                    if pool_max_beats(v, max_value) {
                         max_value = v;
                         arg = candidate_arg;
                     }
@@ -8922,47 +8983,50 @@ fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
         let loc110 = row11 + x0;
         let loc111 = loc110 + 1;
 
-        // Match the generic first-argmax contract exactly: a window of only
-        // NaNs or negative infinities stays at -inf with its default offset.
+        // Match the generic contract exactly. A window of only negative
+        // infinities keeps the seed and reports the window's FIRST offset (torch:
+        // max_pool1d over [1.0, 2.0, -inf, -inf] gives index 2, not 0). A window
+        // containing NaN does NOT stay at -inf -- NaN displaces any value and the
+        // LAST NaN takes the offset. frankentorch-fmmns.
         let mut max_value = f64::NEG_INFINITY;
-        let mut arg = 0usize;
+        let mut arg = loc000;
         let candidate = input[input_plane_base + loc000];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc000;
         }
         let candidate = input[input_plane_base + loc001];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc001;
         }
         let candidate = input[input_plane_base + loc010];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc010;
         }
         let candidate = input[input_plane_base + loc011];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc011;
         }
         let candidate = input[input_plane_base + loc100];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc100;
         }
         let candidate = input[input_plane_base + loc101];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc101;
         }
         let candidate = input[input_plane_base + loc110];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc110;
         }
         let candidate = input[input_plane_base + loc111];
-        if candidate > max_value {
+        if pool_max_beats(candidate, max_value) {
             max_value = candidate;
             arg = loc111;
         }
@@ -9394,7 +9458,7 @@ pub fn max_pool3d_forward_f32(
                             let irow = dz + (bh + kr) * iw + bw;
                             for kc in 0..kw {
                                 let v = input[irow + kc];
-                                if v > m {
+                                if pool_max_beats(v, m) {
                                     m = v;
                                 }
                             }
@@ -9480,42 +9544,42 @@ fn max_pool3d_backward_2x2s2_f64(
                     let mut arg = loc000;
 
                     let candidate = input_plane[loc000];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc000;
                     }
                     let candidate = input_plane[loc001];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc001;
                     }
                     let candidate = input_plane[loc010];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc010;
                     }
                     let candidate = input_plane[loc011];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc011;
                     }
                     let candidate = input_plane[loc100];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc100;
                     }
                     let candidate = input_plane[loc101];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc101;
                     }
                     let candidate = input_plane[loc110];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         m = candidate;
                         arg = loc110;
                     }
                     let candidate = input_plane[loc111];
-                    if candidate > m {
+                    if pool_max_beats(candidate, m) {
                         arg = loc111;
                     }
 
@@ -9751,14 +9815,16 @@ pub fn max_pool3d_backward_f64(
                     for ox in 0..ow {
                         let bw = ox * sw;
                         let mut m = f64::NEG_INFINITY;
-                        let mut arg = 0usize;
+                        // Window start: what torch reports when nothing displaces
+                        // the seed (all -inf). frankentorch-fmmns.
+                        let mut arg = bd * ih * iw + bh * iw + bw;
                         for kdd in 0..kd {
                             let dz = (bd + kdd) * ih * iw;
                             for kr in 0..kh {
                                 let loc = dz + (bh + kr) * iw + bw;
                                 for kc in 0..kw {
                                     let v = input[plane * id * ih * iw + loc + kc];
-                                    if v > m {
+                                    if pool_max_beats(v, m) {
                                         m = v;
                                         arg = loc + kc;
                                     }
@@ -10363,7 +10429,11 @@ pub fn avg_pool1d_forward_f64(
     if kernel == 2 && stride == 2 {
         let pair_plane = |plane: usize, orow: &mut [f64]| {
             let ibase = plane * len;
-            let pairs = input[ibase..ibase + output_len * 2].chunks_exact(2);
+            // as_chunks::<2>() rather than chunks_exact(2): the width becomes a type
+            // guarantee (&[f64; 2]), so pair[0]/pair[1] stop being bounds-checked reads.
+            // The slice length is exactly output_len * 2, so the remainder is empty and
+            // this is element-for-element identical. frankentorch-0aj9z.
+            let pairs = input[ibase..ibase + output_len * 2].as_chunks::<2>().0;
             for (slot, pair) in orow.iter_mut().zip(pairs) {
                 // Preserve the generic accumulator's leading positive-zero add:
                 // it determines the result bit for an all-negative-zero window.
@@ -10659,13 +10729,15 @@ pub fn max_pool1d_forward_f64(
     if kernel == 2 && stride == 2 {
         let pair_plane = |plane: usize, orow: &mut [f64]| {
             let ibase = plane * len;
-            let pairs = input[ibase..ibase + output_len * 2].chunks_exact(2);
+            // as_chunks::<2>(): see the note on the avg-pool sibling above. Exact
+            // multiple, empty remainder, identical values. frankentorch-0aj9z.
+            let pairs = input[ibase..ibase + output_len * 2].as_chunks::<2>().0;
             for (slot, pair) in orow.iter_mut().zip(pairs) {
                 let mut m = f64::NEG_INFINITY;
-                if pair[0] > m {
+                if pool_max_beats(pair[0], m) {
                     m = pair[0];
                 }
-                if pair[1] > m {
+                if pool_max_beats(pair[1], m) {
                     m = pair[1];
                 }
                 *slot = m;
@@ -10689,7 +10761,7 @@ pub fn max_pool1d_forward_f64(
             let mut m = f64::NEG_INFINITY;
             for kx in 0..kernel {
                 let v = input[ibase + start + kx];
-                if v > m {
+                if pool_max_beats(v, m) {
                     m = v;
                 }
             }
@@ -10728,14 +10800,17 @@ pub fn max_pool1d_forward_with_indices_f64(
     if kernel == 2 && stride == 2 {
         let pair_plane = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
             let ibase = plane * len;
-            let pairs = input[ibase..ibase + output_len * 2].chunks_exact(2);
-            for (ox, pair) in pairs.enumerate() {
+            // as_chunks::<2>(): see the note on the avg-pool sibling above. Exact
+            // multiple, empty remainder, identical values and identical first-argmax
+            // tie-breaking (the comparison order is untouched). frankentorch-0aj9z.
+            let pairs = input[ibase..ibase + output_len * 2].as_chunks::<2>().0;
+            for (ox, pair) in pairs.iter().enumerate() {
                 let mut m = f64::NEG_INFINITY;
                 let mut arg = ox * 2;
-                if pair[0] > m {
+                if pool_max_beats(pair[0], m) {
                     m = pair[0];
                 }
-                if pair[1] > m {
+                if pool_max_beats(pair[1], m) {
                     m = pair[1];
                     arg += 1;
                 }
@@ -10765,7 +10840,7 @@ pub fn max_pool1d_forward_with_indices_f64(
             for kx in 0..kernel {
                 let loc = start + kx;
                 let v = input[ibase + loc];
-                if v > m {
+                if pool_max_beats(v, m) {
                     m = v;
                     arg = loc;
                 }
@@ -10874,7 +10949,7 @@ pub fn max_pool2d_forward_f64(
                     let irow = ibase + (base_h + kr) * iw + base_w;
                     for kc in 0..kw {
                         let v = input[irow + kc];
-                        if v > m {
+                        if pool_max_beats(v, m) {
                             m = v;
                         }
                     }
@@ -10922,12 +10997,14 @@ pub fn max_pool2d_forward_with_indices_f64(
             for ox in 0..ow {
                 let base_w = ox * sw;
                 let mut m = f64::NEG_INFINITY;
-                let mut arg = 0usize;
+                // Window start: what torch reports when nothing displaces the
+                // seed (all -inf). frankentorch-fmmns.
+                let mut arg = base_h * iw + base_w;
                 for kr in 0..kh {
                     let loc = (base_h + kr) * iw + base_w;
                     for kc in 0..kw {
                         let v = input[ibase + loc + kc];
-                        if v > m {
+                        if pool_max_beats(v, m) {
                             m = v;
                             arg = loc + kc;
                         }
@@ -10980,12 +11057,14 @@ pub fn max_pool2d_forward_with_indices_f32(
             for ox in 0..ow {
                 let base_w = ox * sw;
                 let mut m = f32::NEG_INFINITY;
-                let mut arg = 0usize;
+                // Window start: what torch reports when nothing displaces the
+                // seed (all -inf). frankentorch-fmmns.
+                let mut arg = base_h * iw + base_w;
                 for kr in 0..kh {
                     let loc = (base_h + kr) * iw + base_w;
                     for kc in 0..kw {
                         let v = input[ibase + loc + kc];
-                        if v > m {
+                        if pool_max_beats(v, m) {
                             m = v;
                             arg = loc + kc;
                         }
@@ -11071,7 +11150,7 @@ pub fn max_pool2d_forward_f32(
                     let irow = ibase + (base_h + kr) * iw + base_w;
                     for kc in 0..kw {
                         let v = input[irow + kc];
-                        if v > m {
+                        if pool_max_beats(v, m) {
                             m = v;
                         }
                     }
@@ -11124,12 +11203,14 @@ pub fn max_pool2d_backward_f64(
                 for ox in 0..ow {
                     let base_w = ox * sw;
                     let mut m = f64::NEG_INFINITY;
-                    let mut arg = 0usize;
+                    // Window start: what torch reports when nothing displaces the
+                    // seed (all -inf). frankentorch-fmmns.
+                    let mut arg = base_h * iw + base_w;
                     for kr in 0..kh {
                         let loc = (base_h + kr) * iw + base_w;
                         for kc in 0..kw {
                             let v = input[ibase + loc + kc];
-                            if v > m {
+                            if pool_max_beats(v, m) {
                                 m = v;
                                 arg = loc + kc;
                             }
@@ -40105,14 +40186,20 @@ mod tests {
                     for ox in 0..ow {
                         let bw = ox * sw;
                         let mut m = f64::NEG_INFINITY;
-                        let mut arg = 0usize;
+                        // Mirrors the kernel contract, including the two parts a
+                        // bare `v > m` seeded at -inf gets wrong: NaN displaces
+                        // any value (and the LAST NaN keeps the offset), and an
+                        // all -inf window reports the window START. This
+                        // reference encoded the pre-frankentorch-fmmns behaviour
+                        // and would otherwise pin the bug it was meant to catch.
+                        let mut arg = bd * ih * iw + bh * iw + bw;
                         for kdd in 0..kd {
                             let dz = (bd + kdd) * ih * iw;
                             for kr in 0..kh {
                                 let loc = dz + (bh + kr) * iw + bw;
                                 for kc in 0..kw {
                                     let v = input[ibase + loc + kc];
-                                    if v > m {
+                                    if super::pool_max_beats(v, m) {
                                         m = v;
                                         arg = loc + kc;
                                     }
@@ -40612,8 +40699,22 @@ mod tests {
     #[test]
     fn max_pool3d_indexed_2x2s2_specialization_preserves_first_argmax_bits() {
         // The first window verifies signed-zero tie ordering, while the second
-        // has only NaNs and -inf. Both value and offset are observable in
-        // backward, so pin them independently of the fused-sum implementation.
+        // holds only NaNs. Both value and offset are observable in backward, so
+        // pin them independently of the fused-sum implementation.
+        //
+        // EXPECTATIONS RE-DERIVED FROM THE ORACLE (frankentorch-fmmns). This test
+        // previously asserted `values[1] == NEG_INFINITY` and `offsets == [0, 0]`,
+        // which is what the kernel did before NaN propagation was fixed -- it
+        // pinned the bug. torch 2.12.0+cpu on this host, same input reshaped to
+        // [1,1,2,2,4] with kernel/stride (2,2,2):
+        //
+        //   F.max_pool3d(x, (2,2,2), (2,2,2), return_indices=True)
+        //     -> values  [-0.0, nan]
+        //        indices [0, 15]
+        //
+        // Window 1 is entirely NaN, so NaN wins and the LAST NaN in scan order
+        // (d, then h, then w: 2,3,6,7,10,11,14,15) keeps the offset -- 15, not the
+        // window start and not 0.
         let input = vec![
             -0.0,
             0.0,
@@ -40637,8 +40738,12 @@ mod tests {
         );
 
         assert_eq!(values[0].to_bits(), (-0.0_f64).to_bits());
-        assert_eq!(values[1].to_bits(), f64::NEG_INFINITY.to_bits());
-        assert_eq!(offsets, vec![0.0, 0.0]);
+        assert!(
+            values[1].is_nan(),
+            "an all-NaN window returns NaN, not the -inf seed; got {}",
+            values[1]
+        );
+        assert_eq!(offsets, vec![0.0, 15.0]);
     }
 
     #[test]
@@ -41040,25 +41145,118 @@ mod tests {
             &input, batch, ch, 1, len, 1, 2, 1, output_len, 1, 2,
         );
 
-        assert_eq!(
-            special_values
+        // Compared bitwise (so -0.0 vs 0.0 and NaN payloads count) but REPORTED
+        // decimally alongside the window each element came from. The previous
+        // form asserted on `Vec<u64>` and, when it failed, printed two rows of
+        // raw bit patterns -- which is what this failure looked like for however
+        // long it sat red on main: unreadable enough that the divergence could
+        // not be diagnosed from the failure text.
+        let describe = |values: &[f64], offsets: &[f64]| {
+            values
                 .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            generic_values
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
+                .zip(offsets.iter())
+                .enumerate()
+                .map(|(window, (value, offset))| {
+                    format!(
+                        "w{window}: value={value:?} bits={:#018x} offset={offset:?}",
+                        value.to_bits()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n    ")
+        };
+        let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert!(
+            bits(&special_values) == bits(&generic_values)
+                && bits(&special_offsets) == bits(&generic_offsets),
+            "max_pool1d 2x2 specialization disagrees with the max_pool2d generic route \
+             on input {input:?}\n  special (max_pool1d):\n    {}\n  generic (max_pool2d):\n    {}",
+            describe(&special_values, &special_offsets),
+            describe(&generic_values, &generic_offsets),
         );
+    }
+
+    #[test]
+    fn max_pool_nan_and_neg_inf_windows_match_the_torch_oracle() {
+        // PINNED AGAINST TORCH, not against another FrankenTorch route. The
+        // sibling test compares the max_pool1d specialization to the max_pool2d
+        // generic, and BOTH were wrong here in the same direction -- NaN skipped
+        // rather than propagated -- so they agreed on two of the three broken
+        // windows and the suite stayed green about it. A route-vs-route test can
+        // only find the disagreement, never the shared error.
+        //
+        // Values below were produced by torch 2.12.0+cpu on this host:
+        //
+        //   x = [1.0, 1.0, NaN, 4.0, 5.0, NaN, NaN, NaN, -0.0, 0.0]
+        //   F.max_pool1d(x, 2, 2, return_indices=True)
+        //     -> values  [1.0, nan, nan, nan, -0.0]
+        //        indices [0, 2, 5, 7, 8]
+        //
+        //   x = [1.0, 2.0, -inf, -inf]
+        //   F.max_pool1d(x, 2, 2, return_indices=True)
+        //     -> values [2.0, -inf]   indices [1, 2]
+        //
+        // Three separate contracts are pinned here, and the third is the one that
+        // catches a plausible wrong fix:
+        //   1. NaN displaces any value (windows 1 and 2).
+        //   2. Among NaNs the LAST one takes the index -- window 3 is [NaN, NaN]
+        //      at offsets 6 and 7 and torch reports 7. "First argmax" reasoning
+        //      applied uniformly gives 6 and passes contract 1 while still being
+        //      wrong.
+        //   3. An all -inf window keeps the WINDOW START, not global index 0.
+        let (batch, ch, len, output_len) = (1usize, 1usize, 10usize, 5usize);
+        let input = vec![
+            1.0,
+            1.0,
+            f64::NAN,
+            4.0,
+            5.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            -0.0,
+            0.0,
+        ];
+        let torch_indices = [0.0f64, 2.0, 5.0, 7.0, 8.0];
+
+        let (values, offsets) =
+            super::max_pool1d_forward_with_indices_f64(&input, batch, ch, len, 2, output_len, 2);
+        assert!(values[0] == 1.0, "window 0 max: {}", values[0]);
+        for window in 1..=3 {
+            assert!(
+                values[window].is_nan(),
+                "window {window} contains a NaN, so torch returns NaN; got {}",
+                values[window]
+            );
+        }
+        assert!(
+            values[4] == 0.0 && values[4].is_sign_negative(),
+            "window 4 is [-0.0, 0.0] and -0.0 is the FIRST maximal element; got {:?}",
+            values[4]
+        );
+        assert_eq!(offsets, torch_indices, "indices must match torch exactly");
+
+        // The plain (no-indices) route must agree on values.
+        let plain = super::max_pool1d_forward_f64(&input, batch, ch, len, 2, output_len, 2);
+        for (window, (a, b)) in plain.iter().zip(values.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "max_pool1d with and without indices disagree at window {window}"
+            );
+        }
+
+        // Contract 3, which only NEG_INFINITY can exercise: the seed survives and
+        // the reported offset is the window start (2), never 0.
+        let ninf = vec![1.0f64, 2.0, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let (ninf_values, ninf_offsets) =
+            super::max_pool1d_forward_with_indices_f64(&ninf, 1, 1, 4, 2, 2, 2);
+        assert_eq!(ninf_values[0], 2.0);
+        assert_eq!(ninf_values[1], f64::NEG_INFINITY);
         assert_eq!(
-            special_offsets
-                .iter()
-                .map(|offset| offset.to_bits())
-                .collect::<Vec<_>>(),
-            generic_offsets
-                .iter()
-                .map(|offset| offset.to_bits())
-                .collect::<Vec<_>>(),
+            ninf_offsets,
+            vec![1.0f64, 2.0],
+            "an all -inf window reports the WINDOW START, not global 0"
         );
     }
 
