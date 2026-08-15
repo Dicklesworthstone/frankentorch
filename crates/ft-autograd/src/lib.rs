@@ -12440,9 +12440,16 @@ impl TensorTape {
                 TensorNodeOp::Floor { input }
                 | TensorNodeOp::Ceil { input }
                 | TensorNodeOp::Round { input } => {
-                    // Gradient is zero almost everywhere (step functions)
-                    let zero_contrib = vec![0.0; incoming.len()];
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &zero_contrib)?;
+                    // Gradient is zero almost everywhere (step functions). Keep this
+                    // owned so an empty slot adopts a warm, scrubbed pool buffer instead
+                    // of allocating a second vector just to copy zeroes into that slot.
+                    // frankentorch-9pafs.
+                    let zero_contrib = ft_core::buffer_pool::take_zeroed(incoming.len());
+                    Self::accumulate_tensor_gradient_owned(
+                        input,
+                        &mut grads[input.0],
+                        zero_contrib,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12518,9 +12525,10 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sign { input } => {
-                    // sign is a step function, gradient is 0
-                    let contrib = vec![0.0; incoming.len()];
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // `sign` is a step function, so its owned zero contribution can
+                    // become the first gradient slot without a copy. frankentorch-9pafs.
+                    let contrib = ft_core::buffer_pool::take_zeroed(incoming.len());
+                    Self::accumulate_tensor_gradient_owned(input, &mut grads[input.0], contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12529,9 +12537,10 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Trunc { input } => {
-                    // trunc is a step function, gradient is 0
-                    let contrib = vec![0.0; incoming.len()];
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // `trunc` is a step function, so its owned zero contribution can
+                    // become the first gradient slot without a copy. frankentorch-9pafs.
+                    let contrib = ft_core::buffer_pool::take_zeroed(incoming.len());
+                    Self::accumulate_tensor_gradient_owned(input, &mut grads[input.0], contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -21168,6 +21177,54 @@ mod tests {
         assert_eq!(ft_core::buffer_pool::stats().hits, 1);
 
         ft_core::buffer_pool::recycle(slot.values);
+        ft_core::buffer_pool::clear();
+        drop(guard);
+    }
+
+    #[test]
+    fn zero_step_backward_reuses_pool_for_root_and_leaf_gradients() {
+        let guard = BUFFER_POOL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = ft_core::buffer_pool::MIN_POOLED_LEN;
+        ft_core::buffer_pool::clear();
+        ft_core::buffer_pool::set_enabled(true);
+
+        let run_once = || {
+            let mut tape = super::TensorTape::new();
+            let input = tape
+                .leaf(vec![1.5; len], vec![len], true)
+                .expect("input leaf");
+            let (root, _) = tape
+                .floor(input, ft_core::ExecutionMode::Strict)
+                .expect("floor");
+            let report = tape.backward(root).expect("floor backward");
+            assert!(
+                report
+                    .gradient(input)
+                    .expect("input gradient")
+                    .iter()
+                    .all(|&v| v == 0.0),
+                "the zero-gradient operation must still materialize a zero gradient"
+            );
+            report
+        };
+
+        // The first run creates two report-owned buffers: the root seed and the
+        // floor input gradient. Dropping the report closes the recycle loop.
+        drop(run_once());
+        let hits_before = ft_core::buffer_pool::stats().hits;
+        let second_report = run_once();
+        let hits_after = ft_core::buffer_pool::stats().hits;
+
+        assert_eq!(
+            hits_after - hits_before,
+            2,
+            "the second floor backward must take a pooled root seed and a pooled zero input \
+             gradient; a borrowed vec![0.0; len] only hits for the root"
+        );
+
+        drop(second_report);
         ft_core::buffer_pool::clear();
         drop(guard);
     }
