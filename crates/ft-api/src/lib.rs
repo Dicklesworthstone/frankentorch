@@ -13222,6 +13222,34 @@ impl FrankenTorchSession {
                 fn direct_p2_f32(values: &[f32], n: usize, m: usize) -> Vec<f32> {
                     const PAIRS_PER_CHUNK: usize = 2_048;
                     use rayon::prelude::*;
+
+                    #[inline]
+                    fn squared_distance_64(left: &[f32], right: &[f32]) -> f32 {
+                        debug_assert_eq!(left.len(), 64);
+                        debug_assert_eq!(right.len(), 64);
+                        let mut squared_distance = 0.0_f32;
+                        // The scorecard's f32 lane has exactly 64 features. Keeping
+                        // the eight-wide loads indexed avoids constructing
+                        // `ChunksExact` iterators for every condensed pair. The lane
+                        // values are still folded one at a time and in ascending-k
+                        // order, so this remains bit-identical to the scalar direct
+                        // definition.
+                        for offset in (0..64).step_by(8) {
+                            let differences = f32x8::from(&left[offset..offset + 8])
+                                - f32x8::from(&right[offset..offset + 8]);
+                            let squares = (differences * differences).to_array();
+                            squared_distance += squares[0];
+                            squared_distance += squares[1];
+                            squared_distance += squares[2];
+                            squared_distance += squares[3];
+                            squared_distance += squares[4];
+                            squared_distance += squares[5];
+                            squared_distance += squares[6];
+                            squared_distance += squares[7];
+                        }
+                        squared_distance
+                    }
+
                     let mut out = vec![0.0_f32; n * (n - 1) / 2];
                     let fill_chunk = |chunk_idx: usize, chunk: &mut [f32]| {
                         let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
@@ -13231,26 +13259,32 @@ impl FrankenTorchSession {
                             let mut squared_distance = 0.0_f32;
                             let left = &values[i_base..i_base + m];
                             let right = &values[j_base..j_base + m];
-                            let mut left_chunks = left.chunks_exact(8);
-                            let mut right_chunks = right.chunks_exact(8);
-                            for (left_chunk, right_chunk) in
-                                left_chunks.by_ref().zip(right_chunks.by_ref())
-                            {
-                                // Keep the reduction scalar and in ascending-k order so
-                                // the public f32 result stays bit-identical to the direct
-                                // reference. Only the independent subtract-and-square work
-                                // is packed into portable safe-Rust SIMD lanes.
-                                let differences =
-                                    f32x8::from(left_chunk) - f32x8::from(right_chunk);
-                                for square in (differences * differences).to_array() {
-                                    squared_distance += square;
+                            if m == 64 {
+                                squared_distance = squared_distance_64(left, right);
+                            } else {
+                                let mut left_chunks = left.chunks_exact(8);
+                                let mut right_chunks = right.chunks_exact(8);
+                                for (left_chunk, right_chunk) in
+                                    left_chunks.by_ref().zip(right_chunks.by_ref())
+                                {
+                                    // Keep the reduction scalar and in ascending-k order so
+                                    // the public f32 result stays bit-identical to the direct
+                                    // reference. Only the independent subtract-and-square work
+                                    // is packed into portable safe-Rust SIMD lanes.
+                                    let differences =
+                                        f32x8::from(left_chunk) - f32x8::from(right_chunk);
+                                    for square in (differences * differences).to_array() {
+                                        squared_distance += square;
+                                    }
                                 }
-                            }
-                            for (&left_value, &right_value) in
-                                left_chunks.remainder().iter().zip(right_chunks.remainder())
-                            {
-                                let diff = left_value - right_value;
-                                squared_distance += diff * diff;
+                                for (&left_value, &right_value) in left_chunks
+                                    .remainder()
+                                    .iter()
+                                    .zip(right_chunks.remainder())
+                                {
+                                    let diff = left_value - right_value;
+                                    squared_distance += diff * diff;
+                                }
                             }
                             // Squared distances are non-negative. `sqrt` is
                             // the p=2 operation directly; `powf(0.5)` would
@@ -128112,6 +128146,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pdist_p2_f32_64_feature_fast_path_keeps_scalar_lane_order() {
+        // Values across widely separated exponents make the f32 accumulation
+        // order observable. This reaches the scorecard-width specialization
+        // above and compares it against the literal scalar definition.
+        let n = 3;
+        let m = 64;
+        let input: Vec<f32> = (0..n * m)
+            .map(|idx| {
+                let row = idx / m;
+                let lane = idx % m;
+                let magnitude = 2.0_f32.powi((lane % 23) as i32 - 11);
+                match row {
+                    0 => magnitude,
+                    1 => -magnitude * if lane % 3 == 0 { 1.5 } else { 1.0 },
+                    _ => magnitude * if lane % 5 == 0 { -0.75 } else { 0.25 },
+                }
+            })
+            .collect();
+        let mut expected = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut squared_distance = 0.0_f32;
+                for k in 0..m {
+                    let difference = input[i * m + k] - input[j * m + k];
+                    squared_distance += difference * difference;
+                }
+                expected.push(squared_distance.sqrt());
+            }
+        }
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = session
+            .tensor_variable_f32(input, vec![n, m], false)
+            .unwrap();
+        let output = session.tensor_pdist(tensor, 2.0).unwrap();
+        let actual = session.tensor_values_f32(output).unwrap();
+        assert_eq!(
+            actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
