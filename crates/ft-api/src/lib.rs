@@ -33314,11 +33314,133 @@ impl FrankenTorchSession {
         self.tensor_reshape(pooled, vec![batch_size, channels, output_h, output_w])
     }
 
+    fn avg_pool2d_2x2s2_sum_pairwise_leaf_f64(
+        input: &[f64],
+        start: usize,
+        input_h: usize,
+        input_w: usize,
+        output_h: usize,
+        output_w: usize,
+        count: usize,
+    ) -> f64 {
+        let mut acc = 0.0_f64;
+        let output_plane = output_h * output_w;
+        for flat in start..start + count {
+            let plane = flat / output_plane;
+            let output_offset = flat - plane * output_plane;
+            let oy = output_offset / output_w;
+            let ox = output_offset - oy * output_w;
+            let input_base = plane * input_h * input_w;
+            let row0 = (oy * 2) * input_w;
+            let row1 = row0 + input_w;
+            let col0 = ox * 2;
+            let v00 = input[input_base + row0 + col0];
+            let v01 = input[input_base + row0 + col0 + 1];
+            let v10 = input[input_base + row1 + col0];
+            let v11 = input[input_base + row1 + col0 + 1];
+            // This is deliberately the same parenthesization as
+            // `avg_pool2d_forward_2x2s2_f64`, whose materialized values used to
+            // be fed to `sum_tensor_contiguous_f64` below.
+            acc += (((v00 + v01) + v10) + v11) / 4.0;
+        }
+        acc
+    }
+
+    fn avg_pool2d_2x2s2_sum_pairwise_range_f64(
+        input: &[f64],
+        start: usize,
+        input_h: usize,
+        input_w: usize,
+        output_h: usize,
+        output_w: usize,
+        count: usize,
+    ) -> f64 {
+        const BLOCK: usize = 128;
+        if count <= BLOCK {
+            return Self::avg_pool2d_2x2s2_sum_pairwise_leaf_f64(
+                input, start, input_h, input_w, output_h, output_w, count,
+            );
+        }
+        let mid = count / 2;
+        Self::avg_pool2d_2x2s2_sum_pairwise_range_f64(
+            input, start, input_h, input_w, output_h, output_w, mid,
+        ) + Self::avg_pool2d_2x2s2_sum_pairwise_range_f64(
+            input,
+            start + mid,
+            input_h,
+            input_w,
+            output_h,
+            output_w,
+            count - mid,
+        )
+    }
+
+    fn avg_pool2d_2x2s2_sum_pairwise_range_f64_par(
+        input: &[f64],
+        start: usize,
+        input_h: usize,
+        input_w: usize,
+        output_h: usize,
+        output_w: usize,
+        count: usize,
+    ) -> f64 {
+        const PAR_BLOCK: usize = 1 << 14;
+        if count <= PAR_BLOCK {
+            return Self::avg_pool2d_2x2s2_sum_pairwise_range_f64(
+                input, start, input_h, input_w, output_h, output_w, count,
+            );
+        }
+        let mid = count / 2;
+        let (left, right) = rayon::join(
+            || {
+                Self::avg_pool2d_2x2s2_sum_pairwise_range_f64_par(
+                    input, start, input_h, input_w, output_h, output_w, mid,
+                )
+            },
+            || {
+                Self::avg_pool2d_2x2s2_sum_pairwise_range_f64_par(
+                    input,
+                    start + mid,
+                    input_h,
+                    input_w,
+                    output_h,
+                    output_w,
+                    count - mid,
+                )
+            },
+        );
+        left + right
+    }
+
+    /// Reduces the specialized 2x2/stride-2 pooled values with the exact tree
+    /// used by `sum_tensor_contiguous_f64`, without materializing the pooled tensor.
+    fn avg_pool2d_2x2s2_sum_forward_f64(
+        input: &[f64],
+        batch: usize,
+        channels: usize,
+        input_h: usize,
+        input_w: usize,
+        output_h: usize,
+        output_w: usize,
+    ) -> f64 {
+        const SUM_PARALLEL_THRESHOLD: usize = 1 << 19;
+        let count = batch * channels * output_h * output_w;
+        if count >= SUM_PARALLEL_THRESHOLD {
+            Self::avg_pool2d_2x2s2_sum_pairwise_range_f64_par(
+                input, 0, input_h, input_w, output_h, output_w, count,
+            )
+        } else {
+            Self::avg_pool2d_2x2s2_sum_pairwise_range_f64(
+                input, 0, input_h, input_w, output_h, output_w, count,
+            )
+        }
+    }
+
     /// Fused scalar loss for `sum(avg_pool2d(input))` on f64 `[N, C, H, W]`.
     ///
-    /// The forward still materializes the optimized pooled tensor locally and
-    /// reduces it with the same pairwise tree as `tensor_sum`; the backward skips
-    /// the dense all-ones output-gradient buffer.
+    /// The 2x2/stride-2 tiled path visits each pooled window directly in the
+    /// `tensor_sum` pairwise order, avoiding the otherwise-discarded pooled
+    /// activation. The backward skips the dense all-ones output-gradient buffer.
     #[allow(clippy::too_many_arguments)]
     pub fn functional_avg_pool2d_sum(
         &mut self,
@@ -33419,6 +33541,17 @@ impl FrankenTorchSession {
             (kernel_h, kernel_w, output_h, output_w, stride_h, stride_w);
         let (pdh, pdw, ih_, iw_) = (padding_h, padding_w, input_h, input_w);
         let out_meta = TensorMeta::from_shape(vec![b_, ch_, oh_, ow_], DType::F64, Device::Cpu);
+        let tiled_2x2s2 = kh_ == 2
+            && kw_ == 2
+            && sh_ == 2
+            && sw_ == 2
+            && pdh == 0
+            && pdw == 0
+            && cip
+            && ph_ == ih_
+            && pw_ == iw_
+            && oh_ == ih_ / 2
+            && ow_ == iw_ / 2;
 
         if !self.tensor_tape.tensor_requires_grad(input)? {
             let value = {
@@ -33428,11 +33561,17 @@ impl FrankenTorchSession {
                 // The enclosing block already scopes the borrow away from the
                 // `&mut self` call below.
                 let pv = self.tensor_tape.values_borrowed(padded)?;
-                let out = ft_kernel_cpu::avg_pool2d_forward_f64(
-                    pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
-                );
-                ft_kernel_cpu::sum_tensor_contiguous_f64(&out, &out_meta)
-                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?
+                if tiled_2x2s2 {
+                    Self::avg_pool2d_2x2s2_sum_forward_f64(pv, b_, ch_, ih_, iw_, oh_, ow_)
+                } else {
+                    let out = ft_kernel_cpu::avg_pool2d_forward_f64(
+                        pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_,
+                        cip,
+                    );
+                    ft_kernel_cpu::sum_tensor_contiguous_f64(&out, &out_meta).map_err(|e| {
+                        AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                    })?
+                }
             };
             return self.tensor_variable(vec![value], vec![1], false);
         }
@@ -33441,11 +33580,17 @@ impl FrankenTorchSession {
             &[padded],
             move |_ctx, ins| {
                 let (pv, _) = ins[0];
-                let out = ft_kernel_cpu::avg_pool2d_forward_f64(
-                    pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
-                );
-                let sum = ft_kernel_cpu::sum_tensor_contiguous_f64(&out, &out_meta)
-                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+                let sum = if tiled_2x2s2 {
+                    Self::avg_pool2d_2x2s2_sum_forward_f64(pv, b_, ch_, ih_, iw_, oh_, ow_)
+                } else {
+                    let out = ft_kernel_cpu::avg_pool2d_forward_f64(
+                        pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_,
+                        cip,
+                    );
+                    ft_kernel_cpu::sum_tensor_contiguous_f64(&out, &out_meta).map_err(|e| {
+                        AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                    })?
+                };
                 Ok((vec![sum], vec![1]))
             },
             move |_ctx, grad_outputs| {
@@ -140843,6 +140988,34 @@ mod tests {
                 "fused avg_pool2d sum input grad[{index}]"
             );
         }
+    }
+
+    #[test]
+    fn functional_avg_pool2d_sum_tiled_score_shape_matches_materialized_forward_bits() {
+        let values: Vec<f64> = (0..8 * 64 * 64 * 64)
+            .map(|i| ((i * 47 + 23) % 193) as f64 * 0.015625 - 1.5)
+            .collect();
+
+        let mut materialized = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_materialized = materialized
+            .tensor_variable(values.clone(), vec![8, 64, 64, 64], false)
+            .unwrap();
+        let pooled = materialized
+            .functional_avg_pool2d(x_materialized, (2, 2), (2, 2), (0, 0), false, true)
+            .unwrap();
+        let loss_materialized = materialized.tensor_sum(pooled).unwrap();
+        let out_materialized = materialized.tensor_values(loss_materialized).unwrap();
+
+        let mut fused = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_fused = fused
+            .tensor_variable(values, vec![8, 64, 64, 64], false)
+            .unwrap();
+        let loss_fused = fused
+            .functional_avg_pool2d_sum(x_fused, (2, 2), (2, 2), (0, 0), false, true)
+            .unwrap();
+        let out_fused = fused.tensor_values(loss_fused).unwrap();
+
+        assert_eq!(out_fused[0].to_bits(), out_materialized[0].to_bits());
     }
 
     #[test]
