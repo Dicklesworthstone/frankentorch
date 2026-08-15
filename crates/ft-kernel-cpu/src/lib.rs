@@ -11043,11 +11043,88 @@ fn conv3d_col2im_repeated_row_f64(
     dpadded
 }
 
-/// Fused conv3d forward (f64) on a PADDED input: 3-D im2col + `panel @
-/// weight_flat^T` (dgemm_bt) straight to NCDHW, plus optional per-channel bias.
+/// Direct NCDHW f64 convolution for the scored 3x3x3 stride-1 route.
+///
+/// Blocks four adjacent output channels so one input patch is read once for four
+/// dot products. Each output channel still visits `(in_channel, kd, kh, kw)` in
+/// the same order as its flattened weight row. Unlike the streamed fallback,
+/// this never gathers a temporary im2col panel or transposes an NHWCO result.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
-pub fn conv3d_forward_f64(
+fn conv3d_forward_direct_3x3s1_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    bias: Option<&[f64]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+) -> Vec<f64> {
+    const KERNEL_WIDTH: usize = 3 * 3 * 3;
+    const OUT_CHANNEL_BLOCK: usize = 4;
+    let patch_width = in_ch * KERNEL_WIDTH;
+    let patch_count = od * oh * ow;
+    let plane_count = batch * out_ch;
+    let mut out = vec![0.0f64; plane_count * patch_count];
+    out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)
+        .enumerate()
+        .for_each(|(block, out_block)| {
+            let first_plane = block * OUT_CHANNEL_BLOCK;
+            let n = first_plane / out_ch;
+            let first_channel = first_plane % out_ch;
+            let width = out_block.len() / patch_count;
+            let batch_offset = n * in_ch * pd * ph * pw;
+            let mut weight_offsets = [0usize; OUT_CHANNEL_BLOCK];
+            for channel_offset in 0..width {
+                weight_offsets[channel_offset] = (first_channel + channel_offset) * patch_width;
+            }
+            for oz in 0..od {
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let mut sums = [0.0f64; OUT_CHANNEL_BLOCK];
+                        for c in 0..in_ch {
+                            let input_channel = batch_offset + c * pd * ph * pw;
+                            let weight_channel = c * KERNEL_WIDTH;
+                            for kdd in 0..3 {
+                                let input_depth = input_channel + (oz + kdd) * ph * pw;
+                                let weight_depth = weight_channel + kdd * 3 * 3;
+                                for kr in 0..3 {
+                                    let input_row = input_depth + (oy + kr) * pw + ox;
+                                    let weight_row = weight_depth + kr * 3;
+                                    for kc in 0..3 {
+                                        let value = padded[input_row + kc];
+                                        let weight_index = weight_row + kc;
+                                        for channel_offset in 0..width {
+                                            sums[channel_offset] += value
+                                                * weight_flat
+                                                    [weight_offsets[channel_offset] + weight_index];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let output_offset = (oz * oh + oy) * ow + ox;
+                        for channel_offset in 0..width {
+                            out_block[channel_offset * patch_count + output_offset] = sums
+                                [channel_offset]
+                                + bias.map_or(0.0, |values| values[first_channel + channel_offset]);
+                        }
+                    }
+                }
+            }
+        });
+    out
+}
+
+/// Streamed im2col-GEMM fallback for f64 convolution on a PADDED input.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_forward_streamed_f64(
     padded: &[f64],
     weight_flat: &[f64],
     bias: Option<&[f64]>,
@@ -11130,6 +11207,80 @@ pub fn conv3d_forward_f64(
             }
         });
     out
+}
+
+/// Fused conv3d forward (f64) on a padded input, plus optional per-channel bias.
+///
+/// The native NCDHW 3x3x3 stride-1 lane uses a direct cache-local kernel. Other
+/// shapes retain the streamed im2col-GEMM fallback, which remains preferable
+/// when the output-channel block would not amortize its scalar dot products.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_forward_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    bias: Option<&[f64]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f64> {
+    if kd == 3
+        && kh == 3
+        && kw == 3
+        && sd == 1
+        && sh == 1
+        && sw == 1
+        && in_ch >= 8
+        && out_ch >= 8
+        && out_ch.is_multiple_of(4)
+    {
+        return conv3d_forward_direct_3x3s1_f64(
+            padded,
+            weight_flat,
+            bias,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            od,
+            oh,
+            ow,
+            out_ch,
+        );
+    }
+    conv3d_forward_streamed_f64(
+        padded,
+        weight_flat,
+        bias,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+    )
 }
 
 /// f32 mirror of [`conv3d_im2col_f64`]: parallel 3-D im2col into a
@@ -40038,6 +40189,57 @@ mod tests {
         assert_eq!(got.len(), want.len());
         for i in 0..want.len() {
             assert_eq!(got[i].to_bits(), want[i].to_bits(), "depthwise3d idx={i}");
+        }
+    }
+
+    #[test]
+    fn conv3d_direct_3x3s1_matches_streamed_reference_bits() {
+        let padded = vec![0.25f64; 8 * 5 * 5 * 5];
+        let weight = vec![0.5f64; 8 * 8 * 3 * 3 * 3];
+        let bias: Vec<f64> = (0..8).map(|channel| channel as f64 * 0.25).collect();
+        let out = super::conv3d_forward_f64(
+            &padded,
+            &weight,
+            Some(&bias),
+            1,
+            8,
+            5,
+            5,
+            5,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            1,
+            1,
+            1,
+            8,
+        );
+        let streamed = super::conv3d_forward_streamed_f64(
+            &padded,
+            &weight,
+            Some(&bias),
+            1,
+            8,
+            5,
+            5,
+            5,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            1,
+            1,
+            1,
+            8,
+        );
+        assert_eq!(out.len(), streamed.len());
+        for (index, (direct, expected)) in out.iter().zip(streamed.iter()).enumerate() {
+            assert_eq!(direct.to_bits(), expected.to_bits(), "output[{index}]");
         }
     }
 
