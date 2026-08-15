@@ -10263,6 +10263,32 @@ pub fn max_pool1d_backward_from_indices_f64(
     din
 }
 
+/// Scalar-loss backward for [`max_pool1d_forward_with_indices_f64`].
+///
+/// Equivalent to scattering a dense output gradient filled with `upstream`,
+/// but avoids materialising that short-lived buffer for `sum(max_pool1d(x))`.
+#[must_use]
+pub fn max_pool1d_backward_from_indices_scalar_f64(
+    upstream: f64,
+    arg_offsets: &[f64],
+    batch: usize,
+    ch: usize,
+    len: usize,
+    output_len: usize,
+) -> Vec<f64> {
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
+    let scatter_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * output_len;
+        for &arg_offset in &arg_offsets[dbase..dbase + output_len] {
+            drow[arg_offset as usize] += upstream;
+        }
+    };
+    din.par_chunks_mut(len)
+        .enumerate()
+        .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    din
+}
+
 /// Fused max-pool2d forward (f64): per output `[n,c,oy,ox]`, the max over its
 /// `kh×kw` window of `[batch, ch, ih, iw]`. One pass, parallel over `(batch,ch)`
 /// planes.
@@ -39994,6 +40020,41 @@ mod tests {
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "1-D serial driver must be bit-identical to the parallel one"
+        );
+    }
+
+    #[test]
+    fn max_pool1d_scalar_backward_matches_dense_output_gradient_bits() {
+        let (batch, ch, len, output_len) = (2usize, 3usize, 16usize, 8usize);
+        let input: Vec<f64> = (0..batch * ch * len)
+            .map(|index| ((index * 17 + 3) % 13) as f64 - 6.0)
+            .collect();
+        let (_, arg_offsets) =
+            super::max_pool1d_forward_with_indices_f64(&input, batch, ch, len, 2, output_len, 2);
+        let upstream = -0.375;
+        let dense = vec![upstream; batch * ch * output_len];
+        let expected = super::max_pool1d_backward_from_indices_f64(
+            &dense,
+            &arg_offsets,
+            batch,
+            ch,
+            len,
+            output_len,
+        );
+        let got = super::max_pool1d_backward_from_indices_scalar_f64(
+            upstream,
+            &arg_offsets,
+            batch,
+            ch,
+            len,
+            output_len,
+        );
+        assert_eq!(
+            got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
         );
     }
 

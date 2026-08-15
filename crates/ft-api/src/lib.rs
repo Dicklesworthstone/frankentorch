@@ -62,7 +62,7 @@ use ft_dispatch::{
     dispatch_tensor_unary_contiguous_f32, dispatch_tensor_unary_contiguous_f64,
 };
 use ft_runtime::{EvidenceEntry, EvidenceKind, RuntimeContext};
-use wide::f64x4;
+use wide::{f32x8, f64x4};
 
 const INPLACE_FLOAT_REASON: &str = "in-place mutation only supported for float32/float64 tensors";
 
@@ -395,6 +395,20 @@ struct AvgPool1dSumShortcut {
     stride: usize,
 }
 
+/// Registered on the f64 grad-path output of `functional_max_pool1d` so that
+/// the ordinary following `tensor_sum` can consume its saved first-argmax
+/// sidecar without materialising a dense all-ones output gradient.
+#[derive(Clone)]
+struct MaxPool1dSumShortcut {
+    input: TensorNodeId,
+    batch: usize,
+    channels: usize,
+    length: usize,
+    output_len: usize,
+    sum: f64,
+    arg_offsets: Vec<f64>,
+}
+
 /// Registered on the f64 grad-path output of `functional_max_pool3d` so that a
 /// following `tensor_sum` can avoid materialising its dense output-gradient
 /// buffer. The pooled activation remains observable until the reduction, so the
@@ -446,6 +460,7 @@ pub struct FrankenTorchSession {
     batch_norm2d_f32_sum_shortcuts: BTreeMap<usize, BatchNorm2dF32SumShortcut>,
     group_norm_f32_sum_shortcuts: BTreeMap<usize, GroupNormF32SumShortcut>,
     avg_pool1d_sum_shortcuts: BTreeMap<usize, AvgPool1dSumShortcut>,
+    max_pool1d_sum_shortcuts: BTreeMap<usize, MaxPool1dSumShortcut>,
     max_pool3d_sum_shortcuts: BTreeMap<usize, MaxPool3dSumShortcut>,
 }
 
@@ -483,6 +498,10 @@ impl std::fmt::Debug for FrankenTorchSession {
             .field(
                 "avg_pool1d_sum_shortcuts",
                 &self.avg_pool1d_sum_shortcuts.len(),
+            )
+            .field(
+                "max_pool1d_sum_shortcuts",
+                &self.max_pool1d_sum_shortcuts.len(),
             )
             .finish()
     }
@@ -602,6 +621,7 @@ impl FrankenTorchSession {
             batch_norm2d_f32_sum_shortcuts: BTreeMap::new(),
             group_norm_f32_sum_shortcuts: BTreeMap::new(),
             avg_pool1d_sum_shortcuts: BTreeMap::new(),
+            max_pool1d_sum_shortcuts: BTreeMap::new(),
             max_pool3d_sum_shortcuts: BTreeMap::new(),
         }
     }
@@ -654,6 +674,8 @@ impl FrankenTorchSession {
             .retain(|&node_id, _| node_id < boundary);
         self.avg_pool1d_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
+        self.max_pool1d_sum_shortcuts
+            .retain(|&node_id, _| node_id < boundary);
         self.max_pool3d_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
     }
@@ -667,6 +689,7 @@ impl FrankenTorchSession {
         self.batch_norm2d_f32_sum_shortcuts.clear();
         self.group_norm_f32_sum_shortcuts.clear();
         self.avg_pool1d_sum_shortcuts.clear();
+        self.max_pool1d_sum_shortcuts.clear();
         self.max_pool3d_sum_shortcuts.clear();
     }
 
@@ -13175,7 +13198,41 @@ impl FrankenTorchSession {
                             let mut squared_distance = 0.0_f32;
                             let left = &values[i_base..i_base + m];
                             let right = &values[j_base..j_base + m];
-                            for (&left_value, &right_value) in left.iter().zip(right) {
+                            let mut left_chunks = left.chunks_exact(8);
+                            let mut right_chunks = right.chunks_exact(8);
+                            for (left_chunk, right_chunk) in
+                                left_chunks.by_ref().zip(right_chunks.by_ref())
+                            {
+                                // Keep the reduction scalar and in ascending-k order so
+                                // the public f32 result stays bit-identical to the direct
+                                // reference. Only the independent subtract-and-square work
+                                // is packed into portable safe-Rust SIMD lanes.
+                                let differences = f32x8::new([
+                                    left_chunk[0],
+                                    left_chunk[1],
+                                    left_chunk[2],
+                                    left_chunk[3],
+                                    left_chunk[4],
+                                    left_chunk[5],
+                                    left_chunk[6],
+                                    left_chunk[7],
+                                ]) - f32x8::new([
+                                    right_chunk[0],
+                                    right_chunk[1],
+                                    right_chunk[2],
+                                    right_chunk[3],
+                                    right_chunk[4],
+                                    right_chunk[5],
+                                    right_chunk[6],
+                                    right_chunk[7],
+                                ]);
+                                for square in (differences * differences).to_array() {
+                                    squared_distance += square;
+                                }
+                            }
+                            for (&left_value, &right_value) in
+                                left_chunks.remainder().iter().zip(right_chunks.remainder())
+                            {
                                 let diff = left_value - right_value;
                                 squared_distance += diff * diff;
                             }
@@ -25233,6 +25290,9 @@ impl FrankenTorchSession {
         if let Some(out) = self.try_avg_pool1d_sum_shortcut(input)? {
             return Ok(out);
         }
+        if let Some(out) = self.try_max_pool1d_sum_shortcut(input)? {
+            return Ok(out);
+        }
         if let Some(out) = self.try_max_pool3d_sum_shortcut(input)? {
             return Ok(out);
         }
@@ -25436,6 +25496,59 @@ impl FrankenTorchSession {
             EvidenceKind::Dispatch,
             format!(
                 "tensor_reduction_op=AvgPool1dSumShortcut input={} source={} out={} kernel={kernel_size} stride={stride}",
+                input.0, source.0, out.0
+            ),
+        );
+        Ok(Some(out))
+    }
+
+    /// Reach the scalar-loss MaxPool1d backward from the ordinary
+    /// `tensor_sum(functional_max_pool1d(x))` spelling.
+    fn try_max_pool1d_sum_shortcut(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<Option<TensorNodeId>, AutogradError> {
+        if !self.max_pool1d_sum_shortcuts.contains_key(&input.0) {
+            return Ok(None);
+        }
+        if self.tensor_tape.tensor_retains_grad(input)?
+            || self.tensor_tape.tensor_has_hooks(input)?
+        {
+            return Ok(None);
+        }
+
+        let shortcut = self
+            .max_pool1d_sum_shortcuts
+            .remove(&input.0)
+            .ok_or_else(|| Self::incompatible_tensor_args("max_pool1d scalar shortcut vanished"))?;
+        let MaxPool1dSumShortcut {
+            input: source,
+            batch,
+            channels,
+            length,
+            output_len,
+            sum,
+            arg_offsets,
+        } = shortcut;
+        let out = self.tensor_apply_function_f64_saved_forward(
+            &[source],
+            move |ctx| {
+                ctx.save_for_backward(arg_offsets, vec![batch, channels, output_len]);
+                Ok((vec![sum], vec![1]))
+            },
+            move |ctx, grad_outputs| {
+                let upstream = grad_outputs[0][0];
+                let saved = ctx.saved_tensors();
+                let grad = ft_kernel_cpu::max_pool1d_backward_from_indices_scalar_f64(
+                    upstream, &saved[0], batch, channels, length, output_len,
+                );
+                Ok(vec![Some(grad)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "tensor_reduction_op=MaxPool1dSumShortcut input={} source={} out={}",
                 input.0, source.0, out.0
             ),
         );
@@ -32930,7 +33043,9 @@ impl FrankenTorchSession {
             // needs ONLY ctx + the output gradient (never the input), so the generic
             // apply_function input clone is pure waste on this loss lane (kgs4.126).
             // Bit-exact: the kernel sees identical contiguous values. frankentorch-0w3ns.
-            return self.tensor_apply_function_f64_borrowed_forward(
+            let shortcut_sidecar = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let shortcut_sidecar_for_forward = std::rc::Rc::clone(&shortcut_sidecar);
+            let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
                 move |ctx, ins| {
                     let (iv, _) = ins[0];
@@ -32943,6 +33058,7 @@ impl FrankenTorchSession {
                         output_len,
                         stride,
                     );
+                    *shortcut_sidecar_for_forward.borrow_mut() = Some(arg_offsets.clone());
                     ctx.save_for_backward(arg_offsets, vec![n, ch, output_len]);
                     Ok((out, vec![n, ch, output_len]))
                 },
@@ -32954,7 +33070,30 @@ impl FrankenTorchSession {
                     );
                     Ok(vec![Some(din)])
                 },
+            )?;
+            let arg_offsets = shortcut_sidecar.borrow_mut().take().ok_or_else(|| {
+                Self::incompatible_tensor_args("max_pool1d forward did not save scalar sidecar")
+            })?;
+            let sum = {
+                let tensor = self.tensor_tape.tensor(pooled)?;
+                ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
+                    .map_err(|error| {
+                        AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
+                    })?
+            };
+            self.max_pool1d_sum_shortcuts.insert(
+                pooled.0,
+                MaxPool1dSumShortcut {
+                    input,
+                    batch: n,
+                    channels: ch,
+                    length: l,
+                    output_len,
+                    sum,
+                    arg_offsets,
+                },
             );
+            return Ok(pooled);
         }
 
         // max_pool1d [N,C,L] is max_pool2d [N,C,1,L] (height-1 window). Route through
@@ -55425,6 +55564,7 @@ impl FrankenTorchSession {
         self.batch_norm2d_f32_sum_shortcuts.remove(&target.0);
         self.group_norm_f32_sum_shortcuts.remove(&target.0);
         self.avg_pool1d_sum_shortcuts.remove(&target.0);
+        self.max_pool1d_sum_shortcuts.remove(&target.0);
         self.max_pool3d_sum_shortcuts.remove(&target.0);
         let mut summary = format!("tensor_inplace_op={op} target={}", target.0);
         if let Some(extra) = extra {
@@ -56631,6 +56771,7 @@ impl FrankenTorchSession {
         self.batch_norm2d_f32_sum_shortcuts.remove(&node.0);
         self.group_norm_f32_sum_shortcuts.remove(&node.0);
         self.avg_pool1d_sum_shortcuts.remove(&node.0);
+        self.max_pool1d_sum_shortcuts.remove(&node.0);
         self.max_pool3d_sum_shortcuts.remove(&node.0);
         self.tensor_tape.detach_tensor_in_place(node)
     }
@@ -127747,32 +127888,37 @@ mod tests {
         // This is the original scorecard lane. It spans 64 Rayon chunks, so it
         // proves the row-slice loop retains the condensed pair order at the
         // exact shape that motivated the optimization.
-        let (n, m) = (512usize, 64usize);
-        let input: Vec<f32> = (0..n * m)
-            .map(|idx| ((idx * 37 % 211) as f32 - 105.0) * 0.0078125)
-            .collect();
-        let mut expected = Vec::with_capacity(n * (n - 1) / 2);
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let mut squared_distance = 0.0_f32;
-                for k in 0..m {
-                    let difference = input[i * m + k] - input[j * m + k];
-                    squared_distance += difference * difference;
+        for (n, m) in [(512usize, 64usize), (33, 13)] {
+            let input: Vec<f32> = (0..n * m)
+                .map(|idx| ((idx * 37 % 211) as f32 - 105.0) * 0.0078125)
+                .collect();
+            let mut expected = Vec::with_capacity(n * (n - 1) / 2);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let mut squared_distance = 0.0_f32;
+                    for k in 0..m {
+                        let difference = input[i * m + k] - input[j * m + k];
+                        squared_distance += difference * difference;
+                    }
+                    expected.push(squared_distance.sqrt());
                 }
-                expected.push(squared_distance.sqrt());
             }
-        }
 
-        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tensor = session
-            .tensor_variable_f32(input, vec![n, m], false)
-            .unwrap();
-        let output = session.tensor_pdist(tensor, 2.0).unwrap();
-        assert_eq!(session.tensor_dtype(output).unwrap(), DType::F32);
-        let actual = session.tensor_values_f32(output).unwrap();
-        assert_eq!(actual.len(), expected.len());
-        for (idx, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(), "pdist f32 p=2 @{idx}");
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let tensor = session
+                .tensor_variable_f32(input, vec![n, m], false)
+                .unwrap();
+            let output = session.tensor_pdist(tensor, 2.0).unwrap();
+            assert_eq!(session.tensor_dtype(output).unwrap(), DType::F32);
+            let actual = session.tensor_values_f32(output).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (idx, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "n={n} m={m} pdist f32 p=2 @{idx}"
+                );
+            }
         }
     }
 
@@ -140871,6 +141017,57 @@ mod tests {
                 got.to_bits(),
                 want.to_bits(),
                 "avg_pool1d sum shortcut input grad[{index}]"
+            );
+        }
+    }
+
+    #[test]
+    fn max_pool1d_sum_shortcut_matches_unfused_compose_bits() {
+        let values: Vec<f64> = (0..2 * 3 * 18)
+            .map(|index| ((index * 41 + 19) % 181) as f64 * 0.015625 - 1.25)
+            .collect();
+
+        let mut unfused = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_unfused = unfused
+            .tensor_variable(values.clone(), vec![2, 3, 18], true)
+            .unwrap();
+        let pooled_unfused = unfused.functional_max_pool1d(x_unfused, 2, 2).unwrap();
+        unfused.tensor_retain_grad(pooled_unfused).unwrap();
+        let loss_unfused = unfused.tensor_sum(pooled_unfused).unwrap();
+        let out_unfused = unfused.tensor_values(loss_unfused).unwrap();
+        let report_unfused = unfused.tensor_backward(loss_unfused).unwrap();
+        let grad_unfused = unfused
+            .tensor_gradient(&report_unfused, x_unfused)
+            .expect("unfused input grad");
+
+        let mut shortcut = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_shortcut = shortcut
+            .tensor_variable(values, vec![2, 3, 18], true)
+            .unwrap();
+        let pooled_shortcut = shortcut.functional_max_pool1d(x_shortcut, 2, 2).unwrap();
+        assert!(
+            shortcut
+                .max_pool1d_sum_shortcuts
+                .contains_key(&pooled_shortcut.0)
+        );
+        let loss_shortcut = shortcut.tensor_sum(pooled_shortcut).unwrap();
+        assert!(
+            !shortcut
+                .max_pool1d_sum_shortcuts
+                .contains_key(&pooled_shortcut.0)
+        );
+        let out_shortcut = shortcut.tensor_values(loss_shortcut).unwrap();
+        let report_shortcut = shortcut.tensor_backward(loss_shortcut).unwrap();
+        let grad_shortcut = shortcut
+            .tensor_gradient(&report_shortcut, x_shortcut)
+            .expect("shortcut input grad");
+
+        assert_eq!(out_shortcut[0].to_bits(), out_unfused[0].to_bits());
+        for (index, (&got, &want)) in grad_shortcut.iter().zip(grad_unfused.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "max_pool1d sum shortcut input grad[{index}]"
             );
         }
     }
