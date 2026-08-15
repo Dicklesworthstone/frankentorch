@@ -9593,22 +9593,32 @@ fn avg_pool2d_backward_scalar_2x2s2_f64(
     oh: usize,
     ow: usize,
 ) -> Vec<f64> {
-    let mut dp = vec![0.0f64; batch * ch * ih * iw];
-    dp.par_chunks_mut(ih * iw).for_each(|drow| {
-        let g = upstream / 4.0;
-        for oy in 0..oh {
-            let row0 = (oy * 2) * iw;
-            let row1 = row0 + iw;
-            for ox in 0..ow {
-                let col0 = ox * 2;
-                drow[row0 + col0] += g;
-                drow[row0 + col0 + 1] += g;
-                drow[row1 + col0] += g;
-                drow[row1 + col0 + 1] += g;
+    let numel = batch * ch * ih * iw;
+    let fill = |dp: &mut [f64]| {
+        dp.par_chunks_mut(ih * iw).for_each(|drow| {
+            let g = upstream / 4.0;
+            for oy in 0..oh {
+                let row0 = (oy * 2) * iw;
+                let row1 = row0 + iw;
+                for ox in 0..ow {
+                    let col0 = ox * 2;
+                    // Preserve the generic accumulator's +0.0 result for a
+                    // negative-zero upstream while filling every tiled element.
+                    drow[row0 + col0] = 0.0 + g;
+                    drow[row0 + col0 + 1] = 0.0 + g;
+                    drow[row1 + col0] = 0.0 + g;
+                    drow[row1 + col0 + 1] = 0.0 + g;
+                }
             }
+        });
+    };
+    match ft_core::buffer_pool::try_take_exact(numel) {
+        Some(mut pooled) => {
+            fill(&mut pooled);
+            pooled
         }
-    });
-    dp
+        None => build_uninit(numel, fill),
+    }
 }
 
 /// f32 mirror of [`avg_pool2d_backward_f64`]: distributes `dout/divisor` over each
@@ -39096,6 +39106,37 @@ mod tests {
                 plain_value.to_bits(),
                 "pooled avg_pool2d backward diverged at [{index}] — a stale element \
                  survived, so the fill does not cover the whole buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn avg_pool2d_scalar_2x2s2_backward_bits_survive_a_dirty_pooled_buffer() {
+        // The h2h avg_pool2d lane uses the scalar-loss backward, so exercise its
+        // exact 2x2 path rather than relying on the dense-dout coverage above.
+        let (batch, ch, ih, iw) = (2usize, 32usize, 32usize, 32usize);
+        let (oh, ow) = (ih / 2, iw / 2);
+        let numel = batch * ch * ih * iw;
+        assert!(numel >= ft_core::buffer_pool::MIN_POOLED_LEN);
+
+        ft_core::buffer_pool::set_enabled(false);
+        let unpooled = super::avg_pool2d_backward_scalar_f64(
+            -1.25, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+        );
+
+        ft_core::buffer_pool::set_enabled(true);
+        ft_core::buffer_pool::recycle(vec![f64::NAN; numel]);
+        let pooled = super::avg_pool2d_backward_scalar_f64(
+            -1.25, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+        );
+
+        assert_eq!(pooled.len(), unpooled.len());
+        for (index, (pooled_value, plain_value)) in pooled.iter().zip(unpooled.iter()).enumerate() {
+            assert_eq!(
+                pooled_value.to_bits(),
+                plain_value.to_bits(),
+                "pooled scalar avg_pool2d backward diverged at [{index}] — a stale \\
+                 element survived, so the fill does not cover the whole buffer"
             );
         }
     }
