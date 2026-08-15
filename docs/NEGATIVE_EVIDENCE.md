@@ -19525,6 +19525,41 @@ Scope note: this refutes NaN-gradient parity only. The zero-boundary work above
 stands — `rrelu` was a real defect and is fixed, and torch is self-consistent at
 zero across every width.
 
+### Follow-on: torch's `mish` FORWARD is vector-width dependent too, by 1 ULP
+
+The NaN result raised the obvious question — if torch's *gradients* are
+width-dependent, are its *forwards*? Swept 25 elementwise ops at
+n = 1,2,3,4,7,8,15,16,31,32,64,257,1024 in both f64 and f32, comparing bit
+patterns of the same input values across widths. **24 of 25 are bit-identical at
+every width. `mish` is not**, in f64, and it flips at exactly the same n=8
+boundary:
+
+| | first element of `mish([0.7, …])`, f64 |
+|---|---|
+| n < 8 (scalar kernel) | `0x3fe1f4ed7145e1b3` = 0.561148377643851**84** |
+| n >= 8 (vectorised) | `0x3fe1f4ed7145e1b4` = 0.561148377643851**95** |
+
+One ULP — but the interesting part is *which* value is which: **the vectorised
+result is exactly the naive composition** `x * tanh(softplus(x))`, and torch's
+own **scalar** kernel is the one that differs from it.
+
+FrankenTorch computes `x * softplus_value(x).tanh()`, i.e. the composition. So
+**FT matches torch's `mish` at n >= 8 and is 1 ULP off at n < 8**, and no
+reordering fixes both — the same structural trap as the NaN case.
+
+Nothing is red today: the only `mish` check in the tree is the metamorphic
+`fuzz_metamorphic_mish_equals_x_times_tanh_softplus`, which compares FT against
+FT's own composition at 32-ULP tolerance and cannot see this. Recorded so that
+nobody later writes a **bit-exact `mish` golden against torch** without pinning
+the size class — such a golden would be green at the size it was captured and red
+at the other, and would look like a real regression.
+
+Generalisation worth carrying: **"bit-exact vs torch" is not a property of an op,
+it is a property of an op at a size class.** Any bit-exactness claim in this
+ledger that was measured at a single tensor length is scoped to that length until
+someone straddles the vector boundary. Cheap to check — the sweep is one Python
+loop over widths comparing `view(torch.int64)` bit patterns.
+
 **11. TWO OF MY OWN HARNESSES DISAGREE ABOUT THE SAME LEVER, AND THE
 DISAGREEMENT IS THE RESULT (`frankentorch-dmpho`, 2026-08-15).** Recorded under
 the fleet rule adopted after frankenlibc measured malloc/free on ONE worker
@@ -19635,3 +19670,47 @@ so the ratio is estimator-matched even though the absolute FrankenTorch
 milliseconds are not comparable to a min-based kernel figure. The GroupNorm f32
 standing in this same invocation is 8.42x (session) and 8.41x (kernels-only),
 parity `match`, PT null PASS on the kernels row.
+
+**13. LANDED BUT NOT CERTIFIED — forward-statistics reuse in the f32 GroupNorm
+sum-loss backward (`frankentorch-qkwsy`, 2026-08-15).** Recorded here rather than
+quoted as a win, because the paired lane could not resolve it on this host.
+
+Lever: the backward rebuilt per-group `mean`/`rstd`/`sum0`/`sum1` that the forward
+had computed and discarded — two full passes over the 1.6 MiB input (one for the
+running sum and per-channel sums, one for the variance, which cannot start until
+the mean is known) on top of the pass its gradient write already makes. The
+forward now emits them and the backward consumes them, so 3 reads + 1 write
+becomes 1 read + 1 write. Bit-exact, and the isomorphism is checked rather than
+argued (see the commit and `..._stats_match_the_backward_recomputation`).
+
+Measured, `harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, paired
+`group_norm_f32_statskernels` vs `_recompute`, one binary, one invocation,
+`same_host=thinkstation1` (5975WX, x86_64+avx2, governor powersave, 64 rayon
+threads, torch threads 8, mimalloc), ELF `5c5647cc`, build worker `vmi1264463`:
+
+| rounds | ratio (off/on) | 95% CI | rounds faster | incumbent control | verdict |
+|---|---|---|---|---|---|
+| 24 | 1.080x | `[0.970, 1.248]` | 18/24 | 0.959 | UNDECIDED |
+| 48 | 1.087x | `[0.986, 1.213]` | 30/48 | 0.982 | UNDECIDED |
+
+**The point estimate is stable across two independent invocations and 62% of
+rounds favour the lever, but the CI brackets 1.0 at both round counts, so this is
+NOT a win and is not banked as one.** Doubling the rounds moved the lower bound
+from 0.970 to 0.986 and no further; the effect is simply near this host's
+resolution. Expected size is consistent with that: the backward is ~0.47 ms of a
+~1.4 ms lane and the lever removes roughly half its traffic, i.e. ~1.15x at best,
+against a lane whose own estimator inflates by 1.33-1.51x depending on load
+(item 12).
+
+**Why it landed anyway, stated so the next person can disagree with the
+reasoning rather than guess at it:** the removed work is provable from the code
+path, not inferred from a timing — two passes over the input that no longer
+happen — and the change is bit-exact with the cache validated by the input's
+version counter. What is unproven is the SIZE of the benefit on this host, not
+its existence or its safety. A future measurement on a quiet machine, or on a
+shape with a larger `spatial`, should either certify it or demote it.
+
+Also reconfirmed in the same run, third independent load point: the
+`frankentorch-dmpho` parallel-forward sentinel reads 0.182 ms parallel vs
+0.638 ms serial (3.5x), and the item-12 estimator ratio reads 1.330x here against
+1.512x earlier — the same lane, the same binary, a different load.
