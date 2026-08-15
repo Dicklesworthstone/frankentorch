@@ -151,7 +151,7 @@ fn balanced_null_is_centered(point: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_null_is_centered, median, paired_slot_median};
+    use super::{balanced_null_is_centered, median, paired_slot_median, timed_conv3d};
 
     #[test]
     fn balanced_square_overall_median_matches_python_statistics_median() {
@@ -171,6 +171,17 @@ mod tests {
         assert!(balanced_null_is_centered(1.019));
         assert!(!balanced_null_is_centered(1.021));
         assert!(!balanced_null_is_centered(f64::NAN));
+    }
+
+    #[test]
+    fn timed_conv3d_builds_weight_before_the_timed_forward_backward_region() {
+        // A 1x1x1 convolution gives a timing-independent contract:
+        // sum(2*x).backward() has dx = 2. This exercises the helper that keeps
+        // the weight leaf out of the FrankenTorch-only timed arm.
+        let (milliseconds, checksum) =
+            timed_conv3d(&[1.5], vec![1, 1, 1, 1, 1], &[2.0], vec![1, 1, 1, 1, 1]);
+        assert!(milliseconds.is_finite() && milliseconds >= 0.0);
+        assert_eq!(checksum.to_bits(), 2.0_f64.to_bits());
     }
 }
 
@@ -230,6 +241,37 @@ where
     // lane's session) that the incumbent's timer never paid. Timing it on one arm
     // only biased every repetition in the same direction, which repetition cannot
     // average out.
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    (elapsed, checksum)
+}
+
+/// Time Conv3d with both tensor leaves built before the declared timed region.
+///
+/// The PyTorch arm constructs `c3w` during setup and reuses it for every sample.
+/// Creating the matching Frankentorch weight after `Instant::now()` would charge
+/// tensor/tape construction to only one arm, so keep it beside the input leaf.
+fn timed_conv3d(
+    values: &[f64],
+    input_shape: Vec<usize>,
+    weights: &[f64],
+    weight_shape: Vec<usize>,
+) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), input_shape, true)
+        .expect("conv3d leaf");
+    let weight = session
+        .tensor_variable(weights.to_vec(), weight_shape, false)
+        .expect("conv3d weight");
+    // Both leaves now exist, matching the PyTorch arm. The timer remains exactly
+    // forward + loss_sum + backward, as declared to the co-process.
+    let started = Instant::now();
+    let out = session
+        .functional_conv3d(x, weight, None, (1, 1, 1), (1, 1, 1))
+        .expect("conv3d");
+    let loss = session.tensor_sum(out).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
     (elapsed, checksum)
@@ -490,13 +532,12 @@ LANES = {
         (
             "conv3d",
             Box::new(|| {
-                timed_op(&c3x, vec![C3_N, C3_CI, C3_D, C3_H, C3_W], |s, x| {
-                    let w = s
-                        .tensor_variable(c3w.clone(), vec![C3_CO, C3_CI, C3_K, C3_K, C3_K], false)
-                        .expect("weight");
-                    s.functional_conv3d(x, w, None, (1, 1, 1), (1, 1, 1))
-                        .expect("conv3d")
-                })
+                timed_conv3d(
+                    &c3x,
+                    vec![C3_N, C3_CI, C3_D, C3_H, C3_W],
+                    &c3w,
+                    vec![C3_CO, C3_CI, C3_K, C3_K, C3_K],
+                )
             }),
         ),
     ];
