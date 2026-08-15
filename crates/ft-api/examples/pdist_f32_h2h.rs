@@ -39,7 +39,7 @@ fn reps() -> usize {
 
 fn seq(n: usize) -> Vec<f32> {
     (0..n)
-        .map(|i| (((i % 251) as f64 * 0.001 - 0.12) as f32))
+        .map(|i| ((i % 251) as f64 * 0.001 - 0.12) as f32)
         .collect()
 }
 
