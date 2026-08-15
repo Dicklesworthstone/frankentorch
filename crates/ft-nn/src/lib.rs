@@ -35762,7 +35762,10 @@ mod tests {
             .unwrap()
             .to_vec();
 
-        for batch in 0..BATCH {
+        // .take(BATCH) keeps the original 0..BATCH bound rather than silently widening
+        // to batched_values.len(); `batch` is still needed as an index for the
+        // batched_grad offsets below. frankentorch-0aj9z.
+        for (batch, batched_value) in batched_values.iter().enumerate().take(BATCH) {
             let mut single_log_probs_data = Vec::with_capacity(TIME * CLASSES);
             for time in 0..TIME {
                 let offset = (time * BATCH + batch) * CLASSES;
@@ -35802,7 +35805,7 @@ mod tests {
                 .tensor_gradient(&single_report, single_log_probs)
                 .unwrap()
                 .to_vec();
-            assert_eq!(batched_values[batch].to_bits(), single_value.to_bits());
+            assert_eq!(batched_value.to_bits(), single_value.to_bits());
             for time in 0..TIME {
                 for class in 0..CLASSES {
                     let batched_offset = (time * BATCH + batch) * CLASSES + class;
