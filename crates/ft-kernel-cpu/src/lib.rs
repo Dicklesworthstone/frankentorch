@@ -9540,6 +9540,42 @@ pub fn max_pool3d_backward_from_indices_scalar_f64(
     din
 }
 
+/// Scalar-loss backward for non-overlapping max-pool3d windows.
+///
+/// The caller proves that every saved first-argmax offset occurs at most once
+/// per plane. The gradient buffer is still zeroed because most input positions
+/// are untouched, but each selected slot can be stored instead of read,
+/// modified, and written. `0.0 + upstream` intentionally preserves the
+/// observable signed-zero and NaN result of the accumulating route.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_backward_from_indices_scalar_nonoverlapping_f64(
+    upstream: f64,
+    arg_offsets: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f64> {
+    let plane_len = id * ih * iw;
+    let out_plane_len = od * oh * ow;
+    let stored_upstream = 0.0_f64 + upstream;
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * plane_len);
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let dbase = plane * out_plane_len;
+            for &arg_offset in &arg_offsets[dbase..dbase + out_plane_len] {
+                drow[arg_offset as usize] = stored_upstream;
+            }
+        });
+    din
+}
+
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn max_pool3d_backward_f64(
@@ -40421,6 +40457,94 @@ mod tests {
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "scalar serial driver must be bit-identical to the parallel one"
+        );
+
+        let direct = super::max_pool3d_backward_from_indices_scalar_nonoverlapping_f64(
+            upstream,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "non-overlapping direct store must preserve signed-zero accumulation"
+        );
+
+        let nan_expected = super::max_pool3d_backward_from_indices_scalar_f64(
+            f64::NAN,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        let nan_direct = super::max_pool3d_backward_from_indices_scalar_nonoverlapping_f64(
+            f64::NAN,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            nan_direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            nan_expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "non-overlapping direct store must preserve NaN accumulation"
+        );
+    }
+
+    #[test]
+    fn max_pool3d_scalar_nonoverlapping_scorecard_geometry_matches_accumulating_bits() {
+        let (batch, ch, id, ih, iw) = (2usize, 32usize, 16usize, 32usize, 32usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let input: Vec<f64> = (0..batch * ch * id * ih * iw)
+            .map(|i| ((i * 29 % 127) as f64) * 0.0625 - 3.0)
+            .collect();
+        let (_, arg_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        let expected = super::max_pool3d_backward_from_indices_scalar_f64(
+            1.25,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        let direct = super::max_pool3d_backward_from_indices_scalar_nonoverlapping_f64(
+            1.25,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         );
     }
 

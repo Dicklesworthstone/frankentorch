@@ -25893,10 +25893,19 @@ impl FrankenTorchSession {
             move |ctx, grad_outputs| {
                 let upstream = grad_outputs[0][0];
                 let saved = ctx.saved_tensors();
-                let grad = ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_f64(
-                    upstream, &saved[0], batch, channels, input_d, input_h, input_w, output_d,
-                    output_h, output_w,
-                );
+                let non_overlapping =
+                    kernel_d == stride_d && kernel_h == stride_h && kernel_w == stride_w;
+                let grad = if non_overlapping {
+                    ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_nonoverlapping_f64(
+                        upstream, &saved[0], batch, channels, input_d, input_h, input_w, output_d,
+                        output_h, output_w,
+                    )
+                } else {
+                    ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_f64(
+                        upstream, &saved[0], batch, channels, input_d, input_h, input_w, output_d,
+                        output_h, output_w,
+                    )
+                };
                 Ok(vec![Some(grad)])
             },
         )?;
@@ -34700,6 +34709,7 @@ impl FrankenTorchSession {
         let (kd_, kh_, kw_) = (kernel_d, kernel_h, kernel_w);
         let (od_, oh_, ow_) = (output_d, output_h, output_w);
         let (sd_, sh_, sw_) = (stride_d, stride_h, stride_w);
+        let non_overlapping = kernel_d == stride_d && kernel_h == stride_h && kernel_w == stride_w;
         self.tensor_apply_function_f64_borrowed_forward(
             &[input],
             move |ctx, ins| {
@@ -34713,9 +34723,15 @@ impl FrankenTorchSession {
             move |ctx, grad_outputs| {
                 let upstream = grad_outputs[0][0];
                 let saved = ctx.saved_tensors();
-                let di = ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_f64(
-                    upstream, &saved[0], b_, ch_, id_, ih_, iw_, od_, oh_, ow_,
-                );
+                let di = if non_overlapping {
+                    ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_nonoverlapping_f64(
+                        upstream, &saved[0], b_, ch_, id_, ih_, iw_, od_, oh_, ow_,
+                    )
+                } else {
+                    ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_f64(
+                        upstream, &saved[0], b_, ch_, id_, ih_, iw_, od_, oh_, ow_,
+                    )
+                };
                 Ok(vec![Some(di)])
             },
         )
