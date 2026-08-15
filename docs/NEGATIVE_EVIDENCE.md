@@ -19295,3 +19295,78 @@ materialisation every time; every rejected lever tried to make the write cheaper
 and the one that paid removed the fault instead.**
 
 **9. UNDECIDABLE LIVE ROW (`2026-08-14`).** Same-invocation, interleaved PyTorch 2.12.1+cpu with in-process ELF `1b803535bed2ac3e0cd699646a11861dd10101f961cbd92824cf45c3bce0065c`: `max_pool3d` read FT 3.886 ms vs PT 0.759 ms = **5.12x slower**, parity `match`, but A/A was **WIDE** `[0.578,1.441]`; the pool ON/OFF pair was also unreadable because its identical-PyTorch control was `0.759`. This row is recorded, not certified or differenceable.
+
+**10. REFUTED BEFORE IT SHIPPED — "the f64 grad-space conversions are why the f32
+GroupNorm lane is 10x" (`frankentorch-dmpho`, 2026-08-15).** The tape's gradient
+space is f64 even for an f32 op, so `try_group_norm_f32_sum_shortcut` widens `dx`
+with a serial `.iter().map(f64::from).collect()` over 401,408 elements — a 1.6 MiB
+read plus a serially first-touched 3.2 MiB write — and 112 such widening sites
+exist in `ft-api`. The hypothesis was that this engine-side conversion traffic was
+a large share of the lane's loss, and the lever was a parallel `build_uninit`
+widen (bit-exact by construction: f32 -> f64 is lossless, so there is no rounding
+to reorder).
+
+Measured first, on the route-matched split, live PyTorch 2.12.0+cpu arm in the
+same invocation, 16 rounds, parity `match` on every row. Host `thinkstation1`,
+AMD Ryzen Threadripper PRO 5975WX, 64 rayon threads, torch threads 8, governor
+**powersave**, mimalloc. TIMING RAN LOCALLY — the rch workers have no PyTorch, so
+both arms are same-host same-invocation by construction; only the BUILDS were
+remote (`vmi1293453` for run 1, `vmi1227854` for run 2), and `.cargo/config.toml`
+carries no `target-cpu`, so the two binaries share the baseline ISA.
+
+Two invocations, and they do NOT agree on the size of the engine term:
+
+| run | ELF | session lane | kernels-only lane | engine term |
+|-----|-----|--------------|-------------------|-------------|
+| 1 | not captured (binary since overwritten) | 4.797 ms | 4.875 ms | ~0 (kernel arm marginally SLOWER) |
+| 2 | `fa00c082` | 3.207 ms | 2.514 ms | ~0.69 ms, ~22% |
+
+**What survives both runs is the refutation, not a number.** The engine term is
+somewhere between zero and ~22% of the lane, so the tape, graph construction,
+gradient accumulation and both full-size dtype conversions TOGETHER are bounded
+well below the loss. The kernel breakdown taken in run 2 (min of 9, FrankenTorch
+internal attribution) puts `group_norm_backward_scalar_f32` alone at **1.819 ms**
+of a 2.619 ms kernel total — a single already-parallel kernel that is larger than
+the entire engine term at its most generous estimate. A perfect widening lever
+could therefore not have moved this lane meaningfully, and the lever was deleted
+unshipped rather than landed on a plausible mechanism.
+
+The first draft of this entry claimed the engine cost "approximately nothing" on
+the strength of run 1 alone, and cited an ELF digest that belonged to a STALE
+smoke-test binary rather than to either measured build. Both are corrected above.
+Recording the mistake because it is the item-6 failure mode reappearing: a
+one-invocation reading, stated more strongly than one invocation can support, on
+a host whose nulls were failing.
+
+Two transferable pieces:
+
+- **The route-matched split is what made this readable, and item 7f is why it had
+  to be rebuilt.** The previous split compared the session's shortcut route
+  against the raw lane's GENERAL route, with a 1.6 MiB all-ones `dy` allocated
+  inside the timed region; it reported 21.40x with both gates PASS and was
+  measuring a route difference. Both arms now enter
+  `group_norm_forward_f32` + `sum_tensor_contiguous_f32` +
+  `group_norm_backward_scalar_f32`, so their difference is the tape and nothing
+  else.
+- **A structural cost can be real and still not be the term.** The 112 serial
+  widening sites are exactly as described; they are simply not what this lane is
+  waiting on. Reading the code found a true mechanism and the wrong answer, which
+  is the same failure mode as items 5 and 7f, arrived at from a different
+  direction. Any future revival of the widening lever needs a lane where the
+  engine term is first shown to be nonzero.
+
+Caveat on the runs themselves: on this host (load 13-23, a dozen peer agents
+building) **most A/A nulls FAILED**, so no individual ratio above is quotable as a
+certified row, and the run-to-run spread on the same lane (4.797 vs 3.207 ms for
+the same session code) is itself the evidence for that. The finding does not rest
+on any single ratio: it rests on the kernels-only arm staying within ~22% of the
+full session arm in BOTH invocations, which bounds the engine term from above no
+matter which invocation is the trustworthy one.
+
+Worker-identity note (adopted 2026-08-15 after frankenscipy measured a **13.6x
+swing** for one cell across two rch workers with BOTH A/A nulls PASSING): a
+passing null controls within-invocation noise only and says nothing about
+between-worker differences. It does not invalidate the rows above — they were
+timed locally, both arms in one process — but any FUTURE row must name its
+worker, and no row may pair an arm measured on one worker with an arm measured on
+another.

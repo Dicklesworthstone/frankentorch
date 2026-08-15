@@ -191,16 +191,24 @@ rch exec -- cargo test --workspace
 # Run with output
 rch exec -- cargo test --workspace -- --nocapture
 
-# Run tests for a specific crate
-rch exec -- cargo test -p ft-core
-rch exec -- cargo test -p ft-dispatch
-rch exec -- cargo test -p ft-kernel-cpu
-rch exec -- cargo test -p ft-autograd
+# Run tests for a specific crate.
+#
+# NOTE: `-p` takes the PACKAGE name, and six packages were renamed for crates.io
+# (frankentorch-registry-safe-core-graph-818va). The Rust crate/import names are
+# unchanged — `ft_core`, `ft_api`, ... still work in `use` — because each renamed
+# package pins `[lib] name = "ft_*"`. Only the `-p` argument moved. Passing the old
+# name fails with `cannot specify features for packages outside of workspace` or
+# `a workspace member with a similar name exists`, which reads like a workspace
+# problem rather than a stale name.
+rch exec -- cargo test -p frankentorch-core        # was ft-core
+rch exec -- cargo test -p frankentorch-dispatch    # was ft-dispatch
+rch exec -- cargo test -p frankentorch-kernel-cpu  # was ft-kernel-cpu
+rch exec -- cargo test -p frankentorch-autograd    # was ft-autograd
+rch exec -- cargo test -p frankentorch-api         # was ft-api
+rch exec -- cargo test -p frankentorch-runtime     # was ft-runtime
 rch exec -- cargo test -p ft-device
 rch exec -- cargo test -p ft-serialize
-rch exec -- cargo test -p ft-api
 rch exec -- cargo test -p ft-conformance
-rch exec -- cargo test -p ft-runtime
 rch exec -- cargo test -p ft-nn
 rch exec -- cargo test -p ft-optim
 rch exec -- cargo test -p ft-data
