@@ -921,6 +921,9 @@ LANES = {
     }
 
     let mut ft_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    // frankentorch-rled4: the same rounds reduced by MIN instead of median.
+    let mut pt_round_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut ft_round_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut pt_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_second_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
@@ -955,6 +958,21 @@ LANES = {
                 .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));
             ft_first_half[index].push(paired_slot_median([ft_slots[0], ft_slots[1]]));
             ft_second_half[index].push(paired_slot_median([ft_slots[2], ft_slots[3]]));
+            // frankentorch-rled4: keep the per-round FLOOR beside the per-round
+            // median. Both are computed from the SAME four slots of the same
+            // round, so the two estimators see identical work and differ only in
+            // how they reduce it — which is the whole point, and the reason this
+            // is not a replacement. Measured on this lane: the median reading of
+            // a fixed workload moved 24% between invocations while the min moved
+            // 9%, because on a host carrying a dozen peer agents the median
+            // mostly measures the neighbours and the min measures the machine.
+            pt_round_min[index].push(
+                incumbent_slots
+                    .iter()
+                    .copied()
+                    .fold(f64::INFINITY, f64::min),
+            );
+            ft_round_min[index].push(ft_slots.iter().copied().fold(f64::INFINITY, f64::min));
             pt_times[index].push(median(incumbent_slots));
             ft_times[index].push(median(ft_slots));
         }
@@ -1128,6 +1146,60 @@ LANES = {
                 format!("the {lever} is SLOWER by the paired CI")
             } else {
                 "UNDECIDED — the paired CI brackets 1.0".to_string()
+            }
+        );
+
+        // frankentorch-rled4: the SAME comparison, same rounds, same pairing,
+        // reduced by the per-round FLOOR instead of the per-round median. Both
+        // arms use the same estimator — mixing a min from one arm with a median
+        // from the other is the error recorded as NEGATIVE_EVIDENCE item 12, and
+        // at 1.33-1.51x the estimator difference on this lane is larger than any
+        // lever measured so far.
+        //
+        // This does NOT replace the median row above, which stays comparable with
+        // everything already banked. It answers a different question: whether the
+        // lever is resolvable at all once the neighbours are taken out of the
+        // reading.
+        let (min_point, min_lo, min_hi) = median_ratio_ci(
+            &ft_round_min[index][..rounds],
+            &ft_round_min[base_index][..rounds],
+        );
+        let min_wins = (0..rounds)
+            .filter(|&k| ft_round_min[index][k] > ft_round_min[base_index][k])
+            .count();
+        let pt_control_min = {
+            let samples = pt_round_min[index]
+                .len()
+                .min(pt_round_min[base_index].len());
+            if samples == 0 {
+                f64::NAN
+            } else {
+                median(
+                    (0..samples)
+                        .map(|k| pt_round_min[index][k] / pt_round_min[base_index][k])
+                        .collect(),
+                )
+            }
+        };
+        let min_verdict = if !pt_control_min.is_finite() || (pt_control_min - 1.0).abs() >= 0.05 {
+            "UNREADABLE — the incumbent control moved".to_string()
+        } else if min_lo > 1.0 {
+            format!("the {lever} is FASTER by the paired CI")
+        } else if min_hi < 1.0 {
+            format!("the {lever} is SLOWER by the paired CI")
+        } else {
+            "UNDECIDED — the paired CI brackets 1.0".to_string()
+        };
+        println!(
+            "  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---\n  \
+             ratio (off/on) = {min_point:.3}x  95% CI [{min_lo:.3},{min_hi:.3}]  {min_wins}/{rounds} rounds faster\n  \
+             incumbent control = {pt_control_min:.3}\n  \
+             verdict: {min_verdict}\n  \
+             estimator agreement: {}",
+            if (point - 1.0).signum() == (min_point - 1.0).signum() {
+                "the two estimators agree on DIRECTION"
+            } else {
+                "WARNING — the two estimators DISAGREE on direction; this row is not usable under either"
             }
         );
     }
