@@ -16331,13 +16331,16 @@ impl CTCLoss {
                         continue;
                     }
 
-                    // Forward pass: alpha[t][s] = log P(emit prefix ending at state s at time t)
-                    let mut alpha = vec![vec![neg_inf; lattice_len]; input_len];
+                    // The forward result only consumes the final alpha row. Keep the
+                    // previous and current rows rather than allocating an O(T * S)
+                    // lattice for every batch element.
+                    let mut alpha = vec![neg_inf; lattice_len];
+                    let mut next_alpha = vec![neg_inf; lattice_len];
 
                     // t=0 initialization: can only be in state 0 (blank) or state 1 (first label)
-                    alpha[0][0] = lp_data[b * num_classes + labels[0]];
+                    alpha[0] = lp_data[b * num_classes + labels[0]];
                     if lattice_len > 1 {
-                        alpha[0][1] = lp_data[b * num_classes + labels[1]];
+                        alpha[1] = lp_data[b * num_classes + labels[1]];
                     }
 
                     // Forward recursion
@@ -16347,27 +16350,25 @@ impl CTCLoss {
                             let emit = lp_data[lp_offset + labels[s]];
 
                             // Can stay in same state
-                            let mut log_sum = alpha[t - 1][s];
+                            let mut log_sum = alpha[s];
 
                             // Can come from previous state
                             if s >= 1 {
-                                log_sum = log_sum_exp(log_sum, alpha[t - 1][s - 1]);
+                                log_sum = log_sum_exp(log_sum, alpha[s - 1]);
                             }
 
                             // Can skip a blank if current and two-back are different non-blank labels
                             if s >= 2 && labels[s] != blank && labels[s] != labels[s - 2] {
-                                log_sum = log_sum_exp(log_sum, alpha[t - 1][s - 2]);
+                                log_sum = log_sum_exp(log_sum, alpha[s - 2]);
                             }
 
-                            alpha[t][s] = log_sum + emit;
+                            next_alpha[s] = log_sum + emit;
                         }
+                        std::mem::swap(&mut alpha, &mut next_alpha);
                     }
 
                     // Total log probability
-                    let log_prob = log_sum_exp(
-                        alpha[input_len - 1][lattice_len - 1],
-                        alpha[input_len - 1][lattice_len - 2],
-                    );
+                    let log_prob = log_sum_exp(alpha[lattice_len - 1], alpha[lattice_len - 2]);
 
                     losses[b] = -log_prob;
                 }
@@ -35665,6 +35666,96 @@ mod tests {
         // Sample 0: alignments for 'a' with T=3: {a,b,b}, {a,b,a}, {b,a,b} etc
         // This gets complicated with uniform C=3, just check they're different since T differs
         assert!((loss_vals[0] - loss_vals[1]).abs() > 1e-6);
+    }
+
+    #[test]
+    fn ctc_loss_long_batch_matches_single_sample_bits() {
+        const TIME: usize = 12;
+        const BATCH: usize = 4;
+        const CLASSES: usize = 5;
+        const TARGET_LEN: usize = 3;
+
+        let mut log_probs_data = Vec::with_capacity(TIME * BATCH * CLASSES);
+        for time in 0..TIME {
+            for batch in 0..BATCH {
+                for class in 0..CLASSES {
+                    let probability = 0.1 + 0.01 * ((time + batch + class) % CLASSES) as f64;
+                    log_probs_data.push(probability.ln());
+                }
+            }
+        }
+        let targets_data = vec![
+            1.0, 2.0, 3.0, // batch 0
+            2.0, 3.0, 1.0, // batch 1
+            3.0, 1.0, 2.0, // batch 2
+            1.0, 3.0, 2.0, // batch 3
+        ];
+
+        let mut batched_session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let batched_log_probs = make_log_probs(
+            &mut batched_session,
+            log_probs_data.clone(),
+            TIME,
+            BATCH,
+            CLASSES,
+        );
+        let batched_targets = batched_session
+            .tensor_variable(targets_data.clone(), vec![BATCH, TARGET_LEN], false)
+            .unwrap();
+        let batched_input_lengths = batched_session
+            .tensor_variable(vec![TIME as f64; BATCH], vec![BATCH], false)
+            .unwrap();
+        let batched_target_lengths = batched_session
+            .tensor_variable(vec![TARGET_LEN as f64; BATCH], vec![BATCH], false)
+            .unwrap();
+        let batched_loss = CTCLoss::new()
+            .with_reduction(CTCReduction::None)
+            .forward_ctc(
+                &mut batched_session,
+                batched_log_probs,
+                batched_targets,
+                batched_input_lengths,
+                batched_target_lengths,
+            )
+            .unwrap();
+        let batched_values = batched_session.tensor_values(batched_loss).unwrap();
+
+        for batch in 0..BATCH {
+            let mut single_log_probs_data = Vec::with_capacity(TIME * CLASSES);
+            for time in 0..TIME {
+                let offset = (time * BATCH + batch) * CLASSES;
+                single_log_probs_data.extend_from_slice(&log_probs_data[offset..offset + CLASSES]);
+            }
+            let mut single_session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let single_log_probs =
+                make_log_probs(&mut single_session, single_log_probs_data, TIME, 1, CLASSES);
+            let target_offset = batch * TARGET_LEN;
+            let single_targets = single_session
+                .tensor_variable(
+                    targets_data[target_offset..target_offset + TARGET_LEN].to_vec(),
+                    vec![1, TARGET_LEN],
+                    false,
+                )
+                .unwrap();
+            let single_input_lengths = single_session
+                .tensor_variable(vec![TIME as f64], vec![1], false)
+                .unwrap();
+            let single_target_lengths = single_session
+                .tensor_variable(vec![TARGET_LEN as f64], vec![1], false)
+                .unwrap();
+            let single_loss = CTCLoss::new()
+                .with_reduction(CTCReduction::None)
+                .forward_ctc(
+                    &mut single_session,
+                    single_log_probs,
+                    single_targets,
+                    single_input_lengths,
+                    single_target_lengths,
+                )
+                .unwrap();
+            let single_value = single_session.tensor_values(single_loss).unwrap()[0];
+            assert_eq!(batched_values[batch].to_bits(), single_value.to_bits());
+        }
     }
 
     #[test]
