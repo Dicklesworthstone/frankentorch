@@ -359,3 +359,169 @@ fn the_comparison_actually_detects_a_difference() {
         "identical inputs must produce no findings"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Row-chunking, for the ops that element-chunking cannot reach (frankentorch-h37tn)
+// ---------------------------------------------------------------------------
+
+/// Rows in the whole-tensor arm. `ROWS * COLS` = 131_072, above the 65_536
+/// `SOFTMAX_PARALLEL_NUMEL_THRESHOLD`.
+const ROWS: usize = 256;
+/// Columns. Each single-row slice is `COLS` = 512 elements, far below every gate.
+///
+/// Deliberately modest: the difference between the two arms must be the NUMEL gate and
+/// nothing else. A very wide row could plausibly get its own per-row reduction
+/// parallelised, and then a legitimate re-association would be indistinguishable from a
+/// defect.
+const COLS: usize = 512;
+
+/// A reduction/normalisation applied along `dim = 1`, where every output element depends
+/// only on its own row.
+struct RowOp {
+    name: &'static str,
+    apply: fn(&mut FrankenTorchSession, TensorNodeId) -> TensorNodeId,
+}
+
+/// Only ops that are genuinely ROW-INDEPENDENT along dim=1. This list is a claim about
+/// each op, not a convenience: a reduction over dim=0 would NOT belong here, and putting
+/// one in would make the test assert something false.
+fn row_ops() -> Vec<RowOp> {
+    vec![
+        RowOp {
+            name: "softmax",
+            apply: |s, x| s.tensor_softmax(x, 1).unwrap(),
+        },
+        RowOp {
+            name: "log_softmax",
+            apply: |s, x| s.tensor_log_softmax(x, 1).unwrap(),
+        },
+        RowOp {
+            name: "sum_dim",
+            apply: |s, x| s.tensor_sum_dim(x, 1).unwrap(),
+        },
+        RowOp {
+            name: "mean_dim",
+            apply: |s, x| s.tensor_mean_dim(x, 1).unwrap(),
+        },
+        RowOp {
+            name: "cumsum",
+            apply: |s, x| s.tensor_cumsum(x, 1).unwrap(),
+        },
+    ]
+}
+
+/// `ROWS * COLS` values. Every row carries the boundary set in its first positions, so the
+/// boundaries are present in each independently-computed slice rather than only in row 0.
+fn row_payload() -> Vec<f64> {
+    let bounds = boundary_values();
+    let mut v = Vec::with_capacity(ROWS * COLS);
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            if c < bounds.len() {
+                v.push(bounds[c]);
+            } else {
+                // Varied per row so rows are not identical — an implementation that
+                // computed one row and broadcast it would still be caught.
+                let f = [0.25_f64, -0.75, 1.5, -2.25, 3.5, -0.125, 0.875];
+                v.push(f[(r + c) % f.len()]);
+            }
+        }
+    }
+    v
+}
+
+fn row_forward_whole(op: &RowOp, vals: &[f64]) -> Vec<f64> {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = s
+        .tensor_variable(vals.to_vec(), vec![ROWS, COLS], false)
+        .expect("leaf");
+    let out = (op.apply)(&mut s, x);
+    s.tensor_values(out).expect("values")
+}
+
+/// The same rows, each computed on its own as a `[1, COLS]` tensor — below every gate.
+fn row_forward_chunked(op: &RowOp, vals: &[f64]) -> Vec<f64> {
+    let mut acc = Vec::new();
+    for row in vals.chunks(COLS) {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(row.to_vec(), vec![1, COLS], false)
+            .expect("leaf");
+        let out = (op.apply)(&mut s, x);
+        acc.extend(s.tensor_values(out).expect("values"));
+    }
+    acc
+}
+
+fn row_grad_whole(op: &RowOp, vals: &[f64]) -> Vec<f64> {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = s
+        .tensor_variable(vals.to_vec(), vec![ROWS, COLS], true)
+        .expect("leaf");
+    let out = (op.apply)(&mut s, x);
+    let scaled = s.tensor_mul_scalar(out, 3.0).expect("scale");
+    let loss = s.tensor_sum(scaled).expect("sum");
+    let report = s.tensor_backward(loss).expect("backward");
+    s.tensor_gradient(&report, x).expect("grad").to_vec()
+}
+
+fn row_grad_chunked(op: &RowOp, vals: &[f64]) -> Vec<f64> {
+    let mut acc = Vec::new();
+    for row in vals.chunks(COLS) {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(row.to_vec(), vec![1, COLS], true)
+            .expect("leaf");
+        let out = (op.apply)(&mut s, x);
+        let scaled = s.tensor_mul_scalar(out, 3.0).expect("scale");
+        let loss = s.tensor_sum(scaled).expect("sum");
+        let report = s.tensor_backward(loss).expect("backward");
+        acc.extend(s.tensor_gradient(&report, x).expect("grad"));
+    }
+    acc
+}
+
+/// Row-independent ops must not depend on how many rows share the tensor.
+///
+/// Element-chunking (the tests above) cannot reach these: a softmax row is computed from
+/// the whole row, so splitting by element would change the answer. Splitting by ROW is the
+/// identity instead, one axis up, and it still straddles the 65_536 numel gate because the
+/// whole arm is 131_072 elements and each slice is 512.
+///
+/// A FULL reduction is deliberately absent. `tensor_sum` over everything associates its
+/// additions differently in a parallel tree than in a serial loop, so the two are EXPECTED
+/// to differ in the last bits; asserting bit-equality there would be wrong, not strict.
+#[test]
+fn row_independent_forward_is_identical_across_the_numel_gate() {
+    let vals = row_payload();
+    let mut failures = Vec::new();
+    for op in row_ops() {
+        let whole = row_forward_whole(&op, &vals);
+        let chunked = row_forward_chunked(&op, &vals);
+        failures.extend(diff_report(op.name, "row-fwd", &vals, &whole, &chunked));
+    }
+    assert!(
+        failures.is_empty(),
+        "row-independent kernels disagree with their own per-row path (frankentorch-h37tn).\n\
+         Splitting by row is the identity for these ops, so these are real defects:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// And the same for their gradients.
+#[test]
+fn row_independent_backward_is_identical_across_the_numel_gate() {
+    let vals = row_payload();
+    let mut failures = Vec::new();
+    for op in row_ops() {
+        let whole = row_grad_whole(&op, &vals);
+        let chunked = row_grad_chunked(&op, &vals);
+        failures.extend(diff_report(op.name, "row-bwd", &vals, &whole, &chunked));
+    }
+    assert!(
+        failures.is_empty(),
+        "row-independent BACKWARD kernels disagree with their own per-row path \
+         (frankentorch-h37tn):\n{}",
+        failures.join("\n")
+    );
+}
