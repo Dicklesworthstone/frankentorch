@@ -10262,6 +10262,28 @@ pub fn avg_pool1d_forward_f64(
     stride: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * output_len];
+    if kernel == 2 && stride == 2 {
+        let pair_plane = |plane: usize, orow: &mut [f64]| {
+            let ibase = plane * len;
+            let pairs = input[ibase..ibase + output_len * 2].chunks_exact(2);
+            for (slot, pair) in orow.iter_mut().zip(pairs) {
+                // Preserve the generic accumulator's leading positive-zero add:
+                // it determines the result bit for an all-negative-zero window.
+                let sum = 0.0_f64 + pair[0];
+                *slot = (sum + pair[1]) / 2.0;
+            }
+        };
+        if out.len() * 2 >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| pair_plane(plane, orow));
+        } else {
+            out.chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| pair_plane(plane, orow));
+        }
+        return out;
+    }
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * len;
         let div = kernel as f64;
@@ -41113,6 +41135,46 @@ mod tests {
         assert_eq!(
             direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             via_2d.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let pair_output_len = (len - 2) / 2 + 1;
+        let negative_zero_input = vec![-0.0_f64; n];
+        let negative_zero_direct = super::avg_pool1d_forward_f64(
+            &negative_zero_input,
+            batch,
+            ch,
+            len,
+            2,
+            pair_output_len,
+            2,
+        );
+        let negative_zero_via_2d = super::avg_pool2d_forward_f64(
+            &negative_zero_input,
+            batch,
+            ch,
+            1,
+            len,
+            1,
+            2,
+            1,
+            pair_output_len,
+            1,
+            2,
+            0,
+            0,
+            1,
+            len,
+            true,
+        );
+        assert_eq!(
+            negative_zero_direct
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            negative_zero_via_2d
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
         );
 
         let dout: Vec<f64> = (0..batch * ch * output_len)
