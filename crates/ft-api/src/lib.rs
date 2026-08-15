@@ -9289,6 +9289,25 @@ impl FrankenTorchSession {
             .apply_function_f64_borrowed_forward(inputs, forward_fn, backward_fn)
     }
 
+    /// Apply a f64 custom autograd function whose forward uses only saved
+    /// context while its backward remains attached to `inputs`.
+    pub fn tensor_apply_function_f64_saved_forward<F, B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(&mut FunctionCtx) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
+        B: Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.tensor_tape
+            .apply_function_f64_saved_forward(inputs, forward_fn, backward_fn)
+    }
+
     /// f32-output custom autograd op: inputs read as f32, forward returns an f32
     /// output (F32 leaf), backward receives the f64 incoming grad + f32 borrowed
     /// inputs and returns f64 input grads. Enables f32 conv/depthwise/linear grad
@@ -25469,9 +25488,9 @@ impl FrankenTorchSession {
             sum,
             arg_offsets,
         } = shortcut;
-        let out = self.tensor_apply_function_f64_borrowed_forward(
+        let out = self.tensor_apply_function_f64_saved_forward(
             &[source],
-            move |ctx, _ins| {
+            move |ctx| {
                 ctx.save_for_backward(
                     arg_offsets,
                     vec![batch, channels, output_d, output_h, output_w],
