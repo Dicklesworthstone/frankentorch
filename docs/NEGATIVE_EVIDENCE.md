@@ -19729,3 +19729,23 @@ Also reconfirmed in the same run, third independent load point: the
 `frankentorch-dmpho` parallel-forward sentinel reads 0.182 ms parallel vs
 0.638 ms serial (3.5x), and the item-12 estimator ratio reads 1.330x here against
 1.512x earlier — the same lane, the same binary, a different load.
+
+**13b. A FILTERED PIPELINE REPORTS THE FILTER'S EXIT CODE, AND AN EMPTY RESULT
+LOOKS EXACTLY LIKE A PASSING RUN (2026-08-15).** Companion to the exit-code traps
+already recorded for this repo. A workspace gate was run as
+
+```
+rch exec -- cargo test --release --workspace 2>&1 | grep -vE '...' | grep -E 'test result: ok|FAILED' | tail -30
+```
+
+and came back with **exit code 0 and no output at all**. Exit 0 was `tail`'s, not
+cargo's, and zero matched lines is indistinguishable from a green run whose lines
+simply did not match — the same shape as "green because nothing was scanned".
+Reading it as a pass would have landed a semantics change on the strength of a
+grep that found nothing.
+
+**The rule: capture the raw log to a file and check the COMMAND's exit code, then
+grep the file.** `cmd > log 2>&1; echo $?` then `grep -c 'test result: ok' log`.
+A gate whose evidence is a count of matched lines must also show that the count
+is nonzero, because zero is the value both a pass and a total failure produce
+after filtering.

@@ -378,6 +378,19 @@ struct GroupNormF32SumShortcut {
     channels_per_group: usize,
     spatial: usize,
     eps: f32,
+    /// Per-group statistics the forward already computed, kept so the sum-loss
+    /// backward can skip rebuilding them — two full passes over the input, on top
+    /// of the one its gradient write already makes (frankentorch-qkwsy). `None`
+    /// for any shape the forward does not emit them for (`cpg != 2`).
+    ///
+    /// This is a CACHE, and `input_version` is what validates it: the backward
+    /// re-reads the input leaf through the borrowed-inputs mechanism, so a cached
+    /// statistic computed from an older value of that leaf would silently mix two
+    /// generations of the same tensor. The consumer checks the version and falls
+    /// back to recomputing when it has moved.
+    stats: Option<std::sync::Arc<Vec<ft_kernel_cpu::GroupNormCpg2StatsF32>>>,
+    /// Version of the input leaf when `stats` were computed.
+    input_version: u64,
 }
 
 /// Registered on the f64 grad-path output of `tensor_prelu` so an immediately
@@ -26155,23 +26168,49 @@ impl FrankenTorchSession {
             channels_per_group,
             spatial,
             eps,
+            stats,
+            input_version,
         } = shortcut;
+        // The cached statistics are only usable if the leaf they were computed
+        // from has not moved since. The backward re-reads that leaf through the
+        // borrowed-inputs mechanism, so pairing an older statistic with a newer
+        // value would mix two generations of the same tensor and produce a
+        // gradient for neither. An in-place op bumps the version, so this check
+        // costs one comparison and fails safe into the recomputing path.
+        let stats = match stats {
+            Some(stats) if self.tensor_tape.tensor(source)?.version() == input_version => {
+                Some(stats)
+            }
+            _ => None,
+        };
         let out = self.tensor_apply_function_f32_output_borrowed_inputs(
             &[source, weight, bias],
             move |_ctx, _ins| Ok((vec![sum], vec![1])),
             move |_ctx, grad_outputs, borrowed| {
                 #[allow(clippy::cast_possible_truncation)]
                 let upstream = grad_outputs[0][0] as f32;
-                let (dx, dw, db) = ft_kernel_cpu::group_norm_backward_scalar_f32(
-                    upstream,
-                    borrowed[0].0,
-                    Some(borrowed[1].0),
-                    batch_size,
-                    num_groups,
-                    channels_per_group,
-                    spatial,
-                    eps,
-                );
+                let (dx, dw, db) = match stats.as_deref() {
+                    // frankentorch-qkwsy: the forward already computed these.
+                    Some(stats) => ft_kernel_cpu::group_norm_backward_scalar_f32_with_cpg2_stats(
+                        upstream,
+                        borrowed[0].0,
+                        Some(borrowed[1].0),
+                        stats,
+                        batch_size,
+                        num_groups,
+                        spatial,
+                    ),
+                    None => ft_kernel_cpu::group_norm_backward_scalar_f32(
+                        upstream,
+                        borrowed[0].0,
+                        Some(borrowed[1].0),
+                        batch_size,
+                        num_groups,
+                        channels_per_group,
+                        spatial,
+                        eps,
+                    ),
+                };
                 Ok(vec![
                     Some(dx.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()),
                     Some(
@@ -38241,6 +38280,17 @@ impl FrankenTorchSession {
                 let ishape_cg = input_shape.clone();
                 let wshape_cg = vec![channels];
                 let (mode, eps_c) = (self.mode(), eps);
+                // frankentorch-qkwsy: for `cpg == 2` the forward also emits the
+                // per-group statistics, which the sum-loss backward would
+                // otherwise rebuild with two more full passes over the input. The
+                // forward closure runs inside `apply_function_*`, so the values
+                // are handed back out through this cell and parked on the
+                // shortcut below. Nothing reads the cell until the closure has
+                // run, because `apply_function_*` runs the forward eagerly.
+                let emitted_stats: std::rc::Rc<
+                    std::cell::RefCell<Option<Vec<ft_kernel_cpu::GroupNormCpg2StatsF32>>>,
+                > = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let stats_sink = std::rc::Rc::clone(&emitted_stats);
                 let out = self
                     .tensor_tape
                     .apply_function_f32_output_with_create_graph_borrowed_inputs(
@@ -38249,16 +38299,31 @@ impl FrankenTorchSession {
                             let (xv, _) = ins[0];
                             let (wv, _) = ins[1];
                             let (bv, _) = ins[2];
-                            let out = ft_kernel_cpu::group_norm_forward_f32(
-                                xv,
-                                Some(wv),
-                                Some(bv),
-                                bsz,
-                                ng,
-                                cpg,
-                                sp,
-                                eps_f,
-                            );
+                            let out = if cpg == 2 {
+                                let (out, stats) =
+                                    ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
+                                        xv,
+                                        Some(wv),
+                                        Some(bv),
+                                        bsz,
+                                        ng,
+                                        sp,
+                                        eps_f,
+                                    );
+                                *stats_sink.borrow_mut() = Some(stats);
+                                out
+                            } else {
+                                ft_kernel_cpu::group_norm_forward_f32(
+                                    xv,
+                                    Some(wv),
+                                    Some(bv),
+                                    bsz,
+                                    ng,
+                                    cpg,
+                                    sp,
+                                    eps_f,
+                                )
+                            };
                             Ok((out, ishape.clone()))
                         },
                         move |_ctx, grad_outputs, borrowed| {
@@ -38300,8 +38365,20 @@ impl FrankenTorchSession {
                             )
                         },
                     )?;
+                let stats = emitted_stats.borrow_mut().take().map(std::sync::Arc::new);
+                let input_version = self.tensor_tape.tensor(input)?.version();
                 self.register_group_norm_f32_sum_shortcut(
-                    out, input, w, bs, bsz, ng, cpg, sp, eps_f,
+                    out,
+                    input,
+                    w,
+                    bs,
+                    bsz,
+                    ng,
+                    cpg,
+                    sp,
+                    eps_f,
+                    stats,
+                    input_version,
                 );
                 return Ok(out);
             }
@@ -57062,6 +57139,8 @@ impl FrankenTorchSession {
         channels_per_group: usize,
         spatial: usize,
         eps: f32,
+        stats: Option<std::sync::Arc<Vec<ft_kernel_cpu::GroupNormCpg2StatsF32>>>,
+        input_version: u64,
     ) {
         self.group_norm_f32_sum_shortcuts.insert(
             output.0,
@@ -57074,6 +57153,8 @@ impl FrankenTorchSession {
                 channels_per_group,
                 spatial,
                 eps,
+                stats,
+                input_version,
             },
         );
     }
@@ -108694,6 +108775,155 @@ mod tests {
             for (g, w) in s.tensor_values(got_id).unwrap().iter().zip(want.iter()) {
                 assert!((g - w).abs() < 1e-8, "{name} {g} != {w}");
             }
+        }
+    }
+
+    /// Build the f32 GroupNorm train-step inputs shared by the stats-reuse tests.
+    fn group_norm_f32_stats_fixture() -> (Vec<f32>, Vec<f32>, Vec<f32>, usize, usize, usize) {
+        let (batch, groups, spatial) = (2usize, 3usize, 7usize);
+        let channels = groups * 2;
+        let numel = batch * channels * spatial;
+        let mut z = 0x1234_5678u64;
+        let x: Vec<f32> = (0..numel)
+            .map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 44) as f32) / 256.0 - 2.0;
+                v
+            })
+            .collect();
+        let w: Vec<f32> = (0..channels).map(|c| 1.0 + (c as f32) * 0.05).collect();
+        let b: Vec<f32> = (0..channels).map(|c| (c as f32) * 0.01).collect();
+        (x, w, b, batch, groups, spatial)
+    }
+
+    #[test]
+    fn group_norm_f32_sum_shortcut_reuses_forward_stats_bitwise() {
+        // frankentorch-qkwsy. The sum-loss shortcut now hands the backward the
+        // statistics the forward computed instead of rebuilding them. The
+        // gradient must be BIT-IDENTICAL to the recomputing kernel route --
+        // anything less means the forward's statistics are not the ones the
+        // backward would have derived, which is a behaviour change wearing a
+        // performance change's clothes.
+        let (x, w, b, batch, groups, spatial) = group_norm_f32_stats_fixture();
+        let channels = groups * 2;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = s
+            .tensor_variable_f32(x.clone(), vec![batch, channels, spatial], true)
+            .unwrap();
+        let wt = s
+            .tensor_variable_f32(w.clone(), vec![channels], true)
+            .unwrap();
+        let bt = s
+            .tensor_variable_f32(b.clone(), vec![channels], true)
+            .unwrap();
+        let out = s
+            .functional_group_norm(xt, groups, Some(wt), Some(bt), 1e-5)
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+
+        let (dx, dw, db) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+            1.0,
+            &x,
+            Some(&w),
+            batch,
+            groups,
+            2,
+            spatial,
+            1e-5,
+        );
+        let got_dx = report.gradient(xt).expect("input gradient");
+        for (i, (got, want)) in got_dx.iter().zip(dx.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                f64::from(*want).to_bits(),
+                "input gradient differs from the recomputing route at {i}"
+            );
+        }
+        let got_dw = report.gradient(wt).expect("weight gradient");
+        for (i, (got, want)) in got_dw.iter().zip(dw.unwrap().iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                f64::from(*want).to_bits(),
+                "weight gradient differs at {i}"
+            );
+        }
+        let got_db = report.gradient(bt).expect("bias gradient");
+        for (i, (got, want)) in got_db.iter().zip(db.unwrap().iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                f64::from(*want).to_bits(),
+                "bias gradient differs at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_norm_f32_sum_shortcut_declines_cached_stats_when_the_input_moves() {
+        // The cache validator. The backward re-reads the input leaf, so a cached
+        // statistic from an older value of that leaf would pair statistics and
+        // data from two different generations. An in-place op bumps the version,
+        // and the shortcut must then fall back to recomputing -- which is
+        // observable, because the gradient has to match the recomputation from
+        // the MUTATED input, not from the original.
+        let (x, w, b, batch, groups, spatial) = group_norm_f32_stats_fixture();
+        let channels = groups * 2;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = s
+            .tensor_variable_f32(x.clone(), vec![batch, channels, spatial], false)
+            .unwrap();
+        let wt = s
+            .tensor_variable_f32(w.clone(), vec![channels], true)
+            .unwrap();
+        let bt = s
+            .tensor_variable_f32(b.clone(), vec![channels], true)
+            .unwrap();
+        let out = s
+            .functional_group_norm(xt, groups, Some(wt), Some(bt), 1e-5)
+            .unwrap();
+
+        let version_before = s.tensor_tape.tensor(xt).unwrap().version();
+        // Scaling by 2 changes the values, so stale statistics could not
+        // accidentally agree with fresh ones.
+        s.tensor_mul_scalar_(xt, 2.0).unwrap();
+        let version_after = s.tensor_tape.tensor(xt).unwrap().version();
+        assert!(
+            version_after > version_before,
+            "the in-place op must bump the version or this test proves nothing"
+        );
+
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+
+        let mutated: Vec<f32> = x.iter().map(|v| v * 2.0).collect();
+        let (_, dw, db) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+            1.0,
+            &mutated,
+            Some(&w),
+            batch,
+            groups,
+            2,
+            spatial,
+            1e-5,
+        );
+        let got_dw = report.gradient(wt).expect("weight gradient");
+        for (i, (got, want)) in got_dw.iter().zip(dw.unwrap().iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                f64::from(*want).to_bits(),
+                "weight gradient at {i} was computed from stale statistics"
+            );
+        }
+        let got_db = report.gradient(bt).expect("bias gradient");
+        for (i, (got, want)) in got_db.iter().zip(db.unwrap().iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                f64::from(*want).to_bits(),
+                "bias gradient at {i}"
+            );
         }
     }
 

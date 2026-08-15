@@ -6328,6 +6328,40 @@ pub fn group_norm_forward_f32_scheduled(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        group_norm_write_group_f32(xb, orow, weight, bias, g, cpg, spatial, mean, rstd);
+    };
+    // Reduce-then-scale over groups; the caller supplied the schedule. See
+    // `group_norm_parallel_pays` for why the number of GROUPS decides it and not
+    // the element count alone.
+    if parallel {
+        out.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    } else {
+        out.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    }
+    out
+}
+
+/// The per-group normalize-and-affine write shared by every f32 GroupNorm
+/// forward, so that a variant which also emits statistics cannot drift from the
+/// plain one in the arithmetic that produces the output.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn group_norm_write_group_f32(
+    xb: &[f32],
+    orow: &mut [f32],
+    weight: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    g: usize,
+    cpg: usize,
+    spatial: usize,
+    mean: f32,
+    rstd: f32,
+) {
+    {
         let vmean = f32x8::splat(mean);
         let vrstd = f32x8::splat(rstd);
         for local_channel in 0..cpg {
@@ -6389,20 +6423,111 @@ pub fn group_norm_forward_f32_scheduled(
                 }
             }
         }
+    }
+}
+
+/// Per-group statistics the f32 GroupNorm forward already computes and, before
+/// `frankentorch-qkwsy`, threw away — forcing the sum-loss backward to rebuild
+/// them with two more full passes over the input.
+///
+/// `sum0`/`sum1` are the per-channel sums of a `cpg == 2` group, which is the
+/// shape the scorecard row measures and the only one
+/// [`group_norm_backward_scalar_f32`] specialises.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupNormCpg2StatsF32 {
+    /// Group mean.
+    pub mean: f32,
+    /// Reciprocal standard deviation, `1 / sqrt(var + eps)`.
+    pub rstd: f32,
+    /// Sum over the first channel's spatial run.
+    pub sum0: f32,
+    /// Sum over the second channel's spatial run.
+    pub sum1: f32,
+}
+
+/// [`group_norm_forward_f32`] for `cpg == 2`, additionally returning the
+/// per-group statistics so the sum-loss backward can skip rebuilding them.
+///
+/// BIT-IDENTICAL OUTPUT to the plain forward, and the constraint that makes that
+/// true is not incidental. The plain forward accumulates the group sum in ONE
+/// sequential pass over all `cpg * spatial` elements. Computing `sum0` and `sum1`
+/// as independent half-sums and adding them would reassociate that sum, moving
+/// `mean`, then `rstd`, then every output element by an ULP — a silent change to
+/// the forward in order to speed up the backward. So the loop below keeps a
+/// single running `sum` across two half-loops, which is exactly the shape
+/// `group_norm_backward_scalar_f32` already uses, and the two therefore agree bit
+/// for bit. `group_norm_forward_f32_cpg2_stats_match_the_backward_recomputation`
+/// locks it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_forward_f32_with_cpg2_stats(
+    x: &[f32],
+    weight: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    batch: usize,
+    num_groups: usize,
+    spatial: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<GroupNormCpg2StatsF32>) {
+    const CPG: usize = 2;
+    let group_numel = CPG * spatial;
+    let inv_m = 1.0 / group_numel as f32;
+    let groups = batch * num_groups;
+    let mut out = vec![0.0f32; groups * group_numel];
+    let mut stats = vec![
+        GroupNormCpg2StatsF32 {
+            mean: 0.0,
+            rstd: 0.0,
+            sum0: 0.0,
+            sum1: 0.0,
+        };
+        groups
+    ];
+    let group_fn = |grp: usize, orow: &mut [f32], slot: &mut GroupNormCpg2StatsF32| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let (x0, x1) = xb.split_at(spatial);
+        // One running `sum`, two half-loops: see the note above on why this may
+        // not become `sum0 + sum1`.
+        let mut sum = 0.0f32;
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        for &v in x0 {
+            sum += v;
+            sum0 += v;
+        }
+        for &v in x1 {
+            sum += v;
+            sum1 += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f32;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        *slot = GroupNormCpg2StatsF32 {
+            mean,
+            rstd,
+            sum0,
+            sum1,
+        };
+        group_norm_write_group_f32(xb, orow, weight, bias, g, CPG, spatial, mean, rstd);
     };
-    // Reduce-then-scale over groups; the caller supplied the schedule. See
-    // `group_norm_parallel_pays` for why the number of GROUPS decides it and not
-    // the element count alone.
-    if parallel {
+    if group_norm_parallel_pays(groups, groups * group_numel) {
         out.par_chunks_mut(group_numel)
+            .zip(stats.par_iter_mut())
             .enumerate()
-            .for_each(|(grp, orow)| group_fn(grp, orow));
+            .for_each(|(grp, (orow, slot))| group_fn(grp, orow, slot));
     } else {
         out.chunks_mut(group_numel)
+            .zip(stats.iter_mut())
             .enumerate()
-            .for_each(|(grp, orow)| group_fn(grp, orow));
+            .for_each(|(grp, (orow, slot))| group_fn(grp, orow, slot));
     }
-    out
+    (out, stats)
 }
 
 /// Scalar fused mirror of `sum(group_norm_forward_f32(...))`.
@@ -6872,9 +6997,8 @@ pub fn group_norm_backward_scalar_f32(
 ) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
     let group_numel = cpg * spatial;
     let inv_m = 1.0f32 / group_numel as f32;
-    let channels = num_groups * cpg;
     if cpg == 2 {
-        let stats: Vec<(f32, f32, f32, f32)> = (0..batch * num_groups)
+        let stats: Vec<GroupNormCpg2StatsF32> = (0..batch * num_groups)
             .into_par_iter()
             .map(|grp| {
                 let base = grp * group_numel;
@@ -6901,9 +7025,69 @@ pub fn group_norm_backward_scalar_f32(
                     vsum += d * d;
                 }
                 let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
-                (mean, rstd, sum0, sum1)
+                GroupNormCpg2StatsF32 {
+                    mean,
+                    rstd,
+                    sum0,
+                    sum1,
+                }
             })
             .collect();
+        return group_norm_backward_scalar_f32_cpg2_from_stats(
+            upstream, x, weight, &stats, batch, num_groups, spatial,
+        );
+    }
+    group_norm_backward_scalar_f32_general(
+        upstream, x, weight, batch, num_groups, cpg, spatial, eps,
+    )
+}
+
+/// [`group_norm_backward_scalar_f32`] for `cpg == 2` with the per-group
+/// statistics supplied by the forward instead of rebuilt here.
+///
+/// This is the whole point of `frankentorch-qkwsy`: rebuilding them costs TWO
+/// full passes over the input (one for the running sum and the per-channel sums,
+/// one for the variance, which cannot start until the mean is known), on top of
+/// the single pass the gradient write already makes. The forward computed exactly
+/// these values microseconds earlier.
+///
+/// The supplied statistics must be bit-identical to what
+/// [`group_norm_backward_scalar_f32`] would have computed; they are, when they
+/// come from [`group_norm_forward_f32_with_cpg2_stats`], and a test asserts it
+/// rather than trusting the two loops to stay in step.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_backward_scalar_f32_with_cpg2_stats(
+    upstream: f32,
+    x: &[f32],
+    weight: Option<&[f32]>,
+    stats: &[GroupNormCpg2StatsF32],
+    batch: usize,
+    num_groups: usize,
+    spatial: usize,
+) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    group_norm_backward_scalar_f32_cpg2_from_stats(
+        upstream, x, weight, stats, batch, num_groups, spatial,
+    )
+}
+
+/// The `cpg == 2` gradient write, shared by the route that recomputes statistics
+/// and the route that is handed them, so the two cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn group_norm_backward_scalar_f32_cpg2_from_stats(
+    upstream: f32,
+    x: &[f32],
+    weight: Option<&[f32]>,
+    stats: &[GroupNormCpg2StatsF32],
+    batch: usize,
+    num_groups: usize,
+    spatial: usize,
+) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    let cpg = 2usize;
+    let group_numel = cpg * spatial;
+    let inv_m = 1.0f32 / group_numel as f32;
+    let channels = num_groups * cpg;
+    {
         let spatial_f = spatial as f32;
         // Every per-group vector/tail write below covers exactly `group_numel`
         // entries before returning the buffer, so avoid a 1.6 MiB zero-fill on
@@ -6915,7 +7099,12 @@ pub fn group_norm_backward_scalar_f32(
                     let g = grp % num_groups;
                     let base = grp * group_numel;
                     let xb = &x[base..base + group_numel];
-                    let (mean, rstd, sum0, sum1) = stats[grp];
+                    let GroupNormCpg2StatsF32 {
+                        mean,
+                        rstd,
+                        sum0,
+                        sum1,
+                    } = stats[grp];
                     let c0 = g * 2;
                     let c1 = c0 + 1;
                     let w0 = weight.map_or(1.0f32, |w| w[c0]);
@@ -6963,7 +7152,16 @@ pub fn group_norm_backward_scalar_f32(
         let (dweight, dbias) = if weight.is_some() {
             let mut dw = vec![0.0f32; channels];
             let mut db = vec![0.0f32; channels];
-            for (grp, &(mean, rstd, sum0, sum1)) in stats.iter().enumerate() {
+            for (
+                grp,
+                &GroupNormCpg2StatsF32 {
+                    mean,
+                    rstd,
+                    sum0,
+                    sum1,
+                },
+            ) in stats.iter().enumerate()
+            {
                 let g = grp % num_groups;
                 let c0 = g * 2;
                 let c1 = c0 + 1;
@@ -6976,8 +7174,25 @@ pub fn group_norm_backward_scalar_f32(
         } else {
             (None, None)
         };
-        return (dx, dweight, dbias);
+        (dx, dweight, dbias)
     }
+}
+
+/// [`group_norm_backward_scalar_f32`] for every `cpg` other than 2.
+#[allow(clippy::too_many_arguments)]
+fn group_norm_backward_scalar_f32_general(
+    upstream: f32,
+    x: &[f32],
+    weight: Option<&[f32]>,
+    batch: usize,
+    num_groups: usize,
+    cpg: usize,
+    spatial: usize,
+    eps: f32,
+) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    let group_numel = cpg * spatial;
+    let inv_m = 1.0f32 / group_numel as f32;
+    let channels = num_groups * cpg;
     let stats: Vec<(f32, f32)> = (0..batch * num_groups)
         .into_par_iter()
         .map(|grp| {
@@ -37800,6 +38015,149 @@ mod tests {
         // Many units but a trivial element count stays serial: fork overhead is
         // per-unit, so units alone must not be sufficient.
         assert!(!super::group_norm_parallel_pays(1024, 4096));
+    }
+
+    #[test]
+    fn group_norm_forward_f32_cpg2_stats_match_the_backward_recomputation() {
+        // The safety argument for reusing the forward's statistics, checked
+        // rather than asserted. If the forward ever computes its group sum by
+        // adding two independent half-sums, `mean` moves by an ULP, `rstd`
+        // follows, and every output element with it -- a silent forward change
+        // made to speed up the backward. Comparing only the resulting gradients
+        // would let that hide inside a tolerance, so compare the STATISTICS, bit
+        // for bit, against what the recomputing backward produces.
+        for &(batch, num_groups, spatial) in
+            &[(8usize, 32usize, 28 * 28usize), (1, 1, 5), (3, 4, 64)]
+        {
+            let channels = num_groups * 2;
+            let numel = batch * channels * spatial;
+            let mut z = 0x5deece66du64;
+            let x: Vec<f32> = (0..numel)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 40) as f32) / 512.0 - 2.0;
+                    v
+                })
+                .collect();
+            let weight: Vec<f32> = (0..channels).map(|c| 1.0 + (c as f32) * 0.02).collect();
+            let bias: Vec<f32> = (0..channels).map(|c| (c as f32) * 0.005).collect();
+
+            let (out, stats) = super::group_norm_forward_f32_with_cpg2_stats(
+                &x,
+                Some(&weight),
+                Some(&bias),
+                batch,
+                num_groups,
+                spatial,
+                1e-5,
+            );
+
+            // 1. The output is bit-identical to the plain forward.
+            let plain = super::group_norm_forward_f32(
+                &x,
+                Some(&weight),
+                Some(&bias),
+                batch,
+                num_groups,
+                2,
+                spatial,
+                1e-5,
+            );
+            for (i, (a, b)) in out.iter().zip(plain.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "stats-emitting forward changed the output at {i} for \
+                     batch={batch} groups={num_groups} spatial={spatial}"
+                );
+            }
+
+            // 2. The gradients from the reused statistics are bit-identical to
+            //    the gradients from the recomputing route.
+            let (dx_reused, dw_reused, db_reused) =
+                super::group_norm_backward_scalar_f32_with_cpg2_stats(
+                    1.5,
+                    &x,
+                    Some(&weight),
+                    &stats,
+                    batch,
+                    num_groups,
+                    spatial,
+                );
+            let (dx_recomputed, dw_recomputed, db_recomputed) =
+                super::group_norm_backward_scalar_f32(
+                    1.5,
+                    &x,
+                    Some(&weight),
+                    batch,
+                    num_groups,
+                    2,
+                    spatial,
+                    1e-5,
+                );
+            for (i, (a, b)) in dx_reused.iter().zip(dx_recomputed.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dx differs at {i} for batch={batch} groups={num_groups} spatial={spatial}"
+                );
+            }
+            assert_eq!(
+                dw_reused.map(|v| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>()),
+                dw_recomputed.map(|v| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>()),
+            );
+            assert_eq!(
+                db_reused.map(|v| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>()),
+                db_recomputed.map(|v| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>()),
+            );
+
+            // 3. NEGATIVE CASE: the half-sum reassociation this design exists to
+            //    avoid must actually be observable, otherwise the constraint is
+            //    vacuous and a future edit could reintroduce it unnoticed.
+            let group_numel = 2 * spatial;
+            let mut sequential_differs_somewhere = false;
+            for grp in 0..batch * num_groups {
+                let base = grp * group_numel;
+                let (x0, x1) = x[base..base + group_numel].split_at(spatial);
+                let mut running = 0.0f32;
+                for &v in x0 {
+                    running += v;
+                }
+                for &v in x1 {
+                    running += v;
+                }
+                let mut half0 = 0.0f32;
+                for &v in x0 {
+                    half0 += v;
+                }
+                let mut half1 = 0.0f32;
+                for &v in x1 {
+                    half1 += v;
+                }
+                if running.to_bits() != (half0 + half1).to_bits() {
+                    sequential_differs_somewhere = true;
+                }
+                // Whatever else is true, the forward must have recorded the
+                // RUNNING sum's mean, not the half-sum one.
+                let inv_m = 1.0f32 / group_numel as f32;
+                assert_eq!(
+                    stats[grp].mean.to_bits(),
+                    (running * inv_m).to_bits(),
+                    "group {grp} recorded a mean that is not the sequential sum's"
+                );
+            }
+            if spatial > 64 {
+                assert!(
+                    sequential_differs_somewhere,
+                    "on this input the two associations agree everywhere, so the test is not \
+                     exercising the constraint it claims to protect (batch={batch} \
+                     groups={num_groups} spatial={spatial})"
+                );
+            }
+        }
     }
 
     #[test]

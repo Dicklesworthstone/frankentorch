@@ -351,6 +351,64 @@ fn timed_group_norm_f32_kernels(
     bias: &[f32],
     parallel_forward: bool,
 ) -> (f64, f64) {
+    timed_group_norm_f32_kernels_inner(values, weight, bias, parallel_forward, false)
+}
+
+/// `reuse_stats` selects the `frankentorch-qkwsy` lever: the forward emits the
+/// per-group statistics it computed anyway and the backward consumes them instead
+/// of rebuilding them with two more full passes over the input. Both arms produce
+/// bit-identical gradients (locked by
+/// `group_norm_forward_f32_cpg2_stats_match_the_backward_recomputation`), so the
+/// pair isolates the removed passes and nothing else, inside ONE invocation on
+/// ONE host.
+fn timed_group_norm_f32_kernels_inner(
+    values: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    parallel_forward: bool,
+    reuse_stats: bool,
+) -> (f64, f64) {
+    if reuse_stats {
+        let spatial = GN_H * GN_W;
+        let out_meta = TensorMeta::from_shape(
+            vec![GN_N, GN_C, GN_H, GN_W],
+            DType::F32,
+            ft_core::Device::Cpu,
+        );
+        let started = Instant::now();
+        let (out, stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            spatial,
+            1e-5,
+        );
+        let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&out, &out_meta).expect("sum");
+        let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32_with_cpg2_stats(
+            1.0f32,
+            values,
+            Some(weight),
+            &stats,
+            GN_N,
+            GN_GROUPS,
+            spatial,
+        );
+        let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+        assert!(loss.is_finite(), "group_norm f32 sum loss must be finite");
+        let checksum = dx.iter().map(|g| f64::from(g.abs())).sum::<f64>();
+        return (elapsed, checksum);
+    }
+    timed_group_norm_f32_kernels_recomputing(values, weight, bias, parallel_forward)
+}
+
+fn timed_group_norm_f32_kernels_recomputing(
+    values: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    parallel_forward: bool,
+) -> (f64, f64) {
     let spatial = GN_H * GN_W;
     let channels_per_group = GN_C / GN_GROUPS;
     // Built outside the timer: the session lane's `tensor_sum` reads a meta that
@@ -620,6 +678,10 @@ LANES = {
     # schedule, so the pair prices the parallel gate against one live incumbent
     # inside one invocation. PT(serialfwd)/PT(kernels) is a free ~1.0 control.
     "group_norm_f32_kernels_serialfwd": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # frankentorch-qkwsy: the same torch op again for the forward-statistics-reuse
+    # pair. PT(statskernels_recompute)/PT(statskernels) is a free ~1.0 control.
+    "group_norm_f32_statskernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "group_norm_f32_statskernels_recompute": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     "prelu": (prx, lambda x: Fn.prelu(x,prw)),
     # frankentorch-k1hto: the same torch op under a second name, exactly as the
     # `_nopool` lanes do. The FrankenTorch side runs this one with an
@@ -813,6 +875,20 @@ LANES = {
             "group_norm_f32_kernels_serialfwd",
             Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, false)),
         ),
+        (
+            // frankentorch-qkwsy: lever ON — the forward emits its statistics and
+            // the backward consumes them. This pair gets its own base rather than
+            // reusing `group_norm_f32_kernels`, which is already the base for
+            // `_serialfwd`; sharing it would leave a twin differing in two things
+            // at once.
+            "group_norm_f32_statskernels",
+            Box::new(|| timed_group_norm_f32_kernels_inner(&gnx, &gnw, &gnb, true, true)),
+        ),
+        (
+            // Lever OFF: identical work, statistics rebuilt in the backward.
+            "group_norm_f32_statskernels_recompute",
+            Box::new(|| timed_group_norm_f32_kernels_inner(&gnx, &gnw, &gnb, true, false)),
+        ),
         ("prelu", Box::new(|| timed_prelu(&prx, &prw, false))),
         (
             // frankentorch-k1hto: the SAME lane with the PReLU+sum shortcut
@@ -993,6 +1069,10 @@ LANES = {
                 name.strip_suffix("_serialfwd")
                     .map(|base| (base, "parallel forward gate"))
             })
+            .or_else(|| {
+                name.strip_suffix("_recompute")
+                    .map(|base| (base, "forward-statistics reuse"))
+            })
         else {
             continue;
         };
@@ -1099,6 +1179,8 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
     let mut fwd_serial = Vec::with_capacity(reps);
     let mut sum = Vec::with_capacity(reps);
     let mut bwd = Vec::with_capacity(reps);
+    let mut reduce_seq = Vec::with_capacity(reps);
+    let mut reduce_wide = Vec::with_capacity(reps);
     for _ in 0..reps {
         let started = Instant::now();
         let out = ft_kernel_cpu::group_norm_forward_f32(
@@ -1162,6 +1244,43 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         );
         bwd.push(started.elapsed().as_secs_f64() * 1_000.0);
         std::hint::black_box(&dx);
+
+        // REDUCTION ARM (frankentorch-zv1y1). Every per-group statistic is a
+        // scalar accumulation over `group_numel` elements, and float addition is
+        // not associative, so LLVM may neither vectorise it nor break the
+        // dependency chain. This prices what multiple independent accumulators
+        // would buy BEFORE anyone is asked to accept the tolerance change that
+        // reassociation implies — if it buys little, the question never needs
+        // asking.
+        //
+        // Both arms read the SAME slice in the same cache state, interleaved rep
+        // by rep, and both are reduced by min below: comparing a min against a
+        // median is the error that cost this lane a whole bead
+        // (NEGATIVE_EVIDENCE item 12), and at 1.33-1.51x the estimator difference
+        // alone would swamp the effect being measured.
+        let probe_group = &values[..channels_per_group * spatial];
+        let started = Instant::now();
+        let mut sequential = 0.0f32;
+        for &v in probe_group {
+            sequential += v;
+        }
+        reduce_seq.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        std::hint::black_box(sequential);
+
+        let started = Instant::now();
+        let mut acc = [0.0f32; 8];
+        let mut chunks = probe_group.chunks_exact(8);
+        for chunk in &mut chunks {
+            for (slot, &v) in acc.iter_mut().zip(chunk) {
+                *slot += v;
+            }
+        }
+        let mut widened = acc.iter().sum::<f32>();
+        for &v in chunks.remainder() {
+            widened += v;
+        }
+        reduce_wide.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+        std::hint::black_box(widened);
     }
 
     // ESTIMATOR ARM (frankentorch-59kjf). The three per-kernel figures above sum
@@ -1234,6 +1353,7 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         v[0]
     };
     let (fwd, fwd_serial, sum, bwd) = (floor(fwd), floor(fwd_serial), floor(sum), floor(bwd));
+    let (reduce_seq, reduce_wide) = (floor(reduce_seq), floor(reduce_wide));
     println!(
         "\nGROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of {reps}; NOT a ratio)\n  \
          numel={numel}  groups={GN_GROUPS}  cpg={channels_per_group}  spatial={spatial}  rayon_threads={}\n  \
@@ -1245,7 +1365,11 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
          ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----\n  \
          step min of {}            {step_min:8.3} ms   comparable to the per-kernel figures above\n  \
          step lane estimator      {step_lane_estimator:8.3} ms   median of 4 per round, then median over {step_groups} rounds\n  \
-         estimator ratio          {:8.3}x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)",
+         estimator ratio          {:8.3}x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)\n  \
+         ---- one group's reduction, sequential vs 8 accumulators (frankentorch-zv1y1) ----\n  \
+         reduce sequential        {reduce_seq:8.3} us   {} elems, one dependency chain — what every statistic pass costs today\n  \
+         reduce 8 accumulators    {reduce_wide:8.3} us   same data, same rep, chain broken 8 ways\n  \
+         reduction headroom       {:8.3}x  (NOT bit-exact: reassociation moves mean/rstd/output by an ULP; this prices the tolerance question, it does not answer it)",
         rayon::current_num_threads(),
         if units >= 64 && numel >= (1 << 17) {
             "PARALLEL"
@@ -1263,5 +1387,7 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         fwd + sum + bwd,
         step_samples.len(),
         step_lane_estimator / step_min,
+        channels_per_group * spatial,
+        reduce_seq / reduce_wide,
     );
 }
