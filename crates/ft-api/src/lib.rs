@@ -13251,6 +13251,38 @@ impl FrankenTorchSession {
                     }
 
                     let mut out = vec![0.0_f32; n * (n - 1) / 2];
+                    if m == 64 {
+                        // Select this once per call instead of branching once per
+                        // condensed pair. The scored 512x64 lane therefore keeps
+                        // its indexed loads and exact reduction without adding a
+                        // hot-loop dispatch.
+                        let fill_chunk = |chunk_idx: usize, chunk: &mut [f32]| {
+                            let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
+                            for slot in chunk {
+                                let i_base = i * 64;
+                                let j_base = j * 64;
+                                *slot = squared_distance_64(
+                                    &values[i_base..i_base + 64],
+                                    &values[j_base..j_base + 64],
+                                )
+                                .sqrt();
+                                j += 1;
+                                if j == n {
+                                    i += 1;
+                                    j = i + 1;
+                                }
+                            }
+                        };
+                        if out.len() < PAIRS_PER_CHUNK {
+                            fill_chunk(0, &mut out);
+                        } else {
+                            out.par_chunks_mut(PAIRS_PER_CHUNK)
+                                .enumerate()
+                                .for_each(|(chunk_idx, chunk)| fill_chunk(chunk_idx, chunk));
+                        }
+                        return out;
+                    }
+
                     let fill_chunk = |chunk_idx: usize, chunk: &mut [f32]| {
                         let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
                         for slot in chunk {
@@ -13259,32 +13291,26 @@ impl FrankenTorchSession {
                             let mut squared_distance = 0.0_f32;
                             let left = &values[i_base..i_base + m];
                             let right = &values[j_base..j_base + m];
-                            if m == 64 {
-                                squared_distance = squared_distance_64(left, right);
-                            } else {
-                                let mut left_chunks = left.chunks_exact(8);
-                                let mut right_chunks = right.chunks_exact(8);
-                                for (left_chunk, right_chunk) in
-                                    left_chunks.by_ref().zip(right_chunks.by_ref())
-                                {
-                                    // Keep the reduction scalar and in ascending-k order so
-                                    // the public f32 result stays bit-identical to the direct
-                                    // reference. Only the independent subtract-and-square work
-                                    // is packed into portable safe-Rust SIMD lanes.
-                                    let differences =
-                                        f32x8::from(left_chunk) - f32x8::from(right_chunk);
-                                    for square in (differences * differences).to_array() {
-                                        squared_distance += square;
-                                    }
+                            let mut left_chunks = left.chunks_exact(8);
+                            let mut right_chunks = right.chunks_exact(8);
+                            for (left_chunk, right_chunk) in
+                                left_chunks.by_ref().zip(right_chunks.by_ref())
+                            {
+                                // Keep the reduction scalar and in ascending-k order so
+                                // the public f32 result stays bit-identical to the direct
+                                // reference. Only the independent subtract-and-square work
+                                // is packed into portable safe-Rust SIMD lanes.
+                                let differences =
+                                    f32x8::from(left_chunk) - f32x8::from(right_chunk);
+                                for square in (differences * differences).to_array() {
+                                    squared_distance += square;
                                 }
-                                for (&left_value, &right_value) in left_chunks
-                                    .remainder()
-                                    .iter()
-                                    .zip(right_chunks.remainder())
-                                {
-                                    let diff = left_value - right_value;
-                                    squared_distance += diff * diff;
-                                }
+                            }
+                            for (&left_value, &right_value) in
+                                left_chunks.remainder().iter().zip(right_chunks.remainder())
+                            {
+                                let diff = left_value - right_value;
+                                squared_distance += diff * diff;
                             }
                             // Squared distances are non-negative. `sqrt` is
                             // the p=2 operation directly; `powf(0.5)` would
@@ -128186,8 +128212,58 @@ mod tests {
         let output = session.tensor_pdist(tensor, 2.0).unwrap();
         let actual = session.tensor_values_f32(output).unwrap();
         assert_eq!(
-            actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-            expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pdist_p2_f32_64_feature_fast_path_matches_scalar_nonfinite_lanes() {
+        // Keep the fixed-width route aligned with the direct f32 definition for
+        // values where vector-lane arithmetic can otherwise hide NaN payload and
+        // infinity propagation differences.
+        let n = 3;
+        let m = 64;
+        let mut input = vec![0.0_f32; n * m];
+        input[1] = f32::INFINITY;
+        input[m + 1] = f32::INFINITY;
+        input[m + 9] = f32::NAN;
+        input[2 * m + 17] = f32::NEG_INFINITY;
+        input[2 * m + 31] = -0.0;
+
+        let mut expected = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut squared_distance = 0.0_f32;
+                for k in 0..m {
+                    let difference = input[i * m + k] - input[j * m + k];
+                    squared_distance += difference * difference;
+                }
+                expected.push(squared_distance.sqrt());
+            }
+        }
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = session
+            .tensor_variable_f32(input, vec![n, m], false)
+            .unwrap();
+        let output = session.tensor_pdist(tensor, 2.0).unwrap();
+        let actual = session.tensor_values_f32(output).unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
         );
     }
 
