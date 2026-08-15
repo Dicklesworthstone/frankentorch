@@ -9421,7 +9421,10 @@ fn max_pool3d_backward_2x2s2_f64(
                         arg = loc111;
                     }
 
-                    drow[arg] += dout_plane[(oz * oh + oy) * ow + ox];
+                    // Fixed 2x2x2 stride-2 windows are disjoint, so this argmax
+                    // slot cannot receive another contribution. Preserve the
+                    // accumulating route's signed-zero and NaN result explicitly.
+                    drow[arg] = 0.0_f64 + dout_plane[(oz * oh + oy) * ow + ox];
                 }
             }
         }
@@ -39831,9 +39834,11 @@ mod tests {
         input[17] = 5.0;
         input[20] = 6.0;
         input[21] = 7.0;
-        let dout: Vec<f64> = (0..batch * ch * od * oh * ow)
+        let mut dout: Vec<f64> = (0..batch * ch * od * oh * ow)
             .map(|i| ((i * 29 + 7) % 31) as f64 * 0.0625 - 0.5)
             .collect();
+        dout[0] = -0.0;
+        dout[1] = f64::NAN;
 
         let mut expected = vec![0.0f64; input.len()];
         let plane_len = id * ih * iw;
@@ -39873,7 +39878,7 @@ mod tests {
         );
         assert_eq!(
             got[0].to_bits(),
-            dout[0].to_bits(),
+            expected[0].to_bits(),
             "first tied argmax wins"
         );
         assert_eq!(
