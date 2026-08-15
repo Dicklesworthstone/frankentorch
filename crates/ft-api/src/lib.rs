@@ -395,6 +395,29 @@ struct AvgPool1dSumShortcut {
     stride: usize,
 }
 
+/// Registered on the f64 grad-path output of `functional_max_pool3d` so that a
+/// following `tensor_sum` can avoid materialising its dense output-gradient
+/// buffer. The pooled activation remains observable until the reduction, so the
+/// shortcut declines when callers retain it or attach a hook.
+#[derive(Clone, Copy)]
+struct MaxPool3dSumShortcut {
+    input: TensorNodeId,
+    batch: usize,
+    channels: usize,
+    input_d: usize,
+    input_h: usize,
+    input_w: usize,
+    kernel_d: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    output_d: usize,
+    output_h: usize,
+    output_w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+}
+
 #[derive(Clone)]
 pub struct FrankenTorchSession {
     tape: Tape,
@@ -417,6 +440,7 @@ pub struct FrankenTorchSession {
     batch_norm2d_f32_sum_shortcuts: BTreeMap<usize, BatchNorm2dF32SumShortcut>,
     group_norm_f32_sum_shortcuts: BTreeMap<usize, GroupNormF32SumShortcut>,
     avg_pool1d_sum_shortcuts: BTreeMap<usize, AvgPool1dSumShortcut>,
+    max_pool3d_sum_shortcuts: BTreeMap<usize, MaxPool3dSumShortcut>,
 }
 
 impl std::fmt::Debug for FrankenTorchSession {
@@ -572,6 +596,7 @@ impl FrankenTorchSession {
             batch_norm2d_f32_sum_shortcuts: BTreeMap::new(),
             group_norm_f32_sum_shortcuts: BTreeMap::new(),
             avg_pool1d_sum_shortcuts: BTreeMap::new(),
+            max_pool3d_sum_shortcuts: BTreeMap::new(),
         }
     }
 
@@ -623,6 +648,8 @@ impl FrankenTorchSession {
             .retain(|&node_id, _| node_id < boundary);
         self.avg_pool1d_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
+        self.max_pool3d_sum_shortcuts
+            .retain(|&node_id, _| node_id < boundary);
     }
 
     /// Free the entire autograd tape (`truncate_autograd_graph(0)`); invalidates
@@ -634,6 +661,7 @@ impl FrankenTorchSession {
         self.batch_norm2d_f32_sum_shortcuts.clear();
         self.group_norm_f32_sum_shortcuts.clear();
         self.avg_pool1d_sum_shortcuts.clear();
+        self.max_pool3d_sum_shortcuts.clear();
     }
 
     fn compact_nograd_tensor_since(
@@ -25178,6 +25206,9 @@ impl FrankenTorchSession {
         if let Some(out) = self.try_avg_pool1d_sum_shortcut(input)? {
             return Ok(out);
         }
+        if let Some(out) = self.try_max_pool3d_sum_shortcut(input)? {
+            return Ok(out);
+        }
         let (out, event) = self.tensor_tape.sum(input, self.mode())?;
         self.record_tensor_reduction_operation(&event);
         Ok(out)
@@ -25378,6 +25409,83 @@ impl FrankenTorchSession {
             EvidenceKind::Dispatch,
             format!(
                 "tensor_reduction_op=AvgPool1dSumShortcut input={} source={} out={} kernel={kernel_size} stride={stride}",
+                input.0, source.0, out.0
+            ),
+        );
+        Ok(Some(out))
+    }
+
+    /// Reach the scalar-loss MaxPool3d backward from the ordinary
+    /// `tensor_sum(functional_max_pool3d(x))` spelling. The pooled output is
+    /// already materialized by the public pool operation, so preserve its exact
+    /// pairwise reduction value and recompute only the first-argmax sidecar for
+    /// the scalar backward edge.
+    fn try_max_pool3d_sum_shortcut(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<Option<TensorNodeId>, AutogradError> {
+        let Some(shortcut) = self.max_pool3d_sum_shortcuts.get(&input.0).copied() else {
+            return Ok(None);
+        };
+        if self.tensor_tape.tensor_retains_grad(input)?
+            || self.tensor_tape.tensor_has_hooks(input)?
+        {
+            return Ok(None);
+        }
+
+        let sum = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
+                .map_err(|error| {
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
+                })?
+        };
+
+        let MaxPool3dSumShortcut {
+            input: source,
+            batch,
+            channels,
+            input_d,
+            input_h,
+            input_w,
+            kernel_d,
+            kernel_h,
+            kernel_w,
+            output_d,
+            output_h,
+            output_w,
+            stride_d,
+            stride_h,
+            stride_w,
+        } = shortcut;
+        let out = self.tensor_apply_function_f64_borrowed_forward(
+            &[source],
+            move |ctx, ins| {
+                let (values, _) = ins[0];
+                let (_, arg_offsets) = ft_kernel_cpu::max_pool3d_sum_forward_with_indices_f64(
+                    values, batch, channels, input_d, input_h, input_w, kernel_d, kernel_h,
+                    kernel_w, output_d, output_h, output_w, stride_d, stride_h, stride_w,
+                );
+                ctx.save_for_backward(
+                    arg_offsets,
+                    vec![batch, channels, output_d, output_h, output_w],
+                );
+                Ok((vec![sum], vec![1]))
+            },
+            move |ctx, grad_outputs| {
+                let upstream = grad_outputs[0][0];
+                let saved = ctx.saved_tensors();
+                let grad = ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_f64(
+                    upstream, &saved[0], batch, channels, input_d, input_h, input_w, output_d,
+                    output_h, output_w,
+                );
+                Ok(vec![Some(grad)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "tensor_reduction_op=MaxPool3dSumShortcut input={} source={} out={} kernel=({kernel_d},{kernel_h},{kernel_w}) stride=({stride_d},{stride_h},{stride_w})",
                 input.0, source.0, out.0
             ),
         );
@@ -33806,7 +33914,7 @@ impl FrankenTorchSession {
                 };
                 return self.tensor_variable(out, out_shape, false);
             }
-            return self.tensor_apply_function_f64_borrowed_forward(
+            let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
                 move |ctx, ins| {
                     let (iv, _) = ins[0];
@@ -33824,7 +33932,28 @@ impl FrankenTorchSession {
                     );
                     Ok(vec![Some(di)])
                 },
+            )?;
+            self.max_pool3d_sum_shortcuts.insert(
+                pooled.0,
+                MaxPool3dSumShortcut {
+                    input,
+                    batch: b_,
+                    channels: ch_,
+                    input_d: id_,
+                    input_h: ih_,
+                    input_w: iw_,
+                    kernel_d: kd_,
+                    kernel_h: kh_,
+                    kernel_w: kw_,
+                    output_d: od_,
+                    output_h: oh_,
+                    output_w: ow_,
+                    stride_d: sd_,
+                    stride_h: sh_,
+                    stride_w: sw_,
+                },
             );
+            return Ok(pooled);
         }
 
         // F32 no-grad fused fast path (dominant ML dtype; video/3D CNNs): the same
@@ -55117,6 +55246,7 @@ impl FrankenTorchSession {
         self.batch_norm2d_f32_sum_shortcuts.remove(&target.0);
         self.group_norm_f32_sum_shortcuts.remove(&target.0);
         self.avg_pool1d_sum_shortcuts.remove(&target.0);
+        self.max_pool3d_sum_shortcuts.remove(&target.0);
         let mut summary = format!("tensor_inplace_op={op} target={}", target.0);
         if let Some(extra) = extra {
             summary.push(' ');
@@ -56322,6 +56452,7 @@ impl FrankenTorchSession {
         self.batch_norm2d_f32_sum_shortcuts.remove(&node.0);
         self.group_norm_f32_sum_shortcuts.remove(&node.0);
         self.avg_pool1d_sum_shortcuts.remove(&node.0);
+        self.max_pool3d_sum_shortcuts.remove(&node.0);
         self.tensor_tape.detach_tensor_in_place(node)
     }
 
@@ -141063,7 +141194,7 @@ mod tests {
     }
 
     #[test]
-    fn functional_max_pool3d_sum_matches_pool_sum_backward_bits() {
+    fn tensor_sum_max_pool3d_reaches_scalar_shortcut_and_matches_direct_bits() {
         let (n, c, d, h, w) = (2usize, 2usize, 5usize, 4usize, 4usize);
         let xv: Vec<f64> = (0..n * c * d * h * w)
             .map(|i| ((i * 41 + 17) % 59) as f64 * 0.125 - 3.0)
@@ -141077,6 +141208,15 @@ mod tests {
             .functional_max_pool3d(x_ref, (3, 2, 2), (1, 2, 2))
             .unwrap();
         let loss_ref = reference.tensor_sum(out_ref).unwrap();
+        assert!(
+            reference.evidence().iter().any(|entry| {
+                entry.kind == EvidenceKind::Dispatch
+                    && entry
+                        .summary
+                        .contains("tensor_reduction_op=MaxPool3dSumShortcut")
+            }),
+            "tensor_sum(functional_max_pool3d(x)) must reach the scalar-loss shortcut"
+        );
         let loss_ref_value = reference.tensor_values(loss_ref).unwrap()[0];
         reference.tensor_backward(loss_ref).unwrap();
         let grad_ref = reference.tensor_grad(x_ref).unwrap().unwrap();
@@ -141103,6 +141243,33 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn max_pool3d_sum_shortcut_declines_when_pooled_retains_grad() {
+        let (n, c, d, h, w) = (2usize, 2usize, 5usize, 4usize, 4usize);
+        let values: Vec<f64> = (0..n * c * d * h * w)
+            .map(|i| ((i * 41 + 17) % 59) as f64 * 0.125 - 3.0)
+            .collect();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(values, vec![n, c, d, h, w], true)
+            .unwrap();
+        let pooled = session
+            .functional_max_pool3d(input, (3, 2, 2), (1, 2, 2))
+            .unwrap();
+        session.tensor_retain_grad(pooled).unwrap();
+        let loss = session.tensor_sum(pooled).unwrap();
+        assert_eq!(
+            session.tensor_grad_fn(loss).unwrap().as_deref(),
+            Some("Sum"),
+            "retain_grad must preserve the materialized MaxPool3d output edge"
+        );
+        let report = session.tensor_backward(loss).unwrap();
+        let pooled_grad = session
+            .tensor_gradient(&report, pooled)
+            .expect("retained MaxPool3d gradient");
+        assert_eq!(pooled_grad, vec![1.0; n * c * 3 * 2 * 2]);
     }
 
     #[test]
