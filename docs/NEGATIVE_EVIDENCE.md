@@ -1,5 +1,66 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## STANDING GATE: A ROW NAMES ITS WORKER *AND* ITS HARNESS, OR IT IS NOT A ROW
+
+Adopted 2026-08-15 (`frankentorch-banfj`) from three sibling projects that each
+paid for it separately:
+
+- **frankenlibc** measured malloc/free on **one** worker (`hz2`) with two
+  separately-sanctioned harnesses and got **5.9459x** and **12.385414x** — a ~2x
+  spread, with **both A/A nulls passing in tolerance**.
+- **frankenfs** made identity a gate: every timed row carries `RCH_WORKER=<id>`
+  or `same_host=<hostname>`, and it retro-flagged **166** existing rows as
+  worker-scoped rather than silently trusting them.
+- **franken_numpy** replicated a win on a second worker and **retracted a
+  sub-claim** doing it: "the deferral parallel cost is gone" read **1.004x** on
+  one host and **0.928x** on another, so the cost is still ~7.8%.
+
+Two rules follow, and they are separate:
+
+1. **Name the worker.** Both arms must be shown to have run on the **same machine
+   in the same invocation**. A row that cannot say where it ran is not comparable
+   to any other row — *including to its own later re-measurement*.
+2. **Name the harness.** A passing A/A null controls within-invocation noise; it
+   does **not** certify that the harness measures what its author thinks it
+   measures. Item 11 below is this repo's own instance: `group_norm_parallel_pays`
+   reads **0.991x** from the paired h2h lane and **4.0x** from the kernel
+   breakdown — same binary, same invocation, same machine. **When two harnesses
+   disagree, the disagreement is the finding.** Do not pick between them.
+
+### Retro-flag of everything above this line's adoption date
+
+Counted mechanically against commit `dcc6a1f5` on 2026-08-15, not estimated:
+
+| ledger sections | banking >= 1 ratio | naming a machine | **naming none** |
+|---|---|---|---|
+| 760 | 684 | 150 | **534** |
+
+**What that count actually is, stated precisely**, because a provenance rule that
+launders its own number would be self-refuting: a section counts as "banking a
+ratio" if it matches `[0-9]\.[0-9]+x`, and as "naming a machine" if it matches a
+worker/host pattern (`vmi…`, `hz…`, `ovh-…`, `same_host`, `RCH_WORKER`, `csd`).
+So **534 is an upper bound on unprovenanced rows, not a row count.** It counts
+prose that merely mentions a ratio, and it counts citations of *other* projects'
+numbers — this very section trips it, via franken_numpy's 1.004x/0.928x. It also
+misses any row whose worker is named in a neighbouring section rather than its
+own. Treat 534 as "sections a reader must not assume are cross-machine
+comparable", which is the property the flag is for; a true banked-row census
+would need each section classified by hand.
+
+**Those 534 sections are hereby flagged worker-scoped and not cross-machine
+comparable.** They are flagged wholesale, here, rather than by rewriting 534
+sections — mass mechanical edits to a 19k-line document are churn that would bury
+the content the flag is protecting.
+
+**Flagging is not retraction.** A flagged row may well be true; what is missing is
+evidence that it survives a change of machine. franken_numpy's retraction is the
+reason that distinction is not pedantry — that check came back *both* ways, 1.004x
+on one host and 0.928x on another. Also unaudited on the same grounds: 302 dirs
+under `artifacts/perf` and 24 under `tests/artifacts/perf`.
+
+Deletion condition for this section: when no unprovenanced ratio section remains
+below it.
+
 ## STANDING RULE FOR EVERY LEVER: SPLIT THE PHASE BEFORE YOU CHOOSE THE LEVER
 
 **Do not pick an optimization target by reading the source. Split the work into
