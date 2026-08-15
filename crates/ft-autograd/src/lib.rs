@@ -9208,6 +9208,81 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// Apply a f64 custom autograd function whose forward uses only caller-saved
+    /// context. Unlike [`Self::apply_function_f64_borrowed_forward`], this
+    /// avoids constructing borrowed input slices when the forward result is
+    /// already available (for example, a fused scalar loss cached by its
+    /// producer). First-order backward still receives the same saved context
+    /// and attaches to `inputs` normally.
+    pub fn apply_function_f64_saved_forward<F, B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(&mut FunctionCtx) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
+        B: Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut needs_input_grad = Vec::with_capacity(inputs.len());
+        let mut input_numels = Vec::with_capacity(inputs.len());
+        let mut any_requires_grad = false;
+        let mut output_device = Device::Cpu;
+        for &input_id in inputs {
+            let node = self.node(input_id)?;
+            let requires_grad = node.requires_grad && self.grad_enabled;
+            needs_input_grad.push(requires_grad);
+            any_requires_grad |= requires_grad;
+            // Retain the f64 validation performed by the borrowed-forward
+            // variant without retaining a slice for the forward callback.
+            input_numels.push(node.tensor.contiguous_values()?.len());
+            output_device = node.tensor.meta().device();
+        }
+
+        let mut ctx = FunctionCtx::new(needs_input_grad);
+        let (output_values, output_shape) = forward_fn(&mut ctx)?;
+        let inputs_owned = inputs.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        if !any_requires_grad || !self.grad_enabled {
+            self.nodes.push(TensorNode {
+                tensor: DenseTensor::from_storage(
+                    TensorMeta::from_shape(output_shape, DType::F64, output_device),
+                    output_values,
+                )?,
+                requires_grad: false,
+                op: TensorNodeOp::Leaf,
+            });
+            return Ok(out);
+        }
+
+        let function_id = self.next_custom_function_id;
+        self.next_custom_function_id += 1;
+        self.custom_functions.insert(
+            function_id,
+            CustomFunctionRecord {
+                ctx,
+                backward: CustomFunctionBackward::Owned(Arc::new(backward_fn)),
+                input_numel: input_numels,
+                create_graph_backward: None,
+            },
+        );
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                TensorMeta::from_shape(output_shape, DType::F64, output_device),
+                output_values,
+            )?,
+            requires_grad: any_requires_grad,
+            op: TensorNodeOp::CustomFunction {
+                inputs: inputs_owned,
+                function_id,
+            },
+        });
+        Ok(out)
+    }
+
     /// Borrowed-inputs custom op (zero-copy 1st-order backward, like
     /// [`Self::apply_function_f64_borrowed_inputs`]) that ALSO registers a
     /// create_graph backward so the op participates in double-backward without
@@ -26366,6 +26441,32 @@ mod tests {
                 },
             )
             .expect("borrowed-forward function");
+
+        assert_eq!(tape.values(y).expect("values"), vec![2.0, -4.0, 7.0]);
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn custom_function_saved_forward_owned_backward_uses_saved_context() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, -2.0, 3.5], vec![3], true).expect("x");
+
+        let y = tape
+            .apply_function_f64_saved_forward(
+                &[x],
+                |ctx| {
+                    ctx.save_for_backward(vec![2.0], vec![1]);
+                    Ok((vec![2.0, -4.0, 7.0], vec![3]))
+                },
+                |ctx, grad_outputs| {
+                    let scale = ctx.saved_tensors()[0][0];
+                    let grad = grad_outputs[0].iter().map(|grad| grad * scale).collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("saved-forward function");
 
         assert_eq!(tape.values(y).expect("values"), vec![2.0, -4.0, 7.0]);
         let report = tape.backward(y).expect("backward");

@@ -344,7 +344,13 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
         1e-5,
     );
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-    let checksum = f64::from(dx.iter().map(|g| g.abs()).sum::<f32>());
+    // Accumulate in f64. Summing 401,408 f32 values naively carries ~1e-4
+    // relative error — a hundred times the parity tolerance — so an f32
+    // accumulator reports MISMATCH against a torch arm that computed the SAME
+    // gradients, purely from the accumulator's precision. The other lanes are
+    // unaffected because the tape's gradients are already f64; this is the one
+    // lane that touches raw f32 kernel output.
+    let checksum = dx.iter().map(|g| f64::from(g.abs())).sum::<f64>();
     (elapsed, checksum)
 }
 

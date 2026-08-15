@@ -19255,6 +19255,31 @@ pool work should start from "get more hits".** A test now locks the refuse
 behaviour so the next person with the same reasonable idea has to beat this
 measurement first.
 
+**7e. A STALE SCORECARD ROW IS WORSE THAN NO ROW (`frankentorch-npod3`,
+2026-08-14).** `RELEASE_READINESS_SCORECARD` carried GroupNorm f32 train step
+`[8,64,28,28]`, 32 groups, affine grads, sum loss at **19.04x slower**, and the
+campaign was being steered by it. Re-measured against a live PyTorch 2.12.1+cpu
+arm in the same invocation, ELF `c7c0a3b2`, 6 invocations, parity `match` every
+time: the session path runs at **8.81-10.93x**. The row predated
+`frankentorch-48w0b`'s f32 affine-grad fused path and its sum-loss shortcut.
+Still a large loss — but half the advertised one, and effort was being aimed by
+the wrong number. **Re-measure a scorecard row before optimizing against it; the
+tree moves faster than the scorecard.**
+
+**7f. A PHASE SPLIT THAT COMPARES TWO DIFFERENT ROUTES SPLITS NOTHING
+(`frankentorch-npod3`).** I added a raw-kernel lane beside the session lane to
+separate "kernel" from "engine + f32/f64 conversions", saw the raw lane come out
+SLOWER, and concluded the engine was not the term. Wrong: the session lane takes
+the sum-loss shortcut (`group_norm_f32_sum_shortcuts` →
+`group_norm_backward_scalar_f32`, no upstream gradient ever materialized) while
+the raw lane takes the GENERAL route and additionally allocates a 1.6 MB all-ones
+`dy` inside the timed region, which the general backward then scans end-to-end
+just to discover it could have used the scalar path. The split measured
+**general route vs shortcut route** — a real number (21.40x, both gates PASS)
+but not the one it claimed. **Before reading a split, check that both arms enter
+the same code path; a dispatch that switches on a VALUE (here, `dy` being all
+ones) can route two nominally identical lanes to different kernels.**
+
 **8. WHAT DID PAY on this lineage — recycling, not scheduling
 (`frankentorch-v92uh`).** After a size gate (2), an avg_pool gate (3) and a serial
 pre-touch (1) all failed, the lever that worked attacked neither the thread count

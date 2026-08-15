@@ -10082,6 +10082,26 @@ pub fn avg_pool1d_backward_scalar_f64(
             .for_each(|drow| drow[..covered_len].fill(g));
         return din;
     }
+    if stride > kernel
+        && g.is_finite()
+        && g != 0.0
+        && let Some(last_start) = output_len
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(stride))
+        && let Some(covered_len) = last_start.checked_add(kernel)
+        && covered_len <= len
+    {
+        // The stride leaves gaps, but the windows still do not overlap.  Fill
+        // only their covered runs so the untouched gaps retain their initial
+        // positive zero without repeated read-modify-write accumulation.
+        din.par_chunks_mut(len).for_each(|drow| {
+            for ox in 0..output_len {
+                let start = ox * stride;
+                drow[start..start + kernel].fill(g);
+            }
+        });
+        return din;
+    }
     din.par_chunks_mut(len).for_each(|drow| {
         for ox in 0..output_len {
             let start = ox * stride;
@@ -40283,6 +40303,37 @@ mod tests {
         assert_eq!(
             got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
             expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let (gapped_len, gapped_kernel, gapped_stride) = (14usize, 2usize, 3usize);
+        let gapped_output_len = (gapped_len - gapped_kernel) / gapped_stride + 1;
+        let gapped_expected = super::avg_pool1d_backward_f64(
+            &vec![1.5f64; batch * ch * gapped_output_len],
+            batch,
+            ch,
+            gapped_len,
+            gapped_kernel,
+            gapped_output_len,
+            gapped_stride,
+        );
+        let gapped_got = super::avg_pool1d_backward_scalar_f64(
+            1.5,
+            batch,
+            ch,
+            gapped_len,
+            gapped_kernel,
+            gapped_output_len,
+            gapped_stride,
+        );
+        assert_eq!(
+            gapped_got
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            gapped_expected
                 .iter()
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()

@@ -1,0 +1,18 @@
+### RUN 1 load=14.73
+  group_norm_f32    3.861    0.353   FT 10.93x SLOWER    PT OFFSET [0.937,1.447] FT OFFSET [0.772,1.077] ratio 0.091 [0.089,0.116] match
+  group_norm_f32_kernels    6.730    0.288   FT 23.40x SLOWER    PT OFFSET [0.758,1.074] FT PASS [0.750,1.224] ratio 0.043 [0.035,0.050] match
+### RUN 2 load=16.19
+  group_norm_f32    3.561    0.404   FT 8.81x SLOWER     PT FAIL [1.057,1.558] FT OFFSET [0.809,1.143] ratio 0.113 [0.096,0.135] match
+  group_norm_f32_kernels    6.396    0.279   FT 22.96x SLOWER    PT OFFSET [0.910,1.270] FT WIDE [0.835,1.661] ratio 0.044 [0.038,0.049] match
+### RUN 3 load=17.52
+  group_norm_f32    3.358    0.358   FT 9.38x SLOWER     PT FAIL [1.286,1.858] FT OFFSET [0.816,1.108] ratio 0.107 [0.096,0.121] match
+  group_norm_f32_kernels    6.317    0.276   FT 22.92x SLOWER    PT PASS [0.840,1.239] FT FAIL [0.754,0.944] ratio 0.044 [0.040,0.054] match
+### RUN 4 load=18.42
+  group_norm_f32    3.310    0.347   FT 9.53x SLOWER     PT FAIL [1.191,1.689] FT OFFSET [0.785,1.146] ratio 0.105 [0.095,0.120] match
+  group_norm_f32_kernels    6.576    0.285   FT 23.05x SLOWER    PT OFFSET [0.762,1.095] FT OFFSET [0.817,1.023] ratio 0.043 [0.040,0.050] match
+### RUN 5 load=21.92
+  group_norm_f32    3.174    0.359   FT 8.83x SLOWER     PT FAIL [1.048,1.618] FT OFFSET [0.786,1.080] ratio 0.113 [0.098,0.125] match
+  group_norm_f32_kernels    6.094    0.303   FT 20.10x SLOWER    PT OFFSET [0.841,1.143] FT OFFSET [0.783,1.190] ratio 0.050 [0.043,0.052] match
+### RUN 6 load=29.43
+  group_norm_f32    3.205    0.355   FT 9.03x SLOWER     PT FAIL [1.106,1.614] FT FAIL [0.742,0.980] ratio 0.111 [0.090,0.132] match
+  group_norm_f32_kernels    6.449    0.301   FT 21.40x SLOWER    PT PASS [0.823,1.113] FT PASS [0.834,1.103] ratio 0.047 [0.043,0.054] match
