@@ -438,10 +438,12 @@ mod tests {
             });
             assert_eq!(stats().hits, 1);
             assert_eq!(built.len(), MIN_POOLED_LEN);
-            assert!(built
-                .iter()
-                .enumerate()
-                .all(|(index, value)| *value == index as f64));
+            assert!(
+                built
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| *value == index as f64)
+            );
         });
     }
 
