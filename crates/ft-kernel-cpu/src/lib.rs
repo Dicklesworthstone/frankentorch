@@ -11782,6 +11782,14 @@ fn conv3d_forward_direct_3x3s1_f64(
             let weight_offset1 = weight_offset0 + patch_width;
             let weight_offset2 = weight_offset1 + patch_width;
             let weight_offset3 = weight_offset2 + patch_width;
+            let biases = bias.map_or([0.0; OUT_CHANNEL_BLOCK], |values| {
+                [
+                    values[first_channel],
+                    values[first_channel + 1],
+                    values[first_channel + 2],
+                    values[first_channel + 3],
+                ]
+            });
             for oz in 0..od {
                 for oy in 0..oh {
                     for ox in 0..ow {
@@ -11811,14 +11819,10 @@ fn conv3d_forward_direct_3x3s1_f64(
                             }
                         }
                         let output_offset = (oz * oh + oy) * ow + ox;
-                        out_block[output_offset] =
-                            sums[0] + bias.map_or(0.0, |values| values[first_channel]);
-                        out_block[patch_count + output_offset] =
-                            sums[1] + bias.map_or(0.0, |values| values[first_channel + 1]);
-                        out_block[2 * patch_count + output_offset] =
-                            sums[2] + bias.map_or(0.0, |values| values[first_channel + 2]);
-                        out_block[3 * patch_count + output_offset] =
-                            sums[3] + bias.map_or(0.0, |values| values[first_channel + 3]);
+                        out_block[output_offset] = sums[0] + biases[0];
+                        out_block[patch_count + output_offset] = sums[1] + biases[1];
+                        out_block[2 * patch_count + output_offset] = sums[2] + biases[2];
+                        out_block[3 * patch_count + output_offset] = sums[3] + biases[3];
                     }
                 }
             }
@@ -41500,6 +41504,24 @@ mod tests {
         for (index, (direct, expected)) in out.iter().zip(streamed.iter()).enumerate() {
             assert_eq!(direct.to_bits(), expected.to_bits(), "output[{index}]");
         }
+
+        let out_without_bias = super::conv3d_forward_f64(
+            &padded, &weight, None, 1, 8, 5, 5, 5, 3, 3, 3, 3, 3, 3, 1, 1, 1, 8,
+        );
+        let streamed_without_bias = super::conv3d_forward_streamed_f64(
+            &padded, &weight, None, 1, 8, 5, 5, 5, 3, 3, 3, 3, 3, 3, 1, 1, 1, 8,
+        );
+        assert_eq!(
+            out_without_bias
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            streamed_without_bias
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "direct no-bias route must retain streamed bits"
+        );
     }
 
     #[test]
