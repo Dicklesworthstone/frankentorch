@@ -11291,13 +11291,16 @@ fn conv3d_forward_direct_3x3s1_f64(
             let first_plane = block * OUT_CHANNEL_BLOCK;
             let n = first_plane / out_ch;
             let first_channel = first_plane % out_ch;
-            let width = out_block.len() / patch_count;
             let batch_offset = n * in_ch * pd * ph * pw;
-            let mut weight_offsets = [0usize; OUT_CHANNEL_BLOCK];
-            for (channel_offset, weight_offset) in weight_offsets.iter_mut().enumerate().take(width)
-            {
-                *weight_offset = (first_channel + channel_offset) * patch_width;
-            }
+            // The dispatch guard requires `out_ch` to be divisible by four, so
+            // every block is full and cannot cross an NCDHW batch boundary.
+            // Keeping the four accumulators explicit lets LLVM keep them in
+            // registers instead of reloading the dynamic channel loop state at
+            // every input tap.
+            let weight_offset0 = first_channel * patch_width;
+            let weight_offset1 = weight_offset0 + patch_width;
+            let weight_offset2 = weight_offset1 + patch_width;
+            let weight_offset3 = weight_offset2 + patch_width;
             for oz in 0..od {
                 for oy in 0..oh {
                     for ox in 0..ow {
@@ -11314,21 +11317,27 @@ fn conv3d_forward_direct_3x3s1_f64(
                                     for kc in 0..3 {
                                         let value = padded[input_row + kc];
                                         let weight_index = weight_row + kc;
-                                        for channel_offset in 0..width {
-                                            sums[channel_offset] += value
-                                                * weight_flat
-                                                    [weight_offsets[channel_offset] + weight_index];
-                                        }
+                                        sums[0] +=
+                                            value * weight_flat[weight_offset0 + weight_index];
+                                        sums[1] +=
+                                            value * weight_flat[weight_offset1 + weight_index];
+                                        sums[2] +=
+                                            value * weight_flat[weight_offset2 + weight_index];
+                                        sums[3] +=
+                                            value * weight_flat[weight_offset3 + weight_index];
                                     }
                                 }
                             }
                         }
                         let output_offset = (oz * oh + oy) * ow + ox;
-                        for channel_offset in 0..width {
-                            out_block[channel_offset * patch_count + output_offset] = sums
-                                [channel_offset]
-                                + bias.map_or(0.0, |values| values[first_channel + channel_offset]);
-                        }
+                        out_block[output_offset] =
+                            sums[0] + bias.map_or(0.0, |values| values[first_channel]);
+                        out_block[patch_count + output_offset] =
+                            sums[1] + bias.map_or(0.0, |values| values[first_channel + 1]);
+                        out_block[2 * patch_count + output_offset] =
+                            sums[2] + bias.map_or(0.0, |values| values[first_channel + 2]);
+                        out_block[3 * patch_count + output_offset] =
+                            sums[3] + bias.map_or(0.0, |values| values[first_channel + 3]);
                     }
                 }
             }
@@ -40561,8 +40570,12 @@ mod tests {
 
     #[test]
     fn conv3d_direct_3x3s1_matches_streamed_reference_bits() {
-        let padded = vec![0.25f64; 8 * 5 * 5 * 5];
-        let weight = vec![0.5f64; 8 * 8 * 3 * 3 * 3];
+        let padded: Vec<f64> = (0..8 * 5 * 5 * 5)
+            .map(|index| (index % 31) as f64 * 0.03125 - 0.375)
+            .collect();
+        let weight: Vec<f64> = (0..8 * 8 * 3 * 3 * 3)
+            .map(|index| (index % 29) as f64 * 0.015625 - 0.21875)
+            .collect();
         let bias: Vec<f64> = (0..8).map(|channel| channel as f64 * 0.25).collect();
         let out = super::conv3d_forward_f64(
             &padded,
