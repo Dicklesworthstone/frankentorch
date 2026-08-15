@@ -26475,6 +26475,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_function_saved_forward_without_grad_stays_a_leaf() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, -2.0], vec![2], false).expect("x");
+
+        let y = tape
+            .apply_function_f64_saved_forward(
+                &[x],
+                |_ctx| Ok((vec![3.0], vec![1])),
+                |_ctx, _grad_outputs| Ok(vec![Some(vec![99.0, 99.0])]),
+            )
+            .expect("saved-forward no-grad function");
+
+        assert_eq!(tape.values(y).expect("values"), vec![3.0]);
+        assert!(
+            !tape.tensor_requires_grad(y).expect("requires-grad"),
+            "a saved-forward op with no grad inputs must remain a leaf"
+        );
+        assert!(
+            tape.backward(y).is_err(),
+            "a no-grad saved-forward leaf must not register a backward edge"
+        );
+    }
+
+    #[test]
     fn custom_function_f32_preserves_dtype_without_grad() {
         let mut tape = TensorTape::new();
         let x = tape
