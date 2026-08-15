@@ -8408,6 +8408,78 @@ pub fn max_pool3d_forward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * od * oh * ow];
+    if kd == 2 && kh == 2 && kw == 2 && sd == 2 && sh == 2 && sw == 2 {
+        let plane_fn = |plane: usize, orow: &mut [f64]| {
+            let ibase = plane * id * ih * iw;
+            let depth_stride = ih * iw;
+            for oz in 0..od {
+                let z0 = (oz * 2) * depth_stride;
+                let z1 = z0 + depth_stride;
+                for oy in 0..oh {
+                    let row00 = z0 + (oy * 2) * iw;
+                    let row01 = row00 + iw;
+                    let row10 = z1 + (oy * 2) * iw;
+                    let row11 = row10 + iw;
+                    for ox in 0..ow {
+                        let x0 = ox * 2;
+                        let loc000 = ibase + row00 + x0;
+                        let loc001 = loc000 + 1;
+                        let loc010 = ibase + row01 + x0;
+                        let loc011 = loc010 + 1;
+                        let loc100 = ibase + row10 + x0;
+                        let loc101 = loc100 + 1;
+                        let loc110 = ibase + row11 + x0;
+                        let loc111 = loc110 + 1;
+
+                        let mut max_value = f64::NEG_INFINITY;
+                        let candidate = input[loc000];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc001];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc010];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc011];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc100];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc101];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc110];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        let candidate = input[loc111];
+                        if candidate > max_value {
+                            max_value = candidate;
+                        }
+                        orow[(oz * oh + oy) * ow + ox] = max_value;
+                    }
+                }
+            }
+        };
+        if pool_fwd_should_parallelize(out.len() * 8, batch * ch) {
+            out.par_chunks_mut(od * oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        } else {
+            out.chunks_mut(od * oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        }
+        return out;
+    }
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * id * ih * iw;
         for oz in 0..od {
@@ -40030,6 +40102,44 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(sum.to_bits(), expected_sum.to_bits());
+    }
+
+    #[test]
+    fn max_pool3d_no_grad_2x2s2_specialization_matches_generic_bits() {
+        let input = vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let special =
+            super::max_pool3d_forward_f64(&input, 1, 1, 2, 2, 4, 2, 2, 2, 1, 1, 2, 2, 2, 2);
+        let (generic, _) = super::max_pool3d_forward_with_indices_f64(
+            &input, 1, 1, 2, 2, 4, 2, 2, 2, 1, 1, 2, 2, 2, 2,
+        );
+
+        assert_eq!(
+            special
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            generic
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
     }
 
     // frankentorch-un3os. `max_pool3d_backward_from_indices_f64` now picks a serial or
