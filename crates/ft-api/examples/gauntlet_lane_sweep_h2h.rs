@@ -1164,6 +1164,69 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         std::hint::black_box(&dx);
     }
 
+    // ESTIMATOR ARM (frankentorch-59kjf). The three per-kernel figures above sum
+    // to far less than the lane that runs the same three kernels — ~0.85 ms
+    // against ~2.0 ms, i.e. most of that lane is outside its own kernels. Two
+    // explanations have opposite consequences: per-rep allocation churn (a real
+    // lever) or the ESTIMATOR (no lever at all — the lane takes a median of four
+    // samples per round, this block takes a min, and on a host carrying a dozen
+    // peer agents a median mostly measures the neighbours).
+    //
+    // So run the lane's exact work here and report it BOTH ways. Estimator is
+    // then the only difference between the two numbers, inside one invocation on
+    // one host. Adding a separate probe instead is what produced the harness
+    // disagreement recorded as NEGATIVE_EVIDENCE item 11.
+    let step_groups = 10;
+    let mut step_samples = Vec::with_capacity(step_groups * 4);
+    for _ in 0..step_groups * 4 {
+        let started = Instant::now();
+        // Exactly what `timed_group_norm_f32_kernels` times, including summing
+        // the freshly produced forward output rather than a buffer built once.
+        let out = ft_kernel_cpu::group_norm_forward_f32(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+        );
+        let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&out, &out_meta).expect("sum");
+        let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+            1.0f32,
+            values,
+            Some(weight),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+        );
+        step_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box((&out, loss, &dx));
+    }
+    let step_min = step_samples
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, |acc, sample| acc.min(sample));
+    // The lane's estimator: median of four samples per round, then the median of
+    // those round medians. `median` here is the mean of the middle pair for an
+    // even count, matching the harness's `paired_slot_median`.
+    let mid = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        if n.is_multiple_of(2) {
+            (v[n / 2 - 1] + v[n / 2]) * 0.5
+        } else {
+            v[n / 2]
+        }
+    };
+    let step_lane_estimator = mid(step_samples
+        .chunks_exact(4)
+        .map(|round| mid(round.to_vec()))
+        .collect::<Vec<_>>());
+
     // Min, not median: this is attribution of a floor, and on a host carrying a
     // dozen other agents the median mostly measures the neighbours.
     let floor = |mut v: Vec<f64>| {
@@ -1178,7 +1241,11 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
          forward_f32 SERIAL       {fwd_serial:8.3} ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)\n  \
          sum_tensor_contiguous_f32 {sum:7.3} ms\n  \
          backward_scalar_f32      {bwd:8.3} ms   (cpg==2 path, unconditionally parallel)\n  \
-         total                    {:8.3} ms",
+         total                    {:8.3} ms\n  \
+         ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----\n  \
+         step min of {}            {step_min:8.3} ms   comparable to the per-kernel figures above\n  \
+         step lane estimator      {step_lane_estimator:8.3} ms   median of 4 per round, then median over {step_groups} rounds\n  \
+         estimator ratio          {:8.3}x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)",
         rayon::current_num_threads(),
         if units >= 64 && numel >= (1 << 17) {
             "PARALLEL"
@@ -1194,5 +1261,7 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
             "SERIAL"
         },
         fwd + sum + bwd,
+        step_samples.len(),
+        step_lane_estimator / step_min,
     );
 }

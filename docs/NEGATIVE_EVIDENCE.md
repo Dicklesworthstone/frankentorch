@@ -19586,3 +19586,52 @@ binaries share a baseline ISA, and each run self-reports its ELF digest. Item 10
 carries its ELF (`fa00c082`) for run 2 and explicitly records that run 1's binary
 was overwritten before its digest was captured — that row stays flagged as
 un-namable and is not comparable to any other.
+
+**12. REFUTED, MY OWN CLAIM FROM ITEM 11 — "57% of the GroupNorm f32 lane is
+outside its kernels" (`frankentorch-59kjf`, 2026-08-15).** I had subtracted a
+min-of-9 per-kernel figure (0.851 ms) from a lane figure (~2.0 ms) and called the
+difference overhead, then reasoned about which lever would remove it. The
+subtraction was invalid: the two numbers come from different ESTIMATORS.
+
+Measured with both estimators over the SAME work, in one invocation, one binary.
+`harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1` (AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2,
+governor powersave, 64 rayon threads, torch threads 8, mimalloc), ELF
+`72c80e41`, load 5.14 -> 15.46, build worker `vmi1293453`:
+
+| arm | estimator | time |
+|---|---|---|
+| three kernels as one timed step | min of 40 | **0.760 ms** |
+| the identical step | median of 4 per round, then median over 10 rounds | **1.149 ms** |
+| `group_norm_f32_kernels` lane | the same median-of-4 estimator, interleaved | **1.849 ms** |
+
+**The estimator alone accounts for 1.512x of the 2.43x gap.** And per-rep
+allocation churn — the lever I was about to build, with `ft_core::buffer_pool`
+already sitting there to make it easy — is REFUTED as the explanation: the step
+arm allocates the same 1.6 MiB forward output and 1.6 MiB `dx` every rep and
+drops them, exactly as the lane does. Both arms pay identical allocation. It
+cannot be what separates them.
+
+**What the residual 1.61x is, this design cannot say**, and it is recorded as
+open rather than attributed. Two candidates it cannot separate: the lane's
+samples are taken INTERLEAVED with a live PyTorch co-process and thirteen other
+lanes, whereas the step arm runs alone at the end of the process; and by that
+point the allocator has cycled thousands of same-size allocations, so the step
+arm may be reading a warmth the lane never sees (the standing in-situ-over-
+standalone finding: a ladder that inverted purely from allocator warmth).
+Separating those needs the step arm scheduled INSIDE the balanced square, not
+appended after it.
+
+**The transferable rule, which is item 6's "ratio mixing conditioned and
+unconditioned figures" arriving by a different route: never subtract two timings
+produced by different estimators and call the remainder a phase.** A min and a
+median of the same work differ here by 1.5x on this host, which is larger than
+most levers this campaign has shipped. If a phase split needs a number from
+another harness, convert the estimator first or do not do the split.
+
+**What this does NOT invalidate: the vs-PyTorch ratios themselves.** Both arms of
+every lane row are sampled interleaved and reduced by the same per-round median,
+so the ratio is estimator-matched even though the absolute FrankenTorch
+milliseconds are not comparable to a min-based kernel figure. The GroupNorm f32
+standing in this same invocation is 8.42x (session) and 8.41x (kernels-only),
+parity `match`, PT null PASS on the kernels row.
