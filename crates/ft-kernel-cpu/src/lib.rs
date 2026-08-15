@@ -10127,6 +10127,34 @@ pub fn max_pool1d_forward_f64(
     stride: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * output_len];
+    // The common 2/2 pool is a disjoint adjacent-pair scan. Keep the two
+    // comparisons in the generic order so NaNs retain the same max semantics.
+    if kernel == 2 && stride == 2 {
+        let pair_plane = |plane: usize, orow: &mut [f64]| {
+            let ibase = plane * len;
+            let pairs = input[ibase..ibase + output_len * 2].chunks_exact(2);
+            for (slot, pair) in orow.iter_mut().zip(pairs) {
+                let mut m = f64::NEG_INFINITY;
+                if pair[0] > m {
+                    m = pair[0];
+                }
+                if pair[1] > m {
+                    m = pair[1];
+                }
+                *slot = m;
+            }
+        };
+        if out.len() * 2 >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| pair_plane(plane, orow));
+        } else {
+            out.chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| pair_plane(plane, orow));
+        }
+        return out;
+    }
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * len;
         for (ox, slot) in orow.iter_mut().enumerate() {
@@ -40098,6 +40126,38 @@ mod tests {
             generic_offsets
                 .iter()
                 .map(|offset| offset.to_bits())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn max_pool1d_pair_no_grad_specialization_matches_generic_bits() {
+        let (batch, ch, len, output_len) = (1usize, 1usize, 10usize, 5usize);
+        let input = vec![
+            1.0,
+            1.0,
+            f64::NAN,
+            4.0,
+            5.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            -0.0,
+            0.0,
+        ];
+
+        let special = super::max_pool1d_forward_f64(&input, batch, ch, len, 2, output_len, 2);
+        let generic =
+            super::max_pool2d_forward_f64(&input, batch, ch, 1, len, 1, 2, 1, output_len, 1, 2);
+
+        assert_eq!(
+            special
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            generic
+                .iter()
+                .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
         );
     }
