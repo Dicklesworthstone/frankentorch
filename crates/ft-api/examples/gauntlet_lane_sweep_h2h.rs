@@ -338,7 +338,19 @@ fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f
 /// plus the end-to-end scan the general backward performs just to discover the
 /// gradient was all ones. Both arms now enter the same kernels, so the
 /// difference between them is the tape.
-fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
+/// `parallel_forward` selects the control arm, and it is the LEVER under test.
+/// `false` reproduces the schedule the numel-only gate used to pick for this
+/// shape (401,408 elements, 122,880 short of `NORM_FWD_PARALLEL_MIN`, so serial
+/// on a 64-core host); `true` is what `group_norm_parallel_pays` now picks, since
+/// the shape has 256 groups. Both produce bit-identical output, so the pair
+/// isolates scheduling and nothing else — and it runs inside ONE invocation on
+/// ONE host, which is the only form of this comparison that is admissible.
+fn timed_group_norm_f32_kernels(
+    values: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    parallel_forward: bool,
+) -> (f64, f64) {
     let spatial = GN_H * GN_W;
     let channels_per_group = GN_C / GN_GROUPS;
     // Built outside the timer: the session lane's `tensor_sum` reads a meta that
@@ -350,7 +362,7 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
         ft_core::Device::Cpu,
     );
     let started = Instant::now();
-    let out = ft_kernel_cpu::group_norm_forward_f32(
+    let out = ft_kernel_cpu::group_norm_forward_f32_scheduled(
         values,
         Some(weight),
         Some(bias),
@@ -359,6 +371,7 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
         channels_per_group,
         spatial,
         1e-5,
+        parallel_forward,
     );
     // The `sum` loss itself, which the session lane also pays: its shortcut still
     // reduces the forward output to a scalar before backward runs.
@@ -602,6 +615,11 @@ LANES = {
     # grad-space conversions separately from the kernel. The incumbent is the
     # same op under both names, so PT(kernels)/PT(f32) is a free ~1.0 control.
     "group_norm_f32_kernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # frankentorch-dmpho: the same torch op under a third name. The FrankenTorch
+    # side runs this one with the group-norm forward forced onto the old serial
+    # schedule, so the pair prices the parallel gate against one live incumbent
+    # inside one invocation. PT(serialfwd)/PT(kernels) is a free ~1.0 control.
+    "group_norm_f32_kernels_serialfwd": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     "prelu": (prx, lambda x: Fn.prelu(x,prw)),
     # frankentorch-k1hto: the same torch op under a second name, exactly as the
     # `_nopool` lanes do. The FrankenTorch side runs this one with an
@@ -787,7 +805,13 @@ LANES = {
         ),
         (
             "group_norm_f32_kernels",
-            Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb)),
+            Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, true)),
+        ),
+        (
+            // frankentorch-dmpho: the lever-off twin. Same kernels, same shape,
+            // same binary; only the forward's schedule differs.
+            "group_norm_f32_kernels_serialfwd",
+            Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, false)),
         ),
         ("prelu", Box::new(|| timed_prelu(&prx, &prw, false))),
         (
@@ -952,9 +976,11 @@ LANES = {
     // rows carry their own control: PT is byte-identical code under both names,
     // so PT(off)/PT(on) must land near 1.0 or the run is not readable at all.
     //
-    // Two suffixes name a lever-off twin. `_nopool` is `ft_core::buffer_pool`
+    // Three suffixes name a lever-off twin. `_nopool` is `ft_core::buffer_pool`
     // switched off (frankentorch-v92uh, -9pafs, -7zqbc); `_noshortcut` is the
-    // PReLU+sum deforest declined through its hook exit (frankentorch-k1hto).
+    // PReLU+sum deforest declined through its hook exit (frankentorch-k1hto);
+    // `_serialfwd` is the group-norm forward forced onto the pre-`group_norm_parallel_pays`
+    // serial schedule (frankentorch-dmpho).
     for (index, (name, _)) in lanes.iter().enumerate() {
         let Some((base, lever)) = name
             .strip_suffix("_nopool")
@@ -962,6 +988,10 @@ LANES = {
             .or_else(|| {
                 name.strip_suffix("_noshortcut")
                     .map(|base| (base, "sum shortcut"))
+            })
+            .or_else(|| {
+                name.strip_suffix("_serialfwd")
+                    .map(|base| (base, "parallel forward gate"))
             })
         else {
             continue;
@@ -1045,6 +1075,7 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
     let spatial = GN_H * GN_W;
     let channels_per_group = GN_C / GN_GROUPS;
     let numel = GN_N * GN_C * GN_H * GN_W;
+    let units = GN_N * GN_GROUPS;
     let out_meta = TensorMeta::from_shape(
         vec![GN_N, GN_C, GN_H, GN_W],
         DType::F32,
@@ -1065,6 +1096,7 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
 
     let reps = 9;
     let mut fwd = Vec::with_capacity(reps);
+    let mut fwd_serial = Vec::with_capacity(reps);
     let mut sum = Vec::with_capacity(reps);
     let mut bwd = Vec::with_capacity(reps);
     for _ in 0..reps {
@@ -1081,6 +1113,36 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         );
         fwd.push(started.elapsed().as_secs_f64() * 1_000.0);
         std::hint::black_box(&out);
+
+        // The SAME kernel forced onto the other schedule, interleaved rep by rep
+        // with the one above. This is the sentinel for the `_serialfwd` twin
+        // lane: if the paired lane reports no effect, these two numbers say
+        // whether that is because the schedules cost the same or because the flag
+        // never reached the kernel. A paired lane that reads ~1.0 for a broken
+        // switch looks exactly like one that reads ~1.0 for an honest null.
+        let started = Instant::now();
+        let out_serial = ft_kernel_cpu::group_norm_forward_f32_scheduled(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+            false,
+        );
+        fwd_serial.push(started.elapsed().as_secs_f64() * 1_000.0);
+        // Cheap on top of a 401,408-element kernel, and it turns the bit-identity
+        // claim into something this run actually checks rather than cites.
+        assert!(
+            out_serial
+                .iter()
+                .zip(out.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the two group_norm forward schedules must agree bit for bit"
+        );
+        std::hint::black_box(&out_serial);
 
         let started = Instant::now();
         let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&forward_out, &out_meta).expect("sum");
@@ -1108,21 +1170,29 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         v.sort_by(f64::total_cmp);
         v[0]
     };
-    let (fwd, sum, bwd) = (floor(fwd), floor(sum), floor(bwd));
+    let (fwd, fwd_serial, sum, bwd) = (floor(fwd), floor(fwd_serial), floor(sum), floor(bwd));
     println!(
         "\nGROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of {reps}; NOT a ratio)\n  \
          numel={numel}  groups={GN_GROUPS}  cpg={channels_per_group}  spatial={spatial}  rayon_threads={}\n  \
-         forward_f32              {fwd:8.3} ms   parallel gate {}: numel {numel} vs NORM_FWD_PARALLEL_MIN {}\n  \
+         forward_f32              {fwd:8.3} ms   schedule {}: {} groups; the numel-only gate ({} vs NORM_FWD_PARALLEL_MIN {}) would have said {}\n  \
+         forward_f32 SERIAL       {fwd_serial:8.3} ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)\n  \
          sum_tensor_contiguous_f32 {sum:7.3} ms\n  \
          backward_scalar_f32      {bwd:8.3} ms   (cpg==2 path, unconditionally parallel)\n  \
          total                    {:8.3} ms",
         rayon::current_num_threads(),
-        if numel >= (1 << 19) {
-            "MET"
+        if units >= 64 && numel >= (1 << 17) {
+            "PARALLEL"
         } else {
-            "NOT MET -> SERIAL"
+            "SERIAL"
         },
+        units,
+        numel,
         1u32 << 19,
+        if numel >= (1 << 19) {
+            "PARALLEL"
+        } else {
+            "SERIAL"
+        },
         fwd + sum + bwd,
     );
 }

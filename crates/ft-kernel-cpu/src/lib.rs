@@ -5178,6 +5178,48 @@ pub fn sdpa_backward_f32_unit_dout(
 /// serial. frankentorch-kgs4-normgate.
 const NORM_FWD_PARALLEL_MIN: usize = 1 << 19; // 524288
 
+/// Minimum parallel UNITS (groups) before the group-norm kernels will parallelize
+/// below `NORM_FWD_PARALLEL_MIN`, and the total-numel floor that must accompany
+/// them. See `group_norm_parallel_pays`.
+const GROUP_NORM_MIN_PARALLEL_UNITS: usize = 64;
+const GROUP_NORM_MIN_PARALLEL_NUMEL: usize = 1 << 17; // 131072
+
+/// Whether the per-group parallel path pays, for the GROUP-norm kernels only.
+///
+/// `NORM_FWD_PARALLEL_MIN` gates on TOTAL NUMEL, and the measurement behind it
+/// (frankentorch-kgs4-normgate) is about LayerNorm-shaped rows: `[8,768]` 0.09x,
+/// `[8,4096]` 0.41x, `[32,4096]` 0.85x, winning from `[128,4096]`. Read the row
+/// counts — 8, 8, 32, then 128. What actually failed in those cases was having
+/// only 8 or 32 parallel units to spread across the pool, not the element count;
+/// numel merely correlated with it because the row width was held fixed.
+///
+/// GroupNorm decouples the two. The scorecard's own shape, `[8,64,28,28]` with 32
+/// groups, is `batch*num_groups = 256` units of 1568 elements — MORE units than
+/// the `[128,4096]` case the note records as a win — but its 401,408 elements sit
+/// just under the 524,288 numel gate, so it took the serial path on a 64-core
+/// host. Measured cost of that, live harness breakdown, min of 9, host
+/// `thinkstation1` (5975WX, 64 rayon threads, governor powersave), quiet-load
+/// invocation: `group_norm_forward_f32` **0.703 ms serial**, versus 0.535 ms for
+/// `group_norm_backward_scalar_f32` doing comparable per-element work in parallel
+/// — i.e. the forward was the single largest kernel in the lane at 51% of its
+/// total, purely from a gate whose unit is wrong for this op.
+///
+/// The predicate is strictly a WIDENING: anything the numel gate already
+/// parallelized still parallelizes, so no shape that was measured as a win can
+/// regress. It only adds shapes with many groups and a real element count.
+/// Deliberately NOT applied to the row-norm sites, whose shapes were measured
+/// with the old rule and are not what this change measured.
+///
+/// Parallel and serial are BIT-IDENTICAL here by construction, not by tolerance:
+/// each group's mean, rstd and outputs are computed solely from that group's own
+/// elements and written to its own disjoint slice, so no reduction order and no
+/// value crosses a group boundary. `group_norm_forward_f32_serial_matches_parallel_bits`
+/// locks that.
+const fn group_norm_parallel_pays(units: usize, numel: usize) -> bool {
+    numel >= NORM_FWD_PARALLEL_MIN
+        || (units >= GROUP_NORM_MIN_PARALLEL_UNITS && numel >= GROUP_NORM_MIN_PARALLEL_NUMEL)
+}
+
 /// Fused LayerNorm forward (f64): per row of `[batch, norm_size]`, computes
 /// `y = (x - mean) / sqrt(var + eps) * weight + bias` in two streaming passes,
 /// NEVER materialising the ~14 full-size intermediates (broadcast mean/var, the
@@ -6193,8 +6235,10 @@ pub fn group_norm_forward_f64(
             }
         }
     };
-    // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
-    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+    // Reduce-then-scale over groups. Gated on the number of GROUPS as well as the
+    // element count (`group_norm_parallel_pays`): a numel-only gate left the
+    // 256-group scorecard shape on the serial path.
+    if group_norm_parallel_pays(batch * num_groups, batch * num_groups * group_numel) {
         out.par_chunks_mut(group_numel)
             .enumerate()
             .for_each(|(grp, orow)| group_fn(grp, orow));
@@ -6221,6 +6265,50 @@ pub fn group_norm_forward_f32(
     cpg: usize,
     spatial: usize,
     eps: f32,
+) -> Vec<f32> {
+    let units = batch * num_groups;
+    group_norm_forward_f32_scheduled(
+        x,
+        weight,
+        bias,
+        batch,
+        num_groups,
+        cpg,
+        spatial,
+        eps,
+        group_norm_parallel_pays(units, units * cpg * spatial),
+    )
+}
+
+/// [`group_norm_forward_f32`] with the scheduling decision supplied instead of
+/// computed, so a measurement lane can run the SAME kernel both ways inside ONE
+/// invocation on ONE host.
+///
+/// This exists because of what it costs not to have it. The gate this replaces
+/// was chosen from a measurement on a differently-shaped op, and the only way to
+/// find that out was to compare the two schedules — but a cross-invocation
+/// comparison of two binaries is not admissible evidence on a shared host (the
+/// same lane read 4.797 ms and 3.207 ms in two invocations an hour apart), and a
+/// cross-worker one is worse (frankenscipy measured a 13.6x swing for one cell
+/// across two rch workers with both A/A nulls PASSING). Injecting the flag is
+/// what makes the lever certifiable by a paired lane rather than assertable.
+///
+/// Both schedules produce BIT-IDENTICAL output — see
+/// `group_norm_forward_f32_serial_matches_parallel_bits` — so this is a
+/// scheduling knob and never a numerical one.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_forward_f32_scheduled(
+    x: &[f32],
+    weight: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    batch: usize,
+    num_groups: usize,
+    cpg: usize,
+    spatial: usize,
+    eps: f32,
+    parallel: bool,
 ) -> Vec<f32> {
     let group_numel = cpg * spatial;
     let inv_m = 1.0 / group_numel as f32;
@@ -6302,8 +6390,10 @@ pub fn group_norm_forward_f32(
             }
         }
     };
-    // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
-    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+    // Reduce-then-scale over groups; the caller supplied the schedule. See
+    // `group_norm_parallel_pays` for why the number of GROUPS decides it and not
+    // the element count alone.
+    if parallel {
         out.par_chunks_mut(group_numel)
             .enumerate()
             .for_each(|(grp, orow)| group_fn(grp, orow));
@@ -6572,8 +6662,10 @@ pub fn group_norm_backward_f64(
             dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
         }
     };
-    // Bandwidth-bound reduce-then-scale (per group): gate (NORM_FWD_PARALLEL_MIN).
-    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+    // Reduce-then-scale over groups. Gated on the number of GROUPS as well as the
+    // element count (`group_norm_parallel_pays`); see the forward for why a
+    // numel-only gate is the wrong unit for this op.
+    if group_norm_parallel_pays(batch * num_groups, batch * num_groups * group_numel) {
         dx.par_chunks_mut(group_numel)
             .enumerate()
             .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
@@ -6718,8 +6810,10 @@ pub fn group_norm_backward_f32(
             dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
         }
     };
-    // Bandwidth-bound reduce-then-scale (per group): gate (NORM_FWD_PARALLEL_MIN).
-    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+    // Reduce-then-scale over groups. Gated on the number of GROUPS as well as the
+    // element count (`group_norm_parallel_pays`); see the forward for why a
+    // numel-only gate is the wrong unit for this op.
+    if group_norm_parallel_pays(batch * num_groups, batch * num_groups * group_numel) {
         dx.par_chunks_mut(group_numel)
             .enumerate()
             .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
@@ -6815,54 +6909,56 @@ pub fn group_norm_backward_scalar_f32(
         // entries before returning the buffer, so avoid a 1.6 MiB zero-fill on
         // the scorecard's cpg=2 scalar-loss path.
         let dx = build_uninit(batch * num_groups * group_numel, |dx| {
-            dx.par_chunks_mut(group_numel).enumerate().for_each(|(grp, dxrow)| {
-                let g = grp % num_groups;
-                let base = grp * group_numel;
-                let xb = &x[base..base + group_numel];
-                let (mean, rstd, sum0, sum1) = stats[grp];
-                let c0 = g * 2;
-                let c1 = c0 + 1;
-                let w0 = weight.map_or(1.0f32, |w| w[c0]);
-                let w1 = weight.map_or(1.0f32, |w| w[c1]);
-                let dxhat0 = upstream * w0;
-                let dxhat1 = upstream * w1;
-                let c1_sum = spatial_f * (dxhat0 + dxhat1);
-                let c2_sum = rstd
-                    * (dxhat0 * (sum0 - spatial_f * mean) + dxhat1 * (sum1 - spatial_f * mean));
-                let (x0, x1) = xb.split_at(spatial);
-                let (dx0, dx1) = dxrow.split_at_mut(spatial);
-                let vmean = f32x8::splat(mean);
-                let vrstd = f32x8::splat(rstd);
-                let vinv_m = f32x8::splat(inv_m);
-                let vc1_sum = f32x8::splat(c1_sum);
-                let vc2_sum = f32x8::splat(c2_sum);
-                let vdxhat0 = f32x8::splat(dxhat0);
-                let vdxhat1 = f32x8::splat(dxhat1);
-                let mut lane = 0;
-                while lane + 8 <= spatial {
-                    let xhat = (f32x8::from(&x0[lane..lane + 8]) - vmean) * vrstd;
-                    dx0[lane..lane + 8].copy_from_slice(
-                        &(vrstd * (vdxhat0 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
-                    );
-                    lane += 8;
-                }
-                for i in lane..spatial {
-                    let xhat = (x0[i] - mean) * rstd;
-                    dx0[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
-                }
-                let mut lane = 0;
-                while lane + 8 <= spatial {
-                    let xhat = (f32x8::from(&x1[lane..lane + 8]) - vmean) * vrstd;
-                    dx1[lane..lane + 8].copy_from_slice(
-                        &(vrstd * (vdxhat1 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
-                    );
-                    lane += 8;
-                }
-                for i in lane..spatial {
-                    let xhat = (x1[i] - mean) * rstd;
-                    dx1[i] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
-                }
-            });
+            dx.par_chunks_mut(group_numel)
+                .enumerate()
+                .for_each(|(grp, dxrow)| {
+                    let g = grp % num_groups;
+                    let base = grp * group_numel;
+                    let xb = &x[base..base + group_numel];
+                    let (mean, rstd, sum0, sum1) = stats[grp];
+                    let c0 = g * 2;
+                    let c1 = c0 + 1;
+                    let w0 = weight.map_or(1.0f32, |w| w[c0]);
+                    let w1 = weight.map_or(1.0f32, |w| w[c1]);
+                    let dxhat0 = upstream * w0;
+                    let dxhat1 = upstream * w1;
+                    let c1_sum = spatial_f * (dxhat0 + dxhat1);
+                    let c2_sum = rstd
+                        * (dxhat0 * (sum0 - spatial_f * mean) + dxhat1 * (sum1 - spatial_f * mean));
+                    let (x0, x1) = xb.split_at(spatial);
+                    let (dx0, dx1) = dxrow.split_at_mut(spatial);
+                    let vmean = f32x8::splat(mean);
+                    let vrstd = f32x8::splat(rstd);
+                    let vinv_m = f32x8::splat(inv_m);
+                    let vc1_sum = f32x8::splat(c1_sum);
+                    let vc2_sum = f32x8::splat(c2_sum);
+                    let vdxhat0 = f32x8::splat(dxhat0);
+                    let vdxhat1 = f32x8::splat(dxhat1);
+                    let mut lane = 0;
+                    while lane + 8 <= spatial {
+                        let xhat = (f32x8::from(&x0[lane..lane + 8]) - vmean) * vrstd;
+                        dx0[lane..lane + 8].copy_from_slice(
+                            &(vrstd * (vdxhat0 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
+                        );
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        let xhat = (x0[i] - mean) * rstd;
+                        dx0[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
+                    }
+                    let mut lane = 0;
+                    while lane + 8 <= spatial {
+                        let xhat = (f32x8::from(&x1[lane..lane + 8]) - vmean) * vrstd;
+                        dx1[lane..lane + 8].copy_from_slice(
+                            &(vrstd * (vdxhat1 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
+                        );
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        let xhat = (x1[i] - mean) * rstd;
+                        dx1[i] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
+                    }
+                });
         });
         let (dweight, dbias) = if weight.is_some() {
             let mut dw = vec![0.0f32; channels];
@@ -37589,6 +37685,120 @@ unsafe fn transpose_block_8x8_avx2_f32(
 mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn group_norm_parallel_gate_counts_groups_not_only_elements() {
+        // The scorecard shape this was written for: [8,64,28,28], 32 groups ->
+        // 256 units of 1568 elements, 401,408 total. Under the old numel-only
+        // rule it fell 122,880 elements short of the gate and ran SERIAL on a
+        // 64-core host; it must now parallelize.
+        assert!(
+            super::group_norm_parallel_pays(8 * 32, 8 * 64 * 28 * 28),
+            "the 256-group scorecard shape must take the parallel path"
+        );
+        // Strictly a widening: everything the numel gate already admitted is
+        // still admitted, whatever the unit count.
+        assert!(super::group_norm_parallel_pays(
+            1,
+            super::NORM_FWD_PARALLEL_MIN
+        ));
+        assert!(super::group_norm_parallel_pays(
+            2,
+            4 * super::NORM_FWD_PARALLEL_MIN
+        ));
+        // ...and it does NOT admit the shapes the original measurement recorded
+        // as regressions, which are exactly the few-unit ones.
+        assert!(
+            !super::group_norm_parallel_pays(8, 8 * 768),
+            "8 units must stay serial: measured 0.09x when parallelized"
+        );
+        assert!(
+            !super::group_norm_parallel_pays(32, 32 * 4096),
+            "32 units must stay serial: measured 0.85x when parallelized"
+        );
+        // Many units but a trivial element count stays serial: fork overhead is
+        // per-unit, so units alone must not be sufficient.
+        assert!(!super::group_norm_parallel_pays(1024, 4096));
+    }
+
+    #[test]
+    fn group_norm_forward_f32_serial_matches_parallel_bits() {
+        // The isomorphism the gate change rests on. Each group's mean, rstd and
+        // outputs come solely from that group's own elements and land in its own
+        // disjoint slice, so serial and parallel must agree BIT for BIT, not to a
+        // tolerance. Run either side of the gate by choosing shapes that fall on
+        // both sides of it, and compare against a from-scratch per-group
+        // reference so a bug shared by both scheduling paths cannot hide.
+        for &(batch, channels, spatial, groups) in &[
+            (8usize, 64usize, 28 * 28usize, 32usize), // the scorecard shape: newly parallel
+            (2, 8, 33, 4),                            // tiny, ragged spatial: stays serial
+            (1, 4, 4096, 2),                          // few groups, large rows
+        ] {
+            let cpg = channels / groups;
+            let numel = batch * channels * spatial;
+            let mut z = 0x243f_6a88_85a3_08d3u64;
+            let x: Vec<f32> = (0..numel)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 40) as f32) / 1024.0 - 1.0;
+                    v
+                })
+                .collect();
+            let weight: Vec<f32> = (0..channels).map(|c| 1.0 + (c as f32) * 0.01).collect();
+            let bias: Vec<f32> = (0..channels).map(|c| (c as f32) * 0.003).collect();
+
+            let got = super::group_norm_forward_f32(
+                &x,
+                Some(&weight),
+                Some(&bias),
+                batch,
+                groups,
+                cpg,
+                spatial,
+                1e-5,
+            );
+
+            // Independent per-group reference, written serially and without any
+            // reference to the kernel's scheduling decision.
+            let group_numel = cpg * spatial;
+            let inv_m = 1.0f32 / group_numel as f32;
+            let mut want = vec![0.0f32; numel];
+            for grp in 0..batch * groups {
+                let g = grp % groups;
+                let base = grp * group_numel;
+                let xb = &x[base..base + group_numel];
+                let mut sum = 0.0f32;
+                for &v in xb {
+                    sum += v;
+                }
+                let mean = sum * inv_m;
+                let mut vsum = 0.0f32;
+                for &v in xb {
+                    let d = v - mean;
+                    vsum += d * d;
+                }
+                let rstd = 1.0f32 / (vsum * inv_m + 1e-5).sqrt();
+                for i in 0..group_numel {
+                    let c = g * cpg + i / spatial;
+                    want[base + i] = (xb[i] - mean) * rstd * weight[c] + bias[c];
+                }
+            }
+
+            assert_eq!(got.len(), want.len());
+            for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "group_norm_forward_f32 differs from the per-group reference at \
+                     index {i} for shape [{batch},{channels},{spatial}] groups={groups}: \
+                     {a} vs {b}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parallel_radix_perm_matches_serial_bit_for_bit() {
