@@ -10067,8 +10067,22 @@ pub fn avg_pool1d_backward_scalar_f64(
 ) -> Vec<f64> {
     // frankentorch-7zqbc: pooled dense gradient (accumulating route — zeros kept).
     let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
+    let g = upstream / kernel as f64;
+    if stride == kernel
+        && g.is_finite()
+        && g != 0.0
+        && let Some(covered_len) = output_len.checked_mul(kernel)
+        && covered_len <= len
+    {
+        // Disjoint windows write each covered input exactly once.  A direct fill
+        // avoids reloading and storing the same zero-initialized gradient cells
+        // while retaining the generic accumulation path for signed zero, NaN,
+        // infinity, overlap, and trailing shape edge cases.
+        din.par_chunks_mut(len)
+            .for_each(|drow| drow[..covered_len].fill(g));
+        return din;
+    }
     din.par_chunks_mut(len).for_each(|drow| {
-        let g = upstream / kernel as f64;
         for ox in 0..output_len {
             let start = ox * stride;
             for kx in 0..kernel {
@@ -40247,6 +40261,54 @@ mod tests {
                 "avg_pool1d scalar grad[{index}]"
             );
         }
+    }
+
+    #[test]
+    fn avg_pool1d_scalar_backward_disjoint_fill_preserves_bits_and_trailing_zero() {
+        let (batch, ch, len) = (2usize, 3usize, 11usize);
+        let (kernel, stride) = (2usize, 2usize);
+        let output_len = (len - kernel) / stride + 1;
+
+        let expected = super::avg_pool1d_backward_f64(
+            &vec![1.5f64; batch * ch * output_len],
+            batch,
+            ch,
+            len,
+            kernel,
+            output_len,
+            stride,
+        );
+        let got =
+            super::avg_pool1d_backward_scalar_f64(1.5, batch, ch, len, kernel, output_len, stride);
+        assert_eq!(
+            got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let signed_zero_expected = super::avg_pool1d_backward_f64(
+            &vec![-0.0f64; batch * ch * output_len],
+            batch,
+            ch,
+            len,
+            kernel,
+            output_len,
+            stride,
+        );
+        let signed_zero_got =
+            super::avg_pool1d_backward_scalar_f64(-0.0, batch, ch, len, kernel, output_len, stride);
+        assert_eq!(
+            signed_zero_got
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            signed_zero_expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
