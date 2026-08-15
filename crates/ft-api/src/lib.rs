@@ -380,6 +380,16 @@ struct GroupNormF32SumShortcut {
     eps: f32,
 }
 
+/// Registered on the f64 grad-path output of `tensor_prelu` so an immediately
+/// following `tensor_sum` can propagate its scalar upstream value without
+/// materialising the dense all-ones PReLU output gradient.
+#[derive(Clone)]
+struct PreluSumShortcut {
+    input: TensorNodeId,
+    weight: TensorNodeId,
+    input_shape: Vec<usize>,
+}
+
 /// Registered on the f64 grad-path output of `functional_avg_pool1d` so that a
 /// following `tensor_sum` can reach the fused scalar-loss backward without the
 /// caller having to know the `functional_avg_pool1d_sum` name
@@ -483,6 +493,7 @@ pub struct FrankenTorchSession {
     batch_norm1d_sum_shortcuts: BTreeMap<usize, BatchNorm1dSumShortcut>,
     batch_norm2d_f32_sum_shortcuts: BTreeMap<usize, BatchNorm2dF32SumShortcut>,
     group_norm_f32_sum_shortcuts: BTreeMap<usize, GroupNormF32SumShortcut>,
+    prelu_sum_shortcuts: BTreeMap<usize, PreluSumShortcut>,
     avg_pool1d_sum_shortcuts: BTreeMap<usize, AvgPool1dSumShortcut>,
     avg_pool2d_sum_shortcuts: BTreeMap<usize, AvgPool2dSumShortcut>,
     max_pool1d_sum_shortcuts: BTreeMap<usize, MaxPool1dSumShortcut>,
@@ -649,6 +660,7 @@ impl FrankenTorchSession {
             batch_norm1d_sum_shortcuts: BTreeMap::new(),
             batch_norm2d_f32_sum_shortcuts: BTreeMap::new(),
             group_norm_f32_sum_shortcuts: BTreeMap::new(),
+            prelu_sum_shortcuts: BTreeMap::new(),
             avg_pool1d_sum_shortcuts: BTreeMap::new(),
             avg_pool2d_sum_shortcuts: BTreeMap::new(),
             max_pool1d_sum_shortcuts: BTreeMap::new(),
@@ -702,6 +714,8 @@ impl FrankenTorchSession {
             .retain(|&node_id, _| node_id < boundary);
         self.group_norm_f32_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
+        self.prelu_sum_shortcuts
+            .retain(|&node_id, _| node_id < boundary);
         self.avg_pool1d_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
         self.avg_pool2d_sum_shortcuts
@@ -720,6 +734,7 @@ impl FrankenTorchSession {
         self.batch_norm1d_sum_shortcuts.clear();
         self.batch_norm2d_f32_sum_shortcuts.clear();
         self.group_norm_f32_sum_shortcuts.clear();
+        self.prelu_sum_shortcuts.clear();
         self.avg_pool1d_sum_shortcuts.clear();
         self.avg_pool2d_sum_shortcuts.clear();
         self.max_pool1d_sum_shortcuts.clear();
@@ -21902,7 +21917,8 @@ impl FrankenTorchSession {
             // frankentorch-avfl.
             let ndim = input_shape.len();
             let shape_f64: Vec<f64> = input_shape.iter().map(|&d| d as f64).collect();
-            return self.tensor_apply_function_f64_borrowed_inputs(
+            let shortcut_shape = input_shape.clone();
+            let out = self.tensor_apply_function_f64_borrowed_inputs(
                 &[input, weight],
                 move |_ctx, inputs| {
                     let (xv, x_shape) = inputs[0];
@@ -22007,7 +22023,16 @@ impl FrankenTorchSession {
                     };
                     Ok(vec![Some(grad_x), Some(grad_w)])
                 },
+            )?;
+            self.prelu_sum_shortcuts.insert(
+                out.0,
+                PreluSumShortcut {
+                    input,
+                    weight,
+                    input_shape: shortcut_shape,
+                },
             );
+            return Ok(out);
         }
 
         // No-grad f32 fast path (correctness bug + asymmetric-dtype): the f64 path below reads
@@ -25415,6 +25440,9 @@ impl FrankenTorchSession {
         if let Some(out) = self.try_group_norm_f32_sum_shortcut(input)? {
             return Ok(out);
         }
+        if let Some(out) = self.try_prelu_sum_shortcut(input)? {
+            return Ok(out);
+        }
         if let Some(out) = self.try_avg_pool2d_sum_shortcut(input)? {
             return Ok(out);
         }
@@ -25430,6 +25458,135 @@ impl FrankenTorchSession {
         let (out, event) = self.tensor_tape.sum(input, self.mode())?;
         self.record_tensor_reduction_operation(&event);
         Ok(out)
+    }
+
+    fn try_prelu_sum_shortcut(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<Option<TensorNodeId>, AutogradError> {
+        let Some(shortcut) = self.prelu_sum_shortcuts.get(&input.0).cloned() else {
+            return Ok(None);
+        };
+        if self.tensor_tape.tensor_retains_grad(input)?
+            || self.tensor_tape.tensor_has_hooks(input)?
+        {
+            return Ok(None);
+        }
+
+        let sum = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
+                .map_err(|error| {
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
+                })?
+        };
+        let PreluSumShortcut {
+            input: source,
+            weight,
+            input_shape,
+        } = shortcut;
+        let ndim = input_shape.len();
+        let channel_size = if ndim >= 2 {
+            input_shape[2..].iter().product::<usize>().max(1)
+        } else {
+            1
+        };
+        let out = self.tensor_apply_function_f64_borrowed_inputs(
+            &[source, weight],
+            move |_ctx, _inputs| Ok((vec![sum], vec![1])),
+            move |_ctx, grad_outputs, borrowed| {
+                let upstream = grad_outputs[0][0];
+                let xv = borrowed[0].0;
+                let wv = borrowed[1].0;
+                let nch = wv.len();
+                let channel_for = |i: usize| {
+                    if nch == 1 {
+                        0
+                    } else if ndim >= 2 {
+                        (i / channel_size) % nch
+                    } else {
+                        i % nch
+                    }
+                };
+                let grad_x: Vec<f64> = if xv.len() >= 65_536 {
+                    use rayon::prelude::*;
+                    (0..xv.len())
+                        .into_par_iter()
+                        .map(|i| {
+                            if xv[i] >= 0.0 {
+                                upstream
+                            } else {
+                                upstream * wv[channel_for(i)]
+                            }
+                        })
+                        .collect()
+                } else {
+                    xv.iter()
+                        .enumerate()
+                        .map(|(i, &x)| {
+                            if x >= 0.0 {
+                                upstream
+                            } else {
+                                upstream * wv[channel_for(i)]
+                            }
+                        })
+                        .collect()
+                };
+                let mut grad_w = vec![0.0_f64; nch];
+                if nch == 1 {
+                    for &x in xv {
+                        if x < 0.0 {
+                            grad_w[0] += upstream * x;
+                        }
+                    }
+                } else {
+                    use rayon::prelude::*;
+                    grad_w.par_iter_mut().enumerate().for_each(|(c, slot)| {
+                        let mut acc = 0.0_f64;
+                        if ndim >= 2 {
+                            let channel_span = nch * channel_size;
+                            let outer = xv.len() / channel_span;
+                            if outer * channel_span == xv.len() {
+                                for n in 0..outer {
+                                    let start = n * channel_span + c * channel_size;
+                                    let end = start + channel_size;
+                                    for &x in &xv[start..end] {
+                                        if x < 0.0 {
+                                            acc += upstream * x;
+                                        }
+                                    }
+                                }
+                            } else {
+                                for (i, &x) in xv.iter().enumerate() {
+                                    if channel_for(i) == c && x < 0.0 {
+                                        acc += upstream * x;
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut i = c;
+                            while i < xv.len() {
+                                let x = xv[i];
+                                if x < 0.0 {
+                                    acc += upstream * x;
+                                }
+                                i += nch;
+                            }
+                        }
+                        *slot = acc;
+                    });
+                }
+                Ok(vec![Some(grad_x), Some(grad_w)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "tensor_reduction_op=PreluSumShortcut input={} source={} out={}",
+                input.0, source.0, out.0
+            ),
+        );
+        Ok(Some(out))
     }
 
     fn try_batch_norm1d_sum_shortcut(
@@ -164529,6 +164686,71 @@ mod tests {
             .expect("prelu grad_w2 present");
         assert_eq!(gx2, vec![1.0, 0.5, 0.1, 1.0]);
         assert_eq!(gw2, vec![-2.0, -3.0]);
+    }
+
+    #[test]
+    fn prelu_sum_shortcut_matches_retained_materialized_backward_bits() {
+        let values: Vec<f64> = (0..2 * 3 * 5)
+            .map(|i| ((i * 41 % 97) as f64 - 61.0) * 0.03125)
+            .collect();
+        let weights = vec![0.5_f64, -0.25, 0.125];
+
+        // Retaining the PReLU output declines the shortcut and therefore pins
+        // the ordinary materialized-sum gradient route as the reference.
+        let mut materialized = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_materialized = materialized
+            .tensor_variable(values.clone(), vec![2, 3, 5], true)
+            .unwrap();
+        let w_materialized = materialized
+            .tensor_variable(weights.clone(), vec![3], true)
+            .unwrap();
+        let prelu_materialized = materialized
+            .tensor_prelu(x_materialized, w_materialized)
+            .unwrap();
+        materialized.tensor_retain_grad(prelu_materialized).unwrap();
+        let loss_materialized = materialized.tensor_sum(prelu_materialized).unwrap();
+        let loss_value = materialized.tensor_values(loss_materialized).unwrap();
+        let report_materialized = materialized.tensor_backward(loss_materialized).unwrap();
+
+        let mut shortcut = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_shortcut = shortcut
+            .tensor_variable(values, vec![2, 3, 5], true)
+            .unwrap();
+        let w_shortcut = shortcut.tensor_variable(weights, vec![3], true).unwrap();
+        let prelu_shortcut = shortcut.tensor_prelu(x_shortcut, w_shortcut).unwrap();
+        let loss_shortcut = shortcut.tensor_sum(prelu_shortcut).unwrap();
+        let shortcut_value = shortcut.tensor_values(loss_shortcut).unwrap();
+        let report_shortcut = shortcut.tensor_backward(loss_shortcut).unwrap();
+
+        assert_eq!(shortcut_value[0].to_bits(), loss_value[0].to_bits());
+        assert_eq!(
+            shortcut
+                .tensor_gradient(&report_shortcut, x_shortcut)
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            materialized
+                .tensor_gradient(&report_materialized, x_materialized)
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            shortcut
+                .tensor_gradient(&report_shortcut, w_shortcut)
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            materialized
+                .tensor_gradient(&report_materialized, w_materialized)
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
