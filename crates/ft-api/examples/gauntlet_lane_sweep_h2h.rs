@@ -116,6 +116,17 @@ const MP3_D: usize = 16;
 const MP3_H: usize = 32;
 const MP3_W: usize = 32;
 
+// frankentorch-kgs4.115: GroupNorm f32 train step, copied from the scorecard row
+// that records it at 19.04x slower — [8,64,28,28], 32 groups, affine grads, sum
+// loss. That number predates the f32 affine-grad fused path (frankentorch-48w0b),
+// so this lane exists to find out what the standing actually IS rather than to
+// re-quote it.
+const GN_N: usize = 8;
+const GN_C: usize = 64;
+const GN_H: usize = 28;
+const GN_W: usize = 28;
+const GN_GROUPS: usize = 32;
+
 /// One FrankenTorch lane: runs a single timed forward+backward, returning
 /// (milliseconds, gradient checksum).
 type LaneRun<'a> = Box<dyn Fn() -> (f64, f64) + 'a>;
@@ -246,6 +257,87 @@ where
     (elapsed, checksum)
 }
 
+/// GroupNorm f32 train step: f32 input leaf plus f32 affine parameters, all three
+/// requiring grad, with every leaf built before the declared timed region.
+///
+/// Deliberately a separate function rather than a generic over dtype: `timed_op`
+/// builds an f64 leaf, and quietly handing this lane an f64 input would compare
+/// FrankenTorch's f64 path against PyTorch's f32 one and read as a large loss for
+/// a reason that has nothing to do with the kernel. The whole scorecard row is
+/// about the f32 GRAD path, so the dtype is the measurement.
+fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable_f32(values.to_vec(), vec![GN_N, GN_C, GN_H, GN_W], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable_f32(weight.to_vec(), vec![GN_C], true)
+        .expect("weight");
+    let b = session
+        .tensor_variable_f32(bias.to_vec(), vec![GN_C], true)
+        .expect("bias");
+    let started = Instant::now();
+    let out = session
+        .functional_group_norm(x, GN_GROUPS, Some(w), Some(b), 1e-5)
+        .expect("group_norm");
+    let loss = session.tensor_sum(out).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    (elapsed, checksum)
+}
+
+/// The same GroupNorm f32 work with NO session and NO tape: the two kernels
+/// called directly, on f32 throughout.
+///
+/// This is the phase split, taken in the same invocation as the lane it splits,
+/// so it costs one build instead of two round trips through a saturated fleet.
+/// Reading the three numbers together answers the question the scorecard row
+/// cannot:
+///
+///   PT vs `group_norm_f32`         the standing
+///   `group_norm_f32` vs this       what the engine + dtype conversions cost
+///   PT vs this                     whether the KERNEL is competitive at all
+///
+/// The engine term is the interesting one and it is structural, not incidental:
+/// `apply_function_f32_output_with_create_graph_borrowed_inputs` takes incoming
+/// gradients as `&[&[f64]]` and returns `Vec<Option<Vec<f64>>>`, so the tape's
+/// gradient space is f64 even for an f32 op. Every f32 backward therefore
+/// downcasts the incoming gradient and upcasts its results — two full-size
+/// conversions plus their allocations, here over 401,408 elements. This lane
+/// prices that, rather than assuming it matters.
+fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
+    let spatial = GN_H * GN_W;
+    let channels_per_group = GN_C / GN_GROUPS;
+    let started = Instant::now();
+    let out = ft_kernel_cpu::group_norm_forward_f32(
+        values,
+        Some(weight),
+        Some(bias),
+        GN_N,
+        GN_GROUPS,
+        channels_per_group,
+        spatial,
+        1e-5,
+    );
+    // `sum` loss, so the upstream gradient is all ones — the same thing the
+    // session lane's `tensor_sum` produces, kept in f32 here.
+    let dy = vec![1.0f32; out.len()];
+    let (dx, _, _) = ft_kernel_cpu::group_norm_backward_f32(
+        &dy,
+        values,
+        Some(weight),
+        GN_N,
+        GN_GROUPS,
+        channels_per_group,
+        spatial,
+        1e-5,
+    );
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = f64::from(dx.iter().sum::<f32>());
+    (elapsed, checksum)
+}
+
 /// Time Conv3d with both tensor leaves built before the declared timed region.
 ///
 /// The PyTorch arm constructs `c3w` during setup and reuses it for every sample.
@@ -317,6 +409,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c3x = seq(C3_N * C3_CI * C3_D * C3_H * C3_W);
     let c3w = seq(C3_CO * C3_CI * C3_K * C3_K * C3_K);
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
+    // Built by the SAME formula the python arm uses, then cast — so the two arms
+    // normalize identical numbers and the gradient checksum is a real parity check
+    // rather than a coincidence of shapes.
+    #[allow(clippy::cast_possible_truncation)]
+    let gnx: Vec<f32> = seq(GN_N * GN_C * GN_H * GN_W)
+        .into_iter()
+        .map(|value| value as f32)
+        .collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let gnw: Vec<f32> = seq(GN_C)
+        .into_iter()
+        .map(|value| (value * 10.0 + 1.0) as f32)
+        .collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let gnb: Vec<f32> = seq(GN_C)
+        .into_iter()
+        .map(|value| (value * 3.0) as f32)
+        .collect();
 
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     // Setup only. The request/serve/quit loop is appended from the library so the
@@ -335,6 +445,14 @@ ap2=seq(8*64*64*64).reshape(8,64,64,64)
 c3x=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 c3w=seq(32*32*3*3*3).reshape(32,32,3,3,3)
 mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
+# frankentorch-kgs4.115 GroupNorm f32 train step, shape and groups copied verbatim
+# from the scorecard row so the two describe the same workload. f32 on BOTH sides:
+# `.float()` here, `tensor_variable_f32` there. The affine parameters require grad,
+# which is the whole point of the row — the f32 no-grad path has long been fused,
+# and it is the GRAD path the scorecard measured at 19.04x.
+gnx=seq(8*64*28*28).reshape(8,64,28,28).float()
+gnw=(seq(64)*10.0+1.0).float().requires_grad_(True)
+gnb=(seq(64)*3.0).float().requires_grad_(True)
 # frankentorch-574cu: this arm declares the region it times, so a change to
 # `run` below that is not mirrored here fails the run instead of silently
 # biasing every ratio. Written as an independent literal rather than generated
@@ -364,6 +482,12 @@ LANES = {
     # takes from the pool.
     "avg_pool2d_nopool": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "max_pool1d_nopool": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
+    "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # The FrankenTorch side of this second name calls the two f32 kernels
+    # DIRECTLY, with no session and no tape, to price the engine and the f64
+    # grad-space conversions separately from the kernel. The incumbent is the
+    # same op under both names, so PT(kernels)/PT(f32) is a free ~1.0 control.
+    "group_norm_f32_kernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
 }
 "#;
     let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
@@ -528,6 +652,14 @@ LANES = {
                 ft_core::buffer_pool::set_enabled(true);
                 sample
             }),
+        ),
+        (
+            "group_norm_f32",
+            Box::new(|| timed_group_norm_f32(&gnx, &gnw, &gnb)),
+        ),
+        (
+            "group_norm_f32_kernels",
+            Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb)),
         ),
         (
             "conv3d",
