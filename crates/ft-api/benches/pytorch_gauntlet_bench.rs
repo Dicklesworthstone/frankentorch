@@ -1087,28 +1087,59 @@ criterion_group!(
 /// less than 10%. Numbers published without saying which allocator produced them
 /// therefore overstate FrankenTorch's losses, silently and by a lot
 /// (`frankentorch-ug4ep`, `frankentorch-1ji9l`).
-fn print_allocator_provenance() {
+fn allocator_provenance() -> String {
     let allocator = if cfg!(feature = "fair-alloc") {
         "mimalloc (built with --features fair-alloc)"
     } else {
         "system (glibc malloc)"
     };
-    println!("gauntlet allocator: {allocator}");
+    let mut provenance = format!("gauntlet allocator: {allocator}\n");
     if !cfg!(feature = "fair-alloc") {
-        println!(
-            "gauntlet WARNING: these FrankenTorch-vs-PyTorch ratios include per-iteration \
-             mmap/munmap churn on each lane's input rebuild, which PyTorch's caching allocator \
-             does not pay. They OVERSTATE FrankenTorch's losses — by up to ~4x on the 32 MB-input \
-             lanes. Re-run with --features fair-alloc before quoting any ratio from this bench."
-        );
+        provenance.push_str(concat!(
+            "gauntlet WARNING: these FrankenTorch-vs-PyTorch ratios include per-iteration ",
+            "mmap/munmap churn on each lane's input rebuild, which PyTorch's caching allocator ",
+            "does not pay. They OVERSTATE FrankenTorch's losses — by up to ~4x on the 32 MB-input ",
+            "lanes. Re-run with --features fair-alloc before quoting any ratio from this bench."
+        ));
+        provenance.push('\n');
     }
+    provenance
+}
+
+fn gauntlet_provenance(executing_elf_sha256: &str) -> String {
+    format!(
+        "executing_elf_sha256={executing_elf_sha256}\n{}",
+        allocator_provenance()
+    )
 }
 
 fn main() {
     // Printed before Criterion runs, so the provenance is attached to the
     // numbers in any captured log rather than being something a reader has to
     // reconstruct from the build command.
-    print_allocator_provenance();
+    print!(
+        "{}",
+        gauntlet_provenance(&ft_api::harness_provenance::executing_elf_sha256())
+    );
     benches();
     Criterion::default().configure_from_args().final_summary();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gauntlet_provenance;
+
+    #[test]
+    fn provenance_starts_with_the_executing_elf_digest() {
+        let digest = "9e0c16f60d469cf4c2ec7a67c861126a05e9e2e4c44e2f3075103c24a2d6ac21";
+        let provenance = gauntlet_provenance(digest);
+        assert!(
+            provenance.starts_with(&format!("executing_elf_sha256={digest}\n")),
+            "provenance must bind the live gauntlet row to the executing binary: {provenance}"
+        );
+        assert!(
+            provenance.contains("gauntlet allocator:"),
+            "the allocator provenance must remain attached: {provenance}"
+        );
+    }
 }
