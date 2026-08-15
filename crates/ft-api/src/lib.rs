@@ -165002,6 +165002,174 @@ mod tests {
         );
     }
 
+    /// Which callers of the f64 borrowed-inputs helper reject or widen f32.
+    ///
+    /// `tensor_apply_function_f64_borrowed_inputs` reads its inputs with the f64
+    /// accessor and hardcodes `DType::F64` in its output meta, so every caller
+    /// lacking an upcast-compute-narrow guard inherits the defect `wp18c` found in
+    /// `rrelu` — a hard `UnsupportedDType(F32)` rather than a silent widening.
+    /// torch accepts f32 for all of these. frankentorch-1knqk.
+    ///
+    /// **The sweep came back clean: all ten call sites already keep f32.** `rrelu`
+    /// was the only unguarded one, and the nine others reach an f32 fast path that
+    /// returns before the helper is ever entered. A grep for "does this function
+    /// body mention a dtype guard" reported 10 candidates and was wrong 10 times —
+    /// the guard is often an earlier fast path, not a visible `!= DType::F64`.
+    ///
+    /// Kept as a live gate rather than a one-off survey: it costs ~0.01s and it
+    /// fails the moment someone adds a new caller of the helper without a guard, or
+    /// removes an existing f32 fast path. Reports every op rather than stopping at
+    /// the first.
+    #[test]
+    fn f64_borrowed_helper_callers_accept_f32_survey() {
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            Box<dyn Fn(&mut FrankenTorchSession) -> Result<TensorNodeId, AutogradError>>,
+        )> = vec![
+            (
+                "tensor_sum",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    let x = s.tensor_variable_f32(vec![1.0, 2.0, 3.0], vec![3], false)?;
+                    s.tensor_sum(x)
+                }),
+            ),
+            (
+                "tensor_prelu",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    let x = s.tensor_variable_f32(vec![-1.0, 0.0, 1.0], vec![3], false)?;
+                    let w = s.tensor_variable_f32(vec![0.25], vec![1], false)?;
+                    s.tensor_prelu(x, w)
+                }),
+            ),
+            (
+                "tensor_cdist",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    let a = s.tensor_variable_f32(vec![0.0, 0.0, 1.0, 1.0], vec![2, 2], false)?;
+                    let b = s.tensor_variable_f32(vec![1.0, 0.0, 0.0, 2.0], vec![2, 2], false)?;
+                    s.tensor_cdist(a, b, 2.0)
+                }),
+            ),
+            (
+                "tensor_smooth_l1_loss",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    let i = s.tensor_variable_f32(vec![0.5, -1.5, 2.0], vec![3], false)?;
+                    let t = s.tensor_variable_f32(vec![0.0, 0.0, 1.0], vec![3], false)?;
+                    s.tensor_smooth_l1_loss(i, t, "mean", 1.0)
+                }),
+            ),
+            (
+                "tensor_cross_entropy",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    // Soft-label form: probability target matching the [N, C] input.
+                    let i = s.tensor_variable_f32(vec![1.0, 2.0, 0.5, 0.25], vec![2, 2], false)?;
+                    let t = s.tensor_variable_f32(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false)?;
+                    s.tensor_cross_entropy(i, t, "mean")
+                }),
+            ),
+            (
+                "tensor_gaussian_nll_loss",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    let i = s.tensor_variable_f32(vec![0.5, 1.5], vec![2], false)?;
+                    let t = s.tensor_variable_f32(vec![0.0, 1.0], vec![2], false)?;
+                    let v = s.tensor_variable_f32(vec![1.0, 2.0], vec![2], false)?;
+                    s.tensor_gaussian_nll_loss(i, t, v, "mean", false)
+                }),
+            ),
+            (
+                "tensor_scaled_dot_product_attention",
+                Box::new(|s: &mut FrankenTorchSession| {
+                    let q =
+                        s.tensor_variable_f32(vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2], false)?;
+                    let k =
+                        s.tensor_variable_f32(vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2], false)?;
+                    let v =
+                        s.tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2], false)?;
+                    s.tensor_scaled_dot_product_attention(q, k, v, None, false, None)
+                }),
+            ),
+        ];
+
+        let mut report = Vec::new();
+        for (name, build) in cases {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            match build(&mut s) {
+                Err(e) => report.push(format!("  {name:38} ERRORS: {e:?}")),
+                Ok(out) => match s.tensor_dtype(out) {
+                    Ok(DType::F32) => {}
+                    Ok(other) => report.push(format!("  {name:38} widened to {other:?}")),
+                    Err(e) => report.push(format!("  {name:38} dtype query failed: {e:?}")),
+                },
+            }
+        }
+        // Three sites do not fit the closure vector above — the batch-norm pair
+        // returns a tuple, and `scaled_dot_product_attention` is a separate public
+        // entry point from `tensor_scaled_dot_product_attention` with a different
+        // signature (dropout_p instead of scale). Checked directly so the survey
+        // covers all ten, not seven.
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mk = |s: &mut FrankenTorchSession| {
+                s.tensor_variable_f32(vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2], false)
+            };
+            match (mk(&mut s), mk(&mut s), mk(&mut s)) {
+                (Ok(q), Ok(k), Ok(v)) => {
+                    match s.scaled_dot_product_attention(q, k, v, None, 0.0, false) {
+                        Err(e) => report.push(format!(
+                            "  {:38} ERRORS: {e:?}",
+                            "scaled_dot_product_attention"
+                        )),
+                        Ok(out) => {
+                            if s.tensor_dtype(out) != Ok(DType::F32) {
+                                report.push(format!(
+                                    "  {:38} widened to {:?}",
+                                    "scaled_dot_product_attention",
+                                    s.tensor_dtype(out)
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => report.push(format!("  {:38} f32 leaf build failed", "sdpa inputs")),
+            }
+        }
+        for (name, is_2d) in [
+            ("tensor_batch_norm2d_sum", true),
+            ("functional_batch_norm1d_sum", false),
+        ] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            // [N, C, H, W] for 2d, [N, C, L] for 1d.
+            let shape = if is_2d {
+                vec![2, 2, 1, 1]
+            } else {
+                vec![2, 2, 1]
+            };
+            let x = s
+                .tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], shape, false)
+                .expect("f32 leaf");
+            let built = if is_2d {
+                s.tensor_batch_norm2d_sum(x, None, None, None, None, true, 0.1, 1e-5)
+            } else {
+                s.functional_batch_norm1d_sum(x, None, None, None, None, true, 0.1, 1e-5)
+            };
+            match built {
+                Err(e) => report.push(format!("  {name:38} ERRORS: {e:?}")),
+                Ok((out, _, _)) => {
+                    if s.tensor_dtype(out) != Ok(DType::F32) {
+                        report.push(format!("  {name:38} widened to {:?}", s.tensor_dtype(out)));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            report.is_empty(),
+            "callers of tensor_apply_function_f64_borrowed_inputs that do not keep f32 \
+             (torch accepts f32 for all of these) — frankentorch-1knqk:\n{}",
+            report.join("\n")
+        );
+    }
+
     /// `rrelu` preserves the input dtype, like torch, instead of widening to f64.
     ///
     /// `tensor_rrelu` routes through `tensor_apply_function_f64_borrowed_inputs`,
