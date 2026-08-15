@@ -136,6 +136,7 @@ storage.sqlite3-wal.corrupt-*
 # files. br reads the DB *through* this layer, so these are not optional
 # scratch, but they are local-only and must not be committed.
 .beads/beads.db-fsqlite-ns-*
+.beads/*.db-wal-cert*
 
 # Beads recovery scratch databases and probe directories
 artifacts/beads_recovery/
