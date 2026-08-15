@@ -10167,6 +10167,40 @@ pub fn max_pool1d_forward_with_indices_f64(
 ) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; batch * ch * output_len];
     let mut arg_offsets = vec![0.0f64; batch * ch * output_len];
+    // The common 2/2 pool is a disjoint adjacent-pair scan. Keep the two
+    // comparisons in the generic order so first ties and NaNs retain the exact
+    // first-argmax behaviour of the fallback below.
+    if kernel == 2 && stride == 2 {
+        let pair_plane = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
+            let ibase = plane * len;
+            let pairs = input[ibase..ibase + output_len * 2].chunks_exact(2);
+            for (ox, pair) in pairs.enumerate() {
+                let mut m = f64::NEG_INFINITY;
+                let mut arg = ox * 2;
+                if pair[0] > m {
+                    m = pair[0];
+                }
+                if pair[1] > m {
+                    m = pair[1];
+                    arg += 1;
+                }
+                orow[ox] = m;
+                arow[ox] = arg as f64;
+            }
+        };
+        if out.len() * 2 >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(output_len)
+                .zip(arg_offsets.par_chunks_mut(output_len))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| pair_plane(plane, orow, arow));
+        } else {
+            out.chunks_mut(output_len)
+                .zip(arg_offsets.chunks_mut(output_len))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| pair_plane(plane, orow, arow));
+        }
+        return (out, arg_offsets);
+    }
     let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
         let ibase = plane * len;
         for ox in 0..output_len {
@@ -39960,6 +39994,50 @@ mod tests {
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "1-D serial driver must be bit-identical to the parallel one"
+        );
+    }
+
+    #[test]
+    fn max_pool1d_pair_specialization_matches_generic_first_argmax_bits() {
+        let (batch, ch, len, output_len) = (1usize, 1usize, 10usize, 5usize);
+        let input = vec![
+            1.0,
+            1.0,
+            f64::NAN,
+            4.0,
+            5.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            -0.0,
+            0.0,
+        ];
+
+        let (special_values, special_offsets) =
+            super::max_pool1d_forward_with_indices_f64(&input, batch, ch, len, 2, output_len, 2);
+        let (generic_values, generic_offsets) = super::max_pool2d_forward_with_indices_f64(
+            &input, batch, ch, 1, len, 1, 2, 1, output_len, 1, 2,
+        );
+
+        assert_eq!(
+            special_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            generic_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            special_offsets
+                .iter()
+                .map(|offset| offset.to_bits())
+                .collect::<Vec<_>>(),
+            generic_offsets
+                .iter()
+                .map(|offset| offset.to_bits())
+                .collect::<Vec<_>>(),
         );
     }
 
