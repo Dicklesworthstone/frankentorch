@@ -9501,6 +9501,42 @@ pub fn max_pool3d_backward_from_indices_f64(
     din
 }
 
+/// Dense-gradient backward for non-overlapping max-pool3d windows.
+///
+/// The caller proves that an input position can be the first argmax of at
+/// most one output window per plane. The buffer remains zeroed for untouched
+/// positions; selected positions store `0.0 + dout` so signed-zero and NaN
+/// behavior stays identical to the accumulating backward.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_backward_from_indices_nonoverlapping_f64(
+    dout: &[f64],
+    arg_offsets: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f64> {
+    let plane_len = id * ih * iw;
+    let out_plane_len = od * oh * ow;
+    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * plane_len);
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let dbase = plane * out_plane_len;
+            for (out_index, &arg_offset) in
+                arg_offsets[dbase..dbase + out_plane_len].iter().enumerate()
+            {
+                drow[arg_offset as usize] = 0.0_f64 + dout[dbase + out_index];
+            }
+        });
+    din
+}
+
 /// Scalar-loss backward for [`max_pool3d_sum_forward_with_indices_f64`].
 ///
 /// Equivalent to scattering a dense `dout` filled with `upstream`, but avoids
@@ -39893,6 +39929,58 @@ mod tests {
         for (i, (&g, &e)) in sidecar_grad.iter().zip(rescan_grad.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "max_pool3d sidecar grad[{i}]");
         }
+    }
+
+    #[test]
+    fn max_pool3d_nonoverlapping_dense_backward_matches_accumulating_bits() {
+        let (batch, ch, id, ih, iw) = (2usize, 3usize, 4usize, 6usize, 6usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let input: Vec<f64> = (0..batch * ch * id * ih * iw)
+            .map(|i| ((i % 11) as f64) - 5.0)
+            .collect();
+        let (_, arg_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        let mut dout: Vec<f64> = (0..batch * ch * od * oh * ow)
+            .map(|i| ((i % 7) as f64) * 0.25 - 0.75)
+            .collect();
+        dout[0] = -0.0;
+        dout[1] = f64::NAN;
+
+        let expected = super::max_pool3d_backward_from_indices_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        let direct = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            direct
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
     }
 
     /// frankentorch-7zqbc: `avg_pool2d`'s 2x2-stride-2 backward is the ONE pooled

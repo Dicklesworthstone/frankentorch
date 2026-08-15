@@ -34551,9 +34551,16 @@ impl FrankenTorchSession {
                 move |ctx, grad_outputs| {
                     let dout = grad_outputs[0];
                     let s = ctx.saved_tensors();
-                    let di = ft_kernel_cpu::max_pool3d_backward_from_indices_f64(
-                        dout, &s[0], b_, ch_, id_, ih_, iw_, od_, oh_, ow_,
-                    );
+                    let non_overlapping = kd_ == sd_ && kh_ == sh_ && kw_ == sw_;
+                    let di = if non_overlapping {
+                        ft_kernel_cpu::max_pool3d_backward_from_indices_nonoverlapping_f64(
+                            dout, &s[0], b_, ch_, id_, ih_, iw_, od_, oh_, ow_,
+                        )
+                    } else {
+                        ft_kernel_cpu::max_pool3d_backward_from_indices_f64(
+                            dout, &s[0], b_, ch_, id_, ih_, iw_, od_, oh_, ow_,
+                        )
+                    };
                     Ok(vec![Some(di)])
                 },
             )?;
