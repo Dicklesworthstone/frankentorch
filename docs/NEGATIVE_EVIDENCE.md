@@ -19475,6 +19475,56 @@ Three things worth keeping from the sweep:
   "took the multiply branch" from "took the identity branch" even when every
   finite value agrees — worth reaching for first in any future select-op audit.
 
+## REFUTED: "match torch's NaN gradient" — torch has no single answer (`jedc6`)
+
+The zero-boundary sweep above raised an obvious follow-up: NaN is a second branch
+boundary, so probe it too. That found seven ops where FrankenTorch's NaN gradient
+differs from torch, and the lever "make them match" looked clean and mechanical.
+
+**It is ill-posed, and the sweep that found the disagreement is what refuted it.**
+torch's NaN gradient depends on the LENGTH OF THE TENSOR. Measured on torch
+2.12.1+cpu, NaN in slot 0, upstream 3.0:
+
+| op | n=1 | n=2 | n=4 | n=8 | n=16 | n=64 |
+|---|---|---|---|---|---|---|
+| `relu6` | 3 | 3 | 3 | **0** | 0 | 0 |
+| `celu` | 3 | 3 | 3 | **nan** | nan | nan |
+| `selu` | 3.152 | 3.152 | 3.152 | **nan** | nan | nan |
+| `hardswish` | 3 | 3 | 3 | **nan** | nan | nan |
+| `elu` | 3 | 3 | 3 | **nan** | nan | nan |
+| `hardtanh` | 3 | 3 | 3 | **0** | 0 | 0 |
+| `relu`, `hardsigmoid`, `threshold` | — | — | — | stable across all widths | | |
+
+**It is the vectorised kernel, and the dtype proves it**: the flip is at `n=8` for
+f64 and at `n=16` for f32 — it tracks a fixed vector *byte* width, not an element
+count. It does not depend on where in the tensor the NaN sits (slot 0, 3, 7, 8 and
+63 of an n=64 tensor all agree). Same op, same input value, two different answers
+depending on whether that element landed in a vectorised body or a scalar tail.
+
+Consequences, in order of how much they cost to learn:
+
+- **Matching `n=1` guarantees disagreeing at `n>=8`, and vice versa.** There is no
+  target to hit. Any "NaN parity fix" here would have been a coin flip dressed as
+  a correctness fix, and would have been defensible right up until someone tested
+  the other width.
+- **A one-element probe is not an oracle for a vectorised library.** The first
+  probe used `n=1` throughout and produced a confident, wrong, seven-row table. The
+  same numbers at `n=64` say something else. Probe widths that straddle the vector
+  boundary, or do not quote the number.
+- **`aten.hardswish_backward` called directly returns a THIRD answer** (`1.0`, i.e.
+  pass-through) where the `n=8` autograd path returns `nan`. Calling the aten op to
+  "check what torch really does" measures a different code path than the one
+  autograd runs.
+- FrankenTorch is shape-independent here and that is the better property — it is
+  what the Deterministic Autograd Contract requires. **Do not "fix" these ops toward
+  either of torch's two answers.** Pinned by
+  `activation_gradients_at_nan_are_shape_independent`, which compares n=1 against
+  n=2/4/8/16/64/257 rather than against a hardcoded table.
+
+Scope note: this refutes NaN-gradient parity only. The zero-boundary work above
+stands — `rrelu` was a real defect and is fixed, and torch is self-consistent at
+zero across every width.
+
 **11. TWO OF MY OWN HARNESSES DISAGREE ABOUT THE SAME LEVER, AND THE
 DISAGREEMENT IS THE RESULT (`frankentorch-dmpho`, 2026-08-15).** Recorded under
 the fleet rule adopted after frankenlibc measured malloc/free on ONE worker

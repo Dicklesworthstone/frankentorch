@@ -164990,6 +164990,135 @@ mod tests {
         );
     }
 
+    /// An activation's gradient at `x = NaN` does not depend on the tensor's length.
+    ///
+    /// This started as a parity test asserting torch's NaN gradients and became a
+    /// determinism test, because **torch has no single answer to assert**
+    /// (`frankentorch-jedc6`). torch's NaN gradient flips at the vector-width
+    /// boundary — measured on torch 2.12.1+cpu with the NaN in slot 0 and an
+    /// upstream of 3.0:
+    ///
+    /// ```text
+    ///                  n=1    n=2    n=4  |  n=8   n=16   n=64
+    ///   relu6            3      3      3  |    0      0      0
+    ///   celu             3      3      3  |  nan    nan    nan
+    ///   selu         3.152  3.152  3.152  |  nan    nan    nan
+    ///   hardswish        3      3      3  |  nan    nan    nan
+    ///   elu              3      3      3  |  nan    nan    nan
+    ///   hardtanh         3      3      3  |    0      0      0
+    /// ```
+    ///
+    /// It is the vectorised kernel, confirmed by dtype: the flip is at n=8 for f64
+    /// and at n=16 for f32, i.e. it tracks a fixed vector *byte* width, and it does
+    /// not depend on where in the tensor the NaN sits. `relu`, `hardsigmoid` and
+    /// `threshold` are stable across widths; the other six are not.
+    ///
+    /// So "match torch at NaN" is ill-posed: matching `n=1` guarantees disagreeing
+    /// at `n>=8`. FrankenTorch instead computes one shape-independent value per op,
+    /// which is what the Deterministic Autograd Contract requires and what this test
+    /// pins. Do NOT "fix" these ops toward either of torch's two answers.
+    ///
+    /// Compares n=1 against n=64 rather than against a hardcoded table, so it stays
+    /// honest if a value legitimately changes.
+    #[test]
+    fn activation_gradients_at_nan_are_shape_independent() {
+        const GO: f64 = 3.0;
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            Box<dyn Fn(&mut FrankenTorchSession, TensorNodeId) -> TensorNodeId>,
+        )> = vec![
+            (
+                "relu",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_relu(x).unwrap()),
+            ),
+            (
+                "relu6",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_relu6(x).unwrap()),
+            ),
+            (
+                "leaky_relu",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_leaky_relu(x).unwrap()),
+            ),
+            (
+                "elu",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_elu(x).unwrap()),
+            ),
+            (
+                "celu",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_celu(x, 2.0).unwrap()),
+            ),
+            (
+                "selu",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_selu(x).unwrap()),
+            ),
+            (
+                "hardtanh",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_hardtanh(x).unwrap()),
+            ),
+            (
+                "hardswish",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_hardswish(x).unwrap()),
+            ),
+            (
+                "hardsigmoid",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_hardsigmoid(x).unwrap()),
+            ),
+            (
+                "threshold",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_threshold(x, 1.0, 9.0).unwrap()),
+            ),
+            (
+                "softplus",
+                Box::new(|s: &mut FrankenTorchSession, x| s.tensor_softplus(x).unwrap()),
+            ),
+            (
+                "rrelu",
+                Box::new(|s: &mut FrankenTorchSession, x| {
+                    s.tensor_rrelu(x, 0.125, 1.0 / 3.0).unwrap()
+                }),
+            ),
+        ];
+
+        // Gradient in the NaN slot for a tensor of `n` elements, NaN in slot 0 and
+        // benign values elsewhere. Widths straddle the f64 vector boundary (8) that
+        // torch's own answer flips across.
+        let grad_at_nan = |op: &dyn Fn(&mut FrankenTorchSession, TensorNodeId) -> TensorNodeId,
+                           n: usize| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mut vals = vec![0.5_f64; n];
+            vals[0] = f64::NAN;
+            let x = s.tensor_variable(vals, vec![n], true).unwrap();
+            let y = op(&mut s, x);
+            // Scale so the upstream gradient is 3.0, not 1.0: with an upstream of
+            // 1.0 a pass-through is indistinguishable from a hardcoded 1.0.
+            let scaled = s.tensor_mul_scalar(y, GO).unwrap();
+            let loss = s.tensor_sum(scaled).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            s.tensor_gradient(&report, x).expect("grad")[0]
+        };
+
+        let mut failures = Vec::new();
+        for (name, op) in cases {
+            let base = grad_at_nan(op.as_ref(), 1);
+            for n in [2_usize, 4, 8, 16, 64, 257] {
+                let got = grad_at_nan(op.as_ref(), n);
+                let same = (base.is_nan() && got.is_nan()) || base.to_bits() == got.to_bits();
+                if !same {
+                    failures.push(format!(
+                        "  {name:12} n=1 gives {base:?} but n={n} gives {got:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "gradient at x = NaN changed with tensor length — FrankenTorch must be \
+             shape-independent here even though torch is not (see frankentorch-jedc6):\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn test_channel_shuffle_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
