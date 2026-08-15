@@ -6588,17 +6588,25 @@ impl Module for RReLU {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // RReLU(x) = x         if x >= 0
+        // RReLU(x) = x         if x > 0
         //          = slope * x otherwise
         // where slope is sampled element-wise from U(lower, upper)
         // during training and is the midpoint of [lower, upper] for
         // deterministic eval-mode replay.
         //
-        // Composed as where(x >= 0, x, slope * x) using tensor_ge,
+        // The compare is STRICT (x > 0), matching torch: x == 0 takes the
+        // slope branch in both eval and training, so its gradient is the
+        // realized slope rather than 1.0. Verified against torch 2.12.1+cpu
+        // via rrelu_with_noise, whose noise entry for a 0.0 input is a
+        // sampled slope, not 1.0 (frankentorch-3eq5b). The RNG draw count is
+        // unchanged — rand_like already samples every element, and torch also
+        // consumes a draw at x == 0 — so this does not perturb the stream.
+        //
+        // Composed as where(x > 0, x, slope * x) using tensor_gt,
         // tensor_mul (with broadcast `slope` constant), and
         // tensor_where. Backward routes the gradient correctly:
-        //   x >= 0: 1
-        //   x <  0: realized slope
+        //   x >  0: 1
+        //   x <= 0: realized slope
         if !self.lower.is_finite() || !self.upper.is_finite() || self.lower > self.upper {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -6618,7 +6626,7 @@ impl Module for RReLU {
         };
         let neg_branch = session.tensor_mul(slope_t, input)?;
         let zeros = session.zeros_like(input, false)?;
-        let mask = session.tensor_ge(input, zeros)?;
+        let mask = session.tensor_gt(input, zeros)?;
         session.tensor_where(mask, input, neg_branch)
     }
 
@@ -37026,7 +37034,9 @@ mod tests {
     fn rrelu_propagates_gradients() {
         // Default RReLU: lower=1/8, upper=1/3 → midpoint slope=11/48.
         // For input [-2, -0.5, 0.0, 0.5, 2.0] sum loss:
-        //   grad = [slope, slope, 1, 1, 1]
+        //   grad = [slope, slope, slope, 1, 1]
+        // The x == 0.0 entry takes the SLOPE, not 1.0 — torch's rrelu compares
+        // x > 0, so zero falls to the negative branch (frankentorch-3eq5b).
         const LOWER: f64 = 1.0 / 8.0;
         const UPPER: f64 = 1.0 / 3.0;
         const SLOPE: f64 = (LOWER + UPPER) / 2.0;
@@ -37042,7 +37052,7 @@ mod tests {
         let grad = session
             .tensor_gradient(&report, input)
             .expect("RReLU must propagate gradient to input");
-        let expected = [SLOPE, SLOPE, 1.0, 1.0, 1.0];
+        let expected = [SLOPE, SLOPE, SLOPE, 1.0, 1.0];
         for (i, (&g, &want)) in grad.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (g - want).abs() < 1e-12,
@@ -37113,13 +37123,37 @@ mod tests {
         let grad = session
             .tensor_gradient(&report, input)
             .expect("training RReLU must propagate gradient to input");
-        let expected = [realized_slopes[0], realized_slopes[1], 1.0, 1.0, 1.0];
-        for (i, (&g, &want)) in grad.iter().zip(expected.iter()).enumerate() {
+        // Index 2 is x == 0.0, whose realized slope cannot be recovered from the
+        // forward (slope * 0.0 == 0.0 for every slope), so it is checked by range
+        // below rather than by value.
+        let expected = [
+            realized_slopes[0],
+            realized_slopes[1],
+            f64::NAN, // index 2 (x == 0.0): range-checked below, not value-checked
+            1.0,
+            1.0,
+        ];
+        for (i, (&g, &want)) in grad
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .filter(|(i, _)| *i != 2)
+        {
             assert!(
                 (g - want).abs() < 1e-12,
                 "training RReLU grad[{i}] = {g}, expected realized slope {want}"
             );
         }
+
+        // torch's training rrelu compares x > 0, so an exact 0.0 takes the negative
+        // branch and receives a SAMPLED slope — not 1.0. Confirmed against torch
+        // 2.12.1+cpu, where rrelu_with_noise writes a sampled slope (not 1.0) into
+        // the noise entry for a 0.0 input. frankentorch-3eq5b.
+        assert!(
+            (0.1..0.3).contains(&grad[2]),
+            "training RReLU grad at x == 0.0 must be a sampled slope in [0.1, 0.3), got {}",
+            grad[2]
+        );
     }
 
     #[test]

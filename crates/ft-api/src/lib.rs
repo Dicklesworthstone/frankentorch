@@ -22152,7 +22152,17 @@ impl FrankenTorchSession {
         upper: f64,
     ) -> Result<TensorNodeId, AutogradError> {
         let slope = (lower + upper) / 2.0;
-        // Borrowed-inputs: the backward only needs the SIGN of x (x>=0), an input leaf, so
+        // Branch on x > 0, NOT x >= 0: torch's rrelu keeps the input only where it is
+        // STRICTLY positive and multiplies everywhere else, so x == 0 takes the slope
+        // branch. Verified against torch 2.12.1+cpu (frankentorch-3eq5b), which is
+        // observable twice over:
+        //   * grad at x == 0 is `slope`, not 1.0;
+        //   * with a NEGATIVE slope the forward differs by the sign of zero, because
+        //     multiplying is not the identity there — rrelu(+0.0, slope=-0.25) is -0.0
+        //     in torch, whereas passing the input through would give +0.0.
+        // Same convention (and same latent defect) as prelu in frankentorch-x4cx3.
+        //
+        // Borrowed-inputs: the backward only needs the SIGN of x (x>0), an input leaf, so
         // re-read it from the live leaf instead of cloning the whole input into ctx every
         // forward. rrelu(eval) is a trivially cheap op (one compare+mul/elem), so that
         // full-input clone was the dominant cost; eliding it helps both no-grad inference and
@@ -22163,7 +22173,7 @@ impl FrankenTorchSession {
                 let (vals, shape) = inputs[0];
                 let values: Vec<f64> = vals
                     .iter()
-                    .map(|&x| if x >= 0.0 { x } else { slope * x })
+                    .map(|&x| if x > 0.0 { x } else { slope * x })
                     .collect();
                 Ok((values, shape.to_vec()))
             },
@@ -22180,7 +22190,7 @@ impl FrankenTorchSession {
                 let grad_in: Vec<f64> = x_vals
                     .iter()
                     .zip(grad_out.iter())
-                    .map(|(&x, &go)| if x >= 0.0 { go } else { go * slope })
+                    .map(|(&x, &go)| if x > 0.0 { go } else { go * slope })
                     .collect();
                 Ok(vec![Some(grad_in)])
             },
@@ -164905,6 +164915,79 @@ mod tests {
         assert!((vals[1] + 0.2).abs() < 1e-10); // -1 * 0.2 (midpoint)
         assert!((vals[2] - 2.0).abs() < 1e-10);
         assert!((vals[3] + 0.4).abs() < 1e-10); // -2 * 0.2
+    }
+
+    /// rrelu compares `x > 0` like torch, so an exact 0.0 takes the slope branch.
+    ///
+    /// Values below are from torch 2.12.1+cpu (frankentorch-3eq5b):
+    ///
+    /// ```text
+    /// x = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float64).requires_grad_(True)
+    /// torch.nn.functional.rrelu(x, 0.125, 1.0/3.0, training=False).sum().backward()
+    /// x.grad  ->  [0.22916666666666666, 0.22916666666666666, 1.0]
+    /// ```
+    ///
+    /// The grad at x == 0 is the slope, NOT 1.0 — the defect this test pins, and
+    /// the same convention that prelu got wrong in frankentorch-x4cx3.
+    #[test]
+    fn rrelu_zero_input_takes_the_slope_branch_like_torch() {
+        const LOWER: f64 = 0.125;
+        const UPPER: f64 = 1.0 / 3.0;
+        const SLOPE: f64 = (LOWER + UPPER) / 2.0; // 0.22916666666666666
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], true)
+            .unwrap();
+        let out = s.tensor_rrelu(x, LOWER, UPPER).unwrap();
+        assert_eq!(
+            s.tensor_values(out).unwrap(),
+            vec![-SLOPE, 0.0, 1.0],
+            "rrelu forward"
+        );
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert_eq!(
+            s.tensor_gradient(&report, x).expect("grad_x"),
+            vec![SLOPE, SLOPE, 1.0],
+            "grad at x == 0 must be the slope, not 1.0"
+        );
+
+        // NEGATIVE case a naive `x >= 0` implementation fails on the FORWARD, not
+        // just the gradient: with a negative slope, multiplying is not the identity
+        // on zero, so the sign of the zero reveals which branch ran. torch gives
+        // rrelu(+0.0) = -0.0 and rrelu(-0.0) = +0.0 for slope = -0.25; passing the
+        // input through (the `>=` bug) would return +0.0 and -0.0 respectively.
+        let mut ng = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xz = ng.tensor_variable(vec![0.0, -0.0], vec![2], false).unwrap();
+        let oz = ng.tensor_rrelu(xz, -0.25, -0.25).unwrap();
+        let vz = ng.tensor_values(oz).unwrap();
+        assert_eq!(
+            vz[0].to_bits(),
+            (-0.0_f64).to_bits(),
+            "rrelu(+0.0) with slope<0 must multiply, giving -0.0"
+        );
+        assert_eq!(
+            vz[1].to_bits(),
+            0.0_f64.to_bits(),
+            "rrelu(-0.0) with slope<0 must multiply, giving +0.0"
+        );
+
+        // NaN falls to the slope branch under both conventions (NaN compares false
+        // either way) and must stay NaN in the forward with a slope gradient.
+        let mut nan_s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xn = nan_s
+            .tensor_variable(vec![f64::NAN], vec![1], true)
+            .unwrap();
+        let on = nan_s.tensor_rrelu(xn, LOWER, UPPER).unwrap();
+        assert!(nan_s.tensor_values(on).unwrap()[0].is_nan(), "rrelu(NaN)");
+        let nl = nan_s.tensor_sum(on).unwrap();
+        let nr = nan_s.tensor_backward(nl).unwrap();
+        assert_eq!(
+            nan_s.tensor_gradient(&nr, xn).expect("grad_nan"),
+            vec![SLOPE],
+            "grad at NaN is the slope branch"
+        );
     }
 
     #[test]
