@@ -21807,8 +21807,15 @@ impl FrankenTorchSession {
     }
 
     /// Elementwise PReLU forward values, shared by the autograd and non-grad
-    /// paths so they stay bit-identical. `x >= 0 ? x : w_c * x`, where `w_c` is
+    /// paths so they stay bit-identical. `x > 0 ? x : w_c * x`, where `w_c` is
     /// the single shared weight (len 1) or the per-channel weight.
+    ///
+    /// The comparison is STRICT, matching torch's `where(input > 0, input,
+    /// weight*input)`. It reads like a free choice — both branches are zero at
+    /// `x == 0` — but it is not: with a negative weight, torch's `prelu(+0.0)` is
+    /// `-0.0` and its `prelu(-0.0)` is `+0.0`, while passing the input through
+    /// returns the sign unchanged. The backward is where the choice becomes
+    /// visible at full magnitude; see `tensor_prelu`. frankentorch-x4cx3.
     fn prelu_forward_values(
         input_vals: &[f64],
         input_shape: &[usize],
@@ -21820,7 +21827,7 @@ impl FrankenTorchSession {
         // fast path AND the grad-path forward, so both benefit.
         let prelu_at = |i: usize, x: f64| -> f64 {
             if weight_vals.len() == 1 {
-                if x >= 0.0 { x } else { weight_vals[0] * x }
+                if x > 0.0 { x } else { weight_vals[0] * x }
             } else {
                 let num_channels = weight_vals.len();
                 let channel_size: usize = if input_shape.len() >= 2 {
@@ -21833,7 +21840,7 @@ impl FrankenTorchSession {
                 } else {
                     i % num_channels
                 };
-                if x >= 0.0 { x } else { weight_vals[c] * x }
+                if x > 0.0 { x } else { weight_vals[c] * x }
             }
         };
         if input_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
@@ -21863,7 +21870,7 @@ impl FrankenTorchSession {
     ) -> Vec<f32> {
         let prelu_at = |i: usize, x: f32| -> f32 {
             if weight_vals.len() == 1 {
-                if x >= 0.0 { x } else { weight_vals[0] * x }
+                if x > 0.0 { x } else { weight_vals[0] * x }
             } else {
                 let num_channels = weight_vals.len();
                 let channel_size: usize = if input_shape.len() >= 2 {
@@ -21876,7 +21883,7 @@ impl FrankenTorchSession {
                 } else {
                     i % num_channels
                 };
-                if x >= 0.0 { x } else { weight_vals[c] * x }
+                if x > 0.0 { x } else { weight_vals[c] * x }
             }
         };
         if input_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
@@ -21908,10 +21915,20 @@ impl FrankenTorchSession {
         let input_shape = self.tensor_shape(input)?;
 
         if self.tensor_requires_grad(input)? || self.tensor_requires_grad(weight)? {
-            // PReLU(x, w) = x if x>=0 else w_c * x (w_c is the per-channel weight,
+            // PReLU(x, w) = x if x>0 else w_c * x (w_c is the per-channel weight,
             // or the single shared weight). Linear in both args on each side of 0:
-            //   d/dx = 1 if x>=0 else w_c
+            //   d/dx = 1 if x>0 else w_c
             //   d/dw_c = sum over x<0 in channel c of (grad_out * x)
+            //
+            // The `x > 0` in d/dx is STRICT and it is load-bearing: torch returns
+            // w_c, not 1, at x == 0 (`F.prelu` grad at [-1,0,1] with w=0.25 is
+            // [0.25,0.25,1.0], torch 2.12.1). This used to read `x >= 0`, which put
+            // 16,710 of the gauntlet prelu lane's 4.19M elements on the wrong branch
+            // and moved sum|grad_x| by 15,870 against a 2.27 parity tolerance —
+            // enough to fail the lane outright. frankentorch-x4cx3.
+            //
+            // d/dw_c needs no such care: an x == 0 element contributes grad_out * 0
+            // under either convention, so `x < 0` is already torch's rule.
             // 2-input borrowed apply_function; forward is identical to the non-grad
             // path while backward reads x/w directly from the immutable tape slices.
             // frankentorch-avfl.
@@ -21953,7 +21970,7 @@ impl FrankenTorchSession {
                                 } else {
                                     i % nch
                                 };
-                                if x >= 0.0 { g[i] } else { g[i] * wv[c] }
+                                if x > 0.0 { g[i] } else { g[i] * wv[c] }
                             })
                             .collect();
                         let mut grad_w = vec![0.0_f64; nch];
@@ -22012,10 +22029,20 @@ impl FrankenTorchSession {
                             } else {
                                 i % nch
                             };
-                            if x >= 0.0 {
+                            // Two SEPARATE predicates, deliberately. grad_x turns on
+                            // `x > 0` (torch's rule, frankentorch-x4cx3) while grad_w
+                            // still accumulates only on `x < 0`, exactly as the
+                            // parallel branch above does. Folding them back into one
+                            // if/else would make an `x == 0` element contribute
+                            // `g[i] * 0.0` to grad_w here and nothing there, so the
+                            // two branches would stop being bit-identical for a
+                            // difference that is pure bookkeeping.
+                            if x > 0.0 {
                                 grad_x[i] = g[i];
                             } else {
                                 grad_x[i] = g[i] * wv[c];
+                            }
+                            if x < 0.0 {
                                 grad_w[c] += g[i] * x;
                             }
                         }
@@ -25513,7 +25540,7 @@ impl FrankenTorchSession {
                     (0..xv.len())
                         .into_par_iter()
                         .map(|i| {
-                            if xv[i] >= 0.0 {
+                            if xv[i] > 0.0 {
                                 upstream
                             } else {
                                 upstream * wv[channel_for(i)]
@@ -25524,7 +25551,7 @@ impl FrankenTorchSession {
                     xv.iter()
                         .enumerate()
                         .map(|(i, &x)| {
-                            if x >= 0.0 {
+                            if x > 0.0 {
                                 upstream
                             } else {
                                 upstream * wv[channel_for(i)]
@@ -164686,6 +164713,119 @@ mod tests {
             .expect("prelu grad_w2 present");
         assert_eq!(gx2, vec![1.0, 0.5, 0.1, 1.0]);
         assert_eq!(gw2, vec![-2.0, -3.0]);
+    }
+
+    /// PReLU at exactly zero takes the WEIGHT branch, in every path.
+    ///
+    /// Reference values read from torch 2.12.1+cpu, which computes
+    /// `where(input > 0, input, weight*input)`:
+    ///
+    /// ```text
+    /// x = [[-1.0, 0.0, 1.0]], w = [0.25]
+    ///   F.prelu(x, w).sum().backward()  ->  x.grad = [[0.25, 0.25, 1.0]]
+    /// x = [[0.0, -0.0]], w = [-0.25]
+    ///   F.prelu(x, w)  ->  bits 8000000000000000, 0000000000000000
+    /// ```
+    ///
+    /// FrankenTorch used to compare `x >= 0` throughout, which returns 1.0 rather
+    /// than `w` at the kink and passes the input's zero sign straight through. The
+    /// gauntlet prelu lane caught it: `seq()` lands on exactly 0.0 once every 251
+    /// elements, and the 16,710 affected elements moved sum|grad_x| by 15,870
+    /// against a 2.27 tolerance. frankentorch-x4cx3.
+    #[test]
+    fn prelu_zero_input_takes_the_weight_branch_like_torch() {
+        // Scalar weight, serial backward.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], true)
+            .unwrap();
+        let w = s.tensor_variable(vec![0.25], vec![1], true).unwrap();
+        let out = s.tensor_prelu(x, w).unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), vec![-0.25, 0.0, 1.0]);
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert_eq!(
+            s.tensor_gradient(&report, x).expect("grad_x"),
+            vec![0.25, 0.25, 1.0],
+            "grad at x == 0 must be the weight, not 1.0"
+        );
+        // grad_w still sums only the strictly-negative elements, so the zero
+        // contributes nothing: -1.0, not -1.0 + 0.0 under a different sign.
+        assert_eq!(s.tensor_gradient(&report, w).expect("grad_w"), vec![-1.0]);
+
+        // Per-channel weight on [1,3,1], one channel per element.
+        let x2 = s
+            .tensor_variable(vec![-1.0, 0.0, 1.0], vec![1, 3, 1], true)
+            .unwrap();
+        let w2 = s
+            .tensor_variable(vec![0.5, 0.25, 0.125], vec![3], true)
+            .unwrap();
+        let out2 = s.tensor_prelu(x2, w2).unwrap();
+        let loss2 = s.tensor_sum(out2).unwrap();
+        let report2 = s.tensor_backward(loss2).unwrap();
+        assert_eq!(
+            s.tensor_gradient(&report2, x2).expect("grad_x2"),
+            vec![0.5, 0.25, 1.0]
+        );
+
+        // Signed zero in the forward, which is only observable for a negative
+        // weight: torch multiplies rather than passing the input through.
+        let mut ng = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xz = ng.tensor_variable(vec![0.0, -0.0], vec![2], false).unwrap();
+        let wz = ng.tensor_variable(vec![-0.25], vec![1], false).unwrap();
+        let oz = ng.tensor_prelu(xz, wz).unwrap();
+        let vz = ng.tensor_values(oz).unwrap();
+        assert_eq!(
+            vz[0].to_bits(),
+            (-0.0_f64).to_bits(),
+            "prelu(+0.0) with w<0"
+        );
+        assert_eq!(vz[1].to_bits(), 0.0_f64.to_bits(), "prelu(-0.0) with w<0");
+
+        // The parallel branches use their own compare, so drive one past the
+        // 65_536-element gate — with and without the sum shortcut, which is the
+        // pair the gauntlet lane runs.
+        const BIG: usize = 1 << 17;
+        let values: Vec<f64> = (0..BIG)
+            .map(|i| {
+                if i % 3 == 0 {
+                    0.0
+                } else {
+                    (i % 7) as f64 - 3.0
+                }
+            })
+            .collect();
+        let zeros = values.iter().filter(|v| **v == 0.0).count();
+        assert!(zeros > 0, "the fixture must actually contain zeros");
+        for retain in [false, true] {
+            let mut big = FrankenTorchSession::new(ExecutionMode::Strict);
+            let bx = big
+                .tensor_variable(values.clone(), vec![1, 2, BIG / 2], true)
+                .unwrap();
+            let bw = big.tensor_variable(vec![0.5, 0.25], vec![2], true).unwrap();
+            let bo = big.tensor_prelu(bx, bw).unwrap();
+            if retain {
+                big.tensor_retain_grad(bo).unwrap();
+            }
+            let bloss = big.tensor_sum(bo).unwrap();
+            let breport = big.tensor_backward(bloss).unwrap();
+            let gx = big.tensor_gradient(&breport, bx).expect("big grad_x");
+            let channel_size = BIG / 2;
+            for (i, (&value, &grad)) in values.iter().zip(gx.iter()).enumerate() {
+                let expected: f64 = if value > 0.0 {
+                    1.0
+                } else if i / channel_size == 0 {
+                    0.5
+                } else {
+                    0.25
+                };
+                assert_eq!(
+                    grad.to_bits(),
+                    expected.to_bits(),
+                    "element {i} (value {value}, retain={retain})"
+                );
+            }
+        }
     }
 
     #[test]

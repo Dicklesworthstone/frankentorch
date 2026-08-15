@@ -33,12 +33,15 @@
 //! necessary cost of a paired comparison that remains valid on a shared host.
 //!
 //! Four lanes, shapes copied from `pytorch_gauntlet_bench` so the two describe the
-//! same workloads: `max_pool1d`, `avg_pool2d`, `conv3d`, `max_pool3d`.
+//! same workloads: `max_pool1d`, `avg_pool2d`, `conv3d`, `max_pool3d`. Later rows
+//! add `group_norm_f32` (kgs4.115) and `prelu` (k1hto) from the scorecard, each
+//! beside a lever-off twin so one invocation carries both the standing and the
+//! lever.
 //!
 //! Run (must be local; rch workers have no PyTorch):
 //! ```text
 //! PYTORCH_PYTHON=/path/to/python \
-//!   cargo run --release -p ft-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+//!   cargo run --release -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
 //! ```
 
 use std::io::{BufRead, BufReader, Write};
@@ -51,7 +54,7 @@ use ft_api::harness_interleave::{
     TIMED_STEPS_MARKER, adjudicate_null, parse_sample_line, parse_timed_steps, sample_request,
     timed_region_disagreement,
 };
-use ft_core::ExecutionMode;
+use ft_core::{DType, ExecutionMode, TensorMeta};
 
 /// Every balanced-square round has four samples from each arm, so every arm
 /// occupies two positions in each half even when the number of rounds is odd.
@@ -126,6 +129,14 @@ const GN_C: usize = 64;
 const GN_H: usize = 28;
 const GN_W: usize = 28;
 const GN_GROUPS: usize = 32;
+
+// frankentorch-k1hto: PReLU f64 scalar-loss train step, shape copied verbatim
+// from the kgs4.157 scorecard row that records it at 2.58x slower. Both the input
+// and the per-channel weight require grad, which is what makes the dense all-ones
+// PReLU output gradient the thing the deforest lever removes.
+const PR_N: usize = 32;
+const PR_C: usize = 512;
+const PR_W: usize = 256;
 
 /// One FrankenTorch lane: runs a single timed forward+backward, returning
 /// (milliseconds, gradient checksum).
@@ -297,8 +308,8 @@ fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f
     (elapsed, checksum)
 }
 
-/// The same GroupNorm f32 work with NO session and NO tape: the two kernels
-/// called directly, on f32 throughout.
+/// The same GroupNorm f32 work with NO session and NO tape: the kernels the
+/// session lane actually calls, invoked directly, on f32 throughout.
 ///
 /// This is the phase split, taken in the same invocation as the lane it splits,
 /// so it costs one build instead of two round trips through a saturated fleet.
@@ -316,9 +327,28 @@ fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f
 /// downcasts the incoming gradient and upcasts its results — two full-size
 /// conversions plus their allocations, here over 401,408 elements. This lane
 /// prices that, rather than assuming it matters.
+///
+/// ROUTE-MATCHED (frankentorch-npod3 ledger item 7f). The first version of this
+/// lane called `group_norm_backward_f32` with a freshly built all-ones `dy`,
+/// while the session lane takes the `sum`-loss shortcut
+/// (`group_norm_f32_sum_shortcuts` -> `group_norm_backward_scalar_f32`) and never
+/// materialises an upstream gradient at all. That split therefore measured
+/// GENERAL route vs SHORTCUT route — a real number, but not the engine cost it
+/// was read as, and it additionally charged this arm a 1.6 MiB `dy` allocation
+/// plus the end-to-end scan the general backward performs just to discover the
+/// gradient was all ones. Both arms now enter the same kernels, so the
+/// difference between them is the tape.
 fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
     let spatial = GN_H * GN_W;
     let channels_per_group = GN_C / GN_GROUPS;
+    // Built outside the timer: the session lane's `tensor_sum` reads a meta that
+    // already exists, so charging this arm for constructing one would price a
+    // difference in harness bookkeeping as a difference in engine cost.
+    let out_meta = TensorMeta::from_shape(
+        vec![GN_N, GN_C, GN_H, GN_W],
+        DType::F32,
+        ft_core::Device::Cpu,
+    );
     let started = Instant::now();
     let out = ft_kernel_cpu::group_norm_forward_f32(
         values,
@@ -330,11 +360,14 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
         spatial,
         1e-5,
     );
-    // `sum` loss, so the upstream gradient is all ones — the same thing the
-    // session lane's `tensor_sum` produces, kept in f32 here.
-    let dy = vec![1.0f32; out.len()];
-    let (dx, _, _) = ft_kernel_cpu::group_norm_backward_f32(
-        &dy,
+    // The `sum` loss itself, which the session lane also pays: its shortcut still
+    // reduces the forward output to a scalar before backward runs.
+    let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&out, &out_meta).expect("sum");
+    // `sum` loss, so the upstream gradient is the scalar 1.0 — the shortcut the
+    // session lane takes, entered here through the same kernel rather than
+    // through the general backward's all-ones `dy` scan.
+    let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+        1.0f32,
         values,
         Some(weight),
         GN_N,
@@ -344,6 +377,9 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
         1e-5,
     );
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    // Keeps the loss observable so the compiler cannot delete the reduction that
+    // was just timed.
+    assert!(loss.is_finite(), "group_norm f32 sum loss must be finite");
     // Accumulate in f64. Summing 401,408 f32 values naively carries ~1e-4
     // relative error — a hundred times the parity tolerance — so an f32
     // accumulator reports MISMATCH against a torch arm that computed the SAME
@@ -351,6 +387,49 @@ fn timed_group_norm_f32_kernels(values: &[f32], weight: &[f32], bias: &[f32]) ->
     // unaffected because the tape's gradients are already f64; this is the one
     // lane that touches raw f32 kernel output.
     let checksum = dx.iter().map(|g| f64::from(g.abs())).sum::<f64>();
+    (elapsed, checksum)
+}
+
+/// PReLU f64 scalar-loss train step: input leaf plus per-channel weight leaf,
+/// both requiring grad, both built before the declared timed region.
+///
+/// `defeat_shortcut` selects the control arm. `frankentorch-k1hto` made
+/// `tensor_sum` on a PReLU output reconstruct both gradients from the saved input
+/// and weight, so the dense all-ones output gradient is never materialised. The
+/// shortcut declines whenever that output retains its gradient or carries a hook,
+/// and the HOOK exit is the one to take here: an observation-only hook (returning
+/// `Ok(None)`) costs one map insert at registration and one closure call in
+/// backward, and copies nothing, so the control lane is the old materialising path
+/// plus a constant far below the resolution of a lane this size. Registration sits
+/// inside the timed region only because the node it names does not exist before
+/// the forward. The retain_grad exit is NOT
+/// usable for this — `backward` persists a retained gradient via
+/// `contiguous_values_as_f64()`, charging the control arm a 33 MiB copy that has
+/// nothing to do with the lever and would inflate the paired ratio.
+fn timed_prelu(values: &[f64], weight: &[f64], defeat_shortcut: bool) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), vec![PR_N, PR_C, PR_W], true)
+        .expect("prelu leaf");
+    let w = session
+        .tensor_variable(weight.to_vec(), vec![PR_C], true)
+        .expect("prelu weight");
+    let started = Instant::now();
+    let out = session.tensor_prelu(x, w).expect("prelu");
+    if defeat_shortcut {
+        session
+            .tensor_register_hook(out, |_grad| Ok(None))
+            .expect("observation-only hook");
+    }
+    let loss = session.tensor_sum(out).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
     (elapsed, checksum)
 }
 
@@ -449,6 +528,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|value| (value * 3.0) as f32)
         .collect();
 
+    // frankentorch-k1hto. `seq` spans -0.12..0.131, so both sides of the PReLU
+    // kink carry real elements — a same-sign input would exercise one branch of
+    // the backward and price the lever against work it never does.
+    let prx = seq(PR_N * PR_C * PR_W);
+    let prw: Vec<f64> = seq(PR_C)
+        .into_iter()
+        .map(|value| value * 0.1 + 0.05)
+        .collect();
+
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     // Setup only. The request/serve/quit loop is appended from the library so the
     // protocol markers cannot drift away from the parser that reads them.
@@ -474,6 +562,11 @@ mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
 gnx=seq(8*64*28*28).reshape(8,64,28,28).float()
 gnw=(seq(64)*10.0+1.0).float().requires_grad_(True)
 gnb=(seq(64)*3.0).float().requires_grad_(True)
+# frankentorch-k1hto PReLU f64 train step. The weight requires grad on both arms:
+# the lever reconstructs BOTH gradients from the scalar upstream, so a no-grad
+# weight would skip the half of the backward it changes most.
+prx=seq(32*512*256).reshape(32,512,256)
+prw=(seq(512)*0.1+0.05).requires_grad_(True)
 # frankentorch-574cu: this arm declares the region it times, so a change to
 # `run` below that is not mirrored here fails the run instead of silently
 # biasing every ratio. Written as an independent literal rather than generated
@@ -509,6 +602,13 @@ LANES = {
     # grad-space conversions separately from the kernel. The incumbent is the
     # same op under both names, so PT(kernels)/PT(f32) is a free ~1.0 control.
     "group_norm_f32_kernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "prelu": (prx, lambda x: Fn.prelu(x,prw)),
+    # frankentorch-k1hto: the same torch op under a second name, exactly as the
+    # `_nopool` lanes do. The FrankenTorch side runs this one with an
+    # observation-only hook on the PReLU output, which makes the sum shortcut
+    # decline and restores the materialising path. PT(noshortcut)/PT(prelu) is
+    # therefore a free control that must land near 1.0.
+    "prelu_noshortcut": (prx, lambda x: Fn.prelu(x,prw)),
 }
 "#;
     let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
@@ -580,6 +680,13 @@ LANES = {
     println!(
         "{}",
         ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
+    );
+    // Names the machine this row was measured on. Both arms are sampled in this
+    // one invocation on this one host, so the row is internally comparable; the
+    // block exists so it can still be PLACED against other rows afterwards.
+    println!(
+        "{}",
+        ft_api::harness_provenance::measurement_host_block(rayon::current_num_threads())
     );
     println!(
         "allocator={}",
@@ -681,6 +788,15 @@ LANES = {
         (
             "group_norm_f32_kernels",
             Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb)),
+        ),
+        ("prelu", Box::new(|| timed_prelu(&prx, &prw, false))),
+        (
+            // frankentorch-k1hto: the SAME lane with the PReLU+sum shortcut
+            // declined. One binary, two arms against one live incumbent inside one
+            // invocation, so the ratio-of-ratios against `prelu` is immune to the
+            // host drift that makes cross-run ratios unquotable here.
+            "prelu_noshortcut",
+            Box::new(|| timed_prelu(&prx, &prw, true)),
         ),
         (
             "conv3d",
@@ -819,7 +935,7 @@ LANES = {
         pool.parked_bytes as f64 / (1024.0 * 1024.0)
     );
 
-    // ── frankentorch-v92uh: PAIRED analysis for `X` vs `X_nopool` ───────────
+    // ── frankentorch-v92uh: PAIRED analysis for `X` vs its lever-off twin ───
     //
     // The table above compares two lanes through their independent medians, and
     // on a shared host that is the weakest reading available: a load excursion
@@ -832,12 +948,22 @@ LANES = {
     // every arm's estimator paired to the same host window and matches the row
     // estimator above.
     //
-    // Reported as `nopool / pooled`, so > 1.0 means the pool is FASTER. The
-    // incumbent rows carry their own control: PT is byte-identical code under
-    // both names, so PT(nopool)/PT(pooled) must land near 1.0 or the run is not
-    // readable at all.
+    // Reported as `off / on`, so > 1.0 means the lever is FASTER. The incumbent
+    // rows carry their own control: PT is byte-identical code under both names,
+    // so PT(off)/PT(on) must land near 1.0 or the run is not readable at all.
+    //
+    // Two suffixes name a lever-off twin. `_nopool` is `ft_core::buffer_pool`
+    // switched off (frankentorch-v92uh, -9pafs, -7zqbc); `_noshortcut` is the
+    // PReLU+sum deforest declined through its hook exit (frankentorch-k1hto).
     for (index, (name, _)) in lanes.iter().enumerate() {
-        let Some(base) = name.strip_suffix("_nopool") else {
+        let Some((base, lever)) = name
+            .strip_suffix("_nopool")
+            .map(|base| (base, "buffer pool"))
+            .or_else(|| {
+                name.strip_suffix("_noshortcut")
+                    .map(|base| (base, "sum shortcut"))
+            })
+        else {
             continue;
         };
         let Some(base_index) = lanes.iter().position(|(other, _)| *other == base) else {
@@ -879,20 +1005,124 @@ LANES = {
             }
         };
         println!(
-            "\nPAIRED {base}: pool ON vs OFF, one binary, one invocation, per-round square medians\n  \
-             ratio (off/on) = {point:.3}x  95% CI [{lo:.3},{hi:.3}]  {wins}/{rounds} rounds faster with the pool\n  \
+            "\nPAIRED {base}: {lever} ON vs OFF, one binary, one invocation, per-round square medians\n  \
+             ratio (off/on) = {point:.3}x  95% CI [{lo:.3},{hi:.3}]  {wins}/{rounds} rounds faster with the {lever}\n  \
              incumbent control PT(off)/PT(on) = {pt_control:.3} (paired by sample index; must be ~1.0, the arm is identical code)\n  \
              verdict: {}",
             if !pt_control.is_finite() || (pt_control - 1.0).abs() >= 0.05 {
                 "UNREADABLE — the incumbent control moved, so the host shifted between the two lanes"
+                    .to_string()
             } else if lo > 1.0 {
-                "the pool is FASTER by the paired CI"
+                format!("the {lever} is FASTER by the paired CI")
             } else if hi < 1.0 {
-                "the pool is SLOWER by the paired CI"
+                format!("the {lever} is SLOWER by the paired CI")
             } else {
-                "UNDECIDED — the paired CI brackets 1.0"
+                "UNDECIDED — the paired CI brackets 1.0".to_string()
             }
         );
     }
+
+    group_norm_f32_kernel_breakdown(&gnx, &gnw, &gnb);
+
     Ok(())
+}
+
+/// Which of the three f32 GroupNorm kernels the lane's time is actually in.
+///
+/// Runs AFTER every paired lane has finished, so it cannot perturb a single
+/// number above, and with the allocator already warm — which is the state the
+/// lanes themselves ran in, not the cold state a standalone ladder would measure
+/// (`frankentorch` in-situ-over-standalone finding: a standalone ladder inverted
+/// in situ purely from allocator warmth).
+///
+/// This is a BREAKDOWN, not a lane: there is no PyTorch arm to pair against, so
+/// its numbers are FrankenTorch-internal attribution only and no ratio derived
+/// from them is a win. It exists because `group_norm_f32_kernels` reads 16.72x
+/// against a live arm while the full session lane reads 11.77x, i.e. the tape is
+/// not the term — so the next question is strictly which kernel, and guessing
+/// between three of them is how the last four levers on this lane were chosen.
+fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32]) {
+    let spatial = GN_H * GN_W;
+    let channels_per_group = GN_C / GN_GROUPS;
+    let numel = GN_N * GN_C * GN_H * GN_W;
+    let out_meta = TensorMeta::from_shape(
+        vec![GN_N, GN_C, GN_H, GN_W],
+        DType::F32,
+        ft_core::Device::Cpu,
+    );
+    // The forward's own output feeds the sum, so it is built once up front rather
+    // than inside either timed region.
+    let forward_out = ft_kernel_cpu::group_norm_forward_f32(
+        values,
+        Some(weight),
+        Some(bias),
+        GN_N,
+        GN_GROUPS,
+        channels_per_group,
+        spatial,
+        1e-5,
+    );
+
+    let reps = 9;
+    let mut fwd = Vec::with_capacity(reps);
+    let mut sum = Vec::with_capacity(reps);
+    let mut bwd = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let started = Instant::now();
+        let out = ft_kernel_cpu::group_norm_forward_f32(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+        );
+        fwd.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box(&out);
+
+        let started = Instant::now();
+        let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&forward_out, &out_meta).expect("sum");
+        sum.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box(loss);
+
+        let started = Instant::now();
+        let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+            1.0f32,
+            values,
+            Some(weight),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+        );
+        bwd.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box(&dx);
+    }
+
+    // Min, not median: this is attribution of a floor, and on a host carrying a
+    // dozen other agents the median mostly measures the neighbours.
+    let floor = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[0]
+    };
+    let (fwd, sum, bwd) = (floor(fwd), floor(sum), floor(bwd));
+    println!(
+        "\nGROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of {reps}; NOT a ratio)\n  \
+         numel={numel}  groups={GN_GROUPS}  cpg={channels_per_group}  spatial={spatial}  rayon_threads={}\n  \
+         forward_f32              {fwd:8.3} ms   parallel gate {}: numel {numel} vs NORM_FWD_PARALLEL_MIN {}\n  \
+         sum_tensor_contiguous_f32 {sum:7.3} ms\n  \
+         backward_scalar_f32      {bwd:8.3} ms   (cpg==2 path, unconditionally parallel)\n  \
+         total                    {:8.3} ms",
+        rayon::current_num_threads(),
+        if numel >= (1 << 19) {
+            "MET"
+        } else {
+            "NOT MET -> SERIAL"
+        },
+        1u32 << 19,
+        fwd + sum + bwd,
+    );
 }

@@ -210,9 +210,96 @@ pub fn incumbent_provenance_block(version: &str, threads: usize) -> String {
     )
 }
 
+/// Read the first line of a `/proc` or `/sys` file, or `"unknown"`.
+fn first_line_of(path: &str) -> String {
+    std::fs::read_to_string(path).map_or_else(
+        |_| "unknown".to_owned(),
+        |text| text.lines().next().unwrap_or("unknown").trim().to_owned(),
+    )
+}
+
+/// Render the rows that identify the MACHINE a row was measured on.
+///
+/// # Why the machine is provenance
+///
+/// Measured across the rch fleet on 2026-08-15: the same cubic `splu` cell read
+/// **1.2693x on one worker and 0.0093x on another** — a 13.6x swing — with BOTH
+/// A/A nulls PASSING. A passing null controls within-invocation noise; it says
+/// nothing about between-machine differences in CPU model, cache, memory
+/// bandwidth or resident contention. Independently, an external-load veto was
+/// found not to predict the ratio at all (load varied 4.9x while the ratio
+/// spread 6.46%, r = -0.35), so load is not a usable stand-in for machine
+/// identity either.
+///
+/// The consequences are structural, and this block only serves the last one:
+///
+/// 1. Both arms must be sampled in the SAME invocation on the SAME machine.
+/// 2. A row that does not name its machine cannot be compared to any other row.
+///
+/// The harnesses in this crate satisfy (1) by construction — the incumbent is a
+/// co-process interleaved by the balanced square, so there is one machine per
+/// invocation by definition. This prints the identity of that machine so a
+/// banked row can still be placed afterwards.
+#[must_use]
+pub fn measurement_host_block(rayon_threads: usize) -> String {
+    let host = first_line_of("/proc/sys/kernel/hostname");
+    let cpu = std::fs::read_to_string("/proc/cpuinfo").map_or_else(
+        |_| "unknown".to_owned(),
+        |text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("model name"))
+                .and_then(|rest| rest.split_once(':'))
+                .map_or_else(|| "unknown".to_owned(), |(_, name)| name.trim().to_owned())
+        },
+    );
+    let governor = first_line_of("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    let isa = {
+        let mut features = vec![std::env::consts::ARCH];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                features.push("avx512f");
+            } else if std::arch::is_x86_feature_detected!("avx2") {
+                features.push("avx2");
+            }
+        }
+        features.join("+")
+    };
+    format!(
+        "measurement_host={host} cpu={cpu:?} isa={isa} governor={governor} \
+         rayon_threads={rayon_threads} online_cpus={}\n\
+         host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured \
+         elsewhere is not comparable to this one, A/A PASS or not",
+        std::thread::available_parallelism().map_or_else(
+            |_| "unknown".to_owned(),
+            |count| count.get().to_string()
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block must name the machine even when every optional source is
+    /// missing — a provenance line that silently drops fields is worse than one
+    /// that says `unknown`, because a reader cannot tell the two apart.
+    #[test]
+    fn measurement_host_block_names_every_field() {
+        let block = measurement_host_block(8);
+        for field in [
+            "measurement_host=",
+            "cpu=",
+            "isa=",
+            "governor=",
+            "rayon_threads=8",
+            "online_cpus=",
+            "host_rule=",
+        ] {
+            assert!(block.contains(field), "missing {field} in:\n{block}");
+        }
+        assert!(!block.contains("cpu=\"\""), "cpu must not be blank:\n{block}");
+    }
 
     #[test]
     fn parses_a_reported_version() {

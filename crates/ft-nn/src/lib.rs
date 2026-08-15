@@ -5953,21 +5953,21 @@ impl Module for PReLU {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // PReLU(x) = x          if x >= 0
+        // PReLU(x) = x          if x > 0
         //          = w[c] * x   otherwise
         //
         // where w broadcasts: a single scalar across all positions
         // when num_parameters == 1, or one slope per channel when
         // num_parameters == channels. Composed as
         //
-        //     where(x >= 0, x, weight_broadcast * x)
+        //     where(x > 0, x, weight_broadcast * x)
         //
-        // through tensor_ge / tensor_mul / tensor_where + a
+        // through tensor_gt / tensor_mul / tensor_where + a
         // tensor_reshape + tensor_expand chain that lifts `weight`
         // (shape [num_parameters]) to the full input shape. Backward
         // correctness:
-        //   d output / d input  for x >= 0:  1     (where x branch)
-        //                       for x <  0:  w[c]  (mul backward)
+        //   d output / d input  for x >  0:  1     (where x branch)
+        //                       for x <= 0:  w[c]  (mul backward)
         //   d output / d weight[c]: sum over (b, spatial) of x_i
         //                           where mask_i == 0 in channel c
         //                           (mul backward + expand backward
@@ -6026,7 +6026,11 @@ impl Module for PReLU {
         };
         let neg_branch = session.tensor_mul(weight_broadcast, input)?;
         let zeros = session.full(input_shape, 0.0, false)?;
-        let mask = session.tensor_ge(input, zeros)?;
+        // STRICTLY greater, matching torch's `where(input > 0, input, weight*input)`.
+        // This used to be `tensor_ge`, which routes an `x == 0` element down the
+        // identity branch and hands it a gradient of 1.0 where torch hands it
+        // `w[c]`. frankentorch-x4cx3.
+        let mask = session.tensor_gt(input, zeros)?;
         session.tensor_where(mask, input, neg_branch)
     }
 
@@ -34077,12 +34081,17 @@ mod tests {
         //   forward = [-0.2, -0.1, 0, 1, 2]
         //   sum-loss → incoming = ones
         //   d/d input:
-        //     x >= 0: 1
-        //     x <  0: slope (= 0.1)
-        //     so grad_input = [0.1, 0.1, 1, 1, 1]
+        //     x >  0: 1
+        //     x <= 0: slope (= 0.1)
+        //     so grad_input = [0.1, 0.1, 0.1, 1, 1]
         //   d/d weight (single slope):
-        //     sum over i in mask=false of x_i = (-2) + (-1) = -3
+        //     sum over i in mask=false of x_i = (-2) + (-1) + 0 = -3
         //     grad_weight = [-3.0]
+        //
+        // The x == 0 element sits on the SLOPE side, which is torch's rule
+        // (`F.prelu` grad at [-1,0,1] with w=0.25 is [0.25,0.25,1.0], torch
+        // 2.12.1). This test previously expected 1.0 there, pinning the pre-fix
+        // behaviour. frankentorch-x4cx3.
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let prelu = PReLU::new(&mut session, 1, 0.1).unwrap();
         let weight_node = prelu.parameters()[0];
@@ -34100,7 +34109,7 @@ mod tests {
             .expect("PReLU must propagate gradient to its learnable weight");
         for (i, (&g, &want)) in input_grad
             .iter()
-            .zip([0.1, 0.1, 1.0, 1.0, 1.0].iter())
+            .zip([0.1, 0.1, 0.1, 1.0, 1.0].iter())
             .enumerate()
         {
             assert!(
@@ -34126,7 +34135,8 @@ mod tests {
         //   channel 1: [3, -4, 0]    → contributes (-4) to weight grad[1]
         //
         // Per-channel weight grad: [-3.0, -4.0].
-        // Input grad pattern: 1 where x>=0, 0.1 where x<0.
+        // Input grad pattern: 1 where x>0, 0.1 where x<=0 — the trailing 0.0 in
+        // channel 1 therefore reads 0.1, not 1.0 (frankentorch-x4cx3).
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let prelu = PReLU::new(&mut session, 2, 0.1).unwrap();
         let weight_node = prelu.parameters()[0];
@@ -34148,7 +34158,7 @@ mod tests {
 
         let expected_input = [
             0.1, 0.1, 1.0, // channel 0 gradient (mask=[F,F,T])
-            1.0, 0.1, 1.0, // channel 1 gradient (mask=[T,F,T])
+            1.0, 0.1, 0.1, // channel 1 gradient (mask=[T,F,F] — x==0 is not > 0)
         ];
         for (i, (&g, &want)) in input_grad.iter().zip(expected_input.iter()).enumerate() {
             assert!(
