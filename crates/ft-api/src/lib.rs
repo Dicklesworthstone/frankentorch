@@ -22151,6 +22151,18 @@ impl FrankenTorchSession {
         lower: f64,
         upper: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        // f32/half: compute in f64 then cast back. The borrowed-inputs path below reads
+        // its input with the f64 accessor and builds its output meta as DType::F64
+        // unconditionally, so a non-f64 tensor did not merely widen — it failed outright
+        // with UnsupportedDType(F32), while torch's rrelu accepts f32. Same guard relu6
+        // and selu already carry (frankentorch-x9yuq); torch keeps the input dtype.
+        // frankentorch-wp18c.
+        let dt = self.tensor_dtype(input)?;
+        if dt != DType::F64 {
+            let in64 = self.tensor_to_dtype(input, DType::F64)?;
+            let out64 = self.tensor_rrelu(in64, lower, upper)?;
+            return self.tensor_to_dtype(out64, dt);
+        }
         let slope = (lower + upper) / 2.0;
         // Branch on x > 0, NOT x >= 0: torch's rrelu keeps the input only where it is
         // STRICTLY positive and multiplies everywhere else, so x == 0 takes the slope
@@ -164988,6 +165000,60 @@ mod tests {
             vec![SLOPE],
             "grad at NaN is the slope branch"
         );
+    }
+
+    /// `rrelu` preserves the input dtype, like torch, instead of widening to f64.
+    ///
+    /// `tensor_rrelu` routes through `tensor_apply_function_f64_borrowed_inputs`,
+    /// whose tape helper reads inputs with the f64 accessor and builds its output
+    /// meta as `DType::F64` unconditionally. Its siblings `relu6` and `selu` both
+    /// carry an explicit upcast-compute-narrow guard for exactly this reason —
+    /// `rrelu` had none, so an f32 input either errored or came back f64.
+    /// frankentorch-wp18c.
+    #[test]
+    fn rrelu_preserves_f32_dtype() {
+        const LOWER: f64 = 0.125;
+        const UPPER: f64 = 1.0 / 3.0;
+        const SLOPE: f32 = ((LOWER + UPPER) / 2.0) as f32;
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(vec![-1.0, 0.0, 1.0, -2.0], vec![4], false)
+            .expect("f32 leaf");
+        let out = s
+            .tensor_rrelu(x, LOWER, UPPER)
+            .expect("rrelu must accept an f32 tensor");
+        assert_eq!(
+            s.tensor_dtype(out).unwrap(),
+            DType::F32,
+            "rrelu must keep the input dtype; torch does not widen f32 to f64"
+        );
+        assert_eq!(
+            s.tensor_values_f32(out).unwrap(),
+            vec![-SLOPE, 0.0, 1.0, -2.0 * SLOPE],
+            "f32 rrelu values (x > 0 keeps, else multiplies)"
+        );
+
+        // The grad path must survive the same route and stay f32.
+        let mut g = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xg = g
+            .tensor_variable_f32(vec![-1.0, 0.0, 1.0], vec![3], true)
+            .expect("f32 leaf with grad");
+        let og = g
+            .tensor_rrelu(xg, LOWER, UPPER)
+            .expect("f32 rrelu with grad");
+        assert_eq!(g.tensor_dtype(og).unwrap(), DType::F32);
+        let loss = g.tensor_sum(og).unwrap();
+        let report = g.tensor_backward(loss).unwrap();
+        let grad = g.tensor_gradient(&report, xg).expect("grad");
+        // Zero takes the slope branch (frankentorch-3eq5b).
+        let want = [f64::from(SLOPE), f64::from(SLOPE), 1.0];
+        for (i, (&got, &w)) in grad.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (got - w).abs() < 1e-6,
+                "f32 rrelu grad[{i}] = {got}, expected {w}"
+            );
+        }
     }
 
     /// An activation's gradient at `x = NaN` does not depend on the tensor's length.
