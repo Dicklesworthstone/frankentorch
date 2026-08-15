@@ -13114,29 +13114,34 @@ impl FrankenTorchSession {
                     const PAIRS_PER_CHUNK: usize = 2_048;
                     use rayon::prelude::*;
                     let mut out = vec![0.0_f32; n * (n - 1) / 2];
-                    out.par_chunks_mut(PAIRS_PER_CHUNK).enumerate().for_each(
-                        |(chunk_idx, chunk)| {
-                            let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
-                            for slot in chunk {
-                                let i_base = i * m;
-                                let j_base = j * m;
-                                let mut squared_distance = 0.0_f32;
-                                for k in 0..m {
-                                    let diff = values[i_base + k] - values[j_base + k];
-                                    squared_distance += diff * diff;
-                                }
-                                // Squared distances are non-negative. `sqrt` is
-                                // the p=2 operation directly; `powf(0.5)` would
-                                // dispatch a generic exponent routine per pair.
-                                *slot = squared_distance.sqrt();
-                                j += 1;
-                                if j == n {
-                                    i += 1;
-                                    j = i + 1;
-                                }
+                    let fill_chunk = |chunk_idx: usize, chunk: &mut [f32]| {
+                        let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
+                        for slot in chunk {
+                            let i_base = i * m;
+                            let j_base = j * m;
+                            let mut squared_distance = 0.0_f32;
+                            for k in 0..m {
+                                let diff = values[i_base + k] - values[j_base + k];
+                                squared_distance += diff * diff;
                             }
-                        },
-                    );
+                            // Squared distances are non-negative. `sqrt` is
+                            // the p=2 operation directly; `powf(0.5)` would
+                            // dispatch a generic exponent routine per pair.
+                            *slot = squared_distance.sqrt();
+                            j += 1;
+                            if j == n {
+                                i += 1;
+                                j = i + 1;
+                            }
+                        }
+                    };
+                    if out.len() < PAIRS_PER_CHUNK {
+                        fill_chunk(0, &mut out);
+                    } else {
+                        out.par_chunks_mut(PAIRS_PER_CHUNK)
+                            .enumerate()
+                            .for_each(|(chunk_idx, chunk)| fill_chunk(chunk_idx, chunk));
+                    }
                     out
                 }
 
