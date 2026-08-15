@@ -6828,14 +6828,38 @@ pub fn group_norm_backward_scalar_f32(
                 let c1_sum = spatial_f * (dxhat0 + dxhat1);
                 let c2_sum = rstd
                     * (dxhat0 * (sum0 - spatial_f * mean) + dxhat1 * (sum1 - spatial_f * mean));
-                for i in 0..spatial {
-                    let xhat = (xb[i] - mean) * rstd;
-                    dxrow[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
+                let (x0, x1) = xb.split_at(spatial);
+                let (dx0, dx1) = dxrow.split_at_mut(spatial);
+                let vmean = f32x8::splat(mean);
+                let vrstd = f32x8::splat(rstd);
+                let vinv_m = f32x8::splat(inv_m);
+                let vc1_sum = f32x8::splat(c1_sum);
+                let vc2_sum = f32x8::splat(c2_sum);
+                let vdxhat0 = f32x8::splat(dxhat0);
+                let vdxhat1 = f32x8::splat(dxhat1);
+                let mut lane = 0;
+                while lane + 8 <= spatial {
+                    let xhat = (f32x8::from(&x0[lane..lane + 8]) - vmean) * vrstd;
+                    dx0[lane..lane + 8].copy_from_slice(
+                        &(vrstd * (vdxhat0 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
+                    );
+                    lane += 8;
                 }
-                for i in 0..spatial {
-                    let idx = spatial + i;
-                    let xhat = (xb[idx] - mean) * rstd;
-                    dxrow[idx] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
+                for i in lane..spatial {
+                    let xhat = (x0[i] - mean) * rstd;
+                    dx0[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
+                }
+                let mut lane = 0;
+                while lane + 8 <= spatial {
+                    let xhat = (f32x8::from(&x1[lane..lane + 8]) - vmean) * vrstd;
+                    dx1[lane..lane + 8].copy_from_slice(
+                        &(vrstd * (vdxhat1 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
+                    );
+                    lane += 8;
+                }
+                for i in lane..spatial {
+                    let xhat = (x1[i] - mean) * rstd;
+                    dx1[i] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
                 }
             });
         let (dweight, dbias) = if weight.is_some() {
@@ -53735,6 +53759,93 @@ mod tests {
             }
         }
         assert_eq!(digest, 0x533d76b2bc4e86e3);
+    }
+
+    #[test]
+    fn group_norm_f32_cpg2_scalar_backward_matches_scalar_reference_bits() {
+        let (batch, num_groups, cpg, spatial) = (2usize, 2usize, 2usize, 11usize);
+        let eps = 1e-5f32;
+        let group_numel = cpg * spatial;
+        let channels = num_groups * cpg;
+        let upstream = -0.375f32;
+        let x: Vec<f32> = (0..batch * channels * spatial)
+            .map(|i| ((i * 17 % 47) as f32 - 23.0) * 0.03125 + i as f32 * 0.00017)
+            .collect();
+        let weight: Vec<f32> = (0..channels)
+            .map(|c| 0.75 + (c % 5) as f32 * 0.0625)
+            .collect();
+        let inv_m = 1.0f32 / group_numel as f32;
+        let spatial_f = spatial as f32;
+        let mut expected_dx = vec![0.0f32; x.len()];
+        let mut expected_dw = vec![0.0f32; channels];
+        let mut expected_db = vec![0.0f32; channels];
+        for grp in 0..batch * num_groups {
+            let g = grp % num_groups;
+            let base = grp * group_numel;
+            let (x0, x1) = x[base..base + group_numel].split_at(spatial);
+            let mut sum = 0.0f32;
+            let mut sum0 = 0.0f32;
+            for &value in x0 {
+                sum += value;
+                sum0 += value;
+            }
+            let mut sum1 = 0.0f32;
+            for &value in x1 {
+                sum += value;
+                sum1 += value;
+            }
+            let mean = sum * inv_m;
+            let mut vsum = 0.0f32;
+            for &value in x0 {
+                let delta = value - mean;
+                vsum += delta * delta;
+            }
+            for &value in x1 {
+                let delta = value - mean;
+                vsum += delta * delta;
+            }
+            let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+            let c0 = g * 2;
+            let c1 = c0 + 1;
+            let dxhat0 = upstream * weight[c0];
+            let dxhat1 = upstream * weight[c1];
+            let c1_sum = spatial_f * (dxhat0 + dxhat1);
+            let c2_sum =
+                rstd * (dxhat0 * (sum0 - spatial_f * mean) + dxhat1 * (sum1 - spatial_f * mean));
+            let (dx0, dx1) = expected_dx[base..base + group_numel].split_at_mut(spatial);
+            for i in 0..spatial {
+                let xhat = (x0[i] - mean) * rstd;
+                dx0[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
+            }
+            for i in 0..spatial {
+                let xhat = (x1[i] - mean) * rstd;
+                dx1[i] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
+            }
+            expected_dw[c0] += upstream * rstd * (sum0 - spatial_f * mean);
+            expected_dw[c1] += upstream * rstd * (sum1 - spatial_f * mean);
+            expected_db[c0] += upstream * spatial_f;
+            expected_db[c1] += upstream * spatial_f;
+        }
+
+        let (dx, dw, db) = crate::group_norm_backward_scalar_f32(
+            upstream,
+            &x,
+            Some(&weight),
+            batch,
+            num_groups,
+            cpg,
+            spatial,
+            eps,
+        );
+        assert_eq!(
+            dx.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected_dx
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(dw.expect("weight gradient"), expected_dw);
+        assert_eq!(db.expect("bias gradient"), expected_db);
     }
 
     #[test]
