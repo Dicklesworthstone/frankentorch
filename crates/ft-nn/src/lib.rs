@@ -16481,42 +16481,51 @@ impl CTCLoss {
                         labels[2 * i + 1] = tgt_data[b * s_max_b + i] as usize;
                     }
 
-                    // Forward pass (alpha)
-                    let mut alpha = vec![vec![neg_inf; lattice_len]; input_len];
-                    alpha[0][0] = lp_data[b * num_classes_b + labels[0]];
+                    // Keep the full forward/backward tables contiguous. The gradient
+                    // needs every timestep, but it does not need a separate heap
+                    // allocation for every row.
+                    let table_len = input_len * lattice_len;
+                    let mut alpha = vec![neg_inf; table_len];
+                    alpha[0] = lp_data[b * num_classes_b + labels[0]];
                     if lattice_len > 1 {
-                        alpha[0][1] = lp_data[b * num_classes_b + labels[1]];
+                        alpha[1] = lp_data[b * num_classes_b + labels[1]];
                     }
                     for t in 1..input_len {
                         let lp_offset = t * batch_size_b * num_classes_b + b * num_classes_b;
+                        let prev_offset = (t - 1) * lattice_len;
+                        let row_offset = t * lattice_len;
                         for s in 0..lattice_len {
                             let emit = lp_data[lp_offset + labels[s]];
-                            let mut log_sum = alpha[t - 1][s];
+                            let mut log_sum = alpha[prev_offset + s];
                             if s >= 1 {
-                                log_sum = log_sum_exp(log_sum, alpha[t - 1][s - 1]);
+                                log_sum = log_sum_exp(log_sum, alpha[prev_offset + s - 1]);
                             }
                             if s >= 2 && labels[s] != blank && labels[s] != labels[s - 2] {
-                                log_sum = log_sum_exp(log_sum, alpha[t - 1][s - 2]);
+                                log_sum = log_sum_exp(log_sum, alpha[prev_offset + s - 2]);
                             }
-                            alpha[t][s] = log_sum + emit;
+                            alpha[row_offset + s] = log_sum + emit;
                         }
                     }
 
                     // Backward pass (beta)
-                    let mut beta = vec![vec![neg_inf; lattice_len]; input_len];
-                    beta[input_len - 1][lattice_len - 1] = 0.0;
+                    let mut beta = vec![neg_inf; table_len];
+                    let last_row_offset = (input_len - 1) * lattice_len;
+                    beta[last_row_offset + lattice_len - 1] = 0.0;
                     if lattice_len >= 2 {
-                        beta[input_len - 1][lattice_len - 2] = 0.0;
+                        beta[last_row_offset + lattice_len - 2] = 0.0;
                     }
                     for t in (0..input_len - 1).rev() {
                         let lp_offset_next = (t + 1) * batch_size_b * num_classes_b + b * num_classes_b;
+                        let next_row_offset = (t + 1) * lattice_len;
+                        let row_offset = t * lattice_len;
                         for s in 0..lattice_len {
-                            let mut log_sum = beta[t + 1][s]
+                            let mut log_sum = beta[next_row_offset + s]
                                 + lp_data[lp_offset_next + labels[s]];
                             if s + 1 < lattice_len {
                                 log_sum = log_sum_exp(
                                     log_sum,
-                                    beta[t + 1][s + 1] + lp_data[lp_offset_next + labels[s + 1]],
+                                    beta[next_row_offset + s + 1]
+                                        + lp_data[lp_offset_next + labels[s + 1]],
                                 );
                             }
                             if s + 2 < lattice_len
@@ -16525,17 +16534,18 @@ impl CTCLoss {
                             {
                                 log_sum = log_sum_exp(
                                     log_sum,
-                                    beta[t + 1][s + 2] + lp_data[lp_offset_next + labels[s + 2]],
+                                    beta[next_row_offset + s + 2]
+                                        + lp_data[lp_offset_next + labels[s + 2]],
                                 );
                             }
-                            beta[t][s] = log_sum;
+                            beta[row_offset + s] = log_sum;
                         }
                     }
 
                     // Total log probability
                     let log_prob = log_sum_exp(
-                        alpha[input_len - 1][lattice_len - 1],
-                        alpha[input_len - 1][lattice_len - 2],
+                        alpha[last_row_offset + lattice_len - 1],
+                        alpha[last_row_offset + lattice_len - 2],
                     );
 
                     // Compute gradient: for each (t, c), accumulate alpha[t][s] + beta[t][s]
@@ -16546,9 +16556,13 @@ impl CTCLoss {
                         let lp_offset = t * batch_size_b * num_classes_b + b * num_classes_b;
                         // For each class, collect alpha*beta contributions
                         let mut ab_sum = vec![neg_inf; num_classes_b];
+                        let row_offset = t * lattice_len;
                         for s in 0..lattice_len {
                             let c = labels[s];
-                            ab_sum[c] = log_sum_exp(ab_sum[c], alpha[t][s] + beta[t][s]);
+                            ab_sum[c] = log_sum_exp(
+                                ab_sum[c],
+                                alpha[row_offset + s] + beta[row_offset + s],
+                            );
                         }
 
                         for c in 0..num_classes_b {
@@ -35718,7 +35732,16 @@ mod tests {
                 batched_target_lengths,
             )
             .unwrap();
-        let batched_values = batched_session.tensor_values(batched_loss).unwrap();
+        let batched_values = batched_session
+            .tensor_values(batched_loss)
+            .unwrap()
+            .to_vec();
+        let batched_total = batched_session.tensor_sum(batched_loss).unwrap();
+        let batched_report = batched_session.tensor_backward(batched_total).unwrap();
+        let batched_grad = batched_session
+            .tensor_gradient(&batched_report, batched_log_probs)
+            .unwrap()
+            .to_vec();
 
         for batch in 0..BATCH {
             let mut single_log_probs_data = Vec::with_capacity(TIME * CLASSES);
@@ -35754,7 +35777,24 @@ mod tests {
                 )
                 .unwrap();
             let single_value = single_session.tensor_values(single_loss).unwrap()[0];
+            let single_total = single_session.tensor_sum(single_loss).unwrap();
+            let single_report = single_session.tensor_backward(single_total).unwrap();
+            let single_grad = single_session
+                .tensor_gradient(&single_report, single_log_probs)
+                .unwrap()
+                .to_vec();
             assert_eq!(batched_values[batch].to_bits(), single_value.to_bits());
+            for time in 0..TIME {
+                for class in 0..CLASSES {
+                    let batched_offset = (time * BATCH + batch) * CLASSES + class;
+                    let single_offset = time * CLASSES + class;
+                    assert_eq!(
+                        batched_grad[batched_offset].to_bits(),
+                        single_grad[single_offset].to_bits(),
+                        "gradient mismatch at batch={batch}, time={time}, class={class}"
+                    );
+                }
+            }
         }
     }
 
