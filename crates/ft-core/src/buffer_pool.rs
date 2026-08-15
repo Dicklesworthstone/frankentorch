@@ -262,6 +262,13 @@ pub fn recycle(buffer: Vec<f64>) {
     if capacity < MIN_POOLED_LEN || !is_enabled() {
         return;
     }
+    // `try_take_exact` selects by logical length alone, so admitting a buffer
+    // with much more capacity than its length would let one small gradient pin
+    // most of the pool's byte budget. Apply the same slack limit at admission
+    // that `take_filled` applies at reuse.
+    if capacity > buffer.len().saturating_mul(MAX_CAPACITY_SLACK) {
+        return;
+    }
     let bytes = capacity * size_of::<f64>();
     with_pool(|pool| {
         if PARKED_BYTES.load(Ordering::Relaxed) + bytes > MAX_PARKED_BYTES {
@@ -471,6 +478,24 @@ mod tests {
             recycle(vec![0.0; MIN_POOLED_LEN - 1]);
             assert_eq!(stats().parked_buffers, 0);
             assert_eq!(stats().parked_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn over_capacity_small_buffer_is_not_parked_or_reused_exactly() {
+        guarded(|| {
+            let len = MIN_POOLED_LEN;
+            let mut oversized = Vec::with_capacity(len * (MAX_CAPACITY_SLACK + 1));
+            oversized.resize(len, 7.5);
+            recycle(oversized);
+
+            assert_eq!(stats().parked_buffers, 0);
+            assert!(
+                try_take_exact(len).is_none(),
+                "an oversized allocation must not occupy the exact-length cache"
+            );
+            assert_eq!(stats().hits, 0);
+            assert_eq!(stats().misses, 1);
         });
     }
 
