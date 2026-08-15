@@ -19370,3 +19370,108 @@ between-worker differences. It does not invalidate the rows above — they were
 timed locally, both arms in one process — but any FUTURE row must name its
 worker, and no row may pair an arm measured on one worker with an arm measured on
 another.
+
+## Activation zero-boundary sweep: 12 of 13 siblings were already correct (`3eq5b`)
+
+`x4cx3` found that prelu branched on `x >= 0` where torch uses `x > 0`, and filed
+`3eq5b` on the suspicion that the whole activation family shared the defect. It
+does not. Probed against **torch 2.12.1+cpu** at every branch boundary each op
+actually has (not just zero), `rrelu` was the **only** op that disagreed:
+
+| op | boundary probed | torch grad there | FrankenTorch | verdict |
+|---|---|---|---|---|
+| `rrelu` (eval + training) | `x = 0` | slope | **1.0** | **BUG — fixed** |
+| `leaky_relu` | `x = 0` | slope | slope | already correct |
+| `elu`, `celu` | `x = 0` | 1.0 (both branches agree) | same | not observable |
+| `selu` | `x = 0` | 1.7580993408473766 (neg branch) | neg branch | already correct |
+| `relu`, `relu6` | `x = 0`, `x = 6` | 0.0 | 0.0 | already correct |
+| `hardtanh` | `x = ±1` | 0.0 | 0.0 | already correct |
+| `threshold` | `x = t` | 0.0 (value branch) | value branch | already correct |
+| `hardshrink`, `softshrink` | `x = ±λ` | 0.0 | 0.0 | already correct |
+| `hardsigmoid` | `x = ±3` | 0.0 | 0.0 | already correct |
+| `hardswish` | `x = -3` / `x = +3` | 0.0 / **1.0** (asymmetric) | 0.0 / 1.0 | already correct |
+| `softplus` | `x = threshold` | sigmoid branch | sigmoid branch | already correct |
+
+Rejected prior: **"a defect found in one activation implies a family-wide sweep
+will find siblings."** It did not here — one op in thirteen. The sweep was still
+worth running, but the yield rate is the finding, and a future "same shape as X"
+lead should be costed as one probe per op, not as a presumed cluster.
+
+Three things worth keeping from the sweep:
+
+- **`elu`/`celu` are un-probeable at zero and that is not evidence of health.**
+  Both branches evaluate to derivative 1.0 at `x = 0`, so a `>=`/`>` mix is
+  invisible there for `alpha = 1`. They read as correct; nothing measured them.
+- **`clamp` and `relu6` disagree in torch itself.** `clamp(0,6)` keeps gradient
+  **1.0** at both boundaries while `relu6` drops it to **0.0**. An implementation
+  that "simplifies" `relu6` to compose through `clamp`'s backward would silently
+  acquire the wrong boundary gradient. FrankenTorch's `relu6` carries its own
+  predicate and is safe; this is a trap for anyone deduplicating them later.
+- **The signed zero, not the gradient, is the sharpest probe.** For `rrelu` the
+  forward is also wrong under `>=`, but only for a NEGATIVE slope: torch returns
+  `rrelu(+0.0) = -0.0` because it multiplies, where passing the input through
+  returns `+0.0`. Bit-comparing zeros under a negative coefficient distinguishes
+  "took the multiply branch" from "took the identity branch" even when every
+  finite value agrees — worth reaching for first in any future select-op audit.
+
+**11. TWO OF MY OWN HARNESSES DISAGREE ABOUT THE SAME LEVER, AND THE
+DISAGREEMENT IS THE RESULT (`frankentorch-dmpho`, 2026-08-15).** Recorded under
+the fleet rule adopted after frankenlibc measured malloc/free on ONE worker
+(`hz2`) with two separately-sanctioned harnesses and got **5.9459x and
+12.385414x** — a ~2x spread with both A/A nulls passing in tolerance. A passing
+null does not certify that a harness measures what its author thinks it measures.
+
+The lever: `group_norm_parallel_pays` (commit `e434e93a`), which stops
+`group_norm_forward_f32` taking the serial branch on the 256-group scorecard
+shape. Both harnesses are compiled into the SAME binary and run in the SAME
+invocation on the SAME machine, so nothing here is cross-worker or cross-run.
+
+| harness | estimator | incumbent arm | reads the lever as |
+|---|---|---|---|
+| `gauntlet_lane_sweep_h2h` paired lane (`group_norm_f32_kernels` vs `_serialfwd`) | per-round median of 4, balanced square | live PyTorch co-process | **0.991x** `[0.876,1.171]`, 19/40 rounds — no effect |
+| `group_norm_f32_kernel_breakdown` | min of 9, two schedules interleaved rep-by-rep | none | **4.0x** (0.692 ms serial -> 0.173 ms parallel) |
+
+**Scope differs, but not by enough to explain it.** The breakdown times only the
+forward; the lane times forward + sum + backward + per-rep allocation. A
+0.692 -> 0.173 ms drop inside a ~2.0 ms lane should still surface as ~1.26x, and
+the lane's point estimate is 0.991 — the wrong side of unity. So one of these is
+measuring something other than what it claims, and this entry does NOT pick
+between them:
+
+- the breakdown may be flattered by running both schedules back-to-back on one
+  warm input (though the SERIAL arm runs second, which biases against the 4.0x,
+  not for it), and its min-of-9 discards exactly the contention the lane's median
+  keeps;
+- the lane may be dominated by the per-rep allocation churn that its own numbers
+  imply — it reads ~2.0 ms while its three kernels measured back-to-back total
+  0.851 ms — in which case a 0.5 ms kernel saving really can vanish into
+  allocator variance, and the lane is not a kernel measurement at all.
+
+Either way the commit's headline, "sentinel-proved 4.0x", is a
+`group_norm_f32_kernel_breakdown` number and must be quoted with that harness
+named. It is NOT a vs-PyTorch win and was not claimed as one.
+
+**Provenance fields now required on every row banked here**, adopted together
+with the above (frankenfs made worker identity a gate and retro-flagged 166 rows;
+franken_numpy replicated a win on a second worker and RETRACTED a sub-claim in
+the process — "the deferral parallel cost is gone" read 1.004x on one host and
+0.928x on another, so it still costs ~7.8%):
+
+- `harness=` the file and estimator that produced the number;
+- `same_host=` (for locally timed rows) or `RCH_WORKER=` (for rows timed on a
+  worker), plus the ELF digest;
+- a row that cannot name where it ran, and with what, is not comparable to any
+  other row.
+
+**Retro-flag of every row this session banked.** All of them are
+`harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1` (AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2,
+governor powersave, 64 rayon threads, torch threads 8, mimalloc), both arms in
+one process in one invocation — the h2h arms CANNOT land on different machines
+here, because the rch workers have no PyTorch and the harness fails closed
+without it. Only the BUILDS were remote (`vmi1293453`, `vmi1227854`,
+`vmi1152480`, `vmi1153651`); `.cargo/config.toml` sets no `target-cpu`, so the
+binaries share a baseline ISA, and each run self-reports its ELF digest. Item 10
+carries its ELF (`fa00c082`) for run 2 and explicitly records that run 1's binary
+was overwritten before its digest was captured — that row stays flagged as
+un-namable and is not comparable to any other.
