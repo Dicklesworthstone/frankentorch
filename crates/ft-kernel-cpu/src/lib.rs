@@ -13294,7 +13294,22 @@ pub fn batch_norm_backward_scalar_f32(
             let c1 = w * dbias[c];
             let c2 = w * dweight[c];
             let dxhat = upstream * w;
-            for s in 0..spatial {
+            let vmean = f32x8::splat(mean[c]);
+            let vrstd = f32x8::splat(rstd);
+            let vinv_m = f32x8::splat(inv_m);
+            let vm = f32x8::splat(m);
+            let vdxhat = f32x8::splat(dxhat);
+            let vc1 = f32x8::splat(c1);
+            let vc2 = f32x8::splat(c2);
+            let mut lane = 0;
+            while lane + 8 <= spatial {
+                let xhat = (f32x8::from(&x[base + lane..base + lane + 8]) - vmean) * vrstd;
+                dxrow[lane..lane + 8].copy_from_slice(
+                    &(vrstd * vinv_m * (vm * vdxhat - vc1 - xhat * vc2)).to_array(),
+                );
+                lane += 8;
+            }
+            for s in lane..spatial {
                 let xhat = (x[base + s] - mean[c]) * rstd;
                 dxrow[s] = rstd * inv_m * (m * dxhat - c1 - xhat * c2);
             }
@@ -54363,7 +54378,7 @@ mod tests {
 
     #[test]
     fn batch_norm_f32_scalar_backward_matches_unit_dy_bits() {
-        for (batch, channels, spatial) in [(5usize, 7usize, 1usize), (3, 4, 15)] {
+        for (batch, channels, spatial) in [(5usize, 7usize, 1usize), (2, 3, 8), (3, 4, 15)] {
             let eps = 1e-5f32;
             let x: Vec<f32> = (0..batch * channels * spatial)
                 .map(|i| ((i % 37) as f32 - 18.0) * 0.03125 + (i as f32) * 0.0007)
