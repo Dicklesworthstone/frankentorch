@@ -8517,6 +8517,7 @@ pub fn max_pool3d_forward_with_indices_f64(
 #[allow(clippy::too_many_arguments)]
 fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
     input: &[f64],
+    mut values: Option<&mut [f64]>,
     arg_offsets: &mut [f64],
     start: usize,
     id: usize,
@@ -8535,6 +8536,7 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
     if kd == 2 && kh == 2 && kw == 2 && sd == 2 && sh == 2 && sw == 2 {
         return max_pool3d_sum_2x2s2_leaf_with_indices_f64(
             input,
+            values,
             arg_offsets,
             start,
             id,
@@ -8555,7 +8557,7 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
     let mut oy = rem / ow;
     let mut ox = rem - oy * ow;
     let mut sum = 0.0_f64;
-    for arg_slot in arg_offsets {
+    for (index, arg_slot) in arg_offsets.iter_mut().enumerate() {
         let ibase = plane * id * ih * iw;
         let bd = oz * sd;
         let bh = oy * sh;
@@ -8577,6 +8579,9 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
             }
         }
         *arg_slot = arg as f64;
+        if let Some(values) = values.as_deref_mut() {
+            values[index] = max_value;
+        }
         sum += max_value;
 
         ox += 1;
@@ -8599,6 +8604,7 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
 #[allow(clippy::too_many_arguments)]
 fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
     input: &[f64],
+    mut values: Option<&mut [f64]>,
     arg_offsets: &mut [f64],
     start: usize,
     id: usize,
@@ -8619,7 +8625,7 @@ fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
     let mut oy = rem / ow;
     let mut ox = rem - oy * ow;
     let mut sum = 0.0_f64;
-    for arg_slot in arg_offsets {
+    for (index, arg_slot) in arg_offsets.iter_mut().enumerate() {
         let input_plane_base = plane * plane_len;
         let z0 = (oz * 2) * depth_stride;
         let z1 = z0 + depth_stride;
@@ -8637,8 +8643,15 @@ fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
         let loc110 = row11 + x0;
         let loc111 = loc110 + 1;
 
-        let mut max_value = input[input_plane_base + loc000];
-        let mut arg = loc000;
+        // Match the generic first-argmax contract exactly: a window of only
+        // NaNs or negative infinities stays at -inf with its default offset.
+        let mut max_value = f64::NEG_INFINITY;
+        let mut arg = 0usize;
+        let candidate = input[input_plane_base + loc000];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc000;
+        }
         let candidate = input[input_plane_base + loc001];
         if candidate > max_value {
             max_value = candidate;
@@ -8676,6 +8689,9 @@ fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
         }
 
         *arg_slot = arg as f64;
+        if let Some(values) = values.as_deref_mut() {
+            values[index] = max_value;
+        }
         sum += max_value;
 
         ox += 1;
@@ -8698,6 +8714,7 @@ fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
 #[allow(clippy::too_many_arguments)]
 fn max_pool3d_sum_pairwise_range_with_indices_f64(
     input: &[f64],
+    values: Option<&mut [f64]>,
     arg_offsets: &mut [f64],
     start: usize,
     id: usize,
@@ -8717,6 +8734,7 @@ fn max_pool3d_sum_pairwise_range_with_indices_f64(
     if arg_offsets.len() <= BLOCK {
         return max_pool3d_sum_pairwise_leaf_with_indices_f64(
             input,
+            values,
             arg_offsets,
             start,
             id,
@@ -8735,30 +8753,74 @@ fn max_pool3d_sum_pairwise_range_with_indices_f64(
     }
     let mid = arg_offsets.len() / 2;
     let (left, right) = arg_offsets.split_at_mut(mid);
-    max_pool3d_sum_pairwise_range_with_indices_f64(
-        input, left, start, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-    ) + max_pool3d_sum_pairwise_range_with_indices_f64(
-        input,
-        right,
-        start + mid,
-        id,
-        ih,
-        iw,
-        kd,
-        kh,
-        kw,
-        od,
-        oh,
-        ow,
-        sd,
-        sh,
-        sw,
-    )
+    match values {
+        Some(values) => {
+            let (left_values, right_values) = values.split_at_mut(mid);
+            max_pool3d_sum_pairwise_range_with_indices_f64(
+                input,
+                Some(left_values),
+                left,
+                start,
+                id,
+                ih,
+                iw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+            ) + max_pool3d_sum_pairwise_range_with_indices_f64(
+                input,
+                Some(right_values),
+                right,
+                start + mid,
+                id,
+                ih,
+                iw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+            )
+        }
+        None => {
+            max_pool3d_sum_pairwise_range_with_indices_f64(
+                input, None, left, start, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            ) + max_pool3d_sum_pairwise_range_with_indices_f64(
+                input,
+                None,
+                right,
+                start + mid,
+                id,
+                ih,
+                iw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn max_pool3d_sum_pairwise_range_with_indices_f64_par(
     input: &[f64],
+    values: Option<&mut [f64]>,
     arg_offsets: &mut [f64],
     start: usize,
     id: usize,
@@ -8778,6 +8840,7 @@ fn max_pool3d_sum_pairwise_range_with_indices_f64_par(
     if arg_offsets.len() <= PAR_BLOCK {
         return max_pool3d_sum_pairwise_range_with_indices_f64(
             input,
+            values,
             arg_offsets,
             start,
             id,
@@ -8796,33 +8859,84 @@ fn max_pool3d_sum_pairwise_range_with_indices_f64_par(
     }
     let mid = arg_offsets.len() / 2;
     let (left, right) = arg_offsets.split_at_mut(mid);
-    let (ls, rs) = rayon::join(
-        || {
-            max_pool3d_sum_pairwise_range_with_indices_f64_par(
-                input, left, start, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-            )
-        },
-        || {
-            max_pool3d_sum_pairwise_range_with_indices_f64_par(
-                input,
-                right,
-                start + mid,
-                id,
-                ih,
-                iw,
-                kd,
-                kh,
-                kw,
-                od,
-                oh,
-                ow,
-                sd,
-                sh,
-                sw,
-            )
-        },
-    );
-    ls + rs
+    match values {
+        Some(values) => {
+            let (left_values, right_values) = values.split_at_mut(mid);
+            let (ls, rs) = rayon::join(
+                || {
+                    max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                        input,
+                        Some(left_values),
+                        left,
+                        start,
+                        id,
+                        ih,
+                        iw,
+                        kd,
+                        kh,
+                        kw,
+                        od,
+                        oh,
+                        ow,
+                        sd,
+                        sh,
+                        sw,
+                    )
+                },
+                || {
+                    max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                        input,
+                        Some(right_values),
+                        right,
+                        start + mid,
+                        id,
+                        ih,
+                        iw,
+                        kd,
+                        kh,
+                        kw,
+                        od,
+                        oh,
+                        ow,
+                        sd,
+                        sh,
+                        sw,
+                    )
+                },
+            );
+            ls + rs
+        }
+        None => {
+            let (ls, rs) = rayon::join(
+                || {
+                    max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                        input, None, left, start, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+                    )
+                },
+                || {
+                    max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                        input,
+                        None,
+                        right,
+                        start + mid,
+                        id,
+                        ih,
+                        iw,
+                        kd,
+                        kh,
+                        kw,
+                        od,
+                        oh,
+                        ow,
+                        sd,
+                        sh,
+                        sw,
+                    )
+                },
+            );
+            ls + rs
+        }
+    }
 }
 
 /// Fused `sum(max_pool3d(...))` forward plus first-argmax sidecar (f64).
@@ -8854,6 +8968,7 @@ pub fn max_pool3d_sum_forward_with_indices_f64(
     let sum = if len >= FUSED_POOL_SUM_PARALLEL_THRESHOLD {
         max_pool3d_sum_pairwise_range_with_indices_f64_par(
             input,
+            None,
             &mut arg_offsets,
             0,
             id,
@@ -8872,6 +8987,7 @@ pub fn max_pool3d_sum_forward_with_indices_f64(
     } else {
         max_pool3d_sum_pairwise_range_with_indices_f64(
             input,
+            None,
             &mut arg_offsets,
             0,
             id,
@@ -8893,11 +9009,9 @@ pub fn max_pool3d_sum_forward_with_indices_f64(
 
 /// Fused max-pool3d forward, first-argmax sidecar, and exact scalar sum (f64).
 ///
-/// The scalar kernel already visits each pooling window and records the winning
-/// plane-local input offset.  Reconstructing the observable pooled activation
-/// from those offsets costs one linear gather, rather than performing a second
-/// full window scan followed by a third pass for `tensor_sum`.  The sum uses
-/// the same pairwise tree as [`sum_tensor_contiguous_f64`].
+/// The scalar kernel writes the observable pooled value beside each first-argmax
+/// sidecar entry while preserving the pairwise tree used by
+/// [`sum_tensor_contiguous_f64`].
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn max_pool3d_forward_with_indices_and_sum_f64(
@@ -8917,26 +9031,49 @@ pub fn max_pool3d_forward_with_indices_and_sum_f64(
     sh: usize,
     sw: usize,
 ) -> (Vec<f64>, Vec<f64>, f64) {
-    let (sum, arg_offsets) = max_pool3d_sum_forward_with_indices_f64(
-        input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-    );
-    let input_plane_len = id * ih * iw;
-    let output_plane_len = od * oh * ow;
-    let mut out = Vec::with_capacity(arg_offsets.len());
-    for (plane, offsets) in arg_offsets.chunks(output_plane_len).enumerate() {
-        let input_base = plane * input_plane_len;
-        out.extend(offsets.iter().map(|&offset| {
-            let winner = input[input_base + offset as usize];
-            // The first-argmax loop initializes its maximum to -inf and does
-            // not select NaN.  If a whole window is NaN/-inf, it records the
-            // initial offset while its observable output remains -inf.
-            if winner.is_nan() {
-                f64::NEG_INFINITY
-            } else {
-                winner
-            }
-        }));
-    }
+    const FUSED_POOL_SUM_PARALLEL_THRESHOLD: usize = 1 << 13;
+    let len = batch * ch * od * oh * ow;
+    let mut out = vec![0.0_f64; len];
+    let mut arg_offsets = vec![0.0_f64; len];
+    let sum = if len >= FUSED_POOL_SUM_PARALLEL_THRESHOLD {
+        max_pool3d_sum_pairwise_range_with_indices_f64_par(
+            input,
+            Some(&mut out),
+            &mut arg_offsets,
+            0,
+            id,
+            ih,
+            iw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+        )
+    } else {
+        max_pool3d_sum_pairwise_range_with_indices_f64(
+            input,
+            Some(&mut out),
+            &mut arg_offsets,
+            0,
+            id,
+            ih,
+            iw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+        )
+    };
     (out, arg_offsets, sum)
 }
 
@@ -39833,6 +39970,66 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn max_pool3d_fused_sidecar_emits_special_window_values_and_offsets_bits() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        // The two 2x2x2 windows exercise the specialized leaf's two unusual
+        // cases: no value can exceed -inf, and comparisons never select NaN.
+        let input = vec![
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let (expected_values, expected_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, 1, 1, 2, 2, 4, 2, 2, 2, 1, 1, 2, 2, 2, 2,
+        );
+        let expected_sum = super::sum_tensor_contiguous_f64(
+            &expected_values,
+            &TensorMeta::from_shape(vec![1, 1, 1, 1, 2], DType::F64, Device::Cpu),
+        )
+        .expect("materialized special-window sum");
+
+        let (values, offsets, sum) = super::max_pool3d_forward_with_indices_and_sum_f64(
+            &input, 1, 1, 2, 2, 4, 2, 2, 2, 1, 1, 2, 2, 2, 2,
+        );
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_offsets
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(sum.to_bits(), expected_sum.to_bits());
     }
 
     // frankentorch-un3os. `max_pool3d_backward_from_indices_f64` now picks a serial or
