@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! PYTORCH_PYTHON=/path/to/python \
-//!   cargo run --profile release-perf -p ft-api --example pdist_f32_h2h
+//!   cargo run --profile release-perf -p frankentorch-api --example pdist_f32_h2h
 //! ```
 
 use std::io::{BufRead, BufReader, Write};
@@ -129,6 +129,14 @@ fn incumbent_sample(
     }
 }
 
+fn missing_oracle_error(python: &str, preamble: &str) -> String {
+    format!(
+        "the PyTorch arm (`{python}`) exited before announcing `{READY_MARKER}`; set \
+         PYTORCH_PYTHON to an interpreter with torch installed. A FrankenTorch-only run cannot \
+         carry a vs-PyTorch claim. Its output was:\n{preamble}"
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let values = seq(N * M);
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -152,14 +160,29 @@ LANES = {"pdist_f32": (pdist, lambda x: torch.pdist(x, p=2.0))}
         .args(ft_api::harness_interleave::interpreter_args(&py))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child.stdin.take().ok_or("missing PyTorch stdin")?;
-    let mut reader = BufReader::new(child.stdout.take().ok_or("missing PyTorch stdout")?);
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "could not start the PyTorch arm (`{python}`): {error}. Set PYTORCH_PYTHON to \
+                 an interpreter with torch installed; a FrankenTorch-only run cannot carry a \
+                 vs-PyTorch claim."
+            )
+        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no PyTorch stdin"))?;
+    let mut reader = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no PyTorch stdout"))?,
+    );
     let mut preamble = String::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Err(format!("PyTorch arm exited before {READY_MARKER}: {preamble}").into());
+            return Err(missing_oracle_error(&python, &preamble).into());
         }
         if line.trim() == READY_MARKER {
             break;
@@ -250,7 +273,7 @@ LANES = {"pdist_f32": (pdist, lambda x: torch.pdist(x, p=2.0))}
 
 #[cfg(test)]
 mod tests {
-    use super::{median, paired_slot_median, timed_pdist};
+    use super::{median, missing_oracle_error, paired_slot_median, timed_pdist};
 
     #[test]
     fn forward_only_pdist_keeps_leaf_construction_outside_the_timed_region() {
@@ -263,5 +286,13 @@ mod tests {
     fn balanced_square_medians_match_the_incumbent_definition() {
         assert_eq!(median(vec![9.0, 1.0, 3.0, 7.0]), 5.0);
         assert_eq!(paired_slot_median([9.0, 1.0]), 5.0);
+    }
+
+    #[test]
+    fn missing_oracle_names_the_interpreter_and_preserves_its_output() {
+        let error = missing_oracle_error("/missing/python", "ModuleNotFoundError: torch");
+        assert!(error.contains("/missing/python"));
+        assert!(error.contains("PYTORCH_PYTHON"));
+        assert!(error.contains("ModuleNotFoundError: torch"));
     }
 }
