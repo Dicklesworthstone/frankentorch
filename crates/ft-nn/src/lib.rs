@@ -16552,10 +16552,11 @@ impl CTCLoss {
                     // for all states s where labels[s] == c.
                     // grad[t][c] = -exp(ab_sum[c] - log_prob)
                     // This is the derivative of -log P w.r.t. log_probs[t][c].
+                    let mut ab_sum = vec![neg_inf; num_classes_b];
                     for t in 0..input_len {
                         let lp_offset = t * batch_size_b * num_classes_b + b * num_classes_b;
                         // For each class, collect alpha*beta contributions
-                        let mut ab_sum = vec![neg_inf; num_classes_b];
+                        ab_sum.fill(neg_inf);
                         let row_offset = t * lattice_len;
                         for s in 0..lattice_len {
                             let c = labels[s];
@@ -35702,7 +35703,7 @@ mod tests {
             1.0, 2.0, 3.0, // batch 0
             2.0, 3.0, 1.0, // batch 1
             3.0, 1.0, 2.0, // batch 2
-            1.0, 3.0, 2.0, // batch 3
+            1.0, 1.0, 2.0, // batch 3: repeated label exercises the no-skip CTC branch
         ];
 
         let mut batched_session = FrankenTorchSession::new(ExecutionMode::Strict);
