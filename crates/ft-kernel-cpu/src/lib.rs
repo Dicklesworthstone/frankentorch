@@ -6372,6 +6372,48 @@ pub fn group_norm_sum_forward_f32(
     group_sums.into_iter().sum()
 }
 
+/// Scalar fused mirror of `sum(group_norm_forward_f64(...))`.
+///
+/// Keeping the f64 loss scalar avoids allocating the normalized activation for
+/// no-affine GroupNorm training traces that immediately reduce it with `sum`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_sum_forward_f64(
+    x: &[f64],
+    batch: usize,
+    num_groups: usize,
+    cpg: usize,
+    spatial: usize,
+    eps: f64,
+) -> f64 {
+    let group_numel = cpg * spatial;
+    let inv_m = 1.0f64 / group_numel as f64;
+    let group_sums: Vec<f64> = (0..batch * num_groups)
+        .into_par_iter()
+        .map(|grp| {
+            let base = grp * group_numel;
+            let xb = &x[base..base + group_numel];
+            let mut sum = 0.0f64;
+            for &v in xb {
+                sum += v;
+            }
+            let mean = sum * inv_m;
+            let mut vsum = 0.0f64;
+            for &v in xb {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0f64 / (vsum * inv_m + eps).sqrt();
+            let mut out_sum = 0.0f64;
+            for &xv in xb {
+                out_sum += (xv - mean) * rstd;
+            }
+            out_sum
+        })
+        .collect();
+    group_sums.into_iter().sum()
+}
+
 /// Backward of [`group_norm_forward_f64`] with per-channel affine. Returns
 /// `(dx, dweight?, dbias?)`. `dx` is parallel over groups (same normalisation
 /// Jacobian as LayerNorm, over `cpg·spatial` per group); `dweight`/`dbias` are a
@@ -6530,6 +6572,54 @@ pub fn group_norm_backward_f64(
         (None, None)
     };
     (dx, dweight, dbias)
+}
+
+/// Backward of `sum(group_norm_forward_f64(...))` scaled by a scalar upstream
+/// gradient. This is the no-affine f64 scalar-loss counterpart to
+/// [`group_norm_backward_scalar_f32`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_backward_scalar_f64(
+    upstream: f64,
+    x: &[f64],
+    batch: usize,
+    num_groups: usize,
+    cpg: usize,
+    spatial: usize,
+    eps: f64,
+) -> Vec<f64> {
+    let group_numel = cpg * spatial;
+    let inv_m = 1.0f64 / group_numel as f64;
+    let mut dx = vec![0.0f64; batch * num_groups * group_numel];
+    dx.par_chunks_mut(group_numel)
+        .enumerate()
+        .for_each(|(grp, dxrow)| {
+            let base = grp * group_numel;
+            let xb = &x[base..base + group_numel];
+            let mut sum = 0.0f64;
+            for &v in xb {
+                sum += v;
+            }
+            let mean = sum * inv_m;
+            let mut vsum = 0.0f64;
+            for &v in xb {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0f64 / (vsum * inv_m + eps).sqrt();
+            let mut c1 = 0.0f64;
+            let mut c2 = 0.0f64;
+            for &xv in xb {
+                let xhat = (xv - mean) * rstd;
+                c1 += upstream;
+                c2 += upstream * xhat;
+            }
+            for (i, dxv) in dxrow.iter_mut().enumerate() {
+                let xhat = (xb[i] - mean) * rstd;
+                *dxv = rstd * (upstream - (c1 + xhat * c2) * inv_m);
+            }
+        });
+    dx
 }
 
 /// f32 mirror of [`group_norm_backward_f64`] (recomputes per-group mean/rstd from

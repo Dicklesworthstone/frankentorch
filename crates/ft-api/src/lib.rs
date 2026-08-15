@@ -36436,6 +36436,72 @@ impl FrankenTorchSession {
                     },
                 )))?;
 
+        let input_f64 = self.tensor_dtype(input)? == DType::F64;
+        if input_f64 && weight.is_none() && bias.is_none() {
+            let input_grad = self.tensor_tape.tensor_requires_grad(input)?;
+            let (bsz, ng, cpg, sp, eps_c) =
+                (batch_size, num_groups, channels_per_group, spatial, eps);
+            if !input_grad {
+                let sum = if self.tensor_tape.tensor(input)?.meta().is_contiguous() {
+                    let input_tensor = self.tensor_tape.tensor(input)?;
+                    ft_kernel_cpu::group_norm_sum_forward_f64(
+                        input_tensor.contiguous_values()?,
+                        bsz,
+                        ng,
+                        cpg,
+                        sp,
+                        eps_c,
+                    )
+                } else {
+                    let x = self.tensor_values(input)?;
+                    ft_kernel_cpu::group_norm_sum_forward_f64(&x, bsz, ng, cpg, sp, eps_c)
+                };
+                return self.tensor_variable(vec![sum], vec![1], false);
+            }
+
+            let ishape_cg = input_shape.clone();
+            let mode = self.mode();
+            return self
+                .tensor_tape
+                .apply_function_with_create_graph_borrowed_inputs(
+                    &[input],
+                    move |_ctx, ins| {
+                        let (xv, _) = ins[0];
+                        let sum =
+                            ft_kernel_cpu::group_norm_sum_forward_f64(xv, bsz, ng, cpg, sp, eps_c);
+                        Ok((vec![sum], vec![1]))
+                    },
+                    move |_ctx, grad_outputs, borrowed| {
+                        let dx = ft_kernel_cpu::group_norm_backward_scalar_f64(
+                            grad_outputs[0][0],
+                            borrowed[0].0,
+                            bsz,
+                            ng,
+                            cpg,
+                            sp,
+                            eps_c,
+                        );
+                        Ok(vec![Some(dx)])
+                    },
+                    move |ctx, grad_outs, fn_inputs, tape| {
+                        let dy_full = tape.expand(grad_outs[0], ishape_cg.clone())?;
+                        Self::group_norm_no_affine_create_graph_backward(
+                            tape,
+                            mode,
+                            dy_full,
+                            fn_inputs[0],
+                            bsz,
+                            ng,
+                            cpg,
+                            sp,
+                            eps_c,
+                            &ishape_cg,
+                            ctx.needs_input_grad(),
+                        )
+                    },
+                );
+        }
+
         if let (Some(w), Some(bs)) = (weight, bias) {
             let input_grad = self.tensor_tape.tensor_requires_grad(input)?;
             let w_grad = self.tensor_tape.tensor_requires_grad(w)?;
@@ -142701,6 +142767,50 @@ mod tests {
             assert!(
                 (a - e).abs() <= 2e-3,
                 "db[{idx}] scalar {a} vs materialized {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_group_norm_f64_no_affine_sum_grad_matches_materialized_path() {
+        let (n, c, sp, groups) = (2usize, 6usize, 5usize, 3usize);
+        let values: Vec<f64> = (0..n * c * sp)
+            .map(|i| (i % 23) as f64 * 0.05 - 0.7)
+            .collect();
+        let eps = 1e-5;
+
+        let run = |scalar_path: bool| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = session
+                .tensor_variable(values.clone(), vec![n, c, sp], true)
+                .unwrap();
+            let loss = if scalar_path {
+                session
+                    .functional_group_norm_sum(input, groups, None, None, eps)
+                    .unwrap()
+            } else {
+                let output = session
+                    .functional_group_norm(input, groups, None, None, eps)
+                    .unwrap();
+                session.tensor_sum(output).unwrap()
+            };
+            let value = session.tensor_values(loss).unwrap()[0];
+            session.tensor_backward(loss).unwrap();
+            (value, session.tensor_grad(input).unwrap().unwrap())
+        };
+
+        let got = run(true);
+        let want = run(false);
+        assert!(
+            (got.0 - want.0).abs() <= 1e-12 + 1e-10 * want.0.abs(),
+            "loss scalar {} vs materialized {}",
+            got.0,
+            want.0
+        );
+        for (idx, (actual, expected)) in got.1.iter().zip(want.1.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-12 + 1e-10 * expected.abs(),
+                "dx[{idx}] scalar {actual} vs materialized {expected}"
             );
         }
     }
