@@ -13207,25 +13207,8 @@ impl FrankenTorchSession {
                                 // the public f32 result stays bit-identical to the direct
                                 // reference. Only the independent subtract-and-square work
                                 // is packed into portable safe-Rust SIMD lanes.
-                                let differences = f32x8::new([
-                                    left_chunk[0],
-                                    left_chunk[1],
-                                    left_chunk[2],
-                                    left_chunk[3],
-                                    left_chunk[4],
-                                    left_chunk[5],
-                                    left_chunk[6],
-                                    left_chunk[7],
-                                ]) - f32x8::new([
-                                    right_chunk[0],
-                                    right_chunk[1],
-                                    right_chunk[2],
-                                    right_chunk[3],
-                                    right_chunk[4],
-                                    right_chunk[5],
-                                    right_chunk[6],
-                                    right_chunk[7],
-                                ]);
+                                let differences =
+                                    f32x8::from(left_chunk) - f32x8::from(right_chunk);
                                 for square in (differences * differences).to_array() {
                                     squared_distance += square;
                                 }
@@ -127888,7 +127871,7 @@ mod tests {
         // This is the original scorecard lane. It spans 64 Rayon chunks, so it
         // proves the row-slice loop retains the condensed pair order at the
         // exact shape that motivated the optimization.
-        for (n, m) in [(512usize, 64usize), (33, 13)] {
+        for (n, m) in [(512usize, 64usize), (33, 13), (17, 8)] {
             let input: Vec<f32> = (0..n * m)
                 .map(|idx| ((idx * 37 % 211) as f32 - 105.0) * 0.0078125)
                 .collect();
