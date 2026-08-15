@@ -13250,6 +13250,30 @@ impl FrankenTorchSession {
                         squared_distance
                     }
 
+                    #[inline]
+                    fn squared_distance_128(left: &[f32], right: &[f32]) -> f32 {
+                        debug_assert_eq!(left.len(), 128);
+                        debug_assert_eq!(right.len(), 128);
+                        let mut squared_distance = 0.0_f32;
+                        // `cdist_bench` carries a second f32 pdist scorecard lane
+                        // at 256x128. It needs the same indexed packed loads as
+                        // 512x64 while retaining the scalar direct reduction order.
+                        for offset in (0..128).step_by(8) {
+                            let differences = f32x8::from(&left[offset..offset + 8])
+                                - f32x8::from(&right[offset..offset + 8]);
+                            let squares = (differences * differences).to_array();
+                            squared_distance += squares[0];
+                            squared_distance += squares[1];
+                            squared_distance += squares[2];
+                            squared_distance += squares[3];
+                            squared_distance += squares[4];
+                            squared_distance += squares[5];
+                            squared_distance += squares[6];
+                            squared_distance += squares[7];
+                        }
+                        squared_distance
+                    }
+
                     let mut out = vec![0.0_f32; n * (n - 1) / 2];
                     if m == 64 {
                         // Select this once per call instead of branching once per
@@ -13264,6 +13288,34 @@ impl FrankenTorchSession {
                                 *slot = squared_distance_64(
                                     &values[i_base..i_base + 64],
                                     &values[j_base..j_base + 64],
+                                )
+                                .sqrt();
+                                j += 1;
+                                if j == n {
+                                    i += 1;
+                                    j = i + 1;
+                                }
+                            }
+                        };
+                        if out.len() < PAIRS_PER_CHUNK {
+                            fill_chunk(0, &mut out);
+                        } else {
+                            out.par_chunks_mut(PAIRS_PER_CHUNK)
+                                .enumerate()
+                                .for_each(|(chunk_idx, chunk)| fill_chunk(chunk_idx, chunk));
+                        }
+                        return out;
+                    }
+
+                    if m == 128 {
+                        let fill_chunk = |chunk_idx: usize, chunk: &mut [f32]| {
+                            let (mut i, mut j) = pair_at(chunk_idx * PAIRS_PER_CHUNK, n);
+                            for slot in chunk {
+                                let i_base = i * 128;
+                                let j_base = j * 128;
+                                *slot = squared_distance_128(
+                                    &values[i_base..i_base + 128],
+                                    &values[j_base..j_base + 128],
                                 )
                                 .sqrt();
                                 j += 1;
@@ -128237,6 +128289,52 @@ mod tests {
         input[2 * m + 17] = f32::NEG_INFINITY;
         input[2 * m + 31] = -0.0;
 
+        let mut expected = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let mut squared_distance = 0.0_f32;
+                for k in 0..m {
+                    let difference = input[i * m + k] - input[j * m + k];
+                    squared_distance += difference * difference;
+                }
+                expected.push(squared_distance.sqrt());
+            }
+        }
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = session
+            .tensor_variable_f32(input, vec![n, m], false)
+            .unwrap();
+        let output = session.tensor_pdist(tensor, 2.0).unwrap();
+        let actual = session.tensor_values_f32(output).unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pdist_p2_f32_128_feature_fast_path_keeps_scalar_lane_order() {
+        let n = 4;
+        let m = 128;
+        let input: Vec<f32> = (0..n * m)
+            .map(|idx| {
+                let row = idx / m;
+                let lane = idx % m;
+                let magnitude = 2.0_f32.powi((lane % 29) as i32 - 14);
+                if (row + lane) % 7 == 0 {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            })
+            .collect();
         let mut expected = Vec::with_capacity(n * (n - 1) / 2);
         for i in 0..n {
             for j in (i + 1)..n {
