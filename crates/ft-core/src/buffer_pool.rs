@@ -267,28 +267,20 @@ pub fn recycle(buffer: Vec<f64>) {
         if PARKED_BYTES.load(Ordering::Relaxed) + bytes > MAX_PARKED_BYTES {
             return;
         }
+        // frankentorch-7zqbc — REFUTED LEVER, DO NOT RE-LAND WITHOUT NEW EVIDENCE.
+        // A full pool simply refuses. The obvious improvement — evict the SMALLEST
+        // parked buffer when a larger one arrives, on the theory that the saving
+        // is page faults and therefore scales with size — was implemented,
+        // gated green, and measured: it raised the hit rate from 45/134 to 82/134
+        // (identical in all five invocations, so the mechanism worked exactly as
+        // designed) and moved NO lane's paired ratio at all — max_pool3d 1.034 vs
+        // 1.031, avg_pool2d 0.98 either way, max_pool1d 1.006 vs 1.025. What it
+        // did change was retained memory: 69.8 MiB -> 510.6 MiB, because the byte
+        // ceiling then binds instead of the count. Reverted: 440 MiB of RSS for a
+        // measured zero. The finding underneath is the useful part — in the
+        // seven-lane configuration this pool's HIT RATE is not what limits it.
         if pool.len() >= MAX_PARKED_BUFFERS {
-            // frankentorch-7zqbc: KEEP THE LARGEST, evict the smallest — do not
-            // simply refuse. Measured cause of a 34% hit rate: with seven lanes
-            // parking, the 64 slots filled to only 69.8 MiB, an average of
-            // 1.1 MiB per slot. Small intermediate gradients were crowding out
-            // the multi-MiB leaf gradients, which is exactly backwards — the
-            // saving is the page faults avoided, so it scales with buffer SIZE,
-            // and a 1 MiB slot displacing an 8 MiB one trades an 8x saving for a
-            // 1x one. Refusing outright had the same effect, just silently.
-            let Some(smallest) = pool
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, parked)| parked.capacity())
-                .map(|(index, _)| index)
-            else {
-                return;
-            };
-            if pool[smallest].capacity() >= capacity {
-                return;
-            }
-            let evicted = pool.swap_remove(smallest);
-            PARKED_BYTES.fetch_sub(evicted.capacity() * size_of::<f64>(), Ordering::Relaxed);
+            return;
         }
         PARKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
         pool.push(buffer);
@@ -493,52 +485,24 @@ mod tests {
         });
     }
 
+    /// frankentorch-7zqbc: locks the REFUSE-when-full behaviour that survived
+    /// measurement, against the evict-the-smallest policy that did not. Reverting
+    /// a refuted lever without a test lets it be re-landed by the next person who
+    /// has the same reasonable idea.
     #[test]
-    fn a_full_pool_evicts_its_smallest_for_a_larger_buffer() {
-        // The saving a parked buffer represents is the page faults it avoids, so
-        // it scales with SIZE. A full pool must therefore hold the LARGEST
-        // buffers, not the ones that happened to arrive first — measured cause of
-        // a 34% hit rate: 64 slots holding 69.8 MiB, i.e. 1.1 MiB each, while the
-        // lanes that mattered wanted 8-32 MiB.
+    fn a_full_pool_refuses_even_a_much_larger_buffer() {
         guarded(|| {
             for _ in 0..MAX_PARKED_BUFFERS {
                 recycle(vec![0.0; MIN_POOLED_LEN]);
             }
-            assert_eq!(stats().parked_buffers, MAX_PARKED_BUFFERS);
             let before = stats().parked_bytes;
-
             recycle(vec![0.0; MIN_POOLED_LEN * 8]);
-            assert_eq!(
-                stats().parked_buffers,
-                MAX_PARKED_BUFFERS,
-                "eviction must keep the count at the cap, not grow past it"
-            );
-            assert!(
-                stats().parked_bytes > before,
-                "a larger buffer displacing a smaller one must raise parked bytes"
-            );
-            // And it is actually servable now, which is the whole point.
-            let taken = take_zeroed(MIN_POOLED_LEN * 8);
-            assert_eq!(taken.len(), MIN_POOLED_LEN * 8);
-            assert_eq!(stats().hits, 1);
-        });
-    }
-
-    #[test]
-    fn a_full_pool_refuses_a_buffer_no_larger_than_its_smallest() {
-        // The mirror case. Without it, eviction would churn the pool on every
-        // same-sized recycle and could evict a buffer a caller is about to want.
-        guarded(|| {
-            for _ in 0..MAX_PARKED_BUFFERS {
-                recycle(vec![0.0; MIN_POOLED_LEN * 2]);
-            }
-            let before = stats().parked_bytes;
-            recycle(vec![0.0; MIN_POOLED_LEN]);
             assert_eq!(stats().parked_buffers, MAX_PARKED_BUFFERS);
             assert_eq!(
                 stats().parked_bytes,
                 before,
-                "a smaller buffer must not displace a larger one"
+                "a full pool refuses; evicting the smallest to admit a larger buffer \
+                 doubled the hit rate and moved no lane ratio, at 440 MiB of RSS"
             );
         });
     }

@@ -19239,6 +19239,22 @@ And the reason this was caught at all is that the widening was measured
 separately from the thing it was widening; "same mechanism, more sites" is a
 hypothesis, not an inheritance.
 
+**7d. REVERTED — evict-the-smallest when the buffer pool is full
+(`frankentorch-7zqbc`).** Lever: a full pool refuses new buffers, so with seven
+lanes parking, its 64 slots held only 69.8 MiB — 1.1 MiB average — and small
+intermediate gradients crowded out the multi-MiB leaf gradients. Hypothesis: the
+saving is page faults, so it scales with buffer SIZE, and the pool should keep
+the largest. Implemented, gated green, measured on the balanced square, 5
+invocations: **hit rate 45/134 → 82/134, identical in every run — and not one
+lane's paired ratio moved** (max_pool3d 1.034 vs 1.031, avg_pool2d 0.98 either
+way, max_pool1d 1.006 vs 1.025). Retained memory went 69.8 → 510.6 MiB, because
+the byte ceiling binds once the count no longer does. Rejected: 440 MiB of RSS
+for a measured zero. **The finding is worth more than the lever: in the
+seven-lane configuration this pool's HIT RATE is not what limits it, so no future
+pool work should start from "get more hits".** A test now locks the refuse
+behaviour so the next person with the same reasonable idea has to beat this
+measurement first.
+
 **8. WHAT DID PAY on this lineage — recycling, not scheduling
 (`frankentorch-v92uh`).** After a size gate (2), an avg_pool gate (3) and a serial
 pre-touch (1) all failed, the lever that worked attacked neither the thread count

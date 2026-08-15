@@ -1,0 +1,30 @@
+##### RUN 1 load=9.61
+executing_elf_sha256=527307b6163e5bbac0d90e84128e53a6c3a5ceb6876c51656bc0af71a57738ac
+buffer_pool: hits=82 misses=52 parked=64 buffers / 510.6 MiB
+  ratio (off/on) = 1.034x  95% CI [0.903,1.146]  10/16 rounds faster with the pool
+  ratio (off/on) = 0.981x  95% CI [0.907,1.101]  9/16 rounds faster with the pool
+  ratio (off/on) = 1.006x  95% CI [0.931,1.047]  5/16 rounds faster with the pool
+##### RUN 2 load=10.22
+executing_elf_sha256=527307b6163e5bbac0d90e84128e53a6c3a5ceb6876c51656bc0af71a57738ac
+buffer_pool: hits=82 misses=52 parked=64 buffers / 510.6 MiB
+  ratio (off/on) = 1.079x  95% CI [0.991,1.183]  11/16 rounds faster with the pool
+  ratio (off/on) = 0.972x  95% CI [0.918,1.085]  10/16 rounds faster with the pool
+  ratio (off/on) = 1.021x  95% CI [0.982,1.055]  6/16 rounds faster with the pool
+##### RUN 3 load=10.10
+executing_elf_sha256=527307b6163e5bbac0d90e84128e53a6c3a5ceb6876c51656bc0af71a57738ac
+buffer_pool: hits=82 misses=52 parked=64 buffers / 510.6 MiB
+  ratio (off/on) = 1.023x  95% CI [0.887,1.260]  8/16 rounds faster with the pool
+  ratio (off/on) = 0.999x  95% CI [0.819,1.122]  6/16 rounds faster with the pool
+  ratio (off/on) = 1.090x  95% CI [0.970,1.225]  9/16 rounds faster with the pool
+##### RUN 4 load=15.51
+executing_elf_sha256=527307b6163e5bbac0d90e84128e53a6c3a5ceb6876c51656bc0af71a57738ac
+buffer_pool: hits=82 misses=52 parked=64 buffers / 510.6 MiB
+  ratio (off/on) = 1.140x  95% CI [1.014,1.244]  11/16 rounds faster with the pool
+  ratio (off/on) = 0.946x  95% CI [0.893,1.035]  5/16 rounds faster with the pool
+  ratio (off/on) = 0.982x  95% CI [0.957,1.032]  6/16 rounds faster with the pool
+##### RUN 5 load=19.64
+executing_elf_sha256=527307b6163e5bbac0d90e84128e53a6c3a5ceb6876c51656bc0af71a57738ac
+buffer_pool: hits=82 misses=52 parked=64 buffers / 510.6 MiB
+  ratio (off/on) = 0.946x  95% CI [0.856,1.164]  9/16 rounds faster with the pool
+  ratio (off/on) = 1.019x  95% CI [0.914,1.129]  8/16 rounds faster with the pool
+  ratio (off/on) = 1.006x  95% CI [0.963,1.096]  8/16 rounds faster with the pool

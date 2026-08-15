@@ -1,0 +1,45 @@
+##### RUN 1 load=13.61
+executing_elf_sha256=e987c12156234da78d1deb6ce188699ab57ed6f791f10333a65170e4ea6ad6b2
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.031x  95% CI [0.921,1.130]  9/16 rounds faster with the pool
+PAIRED avg_pool2d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.983x  95% CI [0.899,1.065]  7/16 rounds faster with the pool
+PAIRED max_pool1d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.025x  95% CI [0.930,1.174]  9/16 rounds faster with the pool
+##### RUN 2 load=14.61
+executing_elf_sha256=e987c12156234da78d1deb6ce188699ab57ed6f791f10333a65170e4ea6ad6b2
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.962x  95% CI [0.868,1.170]  8/16 rounds faster with the pool
+PAIRED avg_pool2d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.944x  95% CI [0.878,1.114]  8/16 rounds faster with the pool
+PAIRED max_pool1d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.933x  95% CI [0.811,1.096]  7/16 rounds faster with the pool
+##### RUN 3 load=16.55
+executing_elf_sha256=e987c12156234da78d1deb6ce188699ab57ed6f791f10333a65170e4ea6ad6b2
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.126x  95% CI [0.932,1.229]  10/16 rounds faster with the pool
+PAIRED avg_pool2d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.025x  95% CI [0.990,1.116]  9/16 rounds faster with the pool
+PAIRED max_pool1d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.133x  95% CI [0.944,1.329]  10/16 rounds faster with the pool
+##### RUN 4 load=19.57
+executing_elf_sha256=e987c12156234da78d1deb6ce188699ab57ed6f791f10333a65170e4ea6ad6b2
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.952x  95% CI [0.809,1.056]  4/16 rounds faster with the pool
+PAIRED avg_pool2d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.934x  95% CI [0.860,1.035]  4/16 rounds faster with the pool
+PAIRED max_pool1d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.018x  95% CI [0.873,1.199]  9/16 rounds faster with the pool
+##### RUN 5 load=20.51
+executing_elf_sha256=e987c12156234da78d1deb6ce188699ab57ed6f791f10333a65170e4ea6ad6b2
+buffer_pool: hits=45 misses=89 parked=64 buffers / 69.8 MiB
+PAIRED max_pool3d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.220x  95% CI [1.018,1.375]  13/16 rounds faster with the pool
+PAIRED avg_pool2d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.990x  95% CI [0.923,1.050]  9/16 rounds faster with the pool
+PAIRED max_pool1d: pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.046x  95% CI [0.876,1.153]  8/16 rounds faster with the pool
