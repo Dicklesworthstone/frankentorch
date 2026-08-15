@@ -8542,6 +8542,91 @@ pub fn max_pool3d_forward_with_indices_f64(
 ) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; batch * ch * od * oh * ow];
     let mut arg_offsets = vec![0.0f64; batch * ch * od * oh * ow];
+    if kd == 2 && kh == 2 && kw == 2 && sd == 2 && sh == 2 && sw == 2 {
+        let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
+            let ibase = plane * id * ih * iw;
+            let depth_stride = ih * iw;
+            for oz in 0..od {
+                let z0 = (oz * 2) * depth_stride;
+                let z1 = z0 + depth_stride;
+                for oy in 0..oh {
+                    let row00 = z0 + (oy * 2) * iw;
+                    let row01 = row00 + iw;
+                    let row10 = z1 + (oy * 2) * iw;
+                    let row11 = row10 + iw;
+                    for ox in 0..ow {
+                        let x0 = ox * 2;
+                        let loc000 = row00 + x0;
+                        let loc001 = loc000 + 1;
+                        let loc010 = row01 + x0;
+                        let loc011 = loc010 + 1;
+                        let loc100 = row10 + x0;
+                        let loc101 = loc100 + 1;
+                        let loc110 = row11 + x0;
+                        let loc111 = loc110 + 1;
+
+                        let mut max_value = f64::NEG_INFINITY;
+                        let mut arg = 0usize;
+                        let candidate = input[ibase + loc000];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc000;
+                        }
+                        let candidate = input[ibase + loc001];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc001;
+                        }
+                        let candidate = input[ibase + loc010];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc010;
+                        }
+                        let candidate = input[ibase + loc011];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc011;
+                        }
+                        let candidate = input[ibase + loc100];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc100;
+                        }
+                        let candidate = input[ibase + loc101];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc101;
+                        }
+                        let candidate = input[ibase + loc110];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc110;
+                        }
+                        let candidate = input[ibase + loc111];
+                        if candidate > max_value {
+                            max_value = candidate;
+                            arg = loc111;
+                        }
+                        let oidx = (oz * oh + oy) * ow + ox;
+                        orow[oidx] = max_value;
+                        arow[oidx] = arg as f64;
+                    }
+                }
+            }
+        };
+        if pool_fwd_should_parallelize(out.len() * 8, batch * ch) {
+            out.par_chunks_mut(od * oh * ow)
+                .zip(arg_offsets.par_chunks_mut(od * oh * ow))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        } else {
+            out.chunks_mut(od * oh * ow)
+                .zip(arg_offsets.chunks_mut(od * oh * ow))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        }
+        return (out, arg_offsets);
+    }
     let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
         let ibase = plane * id * ih * iw;
         for oz in 0..od {
@@ -40102,6 +40187,38 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(sum.to_bits(), expected_sum.to_bits());
+    }
+
+    #[test]
+    fn max_pool3d_indexed_2x2s2_specialization_preserves_first_argmax_bits() {
+        // The first window verifies signed-zero tie ordering, while the second
+        // has only NaNs and -inf. Both value and offset are observable in
+        // backward, so pin them independently of the fused-sum implementation.
+        let input = vec![
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let (values, offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, 1, 1, 2, 2, 4, 2, 2, 2, 1, 1, 2, 2, 2, 2,
+        );
+
+        assert_eq!(values[0].to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(values[1].to_bits(), f64::NEG_INFINITY.to_bits());
+        assert_eq!(offsets, vec![0.0, 0.0]);
     }
 
     #[test]
