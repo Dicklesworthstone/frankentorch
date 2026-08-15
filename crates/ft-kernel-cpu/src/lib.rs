@@ -6810,11 +6810,12 @@ pub fn group_norm_backward_scalar_f32(
                 (mean, rstd, sum0, sum1)
             })
             .collect();
-        let mut dx = vec![0.0f32; batch * num_groups * group_numel];
         let spatial_f = spatial as f32;
-        dx.par_chunks_mut(group_numel)
-            .enumerate()
-            .for_each(|(grp, dxrow)| {
+        // Every per-group vector/tail write below covers exactly `group_numel`
+        // entries before returning the buffer, so avoid a 1.6 MiB zero-fill on
+        // the scorecard's cpg=2 scalar-loss path.
+        let dx = build_uninit(batch * num_groups * group_numel, |dx| {
+            dx.par_chunks_mut(group_numel).enumerate().for_each(|(grp, dxrow)| {
                 let g = grp % num_groups;
                 let base = grp * group_numel;
                 let xb = &x[base..base + group_numel];
@@ -6862,6 +6863,7 @@ pub fn group_norm_backward_scalar_f32(
                     dx1[i] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
                 }
             });
+        });
         let (dweight, dbias) = if weight.is_some() {
             let mut dw = vec![0.0f32; channels];
             let mut db = vec![0.0f32; channels];
@@ -10364,6 +10366,20 @@ fn avg_pool1d_sum_pairwise_leaf_f64(
 ) -> f64 {
     let div = kernel as f64;
     let mut acc = 0.0_f64;
+    if kernel == 2 && stride == 2 {
+        for flat in start..start + count {
+            let plane = flat / output_len;
+            let ox = flat - plane * output_len;
+            let input_start = plane * len + ox * 2;
+            // Match avg_pool1d_forward_f64's explicit 2/2 path, including its
+            // leading positive-zero add. That keeps signed-zero output bits
+            // stable while avoiding the generic inner window loop on the
+            // scalar-loss path.
+            let sum = 0.0_f64 + input[input_start];
+            acc += (sum + input[input_start + 1]) / div;
+        }
+        return acc;
+    }
     for flat in start..start + count {
         let plane = flat / output_len;
         let ox = flat - plane * output_len;
@@ -41238,6 +41254,31 @@ mod tests {
     }
 
     #[test]
+    fn avg_pool1d_pair_sum_matches_materialized_bits_and_negative_zero() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        let (batch, ch, len) = (2usize, 3usize, 11usize);
+        let (kernel, stride) = (2usize, 2usize);
+        let output_len = (len - kernel) / stride + 1;
+        for input in [
+            (0..batch * ch * len)
+                .map(|i| (((i * 43 + 17) % 181) as f64 - 90.0) * 0.015625)
+                .collect::<Vec<_>>(),
+            vec![-0.0_f64; batch * ch * len],
+        ] {
+            let pooled =
+                super::avg_pool1d_forward_f64(&input, batch, ch, len, kernel, output_len, stride);
+            let meta = TensorMeta::from_shape(vec![batch, ch, output_len], DType::F64, Device::Cpu);
+            let expected =
+                super::sum_tensor_contiguous_f64(&pooled, &meta).expect("materialized pair sum");
+            let got = super::avg_pool1d_sum_forward_f64(
+                &input, batch, ch, len, kernel, output_len, stride,
+            );
+            assert_eq!(got.to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
     fn avg_pool1d_scalar_backward_disjoint_fill_preserves_bits_and_trailing_zero() {
         let (batch, ch, len) = (2usize, 3usize, 11usize);
         let (kernel, stride) = (2usize, 2usize);
@@ -54078,7 +54119,7 @@ mod tests {
     }
 
     #[test]
-    fn group_norm_f32_cpg2_scalar_backward_matches_scalar_reference_bits() {
+    fn group_norm_f32_cpg2_scalar_backward_uninit_vector_tail_matches_reference_bits() {
         let (batch, num_groups, cpg, spatial) = (2usize, 2usize, 2usize, 11usize);
         let eps = 1e-5f32;
         let group_numel = cpg * spatial;
