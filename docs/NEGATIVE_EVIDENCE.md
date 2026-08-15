@@ -19560,6 +19560,21 @@ ledger that was measured at a single tensor length is scoped to that length unti
 someone straddles the vector boundary. Cheap to check — the sweep is one Python
 loop over widths comparing `view(torch.int64)` bit patterns.
 
+### And the bound on it: ordinary-value GRADIENTS are width-stable
+
+The obvious worry after the two results above is that this leaks into everyday
+training. It does not. Swept the gradients of the same 25 ops at ordinary finite,
+non-boundary inputs (0.7, -1.3, 3.9, -0.25, 2.5, 1.75, -2.25, 0.35) across
+n = 1,2,4,7,8,16,32,64,257 with a non-unit upstream, f64 and f32: **every gradient
+is bit-identical at every width, both dtypes, no exceptions.**
+
+So the width hazard is bounded to exactly two places — **special values** (the NaN
+gradients of `jedc6`) and **`mish`'s forward** (1 ULP). Normal-path gradient parity
+against torch is size-independent and existing claims about it stand. Recording the
+bound matters as much as recording the hazard: without it, the honest reading of
+the first two findings is "any torch comparison might be size-dependent", which
+would cast doubt on far more of this ledger than the evidence supports.
+
 **11. TWO OF MY OWN HARNESSES DISAGREE ABOUT THE SAME LEVER, AND THE
 DISAGREEMENT IS THE RESULT (`frankentorch-dmpho`, 2026-08-15).** Recorded under
 the fleet rule adopted after frankenlibc measured malloc/free on ONE worker
