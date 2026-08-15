@@ -416,6 +416,7 @@ struct MaxPool3dSumShortcut {
     stride_d: usize,
     stride_h: usize,
     stride_w: usize,
+    sum: f64,
     /// The ordinary pool node already computed these first-argmax offsets for
     /// its own backward. Keep a shortcut-owned copy so `tensor_sum(pool(x))`
     /// can move the sidecar into its scalar backward instead of scanning every
@@ -13153,8 +13154,10 @@ impl FrankenTorchSession {
                             let i_base = i * m;
                             let j_base = j * m;
                             let mut squared_distance = 0.0_f32;
-                            for k in 0..m {
-                                let diff = values[i_base + k] - values[j_base + k];
+                            let left = &values[i_base..i_base + m];
+                            let right = &values[j_base..j_base + m];
+                            for (&left_value, &right_value) in left.iter().zip(right) {
+                                let diff = left_value - right_value;
                                 squared_distance += diff * diff;
                             }
                             // Squared distances are non-negative. `sqrt` is
@@ -25447,14 +25450,6 @@ impl FrankenTorchSession {
             .remove(&input.0)
             .ok_or_else(|| Self::incompatible_tensor_args("max_pool3d scalar shortcut vanished"))?;
 
-        let sum = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
-                .map_err(|error| {
-                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
-                })?
-        };
-
         let MaxPool3dSumShortcut {
             input: source,
             batch,
@@ -25471,6 +25466,7 @@ impl FrankenTorchSession {
             stride_d,
             stride_h,
             stride_w,
+            sum,
             arg_offsets,
         } = shortcut;
         let out = self.tensor_apply_function_f64_borrowed_forward(
@@ -33924,16 +33920,17 @@ impl FrankenTorchSession {
                 };
                 return self.tensor_variable(out, out_shape, false);
             }
-            let shortcut_arg_offsets = std::rc::Rc::new(std::cell::RefCell::new(None));
-            let shortcut_arg_offsets_for_forward = std::rc::Rc::clone(&shortcut_arg_offsets);
+            let shortcut_sidecar = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let shortcut_sidecar_for_forward = std::rc::Rc::clone(&shortcut_sidecar);
             let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
                 move |ctx, ins| {
                     let (iv, _) = ins[0];
-                    let (out, arg_offsets) = ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
-                        iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
-                    );
-                    *shortcut_arg_offsets_for_forward.borrow_mut() = Some(arg_offsets.clone());
+                    let (out, arg_offsets, sum) =
+                        ft_kernel_cpu::max_pool3d_forward_with_indices_and_sum_f64(
+                            iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
+                        );
+                    *shortcut_sidecar_for_forward.borrow_mut() = Some((arg_offsets.clone(), sum));
                     ctx.save_for_backward(arg_offsets, vec![b_, ch_, od_, oh_, ow_]);
                     Ok((out, vec![b_, ch_, od_, oh_, ow_]))
                 },
@@ -33946,8 +33943,8 @@ impl FrankenTorchSession {
                     Ok(vec![Some(di)])
                 },
             )?;
-            let arg_offsets = shortcut_arg_offsets.borrow_mut().take().ok_or_else(|| {
-                Self::incompatible_tensor_args("max_pool3d forward did not save argmax offsets")
+            let (arg_offsets, sum) = shortcut_sidecar.borrow_mut().take().ok_or_else(|| {
+                Self::incompatible_tensor_args("max_pool3d forward did not save scalar sidecar")
             })?;
             self.max_pool3d_sum_shortcuts.insert(
                 pooled.0,
@@ -33967,6 +33964,7 @@ impl FrankenTorchSession {
                     stride_d: sd_,
                     stride_h: sh_,
                     stride_w: sw_,
+                    sum,
                     arg_offsets,
                 },
             );
@@ -127582,7 +127580,10 @@ mod tests {
         // Exercise multiple balanced condensed-output chunks. The contiguous f32
         // fast path keeps the public f32 subtraction, accumulation, and p=2
         // square root through the whole pair computation.
-        let (n, m) = (97usize, 19usize);
+        // This is the original scorecard lane. It spans 64 Rayon chunks, so it
+        // proves the row-slice loop retains the condensed pair order at the
+        // exact shape that motivated the optimization.
+        let (n, m) = (512usize, 64usize);
         let input: Vec<f32> = (0..n * m)
             .map(|idx| ((idx * 37 % 211) as f32 - 105.0) * 0.0078125)
             .collect();
@@ -141224,16 +141225,16 @@ mod tests {
         let out_ref = reference
             .functional_max_pool3d(x_ref, (3, 2, 2), (1, 2, 2))
             .unwrap();
+        let cached_shortcut = reference
+            .max_pool3d_sum_shortcuts
+            .get(&out_ref.0)
+            .expect("fused MaxPool3d output registers its argmax sidecar");
         assert_eq!(
-            reference
-                .max_pool3d_sum_shortcuts
-                .get(&out_ref.0)
-                .expect("fused MaxPool3d output registers its argmax sidecar")
-                .arg_offsets
-                .len(),
+            cached_shortcut.arg_offsets.len(),
             n * c * 3 * 2 * 2,
             "scalar shortcut must retain the ordinary forward's argmax sidecar"
         );
+        let cached_sum_bits = cached_shortcut.sum.to_bits();
         let loss_ref = reference.tensor_sum(out_ref).unwrap();
         assert!(
             !reference.max_pool3d_sum_shortcuts.contains_key(&out_ref.0),
@@ -141249,6 +141250,11 @@ mod tests {
             "tensor_sum(functional_max_pool3d(x)) must reach the scalar-loss shortcut"
         );
         let loss_ref_value = reference.tensor_values(loss_ref).unwrap()[0];
+        assert_eq!(
+            cached_sum_bits,
+            loss_ref_value.to_bits(),
+            "shortcut must use the exact scalar accumulated during the pool pass"
+        );
         reference.tensor_backward(loss_ref).unwrap();
         let grad_ref = reference.tensor_grad(x_ref).unwrap().unwrap();
 

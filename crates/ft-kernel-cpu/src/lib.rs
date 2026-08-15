@@ -5695,6 +5695,47 @@ pub fn layer_norm_backward_with_stats_f64(
     norm_size: usize,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let inv_n = 1.0 / norm_size as f64;
+    if dy
+        .par_iter()
+        .all(|value| value.to_bits() == 1.0f64.to_bits())
+    {
+        let mut dx = vec![0.0f64; batch * norm_size];
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| {
+                let xrow = &x[r * norm_size..r * norm_size + norm_size];
+                let mean = means[r];
+                let rstd = rstds[r];
+                let mut c1 = 0.0f64;
+                let mut c2 = 0.0f64;
+                for j in 0..norm_size {
+                    let xhat = (xrow[j] - mean) * rstd;
+                    let dxhat = 1.0f64 * weight[j];
+                    c1 += dxhat;
+                    c2 += dxhat * xhat;
+                }
+                for j in 0..norm_size {
+                    let xhat = (xrow[j] - mean) * rstd;
+                    let dxhat = 1.0f64 * weight[j];
+                    dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+                }
+            });
+        let mut dweight = vec![0.0f64; norm_size];
+        for r in 0..batch {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mean = means[r];
+            let rstd = rstds[r];
+            for j in 0..norm_size {
+                let xhat = (xrow[j] - mean) * rstd;
+                dweight[j] += 1.0f64 * xhat;
+            }
+        }
+        let mut dbias_value = 0.0f64;
+        for _ in 0..batch {
+            dbias_value += 1.0;
+        }
+        return (dx, dweight, vec![dbias_value; norm_size]);
+    }
     let mut dx = vec![0.0f64; batch * norm_size];
     dx.par_chunks_mut(norm_size)
         .enumerate()
@@ -8848,6 +8889,55 @@ pub fn max_pool3d_sum_forward_with_indices_f64(
         )
     };
     (sum, arg_offsets)
+}
+
+/// Fused max-pool3d forward, first-argmax sidecar, and exact scalar sum (f64).
+///
+/// The scalar kernel already visits each pooling window and records the winning
+/// plane-local input offset.  Reconstructing the observable pooled activation
+/// from those offsets costs one linear gather, rather than performing a second
+/// full window scan followed by a third pass for `tensor_sum`.  The sum uses
+/// the same pairwise tree as [`sum_tensor_contiguous_f64`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_forward_with_indices_and_sum_f64(
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> (Vec<f64>, Vec<f64>, f64) {
+    let (sum, arg_offsets) = max_pool3d_sum_forward_with_indices_f64(
+        input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
+    let input_plane_len = id * ih * iw;
+    let output_plane_len = od * oh * ow;
+    let mut out = Vec::with_capacity(arg_offsets.len());
+    for (plane, offsets) in arg_offsets.chunks(output_plane_len).enumerate() {
+        let input_base = plane * input_plane_len;
+        out.extend(offsets.iter().map(|&offset| {
+            let winner = input[input_base + offset as usize];
+            // The first-argmax loop initializes its maximum to -inf and does
+            // not select NaN.  If a whole window is NaN/-inf, it records the
+            // initial offset while its observable output remains -inf.
+            if winner.is_nan() {
+                f64::NEG_INFINITY
+            } else {
+                winner
+            }
+        }));
+    }
+    (out, arg_offsets, sum)
 }
 
 /// f32 mirror of [`max_pool3d_forward_f64`]: per output, the max over its
@@ -39504,6 +39594,79 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
+        let (fused_pooled, fused_arg_offsets, fused_sum) =
+            super::max_pool3d_forward_with_indices_and_sum_f64(
+                &input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            );
+        assert_eq!(fused_sum.to_bits(), expected_sum.to_bits());
+        assert_eq!(
+            fused_pooled
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            pooled
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fused_arg_offsets
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            arg_offsets
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let nan_window = vec![f64::NAN; 8];
+        let (expected_nan_pooled, expected_nan_offsets) =
+            super::max_pool3d_forward_with_indices_f64(
+                &nan_window,
+                1,
+                1,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                1,
+                1,
+                1,
+                2,
+                2,
+                2,
+            );
+        let (fused_nan_pooled, fused_nan_offsets, fused_nan_sum) =
+            super::max_pool3d_forward_with_indices_and_sum_f64(
+                &nan_window,
+                1,
+                1,
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                1,
+                1,
+                1,
+                2,
+                2,
+                2,
+            );
+        assert_eq!(
+            fused_nan_pooled[0].to_bits(),
+            expected_nan_pooled[0].to_bits()
+        );
+        assert_eq!(
+            fused_nan_offsets[0].to_bits(),
+            expected_nan_offsets[0].to_bits()
+        );
+        assert_eq!(fused_nan_sum.to_bits(), expected_nan_pooled[0].to_bits());
+
         let dense_dout = vec![upstream; batch * ch * od * oh * ow];
         let expected_grad = super::max_pool3d_backward_from_indices_f64(
             &dense_dout,
@@ -52549,6 +52712,42 @@ mod tests {
             assert_eq!(got.to_bits(), expected.to_bits(), "dweight mismatch");
         }
         for (got, expected) in db.iter().zip(ref_db.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits(), "dbias mismatch");
+        }
+    }
+
+    #[test]
+    fn layer_norm_f64_saved_stats_unit_dy_matches_recomputed_backward_bits() {
+        let (batch, norm_size) = (5usize, 7usize);
+        let eps = 1e-5;
+        let x: Vec<f64> = (0..batch * norm_size)
+            .map(|i| ((i % 23) as f64 - 11.0) * 0.03125 + (i as f64) * 0.00091)
+            .collect();
+        let dy = vec![1.0f64; x.len()];
+        let weight: Vec<f64> = (0..norm_size)
+            .map(|j| 0.75 + (j % 5) as f64 * 0.046875)
+            .collect();
+
+        let (_, means, rstds) = crate::layer_norm_forward_with_stats_f64(
+            &x,
+            Some(&weight),
+            None,
+            batch,
+            norm_size,
+            eps,
+        );
+        let got = crate::layer_norm_backward_with_stats_f64(
+            &dy, &x, &weight, &means, &rstds, batch, norm_size,
+        );
+        let expected = crate::layer_norm_backward_f64(&dy, &x, &weight, batch, norm_size, eps);
+
+        for (got, expected) in got.0.iter().zip(expected.0.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits(), "dx mismatch");
+        }
+        for (got, expected) in got.1.iter().zip(expected.1.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits(), "dweight mismatch");
+        }
+        for (got, expected) in got.2.iter().zip(expected.2.iter()) {
             assert_eq!(got.to_bits(), expected.to_bits(), "dbias mismatch");
         }
     }
