@@ -22922,3 +22922,65 @@ This is worth stating as a general point about the harness: a route with a short
 front of it is INVISIBLE to every lane whose loss triggers the shortcut. Two levers in
 this family (372h8, yc7ud) sit on routes distinguished only by the caller's loss shape,
 and measuring either required knowing which one the lane selects.
+
+## 37. LANE -> ROUTE MAP: EIGHT OPS HAVE A SUM SHORTCUT, AND EVERY SUMMING LANE MEASURES ONLY THE SHORTCUT SIDE
+
+`frankentorch-efm2m` asked for a written map from h2h lane to the kernel route it
+actually selects, because a route behind a shortcut is invisible to any lane whose loss
+triggers that shortcut. Here is the map. It is all reading; no build was involved.
+
+### 37a. The registries
+
+Eight ops register a scalar sum-shortcut keyed on the `tensor_sum(op(x))` spelling:
+
+    avg_pool1d   avg_pool2d   batch_norm1d   batch_norm2d_f32
+    group_norm_f32   max_pool1d   max_pool3d   prelu
+
+`timed_op` — which every lane except the GroupNorm and squared-loss ones uses — ends with
+a plain `tensor_sum(out)`. So for all six of these ops that HAVE a lane, the lane
+exercises the shortcut route and the dense route is never touched.
+
+### 37b. The split routes
+
+    op            shortcut route (what the summing lane measures)         dense route (unmeasured by it)
+    max_pool1d    max_pool1d_backward_from_indices_scalar_f64             ..._from_indices_f64
+    avg_pool1d    avg_pool1d_backward_scalar_f64                          avg_pool1d_backward_f64
+    avg_pool2d    avg_pool2d_backward_scalar_f64                          avg_pool2d_backward_f64 / _f32
+    max_pool3d    ..._from_indices_scalar_f64 / _scalar_nonoverlapping    ..._from_indices_f64 / _nonoverlapping
+
+group_norm_f32 and prelu dispatch differently — their shortcut is consumed at the ft-api
+level rather than by selecting a differently-named kernel — but the same principle holds,
+and `prelu_noshortcut` already exists as a lever-off twin precisely because someone hit
+this before. That lane is the precedent for what `avg_pool1d_dense` does.
+
+### 37c. What this cost and what it is worth
+
+Both directions are now measured rather than argued:
+
+    372h8   landed on the SCALAR avg_pool1d route      at least 2.44x
+    yc7ud   landed on the DENSE avg_pool1d route       at least 1.27x, and needed a NEW
+                                                       lane (`sum(out*out)`) to be visible
+    jlcmi   landed on a group_norm function the lane
+            never executes (`cpg == 2` dispatch)       0.988x / 0.976x, replicated,
+                                                       passing A/A, and entirely false
+
+The jlcmi row is the one to remember: consistent, replicated, tight intervals, a passing
+A/A control, and measuring dead code. No statistic in the row could have revealed it.
+
+### 37d. The standing consequence
+
+**Before placing a lever on any of the four ops above, decide which route it is on, and
+if it is the dense one, build a non-summing lane first.** The pattern is
+`avg_pool1d_dense`: loss `sum(out * out)` so the upstream gradient is non-uniform and the
+shortcut declines, with the incumbent twin squared to match (`Fn.avg_pool1d(x,2,2)**2`)
+so both arms time the same work — parity `match` is the check that they do.
+
+NOT PROPOSING A HARNESS REDESIGN. The summing lane measures a real spelling that real
+callers use, and the shortcut is a real optimization on it. The defect is only that
+nothing in a banked row records WHICH route the lane selected, so this blind spot is
+invisible after the fact. Recording the map is the cheap fix; adding route provenance to
+the row format would be the thorough one.
+
+UNMEASURED BY ANY LANE: batch_norm1d and batch_norm2d_f32 have shortcuts but no h2h lane
+at all, so both their routes are dark. Not a defect, just a fact worth knowing before
+someone sizes a lever there.
