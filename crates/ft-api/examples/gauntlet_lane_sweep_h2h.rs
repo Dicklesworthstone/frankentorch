@@ -1182,6 +1182,51 @@ LANES = {
                     checksums[index] = checksum;
                 }
             }
+            // frankentorch-68pwz: instrument the CERTIFICATION GATE itself. Every
+            // hypothesis so far (allocator, warmup, host drift) was aimed at why
+            // the null fails; none asked what the null is actually comparing.
+            //
+            // It is NOT first-rounds against last-rounds. Within EACH round the
+            // balanced square gives each arm four slots, and the null compares
+            // slots 0,1 against slots 2,3 — a WITHIN-ROUND position effect,
+            // accumulated across rounds. A null below 1.0 therefore says the arm
+            // is FASTER in the later slots of the same round, every round.
+            //
+            // I guessed that was cache eviction between rounds — slots 0,1 paying
+            // a refill that 2,3 skip. THE DUMP REFUTED THAT. The spikes are not
+            // positional at all; they land in any slot, on either arm:
+            //
+            //   ft=[35.0 42.1 36.7 34.6]   clean round
+            //   ft=[83.4 38.7 50.8 38.1]   slot 0 spiked 2.2x
+            //   ft=[35.7 38.1 39.4 75.7]   slot 3 spiked 2.1x
+            //   pt=[ 6.2  8.0  7.2 37.8]   the INCUMBENT spiked 5x
+            //
+            // So the gate is rejecting SPORADIC CONTENDED SAMPLES, not a bias.
+            // That matters for the estimator: `paired_slot_median` over TWO values
+            // is a mean, so one spike drags the half it lands in, and the median
+            // null fails. The MIN reduction of the same two slots discards the
+            // spike, and on the very run that produced the dump above the min
+            // nulls read 1.002 and 0.994 — both PASS — while the median null
+            // failed at 0.855. The estimator, not the host, was vetoing the row.
+            //
+            // Set FT_H2H_DUMP_SLOTS to a lane name (or `*`) to print the raw four
+            // slots per arm per round. Nothing else in the harness shows them, and
+            // three hypotheses died before anyone looked.
+            if let Ok(target) = std::env::var("FT_H2H_DUMP_SLOTS") {
+                if target == "*" || target.as_str() == *name {
+                    println!(
+                        "SLOTS lane={name} ft=[{:.4} {:.4} {:.4} {:.4}] pt=[{:.4} {:.4} {:.4} {:.4}]",
+                        ft_slots[0],
+                        ft_slots[1],
+                        ft_slots[2],
+                        ft_slots[3],
+                        incumbent_slots[0],
+                        incumbent_slots[1],
+                        incumbent_slots[2],
+                        incumbent_slots[3]
+                    );
+                }
+            }
             pt_first_half[index].push(paired_slot_median([incumbent_slots[0], incumbent_slots[1]]));
             pt_second_half[index]
                 .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));

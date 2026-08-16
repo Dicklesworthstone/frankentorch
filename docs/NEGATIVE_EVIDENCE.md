@@ -24184,3 +24184,67 @@ an estimator that is robust to short spikes rather than one assuming they averag
 out. Increasing rounds addresses the sample count and reintroduces drift;
 decreasing them does the reverse. **This pane has now eliminated every cause it can
 control.**
+
+## 57. WHAT THE CERTIFICATION GATE IS ACTUALLY REJECTING: SPORADIC CONTENDED SAMPLES, AND A NON-ROBUST ESTIMATOR
+
+Three hypotheses died before anyone looked at the raw samples. The harness prints
+only summaries, so I added `FT_H2H_DUMP_SLOTS` and printed the four slots per arm
+per round. ELF `8fe547306b319b1e...` rebuilt with the dump; mimalloc; 8 rounds.
+
+### 57a. Two of my own claims were wrong, and the dump corrects both
+
+**Item 56 said the null compares the first four rounds against the last four.** It
+does not. Within EACH round the balanced square gives each arm four slots, and the
+null compares `slots[0],[1]` against `slots[2],[3]`, accumulated across rounds. The
+"four samples per side" framing in item 56 is withdrawn.
+
+**I then guessed that was cache eviction between rounds** — slots 0,1 paying a
+refill 2,3 skip. Also wrong, and the dump says so directly.
+
+### 57b. The raw slots
+
+    ft=[35.0062 42.1252 36.7054 34.5810]   pt=[5.6572  6.9364  6.3282  7.9640]
+    ft=[34.1202 37.7853 30.4243 34.3773]   pt=[7.1037  8.5121  8.2668  8.4298]
+    ft=[37.6990 37.2227 36.2805 37.7233]   pt=[8.9581 11.2199 10.2040  9.1546]
+    ft=[83.4491 38.7419 50.7594 38.1347]   pt=[7.6206  8.6945  7.1295 10.8578]
+    ft=[76.9459 40.6703 40.1046 44.4401]   pt=[7.6970 11.1977  7.5277 12.3692]
+    ft=[58.2650 50.9988 37.0957 38.2117]   pt=[8.8011 13.9057 13.2617 11.5647]
+    ft=[35.7194 38.1084 39.3676 75.7168]   pt=[5.4058  7.8967  5.8958  9.9128]
+    ft=[38.0581 33.6847 33.1041 36.0742]   pt=[6.1986  8.0171  7.1631 37.8423]
+
+The baseline is stable at ~33-42 ms. What breaks the null is **sporadic single-
+sample spikes of 2-5x**, landing in ANY slot, on EITHER arm — slot 0 twice, slot 2
+once, slot 3 twice, and the incumbent spiking 5x in the last round. There is no
+position bias and no warmup ramp. It is contention, one sample at a time.
+
+### 57c. The estimator, not the host, was vetoing the row
+
+`paired_slot_median` over TWO values is a mean. One spike drags whichever half it
+lands in, so the median null fails. The MIN reduction of the same two slots
+discards the spike. On the very run that produced the dump above:
+
+    group_norm_f32   median null: PT 0.855 FAIL   FT 1.018
+                     MIN null:    PT 1.002 PASS   FT 0.994 PASS
+                     MIN ratio 0.198 [0.164,0.237] = 5.06x SLOWER, parity match
+
+**Both min-estimator nulls PASS on the campaign's worst gap.** The arms are clean.
+The median estimator was rejecting rows because it is not robust to a single
+contended sample, which is exactly the failure mode this host produces.
+
+### 57d. It then missed certification by 0.007
+
+    load_series n=10  worst_drift 1.257x  endpoint_gate PASS  series_gate DRIFTED
+
+Threshold is 1.25x. The run drifted 1.257x. **The row has clean nulls on the
+adjudicating estimator and is refused by seven thousandths of drift margin.**
+
+That is not an argument for loosening the gate — the threshold is the threshold,
+and rule 3 says the row is adjudicated under the estimator it is quoted with. It is
+a statement of exactly how close this is: one quiet sweep away.
+
+### 57e. What this retires
+
+Allocator (item 51), warmup (item 55), and drift-as-sole-cause (item 56) are all
+eliminated, and now so is "the nulls are irreparably noisy" — they are not, under
+the min estimator. What remains is a single drift-clean sweep, and the min
+estimator should be the one quoted on this lane.
