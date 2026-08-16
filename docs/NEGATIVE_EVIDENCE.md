@@ -20136,3 +20136,56 @@ rather than as a new mechanism.
 faster in **7 of 7** invocations, across **two** incumbent patch versions, parity
 `match` every time. Direction is robust; magnitude is not. **No new standing is
 banked from this run**, and the floor stays 1.006x from the 2.12.0 series.
+
+## 2026-08-16 — `avg_pool2d`'s "3.08x loss" was never quotable, and the lane has since flipped (`xdw0h`)
+
+`frankentorch-xdw0h` is a P1 asking for a phase-split of "a live 3.08x row" on
+`avg_pool2d` f64 `[8,64,64,64]`, k=2 s=2. **Its founding evidence does not support
+a loss of any size**, and a fresh measurement points the other way.
+
+**The founding rows were all taken on a saturated host and almost all have WIDE
+nulls.** From `artifacts/perf/frankentorch-v92uh/vs_pytorch_rows.txt`, eight runs
+at **load 21.4-22.7**:
+
+| run | FT (ms) | PT (ms) | standing | A/A null |
+|---|---|---|---|---|
+| 1 | 5.666 | 1.839 | 3.08x slower | **WIDE** `[0.566,1.504]` |
+| 2 | 4.322 | 1.992 | 2.17x slower | **WIDE** `[0.662,1.270]` |
+| 3 | 4.537 | 1.747 | 2.60x slower | PASS `[0.803,1.187]`, point **0.933** |
+| 4 | 5.465 | 2.001 | 2.73x slower | **WIDE** `[0.679,1.496]` |
+| 5-8 | 4.505-5.646 | 2.061-2.578 | 1.88-2.69x slower | **WIDE** |
+
+The harness defines WIDE as *"the sample was too noisy to support ANY verdict, so
+the row is undecidable rather than a win or a loss"*. Seven of eight are WIDE. The
+eighth reads 0.933, outside the ±0.02 adjudication rule 3 now requires. **So the
+bead's headline number is the point estimate of an undecidable row.**
+
+**A fresh run points the other way.** Same shape, same harness, same incumbent
+version (2.12.1+cpu), same allocator, ELF `ac1156652bbd0b95`, build worker
+`vmi1149989`, `same_host=thinkstation1`, 32 rounds, **load 7.10**:
+
+```
+avg_pool2d   FT 1.776 ms   PT 2.422 ms   FT 1.364x FASTER  [1.308,1.435]  parity match
+             (PT null OFFSET [0.970,1.068] -> also NOT quotable)
+```
+
+**What actually moved is FrankenTorch's own arm, not PyTorch's.** PT spans
+1.747-2.578 ms across the eight founding runs and the fresh 2.422 sits inside that
+band — the incumbent did not move. FrankenTorch went **5.666 -> 1.776 ms**, a
+~3x improvement in its own time, which is consistent with the pooling and
+buffer-pool work landed between 2026-08-14 and 2026-08-16.
+
+**Neither endpoint is certified**, so the honest statement is not "avg_pool2d is
+now a win" — it is: *the direction of this lane is not established, the loss it was
+filed against was never quotable, and FrankenTorch's own time has improved ~3x
+since.*
+
+Two transferable points:
+
+- **A point estimate from a WIDE row is not a smaller version of a result; it is
+  not a result.** It is the number the instrument produced while telling you it
+  could not measure. Filing optimization work against one commits real effort to a
+  target that may not exist — this bead is P1.
+- **Re-read a bead's founding evidence before optimizing against it**, especially
+  one filed days earlier on a busy host. Checking cost one run; the phase-split it
+  asks for is a multi-session lever.
