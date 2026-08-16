@@ -40859,6 +40859,113 @@ mod tests {
     /// pre-zeroed pages from the kernel instead — no memset, but a minor fault per
     /// page on first touch. `NEGATIVE_EVIDENCE` item 8 says recycling won at the
     /// lane; this re-checks it at the buffer size the scorecard lane actually uses.
+    /// The lever item 21's 1.906x justifies: pay for NaN correctness ONCE per
+    /// block instead of once per element (`frankentorch-87sz8`).
+    ///
+    /// `pool_max_beats` is exact but evaluates `is_nan` for every element that
+    /// does not beat the running max, which is nearly all of them. The same answer
+    /// can be had by scanning with the cheap bare `>` and asking separately
+    /// whether the block contained any NaN at all — `acc |= v != v` is a bitwise
+    /// OR of booleans, which is associative, so unlike the float max it may be
+    /// vectorised and unrolled freely. Only when a NaN is actually present does
+    /// the exact scan need to run.
+    ///
+    /// EXACTNESS, which is the whole point: the fast path is used only when the
+    /// block is NaN-free, and on a NaN-free block `v > m || v.is_nan()` is
+    /// identical to `v > m` for every element. When any NaN is present the fast
+    /// result is discarded and `pool_max_beats` produces the answer, so the
+    /// last-NaN-wins index rule is preserved exactly. The test asserts both paths
+    /// agree bit for bit on NaN-free, NaN-bearing and all-NaN blocks.
+    #[test]
+    fn max_pool3d_nan_fast_path_is_exact_and_reports_its_speedup() {
+        let n = 1 << 20;
+        let mut z = 0xfeed_face_u64;
+        let mut data: Vec<f64> = (0..n)
+            .map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                v
+            })
+            .collect();
+
+        // The exact reference: what the kernels do today.
+        let exact = |values: &[f64]| -> (u64, usize) {
+            let mut m = f64::NEG_INFINITY;
+            let mut arg = 0usize;
+            for (i, &v) in values.iter().enumerate() {
+                if super::pool_max_beats(v, m) {
+                    m = v;
+                    arg = i;
+                }
+            }
+            (m.to_bits(), arg)
+        };
+        // The candidate: cheap scan, one NaN question for the whole block.
+        let fast = |values: &[f64]| -> (u64, usize) {
+            let mut any_nan = false;
+            for &v in values {
+                any_nan |= v != v;
+            }
+            if any_nan {
+                return exact(values);
+            }
+            let mut m = f64::NEG_INFINITY;
+            let mut arg = 0usize;
+            for (i, &v) in values.iter().enumerate() {
+                if v > m {
+                    m = v;
+                    arg = i;
+                }
+            }
+            (m.to_bits(), arg)
+        };
+
+        // Exactness on all three regimes.
+        assert_eq!(fast(&data), exact(&data), "NaN-free block");
+        let mut with_nan = data.clone();
+        with_nan[n / 3] = f64::NAN;
+        with_nan[2 * n / 3] = f64::NAN;
+        assert_eq!(
+            fast(&with_nan),
+            exact(&with_nan),
+            "block containing NaNs — the LAST NaN must take the index"
+        );
+        let all_nan = vec![f64::NAN; 512];
+        assert_eq!(fast(&all_nan), exact(&all_nan), "all-NaN block");
+        // And a -0.0/0.0 block, where the tie rule is what distinguishes them.
+        let zeros = vec![-0.0f64, 0.0, -0.0, 0.0];
+        assert_eq!(fast(&zeros), exact(&zeros), "signed-zero ties");
+
+        // Cost, on the common case the fast path exists for: no NaN present.
+        data[0] = 1.0;
+        let reps = 15;
+        let mut exact_ns = Vec::with_capacity(reps);
+        let mut fast_ns = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let a = exact(&data);
+            exact_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(a);
+
+            let t = std::time::Instant::now();
+            let b = fast(&data);
+            fast_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(b);
+        }
+        exact_ns.sort_unstable();
+        fast_ns.sort_unstable();
+        #[allow(clippy::cast_precision_loss)]
+        let speedup = exact_ns[0] as f64 / fast_ns[0] as f64;
+        println!(
+            "87sz8 NaN fast path over {n} elems (NaN-free, the common case): exact {} ns, \
+             two-pass fast {} ns, speedup {speedup:.3}x (min of {reps}, interleaved)",
+            exact_ns[0], fast_ns[0]
+        );
+    }
+
     #[test]
     fn max_pool3d_prices_the_nan_check_and_the_gradient_buffer_source() {
         // (1) The NaN check, on a realistic max-scan shape.

@@ -20901,3 +20901,44 @@ load 13.38 → 18.75. Its replication attempt is the failed-null run above. Wort
 noting that this is the lane whose `xdw0h` premise was refuted as "never quotable and
 since flipped" — it is now certified *faster* once, which confirms that refutation
 with a gated number.
+
+**22. A WIN, WITH A GRANULARITY CAVEAT THAT DECIDES WHETHER IT CAN SHIP —
+NaN fast path is 1.302x and EXACT (`frankentorch-87sz8`, 2026-08-16).** Item 21
+priced NaN correctness at 1.906x on the max scan and said a cheaper exact
+formulation was now a lever with a measured prize. Here is the formulation and its
+number.
+
+Scan with the cheap bare `v > m`, and ask ONCE per block whether the block
+contained any NaN at all — `acc |= v != v` is a bitwise OR of booleans, which is
+associative, so unlike the float max it may be vectorised and unrolled freely.
+Only when a NaN is actually present does the exact `pool_max_beats` scan run.
+
+rch worker `vmi1227854`, min of 15, both arms interleaved rep by rep on the same
+data, 1_048_576 elements, NaN-free (the common case the fast path exists for):
+
+| scan | time |
+|---|---|
+| exact `pool_max_beats` | 1_249_640 ns |
+| bare `>` plus one NaN question | 960_066 ns |
+| **speedup** | **1.302x** |
+
+**EXACT, not approximately exact**, and the test asserts it: on a NaN-free block
+`v > m || v.is_nan()` is identical to `v > m` for every element, so the fast path
+is only ever taken where the two agree; when any NaN is present the fast result is
+discarded and the exact scan produces the answer, preserving the last-NaN-wins
+index rule. Bit-identity is asserted on NaN-free, NaN-bearing, all-NaN and
+signed-zero (`-0.0`/`0.0` tie) blocks.
+
+**THE CAVEAT, and it is the difference between a shippable lever and another item
+7f.** This measured ONE 1M-element scan. `max_pool3d` does not do that — it does
+131_072 INDEPENDENT 8-element window scans. At 8 elements a two-pass approach
+costs 8 NaN checks plus 8 compares where the fused form costs 8 fused checks, so
+**at window granularity this lever LOSES.** It can only pay if the NaN question is
+hoisted to a coarser unit than the window: ask it once per PLANE (16_384 elements
+here), then run every window in that plane with the cheap compare. That is the
+shape the number above actually measured, and it is the only shape worth wiring.
+
+So the next step on this bead is not "apply the fast path to `pool_max_beats`" —
+that would be slower. It is a plane-level NaN pre-check dispatching to a NaN-free
+window specialisation, and it must be measured at the kernel, not at this
+microbenchmark, before it is believed.
