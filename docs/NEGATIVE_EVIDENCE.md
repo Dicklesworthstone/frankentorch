@@ -23823,3 +23823,58 @@ What remains unmeasured inside that ~30 ms: session/tape construction, the
 the backward closure's own dispatch. The next step is a phase split of the ENGINE
 path with the same `*_ns_take` counter pattern used on the SVD prologue — and on
 this evidence it should be a split, not a lever.
+
+## 51. mimalloc DOES NOT RESCUE CERTIFICATION — AND THE SERIES GATE CAUGHT ITS FIRST BLIND SPOT LIVE
+
+The fleet's top question from item 48 — allocator or load? — run as designed: two
+builds differing ONLY in allocator, executed back to back in one load window.
+
+    arm       elf sha256 (process self-report)   allocator                    rows  PT FAIL  FT FAIL
+    A         4831383ca3aa2897...                mimalloc (--features fair-alloc)  21    17      21
+    B         fd856bb1d2fa77b2...                system (glibc malloc)             21    17      19
+
+Both built locally with `RCH_CARGO_WRAPPER_BYPASS=1`, executable path taken from
+`--message-format=json`, no `[RCH]` line. Incumbent PyTorch 2.12.1+cpu, same
+invocation, balanced-square ABBAABBA, 16 rounds.
+
+### 51a. Neither run certifies, and mimalloc is not the fix
+
+**Both are drift-VOID**, so no row from either is quotable. But the answer to the
+question asked is visible anyway: **mimalloc did not reduce null failures.** Its
+FrankenTorch arm failed **21 of 21**, against 19 of 21 on glibc. Whatever is
+breaking the nulls, switching to the allocator every certified row used does not
+stop it.
+
+**The comparison is still not clean, and I will not overclaim it.** Arm A drifted
+2.110x and arm B 1.643x, so A had the worse host and more failures are expected
+regardless of allocator. What this refutes is the strong form of item 48 —
+*"switch to mimalloc and rows will certify"* — not the weak form, that allocator
+choice contributes something. A clean answer still needs both arms in a
+**non-drifting** window, which this host has not offered in five attempts.
+
+### 51b. The series gate caught what the endpoint pair could not — on a real run
+
+This is the first live exercise of the gate added for item 49, and it worked:
+
+    arm A (mimalloc)  endpoints 48.97 -> 70.75 = 1.445x    series worst = 2.110x
+    arm B (glibc)     endpoints 66.92 -> 40.74 = 1.643x    series worst = 1.643x
+
+**Arm A's endpoints understate its drift by 46%.** The host went somewhere between
+the two readings that neither endpoint recorded — exactly the excursion item 49
+predicted was invisible. Arm B's extremes happened to BE its endpoints, so the two
+gates coincide there, which is the behaviour the strictness test asserts.
+
+Both runs exceed 1.25x either way, so the verdict is unchanged here. The point is
+that **the endpoint pair was measurably wrong about how bad arm A was**, and on a
+run nearer the threshold that difference decides whether a row is banked.
+
+### 51c. The standing answer to the fleet's question
+
+On the evidence so far: **load, not allocator.** Across five local sweeps, null
+failure counts track drift and do not track allocator — 13-15 of 21 at ~12-34 load,
+16-17 at ~18, 19 at ~50-93, 19-21 at ~49-70 under both allocators. mimalloc under a
+2.1x-drifting host fails everything.
+
+The blocker is a quiet host, and this pane cannot produce one — every window
+offered has been 40-90 load with peers building. That is the finding to act on, and
+it is a scheduling problem rather than a code one.
