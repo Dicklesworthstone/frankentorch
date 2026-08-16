@@ -22634,3 +22634,69 @@ seven, and did not: there are 22 in-file cross-references to those numbers, plus
 citations in commits, beads and mail that I cannot rewrite, and a blind renumber under a
 no-build window would trade one ambiguity for a worse one. Adopting the errata's
 resolution instead — **cite by title, not number** — and numbering forward from 35.
+
+## 36. THE SVD BEAD'S NAMED TARGET IS 10.5% — THE THIRD TIME ONE ATTRIBUTION LEVEL MOVED THE ANSWER
+
+`frankentorch-svd-blocked-bidiag-r7jdo.1` proposes replacing the bidiagonal-QR
+Givens replay with a divide-and-conquer merge. Three successive splits have now
+each said the named target is the smaller half, and the third one finally reaches
+a term worth building against.
+
+### 36a. The three levels, each correcting the one above
+
+    LEVEL 1  vectors vs values          vectors 57-77% of a square SVD
+    LEVEL 2  inside the vectors phase   bidiag+V 94.5-99.1%, A*V gemm 0.5-3.1%, assemble 0.4-2.4%
+    LEVEL 3  inside bidiag+V            reduction 57.8%, form P 31.6%, QR SWEEP 10.5%   (n=256)
+
+Level 3, same process, both arms, min of 3, square, rch worker `hz2`:
+
+        n      reduce ns       formP ns       sweep ns   split
+      128        3054705         708217        3064000   44.7% / 10.4% / 44.9%
+      192       15779088       10110750        3294015   54.1% / 34.6% / 11.3%
+      256       35797471       19578624        6530024   57.8% / 31.6% / 10.5%
+
+**The bidiagonal-QR sweep the bead is named after is 10.5% at n=256 and its share
+FALLS with n** (44.9% -> 11.3% -> 10.5%). A perfect D&C merge of that sweep — the
+multi-session structural rewrite the bead was filed for — is worth at most a tenth
+of a square SVD, and less as matrices grow.
+
+### 36b. Where it actually is
+
+`bidiag_blocked_f64` (the `dgebrd` reduction) at 57.8% and `bidiag_form_p_f64`
+(the `dorgbr` expansion of the packed row reflectors into P) at 31.6% are together
+**89.4%**.
+
+The reduction is already blocked and GEMM-bound. **`bidiag_form_p_f64` is not.** It
+walks reflectors one at a time in reverse, doing a rank-1 update over the trailing
+submatrix per reflector — the unblocked `dorg2r` shape: O(n) passes over O(n²)
+data, BLAS-2, no GEMM, no cache reuse. Its share behaves accordingly, jumping
+10.4% -> 34.6% between n=128 and n=192 while the reduction's share moves only
+44.7% -> 54.1%.
+
+Its two inner kernels (`reduce_scaled_rows_f64`, `apply_scaled_rank1_f64`) DO carry
+a rayon gate, so this is not a missing-parallelism finding and should not be filed
+as one — the problem is the BLAS-2 structure, which parallelism does not fix.
+
+### 36c. A correction to my own level-2 reading, caught by instrumenting
+
+My first level-3 attempt timed `svd_blocked_bidiag_prologue` as a single
+"bidiag" term and reported reduction 77.9% / sweep 22.1% at n=256. **That was
+wrong**: the prologue also calls `bidiag_form_p_f64`, so forming V was being
+counted inside "the reduction" — the very term I was trying to separate it from.
+Splitting the prologue moved 31.6 points out of the bucket I had labelled as the
+reduction.
+
+The general trap: **a timer placed at a function boundary measures whatever that
+function happens to contain, not what its name suggests.** The fix is to time the
+callees, not the caller, whenever the caller's name is doing the explaining.
+
+### 36d. What this retires and what it opens
+
+- The D&C bidiagonal merge is NOT the next lever and should not be started on this
+  bead's title. At most ~10% and shrinking.
+- `bidiag_form_p_f64` is the next lever: ~31.6% and rising, structurally BLAS-2,
+  and FrankenTorch already owns blocked compact-WY machinery
+  (`qr_householder_panel_blocked`) that does exactly this expansion GEMM-bound.
+- Anyone sizing `frankentorch-j8sl5` (blocked `orgqr` for the basis completion)
+  should note that the same argument applies to a LARGER term here: on square
+  inputs the completion is not on the critical path at all, and `form_p` is.

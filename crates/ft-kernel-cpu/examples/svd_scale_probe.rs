@@ -24,6 +24,7 @@
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
     svd_contiguous_f64, svd_deferred_left_hits_take, svd_deferred_left_phase_ns_take,
+    svd_reduction_sweep_ns_take,
 };
 
 /// Well-conditioned deterministic fill, same xorshift family as `svd_golden`.
@@ -352,7 +353,48 @@ fn svd_rows_orthogonality_error_pub(vh: &[f64], k: usize, n: usize) -> f64 {
     worst
 }
 
+/// `frankentorch-r7jdo.1`, third level. The vectors phase is 94.5-99.1% of a
+/// square SVD and all of it is inside `golub_reinsch_svd_*`, which has exactly two
+/// O(n^3) halves: the Householder reduction to bidiagonal form, and the
+/// bidiagonal-QR sweep that accumulates V. Those have completely different levers
+/// — the reduction is already blocked (dgebrd-shape, GEMM trailing updates),
+/// while the sweep applies Givens rotations one at a time. This says which one
+/// holds the time before anything is built against either.
+fn reduction_versus_sweep_split() {
+    println!();
+    println!("== r7jdo.1: reduction vs V-accumulating sweep (square, min of 3) ==");
+    println!(
+        "{:>6}  {:>13}  {:>13}  {:>13}  {:>13}  {}",
+        "n", "reduce ns", "formP ns", "sweep ns", "total ns", "split"
+    );
+    for &n in &[128usize, 192, 256] {
+        let a = deterministic_matrix(n, n, 0x9e37_79b9_7f4a_7c15);
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let mut best = (u64::MAX, 0u64, 0u64, 0u64);
+        for _ in 0..3 {
+            let _ = svd_reduction_sweep_ns_take();
+            let _ = svd_contiguous_f64(&a, &meta, true);
+            let (rd, fp, sw) = svd_reduction_sweep_ns_take();
+            if rd + fp + sw < best.0 {
+                best = (rd + fp + sw, rd, fp, sw);
+            }
+        }
+        let (total, rd, fp, sw) = best;
+        #[allow(clippy::cast_precision_loss)]
+        let pct = |x: u64| 100.0 * x as f64 / total.max(1) as f64;
+        println!(
+            "{n:>6}  {rd:>13}  {fp:>13}  {sw:>13}  {total:>13}  \
+             reduce {:.1}% / formP {:.1}% / sweep {:.1}%",
+            pct(rd),
+            pct(fp),
+            pct(sw)
+        );
+    }
+    println!("the reduction is already blocked/GEMM-bound; the sweep is per-rotation");
+}
+
 fn main() {
+    reduction_versus_sweep_split();
     v_orthogonality_rank_scale_sweep();
     scale_probe();
     full_u_cost_probe();

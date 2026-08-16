@@ -28957,14 +28957,28 @@ fn svd_blocked_bidiag_prologue(
     n: usize,
     track_left: bool,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, f64) {
+    // frankentorch-r7jdo.1: the REDUCTION and the reflector EXPANSION are separate
+    // O(n^3) terms with separate levers -- dgebrd is already blocked and
+    // GEMM-bound, while forming P/Q is a dorgbr-shaped expansion. Timed apart so
+    // the next lever names a measured term. Measurement-only atomics.
+    let t_reduce = std::time::Instant::now();
     let (d, e, tauq, taup) = bidiag::bidiag_blocked_f64(a, m, n, svd_bidiag_block_size());
+    SVD_BIDIAG_NS.fetch_add(
+        t_reduce.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // P must be read out of the packed reflectors BEFORE `a` is overwritten with Q.
+    let t_formp = std::time::Instant::now();
     let v = bidiag::bidiag_form_p_f64(a, n, &taup);
     if track_left {
         let q = bidiag::bidiag_form_q_f64(a, m, n, &tauq);
         a[..m * n].copy_from_slice(&q);
     }
+    SVD_FORM_PQ_NS.fetch_add(
+        t_formp.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let (w, rv1, anorm) = svd_bidiag_to_nr_indexing(d, &e);
     (w, rv1, v, anorm)
@@ -29015,12 +29029,29 @@ fn golub_reinsch_svd_with_reduction(
     track_left: bool,
     blocked: bool,
 ) -> Result<(Vec<f64>, Vec<f64>), KernelError> {
+    // frankentorch-r7jdo.1: split the two O(n^3) halves. The vectors phase is
+    // 94.5-99.1% of a square SVD and lives entirely in this function; this says
+    // which of its two halves holds it, so the next lever aims at a measured term.
     let (mut w, mut rv1, mut v, anorm) = if blocked {
+        // The blocked prologue times its own two halves (reduction vs reflector
+        // expansion); the NR prologue is a single fused pass and is attributed
+        // wholly to the reduction.
         svd_blocked_bidiag_prologue(a, m, n, track_left)
     } else {
-        svd_nr_bidiag_prologue(a, m, n, track_left)
+        let t_nr = std::time::Instant::now();
+        let out = svd_nr_bidiag_prologue(a, m, n, track_left);
+        SVD_BIDIAG_NS.fetch_add(
+            t_nr.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        out
     };
+    let t_sweep = std::time::Instant::now();
     svd_bidiag_qr_f64(a, &mut v, &mut w, &mut rv1, n, anorm, track_left)?;
+    SVD_SWEEP_NS.fetch_add(
+        t_sweep.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok((w, v))
 }
 
@@ -29907,6 +29938,27 @@ pub static SVD_DL_QR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub static SVD_DL_GEMM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[doc(hidden)]
 pub static SVD_DL_ASSEMBLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Splits `golub_reinsch_svd_*` into its two O(n^3) halves — the Householder
+/// reduction to bidiagonal form, and the bidiagonal-QR sweep that accumulates V.
+/// `frankentorch-r7jdo.1`; measurement-only.
+#[doc(hidden)]
+pub static SVD_BIDIAG_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static SVD_SWEEP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static SVD_FORM_PQ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read and reset the split as `(reduction_ns, form_pq_ns, sweep_ns)`.
+#[doc(hidden)]
+pub fn svd_reduction_sweep_ns_take() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SVD_BIDIAG_NS.swap(0, Relaxed),
+        SVD_FORM_PQ_NS.swap(0, Relaxed),
+        SVD_SWEEP_NS.swap(0, Relaxed),
+    )
+}
 
 /// Read and reset the deferred-left phase timers as `(qr_ns, gemm_ns, assemble_ns)`.
 #[doc(hidden)]
