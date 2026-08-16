@@ -282,7 +282,78 @@ fn deferred_left_phase_split() {
     }
 }
 
+/// `frankentorch-ga99y` step 2. V's row orthogonality across RANK x SCALE.
+///
+/// Known so far: rank-2-of-64 at 1e-20 gives orthoV 1.839e-2, while full-rank at
+/// 1e-20 is clean at 9.5e-15 — so the defect needs both. This sweep says which
+/// variable actually drives it. If orthoV degrades smoothly as rank falls it is a
+/// deficiency effect; if it switches on sharply at some scale it is a threshold
+/// effect, which is what the near-threshold-convergence hypothesis predicts.
+fn v_orthogonality_rank_scale_sweep() {
+    println!();
+    println!("== ga99y: V row orthogonality across rank x scale (n=64) ==");
+    print!("{:>6}", "rank");
+    for exp in [0i32, -5, -10, -15, -20] {
+        print!("  {:>12}", format!("1e{exp}"));
+    }
+    println!();
+
+    let n = 64usize;
+    for &rank in &[2usize, 4, 8, 32, 64] {
+        // `rank` independent columns; the rest repeat them cyclically.
+        let mut z = 0x51ca_7e51_ca7e_u64;
+        let mut base = vec![0.0f64; n * n];
+        for row in 0..n {
+            for col in 0..n {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                base[row * n + col] = if col < rank {
+                    v
+                } else {
+                    base[row * n + (col % rank)]
+                };
+            }
+        }
+        print!("{rank:>6}");
+        for exp in [0i32, -5, -10, -15, -20] {
+            let scale = 10.0f64.powi(exp);
+            let a: Vec<f64> = base.iter().map(|v| v * scale).collect();
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            match svd_contiguous_f64(&a, &meta, false) {
+                Ok(r) => {
+                    let e = svd_rows_orthogonality_error_pub(&r.vh, r.k, r.n);
+                    print!("  {e:>12.3e}");
+                }
+                Err(_) => print!("  {:>12}", "err"),
+            }
+        }
+        println!();
+    }
+    println!("clean is ~1e-14; the bead's failing cell is rank 2 @ 1e-20 = 1.839e-2");
+}
+
+/// Local copy of the orthogonality metric so the example does not depend on a
+/// private helper.
+fn svd_rows_orthogonality_error_pub(vh: &[f64], k: usize, n: usize) -> f64 {
+    let mut worst = 0.0f64;
+    for p in 0..k {
+        for q in p..k {
+            let mut dot = 0.0f64;
+            for j in 0..n {
+                dot += vh[p * n + j] * vh[q * n + j];
+            }
+            let want = if p == q { 1.0 } else { 0.0 };
+            worst = worst.max((dot - want).abs());
+        }
+    }
+    worst
+}
+
 fn main() {
+    v_orthogonality_rank_scale_sweep();
     scale_probe();
     full_u_cost_probe();
     square_fast_path_gate_probe();
