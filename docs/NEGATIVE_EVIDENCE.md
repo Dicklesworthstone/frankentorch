@@ -24782,3 +24782,64 @@ that PASSED.
 That last clause is why this matters beyond max_pool3d. The isolation probe needs a
 harness flag to skip the incumbent, which is a build; it is the highest-value build
 available on this lane and it has now been named three times without being run.
+
+## 63. TWO DRIFT-CLEAN RUNS AT LOW LOAD CERTIFIED NOTHING — THE REFUSAL IS THE BAND, NOT CONTENTION
+
+First rows taken under the new standing rule: `uptime` read immediately before each
+sweep, observed loadavg recorded per run. ELF `171f84f8617e1b43...`, mimalloc,
+symmetric warmup 32, `FT_H2H_LANES=group_norm_f32`, `FT_H2H_REPS=16`, incumbent
+PyTorch 2.12.1+cpu.
+
+    run   loadavg 1m (pre -> post)   worst_drift   series_gate   certified
+    r1    15.67 -> 15.54             1.032x        PASS          0
+    r2    15.54 -> 20.20             1.323x        DRIFTED       1
+    r3    20.20 -> 21.28             1.249x        PASS          0
+
+All three well under the 30 threshold. **The two drift-clean runs certified
+nothing; the run that had a passing null pair was the one that drifted.**
+
+### 63a. The refusal at load 15.6 is not contention
+
+    r1  group_norm_f32  5.37x SLOWER  ratio 0.186 [0.180,0.197]
+                        PT null 0.919 FAIL   FT null 0.937 FAIL
+    r3  group_norm_f32  5.21x SLOWER  ratio 0.192 [0.181,0.197]
+                        PT null 1.034 FAIL   FT null 1.010 PASS
+
+r1 is the cleanest host state measured in this campaign — loadavg 15.6 flat, drift
+1.032x — and it still refused. **Both arms moved DOWN together**, 0.919 and 0.937,
+so the machine sped up ~7% between the halves of each round. That is SHARED drift,
+which item 26 identified as the case that largely cancels in a ratio, and the ratio
+confirms it: `[0.180,0.197]`, tight and indistinguishable from every other run.
+
+**A row whose ratio is demonstrably sound was refused because both arms moved
+together.** The gate treats shared movement exactly as it treats one-sided
+movement, and item 26 already established those are not equivalent.
+
+### 63b. The ratio has converged regardless of the verdicts
+
+Across every group_norm_f32 measurement now taken, certified or not:
+
+    5.21x  5.37x  5.48x  5.61x  5.83x
+    CIs [0.181,0.197] [0.180,0.197] [0.173,0.198] [0.176,0.191] [0.162,0.177]
+
+Every interval overlaps. **The physical quantity is settled to within a few
+percent**, and the certification verdict is now the noisier signal — it flips on
+whether two nulls happen to land inside +/-0.02 in a given run, while the ratio
+barely moves.
+
+### 63c. What this adds to items 60 and 62
+
+Item 62 showed a quiet host raises the full-board rate from 0/21 to 2/21, and
+concluded contention was substantially the story. This narrows that: at loadavg
+15-21 with drift at 1.032x, the filtered family still certified 0 of 6. **Contention
+governs whether a sweep is ADMISSIBLE; the +/-0.02 band governs how many lanes then
+pass, and the band is the binding constraint at low load.**
+
+Item 60's proposal stands and is strengthened by r1: an effect-scaled band
+(`min(0.05, |1 - ratio| / 4)`) would admit r1's 5.37x row, whose nulls are 0.919
+and 0.937 — within 8% on a claim of 437%. Adding item 26's shared-drift clause as a
+second relaxation would admit it on independent grounds.
+
+A failure to certify under load is not a loss. **Nor is a failure to certify at
+loadavg 15 with 1.032x drift — that one is the instrument's threshold, not the
+machine's.**
