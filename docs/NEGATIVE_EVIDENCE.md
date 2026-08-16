@@ -22537,3 +22537,34 @@ two writers scan before either appends** — the numbering is a distributed coun
 with no coordination. Titles and bead ids are content-derived and cannot collide
 that way, which is why the fix is to stop citing the counter rather than to repair
 it.
+
+### 31a. TEN runs now agree the max_pool1d lane is FT-faster, and it is STILL not banked
+
+Item 31 recorded four runs. Six more were taken incidentally while measuring avg_pool1d
+(the lane is sampled in every invocation), so the body of evidence is now ten runs
+across two binaries, and it is worth stating precisely because the temptation to bank
+it grows with the count.
+
+    ELF 2fe20c331e265aa1   1.143  1.120  1.094  1.064
+    ELF 741989be5b958137   1.091  1.167  1.104  1.124  1.065  1.107
+
+Ten of ten say FrankenTorch is FASTER, in a band of 1.064-1.167, against banked
+standings of 1.58-1.76x SLOWER on the earlier binaries. NOT ONE IS ADMISSIBLE:
+
+    six runs   one arm's A/A null failed while the other passed -> one-sided, not
+               excusable under the shared-drift clause, no matter how well it replicates
+    three runs drift gate failed on magnitude
+    one run    (ap1_r4) BOTH nulls PASS -- 0.991 and 0.996 -- and the DRIFT gate failed
+
+That last row is the interesting one and the reason this stays unbanked. A run with two
+clean nulls is exactly what the null gate is for, and it is still refused, because the
+null is a within-arm stability test and cannot see the host moving under both arms
+together (item 18, half one). The two gates are independent by design and this is the
+case that shows why: passing nulls do not certify a drifting run any more than a quiet
+host certifies failing ones.
+
+SO THE HONEST STATE IS UNCHANGED FROM ITEM 31 — no current standing, a strong unbanked
+suggestion of a flip — and ten agreeing runs do not change it. Recorded rather than
+banked because "ten runs all agree" is precisely the argument that would justify
+lowering the bar, and the bar is the only reason any row in this ledger is worth
+anything. One admissible run still closes it; the binary is on disk and needs no build.
