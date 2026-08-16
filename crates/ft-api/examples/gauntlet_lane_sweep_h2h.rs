@@ -693,6 +693,9 @@ LANES = {
     # frankentorch-yu1zm: same torch code under a third name; PT(zeroed)/PT(base)
     # must come out ~1.0 or the host moved between the two lanes.
     "max_pool1d_zeroed": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
+    # frankentorch-372h8: avg_pool1d on the same tensor, exact 2/2 tiling.
+    "avg_pool1d": (mp1, lambda x: Fn.avg_pool1d(x,2,2)),
+    "avg_pool1d_zeroed": (mp1, lambda x: Fn.avg_pool1d(x,2,2)),
     # frankentorch-lu3ht: incumbent twin for the avg_pool2d uninit A/B.
     "avg_pool2d_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
@@ -846,6 +849,30 @@ LANES = {
                 let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
                 let sample = timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
                     s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+                });
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
+            }),
+        ),
+        (
+            // frankentorch-372h8: avg_pool1d on the max_pool1d shape [8,64,8192], which
+            // tiles exactly at kernel=stride=2 and so takes the total-coverage backward.
+            // timed_op SUMS, so this lane exercises `avg_pool1d_backward_scalar_f64` —
+            // the scalar shortcut — and NOT the dense `avg_pool1d_backward_f64`. That
+            // distinction is the whole reason this lane exists on this route.
+            "avg_pool1d",
+            Box::new(|| {
+                timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_avg_pool1d(x, 2, 2).expect("avg_pool1d")
+                })
+            }),
+        ),
+        (
+            "avg_pool1d_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_avg_pool1d(x, 2, 2).expect("avg_pool1d")
                 });
                 ft_kernel_cpu::set_pool_output_zeroed(previous);
                 sample

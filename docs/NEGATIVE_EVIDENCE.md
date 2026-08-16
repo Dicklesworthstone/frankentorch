@@ -22401,3 +22401,71 @@ paired inside one call and agrees across three sizes — not the absolute times.
 The reusable rule: a phase attribution licenses a lever only at the granularity it
 was measured. "Vectors are 57-77%" is true and was not enough; it would have
 funded two levers worth a combined 3%.
+
+---
+
+## 33. avg_pool1d: THE 24.92x SCORECARD LOSS IS STALE — THE LANE IS FrankenTorch-FASTER, AND A 2.44x LEVER SHIPPED
+
+`frankentorch-372h8` was filed against a release-scorecard row recording avg_pool1d f64
+`[8,64,8192]` at **24.92x SLOWER** than PyTorch. Measured on a live h2h lane built for
+this bead, it is **FASTER**, and a lever landed on top of that.
+
+### 33a. The lever — REPLICATED STANDING, at least 2.44x FASTER
+
+`avg_pool1d_backward_scalar_f64` took `buffer_pool::take_zeroed(batch*ch*len)` — 33.5 MB
+at this shape — and then `fill(g)` overwrote ALL of it whenever the windows tile the
+input exactly. The zeroing was 100% dead on that path. It now takes a parked buffer, or
+`build_uninit` on a miss, and fills it directly.
+
+Paired `avg_pool1d` vs `avg_pool1d_zeroed`, arms adjacent in one round, ELF
+`741989be5b958137...`, BUILD WORKER `vmi1227854`:
+
+    run   ratio (off/on)            rounds   PT control
+     2    2.898x [2.768,3.057]      32/32     0.974
+     3    2.812x [2.635,2.960]      32/32     1.009
+     4    2.739x [2.474,2.893]      32/32     1.006
+     5    2.617x [2.473,2.843]      32/32     0.986
+     6    2.699x [2.442,2.861]      32/32     1.001
+    (run 1 discarded: PT control 1.071, past the 5% readability threshold)
+
+CONSERVATIVE CLAIM: **at least 2.44x FASTER**, taking 2.442 — the lowest bound any
+readable run produced — not the 2.90x headline. Five readable runs, 32/32 rounds every
+time, every incumbent control within 3% of 1.0.
+
+This is the largest lever this campaign has measured, and it was PREDICTED by item 30's
+rule rather than found by luck: a large buffer (33.5 MB), trivial per-element work (a
+single store), and `take_zeroed` drawing from the buffer pool — so the memory is
+recycled and DIRTY and the memset is real work, not free kernel zero pages. That is the
+one profile the uninit vein pays on, and it is why max_pool1d paid where avg_pool2d and
+group_norm did not.
+
+### 33b. The scorecard row is stale by more than an order of magnitude
+
+Same runs, the vs-PyTorch row for this lane:
+
+    run 3   min 2.546 [2.426,2.638] = 2.55x FASTER   PT null 1.016 PASS  FT null 1.010 PASS
+            drift gate PASS -- QUOTABLE under the min estimator
+
+That is ONE certifying run, so it is a CANDIDATE and NOT a standing; a second could not
+be taken because a build freeze landed mid-measurement (see 33c). The uncertified rows
+from the other five runs all agree in direction and magnitude — 2.696, 2.600, 2.558,
+2.614 — so the direction is not in doubt even though the standing is not banked.
+
+Against the bead's 24.92x SLOWER, this lane now reads ~2.5x FASTER: a swing of roughly
+60x. The scorecard row predates the scalar-shortcut and borrow-forward levers this path
+already carries (`frankentorch-o4782`, `kgs4.122`, `0w3ns`) and is not merely stale but
+inverted. **Do not size work off that row.** This is the fourth stale-scorecard finding
+in this ledger (7e, npod3, 68pwz, and now 372h8); the pattern is now strong enough to
+state as a rule: a scorecard row older than the levers on its path is evidence of
+nothing.
+
+### 33c. What the freeze cost, recorded so the gap is not mistaken for a result
+
+A fleet-wide build freeze took effect at the 58G disk floor while this lane was being
+measured. One more admissible run would have converted 33b from a candidate into a
+replicated vs-PyTorch standing — the cheapest standing available in the repo, since the
+binary is already on disk at `scratchpad/h2h_ap1.bin` and needs no build.
+
+WHAT REMAINS FOR WHOEVER PICKS THIS UP, in order: one certifying run of the existing
+binary (no build) closes 33b. Nothing else about this bead needs a build either — the
+lever is landed and gated.
