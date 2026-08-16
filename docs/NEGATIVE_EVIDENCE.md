@@ -19859,3 +19859,27 @@ within-run interval says it should be. So:
   survive replication;
 - **any row banked from a single invocation should carry its round count and be
   re-run before it is quoted as a standing.** Two runs cost eleven minutes here.
+
+**14c. THIRD REPLICATION, and run 1 was the optimistic outlier
+(`frankentorch-rled4`, 2026-08-15).** Same binary (ELF `9125c43489561480`, build
+worker `vmi1227854`, harness `gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1`, 32 rounds), `prelu_noshortcut`, parity `match` every
+time, all twelve nulls PASS:
+
+| run | load | median | min |
+|---|---|---|---|
+| 1 | 5.91 -> 16.16 | 1.180x `[1.140,1.222]` | 1.213x `[1.184,1.239]` |
+| 2 | 6.32 -> 17.23 | 1.113x `[1.075,1.143]` | 1.175x `[1.129,1.213]` |
+| 3 | 6.39 -> 9.76 | 1.114x `[1.078,1.151]` | 1.157x `[1.101,1.181]` |
+
+Runs 2 and 3 agree to within 0.001 on the median and 0.018 on the min; run 1 sits
+above both on both estimators. **Had this been banked from its first invocation
+the standing would have been 1.213x, and the replicated value is 1.11-1.18x.**
+That is a 5-9% over-claim avoided by spending eleven extra minutes, and it is the
+concrete argument for the rule in 14b: a row from a single invocation is a
+candidate, not a standing.
+
+**BANKED CLAIM: FrankenTorch is at least 1.07x faster than PyTorch 2.12.0+cpu on
+`prelu_noshortcut`** (PReLU f64 train step `[32,512,256]`, sum shortcut defeated
+via its hook exit), taking the lowest confidence bound any of the three runs
+produced. Not the best run's point estimate, and not the best estimator's.
