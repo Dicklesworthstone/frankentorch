@@ -275,6 +275,91 @@ pub fn measurement_host_block(rayon_threads: usize) -> String {
     )
 }
 
+/// Instantaneous per-core clocks, sorted ascending, in MHz.
+///
+/// frankentorch-68pwz: **cores on this machine run at different clocks AT THE SAME
+/// INSTANT.** Measured here: 64 cores spanning 1429 MHz to 4018 MHz, a 2.812x spread,
+/// with roughly a quarter parked at the floor while the rest sit at 3192-4018. It is
+/// bimodal, not a gradient.
+///
+/// That makes clock a first-class confound for any two-arm ratio. Our arm runs 64 rayon
+/// threads and therefore spans every core, so a parallel join waits on whichever core is
+/// parked; the incumbent runs 8 threads that may land anywhere. **A ratio whose arms sat
+/// at different clocks is partly a frequency ratio.** Reading `scaling_cur_freq` is the
+/// only way to notice, because loadavg is blind to it — the spread above was observed at
+/// loadavg 28.
+pub fn cpu_mhz_sorted() -> Vec<f64> {
+    let mut mhz: Vec<f64> = (0..)
+        .map_while(|cpu| {
+            std::fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq"
+            ))
+            .ok()
+        })
+        .filter_map(|raw| raw.trim().parse::<f64>().ok().map(|khz| khz / 1000.0))
+        .collect();
+    if mhz.is_empty() {
+        // No cpufreq sysfs (containers, some VMs). /proc/cpuinfo still reports a
+        // per-core MHz on x86, and an empty result is reported honestly rather than
+        // faked with a constant.
+        mhz = std::fs::read_to_string("/proc/cpuinfo")
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("cpu MHz"))
+            .filter_map(|line| line.split(':').nth(1)?.trim().parse::<f64>().ok())
+            .collect();
+    }
+    mhz.sort_by(f64::total_cmp);
+    mhz
+}
+
+/// `(min, median, max, spread)` of the current per-core clocks, or `None` if the machine
+/// does not report them. `spread` is `max / min` — the factor by which two cores can
+/// differ AT THE SAME MOMENT, which is the number that decides whether a row's arms were
+/// comparable.
+#[must_use]
+pub fn cpu_mhz_stats() -> Option<(f64, f64, f64, f64)> {
+    let mhz = cpu_mhz_sorted();
+    if mhz.is_empty() {
+        return None;
+    }
+    let min = mhz[0];
+    let max = mhz[mhz.len() - 1];
+    let median = mhz[mhz.len() / 2];
+    Some((min, median, max, if min > 0.0 { max / min } else { f64::NAN }))
+}
+
+/// One line of clock provenance for a banked row.
+///
+/// Says what the clocks were AND how comparability was ensured, because "we measured the
+/// clocks" and "the arms ran at the same clock" are different claims and only the second
+/// licenses a ratio.
+#[must_use]
+pub fn cpu_clock_block(pinned: Option<&str>) -> String {
+    match cpu_mhz_stats() {
+        None => "cpu_mhz=UNAVAILABLE (no cpufreq sysfs and no /proc/cpuinfo MHz); this \
+                 host cannot show whether the two arms ran at comparable clocks"
+            .to_string(),
+        Some((min, median, max, spread)) => {
+            let comparability = match pinned {
+                Some(set) => format!(
+                    "arms pinned to the SAME core set [{set}], so both saw the same clock \
+                     domain"
+                ),
+                None => "arms NOT pinned: our 64 rayon threads span every core including \
+                         any parked at the floor, the incumbent's 8 land wherever the \
+                         scheduler puts them, so this row's arms are NOT known to have \
+                         run at comparable clocks"
+                    .to_string(),
+            };
+            format!(
+                "cpu_mhz min={min:.0} median={median:.0} max={max:.0} spread={spread:.3}x; \
+                 {comparability}"
+            )
+        }
+    }
+}
+
 /// The 1-minute load average, or `None` if it cannot be read.
 #[must_use]
 pub fn load_average_1m() -> Option<f64> {

@@ -839,6 +839,15 @@ LANES = {
         "{}",
         ft_api::harness_provenance::measurement_host_block(rayon::current_num_threads())
     );
+    // frankentorch-68pwz: the clock domain each arm ran in. Printed unconditionally
+    // because a row that does not say this cannot be read: at a 2.8x cross-core spread,
+    // a ratio can be a frequency artefact and every gate in this harness is blind to it.
+    println!(
+        "{}",
+        ft_api::harness_provenance::cpu_clock_block(
+            std::env::var("FT_H2H_PIN_CORES").ok().as_deref()
+        )
+    );
     // frankentorch-2h8vi: the host's own movement, which no A/A null can see.
     let load_at_start = ft_api::harness_provenance::load_average_1m();
     println!(
@@ -1217,6 +1226,15 @@ LANES = {
     }
 
     // frankentorch-pbkvs: see the ISOLATION PROBE note in the slot loop below.
+    // frankentorch-68pwz: PER-ARM CLOCKS. Cores on this box run at different speeds at
+    // the same instant -- measured 1429 MHz against 4018 MHz, a 2.812x spread, bimodal
+    // with about a quarter parked at the floor. A ratio whose arms sat at different
+    // clocks is partly a frequency ratio, and loadavg cannot see it.
+    //
+    // Sampled immediately after each arm's four slots, so each accumulator holds the
+    // clock state that arm was actually measured under rather than a run-level average.
+    let mut ft_mhz: Vec<f64> = Vec::with_capacity(reps * lanes.len());
+    let mut pt_mhz: Vec<f64> = Vec::with_capacity(reps * lanes.len());
     let isolate_arm = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
     // frankentorch-68pwz item 48: the MIRROR of the probe above. With
     // `FT_H2H_NO_FT_ARM` the incumbent keeps its four slots in their square positions
@@ -1329,6 +1347,19 @@ LANES = {
                     );
                 }
             }
+            if let Some((min_mhz, median_mhz, _, spread)) =
+                ft_api::harness_provenance::cpu_mhz_stats()
+            {
+                // TWO different numbers, and the distinction decides whether a ratio is
+                // readable. `median_mhz` is how fast a typical core is running -- its
+                // variation over time is thermal/boost behaviour. `spread` is how far
+                // apart two cores are AT THE SAME INSTANT, which is what makes one arm's
+                // threads faster than the other's. An idle snapshot shows 2.9x; only the
+                // in-measurement value says whether that mattered while we sampled.
+                ft_mhz.push(median_mhz);
+                pt_mhz.push(spread);
+                let _ = min_mhz;
+            }
             pt_first_half[index].push(paired_slot_median([incumbent_slots[0], incumbent_slots[1]]));
             pt_second_half[index]
                 .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));
@@ -1364,6 +1395,26 @@ LANES = {
         }
     }
 
+    if !ft_mhz.is_empty() {
+        let summarise = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            (v[0], v[v.len() / 2], v[v.len() - 1])
+        };
+        let (flo, fmid, fhi) = summarise(ft_mhz.clone());
+        let (slo, smid, shi) = summarise(pt_mhz.clone());
+        println!(
+            "\nCLOCKS DURING SAMPLING (sampled once per lane per round, both arms inside \
+             the same round)\n  \
+             typical core   min {flo:.0} median {fmid:.0} max {fhi:.0} MHz   (boost/thermal \
+             behaviour over time)\n  \
+             CROSS-CORE SPREAD at one instant   min {slo:.3}x median {smid:.3}x max \
+             {shi:.3}x   (how far apart two cores were WHILE we sampled)\n  \
+             The spread is the number that decides comparability: it is what makes one \
+             arm's threads faster than the other's. Compare it against the idle snapshot in \
+             the cpu_mhz header line -- if the idle spread is large and this one is small, \
+             the cores boosted once work arrived and the clock confound did not bite."
+        );
+    }
     writeln!(stdin, "{QUIT_REQUEST}")?;
     stdin.flush()?;
     drop(stdin);

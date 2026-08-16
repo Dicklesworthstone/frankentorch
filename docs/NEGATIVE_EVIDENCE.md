@@ -25190,3 +25190,59 @@ neither moves as far as I said yesterday.
 STILL NOT WITHDRAWING ROWS on one lane's probe. The 12% is measured on max_pool3d only.
 Whether it is uniform across lanes is exactly what the two probes can now answer cheaply,
 lane by lane, and that is the work this instrument was built for.
+
+## 50. PER-ARM CLOCKS ARE NOW RECORDED, AND THE CROSS-CORE SPREAD DOES NOT CLOSE WHILE WE SAMPLE
+
+frankenfs measured a 2.879x cross-core frequency spread and the fleet confirmed cores at
+1429 MHz and 3946 MHz **at the same instant**. Verified on this box and wired into the
+harness. Observed loadavg 16.26 / 25.12 / 30.50.
+
+    idle snapshot (header)     min 1910  median 3234  max 4046 MHz   spread 2.118x
+    DURING sampling            cross-core spread   min 1.556x  median 1.862x  max 2.847x
+    typical core over time     min 3211  median 3240  max 3879 MHz
+
+**The spread does NOT close once work arrives.** My first reading of the earlier data was
+that the parked cores would boost and the confound would evaporate; the in-measurement
+numbers refute it. While we sample, two cores are typically **1.86x apart** and can be
+2.85x apart.
+
+An idle snapshot on this box has shown 2.118x, 2.812x and 2.932x on three separate reads,
+so the resting spread is not a fluke either. What the new instrumentation adds is the
+number that actually matters — the spread *while the arms are running*, which no previous
+row recorded.
+
+### 50a. Why this is a first-class confound for every ratio here
+
+Our arm runs 64 rayon threads and therefore spans every core, including whichever are at
+the floor; a parallel join waits on the slowest. The incumbent runs 8 threads that land
+wherever the scheduler puts them, and 8 threads can fit entirely inside the fast set. So
+the two arms are not sampling the same machine, and **a ratio whose arms sat at different
+clocks is partly a frequency ratio.**
+
+Nothing in the existing gate stack can see this. The A/A null is a within-arm comparison;
+the drift gates read loadavg, which was 16-30 throughout while cores sat 1.86x apart. This
+is the third confound found this session that every gate is blind to, after arm-on-arm
+contention (item 49) and the within-round ramp (item 47) — and the ramp in particular now
+has a candidate explanation it did not have: thread migration across a 1.86x clock gap
+would produce exactly a per-slot ramp.
+
+### 50b. What is implemented, and what is NOT
+
+IMPLEMENTED: `harness_provenance::cpu_mhz_sorted`, `cpu_mhz_stats` and `cpu_clock_block`,
+plus per-round sampling of both the typical-core clock and the instantaneous cross-core
+spread, printed for every run. Any row taken from now on can state the clock conditions
+its arms saw instead of assuming them.
+
+**NOT IMPLEMENTED: pinning.** `FT_H2H_PIN_CORES` is read only to phrase the disclosure
+line; it sets no affinity. So the harness currently MEASURES comparability and does not
+ENSURE it, and the header says so in as many words — it prints "arms NOT pinned: our 64
+rayon threads span every core including any parked at the floor". That distinction matters
+enough to state twice: recording a confound is not controlling it, and a row that cites
+this instrumentation is entitled to say what the clocks were, not that the arms were
+comparable.
+
+Real pinning needs `sched_setaffinity` on our side and a matching `os.sched_setaffinity`
+in the incumbent child, plus a decision about what "comparable" means when one arm wants
+64 threads and the other 8 — pinning both to the same 8 cores would cripple the design
+under test rather than measure it. That is a genuine instrument-design question and is
+filed rather than guessed at.
