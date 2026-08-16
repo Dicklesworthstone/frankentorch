@@ -23502,3 +23502,61 @@ the same bucket as group_norm (item 29e): the defect is in how the lane is measu
 in the op. The cheap discriminator that settled group_norm applies here too — run the
 FrankenTorch arm ALONE at this shape, no incumbent co-process, and see whether the
 one-sided drop survives isolation.
+
+## 46. CORRECTION: THE WORST LANE IS group_norm_f32 AT 5.33x — AND ITS KERNELS ARE FASTER THAN TORCH
+
+Two corrections and one attribution, all from the drift-clean run already banked as
+item 45. No new build; this is the same output read properly.
+
+### 46a. I banked the wrong lane as "the worst"
+
+Items 44 and 45 named `group_norm_f32_zeroed` the largest vs-incumbent gap. The
+plain lane is worse:
+
+    group_norm_f32          FT 34.167 ms  PT 6.412 ms  5.33x SLOWER  ratio 0.188 [0.179,0.209]
+    group_norm_f32_zeroed   FT 33.671 ms  PT 6.922 ms  4.86x SLOWER  ratio 0.206 [0.189,0.218]
+
+I reached for the `_zeroed` row because I assumed the suffix marked a
+deliberately-pessimized toggle arm and therefore the interesting one. It is the
+plain production lane that is worst, and **`group_norm_f32` at 5.33x is the
+campaign's largest locally-measured vs-incumbent gap.** Neither is quotable — the
+null and allocator caveats in item 45 apply unchanged.
+
+### 46b. The kernels are FASTER than torch. The loss is not in them.
+
+Same invocation, same arms:
+
+    group_norm_f32                        FT 34.167 ms   5.33x SLOWER
+    group_norm_f32_kernels                FT  4.298 ms   1.54x FASTER
+    group_norm_f32_statskernels           FT  3.591 ms   1.83x FASTER
+    group_norm_f32_statskernels_recompute FT  4.094 ms   1.66x FASTER
+    group_norm_f32_kernels_serialfwd      FT 15.382 ms   2.35x SLOWER  (serial sentinel)
+
+**The full lane is 34.167 ms and the kernel work inside it is 4.298 ms.** So
+roughly **30 ms — 87.4% of the lane — is not kernel work at all**, and the kernels
+it does run beat the incumbent by 1.54-1.83x.
+
+This is the single most useful thing measured on this lane. Every group_norm lever
+this campaign has considered — the cpg2 stats cache, the parallel gate, the
+reduction reassociation, the fused normalization path — targets the 12.6% that is
+already winning.
+
+### 46c. What it redirects
+
+`frankentorch-68pwz` is filed as "fuse f32 GroupNorm and BatchNorm2d engine paths",
+and this is the measurement that justifies it: the engine path, not the kernel, is
+where the 5.33x lives. The serial-forward sentinel at 15.382 ms is a useful
+midpoint — it shows even a deliberately-serialized kernel arm is less than half the
+full lane's cost, so scheduling is not the residue either.
+
+The next attribution step is to split those ~30 ms, and it needs no new
+instrumentation design: the same `svd_*_ns_take` counter pattern used on the SVD
+prologue applies directly to the f32 GroupNorm engine path.
+
+### 46d. The method note
+
+I nearly wrote a lever against `_zeroed` on the strength of a suffix I had not
+checked. The cost of checking was one grep of the lane table. **When a lane name
+carries a modifier, read what the modifier does before treating the lane as the
+target** — the same class of error as assuming a bead's title names its dominant
+term, which this ledger has now recorded three times on SVD.
