@@ -24120,3 +24120,67 @@ else is now in place: the allocator is matched to the banked set, the warmup is
 sufficient, the estimator is adjudicated per rule 3, and the worst-gap lane has
 demonstrated it can produce clean nulls. Nine attempts have not found that window,
 and this pane cannot manufacture one.
+
+## 56. TWO DRIFT-CLEAN SWEEPS, WARMUP FIXED, STILL ZERO OF 21 — THE 1m LOAD AVERAGE IS THE WRONG INSTRUMENT
+
+Three back-to-back 8-round sweeps on the warmup-corrected binary
+(ELF `8fe547306b319b1e...`, mimalloc, warmup default 32). Zero builds.
+
+    sweep   worst_drift   series_gate   FT_FAIL   PT_FAIL   both-PASS   of 21
+    a       2.318x        DRIFTED         21        20          0
+    b       1.218x        PASS            21        20          0
+    c       1.212x        PASS            20        18          0
+
+**Two sweeps passed BOTH drift gates and certified nothing.** That removes drift as
+the explanation, on top of warmup (item 55) and allocator (item 51). Three named
+causes eliminated and the board is still empty.
+
+### 56a. What the nulls actually look like once drift is clean
+
+    sweep_c  FT  0.814 0.819 0.834 0.894 0.904 0.912 0.924 0.969 0.980 0.998 1.044 1.045 1.097 1.121 1.122 1.223 1.240 1.252 1.306 1.385 1.442
+    sweep_c  PT  0.877 0.932 0.933 0.947 0.979 0.982 0.998 1.004 1.005 1.017 1.024 1.026 1.036 1.041 1.051 1.099 1.110 1.169 1.174 1.263 1.268
+    sweep_b  FT  0.153 0.161 0.553 0.556 0.624 0.667 0.706 0.720 0.909 0.927 0.948 0.964 0.972 0.978 1.008 1.011 1.026 1.069 1.122 1.241 6.256
+
+Both distributions are now CENTRED near unity — the one-sided skew item 54 found is
+gone and stayed gone. They are simply far too WIDE: sweep_c spans 1.8x, and
+sweep_b spans **forty-fold**, from 0.153 to 6.256, on a run whose 1m load held
+within 1.218x.
+
+### 56b. The instrument mismatch
+
+`load_average_1m` is a sixty-second exponential average. The samples it is being
+used to vouch for are individual lane timings, milliseconds apart. **A host can
+hold a 1.218x one-minute average while individual samples are contended by
+40x** — sweep_b is the proof, and no gate built on the 1m average can see it. The
+series gate added in item 49 fixed the endpoint blind spot; it did not, and cannot,
+fix the timescale mismatch, because it samples the same coarse signal more often.
+
+### 56c. The other half: four samples per null half
+
+At `FT_H2H_REPS=8`, an A/A null compares the first four round-medians against the
+last four. Four samples per side cannot absorb the variance above; the +/-0.02 band
+is asking for a precision the sample count does not support. Item 53 halved the
+sweep to beat drift and that worked — but it bought drift-passes at the cost of a
+null that is too noisy to pass.
+
+**The two gates are in direct tension on this host**: 16 rounds gives tighter nulls
+and always drifts; 8 rounds passes drift and cannot settle the nulls. Neither
+setting certifies, and this is now measured from both sides rather than argued.
+
+### 56d. The worst gap, from the cleanest sweep
+
+    group_norm_f32  MIN 5.48x SLOWER  ratio 0.182 [0.154,0.901]
+                    PT null 1.026 FAIL   FT null 0.904 FAIL   parity match
+
+5.48x, consistent with the 5.05-5.57x banked across six earlier runs and three
+ELFs. The median estimator on this sweep reads 1.84x with WIDE nulls on both arms
+(`[0.431,2.760]` and `[0.503,1.937]`) — a spread that says the same thing the
+distributions do.
+
+### 56e. What is actually required now
+
+Not a code change. A host whose contention is stable at the MILLISECOND scale, or
+an estimator that is robust to short spikes rather than one assuming they average
+out. Increasing rounds addresses the sample count and reintroduces drift;
+decreasing them does the reverse. **This pane has now eliminated every cause it can
+control.**
