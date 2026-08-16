@@ -24,7 +24,7 @@
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
     svd_contiguous_f64, svd_deferred_left_hits_take, svd_deferred_left_phase_ns_take,
-    svd_reduction_sweep_ns_take,
+    svd_prologue_p_orthogonality, svd_reduction_sweep_ns_take,
 };
 
 /// Well-conditioned deterministic fill, same xorshift family as `svd_golden`.
@@ -338,6 +338,65 @@ fn v_orthogonality_rank_scale_sweep() {
     // Is the trigger ABSOLUTE rank, or the RATIO rank/n? Rank 2 held fixed while n
     // varies separates them: absolute rank predicts failure at every n, a ratio
     // predicts it only where 2/n is small.
+    // Is P born non-orthonormal in the prologue, or does the QR sweep corrupt a
+    // good one? Set FT_SVD_CAPTURE_P_ORTHO to fill this column.
+    println!();
+    println!("== ga99y: P as it LEAVES the prologue vs V after the sweep (rank 2, n=64) ==");
+    println!(
+        "{:>10}  {:>14}  {:>14}  {}",
+        "scale", "P (prologue)", "V (final)", "verdict"
+    );
+    {
+        let nn = 64usize;
+        let mut z = 0x51ca_7e51_ca7e_u64;
+        let mut base = vec![0.0f64; nn * nn];
+        for row in 0..nn {
+            for col in 0..nn {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                base[row * nn + col] = if col < 2 {
+                    v
+                } else {
+                    base[row * nn + (col % 2)]
+                };
+            }
+        }
+        for exp in [0i32, -15, -20] {
+            let a: Vec<f64> = base.iter().map(|v| v * 10.0f64.powi(exp)).collect();
+            let meta = TensorMeta::from_shape(vec![nn, nn], DType::F64, Device::Cpu);
+            let _ = svd_prologue_p_orthogonality();
+            match svd_contiguous_f64(&a, &meta, false) {
+                Ok(r) => {
+                    let after = svd_rows_orthogonality_error_pub(&r.vh, r.k, r.n);
+                    match svd_prologue_p_orthogonality() {
+                        Some(before) => {
+                            let verdict = if before > 1e-9 {
+                                "P BORN BAD -> prologue (form_p / reflectors)"
+                            } else if after > 1e-9 {
+                                "P born clean -> the SWEEP corrupts it"
+                            } else {
+                                "both clean"
+                            };
+                            println!(
+                                "{:>10.0e}  {before:>14.3e}  {after:>14.3e}  {verdict}",
+                                10.0f64.powi(exp)
+                            );
+                        }
+                        None => println!(
+                            "{:>10.0e}  {:>14}  {after:>14.3e}  set FT_SVD_CAPTURE_P_ORTHO",
+                            10.0f64.powi(exp),
+                            "-"
+                        ),
+                    }
+                }
+                Err(_) => println!("{:>10.0e}  svd failed", 10.0f64.powi(exp)),
+            }
+        }
+    }
+
     println!();
     println!("== ga99y: rank 2 held fixed, n varied (scale 1e-20) ==");
     println!("{:>6}  {:>14}  {}", "n", "orthoV", "rank/n");

@@ -28980,6 +28980,26 @@ fn svd_blocked_bidiag_prologue(
         std::sync::atomic::Ordering::Relaxed,
     );
 
+    // frankentorch-ga99y sentinel: is P already non-orthonormal when it LEAVES the
+    // prologue, or does the QR sweep corrupt a good one? Forcing the NR reduction
+    // fixes the bug, but that swaps the prologue AND the v the sweep consumes, so
+    // it cannot separate the two. Measuring P here does. Gated off by default --
+    // it is O(n^3) and would dominate the very timings above.
+    if svd_capture_p_orthogonality() {
+        let mut worst = 0.0f64;
+        for p_row in 0..n {
+            for q_row in p_row..n {
+                let mut dot = 0.0f64;
+                for j in 0..n {
+                    dot += v[p_row * n + j] * v[q_row * n + j];
+                }
+                let want = if p_row == q_row { 1.0 } else { 0.0 };
+                worst = worst.max((dot - want).abs());
+            }
+        }
+        SVD_PROLOGUE_P_ORTHO_BITS.store(worst.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     let (w, rv1, anorm) = svd_bidiag_to_nr_indexing(d, &e);
     (w, rv1, v, anorm)
 }
@@ -29948,6 +29968,29 @@ pub static SVD_BIDIAG_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static SVD_SWEEP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[doc(hidden)]
 pub static SVD_FORM_PQ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `frankentorch-ga99y`: worst `|P P^T - I|` as P LEAVES the blocked prologue,
+/// before the QR sweep touches it. Off unless `FT_SVD_CAPTURE_P_ORTHO` is set,
+/// because the check is itself O(n^3).
+#[doc(hidden)]
+pub static SVD_PROLOGUE_P_ORTHO_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn svd_capture_p_orthogonality() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FT_SVD_CAPTURE_P_ORTHO").is_some())
+}
+
+/// Read the prologue's P-orthogonality sentinel. `None` when uncaptured.
+#[doc(hidden)]
+pub fn svd_prologue_p_orthogonality() -> Option<f64> {
+    let bits = SVD_PROLOGUE_P_ORTHO_BITS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
 
 /// Read and reset the split as `(reduction_ns, form_pq_ns, sweep_ns)`.
 #[doc(hidden)]
