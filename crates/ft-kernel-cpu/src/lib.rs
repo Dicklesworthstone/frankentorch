@@ -9917,6 +9917,101 @@ pub fn max_pool3d_backward_from_indices_nonoverlapping_f64(
     din
 }
 
+/// [`max_pool3d_backward_from_indices_nonoverlapping_f64`] written as ONE
+/// full-coverage pass instead of zero-then-scatter (`frankentorch-87sz8`).
+///
+/// The route it replaces zeroes the whole dense gradient — 8 MiB on the scorecard
+/// lane — and then scatters one value per output into it, a density of 12.5%. When
+/// the windows TILE the input exactly (`od * kd == id` and likewise for h and w),
+/// every input element belongs to exactly one window, so a single pass can write
+/// each element once: the gradient at that window's argmax, `0.0` at the rest. The
+/// zeroing pass then does not need to happen at all.
+///
+/// WHETHER THAT IS FASTER IS AN OPEN QUESTION, WHICH IS WHY THIS EXISTS BESIDE
+/// THE ORIGINAL RATHER THAN REPLACING IT — AND IT IS NOW REJECTED.
+///
+/// REJECTED LEVER, DO NOT RE-LAND AS THE DEFAULT. Measured 2026-08-16 on rch
+/// worker `vmi1227854`, 10 threads, both arms interleaved rep by rep in one
+/// process on the same data, min of 25, output asserted bit-identical:
+/// zero-then-scatter **17_206 ns** against full-coverage **25_949 ns**, i.e. this
+/// function is **0.663x — 1.51x SLOWER**. It stays exported and tested only so the
+/// refutation is executable rather than folklore:
+/// `max_pool3d_full_coverage_backward_matches_bits_and_reports_its_cost` re-measures
+/// it on every run, so anyone proposing this idea again must beat that number
+/// instead of re-deriving the intuition.
+///
+/// Why it loses, which is exactly what `NEGATIVE_EVIDENCE` item 3 predicted for
+/// pooling backwards: a `memset` is bandwidth-optimal in a way per-element stores
+/// are not, and the writes replacing it are NOT sequential — each window touches
+/// `kd*kh*kw` positions strided across rows and planes. Removing a pass is not the
+/// same as removing work when the pass removed was the fastest kind of write the
+/// machine has.
+///
+/// Caveat on scale, stated because it is the one thing that could overturn this:
+/// the test shape is 32_768 elements while the scorecard lane is 1_048_576, so
+/// there the `memset` is DRAM-bound rather than cache-bound. The mechanism does
+/// not reverse with size — the strided full-coverage write is DRAM-bound too, and
+/// worse-ordered — but a challenger should measure at the lane's size.
+///
+/// Returns `None` when the windows do not tile the input exactly, because then
+/// some elements belong to no window and full coverage would leave them
+/// uninitialised — the caller must keep the zero-then-scatter route for that case.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_backward_from_indices_nonoverlapping_full_coverage_f64(
+    dout: &[f64],
+    arg_offsets: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+) -> Option<Vec<f64>> {
+    if od == 0 || oh == 0 || ow == 0 {
+        return None;
+    }
+    let (kd, kh, kw) = (id / od, ih / oh, iw / ow);
+    // Exact tiling is the whole precondition: without it some input element is in
+    // no window and would never be written.
+    if kd * od != id || kh * oh != ih || kw * ow != iw || kd == 0 || kh == 0 || kw == 0 {
+        return None;
+    }
+    let plane_len = id * ih * iw;
+    let out_plane_len = od * oh * ow;
+    let fill_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * out_plane_len;
+        for oz in 0..od {
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let out_index = (oz * oh + oy) * ow + ox;
+                    let arg = arg_offsets[dbase + out_index] as usize;
+                    // `0.0 +` matches the zero-then-scatter route's canonicalisation
+                    // of a negative-zero upstream gradient exactly.
+                    let gradient = 0.0_f64 + dout[dbase + out_index];
+                    for wz in 0..kd {
+                        let plane_base = (oz * kd + wz) * ih * iw;
+                        for wy in 0..kh {
+                            let row = plane_base + (oy * kh + wy) * iw + ox * kw;
+                            for wx in 0..kw {
+                                drow[row + wx] = 0.0;
+                            }
+                        }
+                    }
+                    drow[arg] = gradient;
+                }
+            }
+        }
+    };
+    Some(build_uninit(batch * ch * plane_len, |din| {
+        din.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| fill_plane(plane, drow));
+    }))
+}
+
 /// Scalar-loss backward for [`max_pool3d_sum_forward_with_indices_f64`].
 ///
 /// Equivalent to scattering a dense `dout` filled with `upstream`, but avoids
@@ -40631,6 +40726,119 @@ mod tests {
         for (i, (&g, &e)) in sidecar_grad.iter().zip(rescan_grad.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "max_pool3d sidecar grad[{i}]");
         }
+    }
+
+    /// The `frankentorch-87sz8` lever, measured where it can actually run.
+    ///
+    /// The paired A/B lives here rather than in the h2h harness because the
+    /// harness binary must execute on the measurement host, and rch keeps
+    /// selecting workers whose glibc that host does not have (`GLIBC_2.43 not
+    /// found` — ledger item 19). A kernel-level A/B does not need the incumbent
+    /// arm, so it can run wherever the tests run, provided BOTH arms run in the
+    /// same process on the same machine — which they do here, interleaved rep by
+    /// rep on the same data.
+    ///
+    /// This is an FrankenTorch-internal comparison and therefore NOT a
+    /// vs-PyTorch row. It answers one question: does replacing zero-then-scatter
+    /// with a single full-coverage pass pay, given that `NEGATIVE_EVIDENCE` item 3
+    /// measured that trade going the WRONG way on pooling backwards?
+    #[test]
+    fn max_pool3d_full_coverage_backward_matches_bits_and_reports_its_cost() {
+        let (batch, ch, id, ih, iw) = (2usize, 8usize, 8usize, 16usize, 16usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let in_numel = batch * ch * id * ih * iw;
+        let out_numel = batch * ch * od * oh * ow;
+        let mut z = 0x1357_9bdf_2468_ace0u64;
+        let input: Vec<f64> = (0..in_numel)
+            .map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                v
+            })
+            .collect();
+        let (_, offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        let dout: Vec<f64> = (0..out_numel)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let v = (i % 13) as f64 - 6.0;
+                v
+            })
+            .collect();
+
+        // Correctness first: the lever is only interesting if it is exact.
+        let scatter = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
+            &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+        );
+        let full = super::max_pool3d_backward_from_indices_nonoverlapping_full_coverage_f64(
+            &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+        )
+        .expect("this shape tiles exactly");
+        assert_eq!(scatter.len(), full.len());
+        for (i, (a, b)) in scatter.iter().zip(full.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "full-coverage backward differs from zero-then-scatter at {i}"
+            );
+        }
+
+        // The precondition must be enforced, not assumed: a shape whose windows
+        // do NOT tile the input has elements in no window, and full coverage
+        // would leave them uninitialised. `None` is the contract.
+        assert!(
+            super::max_pool3d_backward_from_indices_nonoverlapping_full_coverage_f64(
+                &dout,
+                &offsets,
+                batch,
+                ch,
+                id,
+                ih,
+                iw,
+                od,
+                oh,
+                ow - 1,
+            )
+            .is_none(),
+            "a shape that does not tile exactly must be refused, not silently half-written"
+        );
+
+        // Now the cost, both arms interleaved in one process on one machine.
+        let reps = 25;
+        let mut scatter_ns = Vec::with_capacity(reps);
+        let mut full_ns = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let a = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
+                &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+            );
+            scatter_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(&a);
+
+            let t = std::time::Instant::now();
+            let b = super::max_pool3d_backward_from_indices_nonoverlapping_full_coverage_f64(
+                &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+            );
+            full_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(&b);
+        }
+        scatter_ns.sort_unstable();
+        full_ns.sort_unstable();
+        let (scatter_min, full_min) = (scatter_ns[0], full_ns[0]);
+        #[allow(clippy::cast_precision_loss)]
+        let speedup = scatter_min as f64 / full_min as f64;
+        println!(
+            "87sz8 max_pool3d backward, in_numel={in_numel} out_numel={out_numel} density={:.1}% \
+             threads={}: zero-then-scatter {scatter_min} ns, full-coverage {full_min} ns, \
+             speedup {speedup:.3}x (min of {reps}, interleaved; FrankenTorch-internal, NOT a \
+             vs-PyTorch row)",
+            100.0 * out_numel as f64 / in_numel as f64,
+            rayon::current_num_threads(),
+        );
     }
 
     #[test]

@@ -20749,3 +20749,46 @@ What is *not* done: measuring the self-load directly by running on an idle host.
 That state has not occurred once this session — three unrelated processes have held
 a core each for fifteen hours — so the bound above is derived from data already in
 hand rather than from a run that cannot be obtained.
+
+**20. REJECTED — full-coverage max_pool3d backward is 1.51x SLOWER than
+zero-then-scatter (`frankentorch-87sz8`, 2026-08-16).** Item 19 attributed 60% of
+the lane's kernel time to the backward and named this lever; item 3 predicted it
+would fail. It failed, and now it fails executably.
+
+The backward zeroes the dense gradient (8 MiB on the scorecard lane) and scatters
+one value per output into it — 12.5% density. Since the windows tile the input
+exactly when `kernel == stride`, a single pass can write every element once and
+skip the zeroing. Measured, rch worker `vmi1227854`, 10 threads, both arms
+interleaved rep by rep in one process on the same data, min of 25, output asserted
+BIT-IDENTICAL:
+
+| route | time |
+|---|---|
+| zero-then-scatter (current) | **17_206 ns** |
+| single full-coverage pass | 25_949 ns |
+| **speedup** | **0.663x — 1.51x SLOWER** |
+
+**Why, and item 3 said it in advance: a `memset` is bandwidth-optimal in a way
+per-element stores are not, and the writes replacing it are not sequential** —
+each window touches `kd*kh*kw` positions strided across rows and planes. Removing
+a pass is not the same as removing work when the pass removed was the fastest kind
+of write the machine has.
+
+The function is kept, exported and tested rather than deleted, so the refutation
+is executable: `max_pool3d_full_coverage_backward_matches_bits_and_reports_its_cost`
+re-measures it on every run and pins the `None` contract for shapes that do not
+tile. Anyone proposing this again has to beat 0.663x rather than re-derive the
+intuition.
+
+Caveat recorded rather than buried: the test shape is 32_768 elements and the
+scorecard lane is 1_048_576, so there the `memset` is DRAM-bound rather than
+cache-bound. The mechanism does not reverse with size — the strided write is
+DRAM-bound too, and worse-ordered — but a challenger should measure at the lane's
+size before arguing.
+
+**Where that leaves max_pool3d.** The backward is 60% of kernel time; its dense
+materialisation is required (the consumer reads a dense gradient); its zeroing is
+already the cheapest available write; and the non-overlapping specialisation
+already buys 1.25x over the generic scatter. The remaining lever is not in this
+kernel's write pattern — it is either the 8 comparisons per output in the forward
+(0.582 ms) or the ~half of the lane that sits outside these two kernels entirely.
