@@ -20422,3 +20422,55 @@ A loss that reproduces across two agents, two incumbent builds and four
 invocations at 2.74-3.18x is worth more than a 1.1x win that flips sign under
 load. **The certified row this campaign has is a LOSS, and that is the honest
 state of the board.**
+
+## 2026-08-16 — TWO more certified rows, one a WIN: `prelu_noshortcut` 1.53x faster, `group_norm_f32_statskernels` 5.66x slower (`vhgue`)
+
+Both cleared the gate in **one invocation**, both A/A nulls PASS, parity `match`,
+under the **min** estimator.
+
+```
+prelu_noshortcut              FT 12.462 ms   PT 17.385 ms
+  MIN  ratio 1.533 [1.458,1.598] = FT 1.53x FASTER   PT null 1.009 PASS   FT null 0.994 PASS
+group_norm_f32_statskernels   FT  1.567 ms   PT  0.236 ms
+  MIN  ratio 0.177 [0.157,0.191] = FT 5.66x SLOWER   PT null 1.001 PASS   FT null 0.993 PASS
+```
+
+Both are **min-estimator rows only**. Under the median, `prelu_noshortcut`'s FT null
+was OFFSET at 1.024 and `group_norm_f32_statskernels`' nulls failed outright
+(1.062 / 0.931). Rule 3 adjudicates nulls under the estimator the row is quoted
+with, so they are banked as min rows and explicitly not as median ones.
+
+```
+executing_elf_sha256 = fc53650281e8ba9abab28709e399b11e5180be8620c610f1dc4a34454ea2851f
+harness              = crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs
+measurement_host     = thinkstation1, 5975WX 32-Core, x86_64+avx2, powersave,
+                       rayon_threads=64, online_cpus=64, torch threads=8
+allocator            = mimalloc (--features fair-alloc)
+sampling             = balanced-square ABBAABBA, 32 rounds, 4 live samples/arm/round
+incumbent            = PyTorch 2.12.1+cpu
+load                 = 23.05 -> 29.09
+```
+
+**Build-worker gap, stated rather than papered over.** I was about to record ELF
+`ac1156652bbd0b95` on these rows — my own `vmi1149989` build from earlier. The
+binary that actually ran is `fc53650281e8ba9a`; it had been rebuilt in between,
+almost certainly picking up my own `addcdiv` fix (`72dec3b7`). The ELF above is
+self-reported *from inside the process*, so what executed is pinned exactly — but I
+did not build this binary and therefore cannot name its build worker. Anyone
+extending these rows should rebuild and re-run to close that. **Copying a stale ELF
+forward from a previous run is precisely the error the ELF field exists to catch,
+and I nearly committed it.**
+
+**The load is the highest I have certified from: 23.05 → 29.09, a +26% change.**
+The runs that certified nothing moved +72% and +105%. That sharpens the
+stability-not-level rule from `y4nj9`: it is the *ratio* of change across the sweep
+that matters, not an absolute load ceiling — a busy but steady host certifies where
+a quiet but ramping one does not.
+
+**Version scope.** The incumbent is 2.12.1+cpu; the banked six-run `prelu` series
+used 2.12.0+cpu. So the win **does not extend or replicate that series** — it is a
+standalone certified row against 2.12.1. It agrees in direction (FrankenTorch faster
+on this lane in 8 of 8 invocations now, across two incumbent patch versions) but must
+not be averaged into the 2.12.0 floor of 1.006x.
+
+Both are one invocation, so **candidates, not standings** (rule 4).
