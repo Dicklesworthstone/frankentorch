@@ -124,10 +124,21 @@ const MP3_W: usize = 32;
 // loss. That number predates the f32 affine-grad fused path (frankentorch-48w0b),
 // so this lane exists to find out what the standing actually IS rather than to
 // re-quote it.
-const GN_N: usize = 8;
+// frankentorch-uilzh: RESIZED 16x from the scorecard's [8,64,28,28]. At that size
+// the incumbent arm ran 0.199-0.310 ms — an order of magnitude shorter than any
+// other lane here — and its A/A null failed one-sided in 11 of 11 runs of one
+// binary, so no GroupNorm ratio from this harness was ever gate-quotable
+// (NEGATIVE_EVIDENCE item 24b, and MossyOtter's item 27 showing the arms perturb
+// each other monotonically in lane duration). 16x puts the incumbent near 4-5 ms,
+// in the band where max_pool3d_nopool, conv3d and prelu all null cleanly.
+//
+// This BREAKS COMPARABILITY with every group_norm row banked before it. That is
+// intended: those rows are withdrawn precisely because the lane could not be
+// gated at the old size.
+const GN_N: usize = 32;
 const GN_C: usize = 64;
-const GN_H: usize = 28;
-const GN_W: usize = 28;
+const GN_H: usize = 56;
+const GN_W: usize = 56;
 const GN_GROUPS: usize = 32;
 
 // frankentorch-k1hto: PReLU f64 scalar-loss train step, shape copied verbatim
@@ -573,6 +584,18 @@ fn incumbent_sample(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // frankentorch-yu1zm: THE A/A CONTROL FOR THE UNINIT PAIR. With
+    // `FT_POOL_ZEROED_OUTPUT=1` the global default becomes the zeroed path, and the
+    // `max_pool1d_zeroed` lane — which sets the toggle and then RESTORES the previous
+    // value — leaves both arms on the zeroed path. The paired ratio must then collapse
+    // to ~1.0.
+    //
+    // This control is not optional. Adding the twin lane moved the BASE lane from
+    // 17.3 ms to 8.6 ms, so lane composition perturbs this lane by 2x on its own, and
+    // a paired ratio between two positions that are not interchangeable would report a
+    // lever effect that is really an ordering effect. The A/A is what tells the two
+    // apart, and until it has run the A/B number means nothing.
+    ft_kernel_cpu::init_pool_output_toggle_from_env();
     let reps = reps();
 
     let mp1 = seq(MP1_N * MP1_C * MP1_L);
@@ -630,7 +653,7 @@ mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
 # `.float()` here, `tensor_variable_f32` there. The affine parameters require grad,
 # which is the whole point of the row — the f32 no-grad path has long been fused,
 # and it is the GRAD path the scorecard measured at 19.04x.
-gnx=seq(8*64*28*28).reshape(8,64,28,28).float()
+gnx=seq(32*64*56*56).reshape(32,64,56,56).float()   # frankentorch-uilzh: keep in lockstep with GN_N/GN_C/GN_H/GN_W
 gnw=(seq(64)*10.0+1.0).float().requires_grad_(True)
 gnb=(seq(64)*3.0).float().requires_grad_(True)
 # frankentorch-k1hto PReLU f64 train step. The weight requires grad on both arms:
@@ -667,6 +690,9 @@ LANES = {
     # takes from the pool.
     "avg_pool2d_nopool": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "max_pool1d_nopool": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
+    # frankentorch-yu1zm: same torch code under a third name; PT(zeroed)/PT(base)
+    # must come out ~1.0 or the host moved between the two lanes.
+    "max_pool1d_zeroed": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # The FrankenTorch side of this second name calls the two f32 kernels
     # DIRECTLY, with no session and no tape, to price the engine and the f64
@@ -802,6 +828,23 @@ LANES = {
                 timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
                     s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
                 })
+            }),
+        ),
+        (
+            // frankentorch-yu1zm: identical work to `max_pool1d`, with the uninit
+            // first-touch lever switched OFF, so the pair measures the lever
+            // against its own predecessor inside ONE binary and ONE invocation.
+            // NEGATIVE_EVIDENCE item 25 could only compare across two binaries
+            // built 90 minutes apart with peer commits between them, which cannot
+            // attribute a 2-3.5% difference to any single change.
+            "max_pool1d_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+                });
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
             }),
         ),
         (
@@ -1180,6 +1223,12 @@ LANES = {
             .or_else(|| {
                 name.strip_suffix("_recompute")
                     .map(|base| (base, "forward-statistics reuse"))
+            })
+            .or_else(|| {
+                // frankentorch-yu1zm: the pooling forwards' UNINIT output vs the
+                // pre-lever zeroed allocation, flipped per arm inside one process.
+                name.strip_suffix("_zeroed")
+                    .map(|base| (base, "uninit output"))
             })
         else {
             continue;

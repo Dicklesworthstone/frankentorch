@@ -21378,6 +21378,13 @@ shows one binary reproduces, not that the result survives a rebuild.
 
 ## 25. THE UNINIT FIRST-TOUCH LEVER DOES NOT PAY ON max_pool1d — MEASURED, NEGATIVE
 
+> **SUPERSEDED IN ITS CONCLUSION BY ITEM 26, same session.** A same-binary paired
+> A/B with a passing A/A control puts the lever at **at least 1.36x FASTER** on
+> this lane. The rows below are NOT withdrawn — they were measured correctly and
+> correctly refused to attribute anything causally — but they were taken in
+> binaries whose allocator state made the lever worth zero, which no ELF hash or
+> worker identity records. Read item 26c before citing anything here.
+
 `frankentorch-3ja43` removed a dead `vec![0.0; numel]` from both max_pool1d
 forwards, so the parallel fill became the sole writer and the page first-toucher.
 The change is bit-exact and removes real dead work. **It does not make the lane
@@ -21545,3 +21552,109 @@ The transferable rule is the one that has now paid three times in this campaign
 (items 22/23, and the max_pool3d backward): **attribute before you build.** The
 bead named a phase, the first split showed the phase was the smaller half, and
 the second split showed the real cost was not in either candidate.
+
+---
+
+## 26. THE UNINIT LEVER IS WORTH 1.36x ON max_pool1d — AND ITEM 25 WAS MEASURING IT UNDER CONDITIONS WHERE IT COULD NOT PAY
+
+Item 25 banked the uninit first-touch lever (`frankentorch-3ja43`) as a negative: no
+gain vs PyTorch across two binaries. **A same-binary paired A/B now shows the lever
+is worth at least 1.36x on this lane.** Item 25's rows are not withdrawn — they were
+correctly measured and correctly refused causal attribution — but its practical
+conclusion is superseded, and the reason is worth more than either number.
+
+### 26a. The paired A/B, replicated across two binaries
+
+Lane `max_pool1d_zeroed` is identical work to `max_pool1d` with the lever switched
+OFF at runtime, sampled adjacently in the same round. Reported `off / on`, so > 1.0
+means uninit is faster. PyTorch is carried as the incumbent control: it is
+byte-identical code under both lane names, so `PT(off)/PT(on)` must land near 1.0.
+
+    ELF 3e44bf19d920b38e (build worker vmi1293453)
+      1.485x  95% CI [1.421,1.523]   32/32 rounds faster   PT control 1.034
+    ELF 6c091e582768113c (build worker vmi1227854)
+      1.406x  95% CI [1.362,1.447]   32/32 rounds faster   PT control 1.007
+
+CONSERVATIVE CLAIM: **at least 1.36x FASTER**, taking 1.362 — the lowest bound
+either run produced — not the 1.485x headline.
+
+### 26b. The A/A control, which is what makes 26a believable
+
+Adding the twin lane moved the BASE lane from 17.3 ms to 8.6 ms. Lane composition
+perturbs this lane by 2x on its own, so a paired ratio between two positions that
+are not interchangeable could report an ORDERING effect dressed as a lever effect.
+
+`FT_POOL_ZEROED_OUTPUT=1` puts BOTH arms on the zeroed path, leaving the pairing
+intact and the lever absent. The ratio must then collapse to 1.0:
+
+    A/A, ELF 6c091e582768113c   1.017  95% CI [0.994,1.064]  PT control 0.999
+                               verdict UNDECIDED — the paired CI brackets 1.0
+                               FT arms 12.656 vs 12.869 ms
+
+It collapses. The same binary that reads 1.406x with the lever reads 1.017 without
+it, so the pairing is not an ordering artifact.
+
+A second A/A run corroborates in substance (FT arms 12.811 vs 13.081, ratio 1.021)
+but its PT control moved 5.1%, past the harness's own 5% readability threshold, so
+it is recorded and NOT counted. The claim rests on the first A/A.
+
+The arm times are internally consistent across all five runs, which is the strongest
+part of the case:
+
+    uninit arm          8.564   8.624   9.580
+    zeroed arm         12.495  12.810  13.474
+    A/A, both zeroed   12.656  12.869 | 12.811  13.081
+
+Under A/A both arms sit exactly where the zeroed arm sits under A/B. Nothing else
+moved.
+
+### 26c. Why item 25 saw nothing — the part that generalises
+
+`vec![0.0; numel]` is a calloc. For a large allocation served by a FRESH `mmap`, the
+kernel supplies zero pages and the "zero pass" costs nothing — there is no memset to
+remove, and the lever is worth exactly zero. For an allocation served from RECYCLED
+dirty arena memory, the zeroing is a real 32 MB memset, and the lever is worth all of
+it.
+
+Which one you get is decided by the rest of the process, not by the kernel under
+test. Item 25's binaries had a `group_norm` lane 16x smaller; this one's larger lane
+changes the whole process's memory footprint, and the same code goes from worthless
+to 1.36x. Offered as the leading hypothesis, not a finding — it is consistent with
+every number above and I have not instrumented the allocator to confirm it.
+
+THE TRANSFERABLE LESSON: **an allocation-removal lever cannot be evaluated in
+isolation from the process's memory history.** A cross-binary before/after is not
+merely uncontrolled for code; it is uncontrolled for allocator state, which no ELF
+hash or worker identity records. A same-binary toggle with an A/A control is the only
+design that answers the question, and it is cheap.
+
+### 26d. What this does NOT restore
+
+The vs-PyTorch standings for this lane are NOT comparable across the lane-composition
+change. `max_pool1d` reads 8.6-9.6 ms here against 16.9-17.3 ms in the binaries that
+produced the banked standings of at least 1.58x SLOWER pooled
+(`frankentorch-yd2w7`) and at least 1.75-1.76x SLOWER unpooled (`frankentorch-07i34`,
+item 25). Those standings stand for the binaries that produced them, and this binary
+is a different workload. **A new vs-PyTorch standing on this lane has to be measured
+fresh; do not divide these numbers into each other.**
+
+`frankentorch-lu3ht` (the five sibling forwards) is UNBLOCKED by 26a, with the caveat
+from 26c: each sibling should be A/B'd in the composition it actually runs in, not
+assumed to inherit 1.36x.
+
+### 26e. Resizing the group_norm lane moved its null failure from one arm to the other
+
+`frankentorch-uilzh` resized the lane 16x, from `[8,64,28,28]` to `[32,64,56,56]`,
+putting the incumbent arm at 6.3-7.5 ms instead of 0.199-0.310 ms.
+
+The FrankenTorch-side one-sided inflation of item 24b is largely GONE — FT nulls now
+read 1.024, 1.010 (PASS), 1.023, against 1.07-1.31 across eleven runs at the old
+size. But the INCUMBENT null now fails, at 0.867-0.900, in ONE direction: torch's
+second half is FASTER than its first. That is warm-up, not degradation, and it is the
+same shape MossyOtter measured standalone (0.1764 -> 0.1485 -> 0.1507 -> 0.1518).
+
+So the lane is still not gate-quotable, and the next step is now specific rather than
+exploratory: **give the incumbent arm more warm-up iterations.** The harness warms
+FrankenTorch 3 iterations and torch 4 (`frankentorch-2kgum`); at 16x the work, four
+is not enough for torch to reach steady state. `uilzh` stays open with that as its
+concrete next action, and `68pwz` stays blocked behind it.

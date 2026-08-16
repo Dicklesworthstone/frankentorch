@@ -2475,6 +2475,72 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
     unsafe { Vec::from_raw_parts(staged.as_mut_ptr().cast::<T>(), numel, staged.capacity()) }
 }
 
+/// frankentorch-yu1zm: runtime switch that puts the ZEROED allocation back, so one
+/// binary can measure the uninit first-touch lever against its own predecessor.
+///
+/// This exists because `frankentorch-3ja43` could only be evaluated across two
+/// binaries built ninety minutes apart with peer commits in between
+/// (NEGATIVE_EVIDENCE item 25), and a cross-binary comparison cannot attribute a
+/// 2-3.5% difference to any one change. Reading it once into a `OnceLock` keeps the
+/// per-call cost to a relaxed atomic load, so the toggle itself cannot be what the
+/// A/B measures.
+///
+/// Set `FT_POOL_ZEROED_OUTPUT=1` to select the pre-lever path. Unset — every
+/// production run — takes the uninit path.
+/// An `AtomicBool` and NOT a `OnceLock`, deliberately: a `OnceLock` caches on first
+/// read, so a paired lane could never flip arms inside one process and the A/B would
+/// be forced back into a cross-invocation comparison — the exact weakness this is
+/// meant to remove. A relaxed load once per kernel call (not per element) cannot be
+/// what the measurement reads.
+static POOL_OUTPUT_ZEROED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn pool_output_zeroed() -> bool {
+    POOL_OUTPUT_ZEROED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Select the pre-lever zeroed-allocation path; returns the previous setting so a
+/// harness can restore it. Measurement-only — production never calls this and the
+/// default is the uninit path.
+pub fn set_pool_output_zeroed(zeroed: bool) -> bool {
+    POOL_OUTPUT_ZEROED.swap(zeroed, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Honour `FT_POOL_ZEROED_OUTPUT=1` once at startup, for whole-process runs that
+/// want the pre-lever path without a paired lane.
+pub fn init_pool_output_toggle_from_env() {
+    if std::env::var("FT_POOL_ZEROED_OUTPUT").map(|v| v == "1") == Ok(true) {
+        set_pool_output_zeroed(true);
+    }
+}
+
+/// One fully-overwritten output buffer, uninitialized unless [`pool_output_zeroed`]
+/// says otherwise. The `fill` contract is [`build_uninit`]'s: write every element,
+/// read none before writing it — which the zeroed arm also satisfies trivially.
+fn build_pool_output<T: Copy + Default, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<T> {
+    if pool_output_zeroed() {
+        let mut out = vec![T::default(); numel];
+        fill(&mut out);
+        return out;
+    }
+    build_uninit(numel, fill)
+}
+
+/// Paired form of [`build_pool_output`] for the value+sidecar kernels.
+fn build_pool_output_pair<T: Copy + Default, U: Copy + Default, F: FnOnce(&mut [T], &mut [U])>(
+    a_numel: usize,
+    b_numel: usize,
+    fill: F,
+) -> (Vec<T>, Vec<U>) {
+    if pool_output_zeroed() {
+        let mut a = vec![T::default(); a_numel];
+        let mut b = vec![U::default(); b_numel];
+        fill(&mut a, &mut b);
+        return (a, b);
+    }
+    build_uninit_pair(a_numel, b_numel, fill)
+}
+
 /// Two fully-overwritten buffers produced by ONE fused pass, both uninitialized.
 ///
 /// For kernels that emit a value buffer and a sidecar together (a pooling output
@@ -11090,7 +11156,7 @@ pub fn max_pool1d_forward_f64(
                 *slot = m;
             }
         };
-        return build_uninit(numel, |out| {
+        return build_pool_output(numel, |out| {
             if numel * 2 >= POOL_FWD_PARALLEL_MIN {
                 out.par_chunks_mut(output_len)
                     .enumerate()
@@ -11116,7 +11182,7 @@ pub fn max_pool1d_forward_f64(
             *slot = m;
         }
     };
-    build_uninit(numel, |out| {
+    build_pool_output(numel, |out| {
         if numel * kernel >= POOL_FWD_PARALLEL_MIN {
             out.par_chunks_mut(output_len)
                 .enumerate()
@@ -11170,7 +11236,7 @@ pub fn max_pool1d_forward_with_indices_f64(
                 arow[ox] = arg as f64;
             }
         };
-        return build_uninit_pair(numel, numel, |out, arg_offsets| {
+        return build_pool_output_pair(numel, numel, |out, arg_offsets| {
             if numel * 2 >= POOL_FWD_PARALLEL_MIN {
                 out.par_chunks_mut(output_len)
                     .zip(arg_offsets.par_chunks_mut(output_len))
@@ -11202,7 +11268,7 @@ pub fn max_pool1d_forward_with_indices_f64(
             arow[ox] = arg as f64;
         }
     };
-    build_uninit_pair(numel, numel, |out, arg_offsets| {
+    build_pool_output_pair(numel, numel, |out, arg_offsets| {
         if numel * kernel >= POOL_FWD_PARALLEL_MIN {
             out.par_chunks_mut(output_len)
                 .zip(arg_offsets.par_chunks_mut(output_len))
