@@ -24248,3 +24248,64 @@ Allocator (item 51), warmup (item 55), and drift-as-sole-cause (item 56) are all
 eliminated, and now so is "the nulls are irreparably noisy" — they are not, under
 the min estimator. What remains is a single drift-clean sweep, and the min
 estimator should be the one quoted on this lane.
+
+## 44. THE WARMUP 4->32 FIX SHIPPED WITH THE INCUMBENT ARM STILL AT 4 — AND THE BOARD DID NOT RECOVER
+
+`99ef0efe` raised the FrankenTorch warmup default from 4 to 32 on the finding that 20
+lanes would not certify because our arm was still warming. Re-ran the full sweep against
+PyTorch on that harness. **Nothing certified, in either of two runs**, and there is a
+defect in the fix that has to be corrected before its own evidence can be read.
+
+### 44a. The fix was ASYMMETRIC as shipped
+
+`gauntlet_lane_sweep_h2h.rs` now defaults `FT_H2H_WARMUP` to **32**.
+`harness_interleave.rs`, which drives the incumbent's warmup loop, still defaulted to
+**4**. Both arms read the SAME variable, so anyone running without exporting it warmed
+FrankenTorch 32 times and torch 4 times.
+
+That is the exact bias the comment three lines above that loop warns against, in my own
+words from when the knob was added: *an asymmetric warmup has a bias whose direction
+depends on which arm is faster, which is a property no instrument may have.* Under-warming
+the incumbent makes torch look slower, which inflates every FrankenTorch-faster ratio and
+deflates every FrankenTorch-slower one.
+
+**Corrected here**: the Python default is now 32, matching. Any row taken on `99ef0efe`
+before this commit was measured on an asymmetric instrument, including the 20-lane finding
+that motivated the change.
+
+### 44b. Two runs on the corrected harness, nothing quotable
+
+    ELF ec5e9bb8a9e2d3ef38cf16d731f43c0e6606a17dee914ba5312efb44925568d3
+    balanced-square ABBAABBA, 32 rounds, warmup 32 BOTH arms, PyTorch 2.12.1+cpu,
+    same_host=thinkstation1
+
+    run  load_1m start -> end   drift   lanes certified   PT nulls passing  FT nulls passing
+     1   40.92 -> 79.41 (+94%)  FAIL    0                 4                 6
+     2   72.66 -> 100.65 (+38%) FAIL    0                 2                 3
+
+**0 of 21 lanes certified in both runs.** Both drift gates failed; the host sat at
+loadavg 40-100 driven by other projects' rch jobs, which is the regime the load-delta
+criterion says is unusable, and item 38 showed a drifting run reports a ratio compressed
+toward 1.0 as well as failing its gates.
+
+### 44c. What the fix DID do, and the part that is confounded
+
+Our arm's nulls improved markedly. Under warmup 4 the FT null on these lanes failed
+one-sided low run after run; at warmup 32 they cluster near 1.0 (0.988, 0.996, 1.008,
+1.019 among the passes). **That part of the 4->32 finding holds.**
+
+The incumbent's nulls now fail, and one-sided HIGH — 1.027, 1.040, 1.091, 1.105, 1.137,
+1.167, 1.222 — meaning torch's second half is slower than its first. Two readings are
+available and this data cannot separate them: either the longer, heavier FrankenTorch
+warmup (64 threads, 32 iterations per lane) leaves the box hot enough that the incumbent
+degrades during measurement, or it is simply the loadavg 40-100 from other projects. **Do
+not conclude the fix broke the incumbent arm on this evidence.**
+
+It is the same shape as item 26e, where resizing the group_norm lane cleared our arm's
+null and moved the failure to the incumbent's. That is now twice that a fix aimed at one
+arm has surfaced as a failure in the other, which is worth watching as a pattern rather
+than treated as coincidence.
+
+WHAT THE BOARD NEEDS is a re-run on the corrected harness during a quiet window. The
+claim that this single fix recovers the board is UNTESTED, not refuted: no run yet exists
+in which the instrument was symmetric AND the host held still.

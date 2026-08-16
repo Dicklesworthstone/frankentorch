@@ -379,7 +379,7 @@ import sys, os
 # stay matched: an asymmetric warmup has a bias whose direction depends on which
 # arm is faster, which is a property no instrument may have.
 for _name, (_base, _fn) in LANES.items():
-    for _ in range(int(os.environ.get('FT_H2H_WARMUP', '4'))):
+    for _ in range(int(os.environ.get('FT_H2H_WARMUP', '32'))):
         run(_base, _fn)
 print('PT_READY', flush=True)
 for _line in sys.stdin:
