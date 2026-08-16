@@ -42236,11 +42236,16 @@ mod tests {
 
     /// frankentorch-3ja43: the max_pool1d forwards build their output (and the
     /// sidecar) into UNINITIALIZED memory, so any element the fill fails to write
-    /// is garbage rather than a benign zero. This pins both routes against an
-    /// independent scalar reference, bit for bit, over shapes that stress the
-    /// coverage argument: the 2/2 specialization, a stride that leaves a tail of
-    /// the input outside every window, overlapping windows (stride < kernel), and
-    /// enough elements to cross POOL_FWD_PARALLEL_MIN into the parallel branch.
+    /// is garbage rather than a benign zero. This pins both routes against a plain
+    /// scalar reference, bit for bit, over shapes that stress the coverage
+    /// argument: the 2/2 specialization, a stride that leaves a tail of the input
+    /// outside every window, overlapping windows (stride < kernel), and enough
+    /// elements to cross POOL_FWD_PARALLEL_MIN into the parallel branch.
+    ///
+    /// The reference deliberately reuses `pool_max_beats`, so it is independent of
+    /// the BUFFER CONSTRUCTION — which is what changed — and not of the tie/NaN
+    /// semantics, which `max_pool1d_pair_specialization_matches_generic_first_argmax_bits`
+    /// already pins against real torch output.
     #[test]
     fn max_pool1d_forward_uninit_routes_match_a_scalar_reference_bitwise() {
         fn reference(
