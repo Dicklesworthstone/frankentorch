@@ -29017,8 +29017,7 @@ mod bidiag {
             let mut block = vec![0.0f64; nrows * nrows];
             for r in 0..nrows {
                 let src = (row0 + r) * n + row0;
-                block[r * nrows..(r + 1) * nrows]
-                    .copy_from_slice(&p[src..src + nrows]);
+                block[r * nrows..(r + 1) * nrows].copy_from_slice(&p[src..src + nrows]);
             }
             let mut vt = vec![0.0f64; w * nrows];
             for r in 0..nrows {
@@ -29144,8 +29143,33 @@ fn svd_blocked_bidiag_prologue(
     );
 
     // P must be read out of the packed reflectors BEFORE `a` is overwritten with Q.
+    //
+    // frankentorch-4zjaa: above n = 64 the expansion goes through the blocked
+    // compact-WY path. `bidiag_form_p_f64` is an unblocked dorg2r — one rank-1
+    // update over the trailing submatrix per reflector, BLAS-2, no GEMM — and it
+    // measured 31.6% of a square SVD, rising with n (NEGATIVE_EVIDENCE item 36),
+    // next to a reduction that is already GEMM-bound.
+    //
+    // The threshold matches `svd_use_blocked_bidiag`'s own n >= 64: below it the
+    // unblocked form is kept, so every smaller shape retains its CURRENT output
+    // bit-for-bit and the existing tests keep their meaning. Panel width is the
+    // same `svd_bidiag_block_size()` already tuned for the reduction.
+    //
+    // NOT bit-identical above the threshold — blocking reassociates the same
+    // arithmetic — so it is admissible only under the ratified eig/SVD tolerance
+    // policy (frankentorch-qgce4). `bidiag_blocked_form_p_matches_the_unblocked_expansion`
+    // asserts agreement with the unblocked oracle to 1e-11 and orthonormality of
+    // the result across five shapes and three panel widths.
+    //
+    // UNMEASURED AS SHIPPED: the correctness case is gated, the SPEEDUP is not.
+    // Per section 1 of the standing orders this is landed, not won, until a
+    // post-fix ratio is taken in a quiet window.
     let t_formp = std::time::Instant::now();
-    let v = bidiag::bidiag_form_p_f64(a, n, &taup);
+    let v = if n >= 64 {
+        bidiag::bidiag_form_p_blocked_f64(a, n, &taup, svd_bidiag_block_size())
+    } else {
+        bidiag::bidiag_form_p_f64(a, n, &taup)
+    };
     if track_left {
         let q = bidiag::bidiag_form_q_f64(a, m, n, &tauq);
         a[..m * n].copy_from_slice(&q);
@@ -58464,8 +58488,7 @@ mod tests {
         for &(m, n) in &[(9usize, 6usize), (24, 16), (40, 33), (12, 3), (5, 1)] {
             for &nb in &[1usize, 4, 16] {
                 let mut packed = bidiag_test_matrix(m, n, 0xC0FFEE ^ (m * 131 + n) as u64);
-                let (_d, _e, _tauq, taup) =
-                    super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+                let (_d, _e, _tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
 
                 let reference = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
                 let blocked = super::bidiag::bidiag_form_p_blocked_f64(&packed, n, &taup, nb);
