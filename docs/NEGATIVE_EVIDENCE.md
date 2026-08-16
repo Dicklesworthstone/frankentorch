@@ -22700,3 +22700,32 @@ callees, not the caller, whenever the caller's name is doing the explaining.
 - Anyone sizing `frankentorch-j8sl5` (blocked `orgqr` for the basis completion)
   should note that the same argument applies to a LARGER term here: on square
   inputs the completion is not on the critical path at all, and `form_p` is.
+
+### 35e. Out-of-sample confirmation of 35c, and its limit
+
+35c's rule was derived from q1-q5. Four further runs tested it prospectively:
+
+    q6  21.55 -> 27.89  (+29%)   LOAD-DRIFTED
+    q7  24.44 -> 29.33  (+20%)   PASS
+    q8  32.15 -> 38.19  (+19%)   PASS
+    q9  40.22 -> 40.41   (+0.5%) PASS
+
+All five drift PASSes across q1-q9 started at 24 or above; every start below 24 drifted.
+So the direction holds out of sample.
+
+THE LIMIT, stated because it stops the rule being read as a guarantee: two runs that
+started warm STILL drifted — q2 (25.19, +33%) and q5 (29.88, +103%, external
+interference). A warm start is NECESSARY but NOT SUFFICIENT. It removes the harness's
+own contribution from the delta; it does nothing about anything else on the box.
+
+WHAT IT DID NOT BUY: certification. Across q1-q9 the avg_pool1d lane read 2.50-2.70x
+FASTER every time, and not one run cleared BOTH nulls and the drift gate together — the
+gates kept failing in different combinations (q6 had both nulls clean and drifted; q7
+and q9 cleared drift and one null, missing the other at 1.026 and 1.025). So the
+vs-PyTorch standing for avg_pool1d remains at ONE certifying run (`ap1_r3`) and is still
+a candidate, not a standing.
+
+Nine runs on one lane with a consistent 2.5-2.7x reading and no admissible pair is worth
+recording as a cost: the gate is expensive, and on this host the binding constraint is
+now the A/A nulls rather than drift. Whoever wants this standing should expect to spend
+runs, and should NOT read the consistency as licence to bank it.
