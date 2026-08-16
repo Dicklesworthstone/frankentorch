@@ -25973,3 +25973,56 @@ That is an architectural change to the tape's storage, not a local fix, and it i
 honest next target for `68pwz` rather than any further fusion. **A second fusion lever
 aimed at the GroupNorm kernels would now be aimed at a phase that is 4.8 ms out of 10.3
 and already 1.32x FASTER than the incumbent.**
+
+## 52. REJECTED LEVER: CAPPING THE CHUNK COUNT IS NOT A SUBSTITUTE FOR CAPPING THE POOL
+
+Item 51 measured the rayon WIDTH curve and found 8 workers 1.663x faster than 64 on
+`max_pool3d_nopool`. `frankentorch-rayon-pool-width-qq8as` lists three candidate shapes
+for the fix — global pool cap, per-op width cap, or **a chunk-size change that
+incidentally reduces effective width** — and does not choose between them.
+
+The chunk-size shape is now measured, and it does NOT work.
+
+### 52a. The row
+
+`max_pool3d_backward_from_indices_nonoverlapping_f64` splits `par_chunks_mut(plane_len)`,
+one chunk per plane, 64 chunks here. The lever groups planes so the split yields ~8
+chunks instead. ABBA over eight passes, one ELF `8d82c07e5c237517`, arm-internal via
+`FT_H2H_NO_INCUMBENT` so there is no incumbent, no ratio and no drift gate.
+
+**Per-arm provenance:** observed loadavg 15.65-18.68 across all eight passes, the
+steadiest window this session; CPU during sampling cross-core spread min 1.537x median
+1.700x max 2.932x.
+
+    chunk-width OFF (one chunk per plane)   min 1.715 ms   median 2.384
+    chunk-width ON  (target 8 chunks)       min 1.861 ms   median 2.639
+                                            0.922x on min, 0.903x on median
+
+**The lever is 8-10% SLOWER.** Shipping it on, which is what I did before measuring it in
+situ, was a regression; the default is now 0 and the pre-lever split is restored.
+
+### 52b. Why the two shapes are not interchangeable
+
+Item 51's sweep changed `RAYON_NUM_THREADS`, which shrinks the POOL: 64 worker threads
+become 8. This lever changes only how the work is PARTITIONED and leaves 64 threads spun
+up. The benefit does not transfer, and in hindsight the reason is visible: the pool still
+has 64 workers parked and stealing, and 8 coarse chunks are less balanced than 64 fine
+ones, so the load imbalance costs more than the narrower join saves.
+
+So the bead's three candidate shapes are not stylistic alternatives. **Pool width is
+measured to work (1.663x); chunk size is measured not to (0.92x).** That is a real
+narrowing of the bead's search space and it cost one build to learn.
+
+### 52c. Kept switchable and tested, not deleted
+
+`set_parallel_target_workers` stays exported, defaulting to 0, and
+`max_pool3d_backward_chunk_width_is_bit_identical_across_worker_targets` still runs on
+every gate — 17 passed / 0 failed on worker vmi1152480, covering widths 0, 1, 4, 8, 16 and
+64 across plane counts of 64, 6 (not divisible by the target) and 4 (below it), with
+negative zero and NaN in `dout`.
+
+That test earns its place independently of the lever: it pins that the partition cannot
+change a bit, which is the property any future width work will need. And keeping the
+refutation executable is the same discipline the full-coverage max_pool3d backward already
+follows — anyone proposing chunk-coarsening again has to beat 0.922x rather than re-derive
+the intuition.

@@ -1235,6 +1235,18 @@ LANES = {
     // clock state that arm was actually measured under rather than a run-level average.
     let mut ft_mhz: Vec<f64> = Vec::with_capacity(reps * lanes.len());
     let mut pt_mhz: Vec<f64> = Vec::with_capacity(reps * lanes.len());
+    // frankentorch-rayon-pool-width-qq8as: let a paired run flip the shipped chunk-width
+    // lever. 0 restores the pre-lever one-chunk-per-plane split, which is the A arm.
+    if let Some(width) = std::env::var("FT_PARALLEL_TARGET_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let previous = ft_kernel_cpu::set_parallel_target_workers(width);
+        println!(
+            "parallel_target_workers={width} (was {previous}); 0 means one chunk per \
+             plane, the pre-qq8as split"
+        );
+    }
     let isolate_arm = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
     // frankentorch-68pwz item 48: the MIRROR of the probe above. With
     // `FT_H2H_NO_FT_ARM` the incumbent keeps its four slots in their square positions

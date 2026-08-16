@@ -2475,6 +2475,66 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
     unsafe { Vec::from_raw_parts(staged.as_mut_ptr().cast::<T>(), numel, staged.capacity()) }
 }
 
+/// frankentorch-rayon-pool-width-qq8as: how many rayon workers a plane-parallel kernel
+/// should actually engage.
+///
+/// MEASURED, not chosen: on this box our arm is monotonically faster as the width drops
+/// from 64, and the curve TURNS at 8 (NEGATIVE_EVIDENCE item 51, load-controlled):
+///
+///     width 64  1.904 ms      width 16  1.291 ms (1.475x)
+///     width 32  1.623 (1.173x) width  8  1.145 ms (1.663x)  <- optimum
+///                              width  4  1.195 ms (1.593x)
+///
+/// The mechanism is clock spread, not join count alone: cores on this machine run
+/// 2.86-3.00x apart AT ONE INSTANT, so a 64-wide join waits on whichever core is parked
+/// near 1.9 GHz while an 8-wide join fits inside the fast set.
+///
+/// This is the CHUNK-SIZE shape of the fix rather than a global pool cap — it groups
+/// planes so the split creates about this many chunks, leaving `rayon`'s pool untouched
+/// so nothing else in the process changes width underneath it.
+/// **DEFAULT 0 = REJECTED.** Capping the CHUNK COUNT does NOT reproduce the win that
+/// capping the POOL does, and shipping it on was a regression. Measured ABBA, one ELF,
+/// arm-internal, loadavg 15.65-18.68 throughout, cross-core spread 2.7-2.9x:
+///
+///     chunk-width off (one chunk per plane)   min 1.715 ms   median 2.384
+///     chunk-width on  (target 8 chunks)       min 1.861 ms   median 2.639
+///                                             0.922x min, 0.903x median -- SLOWER
+///
+/// The width sweep that motivated this changed `RAYON_NUM_THREADS`, which shrinks the
+/// POOL. This changes only how the work is partitioned while leaving 64 threads spun up,
+/// and the benefit does not transfer: the pool still has 64 workers parked and stealing,
+/// and 8 coarse chunks are simply less balanced than 64 fine ones.
+///
+/// So the bead's three candidate shapes are not interchangeable. Pool width is measured
+/// to work (1.663x); chunk size is measured NOT to (0.92x). Kept switchable, defaulting
+/// OFF, so the refutation stays executable rather than becoming folklore.
+static PARALLEL_TARGET_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read the current target width. `0` means "one chunk per plane", i.e. the pre-qq8as
+/// behaviour, which is what the A/B arm uses.
+fn parallel_target_workers() -> usize {
+    PARALLEL_TARGET_WORKERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the target width, returning the previous value. Measurement-only; an `AtomicUsize`
+/// and not a `OnceLock` so a paired lane can flip it inside ONE process, which is the
+/// design that made every other lever on this board decidable.
+pub fn set_parallel_target_workers(workers: usize) -> usize {
+    PARALLEL_TARGET_WORKERS.swap(workers, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Planes to put in one parallel chunk so the split yields about
+/// [`parallel_target_workers`] of them. Returns 1 when the target is 0 or already
+/// exceeds the plane count, which reproduces the one-chunk-per-plane split exactly.
+fn planes_per_chunk(planes: usize) -> usize {
+    let target = parallel_target_workers();
+    if target == 0 || planes <= target {
+        return 1;
+    }
+    planes.div_ceil(target)
+}
+
 /// frankentorch-yu1zm: runtime switch that puts the ZEROED allocation back, so one
 /// binary can measure the uninit first-touch lever against its own predecessor.
 ///
@@ -10017,14 +10077,22 @@ pub fn max_pool3d_backward_from_indices_nonoverlapping_f64(
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
     let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * plane_len);
-    din.par_chunks_mut(plane_len)
+    // frankentorch-rayon-pool-width-qq8as: one chunk per plane engages one worker per
+    // plane -- 64 here -- and a 64-wide join waits on whichever core is parked. Grouping
+    // planes so the split yields ~8 chunks is bit-identical (each plane's writes are
+    // independent of the grouping) and measured 1.663x faster on this lane.
+    let group = planes_per_chunk(batch * ch);
+    din.par_chunks_mut(plane_len * group)
         .enumerate()
-        .for_each(|(plane, drow)| {
-            let dbase = plane * out_plane_len;
-            for (out_index, &arg_offset) in
-                arg_offsets[dbase..dbase + out_plane_len].iter().enumerate()
-            {
-                drow[arg_offset as usize] = 0.0_f64 + dout[dbase + out_index];
+        .for_each(|(chunk_index, chunk)| {
+            for (offset, drow) in chunk.chunks_mut(plane_len).enumerate() {
+                let plane = chunk_index * group + offset;
+                let dbase = plane * out_plane_len;
+                for (out_index, &arg_offset) in
+                    arg_offsets[dbase..dbase + out_plane_len].iter().enumerate()
+                {
+                    drow[arg_offset as usize] = 0.0_f64 + dout[dbase + out_index];
+                }
             }
         });
     din
@@ -42447,6 +42515,76 @@ mod tests {
                     "yc7ud mismatch b={b} c={c} len={len} k={k} stride={st} idx={i}: \
                      accumulating={a} levered={x}"
                 );
+            }
+        }
+    }
+
+    /// frankentorch-rayon-pool-width-qq8as: grouping planes into wider parallel chunks
+    /// must not change a single bit. Each plane's writes depend only on that plane's
+    /// slice of `arg_offsets` and `dout`, so the grouping is a partition change and
+    /// nothing else -- but that is an argument, and this is the check.
+    ///
+    /// Both widths run in ONE process via `set_parallel_target_workers`, so this compares
+    /// the two partitions rather than two binaries. Shapes include a plane count that is
+    /// NOT divisible by the target, which is where an off-by-one in the plane index would
+    /// land, and one below the target, where the grouping must collapse to one-per-plane.
+    #[test]
+    fn max_pool3d_backward_chunk_width_is_bit_identical_across_worker_targets() {
+        // plane counts 64, 6 (not divisible by 8), 4 (below the target)
+        for &(batch, ch, id, ih, iw) in &[
+            (2usize, 32usize, 8usize, 8usize, 8usize),
+            (2, 3, 8, 8, 8),
+            (1, 4, 8, 8, 8),
+        ] {
+            let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+            let in_numel = batch * ch * id * ih * iw;
+            let out_numel = batch * ch * od * oh * ow;
+            let mut z = 0x9e37_79b9_7f4a_7c15u64;
+            let input: Vec<f64> = (0..in_numel)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                    v
+                })
+                .collect();
+            let (_, offsets) = super::max_pool3d_forward_with_indices_f64(
+                &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+            );
+            // Negative zero and NaN in `dout`: the write is `0.0 + dout[..]`, and that
+            // leading add is exactly what a careless refactor would drop.
+            #[allow(clippy::cast_precision_loss)]
+            let dout: Vec<f64> = (0..out_numel)
+                .map(|i| match i % 11 {
+                    3 => -0.0,
+                    7 => f64::NAN,
+                    _ => (i % 13) as f64 - 6.0,
+                })
+                .collect();
+
+            let mut reference: Option<Vec<f64>> = None;
+            for target in [0usize, 1, 4, 8, 16, 64] {
+                let previous = super::set_parallel_target_workers(target);
+                let got = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
+                    &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+                );
+                super::set_parallel_target_workers(previous);
+                match &reference {
+                    None => reference = Some(got),
+                    Some(want) => {
+                        assert_eq!(got.len(), want.len());
+                        for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "qq8as width {target} changed a bit at planes={} idx={i}",
+                                batch * ch
+                            );
+                        }
+                    }
+                }
             }
         }
     }
