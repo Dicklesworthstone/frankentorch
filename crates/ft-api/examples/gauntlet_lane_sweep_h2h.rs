@@ -1218,6 +1218,23 @@ LANES = {
 
     // frankentorch-pbkvs: see the ISOLATION PROBE note in the slot loop below.
     let isolate_arm = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
+    // frankentorch-68pwz item 48: the MIRROR of the probe above. With
+    // `FT_H2H_NO_FT_ARM` the incumbent keeps its four slots in their square positions
+    // and NO FrankenTorch work runs between them, so its uncontended per-slot times can
+    // be read from THIS harness rather than a separate script.
+    //
+    // That matters because item 48's contention figure leaned on a standalone Python
+    // probe which clones its leaf per sample — a caveat that made the number a bound
+    // rather than a measurement. Same harness, same protocol, same reduction, only our
+    // arm removed: the difference IS the contention we impose.
+    let isolate_incumbent = std::env::var("FT_H2H_NO_FT_ARM").is_ok();
+    if isolate_incumbent {
+        println!(
+            "INCUMBENT-ONLY MODE (FT_H2H_NO_FT_ARM): no FrankenTorch work runs between \
+             the incumbent's samples. Every FT column and every ratio below is a \
+             PLACEHOLDER and carries no claim. Read the incumbent's per-slot times only."
+        );
+    }
     if isolate_arm {
         println!(
             "ISOLATION MODE (FT_H2H_NO_INCUMBENT): no incumbent work runs between our \
@@ -1258,6 +1275,10 @@ LANES = {
                     incumbent_slots.push(ms);
                     pt_grads[index] = Some(grad);
                 } else {
+                    if isolate_incumbent {
+                        ft_slots.push(1.0);
+                        continue;
+                    }
                     let (ms, checksum) = run_lane();
                     ft_slots.push(ms);
                     checksums[index] = checksum;

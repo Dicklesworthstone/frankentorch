@@ -25131,3 +25131,62 @@ the clone caveat is real, and whether the floor shift is uniform across lanes is
 What is established is the DIRECTION and that it is not small. Quantifying it per lane needs
 the symmetric probe — an incumbent-only mode, the mirror of `FT_H2H_NO_INCUMBENT` — which
 does not exist yet and is now the highest-value instrument work on the board.
+
+## 49. THE SYMMETRIC PROBE CONFIRMS THE CONTENTION AND CUTS ITEM 48's MAGNITUDE BY THREE
+
+`FT_H2H_NO_FT_ARM` is the mirror of the isolation probe: the incumbent keeps its four slots
+in their square positions and no FrankenTorch work runs between them. Same harness, same
+protocol, same reduction — only our arm removed, so the difference IS what we impose.
+
+    mode             per-slot median (ms)              overall median
+    interleaved      [0.979, 1.275, 0.858, 1.255]      1.125
+    incumbent-only   [1.030, 0.994, 1.007, 0.979]      1.003
+
+### 49a. Confirmed: the alternation is ours
+
+Interleaved, the incumbent alternates hard — slots following our burst run 1.255-1.275 ms
+against 0.858-0.979 ms for slots following itself. **Incumbent-only, that alternation is
+gone**: 1.030, 0.994, 1.007, 0.979, flat to within 5%. The pattern exists only when our arm
+is in the loop, which is direct same-harness proof rather than inference from slot
+positions.
+
+### 49b. CORRECTED: the contention is ~12%, not the 37-104% item 48 reported
+
+Item 48 compared the in-harness incumbent against a STANDALONE Python probe reading
+0.624 ms and concluded the contention was 37% at best, 104% at worst. **That was wrong, and
+wrong in my favour-of-alarm direction.** The harness's own incumbent-only mode reads
+1.003 ms with no FrankenTorch present at all.
+
+So the gap between 0.624 ms and 1.003 ms is NOT contention — it is the difference between
+two measurement paths, and item 48 charged all of it to our arm. The contention we actually
+impose is:
+
+    1.125 / 1.003 = 1.121x, i.e. **+12.1%**
+
+That is a third of what I banked one turn ago. The finding survives; the number does not.
+
+WHY I GOT IT WRONG: I validated a cross-project claim by reaching for a probe I had already
+written for a different lane, rather than building the symmetric one inside the instrument
+under test. The lesson is the one the cross-project instruction stated and I half-followed —
+verify against your own harness — and "your own harness" means the same code path, not
+merely the same machine and shape.
+
+CONSERVATIVE DIRECTION: the incumbent-only run was taken at loadavg 70.56 / 44.70 while the
+interleaved comparison ran at 13-31. A busier host should make the incumbent-only arm
+SLOWER, which would shrink the measured gap. So +12.1% is a LOWER bound on the contention,
+not an upper one.
+
+### 49c. What stands and what it costs the board
+
+STANDS: our arm slows the incumbent; the A/A null is structurally blind to it because the
+square puts one after-FT and one after-PT slot in each half; and every vs-PyTorch ratio in
+this campaign is therefore shifted in our favour.
+
+REVISED: the shift is about 12%, not 37%+. So `prelu` at "at least 1.30x FASTER" is more
+nearly 1.16x once the incumbent is unhandicapped, and `max_pool3d_nopool` at "at least
+2.86x SLOWER" is nearer 3.2x rather than the ~4x item 48 implied. Both directions move, and
+neither moves as far as I said yesterday.
+
+STILL NOT WITHDRAWING ROWS on one lane's probe. The 12% is measured on max_pool3d only.
+Whether it is uniform across lanes is exactly what the two probes can now answer cheaply,
+lane by lane, and that is the work this instrument was built for.
