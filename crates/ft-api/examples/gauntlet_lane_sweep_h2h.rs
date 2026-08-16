@@ -693,6 +693,8 @@ LANES = {
     # frankentorch-yu1zm: same torch code under a third name; PT(zeroed)/PT(base)
     # must come out ~1.0 or the host moved between the two lanes.
     "max_pool1d_zeroed": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
+    # frankentorch-lu3ht: incumbent twin for the avg_pool2d uninit A/B.
+    "avg_pool2d_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # The FrankenTorch side of this second name calls the two f32 kernels
     # DIRECTLY, with no session and no tape, to price the engine and the f64
@@ -944,6 +946,24 @@ LANES = {
             Box::new(|| timed_prelu(&prx, &prw, true)),
         ),
         (
+            // frankentorch-lu3ht: the avg_pool2d forward is the ONE member of the
+            // sibling uninit set that sits on a live lane, so it is the only one
+            // that can be A/B'd against a real incumbent rather than assumed to
+            // inherit max_pool1d's 1.36x. Item 26c is explicit that it must not be
+            // assumed: the lever's worth depends on whether the allocation is
+            // served by fresh mmap zero pages or recycled dirty arena memory.
+            "avg_pool2d_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_op(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
+                    s.functional_avg_pool2d_sum(x, (2, 2), (2, 2), (0, 0), false, true)
+                        .expect("avg_pool2d")
+                });
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
+            }),
+        ),
+        (
             "conv3d",
             Box::new(|| {
                 timed_conv3d(
@@ -968,10 +988,16 @@ LANES = {
     // instrument: the first time a lane is quoted where torch is ahead, the same
     // asymmetry inflates instead. An instrument must not have a bias whose
     // direction depends on the answer.
-    const WARMUP_ITERS: usize = 4;
+    // frankentorch-uilzh: reads the SAME variable as the incumbent's loop in
+    // `harness_interleave::SAMPLE_LOOP_PY`, so the two counts cannot drift apart.
+    // Default 4, unchanged.
+    let warmup_iters: usize = std::env::var("FT_H2H_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     for (_, run_lane) in &lanes {
         let mut warm = 0.0;
-        for _ in 0..WARMUP_ITERS {
+        for _ in 0..warmup_iters {
             warm += run_lane().0;
         }
         std::hint::black_box(warm);

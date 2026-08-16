@@ -10332,7 +10332,12 @@ fn avg_pool2d_forward_2x2s2_f64(
     oh: usize,
     ow: usize,
 ) -> Vec<f64> {
-    let mut out = vec![0.0f64; batch * ch * oh * ow];
+    // frankentorch-lu3ht: UNINITIALIZED output behind the yu1zm toggle. This is the
+    // route the `avg_pool2d` h2h lane actually takes, which makes it the ONE member
+    // of the sibling set that can be A/B'd against a live incumbent — the other five
+    // sit on no lane. Coverage is total: the `oy`/`ox` loops assign every
+    // `oy * ow + ox` in the plane.
+    let numel = batch * ch * oh * ow;
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * ih * iw;
         for oy in 0..oh {
@@ -10349,16 +10354,17 @@ fn avg_pool2d_forward_2x2s2_f64(
         }
     };
     // 2x2 window => 4 input reads per output.
-    if out.len() * 4 >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(oh * ow)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    } else {
-        out.chunks_mut(oh * ow)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    }
-    out
+    build_pool_output(numel, |out| {
+        if numel * 4 >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        } else {
+            out.chunks_mut(oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        }
+    })
 }
 
 /// f32 mirror of [`avg_pool2d_forward_f64`]: one windowed-mean pass over the
@@ -10831,7 +10837,12 @@ pub fn avg_pool1d_forward_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
-    let mut out = vec![0.0f64; batch * ch * output_len];
+    // frankentorch-lu3ht: UNINITIALIZED output, as on the max_pool1d sibling
+    // (frankentorch-3ja43). Coverage is total because the output IS the loop bound:
+    // both plane loops assign every one of their `output_len` slots, so there is no
+    // tiling remainder that could leave an element unwritten. The zero pass this
+    // replaces was dead AND serial AND the page first-touch.
+    let numel = batch * ch * output_len;
     if kernel == 2 && stride == 2 {
         let pair_plane = |plane: usize, orow: &mut [f64]| {
             let ibase = plane * len;
@@ -10847,16 +10858,17 @@ pub fn avg_pool1d_forward_f64(
                 *slot = (sum + pair[1]) / 2.0;
             }
         };
-        if out.len() * 2 >= POOL_FWD_PARALLEL_MIN {
-            out.par_chunks_mut(output_len)
-                .enumerate()
-                .for_each(|(plane, orow)| pair_plane(plane, orow));
-        } else {
-            out.chunks_mut(output_len)
-                .enumerate()
-                .for_each(|(plane, orow)| pair_plane(plane, orow));
-        }
-        return out;
+        return build_pool_output(numel, |out| {
+            if numel * 2 >= POOL_FWD_PARALLEL_MIN {
+                out.par_chunks_mut(output_len)
+                    .enumerate()
+                    .for_each(|(plane, orow)| pair_plane(plane, orow));
+            } else {
+                out.chunks_mut(output_len)
+                    .enumerate()
+                    .for_each(|(plane, orow)| pair_plane(plane, orow));
+            }
+        });
     }
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * len;
@@ -10870,16 +10882,17 @@ pub fn avg_pool1d_forward_f64(
             *slot = sum / div;
         }
     };
-    if out.len() * kernel >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(output_len)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    } else {
-        out.chunks_mut(output_len)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    }
-    out
+    build_pool_output(numel, |out| {
+        if numel * kernel >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        } else {
+            out.chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        }
+    })
 }
 
 /// Backward of [`avg_pool1d_forward_f64`]: distributes each output gradient
@@ -11357,7 +11370,10 @@ pub fn max_pool2d_forward_f64(
     sh: usize,
     sw: usize,
 ) -> Vec<f64> {
-    let mut out = vec![0.0f64; batch * ch * oh * ow];
+    // frankentorch-lu3ht: UNINITIALIZED output (see the max_pool1d sibling,
+    // frankentorch-3ja43). The nested `oy`/`ox` loops cover every `oy * ow + ox`
+    // for oy < oh and ox < ow, which is exactly the plane, so coverage is total.
+    let numel = batch * ch * oh * ow;
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * ih * iw;
         for oy in 0..oh {
@@ -11378,16 +11394,17 @@ pub fn max_pool2d_forward_f64(
             }
         }
     };
-    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(oh * ow)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    } else {
-        out.chunks_mut(oh * ow)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    }
-    out
+    build_pool_output(numel, |out| {
+        if numel * kh * kw >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        } else {
+            out.chunks_mut(oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        }
+    })
 }
 
 /// Fused max-pool2d forward plus first-argmax sidecar (f64). The sidecar stores
@@ -11408,8 +11425,10 @@ pub fn max_pool2d_forward_with_indices_f64(
     sh: usize,
     sw: usize,
 ) -> (Vec<f64>, Vec<f64>) {
-    let mut out = vec![0.0f64; batch * ch * oh * ow];
-    let mut arg_offsets = vec![0.0f64; batch * ch * oh * ow];
+    // frankentorch-lu3ht: both buffers UNINITIALIZED and filled by the one fused
+    // pass (see frankentorch-3ja43). Coverage is total — the `oy`/`ox` loops assign
+    // every `oidx` in the plane, for the values AND the sidecar.
+    let numel = batch * ch * oh * ow;
     let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
         let ibase = plane * ih * iw;
         for oy in 0..oh {
@@ -11436,18 +11455,19 @@ pub fn max_pool2d_forward_with_indices_f64(
             }
         }
     };
-    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(oh * ow)
-            .zip(arg_offsets.par_chunks_mut(oh * ow))
-            .enumerate()
-            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
-    } else {
-        out.chunks_mut(oh * ow)
-            .zip(arg_offsets.chunks_mut(oh * ow))
-            .enumerate()
-            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
-    }
-    (out, arg_offsets)
+    build_pool_output_pair(numel, numel, |out, arg_offsets| {
+        if numel * kh * kw >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(oh * ow)
+                .zip(arg_offsets.par_chunks_mut(oh * ow))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        } else {
+            out.chunks_mut(oh * ow)
+                .zip(arg_offsets.chunks_mut(oh * ow))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        }
+    })
 }
 
 /// f32 mirror of [`max_pool2d_forward_with_indices_f64`]: returns `(maxes,
@@ -11468,8 +11488,10 @@ pub fn max_pool2d_forward_with_indices_f32(
     sh: usize,
     sw: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    let mut out = vec![0.0f32; batch * ch * oh * ow];
-    let mut arg_offsets = vec![0.0f32; batch * ch * oh * ow];
+    // frankentorch-lu3ht: f32 mirror of the uninit-output change on the f64
+    // sibling; same total-coverage argument (the `oy`/`ox` loops assign every
+    // `oidx` in the plane, values and sidecar alike).
+    let numel = batch * ch * oh * ow;
     let plane_fn = |plane: usize, orow: &mut [f32], arow: &mut [f32]| {
         let ibase = plane * ih * iw;
         for oy in 0..oh {
@@ -11496,18 +11518,19 @@ pub fn max_pool2d_forward_with_indices_f32(
             }
         }
     };
-    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(oh * ow)
-            .zip(arg_offsets.par_chunks_mut(oh * ow))
-            .enumerate()
-            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
-    } else {
-        out.chunks_mut(oh * ow)
-            .zip(arg_offsets.chunks_mut(oh * ow))
-            .enumerate()
-            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
-    }
-    (out, arg_offsets)
+    build_pool_output_pair(numel, numel, |out, arg_offsets| {
+        if numel * kh * kw >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(oh * ow)
+                .zip(arg_offsets.par_chunks_mut(oh * ow))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        } else {
+            out.chunks_mut(oh * ow)
+                .zip(arg_offsets.chunks_mut(oh * ow))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        }
+    })
 }
 
 /// f32 mirror of [`max_pool2d_backward_from_indices_f64`]: scatter `dout` to the
@@ -11558,7 +11581,9 @@ pub fn max_pool2d_forward_f32(
     sh: usize,
     sw: usize,
 ) -> Vec<f32> {
-    let mut out = vec![0.0f32; batch * ch * oh * ow];
+    // frankentorch-lu3ht: f32 mirror of the uninit-output change on
+    // `max_pool2d_forward_f64`; same total-coverage argument.
+    let numel = batch * ch * oh * ow;
     let plane_fn = |plane: usize, orow: &mut [f32]| {
         let ibase = plane * ih * iw;
         for oy in 0..oh {
@@ -11579,16 +11604,17 @@ pub fn max_pool2d_forward_f32(
             }
         }
     };
-    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(oh * ow)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    } else {
-        out.chunks_mut(oh * ow)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    }
-    out
+    build_pool_output(numel, |out| {
+        if numel * kh * kw >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        } else {
+            out.chunks_mut(oh * ow)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        }
+    })
 }
 
 /// Backward of [`max_pool2d_forward_f64`]: recomputes the (first) argmax of each
@@ -42394,6 +42420,167 @@ mod tests {
                 bits(&want_args),
                 "max_pool1d_forward_with_indices_f64 argmax offsets disagree at \
                  planes={planes} len={len} kernel={kernel} stride={stride}"
+            );
+        }
+    }
+
+    /// frankentorch-lu3ht: the sibling pooling forwards converted to uninitialized
+    /// output alongside max_pool1d. Same hazard, same guard — an element the fill
+    /// misses reads back as garbage, not zero — so each route is pinned bit-for-bit
+    /// against a scalar reference, including a case large enough to take the
+    /// PARALLEL branch and a stride that leaves part of the input in no window.
+    #[test]
+    fn sibling_pooling_forwards_uninit_routes_match_scalar_references_bitwise() {
+        let bits64 = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let bits32 = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let gen64 = |n: usize| -> Vec<f64> {
+            (0..n)
+                .map(|i| match i % 23 {
+                    7 => -0.0,
+                    11 => f64::NAN,
+                    _ => ((i * 37 % 61) as f64) * 0.125 - 4.0,
+                })
+                .collect()
+        };
+
+        // ---- avg_pool1d: (planes, len, kernel, stride, output_len) ----
+        for (planes, len, kernel, stride, output_len) in [
+            (3usize, 16usize, 2usize, 2usize, 8usize),
+            // stride 3 over len 16 leaves index 15 outside every window.
+            (3, 16, 3, 3, 5),
+            (3, 16, 3, 1, 14),
+            // numel * kernel == 2^21 == POOL_FWD_PARALLEL_MIN: parallel branch.
+            (2048, 1024, 2, 2, 512),
+        ] {
+            let input = gen64(planes * len);
+            let mut want = Vec::with_capacity(planes * output_len);
+            for plane in 0..planes {
+                for ox in 0..output_len {
+                    let start = ox * stride;
+                    // Mirror the kernel's accumulator exactly, including the
+                    // leading `0.0 +` that fixes the all-negative-zero window bit.
+                    let mut sum = 0.0f64;
+                    for kx in 0..kernel {
+                        sum += input[plane * len + start + kx];
+                    }
+                    want.push(sum / kernel as f64);
+                }
+            }
+            let got =
+                super::avg_pool1d_forward_f64(&input, planes, 1, len, kernel, output_len, stride);
+            assert_eq!(
+                bits64(&got),
+                bits64(&want),
+                "avg_pool1d_forward_f64 at planes={planes} len={len} \
+                 kernel={kernel} stride={stride}"
+            );
+        }
+
+        // ---- max_pool2d: (planes, ih, iw, kh, kw, oh, ow, sh, sw) ----
+        for (planes, ih, iw, kh, kw, oh, ow, sh, sw) in [
+            (
+                3usize, 8usize, 8usize, 2usize, 2usize, 4usize, 4usize, 2usize, 2usize,
+            ),
+            // sh=sw=3 over 8: the last row and column fall outside every window.
+            (3, 8, 8, 2, 2, 3, 3, 3, 3),
+            // Overlapping windows in both axes.
+            (3, 8, 8, 3, 3, 6, 6, 1, 1),
+            // numel * kh * kw == 2^21: parallel branch.
+            (128, 128, 128, 2, 2, 64, 64, 2, 2),
+        ] {
+            let input = gen64(planes * ih * iw);
+            let (mut want_v, mut want_a) = (Vec::new(), Vec::new());
+            for plane in 0..planes {
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let (base_h, base_w) = (oy * sh, ox * sw);
+                        let mut m = f64::NEG_INFINITY;
+                        let mut arg = base_h * iw + base_w;
+                        for kr in 0..kh {
+                            let loc = (base_h + kr) * iw + base_w;
+                            for kc in 0..kw {
+                                let v = input[plane * ih * iw + loc + kc];
+                                if super::pool_max_beats(v, m) {
+                                    m = v;
+                                    arg = loc + kc;
+                                }
+                            }
+                        }
+                        want_v.push(m);
+                        want_a.push(arg as f64);
+                    }
+                }
+            }
+            let shape = format!("planes={planes} ih={ih} iw={iw} kh={kh} kw={kw} sh={sh} sw={sw}");
+
+            let plain =
+                super::max_pool2d_forward_f64(&input, planes, 1, ih, iw, kh, kw, oh, ow, sh, sw);
+            assert_eq!(
+                bits64(&plain),
+                bits64(&want_v),
+                "max_pool2d_forward_f64 at {shape}"
+            );
+
+            let (v, a) = super::max_pool2d_forward_with_indices_f64(
+                &input, planes, 1, ih, iw, kh, kw, oh, ow, sh, sw,
+            );
+            assert_eq!(
+                bits64(&v),
+                bits64(&want_v),
+                "max_pool2d wi f64 values at {shape}"
+            );
+            assert_eq!(
+                bits64(&a),
+                bits64(&want_a),
+                "max_pool2d wi f64 offsets at {shape}"
+            );
+
+            // f32 mirrors: same windows, so the f64 reference maps across by cast.
+            #[allow(clippy::cast_possible_truncation)]
+            let input32: Vec<f32> = input.iter().map(|&x| x as f32).collect();
+            let (mut wv32, mut wa32) = (Vec::new(), Vec::new());
+            for plane in 0..planes {
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let (base_h, base_w) = (oy * sh, ox * sw);
+                        let mut m = f32::NEG_INFINITY;
+                        let mut arg = base_h * iw + base_w;
+                        for kr in 0..kh {
+                            let loc = (base_h + kr) * iw + base_w;
+                            for kc in 0..kw {
+                                let v = input32[plane * ih * iw + loc + kc];
+                                if super::pool_max_beats(v, m) {
+                                    m = v;
+                                    arg = loc + kc;
+                                }
+                            }
+                        }
+                        wv32.push(m);
+                        #[allow(clippy::cast_precision_loss)]
+                        wa32.push(arg as f32);
+                    }
+                }
+            }
+            let plain32 =
+                super::max_pool2d_forward_f32(&input32, planes, 1, ih, iw, kh, kw, oh, ow, sh, sw);
+            assert_eq!(
+                bits32(&plain32),
+                bits32(&wv32),
+                "max_pool2d_forward_f32 at {shape}"
+            );
+
+            let (v32, a32) = super::max_pool2d_forward_with_indices_f32(
+                &input32, planes, 1, ih, iw, kh, kw, oh, ow, sh, sw,
+            );
+            assert_eq!(
+                bits32(&v32),
+                bits32(&wv32),
+                "max_pool2d wi f32 values at {shape}"
+            );
+            assert_eq!(
+                bits32(&a32),
+                bits32(&wa32),
+                "max_pool2d wi f32 offsets at {shape}"
             );
         }
     }

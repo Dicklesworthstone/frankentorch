@@ -368,11 +368,18 @@ pub fn interpreter_args(script: &str) -> [&str; 2] {
 /// dict and the `run` function are supplied by the calling harness; this is only
 /// the ready/serve/quit protocol.
 pub const SAMPLE_LOOP_PY: &str = r#"
-import sys
+import sys, os
 # frankentorch-6atx2: warm every lane BEFORE announcing readiness, so no lane's
 # first interleaved sample carries its own warmup cost.
+# frankentorch-uilzh: the COUNT is env-tunable and DEFAULTS TO 4, unchanged, so
+# every row already banked stays comparable. It is tunable because four is not
+# enough for torch once a lane is large: at [32,64,56,56] the group_norm incumbent
+# null reads 0.867-0.900 -- its second half FASTER than its first, i.e. still
+# warming up inside the measurement. The Rust arm reads the SAME variable and must
+# stay matched: an asymmetric warmup has a bias whose direction depends on which
+# arm is faster, which is a property no instrument may have.
 for _name, (_base, _fn) in LANES.items():
-    for _ in range(4):
+    for _ in range(int(os.environ.get('FT_H2H_WARMUP', '4'))):
         run(_base, _fn)
 print('PT_READY', flush=True)
 for _line in sys.stdin:
