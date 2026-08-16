@@ -22798,3 +22798,67 @@ convincingly. The campaign already had "prove which path EXECUTES before fixing
 it"; this extends it: **prove which path executes, AND measure at the boundary
 between the paths you are choosing between, because a toggle that swaps both ends
 of a pipeline cannot attribute to either end.**
+
+## 38. THE INVARIANT NEVER ASSERTED, ON THE REGIME NEVER TESTED — HOW ga99y SURVIVED A VALIDATED ORACLE
+
+The blocked bidiagonalisation has what looks like strong coverage: an unblocked
+reference implementation kept alongside it specifically as an oracle, a
+blocked-matches-unblocked test, reconstruction tests for both, and an
+orthonormality test. `frankentorch-ga99y` walked straight through all of it.
+
+Two independent gaps, and the bug sits in their intersection. Found by reading,
+under a build-free turn.
+
+### 38a. Gap one: every fixture is full-rank and unit-scale
+
+Every bidiag test builds its input with `bidiag_test_matrix`, which fills
+uniformly from roughly `[-1, 1)`. Full rank, unit scale, every time.
+
+That is precisely the regime where ga99y does not reproduce — it needs rank <= 2
+AND scale <= ~1e-15. So `bidiag_blocked_matches_unblocked_oracle`, whose entire
+job is to hold the blocked panel to the reference, has never once been handed an
+input of the kind that breaks it.
+
+### 38b. Gap two: Q's orthonormality is asserted, P's never is
+
+`bidiag_unblocked_q_columns_are_orthonormal` checks `Q^T Q = I` explicitly. There
+is no counterpart for P. P appears in exactly three places in the test module and
+**all three are reconstruction checks** (`A ~ Q B P^T`).
+
+**A reconstruction check is structurally incapable of catching this bug.** The
+non-orthonormal rows of P correspond to ZERO singular values, so they contribute
+nothing to the product. The measurement says exactly that: reconstruction
+`1.6e-34` sitting beside `orthoV` of `1.8e-2` on the same output.
+
+So the invariant that fails is the one invariant never asserted, on the one input
+regime never tested. **Either gap alone would have caught it.**
+
+### 38c. Why "we have an oracle" was false comfort
+
+The oracle here is a second implementation of the same algorithm, which is the
+strongest form of test this codebase has. It still could not help, for a reason
+worth stating plainly: **an oracle only covers the inputs you feed it.** A
+reference implementation tests the implementation, not the input space, and a
+fixture that samples one benign regime turns the strongest available test into a
+statement about that regime alone.
+
+The asymmetry between Q and P is the other half. Q got an orthonormality assertion
+because someone thought to write it; P did not, and nothing about the code
+structure made that omission visible. Both factors are ordinary and neither was
+negligence.
+
+### 38d. The reusable checks
+
+- **For every orthogonal factor a kernel produces, assert orthonormality
+  directly.** Reconstruction is not a substitute: it is blind to error in the null
+  space, which is exactly where a rank-deficient input puts it.
+- **Ask what regime the fixture samples, and name it.** "Random matrix" is not a
+  regime; full-rank-unit-scale is. Then ask which regimes the op actually admits —
+  here, rank-deficient and badly-scaled — and whether any test visits them.
+- **When two factors come out of one routine and only one is checked, check the
+  other.** The Q/P asymmetry cost nothing to notice once the question was asked.
+
+The decisive experiment for ga99y now needs no new machinery — only a fixture: run
+the existing blocked-vs-unblocked oracle on a rank-2, 1e-20 input. Divergence
+indicts the reduction's reflectors; agreement with both non-orthonormal indicts
+`bidiag_form_p_f64`'s expansion.
