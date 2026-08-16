@@ -20259,3 +20259,35 @@ the lesson `xdw0h` taught when its 3.08x turned out to be an undecidable row.
 genuinely ~2.7-3.0x behind PyTorch on op work, both arms live in one invocation,
 both nulls passing, parity `match`. Whoever optimizes that lane now has a number
 they can be held to.
+
+### Addendum to the row above: replication attempted twice, not obtained; and the stability rule refined (`pbkvs`)
+
+Rule 4 owes that row a replication. Two attempts, neither admissible:
+
+| run | load start -> end | change | median / min | nulls |
+|---|---|---|---|---|
+| 1 | 8.63 -> 9.25 | **+7%** | 2.74x / 2.99x | **both PASS — quotable** |
+| 2 | 8.42 -> 17.24 | +105% | 2.83x / 3.10x | FAIL (FT 0.850, PT 1.065) |
+| 3 | 16.70 -> 36.89 | +121% | 3.30x / 3.27x | FAIL (FT 0.933, PT 0.947) |
+
+**The direction is consistent across all three** — FrankenTorch 2.7-3.3x slower
+every time — but only run 1 is evidence. Runs 2 and 3 are not averaged in: a run
+whose own A/A null fails is *no* evidence (item 14d).
+
+**The stability rule stated above is right but incomplete, and run 3 is what showed
+it.** The rule said: sample `/proc/loadavg` for ~30s and start when flat. That was
+done — eight samples sitting in a narrow 9.5-10.5 band — and the run still opened
+at 16.70 and closed at 36.89. Two reasons, both actionable:
+
+1. **The 1-minute loadavg lags.** It is exponentially weighted, so it reports the
+   minute that just passed. Flat means *the last minute* was flat, not that the
+   next four will be — and a 32-round sweep takes about four.
+2. **The driver is peer builds, not load.** What ramps this host is an rch build
+   starting mid-run; loadavg is only a lagging proxy for that. `rch queue` is the
+   direct observation.
+
+**Refined pre-flight, still to be validated:** check `rch queue` for the active
+build count *and their ages*, and prefer a window whose active builds are already
+old — past their compile peak — over one where loadavg merely looks flat. A build
+that starts at minute one of a four-minute sweep ruins it, and no amount of
+loadavg-watching predicts that.
