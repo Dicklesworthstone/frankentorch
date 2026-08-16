@@ -1247,6 +1247,14 @@ LANES = {
              plane, the pre-qq8as split"
         );
     }
+    // frankentorch-rayon-pool-width-qq8as: flip the per-op NARROW POOL for a paired run.
+    // Its width is fixed at first use via FT_NARROW_POOL_WIDTH (default 8, where item 51's
+    // curve turns); this only selects whether kernels use it.
+    if let Ok(raw) = std::env::var("FT_NARROW_POOL") {
+        let on = raw == "1";
+        let previous = ft_kernel_cpu::set_narrow_pool_enabled(on);
+        println!("narrow_pool={on} (was {previous})");
+    }
     let isolate_arm = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
     // frankentorch-68pwz item 48: the MIRROR of the probe above. With
     // `FT_H2H_NO_FT_ARM` the incumbent keeps its four slots in their square positions

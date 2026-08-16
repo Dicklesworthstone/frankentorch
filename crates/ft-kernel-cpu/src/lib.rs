@@ -9840,24 +9840,36 @@ pub fn max_pool3d_forward_with_indices_and_sum_f64(
     let mut out = vec![0.0_f64; len];
     let mut arg_offsets = vec![0.0_f64; len];
     let sum = if len >= FUSED_POOL_SUM_PARALLEL_THRESHOLD {
-        max_pool3d_sum_pairwise_range_with_indices_f64_par(
-            input,
-            Some(&mut out),
-            &mut arg_offsets,
-            0,
-            id,
-            ih,
-            iw,
-            kd,
-            kh,
-            kw,
-            od,
-            oh,
-            ow,
-            sd,
-            sh,
-            sw,
-        )
+        // frankentorch-rayon-pool-width-qq8as: this is the forward the h2h lane actually
+        // executes -- ft-api selects it for the f64 grad path -- and it is 0.597 ms of the
+        // lane's 1.474 ms of kernel time, so it is worth the same narrow-pool treatment as
+        // the backward.
+        //
+        // Wrapping the TOP-LEVEL call is enough: `install` sets the pool for everything
+        // nested inside, and the work below is a `rayon::join` recursion rather than a
+        // `par_chunks_mut` split. The result is independent of worker count because the
+        // recursion splits at a fixed `mid` and each half writes its own slice, so the
+        // pairwise sum tree is the same shape whoever executes it.
+        with_narrow_pool(|| {
+            max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                input,
+                Some(&mut out),
+                &mut arg_offsets,
+                0,
+                id,
+                ih,
+                iw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+            )
+        })
     } else {
         max_pool3d_sum_pairwise_range_with_indices_f64(
             input,
@@ -42600,6 +42612,55 @@ mod tests {
                      accumulating={a} levered={x}"
                 );
             }
+        }
+    }
+
+    /// frankentorch-rayon-pool-width-qq8as: the FORWARD the lane executes must also be
+    /// bit-identical on the narrow pool.
+    ///
+    /// This one matters more than the backward's version, because the forward is a
+    /// `rayon::join` RECURSION carrying a pairwise SUM, not an independent-chunk split. A
+    /// summation whose tree shape depended on worker count would be non-deterministic in
+    /// the last bits, so this checks the value AND the argmax sidecar AND the fused sum.
+    #[test]
+    fn max_pool3d_fused_forward_narrow_pool_is_bit_identical() {
+        // Large enough to cross FUSED_POOL_SUM_PARALLEL_THRESHOLD (1 << 13) so the
+        // parallel recursion is the arm under test, not the serial fallback.
+        let (batch, ch, id, ih, iw) = (2usize, 32usize, 16usize, 16usize, 16usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let mut z = 0x5851_f42d_4c95_7f2du64;
+        let input: Vec<f64> = (0..batch * ch * id * ih * iw)
+            .map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                v
+            })
+            .collect();
+
+        let previous = super::set_narrow_pool_enabled(false);
+        let (out_a, arg_a, sum_a) = super::max_pool3d_forward_with_indices_and_sum_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        super::set_narrow_pool_enabled(true);
+        let (out_b, arg_b, sum_b) = super::max_pool3d_forward_with_indices_and_sum_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        super::set_narrow_pool_enabled(previous);
+
+        assert_eq!(
+            sum_a.to_bits(),
+            sum_b.to_bits(),
+            "narrow pool moved the fused sum: {sum_a} vs {sum_b}"
+        );
+        assert_eq!(out_a.len(), out_b.len());
+        for (i, (a, b)) in out_a.iter().zip(out_b.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "narrow pool moved a value at {i}");
+        }
+        for (i, (a, b)) in arg_a.iter().zip(arg_b.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "narrow pool moved an argmax at {i}");
         }
     }
 
