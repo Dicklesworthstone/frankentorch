@@ -20838,3 +20838,66 @@ situ once already. What it does establish is that **the pool's advantage on this
 specific path is not large enough to survive a change of context**, so a future
 lever that removes the pool from this backward should be measured at the lane and
 cannot be waved away with "the pool is obviously faster".
+
+## 2026-08-16 — TWO REPLICATED STANDINGS (`28lhu`): a loss and a win, each certified twice
+
+The campaign's first **replicated** vs-PyTorch standings. Each lane cleared the full
+gate in **two independent invocations** — both A/A nulls PASS, parity `match`, min
+estimator — which is what rule 4 requires to promote a candidate to a standing.
+
+**Standing 1 — a loss, `max_pool3d_nopool`:**
+
+| run | min-estimator ratio | PT null | FT null |
+|---|---|---|---|
+| A (`y4nj9`) | 0.335 `[0.313,0.350]` = **2.99x SLOWER** | 0.995 PASS | 0.988 PASS |
+| B (here) | 0.315 `[0.301,0.330]` = **3.17x SLOWER** | 1.014 PASS | 0.982 PASS |
+
+> **Conservative claim: FrankenTorch is at least 2.86x SLOWER on this lane** — taking
+> 0.350, the most favourable ratio bound either run produced. Not the 3.17x headline.
+
+**Standing 2 — a win, `prelu_noshortcut`:**
+
+| run | min-estimator ratio | PT null | FT null |
+|---|---|---|---|
+| A (`vhgue`) | 1.533 `[1.458,1.598]` = **1.53x FASTER** | 1.009 PASS | 0.994 PASS |
+| B (here) | 1.392 `[1.321,1.435]` = **1.39x FASTER** | 0.982 PASS | 1.016 PASS |
+
+> **Conservative claim: FrankenTorch is at least 1.32x FASTER on this lane** — taking
+> 1.321, the lowest confidence bound either run produced. Not the 1.53x headline.
+
+```
+run B: executing_elf_sha256 = 1fa33e62b39e125e69f2d2e29a9e533bdd505e3d2f6a7dd3661561e5eee7c5a8
+       BUILD WORKER         = vmi1152480  (rch, RCH_WORKER-pinned, -j2 --release --features fair-alloc)
+       harness              = crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs
+       measurement_host     = thinkstation1, 5975WX 32-Core, avx2, powersave, rayon 64, torch threads 8
+       allocator            = mimalloc      sampling = balanced-square ABBAABBA, 32 rounds
+       incumbent            = PyTorch 2.12.1+cpu       load = 14.21 -> 14.90 (+5%)
+```
+
+**First row with a complete provenance chain.** This binary was built by me on a
+*named* worker via the `RCH_WORKER` pin and then run by me, so the row names the
+worker that **built** it as well as the host that **ran** it. Every earlier row had
+to be banked with an unknown builder, because a peer's rebuild had swapped the
+shared `target/` binary underneath it.
+
+**Replicated across different FrankenTorch builds** — stated because it cuts both
+ways. Runs A and B used different ELFs; FrankenTorch's own code changed in between.
+The **incumbent** was 2.12.1+cpu in both and the harness and host were identical. So
+this replicates the **lane's behaviour**, not one binary. Arguably stronger, since
+the result survived code churn — but it is not the same claim as "the same binary
+twice" and must not be quoted as such.
+
+**A counterexample to the load-delta criterion, recorded because it bounds it.** Run
+B's load delta was **+5%** — second-smallest of ten runs — yet in that same run
+`avg_pool2d`'s PT null **failed at 1.142**. So a small delta is **necessary but not
+sufficient**: something else, most plausibly incumbent-side instability, can still
+break a null on a quiet host. The ≥+50% discard rule still earns its keep by
+correctly rejecting every large-delta run, but it is not a guarantee of
+certification and should not be sold as one.
+
+Also certified, **one invocation only — a candidate, not a standing**: `avg_pool2d`
+at min 1.631 `[1.490,1.782]` = **FT 1.63x FASTER**, both nulls PASS, parity `match`,
+load 13.38 → 18.75. Its replication attempt is the failed-null run above. Worth
+noting that this is the lane whose `xdw0h` premise was refuted as "never quotable and
+since flipped" — it is now certified *faster* once, which confirms that refutation
+with a gated number.
