@@ -23878,3 +23878,57 @@ failure counts track drift and do not track allocator — 13-15 of 21 at ~12-34 
 The blocker is a quiet host, and this pane cannot produce one — every window
 offered has been 40-90 load with peers building. That is the finding to act on, and
 it is a scheduling problem rather than a code one.
+
+## 52. group_norm_f32 IS 5.27-5.57x SLOWER ACROSS FOUR RUNS, TWO ALLOCATORS, AND A 4x LOAD RANGE — NONE QUOTABLE
+
+Seventh local ABBA attempt on the worst measured vs-incumbent gap. It replicates
+tightly and it still does not certify.
+
+### 52a. The four rows
+
+    run           FT ms    PT ms   ratio   load_1m start -> end   allocator
+    h2h_run2      34.167   6.412   5.33x   17.78 -> 17.72         glibc
+    run_mimalloc  39.750   7.130   5.57x   48.97 -> 70.75         mimalloc
+    run_glibc     39.047   7.407   5.27x   66.92 -> 40.74         glibc
+    run_quiet     35.211   6.407   5.50x   23.68 -> 32.92         mimalloc
+
+This run's detail, ELF `4831383ca3aa28971ce62f7a07141da98e143ff973eccca5a7dc72223430153c`,
+allocator mimalloc, incumbent PyTorch 2.12.1+cpu, ABBAABBA 16 rounds:
+
+    group_norm_f32  FT 35.211 ms  PT 6.407 ms  5.50x SLOWER  ratio 0.182 [0.176,0.191]
+                    PT null OFFSET [0.841,1.005]   FT null PASS [0.966,1.061]  parity match
+                    MIN 5.76x SLOWER  ratio 0.174 [0.136,0.188]
+                    PT null 0.915 FAIL   FT null 1.037 FAIL   not quotable
+    load_series n=18  worst_drift 1.470x  endpoint_gate DRIFTED  series_gate DRIFTED
+
+### 52b. The replication is real; the certification is not
+
+**5.27x to 5.50x on the median across four runs, two allocators, and a 4x span of
+host load.** The spread is 4.4% — far tighter than the conditions varied. As a
+physical claim about the op, this is about as replicated as anything in the
+campaign.
+
+**Not one of the four is quotable.** Every run drifted, and this one drifted
+despite being launched into the calmest window this pane has seen: the 1m load was
+flat at 13.06-13.16 across three samples 10 seconds apart, and by the time the
+sweep finished it had climbed to 32.92. **Sampling the load before a run does not
+predict the load during it**, which is the practical lesson — the pre-flight check
+I have been using as a scheduling signal is worth less than it looks.
+
+### 52c. What is now established about the blocker
+
+Seven attempts, zero certified rows. Across them the failure has never once been a
+property of the lane or the build:
+
+- both allocators fail (item 51: mimalloc 21/21, glibc 19/21);
+- null failure counts track drift, not allocator (item 49);
+- the one run that held still (17.78 -> 17.72) still certified nothing, and its
+  steadiness is itself suspect now that the series gate exists — its endpoints
+  agreed, but no mid-run samples were taken to confirm it;
+- this run had a passing FT-side null on the median estimator and was still voided
+  by the host.
+
+**The 5.3-5.5x is the campaign's best-replicated unbanked number.** Turning it into
+a standing needs a host that holds within 1.25x for the length of a sweep, and this
+pane has not been offered one in seven tries. Recording it here so the replication
+is not lost the next time someone asks what the worst gap is.
