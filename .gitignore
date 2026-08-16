@@ -137,6 +137,7 @@ storage.sqlite3-wal.corrupt-*
 # scratch, but they are local-only and must not be committed.
 .beads/beads.db-fsqlite-ns-*
 .beads/*.db-wal-cert*
+.beads/.br_recovery/
 
 # Beads recovery scratch databases and probe directories
 artifacts/beads_recovery/
