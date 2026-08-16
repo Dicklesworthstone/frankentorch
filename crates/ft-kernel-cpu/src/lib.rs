@@ -30493,7 +30493,31 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
     // under frankentorch-zs8a — previously the rank-deficient path
     // left those columns as zeros and reduced-mode SVD failed
     // U^T U = I on rank-deficient matrices.
-    complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true, true);
+    // frankentorch-j8sl5: above m = 128 the completion goes through a blocked
+    // Householder QR instead of the Gram-Schmidt sweep. Measured same-process,
+    // same-worker (hz2), min of 3, both arms over one seeded input:
+    //
+    //     m=128 k=16 fill=112   gram 4146290 ns   blocked  691203 ns    6.00x
+    //     m=192 k=24 fill=168   gram 13518018 ns  blocked 1985372 ns    6.81x
+    //     m=256 k=32 fill=224   gram 25461351 ns  blocked 1756317 ns   14.50x
+    //
+    // The threshold is 128 because that is the smallest size measured to pay, and
+    // it matches the QR op's own blocked gate (m >= 128). Below it the Gram-Schmidt
+    // form is kept — not as a fallback but deliberately, so every smaller shape
+    // retains its CURRENT bit-exact output and the existing tests keep their
+    // meaning.
+    //
+    // NOT BIT-EXACT above the threshold, and it cannot be: the completion columns
+    // are a different orthonormal basis of the same complement, and any such basis
+    // is a correct answer. Admissible under the ratified eig/SVD tolerance policy
+    // (frankentorch-qgce4) — vector outputs judged by reconstruction and
+    // orthogonality at 1e-9, not bit-exactness. Measured |U^T U - I| stays at
+    // 8.9e-16 to 1.3e-15 across the three shapes above.
+    if m >= 128 {
+        complete_orthonormal_basis_blocked_f64(&mut u, m, u_cols, tol);
+    } else {
+        complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true, true);
+    }
 
     // Build Vh: V^T with reordering
     let vh_rows = if full_matrices { n } else { k };
