@@ -24383,3 +24383,57 @@ which were not measured in these runs. The lane filter should now be used to
 certify the rest a family at a time, and `frankentorch-uilzh` — the incumbent's
 one-sided null on this lane — did NOT need fixing after all: with enough rounds in
 a short enough window, torch's null lands at 0.988-0.998.
+
+## 59. SYMMETRIC WARMUP, FULL BOARD: STILL ZERO — THE FILTER IS LOAD-BEARING, NOT AN OPTIMISATION
+
+Direct test of whether the 21-lane board certifies once both arms warm 32. It does
+not, and the comparison isolates why.
+
+Same binary for every row below — ELF `171f84f8617e1b43...`, mimalloc, symmetric
+warmup 32 on both arms (the incumbent's loop reads the same `FT_H2H_WARMUP`, made
+default-32 by `d4ba1481`), 16 rounds, incumbent PyTorch 2.12.1+cpu.
+
+    configuration              worst_drift   series_gate   lanes passing both nulls   CERTIFIED
+    21 lanes                   1.802x        DRIFTED       2                          0
+    21 lanes                   1.499x        DRIFTED       1                          0
+     6 lanes (group_norm_f32)  1.151x        PASS          1                          1
+     6 lanes (group_norm_f32)  1.022x        PASS          1                          1
+     6 lanes (group_norm_f32)  1.055x        PASS          1                          1
+
+**Zero of 21 certify on the full board; 3 of 3 certify filtered.** Nothing differs
+but the lane count.
+
+### 59a. The nulls are not the problem any more
+
+One to two lanes pass BOTH A/A nulls on the full board. The arms are fine. Every
+row is refused by the drift gate, because 21 lanes at 16 rounds cannot finish
+inside a window this host holds still for — 1.802x and 1.499x against a 1.25x
+threshold.
+
+### 59b. Warmup symmetry was not the missing piece
+
+Both arms have warmed 32 for these runs, and the full board still certifies
+nothing. Warmup was a real defect (item 54: 11 of 21 FrankenTorch nulls below 0.98,
+one-sided) and fixing it was necessary — it is why 1-2 lanes now pass both nulls
+where none did. **It was not sufficient**, and the remaining gap is not a property
+of the arms at all.
+
+### 59c. What this settles about the instrument
+
+`FT_H2H_LANES` is not a convenience. On this host it is the only setting under
+which the harness can certify anything, because it is the only knob that reduces
+wall clock without reducing statistical power. Rounds trade one for the other;
+lanes do not.
+
+The practical protocol, and it should be the default way rows are taken here:
+**certify one family at a time.** Sweeping 21 lanes produces an unquotable run
+every time and has done so in every attempt on record.
+
+### 59d. Correction carried forward
+
+Items 54 and 55 state the incumbent still warms 4. That was true when written; a
+peer landed `d4ba1481` afterwards, matching the incumbent's default to 32 and
+making the two arms symmetric. The certified rows in item 58 were therefore taken
+under SYMMETRIC warmup, not the asymmetric configuration item 55 describes — the
+ELF is identical (`171f84f8617e1b43...`), so no re-measurement is needed, but the
+provenance note in item 58 should be read with this in mind.
