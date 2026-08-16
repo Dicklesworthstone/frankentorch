@@ -24739,3 +24739,46 @@ sweeping 21 lanes "has produced an unquotable run in every attempt on record". T
 second half is now false — q2 is quotable. The first half stands in weaker form:
 the filter makes certification reliable on a contended host, and is unnecessary on
 a quiet one. **It is a contention mitigation, not a requirement.**
+
+### 46c. THE DEGRADATION IS NOT PROGRESSIVE — it is already there at 8 rounds
+
+Item 43c tried a rounds sweep and could not read it, because every run drifted. With the
+lane filter the drift gates now pass, so the experiment finally works. Observed loadavg
+recorded per the standing rule.
+
+    REPS  loadavg  worst_drift    gates     FT null
+      8   15.92    1.000x         PASS      0.891 FAIL
+     32   27-37    1.000-1.135x   PASS      0.847, 0.855, 0.884, 0.955, 0.955, 0.965
+     64   15.66    1.275x         DRIFTED   0.910 (discarded on drift)
+
+**At 8 rounds the null is already 0.891**, squarely inside the range the 32-round runs
+produce. Four measured rounds per half is enough to show the full effect.
+
+THAT KILLS THE ACCUMULATION HYPOTHESES. Allocator growth, tape length and thermal
+soak all predict the gap widening with round count, and it does not. Whatever makes our
+second-half samples slower is present almost immediately and does not deepen.
+
+### 46d. The surviving candidate is the SAMPLING ORDER, not time
+
+The A/A null compares an arm's first-half samples against its own second-half. In a
+balanced-square ABBAABBA schedule those two halves do NOT sit in the same positions
+relative to the other arm — that is the point of the square, and it is what cancels a
+stable offset in the paired ratio. But it means the null is not a pure time comparison:
+if a FrankenTorch sample that immediately follows a torch sample is slower than one that
+follows another FrankenTorch sample — cache displaced by an 8-thread co-process between
+our 64-thread bursts — the halves differ by CONSTRUCTION, and the null reads below 1.0
+with no drift and no accumulation.
+
+That fits every observation on this lane: present at 8 rounds, not deepening at 32, larger
+on our arm than the incumbent's (64 threads have more cache state to lose), and immune to
+warmup because it recurs every round.
+
+IT IS A HYPOTHESIS. It predicts something specific and cheap to falsify: **run our arm with
+no incumbent co-process at all.** If the one-sided null survives isolation it is ours; if
+it vanishes, the null on interleaved lanes is measuring the interleaving, and every A/A
+null this campaign has read on a contended lane needs re-interpreting — including the ones
+that PASSED.
+
+That last clause is why this matters beyond max_pool3d. The isolation probe needs a
+harness flag to skip the incumbent, which is a build; it is the highest-value build
+available on this lane and it has now been named three times without being run.
