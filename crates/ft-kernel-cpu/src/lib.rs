@@ -40876,6 +40876,159 @@ mod tests {
     /// result is discarded and `pool_max_beats` produces the answer, so the
     /// last-NaN-wins index rule is preserved exactly. The test asserts both paths
     /// agree bit for bit on NaN-free, NaN-bearing and all-NaN blocks.
+    /// Can the NaN fast path be lifted ABOVE plane granularity, at the kernel's
+    /// real structure? (`frankentorch-87sz8`)
+    ///
+    /// Item 22 measured the fast path on ONE 1M-element scan and warned it loses
+    /// at the 8-element window `max_pool3d` actually uses. This runs the kernel's
+    /// real shape — 131_072 independent 8-element windows — three ways:
+    ///
+    ///   per-window exact   what ships today: `pool_max_beats` inside every window
+    ///   per-window fast    the fast path applied at window granularity (expected LOSS)
+    ///   hoisted whole-input  ONE NaN question for the entire tensor, then every
+    ///                        window scanned with the cheap bare `>`
+    ///
+    /// The third is the shippable shape if it pays: a single vectorisable pass
+    /// (`acc |= v != v` is a boolean OR, associative, so it may unroll and
+    /// vectorise) followed by 131_072 windows that each cost 8 bare compares
+    /// instead of 8 fused ones.
+    #[test]
+    fn max_pool3d_nan_check_hoisted_above_the_window_is_exact_and_reports_its_speedup() {
+        let windows = 1 << 17;
+        let n = windows * 8;
+        let mut z = 0xc0de_d00d_u64;
+        let data: Vec<f64> = (0..n)
+            .map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                v
+            })
+            .collect();
+
+        let per_window_exact = |values: &[f64]| -> u64 {
+            let mut acc = 0u64;
+            for w in values.chunks_exact(8) {
+                let mut m = f64::NEG_INFINITY;
+                let mut arg = 0usize;
+                for (i, &v) in w.iter().enumerate() {
+                    if super::pool_max_beats(v, m) {
+                        m = v;
+                        arg = i;
+                    }
+                }
+                acc = acc.wrapping_add(m.to_bits()).wrapping_add(arg as u64);
+            }
+            acc
+        };
+        let per_window_fast = |values: &[f64]| -> u64 {
+            let mut acc = 0u64;
+            for w in values.chunks_exact(8) {
+                let mut any_nan = false;
+                for &v in w {
+                    any_nan |= v != v;
+                }
+                let mut m = f64::NEG_INFINITY;
+                let mut arg = 0usize;
+                if any_nan {
+                    for (i, &v) in w.iter().enumerate() {
+                        if super::pool_max_beats(v, m) {
+                            m = v;
+                            arg = i;
+                        }
+                    }
+                } else {
+                    for (i, &v) in w.iter().enumerate() {
+                        if v > m {
+                            m = v;
+                            arg = i;
+                        }
+                    }
+                }
+                acc = acc.wrapping_add(m.to_bits()).wrapping_add(arg as u64);
+            }
+            acc
+        };
+        let hoisted = |values: &[f64]| -> u64 {
+            // ONE question for the whole tensor.
+            let mut any_nan = false;
+            for &v in values {
+                any_nan |= v != v;
+            }
+            if any_nan {
+                return per_window_exact(values);
+            }
+            let mut acc = 0u64;
+            for w in values.chunks_exact(8) {
+                let mut m = f64::NEG_INFINITY;
+                let mut arg = 0usize;
+                for (i, &v) in w.iter().enumerate() {
+                    if v > m {
+                        m = v;
+                        arg = i;
+                    }
+                }
+                acc = acc.wrapping_add(m.to_bits()).wrapping_add(arg as u64);
+            }
+            acc
+        };
+
+        // Exactness across the regimes that distinguish the rules.
+        assert_eq!(hoisted(&data), per_window_exact(&data), "NaN-free");
+        assert_eq!(per_window_fast(&data), per_window_exact(&data), "NaN-free");
+        let mut nanned = data.clone();
+        nanned[3] = f64::NAN;
+        nanned[n - 2] = f64::NAN;
+        nanned[n / 2] = f64::NAN;
+        nanned[n / 2 + 1] = f64::NAN;
+        assert_eq!(
+            hoisted(&nanned),
+            per_window_exact(&nanned),
+            "NaN present — hoisted must fall back and reproduce last-NaN-wins exactly"
+        );
+        assert_eq!(
+            per_window_fast(&nanned),
+            per_window_exact(&nanned),
+            "NaN present — per-window fast must match too"
+        );
+
+        let reps = 11;
+        let (mut ex, mut pw, mut ho) = (
+            Vec::with_capacity(reps),
+            Vec::with_capacity(reps),
+            Vec::with_capacity(reps),
+        );
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let a = per_window_exact(&data);
+            ex.push(t.elapsed().as_nanos());
+            std::hint::black_box(a);
+
+            let t = std::time::Instant::now();
+            let b = per_window_fast(&data);
+            pw.push(t.elapsed().as_nanos());
+            std::hint::black_box(b);
+
+            let t = std::time::Instant::now();
+            let c = hoisted(&data);
+            ho.push(t.elapsed().as_nanos());
+            std::hint::black_box(c);
+        }
+        ex.sort_unstable();
+        pw.sort_unstable();
+        ho.sort_unstable();
+        #[allow(clippy::cast_precision_loss)]
+        let (pw_speedup, ho_speedup) = (ex[0] as f64 / pw[0] as f64, ex[0] as f64 / ho[0] as f64);
+        println!(
+            "87sz8 NaN check granularity over {windows} windows of 8 (NaN-free): \
+             per-window exact {} ns, per-window fast {} ns ({pw_speedup:.3}x), \
+             hoisted whole-input {} ns ({ho_speedup:.3}x) (min of {reps}, interleaved)",
+            ex[0], pw[0], ho[0]
+        );
+    }
+
     #[test]
     fn max_pool3d_nan_fast_path_is_exact_and_reports_its_speedup() {
         let n = 1 << 20;

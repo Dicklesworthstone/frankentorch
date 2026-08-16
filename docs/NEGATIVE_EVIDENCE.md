@@ -21023,3 +21023,42 @@ pooled lane:** its load *dropped* 21.04 → 15.69 (**−25%**) and it certified 
 Every previous failure was an upward ramp. So it is the **magnitude** of change that
 breaks the null, not its direction — **a decaying host is as bad as a filling one.**
 That sharpens the criterion without changing it.
+
+**23. ITEM 22'S CAVEAT WAS WRONG, AND MEASURING THE REAL SHAPE IS WHAT SHOWED IT
+(`frankentorch-87sz8`, 2026-08-16).** Item 22 measured the NaN fast path on one
+1M-element scan, got 1.302x, and reasoned that it must LOSE at the 8-element
+window `max_pool3d` actually uses: "8 NaN checks plus 8 compares against 8 fused
+checks". That reasoning was plausible, was written down as a shipping-blocker, and
+is false.
+
+Measured at the kernel's real structure — 131_072 independent 8-element windows,
+rch worker `vmi1227854`, min of 11, all three arms interleaved rep by rep on the
+same data, NaN-free (the common case), outputs asserted identical:
+
+| variant | time | speedup |
+|---|---|---|
+| per-window exact (`pool_max_beats`, ships today) | 481_361 ns | — |
+| **per-window fast** (NaN question per window) | **325_658 ns** | **1.478x** |
+| hoisted whole-input (one NaN question for the tensor) | 380_770 ns | 1.264x |
+
+**The fast path wins at BOTH granularities, and the window is the BEST of them.**
+Hoisting is worse than not hoisting, which is the opposite of what item 22
+predicted and of what the coarser-is-better intuition suggests.
+
+Why, in hindsight: the per-window NaN check runs over eight values already in
+registers, with no cross-iteration dependency, so it unrolls into a handful of
+compares and ORs. The fused `v > m || v.is_nan()` keeps a data dependency on the
+running max through a branch on every element. Hoisting to the whole tensor buys a
+cheaper inner loop but pays an ENTIRE EXTRA PASS over 1 MiB of memory — bandwidth
+the per-window form never spends because it reuses data it has already loaded.
+
+**The transferable rule: a cost model built from instruction counts predicted the
+wrong sign here.** Counting "8 checks versus 8 fused checks" ignored that the two
+loops differ in dependency structure and in how much memory they touch, and both
+of those dominated. Item 22 was careful to label its number as measured at one
+granularity and its caveat as reasoning — that labelling is the only reason this
+correction is cheap. **Measure the shape you intend to ship, not a proxy for it.**
+
+Consequence: the shippable form is a per-window NaN pre-check inside the existing
+window loop — a local change — not the plane- or tensor-level dispatch item 22
+called "the only shape worth wiring".
