@@ -23771,3 +23771,55 @@ CONCLUSION UNCHANGED WHERE IT MATTERS: no run of this lane has yet cleared both 
 the drift gate together, so it remains ungateable and no lever can be certified on it.
 The discriminator is still isolation — run our arm alone at this shape — and that needs a
 binary this session cannot build.
+
+## 50. THE f64 GRADIENT ROUND TRIP IS 0.41% OF THE GROUP_NORM ENGINE TERM — HYPOTHESIS REFUTED
+
+The named suspect for `group_norm_f32`'s ~30 ms engine overhead is dead, and it
+cost one test run to kill.
+
+### 50a. The measurement
+
+    68pwz f64 gradient round trip at numel=401408:
+      down 54463 ns, up 68099 ns, total 0.123 ms = 0.41% of the ~30 ms engine term
+
+Local build, wrapper bypass exported, no `[RCH]` line, min of 5 per direction at
+the lane's exact size (8*64*28*28 = 401,408).
+
+### 50b. What it refutes
+
+`gauntlet_lane_sweep_h2h`'s own doc names the mechanism:
+`apply_function_f32_output_with_create_graph_borrowed_inputs` takes `&[&[f64]]` and
+returns `Vec<Option<Vec<f64>>>`, so the tape's gradient space is f64 even for an
+f32 op and every f32 backward downcasts its incoming gradient and upcasts its
+results — "two full-size conversions plus their allocations, here over 401,408
+elements."
+
+That description is ACCURATE. The conversions happen. They are also **0.41% of the
+term they were invoked to explain.** Item 46 put ~30 ms — 87.4% of the lane —
+outside the kernels; two full-size conversions account for 0.123 ms of it.
+
+### 50c. Why this is the test working, not the test failing
+
+It was written to be allowed to fail, and said so in its own comment: *"If two
+conversions at the lane's real size cost well under a millisecond, this hypothesis
+cannot account for ~30 ms and the rewrite would be aimed at the wrong term."* The
+alternative was an engine change to make the tape's gradient space f32 — a
+multi-session rewrite of a path every custom op consumes, aimed at 0.41%.
+
+This ledger now records the same shape four times: a D&C rewrite aimed at 10.5%
+(item 36), four group_norm levers aimed at the 12.6% that was already winning
+(item 46), a GEMM/assemble pair worth under 4% (item 36), and now an f32 tape
+rewrite worth 0.41%. **The cost of pricing a suspect is always a single test; the
+cost of not pricing it is a session or more.**
+
+### 50d. Where the ~30 ms actually is — still open
+
+Ruled out for `group_norm_f32`: the kernels (1.54-1.83x FASTER than torch, item
+46), scheduling (the serial-forward sentinel is under half the lane, item 46), and
+now the f64 gradient round trip (0.41%).
+
+What remains unmeasured inside that ~30 ms: session/tape construction, the
+`FunctionCtx::saved_tensors` clones, allocation of the intermediate buffers, and
+the backward closure's own dispatch. The next step is a phase split of the ENGINE
+path with the same `*_ns_take` counter pattern used on the SVD prologue — and on
+this evidence it should be a split, not a lever.
