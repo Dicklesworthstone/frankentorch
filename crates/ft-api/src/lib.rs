@@ -84,6 +84,45 @@ const PARAM_UPDATE_FLOAT_REASON: &str =
     "parameter update only supported for float32/float64 tensors";
 const NAN_TO_NUM_FLOAT_REASON: &str = "nan_to_num only supported for float32/float64 tensors";
 
+/// Element count at or above which widening an f32 gradient to the tape's f64 storage
+/// is worth a rayon fork/join — `frankentorch-68pwz`.
+///
+/// MEASURED, not chosen (`examples/gradient_widen_probe.rs`, min-of-9, 64 threads):
+///
+///     numel        serial ms   parallel ms   serial/parallel
+///        16 384       0.0030        0.2993             0.01x
+///       262 144       0.7365        2.1140             0.35x
+///     1 048 576       3.8092        2.9133             1.31x   <- first win
+///     4 194 304      15.5076        3.9979             3.88x
+///     6 422 528      24.9170        4.5660             5.46x
+///
+/// The crossover is FAR above the 8192 that `ft-kernel-cpu`'s older gates use: a 64-way
+/// fork/join costs 0.1-0.9 ms here, so a small widen loses by 100x. The gate is placed at
+/// the first size measured to win, not extrapolated below it.
+const GRADIENT_WIDEN_PARALLEL_MIN: usize = 1 << 20;
+
+/// Widen an f32 gradient buffer into the tape's f64 storage.
+///
+/// WHY THIS EXISTS. The f32 GroupNorm backward hands its gradient to the tape as a
+/// `Vec<f64>`, and did so with a serial `.iter().map(f64::from).collect()`. For the
+/// scored `[32,64,56,56]` lane that is 6,422,528 elements — a 49 MiB materialization
+/// costing **24.9 ms**, inside a timed backward whose whole arm measures 30-52 ms. The
+/// certified board says the f32 GroupNorm KERNELS already beat the incumbent
+/// (`group_norm_f32_kernels` 1.26-1.44x FASTER) while the session path is 5.41x SLOWER,
+/// so the engine is the gap and this line is a large part of the engine.
+///
+/// BIT-EXACT BY CONSTRUCTION, not by tolerance: every `f32` is exactly representable in
+/// `f64`, and an elementwise map has no accumulation order to change. Splitting the range
+/// therefore cannot alter a single bit, which is asserted in
+/// `widen_f32_gradient_matches_serial_bitwise` rather than assumed.
+fn widen_f32_gradient(values: &[f32]) -> Vec<f64> {
+    if values.len() < GRADIENT_WIDEN_PARALLEL_MIN {
+        return values.iter().map(|&v| f64::from(v)).collect();
+    }
+    use rayon::prelude::*;
+    values.par_iter().map(|&v| f64::from(v)).collect()
+}
+
 #[derive(Clone, Copy)]
 struct ConvTransposeOutputDimSpec {
     input: usize,
@@ -26239,19 +26278,12 @@ impl FrankenTorchSession {
                     ),
                 };
                 Ok(vec![
-                    Some(dx.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()),
-                    Some(
-                        dw.unwrap()
-                            .iter()
-                            .map(|&v| f64::from(v))
-                            .collect::<Vec<f64>>(),
-                    ),
-                    Some(
-                        db.unwrap()
-                            .iter()
-                            .map(|&v| f64::from(v))
-                            .collect::<Vec<f64>>(),
-                    ),
+                    // frankentorch-68pwz: one element per input, so this is the 49 MiB
+                    // widen that dominated the engine term. dw/db are per-channel (64
+                    // here) and stay serial by the helper's own gate.
+                    Some(widen_f32_gradient(&dx)),
+                    Some(widen_f32_gradient(&dw.unwrap())),
+                    Some(widen_f32_gradient(&db.unwrap())),
                 ])
             },
         )?;
@@ -37675,19 +37707,11 @@ impl FrankenTorchSession {
                                 eps_f,
                             );
                             Ok(vec![
-                                Some(dx.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()),
-                                Some(
-                                    dw.unwrap()
-                                        .iter()
-                                        .map(|&v| f64::from(v))
-                                        .collect::<Vec<f64>>(),
-                                ),
-                                Some(
-                                    db.unwrap()
-                                        .iter()
-                                        .map(|&v| f64::from(v))
-                                        .collect::<Vec<f64>>(),
-                                ),
+                                // frankentorch-68pwz: same widen on the non-shortcut
+                                // f32 GroupNorm backward. See `widen_f32_gradient`.
+                                Some(widen_f32_gradient(&dx)),
+                                Some(widen_f32_gradient(&dw.unwrap())),
+                                Some(widen_f32_gradient(&db.unwrap())),
                             ])
                         },
                         move |ctx, grad_outs, fn_inputs, tape| {
@@ -144447,6 +144471,55 @@ mod tests {
                 (a - b).abs() <= 1e-5 + 1e-4 * b.abs(),
                 "[{i}]: f32 no-grad fused {a} vs grad-path fused {b}"
             );
+        }
+    }
+
+    /// frankentorch-68pwz: `widen_f32_gradient` parallelises the f32->f64 gradient
+    /// materialization above `GRADIENT_WIDEN_PARALLEL_MIN`. Splitting an elementwise map
+    /// cannot change a bit — every f32 is exactly representable in f64 and there is no
+    /// accumulation order — but the whole point of the helper is that it takes a
+    /// DIFFERENT code path above the gate, so both sides of the gate are exercised and
+    /// compared against the serial form the change replaced.
+    #[test]
+    fn widen_f32_gradient_matches_serial_bitwise() {
+        fn serial(values: &[f32]) -> Vec<f64> {
+            values.iter().map(|&v| f64::from(v)).collect()
+        }
+        // Straddle the gate deliberately: below, exactly at, and above.
+        for &len in &[
+            0usize,
+            1,
+            1_023,
+            super::GRADIENT_WIDEN_PARALLEL_MIN - 1,
+            super::GRADIENT_WIDEN_PARALLEL_MIN,
+            super::GRADIENT_WIDEN_PARALLEL_MIN + 12_345,
+        ] {
+            let values: Vec<f32> = (0..len)
+                .map(|index| {
+                    // Mix magnitudes and signs, and include values whose f64 image is
+                    // only reachable exactly (subnormals, infinities, NaN payloads are
+                    // all valid gradient bits and must survive the widen unchanged).
+                    match index % 7 {
+                        0 => f32::MIN_POSITIVE * 0.5, // subnormal
+                        1 => -0.0,
+                        2 => f32::INFINITY,
+                        3 => f32::NEG_INFINITY,
+                        4 => f32::NAN,
+                        5 => f32::MAX,
+                        _ => ((index % 9973) as f32) * 0.000_37 - 1.5,
+                    }
+                })
+                .collect();
+            let got = super::widen_f32_gradient(&values);
+            let want = serial(&values);
+            assert_eq!(got.len(), want.len(), "len mismatch at {len}");
+            for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "widen diverged at index {index} of {len}"
+                );
+            }
         }
     }
 

@@ -25807,3 +25807,102 @@ uncomfortable one:
   measured to be slower.
 - **The real lever is the opposite of the bead**, is larger than the bead's, and is
   sized: re-gate above in_ch~8 for 1.5-3.3x, at a cost of 4.770e-12 relative.
+
+## 69. THE f32 GroupNorm ENGINE GAP WAS ONE SERIAL `.iter().map(f64::from)` — 20.2 ms OF A 31 ms LANE
+
+`frankentorch-68pwz`'s implementation half, which the bead recorded as unstarted. The
+lever is not a fusion and not a kernel: it is one line in the backward closure.
+
+Per-arm host state on the quoted sweeps: **loadavg 16.71/16.32/18.15 (w1),
+17.35/16.72/18.15 (w2), 29.67/21.60/19.80 (w3); CPU 1429-4209 MHz, cross-core spread
+1.62x / 2.86x / 2.84x.** Parity `match` on all 21 lanes of all three sweeps, 0 MISMATCH.
+
+### 69a. The certified board already said the kernels were not the problem
+
+At the matched 8-thread budget the GroupNorm family splits, and the split is the finding:
+
+    group_norm_f32_zeroed   (full session path)        0.185   5.41x SLOWER
+    group_norm_f32_kernels  (kernels, no session/tape) 1.259-1.439  FASTER
+    group_norm_f32_statskernels                        1.782-1.893  FASTER
+
+**Our f32 GroupNorm kernels already beat the incumbent.** Everything between them and
+the session path is the gap, so a lever aimed at the kernels would have been aimed at
+the one part that was already winning.
+
+### 69b. The line
+
+Both f32 GroupNorm backward paths handed their gradient to the tape as
+
+    Some(dx.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>())
+
+`dx` carries one element per input. For the scored `[32,64,56,56]` lane that is
+6,422,528 values — a **serial 49 MiB materialization inside the timed backward**. Priced
+before anything was changed (`examples/gradient_widen_probe.rs`, min-of-9, 64 threads):
+
+    serial   .iter().map()   24.917 ms
+    parallel .par_iter()      4.566 ms      5.46x, saving 20.351 ms
+
+The gate is measured rather than assumed, and it lands far from the usual constant:
+
+    numel        serial ms   parallel ms   serial/parallel
+       16 384       0.0030        0.2993             0.01x
+      262 144       0.7365        2.1140             0.35x
+    1 048 576       3.8092        2.9133             1.31x   <- first win
+    4 194 304      15.5076        3.9979             3.88x
+
+A 64-way fork/join costs 0.1-0.9 ms here, so a small widen loses by 100x.
+`GRADIENT_WIDEN_PARALLEL_MIN` is therefore **1<<20**, the first size measured to win —
+not the 8192 that ft-kernel-cpu's older gates use. `dw`/`db` are per-channel (64) and
+stay serial through the same gate.
+
+### 69c. BIT-EXACT BY CONSTRUCTION, AND ASSERTED ANYWAY
+
+Every `f32` is exactly representable in `f64`, and an elementwise map has no accumulation
+order, so splitting the range cannot alter a bit. `widen_f32_gradient_matches_serial_bitwise`
+straddles the gate (`MIN-1`, `MIN`, `MIN+12345`) and includes subnormals, `-0.0`, both
+infinities, `NaN` and `f32::MAX` — all valid gradient bit patterns. This is not a
+tolerance change and needs no ratification. 2578 ft-api tests pass, clippy clean.
+
+### 69d. IN SITU IT HELD, which is the part that usually fails
+
+The ledger's hardest-won rule is that a standalone ladder can invert in situ. Measured on
+the board as **session lane minus kernels lane, WITHIN each sweep**, so host state and any
+concurrent kernel change cancel on both sides:
+
+    sweep    session   kernels    engine
+    pin1      31.381     5.349    26.032   BEFORE
+    pin2      31.324     5.362    25.962   BEFORE
+    pin3      30.320     5.241    25.079   BEFORE
+    w1        10.309     4.813     5.496   AFTER
+    w2        10.374     4.840     5.534   AFTER
+    w3        10.251     4.928     5.323   AFTER
+
+**Engine term 25.69 -> 5.45 ms, saving 20.24 ms against the probe's predicted 20.351 —
+agreement within 0.5%.** The FT arm itself is reproducible to 1.003x across the three
+after-sweeps (8.214/8.241/8.224 ms on `group_norm_f32`).
+
+### 69e. The standing, and what it does NOT yet say
+
+    group_norm_f32          0.646 / 0.635 / 0.609    was 0.185
+    group_norm_f32_zeroed   0.593 / 0.593 / 0.581    was 0.185
+
+From **5.41x SLOWER to about 1.7x SLOWER** at the matched 8-thread budget. Two honest
+qualifications:
+
+1. **Neither lane certified.** The FrankenTorch null passes (1.002-1.017); it is the
+   INCUMBENT's own A/A that fails (PT null 0.842-0.970, always low). That is torch
+   drifting within the round, not our change, and it is the same +/-0.02 band item 60
+   and 63 already identified as the binding constraint. The row is quoted as a phase
+   measurement, not as a certified vs-incumbent standing.
+2. The before/after ratios come from different ELFs (`0914fa6c` -> `8d82c07e`) with a
+   peer's kernel work also in the tree. **That is exactly why the claim rests on the
+   within-sweep engine term rather than on the ratio**: the engine decomposition
+   subtracts the kernels lane on both sides, so a concurrent kernel change cancels.
+
+### 69f. Where else this pattern lives
+
+`map(|&v| f64::from(v))` appears at 14 sites in `ft-api/src/lib.rs`. Only the two `dx`
+sites are numel-scaled and were converted; the rest are per-channel, index, or grid
+buffers where the helper's gate keeps them serial. A sweep for other numel-scaled
+widenings on the f32 surface is owed and is likely the same vein — this one was worth
+20 ms on a single lane.
