@@ -24560,3 +24560,68 @@ WHAT IT IS NOT: drift (gates pass), warmup (symmetric at 32), or inter-lane inte
 (the filtered run has one op). What remains is something that makes our own arm slower as
 a run proceeds — allocator growth, the tape, or thermal on a 64-thread burst — and
 distinguishing those needs an in-process phase split, not another sweep.
+
+## 61. REPLICATED CERTIFIED STANDINGS — INCLUDING THE CAMPAIGN'S FIRST CERTIFIED WINS
+
+Three further filtered sweeps, all three drift-clean, seven certified rows. ELF
+`171f84f8617e1b43b81818a5873bc156cc99dea590aad4bfc6db21398761ead0`, mimalloc,
+symmetric warmup 32, `FT_H2H_LANES=group_norm_f32`, `FT_H2H_REPS=16`, incumbent
+PyTorch 2.12.1+cpu self-reported in the same invocation. All rows QUOTABLE under
+the MIN estimator, which is the estimator their nulls were adjudicated with
+(rule 3).
+
+    run   worst_drift   lane                                   ratio [CI]            nulls PT / FT
+    6     1.025x PASS   group_norm_f32                    5.61x SL  0.178 [0.176,0.191]  0.996 / 1.003
+    6     1.025x PASS   group_norm_f32_zeroed             5.36x SL  0.187 [0.182,0.194]  0.983 / 0.997
+    6     1.025x PASS   group_norm_f32_kernels_serialfwd  4.47x SL  0.224 [0.215,0.235]  1.012 / 0.988
+    7     1.094x PASS   group_norm_f32_zeroed             5.11x SL  0.196 [0.188,0.206]  0.994 / 0.995
+    7     1.094x PASS   group_norm_f32_kernels            1.19x FA  1.189 [1.028,1.309]  1.018 / 1.008
+    8     1.180x PASS   group_norm_f32_statskernels       1.50x FA  1.496 [1.381,1.532]  1.003 / 1.016
+    8     1.180x PASS   group_norm_f32_statskernels_rec   1.28x FA  1.284 [1.166,1.386]  1.014 / 1.007
+
+### 61a. THE FIRST CERTIFIED WINS IN THIS CAMPAIGN
+
+    group_norm_f32_statskernels             at least 1.381x FASTER  (up to 1.532x)
+    group_norm_f32_statskernels_recompute   at least 1.166x FASTER  (up to 1.386x)
+    group_norm_f32_kernels                  at least 1.028x FASTER  (up to 1.309x)
+
+Quoted as the CI lower bound, since a "faster than" claim is a floor. These are the
+first vs-PyTorch WINS this campaign has certified rather than sized.
+
+They also confirm item 46 under gates: the group_norm f32 KERNELS beat the
+incumbent while the full lane loses by 5x. The 12.6% that was already winning is
+now measured as winning, and the loss is elsewhere.
+
+### 61b. The loss, replicated and bounded conservatively
+
+    group_norm_f32          run3  at least 5.65x SLOWER      run6  at least 5.24x SLOWER
+    group_norm_f32_zeroed   run4  at least 5.46x SLOWER      run6  at least 5.15x SLOWER
+                            run7  at least 4.85x SLOWER
+
+Taking the WEAKEST bound any certified run produced, as this ledger requires:
+**FrankenTorch is at least 4.85x SLOWER than PyTorch on the group_norm f32 lane**,
+with point estimates spanning 5.11-5.83x across five certified rows and two lanes.
+The earlier uncertified figures (5.05-6.09x across ten runs and four ELFs) sit
+inside that range, so nothing is revised — only made quotable.
+
+### 61c. What made this possible, restated because it was not a defect hunt
+
+Four hypotheses about the host and the build (allocator, warmup, drift-as-cause,
+estimator noise) produced zero certified rows between them. Two changes produced
+seven:
+
+1. **the MIN estimator** (item 57) — robust to the sporadic 2-5x contention spikes
+   the median is not; every row above is a min row and none would certify under the
+   median;
+2. **the lane filter** (item 58) — the only knob that cuts wall clock without
+   cutting statistical power, which is what let 16 rounds fit inside a window this
+   host holds still for.
+
+Both came from instrumenting the gate rather than theorising about what it was
+rejecting.
+
+### 61d. Scope
+
+These certify the group_norm f32 family only — 6 lanes of 21. The other 15 remain
+unmeasured under certifying conditions, and the protocol for them is the same: one
+family at a time, filtered, 16 rounds, quoted under MIN with nulls printed.
