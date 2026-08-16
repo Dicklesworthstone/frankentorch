@@ -21474,3 +21474,74 @@ input read rather than the output write, removing one pass over the smaller buff
 is not where the time is. `frankentorch-md74s` records a related cost still in the
 path — the grad forward clones the whole argmax sidecar, a full write of a buffer of
 exactly this size, which the lever does not touch.
+
+## 28. THE SVD VECTOR PHASE IS NOT THE QR REPLAY — IT IS AN O(m^4) BASIS COMPLETION
+
+`frankentorch-svd-blocked-bidiag-r7jdo.1` is filed as "replace the bidiagonal QR
+Givens replay with a divide-and-conquer merge." Two levels of phase attribution,
+taken BEFORE writing any of that, say the bead's premise is wrong about where the
+time is — and the second level says it is wrong by three orders of magnitude.
+
+### 28a. First split: the vectors, not the values
+
+Three public calls isolate the phases, because `svdvals` and `svd` share the
+bidiagonalization and the QR replay and differ only in whether vectors are
+accumulated:
+
+    128x128   svdvals  1.535 ms   full   3.429 ms   vectors  1.894 ms  55.2%
+    256x256   svdvals 15.578 ms   full  27.988 ms   vectors 12.410 ms  44.3%
+    384x384   svdvals 44.174 ms   full 115.826 ms   vectors 71.652 ms  61.9%
+
+rch worker `vmi1149989`, in-crate kernel phase split, min of 5, interleaved,
+commit `8b9430bc`. The QR replay the bead names lives inside `svdvals` — the
+smaller half at every size. A D&C bidiagonal merge, done perfectly, cannot touch
+the 44-62% that is vector work.
+
+### 28b. Second split: on a TALL matrix, the full-U expansion is everything
+
+A tall matrix separates the vector phase further, because `full_matrices=false`
+builds a reduced `m x k` U while `full_matrices=true` must complete it to `m x m`:
+
+    r7jdo.1 svd vector split 256x32:
+      values   0.486 ms
+      reduced  1.335 ms   (reduced-vector accumulation:    0.849 ms)
+      full  4431.615 ms   (full-U expansion:            4430.281 ms, 100.0%)
+
+rch worker `vmi1149989`, harness = in-crate kernel phase split (NOT
+`gauntlet_lane_sweep_h2h`; this is an FT-internal attribution, not a vs-PyTorch
+row), min of 3, interleaved.
+
+**A 256x32 matrix takes 4.43 SECONDS.** The full-U expansion is 3300x the entire
+reduced SVD and 99.97% of the call. The two larger shapes in the same test —
+(512,32) and (256,64) — could not finish inside the 1800s SSH limit, which is
+itself the data point: the cost is superlinear in a way nothing else in the
+kernel is.
+
+### 28c. Why: the seed search restarts from e_0 for every column
+
+`svd_tall`'s orthonormal-basis completion (`crates/ft-kernel-cpu/src/lib.rs`
+around line 29907) fills every zero column of U with a Gram-Schmidt residual of a
+standard basis vector, trying seeds `e_0, e_1, ... e_{m-1}` until one survives.
+For tall + `full_matrices`, columns `k..m` all start unfilled — 224 of them at
+256x32.
+
+The seed loop starts at 0 **for every column**. But a seed consumed by an earlier
+completion column is now inside the span, so it fails — and it fails only AFTER a
+full Gram-Schmidt sweep against all `u_cols` columns at `O(m)` each. The number
+of doomed attempts grows linearly with the column index, so the total is
+`sum_j (j-k)` ~ `(m-k)^2 / 2` ~ 25,000 sweeps of 65,536 operations ~ 1.6 G
+operations. That is the 4.43 s, and it makes the completion **O(m^4)** where the
+work it performs is O(m^3).
+
+### 28d. What this retires
+
+- The bead's D&C rewrite is not the next lever and must not be started on the
+  strength of the title. Recorded on `r7jdo.1`.
+- Any future SVD row measured with `full_matrices=true` on a non-square matrix
+  was measuring this loop, not the decomposition. No such row has been banked in
+  this campaign, but the shape is a trap for the next agent to try one.
+
+The transferable rule is the one that has now paid three times in this campaign
+(items 22/23, and the max_pool3d backward): **attribute before you build.** The
+bead named a phase, the first split showed the phase was the smaller half, and
+the second split showed the real cost was not in either candidate.
