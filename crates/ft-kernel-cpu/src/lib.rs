@@ -2475,6 +2475,33 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
     unsafe { Vec::from_raw_parts(staged.as_mut_ptr().cast::<T>(), numel, staged.capacity()) }
 }
 
+/// Two fully-overwritten buffers produced by ONE fused pass, both uninitialized.
+///
+/// For kernels that emit a value buffer and a sidecar together (a pooling output
+/// and its argmax offsets, say): calling [`build_uninit`] twice would need two
+/// passes and lose the fusion, while allocating either one zeroed reintroduces
+/// exactly the dead init pass that helper exists to remove.
+///
+/// CONTRACT: as [`build_uninit`], applied to BOTH slices — `fill` must write every
+/// element of each and read neither before writing it.
+fn build_uninit_pair<T: Copy, U: Copy, F: FnOnce(&mut [T], &mut [U])>(
+    a_numel: usize,
+    b_numel: usize,
+    fill: F,
+) -> (Vec<T>, Vec<U>) {
+    // `build_uninit` calls its `fill` exactly once and unconditionally, so the
+    // inner buffer is always produced and the `expect` below cannot fire.
+    let mut b_slot: Option<Vec<U>> = None;
+    let a = build_uninit(a_numel, |a| {
+        let b = build_uninit(b_numel, |b| fill(a, b));
+        b_slot = Some(b);
+    });
+    (
+        a,
+        b_slot.expect("build_uninit invokes its fill exactly once"),
+    )
+}
+
 /// Row-structured broadcast-expand materialization (`expand`/`broadcast_to`),
 /// building the output into an UNINITIALIZED buffer so the fill also does the
 /// page FIRST-TOUCH.
@@ -11036,7 +11063,14 @@ pub fn max_pool1d_forward_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
-    let mut out = vec![0.0f64; batch * ch * output_len];
+    // frankentorch-3ja43: UNINITIALIZED output. Every plane loop below writes all
+    // `output_len` of its slots, so the `vec![0.0; numel]` this replaces was a dead
+    // SERIAL first-touch of the whole buffer ahead of a parallel fill that
+    // overwrote it — the expand/transpose materialize lever, applied to pooling
+    // forward. Coverage is total by construction here rather than conditional as in
+    // the avg-pool backward sibling: the output IS the loop bound, so there is no
+    // tiling remainder that could leave a slot unwritten.
+    let numel = batch * ch * output_len;
     // The common 2/2 pool is a disjoint adjacent-pair scan. Keep the two
     // comparisons in the generic order so NaNs retain the same max semantics.
     if kernel == 2 && stride == 2 {
@@ -11056,16 +11090,17 @@ pub fn max_pool1d_forward_f64(
                 *slot = m;
             }
         };
-        if out.len() * 2 >= POOL_FWD_PARALLEL_MIN {
-            out.par_chunks_mut(output_len)
-                .enumerate()
-                .for_each(|(plane, orow)| pair_plane(plane, orow));
-        } else {
-            out.chunks_mut(output_len)
-                .enumerate()
-                .for_each(|(plane, orow)| pair_plane(plane, orow));
-        }
-        return out;
+        return build_uninit(numel, |out| {
+            if numel * 2 >= POOL_FWD_PARALLEL_MIN {
+                out.par_chunks_mut(output_len)
+                    .enumerate()
+                    .for_each(|(plane, orow)| pair_plane(plane, orow));
+            } else {
+                out.chunks_mut(output_len)
+                    .enumerate()
+                    .for_each(|(plane, orow)| pair_plane(plane, orow));
+            }
+        });
     }
     let plane_fn = |plane: usize, orow: &mut [f64]| {
         let ibase = plane * len;
@@ -11081,16 +11116,17 @@ pub fn max_pool1d_forward_f64(
             *slot = m;
         }
     };
-    if out.len() * kernel >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(output_len)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    } else {
-        out.chunks_mut(output_len)
-            .enumerate()
-            .for_each(|(plane, orow)| plane_fn(plane, orow));
-    }
-    out
+    build_uninit(numel, |out| {
+        if numel * kernel >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        } else {
+            out.chunks_mut(output_len)
+                .enumerate()
+                .for_each(|(plane, orow)| plane_fn(plane, orow));
+        }
+    })
 }
 
 /// Fused max-pool1d forward plus first-argmax sidecar (f64). The sidecar stores
@@ -11105,8 +11141,11 @@ pub fn max_pool1d_forward_with_indices_f64(
     output_len: usize,
     stride: usize,
 ) -> (Vec<f64>, Vec<f64>) {
-    let mut out = vec![0.0f64; batch * ch * output_len];
-    let mut arg_offsets = vec![0.0f64; batch * ch * output_len];
+    // frankentorch-3ja43: both buffers UNINITIALIZED and filled by the one fused
+    // pass, for the reason given on `max_pool1d_forward_f64`. This route pays the
+    // dead init TWICE — output and sidecar — and it is the route the grad path
+    // takes, so it is the one the h2h lane spends its forward time in.
+    let numel = batch * ch * output_len;
     // The common 2/2 pool is a disjoint adjacent-pair scan. Keep the two
     // comparisons in the generic order so first ties and NaNs retain the exact
     // first-argmax behaviour of the fallback below.
@@ -11131,18 +11170,19 @@ pub fn max_pool1d_forward_with_indices_f64(
                 arow[ox] = arg as f64;
             }
         };
-        if out.len() * 2 >= POOL_FWD_PARALLEL_MIN {
-            out.par_chunks_mut(output_len)
-                .zip(arg_offsets.par_chunks_mut(output_len))
-                .enumerate()
-                .for_each(|(plane, (orow, arow))| pair_plane(plane, orow, arow));
-        } else {
-            out.chunks_mut(output_len)
-                .zip(arg_offsets.chunks_mut(output_len))
-                .enumerate()
-                .for_each(|(plane, (orow, arow))| pair_plane(plane, orow, arow));
-        }
-        return (out, arg_offsets);
+        return build_uninit_pair(numel, numel, |out, arg_offsets| {
+            if numel * 2 >= POOL_FWD_PARALLEL_MIN {
+                out.par_chunks_mut(output_len)
+                    .zip(arg_offsets.par_chunks_mut(output_len))
+                    .enumerate()
+                    .for_each(|(plane, (orow, arow))| pair_plane(plane, orow, arow));
+            } else {
+                out.chunks_mut(output_len)
+                    .zip(arg_offsets.chunks_mut(output_len))
+                    .enumerate()
+                    .for_each(|(plane, (orow, arow))| pair_plane(plane, orow, arow));
+            }
+        });
     }
     let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
         let ibase = plane * len;
@@ -11162,18 +11202,19 @@ pub fn max_pool1d_forward_with_indices_f64(
             arow[ox] = arg as f64;
         }
     };
-    if out.len() * kernel >= POOL_FWD_PARALLEL_MIN {
-        out.par_chunks_mut(output_len)
-            .zip(arg_offsets.par_chunks_mut(output_len))
-            .enumerate()
-            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
-    } else {
-        out.chunks_mut(output_len)
-            .zip(arg_offsets.chunks_mut(output_len))
-            .enumerate()
-            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
-    }
-    (out, arg_offsets)
+    build_uninit_pair(numel, numel, |out, arg_offsets| {
+        if numel * kernel >= POOL_FWD_PARALLEL_MIN {
+            out.par_chunks_mut(output_len)
+                .zip(arg_offsets.par_chunks_mut(output_len))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        } else {
+            out.chunks_mut(output_len)
+                .zip(arg_offsets.chunks_mut(output_len))
+                .enumerate()
+                .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+        }
+    })
 }
 
 /// Backward of [`max_pool1d_forward_with_indices_f64`]: scatter each output
@@ -40910,6 +40951,75 @@ mod tests {
     /// below ~4M elements because one thread already saturates the write path, and
     /// this buffer is 1M elements. Measured rather than assumed, both arms on an
     /// already-allocated buffer so only the fill is timed.
+    /// Phase attribution for SVD before any lever
+    /// (`frankentorch-svd-blocked-bidiag-r7jdo.1`).
+    ///
+    /// The bead's own instruction is "first profile phases on the current
+    /// executable", and the arc on `frankentorch-87sz8` (ledger 19-24) is why:
+    /// attribution redirected that lever twice, and the one that finally shipped
+    /// was not the one the bead named.
+    ///
+    /// This splits with public APIs rather than instrumenting the kernel.
+    /// `svdvals_contiguous_f64` and `svd_contiguous_f64` share the SAME
+    /// bidiagonalisation and the SAME bidiagonal-QR replay; only the latter
+    /// accumulates and back-transforms U and V. So:
+    ///
+    ///   svdvals            = bidiagonalisation + QR replay
+    ///   svd - svdvals      = U/V accumulation and back-transform
+    ///
+    /// The bead proposes replacing the QR REPLAY with divide-and-conquer. That is
+    /// only worth doing if the replay is where the time is, and this says whether
+    /// it is. Run across sizes because the two phases scale differently:
+    /// bidiagonalisation is a deterministic O(m n^2), the replay is iterative.
+    #[test]
+    fn svd_phase_split_values_only_versus_full_factorisation() {
+        for &(m, n) in &[(128usize, 128usize), (256, 256), (384, 384)] {
+            let mut z = 0x51d_5eed_u64;
+            let data: Vec<f64> = (0..m * n)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 40) as f64) / 1024.0 - 1.0;
+                    v
+                })
+                .collect();
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![m, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+
+            let reps = 5;
+            let mut vals_ns = Vec::with_capacity(reps);
+            let mut full_ns = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                let w = super::svdvals_contiguous_f64(&data, &meta).expect("svdvals");
+                vals_ns.push(t.elapsed().as_nanos());
+                std::hint::black_box(&w);
+
+                let t = std::time::Instant::now();
+                let f = super::svd_contiguous_f64(&data, &meta, false).expect("svd");
+                full_ns.push(t.elapsed().as_nanos());
+                std::hint::black_box(&f);
+            }
+            vals_ns.sort_unstable();
+            full_ns.sort_unstable();
+            let (v, f) = (vals_ns[0], full_ns[0]);
+            #[allow(clippy::cast_precision_loss)]
+            let (vf, ff) = (v as f64, f as f64);
+            println!(
+                "r7jdo.1 svd phases {m}x{n}: svdvals (bidiag + QR replay) {v} ns, full svd {f} ns, \
+                 vectors cost {} ns ({:.1}% of full), values share {:.1}% (min of {reps}, interleaved)",
+                f.saturating_sub(v),
+                100.0 * (ff - vf) / ff,
+                100.0 * vf / ff,
+            );
+        }
+    }
+
     #[test]
     fn max_pool3d_backward_buffer_fill_serial_vs_parallel() {
         let n = 1 << 20; // 8 MiB of f64 — the scorecard lane's dense gradient
@@ -42122,6 +42232,99 @@ mod tests {
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    /// frankentorch-3ja43: the max_pool1d forwards build their output (and the
+    /// sidecar) into UNINITIALIZED memory, so any element the fill fails to write
+    /// is garbage rather than a benign zero. This pins both routes against an
+    /// independent scalar reference, bit for bit, over shapes that stress the
+    /// coverage argument: the 2/2 specialization, a stride that leaves a tail of
+    /// the input outside every window, overlapping windows (stride < kernel), and
+    /// enough elements to cross POOL_FWD_PARALLEL_MIN into the parallel branch.
+    #[test]
+    fn max_pool1d_forward_uninit_routes_match_a_scalar_reference_bitwise() {
+        fn reference(
+            input: &[f64],
+            planes: usize,
+            len: usize,
+            kernel: usize,
+            output_len: usize,
+            stride: usize,
+        ) -> (Vec<f64>, Vec<f64>) {
+            let mut out = Vec::with_capacity(planes * output_len);
+            let mut args = Vec::with_capacity(planes * output_len);
+            for plane in 0..planes {
+                for ox in 0..output_len {
+                    let start = ox * stride;
+                    let mut m = f64::NEG_INFINITY;
+                    let mut arg = start;
+                    for kx in 0..kernel {
+                        let v = input[plane * len + start + kx];
+                        if super::pool_max_beats(v, m) {
+                            m = v;
+                            arg = start + kx;
+                        }
+                    }
+                    out.push(m);
+                    args.push(arg as f64);
+                }
+            }
+            (out, args)
+        }
+
+        // (planes, len, kernel, stride, output_len)
+        let cases = [
+            (3usize, 16usize, 2usize, 2usize, 8usize),
+            // stride 3 over len 16 consumes 15 elements: index 15 is in no window.
+            (3, 16, 3, 3, 5),
+            // Overlapping windows: every element is read by two of them.
+            (3, 16, 3, 1, 14),
+            // numel * kernel == 2^21 == POOL_FWD_PARALLEL_MIN exactly, so this case
+            // takes the PARALLEL branch — where the uninit buffer is filled by many
+            // threads at once and a coverage gap would be least predictable.
+            (2048, 1024, 2, 2, 512),
+        ];
+
+        for (planes, len, kernel, stride, output_len) in cases {
+            let input: Vec<f64> = (0..planes * len)
+                .map(|i| {
+                    // Ties, negative zero and a NaN, so first-argmax and NaN
+                    // handling are exercised rather than assumed away.
+                    match i % 23 {
+                        7 => -0.0,
+                        11 => f64::NAN,
+                        _ => ((i * 37 % 61) as f64) * 0.125 - 4.0,
+                    }
+                })
+                .collect();
+            let (want_out, want_args) = reference(&input, planes, len, kernel, output_len, stride);
+
+            let plain =
+                super::max_pool1d_forward_f64(&input, planes, 1, len, kernel, output_len, stride);
+            let (out, args) = super::max_pool1d_forward_with_indices_f64(
+                &input, planes, 1, len, kernel, output_len, stride,
+            );
+
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&plain),
+                bits(&want_out),
+                "max_pool1d_forward_f64 disagrees with the reference at \
+                 planes={planes} len={len} kernel={kernel} stride={stride}"
+            );
+            assert_eq!(
+                bits(&out),
+                bits(&want_out),
+                "max_pool1d_forward_with_indices_f64 values disagree at \
+                 planes={planes} len={len} kernel={kernel} stride={stride}"
+            );
+            assert_eq!(
+                bits(&args),
+                bits(&want_args),
+                "max_pool1d_forward_with_indices_f64 argmax offsets disagree at \
+                 planes={planes} len={len} kernel={kernel} stride={stride}"
+            );
+        }
     }
 
     #[test]
