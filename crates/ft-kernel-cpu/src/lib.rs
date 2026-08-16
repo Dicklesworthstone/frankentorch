@@ -7514,27 +7514,31 @@ pub fn conv2d_im2col_f64(
 ) -> Vec<f64> {
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
-    let mut panel = vec![0.0f64; batch * patch_count * patch_width];
-    panel
-        .par_chunks_mut(patch_width)
-        .enumerate()
-        .for_each(|(row, prow)| {
-            let b = row / patch_count;
-            let pc = row % patch_count;
-            let base_h = (pc / ow) * sh;
-            let base_w = (pc % ow) * sw;
-            let batch_off = b * in_ch * ph * pw;
-            for c in 0..in_ch {
-                let ch_off = batch_off + c * ph * pw;
-                let pch = c * kh * kw;
-                for kr in 0..kh {
-                    let irow = ch_off + (base_h + kr) * pw + base_w;
-                    let prow_off = pch + kr * kw;
-                    prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+    // frankentorch-l2zki: same dead fill as `conv3d_im2col_f64`; the input is padded, so
+    // every element of every row is written. Pattern-identical, but only the conv3d f64
+    // form was measured (1.29x) — this one is converted for uniformity, not on a number.
+    build_uninit(batch * patch_count * patch_width, |panel: &mut [f64]| {
+        panel
+            .par_chunks_mut(patch_width)
+            .enumerate()
+            .for_each(|(row, prow)| {
+                let b = row / patch_count;
+                let pc = row % patch_count;
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let batch_off = b * in_ch * ph * pw;
+                for c in 0..in_ch {
+                    let ch_off = batch_off + c * ph * pw;
+                    let pch = c * kh * kw;
+                    for kr in 0..kh {
+                        let irow = ch_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pch + kr * kw;
+                        prow[prow_off..(kw + prow_off)]
+                            .copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
                 }
-            }
-        });
-    panel
+            });
+    })
 }
 
 /// Below this batch count, `conv2d_col2im_*` parallelizes per (batch, channel)
@@ -7896,7 +7900,8 @@ pub fn conv2d_im2col_f32(
 ) -> Vec<f32> {
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
-    let mut panel = vec![0.0f32; batch * patch_count * patch_width];
+    // frankentorch-l2zki: see `conv3d_im2col_f64`. Padded input, every element written.
+    build_uninit(batch * patch_count * patch_width, |panel: &mut [f32]| {
     panel
         .par_chunks_mut(patch_width)
         .enumerate()
@@ -7916,7 +7921,7 @@ pub fn conv2d_im2col_f32(
                 }
             }
         });
-    panel
+    })
 }
 
 /// f32 mirror of [`conv2d_forward_f64`]: fused im2col + `panel @ weight_flat^T`
@@ -12477,33 +12482,39 @@ pub fn conv3d_im2col_f64(
 ) -> Vec<f64> {
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
-    let mut panel = vec![0.0f64; batch * patch_count * patch_width];
-    panel
-        .par_chunks_mut(patch_width)
-        .enumerate()
-        .for_each(|(row, prow)| {
-            let b = row / patch_count;
-            let pc = row % patch_count;
-            let base_d = (pc / (oh * ow)) * sd;
-            let rem = pc % (oh * ow);
-            let base_h = (rem / ow) * sh;
-            let base_w = (rem % ow) * sw;
-            let batch_off = b * in_ch * pd * ph * pw;
-            for c in 0..in_ch {
-                let ch_off = batch_off + c * pd * ph * pw;
-                let pch = c * kd * kh * kw;
-                for kdd in 0..kd {
-                    let d_off = ch_off + (base_d + kdd) * ph * pw;
-                    let pkd = pch + kdd * kh * kw;
-                    for kr in 0..kh {
-                        let irow = d_off + (base_h + kr) * pw + base_w;
-                        let prow_off = pkd + kr * kw;
-                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+    // frankentorch-l2zki: the fill below writes EVERY element of every row — the input is
+    // already padded, so no position is skipped and none relies on a zero — which made
+    // `vec![0.0; n]` a dead fill in front of a parallel writer. Measured on the scored
+    // lane's 27.0 MiB panel: 1.457 -> 1.130 ms, 1.29x, bit-identical. Small, and it sits
+    // on BOTH conv3d backward paths.
+    build_uninit(batch * patch_count * patch_width, |panel: &mut [f64]| {
+        panel
+            .par_chunks_mut(patch_width)
+            .enumerate()
+            .for_each(|(row, prow)| {
+                let b = row / patch_count;
+                let pc = row % patch_count;
+                let base_d = (pc / (oh * ow)) * sd;
+                let rem = pc % (oh * ow);
+                let base_h = (rem / ow) * sh;
+                let base_w = (rem % ow) * sw;
+                let batch_off = b * in_ch * pd * ph * pw;
+                for c in 0..in_ch {
+                    let ch_off = batch_off + c * pd * ph * pw;
+                    let pch = c * kd * kh * kw;
+                    for kdd in 0..kd {
+                        let d_off = ch_off + (base_d + kdd) * ph * pw;
+                        let pkd = pch + kdd * kh * kw;
+                        for kr in 0..kh {
+                            let irow = d_off + (base_h + kr) * pw + base_w;
+                            let prow_off = pkd + kr * kw;
+                            prow[prow_off..(kw + prow_off)]
+                                .copy_from_slice(&padded[irow..(kw + irow)]);
+                        }
                     }
                 }
-            }
-        });
-    panel
+            });
+    })
 }
 
 /// 3-D col2im: transpose-scatter of [`conv3d_im2col_f64`] (overlaps summed).
@@ -12921,7 +12932,8 @@ pub fn conv3d_im2col_f32(
 ) -> Vec<f32> {
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
-    let mut panel = vec![0.0f32; batch * patch_count * patch_width];
+    // frankentorch-l2zki: see `conv3d_im2col_f64`. Padded input, every element written.
+    build_uninit(batch * patch_count * patch_width, |panel: &mut [f32]| {
     panel
         .par_chunks_mut(patch_width)
         .enumerate()
@@ -12947,7 +12959,7 @@ pub fn conv3d_im2col_f32(
                 }
             }
         });
-    panel
+    })
 }
 
 /// f32 mirror of [`conv3d_forward_f64`]: fused 3-D im2col + `panel @ weight_flat^T`
@@ -45606,6 +45618,123 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn im2col_uninit_panels_match_a_zero_initialized_reference_bitwise() {
+        // frankentorch-l2zki: the four im2col builders now allocate with `build_uninit`
+        // instead of `vec![0.0; n]`. That is only sound because each fill writes EVERY
+        // element — the input is already padded, so no position is skipped and none
+        // relies on reading a zero.
+        //
+        // This compares against a zero-initialized reference built the old way. The
+        // check is sharp precisely because the routes differ on unwritten elements: a
+        // zeroed panel would quietly report 0.0 where an uninit panel reports garbage,
+        // so any element the fill misses shows up here as a mismatch.
+        let (batch, in_ch) = (2usize, 3usize);
+        let (pd, ph, pw) = (5usize, 6usize, 7usize);
+        let (kd, kh, kw) = (2usize, 3usize, 2usize);
+        let (sd, sh, sw) = (1usize, 2usize, 3usize); // non-unit strides on purpose
+        let (od, oh, ow) = (
+            (pd - kd) / sd + 1,
+            (ph - kh) / sh + 1,
+            (pw - kw) / sw + 1,
+        );
+        let padded64: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
+            .map(|index| (index % 97) as f64 * 0.125 - 6.0)
+            .collect();
+        let padded32: Vec<f32> = padded64.iter().map(|&v| v as f32).collect();
+
+        // 3-D, f64 and f32.
+        let got64 = super::conv3d_im2col_f64(
+            &padded64, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        let got32 = super::conv3d_im2col_f32(
+            &padded32, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        let patch_width3 = in_ch * kd * kh * kw;
+        let patch_count3 = od * oh * ow;
+        let mut want64 = vec![0.0f64; batch * patch_count3 * patch_width3];
+        for row in 0..batch * patch_count3 {
+            let b = row / patch_count3;
+            let pc = row % patch_count3;
+            let base_d = (pc / (oh * ow)) * sd;
+            let rem = pc % (oh * ow);
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            for c in 0..in_ch {
+                for kdd in 0..kd {
+                    for kr in 0..kh {
+                        for kc in 0..kw {
+                            let src = b * in_ch * pd * ph * pw
+                                + c * pd * ph * pw
+                                + (base_d + kdd) * ph * pw
+                                + (base_h + kr) * pw
+                                + base_w
+                                + kc;
+                            let dst = row * patch_width3
+                                + c * kd * kh * kw
+                                + kdd * kh * kw
+                                + kr * kw
+                                + kc;
+                            want64[dst] = padded64[src];
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(got64.len(), want64.len());
+        for (index, (g, w)) in got64.iter().zip(want64.iter()).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "conv3d_im2col_f64 at {index}");
+        }
+        for (index, (g, w)) in got32.iter().zip(want64.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                (*w as f32).to_bits(),
+                "conv3d_im2col_f32 at {index}"
+            );
+        }
+
+        // 2-D, f64 and f32, over the same padded plane.
+        let got2_64 = super::conv2d_im2col_f64(
+            &padded64, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+        );
+        let got2_32 = super::conv2d_im2col_f32(
+            &padded32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+        );
+        let patch_width2 = in_ch * kh * kw;
+        let patch_count2 = oh * ow;
+        let mut want2 = vec![0.0f64; batch * patch_count2 * patch_width2];
+        for row in 0..batch * patch_count2 {
+            let b = row / patch_count2;
+            let pc = row % patch_count2;
+            let base_h = (pc / ow) * sh;
+            let base_w = (pc % ow) * sw;
+            for c in 0..in_ch {
+                for kr in 0..kh {
+                    for kc in 0..kw {
+                        let src = b * in_ch * ph * pw
+                            + c * ph * pw
+                            + (base_h + kr) * pw
+                            + base_w
+                            + kc;
+                        let dst = row * patch_width2 + c * kh * kw + kr * kw + kc;
+                        want2[dst] = padded64[src];
+                    }
+                }
+            }
+        }
+        assert_eq!(got2_64.len(), want2.len());
+        for (index, (g, w)) in got2_64.iter().zip(want2.iter()).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "conv2d_im2col_f64 at {index}");
+        }
+        for (index, (g, w)) in got2_32.iter().zip(want2.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                (*w as f32).to_bits(),
+                "conv2d_im2col_f32 at {index}"
+            );
         }
     }
 
