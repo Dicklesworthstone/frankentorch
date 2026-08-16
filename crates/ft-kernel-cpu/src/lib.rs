@@ -41447,6 +41447,37 @@ mod tests {
                 "a result wrong by a relative 1e-3 must be REJECTED at scale 1e{exp}"
             );
         }
+
+        // CONTROL for frankentorch-ga99y: the same scale sweep on a FULL-RANK
+        // matrix. If orthoV stays clean here and only breaks on the rank-deficient
+        // input above, the defect needs rank-deficiency AND tiny scale together,
+        // not tiny scale alone — which is the first of the two questions that bead
+        // says must be answered before anyone attempts a fix.
+        let mut y = 0xf1a1_a44b_c5ed_9e37_u64;
+        let full_rank: Vec<f64> = (0..n * n)
+            .map(|_| {
+                y ^= y << 13;
+                y ^= y >> 7;
+                y ^= y << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((y >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                v
+            })
+            .collect();
+        for &exp in &[0i32, -20] {
+            let scale = 10.0f64.powi(exp);
+            let a: Vec<f64> = full_rank.iter().map(|v| v * scale).collect();
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let good = svd_contiguous_f64(&a, &meta, false).expect("svd");
+            let (recon, frob) = super::svd_reconstruction_error(&a, &good);
+            let ortho_u = super::svd_columns_orthogonality_error(&good.u, good.m, good.k);
+            let ortho_v = super::svd_rows_orthogonality_error(&good.vh, good.k, good.n);
+            println!(
+                "ga99y CONTROL full-rank scale 1e{exp}: recon {recon:.3e} vs {:.3e} \
+                 | orthoU {ortho_u:.3e} orthoV {ortho_v:.3e}",
+                1e-7 * frob
+            );
+        }
     }
 
     /// frankentorch-v09ms. For a SQUARE matrix the full and reduced SVD are the
