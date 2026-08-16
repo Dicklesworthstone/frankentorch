@@ -20017,3 +20017,36 @@ user; the number is now on the table.
 the GroupNorm f32 kernels total ~0.81 ms and the reductions are a fraction of
 that, so the lane-level effect is bounded well below 7.5x. The honest framing is
 that the reduction PHASE has 7.5x of headroom, not the op.
+
+**14f. NINE INVOCATIONS, AND STILL NO MECHANISM — but the quotable band is
+stable (`frankentorch-2kgum` verification attempts, 2026-08-15).** Three further
+runs of `prelu_noshortcut`, now on the SYMMETRIC-WARMUP instrument (both arms warm
+4 iterations; ELF `d8e61dce`, build worker `vmi1264463`, harness
+`gauntlet_lane_sweep_h2h.rs`, `same_host=thinkstation1`):
+
+| load at start | rounds | median ratio | nulls |
+|---|---|---|---|
+| 32.86 | 32 | 0.636 (FT 1.57x SLOWER) | FT WIDE `[0.715,2.026]` — unusable |
+| 21.77 | 32 | 1.252 `[1.201,1.298]` | PT PASS, FT OFFSET 1.028 — not quotable |
+| 32.33 | 64 | 1.013 `[0.989,1.042]` | PT PASS, FT OFFSET 0.965 — not quotable |
+
+**None of the three is quotable, so none changes the banked standing** — and that
+is the instrument working, not failing. Note also that the load-21.77 run produced
+the HIGHEST ratio of all nine invocations (1.252) while load-32.86 produced the
+lowest, which kills any remaining temptation to reinstate 14d's monotone load
+story. Across nine runs the point estimate spans 1.01-1.25 with no clean relation
+to load; the QUOTABLE subset (both nulls passing) spans 1.048-1.180 with a floor
+of 1.006.
+
+**Consequence for `frankentorch-2kgum`: the symmetric-warmup change cannot be
+verified against the replication band until the host is quiet.** The bead stays
+open. The change itself is landed and argued on grounds that do not depend on this
+measurement — an instrument must not carry a bias whose direction depends on which
+arm is faster — but "does it move the certified row" is an empirical question and
+three saturated runs cannot answer it.
+
+**The reusable rule: a run whose own A/A null fails is not weak evidence, it is
+NO evidence, and it must not be averaged in with the quotable ones.** The
+temptation on a busy host is to take the nine point estimates and average them.
+That would produce ~1.1x from a set in which four runs could not certify their own
+instrument.
