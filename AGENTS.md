@@ -663,6 +663,63 @@ rch queue                     # See active/waiting builds
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
 
+### When `cargo test` is refused but `cargo build` is not: pass `-j2`
+
+`rch` requests a FIXED number of slots per command class, from `~/.config/rch/config.toml`:
+
+```toml
+build_slots = 4
+test_slots  = 8
+check_slots = 2
+```
+
+The request is set by the command VERB, not by the size of the crate. Against this
+fleet only three workers own 8 slots, so **every plain `cargo test` from this repo
+is admissible on at most 3 of 10 workers**, and `active_project_exclusion` removes
+any worker already building frankentorch — often leaving 2. That is why you can
+see `10/10 healthy, 17/49 slots available` and still be refused:
+
+```
+[RCH] remote required; refusing local fallback (no admissible workers:
+  insufficient_slots=3, insufficient_total_slots=6, active_project_exclusion=1) — retryable
+```
+
+**Read the breakdown, not the "retryable".** `insufficient_total_slots` is a
+CAPACITY class: those workers can never serve the job at any load, so retrying
+re-rolls only the availability-limited ones. Two agents lost 90+ minutes each on
+2026-08-15 treating this as transient contention (`frankentorch-1v8kz`,
+`frankentorch-c1ct1`).
+
+**The fix is one flag, and it is measured, not folklore.** At the same instant,
+same crate, same session:
+
+```bash
+rch exec -- cargo test --release -p frankentorch-autograd --lib        # EXIT=103, refused
+rch exec -- cargo test --release -j2 -p frankentorch-autograd --lib    # EXIT=0, 492 passed, ran on hz2
+```
+
+`hz2` has THREE total slots — it could never have taken the 8-slot request. So
+**put `-j2` (or `-j 1`) on every `cargo test` you send through rch**; peers on
+other franken\* projects already do. It costs some build parallelism on the worker
+and buys a tenfold larger eligible pool.
+
+**Second escape, for when even that is refused:** build the test binary on the
+4-slot BUILD lane and execute it locally, which is exactly what the h2h harness
+already does for its PyTorch arm:
+
+```bash
+rch exec -- cargo build --release -p <crate> --tests   # 4 slots
+./target/release/deps/<crate>-<hash>                   # runs locally, not a build
+```
+
+Two cautions if you do that. Do **not** add `--clean-overlay`: it builds from
+`/data/tmp/rch/...`, and `insta` snapshot tests bake their compile-time source
+path, so every snapshot test then fails locally for a reason that has nothing to
+do with your change. And never report a filtered pipeline's exit code as the
+gate — `... | grep ... | tail` returns `tail`'s status, so a refusal reads as a
+pass with no output. Capture the log, check the command's own `$?`, and assert the
+`test result: ok` count is nonzero.
+
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
