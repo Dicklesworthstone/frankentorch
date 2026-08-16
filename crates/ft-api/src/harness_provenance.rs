@@ -275,9 +275,80 @@ pub fn measurement_host_block(rayon_threads: usize) -> String {
     )
 }
 
+/// The 1-minute load average, or `None` if it cannot be read.
+#[must_use]
+pub fn load_average_1m() -> Option<f64> {
+    first_line_of("/proc/loadavg")
+        .split_whitespace()
+        .next()
+        .and_then(|field| field.parse::<f64>().ok())
+}
+
+/// The widest load drift a run may show and still be quoted.
+///
+/// Chosen from the runs already banked rather than by taste
+/// (`frankentorch-2h8vi`): the certified rows ran at drifts of about 1.07x
+/// (`frankentorch-y4nj9`, load 8.63 -> 9.25) and 1.15x, while the pair that
+/// certified OPPOSITE directions under different estimators
+/// (`NEGATIVE_EVIDENCE` item 18) ran at 1.30x and 1.41x. 1.25 sits between the
+/// two populations, so it admits every row this campaign has certified and
+/// refuses both members of the contradicting pair.
+pub const MAX_LOAD_DRIFT: f64 = 1.25;
+
+/// Whether the host stayed put underneath a measurement.
+///
+/// This exists because an A/A null cannot see it. A null establishes that an arm
+/// was STABLE WITHIN the invocation; a run in which every arm is uniformly 40%
+/// slow has immaculate nulls and is still not comparable to anything. Item 18
+/// recorded two runs of the same lane, both with all nulls passing, certifying
+/// **opposite directions** — the distinguishing variable was the host moving
+/// under the measurement, which nothing in the protocol was watching.
+///
+/// The signal is DRIFT IN EITHER DIRECTION, not level. A steady load of 25 is
+/// measurable; 6 -> 30 is not, and 30 -> 6 is equally not, because the arms
+/// sampled early and late in the balanced square then saw different machines. A
+/// gate keyed on absolute load would have rejected the `y4nj9` certified row
+/// (steady 8.63 -> 9.25) for the wrong reason.
+#[must_use]
+pub fn load_drift_is_quotable(start: Option<f64>, end: Option<f64>) -> bool {
+    let (Some(start), Some(end)) = (start, end) else {
+        // Unknown drift is not quotable: a missing signal must not read as a
+        // passing one.
+        return false;
+    };
+    // A very light host makes the ratio jumpy for reasons that are not the
+    // measurement (0.2 -> 0.5 is 2.5x and means nothing), so compare against a
+    // floor rather than the raw readings.
+    let floor = 1.0_f64;
+    let lo = start.max(floor);
+    let hi = end.max(floor);
+    let drift = if hi >= lo { hi / lo } else { lo / hi };
+    drift <= MAX_LOAD_DRIFT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_drift_admits_the_certified_runs_and_refuses_the_contradicting_pair() {
+        // frankentorch-y4nj9's certified row: steady, and it must stay quotable.
+        assert!(load_drift_is_quotable(Some(8.63), Some(9.25)));
+        // A steady HIGH load is measurable — the signal is drift, not level.
+        assert!(load_drift_is_quotable(Some(25.0), Some(26.0)));
+        // NEGATIVE_EVIDENCE item 18, the two runs that certified opposite
+        // directions with every null passing.
+        assert!(!load_drift_is_quotable(Some(21.8), Some(28.3)));
+        assert!(!load_drift_is_quotable(Some(21.9), Some(30.8)));
+        // Drift DOWNWARD is just as disqualifying: the arms sampled early and
+        // late saw different machines either way.
+        assert!(!load_drift_is_quotable(Some(30.0), Some(6.0)));
+        // A missing reading must not read as a pass.
+        assert!(!load_drift_is_quotable(None, Some(9.0)));
+        assert!(!load_drift_is_quotable(Some(9.0), None));
+        // A nearly idle host must not be failed by ratio jitter at tiny values.
+        assert!(load_drift_is_quotable(Some(0.2), Some(0.9)));
+    }
 
     /// The block must name the machine even when every optional source is
     /// missing — a provenance line that silently drops fields is worse than one

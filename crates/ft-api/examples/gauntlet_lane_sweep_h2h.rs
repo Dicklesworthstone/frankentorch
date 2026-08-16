@@ -768,6 +768,8 @@ LANES = {
         "{}",
         ft_api::harness_provenance::measurement_host_block(rayon::current_num_threads())
     );
+    // frankentorch-2h8vi: the host's own movement, which no A/A null can see.
+    let load_at_start = ft_api::harness_provenance::load_average_1m();
     println!(
         "allocator={}",
         if cfg!(feature = "fair-alloc") {
@@ -1009,6 +1011,35 @@ LANES = {
     drop(stdin);
     child.wait()?;
 
+    // frankentorch-2h8vi. Sampling is done; read the host again. An A/A null
+    // certifies that an arm was STABLE WITHIN this invocation and cannot see the
+    // machine moving underneath BOTH arms — NEGATIVE_EVIDENCE item 18 recorded
+    // two runs of one lane, every null passing, certifying OPPOSITE directions,
+    // separated by nothing but the host filling up mid-run. The balanced square
+    // protects against a step between arms, not against drift under both.
+    let load_at_end = ft_api::harness_provenance::load_average_1m();
+    let load_quotable =
+        ft_api::harness_provenance::load_drift_is_quotable(load_at_start, load_at_end);
+    let fmt_load = |value: Option<f64>| {
+        value.map_or_else(|| "unknown".to_owned(), |load| format!("{load:.2}"))
+    };
+    println!(
+        "load_1m start={} end={} drift_gate={} (frankentorch-2h8vi; the signal is DRIFT in either \
+         direction, not level — a steady busy host is measurable, a host that moves under the \
+         measurement is not)",
+        fmt_load(load_at_start),
+        fmt_load(load_at_end),
+        if load_quotable {
+            "PASS".to_owned()
+        } else {
+            format!(
+                "LOAD-DRIFTED — no row from this invocation is quotable, whatever its nulls say \
+                 (max {:.2}x)",
+                ft_api::harness_provenance::MAX_LOAD_DRIFT
+            )
+        }
+    );
+
     for (index, (name, _)) in lanes.iter().enumerate() {
         let (ratio, ratio_lo, ratio_hi) = median_ratio_ci(&pt_times[index], &ft_times[index]);
         let (pt_null_ratio, pt_null_lo, pt_null_hi) =
@@ -1081,8 +1112,10 @@ LANES = {
             "    MIN-ESTIMATOR {min_standing:<19} ratio {min_ratio:.3} [{min_ratio_lo:.3},{min_ratio_hi:.3}]  PT null {pt_min_null:.3} {}  FT null {ft_min_null:.3} {}  {}",
             if pt_min_ok { "PASS" } else { "FAIL" },
             if ft_min_ok { "PASS" } else { "FAIL" },
-            if pt_min_ok && ft_min_ok {
+            if pt_min_ok && ft_min_ok && load_quotable {
                 "QUOTABLE under the min estimator"
+            } else if pt_min_ok && ft_min_ok {
+                "not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)"
             } else {
                 "not quotable"
             }
