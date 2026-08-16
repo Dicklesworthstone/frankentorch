@@ -453,7 +453,10 @@ struct MaxPool1dSumShortcut {
     length: usize,
     output_len: usize,
     sum: f64,
-    arg_offsets: Vec<f64>,
+    /// frankentorch-md74s: a HANDLE to the argmax buffer the forward already built,
+    /// not a copy of it. The grad-path forward, its backward closure and this
+    /// registry all read the same allocation.
+    arg_offsets: std::sync::Arc<std::sync::OnceLock<Vec<f64>>>,
 }
 
 /// Registered on the f64 grad-path output of `functional_max_pool3d` so that a
@@ -26045,17 +26048,22 @@ impl FrankenTorchSession {
             sum,
             arg_offsets,
         } = shortcut;
+        // frankentorch-md74s: the shortcut's backward reads the SAME argmax allocation
+        // the pooling forward built, captured as a handle, rather than having it copied
+        // into this context's saved tensors.
+        let arg_offsets_for_backward = std::sync::Arc::clone(&arg_offsets);
         let out = self.tensor_apply_function_f64_saved_forward(
             &[source],
-            move |ctx| {
-                ctx.save_for_backward(arg_offsets, vec![batch, channels, output_len]);
-                Ok((vec![sum], vec![1]))
-            },
-            move |ctx, grad_outputs| {
+            move |_ctx| Ok((vec![sum], vec![1])),
+            move |_ctx, grad_outputs| {
                 let upstream = grad_outputs[0][0];
-                let saved = ctx.saved_tensors();
+                let saved = arg_offsets_for_backward.get().ok_or_else(|| {
+                    Self::incompatible_tensor_args(
+                        "max_pool1d sum shortcut ran before its forward filled the argmax sidecar",
+                    )
+                })?;
                 let grad = ft_kernel_cpu::max_pool1d_backward_from_indices_scalar_f64(
-                    upstream, &saved[0], batch, channels, length, output_len,
+                    upstream, saved, batch, channels, length, output_len,
                 );
                 Ok(vec![Some(grad)])
             },
@@ -33593,11 +33601,31 @@ impl FrankenTorchSession {
             // needs ONLY ctx + the output gradient (never the input), so the generic
             // apply_function input clone is pure waste on this loss lane (kgs4.126).
             // Bit-exact: the kernel sees identical contiguous values. frankentorch-0w3ns.
-            let shortcut_sidecar = std::rc::Rc::new(std::cell::RefCell::new(None));
-            let shortcut_sidecar_for_forward = std::rc::Rc::clone(&shortcut_sidecar);
+            // frankentorch-md74s: ONE argmax buffer, shared by the backward closure and
+            // the sum-shortcut registry, instead of a `clone()` for the registry plus a
+            // `save_for_backward` for the closure.
+            //
+            // The sidecar is `Arc<OnceLock<Vec<f64>>>` and not `Rc<RefCell<..>>` because
+            // the backward closure is bounded `Send + Sync + 'static`; the forward moves
+            // the buffer in once and the backward reads it, so no copy is made and
+            // `save_for_backward` is not needed for this tensor at all.
+            //
+            // This is what the earlier analysis on this bead MISSED. It concluded the
+            // clone could not be removed without moving `FunctionCtx::saved_tensors`
+            // from `Vec<Vec<f64>>` to a shared handle — a public API every custom op
+            // consumes. That is true if the backward keeps reading `ctx.saved_tensors()`.
+            // It does not have to: the closure can capture the buffer directly, which
+            // touches nothing outside this function.
+            //
+            // At the h2h shape the clone was `8*64*4096` f64 = 16.8 MB copied per
+            // grad-mode forward, on a lane whose whole session is 8-17 ms.
+            let shortcut_sidecar: std::sync::Arc<std::sync::OnceLock<Vec<f64>>> =
+                std::sync::Arc::new(std::sync::OnceLock::new());
+            let shortcut_sidecar_for_forward = std::sync::Arc::clone(&shortcut_sidecar);
+            let shortcut_sidecar_for_backward = std::sync::Arc::clone(&shortcut_sidecar);
             let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
-                move |ctx, ins| {
+                move |_ctx, ins| {
                     let (iv, _) = ins[0];
                     let (out, arg_offsets) = ft_kernel_cpu::max_pool1d_forward_with_indices_f64(
                         iv,
@@ -33608,22 +33636,29 @@ impl FrankenTorchSession {
                         output_len,
                         stride,
                     );
-                    *shortcut_sidecar_for_forward.borrow_mut() = Some(arg_offsets.clone());
-                    ctx.save_for_backward(arg_offsets, vec![n, ch, output_len]);
+                    // Moves; the previous form cloned the whole buffer here.
+                    let _ = shortcut_sidecar_for_forward.set(arg_offsets);
                     Ok((out, vec![n, ch, output_len]))
                 },
-                move |ctx, grad_outputs| {
+                move |_ctx, grad_outputs| {
                     let dout = grad_outputs[0];
-                    let s = ctx.saved_tensors();
+                    let arg_offsets = shortcut_sidecar_for_backward.get().ok_or_else(|| {
+                        Self::incompatible_tensor_args(
+                            "max_pool1d backward ran before its forward filled the argmax sidecar",
+                        )
+                    })?;
                     let din = ft_kernel_cpu::max_pool1d_backward_from_indices_f64(
-                        dout, &s[0], n, ch, l, output_len,
+                        dout, arg_offsets, n, ch, l, output_len,
                     );
                     Ok(vec![Some(din)])
                 },
             )?;
-            let arg_offsets = shortcut_sidecar.borrow_mut().take().ok_or_else(|| {
-                Self::incompatible_tensor_args("max_pool1d forward did not save scalar sidecar")
-            })?;
+            if shortcut_sidecar.get().is_none() {
+                return Err(Self::incompatible_tensor_args(
+                    "max_pool1d forward did not save scalar sidecar",
+                ));
+            }
+            let arg_offsets = std::sync::Arc::clone(&shortcut_sidecar);
             let sum = {
                 let tensor = self.tensor_tape.tensor(pooled)?;
                 ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
