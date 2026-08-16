@@ -21658,3 +21658,101 @@ exploratory: **give the incumbent arm more warm-up iterations.** The harness war
 FrankenTorch 3 iterations and torch 4 (`frankentorch-2kgum`); at 16x the work, four
 is not enough for torch to reach steady state. `uilzh` stays open with that as its
 concrete next action, and `68pwz` stays blocked behind it.
+
+## 29. A CONFIRMED SVD CORRECTNESS RED, FOUND BY SCANNING A PERF BEAD'S BLAST RADIUS
+
+Item 28 attributed the SVD vector phase to an O(m^4) basis completion. Reading the
+loop that causes it turned up something worse three lines above it, and the perf
+finding is now the smaller of the two.
+
+### 29a. `svd_tall` loses U entirely when the input is merely SMALL
+
+`svd_tall` decides whether a column of U is a real singular vector or
+rank-deficient padding by comparing its norm against an **absolute** constant,
+`let tol = 1e-15`. Those norms are the singular values, and singular values scale
+linearly with the matrix. So uniformly scaling a **perfectly well-conditioned**
+matrix down trips the test on every column at once: the columns are left zero and
+the basis completion overwrites them with Gram-Schmidt standard-basis vectors.
+
+Measured through the public kernel API, 8x4 well-conditioned f64, rch worker
+`vmi1149989`, harness `crates/ft-kernel-cpu/examples/svd_scale_probe.rs`:
+
+         scale         s_min     max|USVt-A|/|A|    max|UtU-I|  verdict
+           1e0     3.7884e-1           9.715e-16     2.220e-16  ok
+          1e-8     3.7884e-9           9.367e-16     2.220e-16  ok
+         1e-12    3.7884e-13           7.017e-16     2.429e-16  ok
+         1e-14    3.7884e-15           1.360e-15     3.782e-16  ok
+         1e-15    3.7884e-16            9.972e-1     2.220e-16  BROKEN
+         1e-16    3.7884e-17             2.368e0       0.000e0  BROKEN
+         1e-30    3.7884e-31             2.368e0       0.000e0  BROKEN
+
+**`max|UtU-I|` is EXACTLY ZERO on the broken rows.** That is the signature of the
+bug and the reason it has survived: U is a flawless orthonormal basis, it is simply
+not a basis of anything to do with A. S and Vh remain correct. Every check that
+asks "is U orthonormal" passes; only reconstruction fails, and it fails at 100%.
+
+The incumbent has no such cliff. torch 2.12.1+cpu on the same construction is
+scale-invariant to 1e-30 with condition number 3.8293 at every scale, because
+LAPACK's rank test is relative to the largest singular value.
+
+**This is not a contrived input.** SI-unit data, anything in the 1e-9 range
+squared, and late-training gradients all reach these magnitudes while remaining
+perfectly well-conditioned. The matrix is not near-singular; it is small.
+
+### 29b. The same class, at two more sites, failing the OPPOSITE way
+
+The tests module begins at line 38185, so every other hardcoded tolerance the grep
+found is an assertion. The production sites are three:
+
+- `svd_tall` (29832), `tol = 1e-15` — the above.
+- `validate_rank_deficient_svd` (29638), `tol = 1e-8f64` — an absolute bound on a
+  RESIDUAL, so it fails upward: a large-magnitude matrix produces rounding
+  residuals above 1e-8, the validator rejects a correct fast-path result, and the
+  call silently falls back to the slow path. A perf cliff keyed to nothing but
+  input magnitude, invisible to anyone testing at unit scale.
+- `pinv_moore_penrose_residual_ok` (24826),
+  `1e-7 * max_abs.max(1.0) * (m.max(n) as f64)` — relative in form, but the
+  `.max(1.0)` floor makes it absolute below unit scale, so it accepts essentially
+  any pinv there. A validator that cannot fail.
+
+One cause: comparing a scale-DEPENDENT quantity against a scale-INDEPENDENT
+constant. That the three fail in different directions is probably why the class
+went unnoticed.
+
+### 29c. The O(m^4) claim was right about the mechanism and WRONG about the exponent
+
+Same binary, same worker, tall shapes at fixed n=8, min of 3 interleaved:
+
+         shape      reduced ns         full ns       full-U ns  full/reduced
+          32x8           17456          231599          214143        13.3x
+          64x8           54281         6215964         6161683       114.5x
+          96x8          160672        46267948        46107276       288.0x
+         128x8          307474       255260743       254953269       830.2x
+
+**A 128x8 matrix — 1024 elements — takes 255 milliseconds.**
+
+The measured growth of the full-U term is steeper than item 28 predicted:
+
+    32 -> 64   (x2.00):  x28.8   exponent 4.85
+    64 -> 96   (x1.50):  x 7.48  exponent 4.96
+    96 -> 128  (x1.33):  x 5.53  exponent 5.94
+
+Item 28's sweep-count argument gives `(m-k)^2/2` sweeps of `2m^2` work each, which
+is m^4, and m^4 is a floor the data clears comfortably. **The residual factor is
+not explained by the sweep count and I am not going to pretend it is** — the
+per-attempt `vec![0.0f64; m]` allocation adds only m^3, and memory-hierarchy
+effects are a guess, not a measurement. Recorded as: at least m^4, empirically
+closer to m^5, mechanism confirmed, exponent not fully accounted for.
+
+### 29d. What this says about method
+
+The perf bead is what got read; the correctness bug is what was found. Item 28's
+lesson was "attribute before you build" — this is its corollary: **reading the code
+a perf number points at is worth more than the perf number.** Nothing in the
+campaign's measurement apparatus could have surfaced 29a, because the harness
+compares FrankenTorch against torch on well-scaled inputs, and at well-scaled
+inputs the op is correct.
+
+Filed as `frankentorch-qpe2n` (the RED), `frankentorch-264q0` (the O(m^4/m^5)
+completion), with `frankentorch-tfnap` and `frankentorch-v09ms` as smaller levers
+on the same loop.
