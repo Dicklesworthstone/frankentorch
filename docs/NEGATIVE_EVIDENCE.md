@@ -20541,3 +20541,50 @@ The BatchNorm2d half of `68pwz` remains **unverified**: its "about 5.7x" has not
 been re-established, and BatchNorm2d has **no lane in the h2h harness**, so it
 cannot be checked with the trusted instrument at all. Adding one means a second
 instrument, with the divergence risk item 11 records.
+
+## 2026-08-16 — BLOCKER: worker glibc silently breaks the measurement path (`tdpzf`)
+
+**This blocks all local vs-PyTorch measurement, intermittently and silently.**
+Recorded here because it explains ELF churn that would otherwise look like
+carelessness, and because the failure mode misdirects.
+
+```
+./target/release/examples/gauntlet_lane_sweep_h2h:
+  /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.43' not found
+```
+
+The rch worker fleet is **heterogeneous in glibc**, `rch exec` has **no
+worker-pinning flag**, and the measurement host is older than some workers:
+
+| machine | glibc | harness binary |
+|---|---|---|
+| `thinkstation1` (measurement host) | **2.42** | — |
+| worker `hz1` | ≥2.43 | **unrunnable here** |
+| worker `vmi1149989` | ≤2.42 | ran fine (ELF `ac1156652bbd0b95`) |
+
+So whether a measurement works is decided by which worker rch happens to pick.
+
+Three properties make this worse than an ordinary flake:
+
+1. **It fails at run time, not build time.** The build prints `Finished release
+   profile` and `REAL_EXIT=0`. The failure appears only when measuring, as a loader
+   error that reads like a broken local toolchain rather than a scheduling outcome.
+2. **It silently changes the ELF under you.** `target/release/examples/` is shared,
+   so a peer's rebuild replaces the binary you measured with. The harness ELF moved
+   three times in one session — `ac1156652bbd0b95` (ran) → `fc53650281e8ba9a` (ran,
+   produced the certified rows) → `e7f3af08827089da` → `05b9b45c7f647196` (last two
+   unrunnable). **An agent who records an ELF once and measures later can attribute
+   a row to a binary that never executed.** That is the concrete reason the ELF must
+   be read from the process's own self-report, not from the build you launched.
+3. **It burns the scarcest resource.** Each attempt is a ~6-7 minute release build
+   of `ft-api`, on a fleet that already refuses `ft-conformance`-sized jobs on 6/10
+   workers for capacity (`1v8kz`). Retrying until a compatible worker turns up is
+   expensive, and a seq-retry loop is banned regardless.
+
+Two consecutive rebuilds this session landed on glibc-2.43 workers, both
+`REAL_EXIT=0`, both unrunnable. The certified rows in `y4nj9` and `vhgue` were
+produced *before* this, from a binary that happened to come off a compatible worker.
+
+**If the harness dies with a GLIBC error, the binary is not yours and not runnable
+— that is a scheduling outcome, not a local toolchain problem.** Filed as `tdpzf`
+with the candidate fixes; rch scheduling is not a measurement pane's to change.
