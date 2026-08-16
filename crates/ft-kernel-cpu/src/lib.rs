@@ -41806,6 +41806,91 @@ mod tests {
         }
     }
 
+    /// End-to-end guard for the `frankentorch-j8sl5` dispatch flip, which routes
+    /// tall/wide `full_matrices` completion onto the blocked QR at m >= 128.
+    ///
+    /// I shipped that flip having verified by READING that no existing test
+    /// asserts U's values in that regime — which is exactly the reason one should
+    /// exist. Nothing covered the shapes the flip changes.
+    #[test]
+    fn svd_tall_full_matrices_is_orthonormal_and_reconstructs_across_the_m128_gate() {
+        use super::svd_contiguous_f64;
+
+        // frankentorch-j8sl5 flipped tall/wide `full_matrices` completion onto the
+        // blocked QR at m >= 128. I shipped that flip having verified by READING
+        // that no existing test asserts U's values in that regime -- which is
+        // exactly why one should exist. Nothing covered the shapes the flip
+        // changes.
+        //
+        // Shapes STRADDLE the gate deliberately: 96x24 keeps the Gram-Schmidt
+        // path, 128x16 and 256x32 take the blocked one. A test wholly on one side
+        // would pass regardless of how the dispatch is wired -- the same defect
+        // that let `tensor_linalg_svd_full_square_batched_grad_matches_reduced`
+        // (n=5, below the fast-path gate) miss frankentorch-v09ms entirely.
+        //
+        // Asserts the CONTRACT, not values: any orthonormal basis of the
+        // complement is a correct completion, so U^T U = I and U diag(S) Vh = A
+        // are the properties that must hold on both sides of the gate.
+        for &(m, n) in &[(96usize, 24usize), (128, 16), (256, 32)] {
+            let mut z = 0x7a11_f001_2345_u64;
+            let a: Vec<f64> = (0..m * n)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                    v
+                })
+                .collect();
+            let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+            let r = svd_contiguous_f64(&a, &meta, true).expect("full svd");
+
+            // U is m x m under full_matrices.
+            let u_cols = r.u.len() / m;
+            assert_eq!(u_cols, m, "full_matrices U should be {m}x{m} at {m}x{n}");
+
+            let mut worst_orth = 0.0f64;
+            for p in 0..u_cols {
+                for q in p..u_cols {
+                    let mut dot = 0.0f64;
+                    for i in 0..m {
+                        dot += r.u[i * u_cols + p] * r.u[i * u_cols + q];
+                    }
+                    let want = if p == q { 1.0 } else { 0.0 };
+                    worst_orth = worst_orth.max((dot - want).abs());
+                }
+            }
+            assert!(
+                worst_orth < 1e-9,
+                "U^T U off by {worst_orth} at {m}x{n} (gate: blocked={})",
+                m >= 128
+            );
+
+            // U diag(S) Vh must still be A -- the completion columns ride on zero
+            // singular values, so a wrong basis would NOT show here, which is
+            // precisely why the orthonormality check above is the load-bearing one.
+            let k = r.s.len();
+            let anorm = a.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+            let mut worst_recon = 0.0f64;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for t in 0..k {
+                        acc += r.u[i * u_cols + t] * r.s[t] * r.vh[t * n + j];
+                    }
+                    worst_recon = worst_recon.max((acc - a[i * n + j]).abs());
+                }
+            }
+            let rel = if anorm > 0.0 {
+                worst_recon / anorm
+            } else {
+                worst_recon
+            };
+            assert!(rel < 1e-9, "reconstruction off by {rel} at {m}x{n}");
+        }
+    }
+
     /// frankentorch-j8sl5. The blocked-QR completion must satisfy the same
     /// CONTRACT as the Gram-Schmidt one, not reproduce its values.
     ///
