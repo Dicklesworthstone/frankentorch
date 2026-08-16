@@ -25537,3 +25537,63 @@ under test rather than measure it."* Two things here bear on it, both measured:
    **0.975x** (range 0.859-2.080x), the outliers being the three ~1.2 ms lanes that
    pinning hurts. **Match the thread budget; pinning is optional and mildly harmful
    on the smallest lanes.**
+
+## 51. THE RAYON WIDTH CURVE IS MEASURED: 8 IS THE OPTIMUM, AND THE NAIVE READING SAYS 4
+
+`frankentorch-rayon-pool-width-qq8as` established that 8 threads beat 64 on 21/21 lanes
+but recorded as NOT established "that 8 is the optimum; the curve between 8 and 64 is
+unmeasured". Measured here, on the worst vs-incumbent lane.
+
+Arm-internal via `FT_H2H_NO_INCUMBENT`, so there is no incumbent, no ratio and no drift
+gate — our arm against itself. ELF `0914fa6c5050b5a7`, `max_pool3d_nopool`, 16 rounds x 4
+slots, widths run in the palindrome 4,8,16,32,64,64,32,16,8,4.
+
+**Per-arm provenance:** observed loadavg per pass recorded below; CPU clocks during
+sampling were typical core 1966-3406 MHz with a cross-core spread of 2.864-3.001x
+(median 2.899x). Both arms are the same arm here, so the clock applies to both by
+construction.
+
+### 51a. The load-controlled reading — 8 threads, 1.663x
+
+The sweep's loadavg ramped 10.5 -> 36.7 across the ten passes, so passes are NOT
+comparable across the whole run. The second half is (loads 27.7-33.8):
+
+    pass  width  loadavg  min ms   vs 64t
+      6     64    33.8    1.904    1.000x
+      7     32    32.5    1.623    1.173x
+      8     16    31.2    1.291    1.475x
+      9      8    31.1    1.145    1.663x
+     10      4    27.7    1.195    1.593x
+
+Monotone improvement from 64 down to 8, then it TURNS: 4 threads is worse than 8. So the
+bead's choice of 8 — picked to match torch's hard-coded `set_num_threads(8)` — lands on
+the optimum rather than merely near it, at least on this lane and this host.
+
+### 51b. The naive reading is 2.5x and it is WRONG
+
+Taking the best pass per width across the whole sweep gives width 4 at 0.751 ms, a
+"2.535x vs 64t". That number is an artefact: pass 1 ran width 4 at loadavg 10.5 while the
+64-thread passes ran at 33.8 and 36.7. Min-across-passes silently rewards whichever width
+happened to be scheduled while the box was quiet.
+
+The palindrome was supposed to protect against this, and it does not, because the load
+ramp was **monotone rather than symmetric** — the design cancels a trend that reverses,
+not one that only rises. Recorded because the mistake is subtle and the wrong number is
+50% larger than the right one.
+
+### 51c. The mechanism is visible in the same run
+
+The cross-core spread during this sweep was 2.864-3.001x, with the typical core at
+1966-3406 MHz. A 64-wide join waits on whichever core is at 1966 MHz; an 8-wide join can
+sit entirely inside the fast set. That is the bead's stated hypothesis, and the clock
+instrumentation from item 50 lets a row carry the evidence for it rather than assert it.
+
+### 51d. What this does NOT settle
+
+  - **Whether 8 is optimal per-op.** One lane, and it is the most parallel-heavy one on
+    the board. A lane whose kernel is already near parity may want a different width.
+  - **Whether the fix is a global cap.** The bead lists three candidate shapes (global
+    pool cap, per-op width cap, chunk-size change) and this measurement does not choose
+    between them; it only says the width axis is real and where its optimum sits here.
+  - **Whether it holds off this host.** The mechanism is a property of this box's
+    frequency spread, which is exactly the thing that varies between machines.

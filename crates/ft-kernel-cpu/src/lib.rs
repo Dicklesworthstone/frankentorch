@@ -12844,53 +12844,66 @@ pub fn conv3d_forward_f32(
     let nthreads = rayon::current_num_threads().max(1);
     let cap = (1usize << 16).div_ceil(patch_width.max(1)).max(1);
     let tile = flat.div_ceil(nthreads * 4).clamp(1, cap);
-    let mut out_flat = vec![0.0f32; flat * out_ch];
-    out_flat
-        .par_chunks_mut(tile * out_ch)
-        .enumerate()
-        .for_each(|(ti, oflat_tile)| {
-            let m0 = ti * tile;
-            let rows = oflat_tile.len() / out_ch;
-            let mut ptile = vec![0.0f32; rows * patch_width];
-            for r in 0..rows {
-                let row = m0 + r;
-                let b = row / patch_count;
-                let pc = row % patch_count;
-                let base_d = (pc / (oh * ow)) * sd;
-                let rem = pc % (oh * ow);
-                let base_h = (rem / ow) * sh;
-                let base_w = (rem % ow) * sw;
-                let batch_off = b * in_ch * pd * ph * pw;
-                let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                for c in 0..in_ch {
-                    let ch_off = batch_off + c * pd * ph * pw;
-                    let pch = c * kd * kh * kw;
-                    for kdd in 0..kd {
-                        let d_off = ch_off + (base_d + kdd) * ph * pw;
-                        let pkd = pch + kdd * kh * kw;
-                        for kr in 0..kh {
-                            let irow = d_off + (base_h + kr) * pw + base_w;
-                            let prow_off = pkd + kr * kw;
-                            prow[prow_off..(kw + prow_off)]
-                                .copy_from_slice(&padded[irow..(kw + irow)]);
+    // frankentorch-l2zki: every buffer below is zero-filled and then written in
+    // full, so the `vec![0.0; n]` was a dead SERIAL first-touch ahead of a
+    // parallel writer — the expand/transpose uninit vein. `sgemm_bt` writes
+    // `c[..m*n]` with beta=0 and `par_chunks_mut` never yields an empty chunk, so
+    // `m >= 1` and every output element of each tile is assigned. Bit-exact: no
+    // arithmetic moves, only the allocation's initialization.
+    let out_flat = build_uninit(flat * out_ch, |out_flat| {
+        out_flat
+            .par_chunks_mut(tile * out_ch)
+            .enumerate()
+            .for_each(|(ti, oflat_tile)| {
+                let m0 = ti * tile;
+                let rows = oflat_tile.len() / out_ch;
+            // The panel is fully rewritten below for every (c, kd, kh) triple, so
+            // it too needs no zero pass; it is re-created per tile, which made the
+            // dead fill scale with tile count rather than with output size.
+            let ptile = build_uninit(rows * patch_width, |ptile| {
+                for r in 0..rows {
+                    let row = m0 + r;
+                    let b = row / patch_count;
+                    let pc = row % patch_count;
+                    let base_d = (pc / (oh * ow)) * sd;
+                    let rem = pc % (oh * ow);
+                    let base_h = (rem / ow) * sh;
+                    let base_w = (rem % ow) * sw;
+                    let batch_off = b * in_ch * pd * ph * pw;
+                    let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                    for c in 0..in_ch {
+                        let ch_off = batch_off + c * pd * ph * pw;
+                        let pch = c * kd * kh * kw;
+                        for kdd in 0..kd {
+                            let d_off = ch_off + (base_d + kdd) * ph * pw;
+                            let pkd = pch + kdd * kh * kw;
+                            for kr in 0..kh {
+                                let irow = d_off + (base_h + kr) * pw + base_w;
+                                let prow_off = pkd + kr * kw;
+                                prow[prow_off..(kw + prow_off)]
+                                    .copy_from_slice(&padded[irow..(kw + irow)]);
+                            }
                         }
                     }
                 }
-            }
+            });
             gemm::sgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
-        });
-    let mut out = vec![0.0f32; batch * out_ch * patch_count];
-    out.par_chunks_mut(patch_count)
-        .enumerate()
-        .for_each(|(idx, orow)| {
-            let n = idx / out_ch;
-            let oc = idx % out_ch;
-            let bo = bias.map_or(0.0, |bb| bb[oc]);
-            for p in 0..patch_count {
-                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
-            }
-        });
-    out
+            });
+    });
+    // Same story for the NCDHW transpose: `par_chunks_mut(patch_count)` assigns
+    // every element of every chunk, so the zero pass was pure overhead.
+    build_uninit(batch * out_ch * patch_count, |out| {
+        out.par_chunks_mut(patch_count)
+            .enumerate()
+            .for_each(|(idx, orow)| {
+                let n = idx / out_ch;
+                let oc = idx % out_ch;
+                let bo = bias.map_or(0.0, |bb| bb[oc]);
+                for p in 0..patch_count {
+                    orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+                }
+            });
+    })
 }
 
 /// f32 mirror of [`conv3d_col2im_f64`]: scatter-add a `[batch·od·oh·ow,
@@ -45064,6 +45077,118 @@ mod tests {
         for i in 0..want.len() {
             assert_eq!(got[i].to_bits(), want[i].to_bits(), "depthwise3d idx={i}");
         }
+    }
+
+    /// frankentorch-l2zki, THE DECIDING TEST — run this BEFORE porting anything.
+    ///
+    /// A direct f32 Conv3d kernel accumulates one output element with a plain
+    /// sequential-k loop. The f32 path it would replace routes through
+    /// `gemm::sgemm_bt` -> `sgemm_mm` -> the `matrixmultiply` crate, which panels
+    /// over k and whose microkernel may contract to FMA. So "bit-exact to our own
+    /// current f32 output" is only achievable if blocked-k and sequential-k
+    /// coincide.
+    ///
+    /// The f64 precedent (`conv3d_direct_3x3s1_matches_streamed_reference_bits`)
+    /// proves they CAN coincide at in_ch=8, k=216 in f64. It does not prove it in
+    /// f32, which has half the mantissa, nor at the k the scored lane actually
+    /// uses: the h2h `conv3d` lane is in_ch=32, so k = 32*27 = 864.
+    ///
+    /// The k values below straddle matrixmultiply's k-blocking deliberately: tiny,
+    /// the f64 precedent's 216, the operative 864, and values just under/over the
+    /// usual 256/512/1024 panel boundaries.
+    ///
+    /// RESULT (2026-08-16): they DO NOT coincide, at ANY k tested — including k=8
+    /// and k=27, far below any panel boundary. That rules out k-blocking as the
+    /// cause and points at the microkernel itself contracting to FMA and/or
+    /// carrying several accumulators. Worst observed bit deltas:
+    ///
+    ///     k       8   27  216  255  256  257  511  512  513  864 1023 1024 2048
+    ///     delta   7   32    2    1    4    2   15   11   10   10   15   18   21
+    ///
+    /// **`frankentorch-l2zki` is therefore a TOLERANCE change, not a bit-exact
+    /// port, and is re-scoped on those terms rather than ground at.** This test is
+    /// kept as a TRIPWIRE: if `sgemm_bt` ever becomes sequential-k-exact, it fails
+    /// and the bead can be re-opened as the cheap port it was filed as.
+    ///
+    /// It also records the relative error a tolerance ratification would have to
+    /// accept, which is the number that decision actually needs.
+    #[test]
+    fn sgemm_bt_f32_is_not_sequential_k_exact_so_l2zki_is_a_tolerance_change() {
+        // Deterministic non-dyadic values: dyadic inputs can sum exactly and would
+        // hide precisely the reassociation this test exists to detect.
+        fn value(seed: u64) -> f32 {
+            let mixed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = ((mixed >> 11) as f64) / ((1u64 << 53) as f64);
+            (unit * 2.0 - 1.0) as f32
+        }
+
+        let m = 4usize; // OUT_CHANNEL_BLOCK in the f64 direct kernel
+        let n = 8usize;
+        // The k the scored h2h lane actually uses: in_ch=32, 3x3x3 => 32*27.
+        const OPERATIVE_K: usize = 864;
+        let mut divergent: Vec<(usize, u32)> = Vec::new();
+        let mut worst_relative = 0.0f64;
+
+        for &k in &[
+            1usize, 8, 27, 216, 255, 256, 257, 511, 512, 513, OPERATIVE_K, 1023, 1024, 2048,
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|i| value(i as u64)).collect();
+            let b: Vec<f32> = (0..n * k).map(|i| value(1_000_000 + i as u64)).collect();
+            let mut got = vec![0.0f32; m * n];
+            super::gemm::sgemm_bt(m, k, n, &a, &b, &mut got);
+
+            // The order a direct kernel would use: one sequential pass over k.
+            let mut want = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for p in 0..k {
+                        acc += a[row * k + p] * b[col * k + p];
+                    }
+                    want[row * n + col] = acc;
+                }
+            }
+
+            let worst = got
+                .iter()
+                .zip(want.iter())
+                .map(|(g, w)| g.to_bits().abs_diff(w.to_bits()))
+                .max()
+                .unwrap_or(0);
+            if worst != 0 {
+                divergent.push((k, worst));
+            }
+            for (g, w) in got.iter().zip(want.iter()) {
+                let denom = f64::from(w.abs()).max(f64::from(f32::MIN_POSITIVE));
+                let rel = (f64::from(*g) - f64::from(*w)).abs() / denom;
+                if rel > worst_relative {
+                    worst_relative = rel;
+                }
+            }
+        }
+
+        eprintln!(
+            "l2zki: sgemm_bt vs sequential-k f32 — divergent (k, bit delta) {divergent:?}; \
+             worst relative error {worst_relative:.3e}"
+        );
+
+        // The established fact, pinned. If this ever stops holding, sgemm_bt has
+        // become sequential-k-exact and l2zki reverts to a cheap bit-exact port.
+        assert!(
+            divergent.iter().any(|(k, _)| *k == OPERATIVE_K),
+            "sgemm_bt now MATCHES a sequential-k f32 accumulation at k={OPERATIVE_K}. \
+             That is good news: re-open frankentorch-l2zki as the bit-exact port it was \
+             filed as, and delete this tripwire."
+        );
+        // Characterise the size of the gap for the tolerance decision. Loose on
+        // purpose: the claim is "small but nonzero", not a tuned threshold.
+        assert!(
+            worst_relative < 1e-4,
+            "relative gap {worst_relative:.3e} is larger than a reassociation effect; \
+             re-examine before treating this as a tolerance question"
+        );
     }
 
     #[test]
