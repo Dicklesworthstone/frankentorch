@@ -38119,7 +38119,7 @@ mod tests {
             //    vacuous and a future edit could reintroduce it unnoticed.
             let group_numel = 2 * spatial;
             let mut sequential_differs_somewhere = false;
-            for grp in 0..batch * num_groups {
+            for (grp, stat) in stats.iter().enumerate().take(batch * num_groups) {
                 let base = grp * group_numel;
                 let (x0, x1) = x[base..base + group_numel].split_at(spatial);
                 let mut running = 0.0f32;
@@ -38144,7 +38144,7 @@ mod tests {
                 // RUNNING sum's mean, not the half-sum one.
                 let inv_m = 1.0f32 / group_numel as f32;
                 assert_eq!(
-                    stats[grp].mean.to_bits(),
+                    stat.mean.to_bits(),
                     (running * inv_m).to_bits(),
                     "group {grp} recorded a mean that is not the sequential sum's"
                 );
@@ -41580,11 +41580,10 @@ mod tests {
         let (values, offsets) =
             super::max_pool1d_forward_with_indices_f64(&input, batch, ch, len, 2, output_len, 2);
         assert!(values[0] == 1.0, "window 0 max: {}", values[0]);
-        for window in 1..=3 {
+        for (window, value) in values.iter().enumerate().take(4).skip(1) {
             assert!(
-                values[window].is_nan(),
-                "window {window} contains a NaN, so torch returns NaN; got {}",
-                values[window]
+                value.is_nan(),
+                "window {window} contains a NaN, so torch returns NaN; got {value}"
             );
         }
         assert!(
