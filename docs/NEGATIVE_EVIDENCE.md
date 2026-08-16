@@ -19749,3 +19749,46 @@ grep the file.** `cmd > log 2>&1; echo $?` then `grep -c 'test result: ok' log`.
 A gate whose evidence is a count of matched lines must also show that the count
 is nonzero, because zero is the value both a pass and a total failure produce
 after filtering.
+
+**14. THE FIRST CERTIFIED vs-PyTorch WIN, and what it took to get one
+(`frankentorch-rled4`, 2026-08-15).** This ledger is for things that did not
+work, so the entry is here because of what it corrects: this campaign had NO
+certified vs-PyTorch row, and the reason turned out to be the instrument rather
+than the code.
+
+`harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1` (5975WX, x86_64+avx2, governor powersave, 64 rayon
+threads, torch threads 8, mimalloc), build worker `vmi1227854`, ELF
+`9125c43489561480`, 32 rounds, load 5.91 -> 16.16, live PyTorch 2.12.0+cpu
+co-process interleaved per round, parity `match`:
+
+| lane | estimator | FT | PT | ratio | PT null | FT null |
+|---|---|---|---|---|---|---|
+| `prelu_noshortcut` | per-round median | 15.584 ms | 18.387 ms | **1.180x [1.140,1.222]** | PASS `[0.971,1.014]` | PASS `[0.941,1.038]` |
+| `prelu_noshortcut` | per-round min | — | — | **1.213x [1.184,1.239]** | 1.007 PASS | 0.990 PASS |
+
+Both A/A nulls pass under BOTH estimators and the two agree on direction. The
+lane is the PReLU f64 train step `[32,512,256]` with the sum shortcut DEFEATED
+through its hook exit — so FrankenTorch is faster than torch here even with its
+own lever switched off.
+
+**What was actually blocking certification: the INCUMBENT's null, not ours.** On
+every lane where FrankenTorch read FASTER, it was `PT null` that came back FAIL or
+OFFSET while the FrankenTorch arm passed — torch's own samples are the noisy ones
+on this host. A null is a verdict about the instrument, and it was being
+adjudicated on a per-round median that moves 33-51% with ambient load (item 12).
+Reducing the same four slots of the same round by their FLOOR instead, and
+adjudicating the null on the estimator the row is quoted under, turned
+`prelu_noshortcut`'s incumbent null from a veto into `1.007 PASS`.
+
+**Rows this did NOT rescue, recorded so the method is not oversold.** Of the 14
+lanes in the run exactly one became quotable. `prelu` with its shortcut ON reads
+1.69x/1.73x faster and stays unquotable (PT null OFFSET then FAIL); `avg_pool2d`
+reads 1.29-1.30x faster under both estimators and stays unquotable (PT null 1.072
+FAIL). The min estimator is not a certification machine — it removed one specific
+distortion, and thirteen rows still fail on their own merits.
+
+**And one row where the two estimators DISAGREED ON DIRECTION** — `avg_pool2d`'s
+buffer-pool pair, median `0.965x` versus min `1.005x`. The harness flags that as
+unusable under either rather than letting a reader pick. That flag is the
+guardrail against exactly the temptation this entry could otherwise create.

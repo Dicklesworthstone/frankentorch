@@ -924,6 +924,10 @@ LANES = {
     // frankentorch-rled4: the same rounds reduced by MIN instead of median.
     let mut pt_round_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_round_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut pt_first_half_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut pt_second_half_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut ft_first_half_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut ft_second_half_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut pt_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_second_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
@@ -958,6 +962,16 @@ LANES = {
                 .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));
             ft_first_half[index].push(paired_slot_median([ft_slots[0], ft_slots[1]]));
             ft_second_half[index].push(paired_slot_median([ft_slots[2], ft_slots[3]]));
+            // frankentorch-rled4: the same halves reduced by MIN. The A/A null is
+            // adjudicated on the estimator, so a noisy estimator vetoes rows whose
+            // arms are actually clean — and that is what has been happening: on
+            // every lane where FrankenTorch reads FASTER than the incumbent, it is
+            // the INCUMBENT's null that fails, not ours. Torch's own samples are
+            // the noisy ones on this host.
+            pt_first_half_min[index].push(incumbent_slots[0].min(incumbent_slots[1]));
+            pt_second_half_min[index].push(incumbent_slots[2].min(incumbent_slots[3]));
+            ft_first_half_min[index].push(ft_slots[0].min(ft_slots[1]));
+            ft_second_half_min[index].push(ft_slots[2].min(ft_slots[3]));
             // frankentorch-rled4: keep the per-round FLOOR beside the per-round
             // median. Both are computed from the SAME four slots of the same
             // round, so the two estimators see identical work and differ only in
@@ -1030,6 +1044,37 @@ LANES = {
                 "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must be within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0 and carry a calm CI; do not quote this row"
             );
         }
+        // frankentorch-rled4: the SAME row under the min estimator, nulls
+        // included. A null is a verdict about the instrument, so it must be
+        // adjudicated on the estimator the row is quoted under — quoting a
+        // min-estimator ratio behind a median-estimator null would be the
+        // mixed-estimator error of NEGATIVE_EVIDENCE item 12 wearing a gate's
+        // clothes.
+        let (min_ratio, min_ratio_lo, min_ratio_hi) =
+            median_ratio_ci(&pt_round_min[index], &ft_round_min[index]);
+        let (pt_min_null, pt_min_lo, pt_min_hi) =
+            median_ratio_ci(&pt_first_half_min[index], &pt_second_half_min[index]);
+        let (ft_min_null, ft_min_lo, ft_min_hi) =
+            median_ratio_ci(&ft_first_half_min[index], &ft_second_half_min[index]);
+        let pt_min_ok = adjudicate_null(pt_min_lo, pt_min_hi, MAX_NULL_CI_WIDTH).is_quotable()
+            && balanced_null_is_centered(pt_min_null);
+        let ft_min_ok = adjudicate_null(ft_min_lo, ft_min_hi, MAX_NULL_CI_WIDTH).is_quotable()
+            && balanced_null_is_centered(ft_min_null);
+        let min_standing = if min_ratio >= 1.0 {
+            format!("FT {min_ratio:.2}x FASTER")
+        } else {
+            format!("FT {:.2}x SLOWER", 1.0 / min_ratio)
+        };
+        println!(
+            "    MIN-ESTIMATOR {min_standing:<19} ratio {min_ratio:.3} [{min_ratio_lo:.3},{min_ratio_hi:.3}]  PT null {pt_min_null:.3} {}  FT null {ft_min_null:.3} {}  {}",
+            if pt_min_ok { "PASS" } else { "FAIL" },
+            if ft_min_ok { "PASS" } else { "FAIL" },
+            if pt_min_ok && ft_min_ok {
+                "QUOTABLE under the min estimator"
+            } else {
+                "not quotable"
+            }
+        );
     }
     println!(
         "\nQuote a lane only if both A/A gates say PASS, their point estimates are within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0, and parity is `match`. WIDE means the null's\n\
