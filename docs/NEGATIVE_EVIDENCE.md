@@ -20714,3 +20714,38 @@ Bounding the claim: seven runs, one host, one harness. The +26/+69 boundary is
 where the gap happens to fall in this sample, not a measured threshold. The honest
 reading is "small deltas certified, large ones did not, crossover somewhere between"
 — re-derive it if the host, round count or lane set changes.
+
+### Confound check on the above: is the delta just the harness measuring itself? (`5q3io`)
+
+The obvious objection, raised against my own result after it had already gone out
+fleet-wide. The harness runs **64 rayon threads** on the FrankenTorch arm plus an
+8-thread torch co-process, so *any* run raises loadavg by existing. If that
+self-inflicted component were large, "load delta" would mostly be measuring the
+harness rather than the host, and the criterion would be close to tautological.
+
+**It is not large, and the existing data bounds it.** The quietest certifying run
+moved `8.63 → 9.25` — an absolute delta of **+0.62** across a ~4-minute sweep. Every
+run pays the same self-load, so the harness's own contribution to the 1-minute
+loadavg cannot much exceed that. Against the failing runs' absolute deltas — +5.1,
++7.6, +8.7, +8.8, +20.2 — the self-inflicted part is **under 10% of the signal** in
+every failing case.
+
+The self-load is smaller than "64 threads" suggests because the sweep **interleaves**
+arms: 64-thread FrankenTorch bursts alternate with an 8-thread torch arm and with
+coordination stalls, so mean parallelism over the window sits far below peak, and
+loadavg is an average rather than a peak.
+
+**So the finding survives, with a sharper statement:** what predicts certification is
+**external** load change, and the measured delta is a good proxy because the
+harness's own contribution is bounded near +0.6 and roughly constant. Anyone
+applying the ≥ ~+50% discard rule **on a different harness should re-derive that
+bound first** — a heavier or less interleaved harness could self-inflict much more,
+and the rule would then need the self-load subtracted before it means anything.
+
+Eighth data point, consistent: `7.15 → 14.79` (+107%), 0 of 14 quotable. The tally
+is now **2 certified at ≤+26%, six failed at ≥+69%**, still nothing in the gap.
+
+What is *not* done: measuring the self-load directly by running on an idle host.
+That state has not occurred once this session — three unrelated processes have held
+a core each for fifteen hours — so the bound above is derived from data already in
+hand rather than from a run that cannot be obtained.
