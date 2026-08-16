@@ -24625,3 +24625,61 @@ rejecting.
 These certify the group_norm f32 family only — 6 lanes of 21. The other 15 remain
 unmeasured under certifying conditions, and the protocol for them is the same: one
 family at a time, filtered, 16 rounds, quoted under MIN with nulls printed.
+
+## 46. THE max_pool3d ABBA ROW, SIX DRIFT-CLEAN RUNS: INTRINSIC FT-ARM DEGRADATION, AND LOADAVG DOES NOT EXPLAIN IT
+
+The campaign's worst measured vs-incumbent lane, run ABBA in single invocations with the
+lane filter so the drift gate is passable. ELF
+`171f84f8617e1b43b81818a5873bc156cc99dea590aad4bfc6db21398761ead0`, symmetric warmup 32,
+32 rounds, balanced-square ABBAABBA, PyTorch 2.12.1+cpu, `same_host=thinkstation1`.
+
+    run  load start -> end   worst_drift  gates  min ratio            PT null      FT null
+     A   29.10 -> 27.89      1.043x       PASS   0.341 [0.322,0.360]  0.986 PASS   0.955 FAIL
+     B   37.14 -> 37.14      1.000x       PASS   0.356 [0.333,0.368]  0.982 PASS   0.955 FAIL
+     C   28.64 -> 28.64      1.000x       PASS   0.347 [0.327,0.363]  0.949 FAIL   0.965 FAIL
+     D   27.26 -> 27.26      1.000x       PASS   0.358 [0.333,0.378]  1.052 FAIL   0.847 FAIL
+     E   32.38 -> 31.63      1.024x       PASS   0.366 [0.340,0.386]  1.021 FAIL   0.855 FAIL
+     F   29.00 -> 32.92      1.135x       PASS   0.321 [0.296,0.355]  0.912 FAIL   0.884 FAIL
+
+**NOT QUOTABLE, six times.** Every drift gate passes — both endpoint and per-round series
+— so drift is excluded, and our arm's A/A null is below 1.0 in all six: 0.847, 0.855,
+0.884, 0.955, 0.955, 0.965. FrankenTorch's second-half samples are slower than its
+first-half, reproducibly, with the host holding still.
+
+That settles the question items 43 and 43c could not: **the degradation is intrinsic to our
+arm on this lane.** Not drift (gates pass), not warmup (symmetric at 32), not inter-lane
+interference (one op in the sweep).
+
+The magnitude is 2.73x-3.11x SLOWER, consistent with `28lhu`'s banked at-least-2.86x. The
+number is not in doubt; the gate is.
+
+### 46a. A hypothesis of mine that the data killed immediately
+
+Runs A-C and D-F were taken ten minutes apart and their nulls separate cleanly into two
+groups — 0.955/0.955/0.965 against 0.847/0.855/0.884. My first reading was that a quieter
+host gives our 64-thread arm a bigger initial advantage to lose, so a lower starting
+loadavg should mean a worse null.
+
+**The starting loads refute it.** They overlap almost exactly across the two groups:
+29.10 / 37.14 / 28.64 against 27.26 / 32.38 / 29.00. Run A starts at 29.10 and reads
+0.955; run F starts at 29.00 and reads 0.884. Loadavg does not distinguish them.
+
+What DOES differ is history: A-C followed three full 21-lane sweeps, D-F followed a single
+short filtered warm-up. The plausible remaining candidate is thermal or frequency state,
+which loadavg does not capture and no row in this ledger records. Offered as the surviving
+hypothesis, NOT as a finding — it is untested, and the last two mechanisms I proposed for
+this lane were both wrong.
+
+### 46b. What this forecloses
+
+No lever on max_pool3d can be certified until this is explained, because every row it
+produces fails its own A/A null for reasons that have nothing to do with the lever. That
+is worth stating plainly against the temptation to keep optimizing the op: the kernels are
+already three refutations deep (full-coverage 1.51x slower, parallel fill 0.875x,
+per-window NaN shipped at 1.478x), and the instrument cannot currently score a fourth
+attempt.
+
+The next step is an in-process phase split of OUR arm across the run — first-half against
+second-half, with per-round timings retained — to see whether the slowdown is uniform or
+concentrated, and whether it tracks a counter we can read (allocator growth, tape length)
+rather than one we can only guess at.
