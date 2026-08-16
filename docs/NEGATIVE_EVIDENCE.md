@@ -23992,3 +23992,72 @@ this specific lane — which is neither a FrankenTorch defect nor something more
 rounds or a quieter host will fix. It needs the lane itself investigated, and it is
 the single thing standing between this campaign and its first certified
 vs-incumbent row.
+
+## 54. WHY 20 LANES WOULD NOT CERTIFY: THE FrankenTorch ARM WAS STILL WARMING UP
+
+Three runs this turn, all 8-round, zero builds. Answers the standing question and
+produces the campaign's first both-nulls-PASS row — which the series gate then
+correctly refused.
+
+### 54a. Second ELF, drift-clean-ish: the 5.x replicates again
+
+    ELF fd856bb1d2fa77b2... (glibc)   group_norm_f32  FT 31.880 ms  PT 6.078 ms  5.25x SLOWER
+                                      ratio 0.191 [0.183,0.200]
+                                      PT null 0.947 OFFSET / 0.908 FAIL
+                                      FT null 1.013 PASS / 1.001 PASS   parity match
+
+`group_norm_f32` is now **5.05-5.57x across six runs and three distinct ELFs**
+(`b6daceec`, `fd856bb1`, `4831383c`). On this ELF our arm's null passes on BOTH
+estimators while the incumbent's fails one-sided on both.
+
+### 54b. The nulls were not noise — both arms had systematic, opposite trends
+
+Null distribution from the drift-clean mimalloc run, 21 lanes, MIN estimator:
+
+    FT: 0.794 0.845 0.878 0.902 0.905 0.908 0.910 0.914 0.922 0.927 0.975 | 1.014 1.015 | 1.027 ... 1.399
+    PT: 0.826 0.942 0.950 0.956 0.963 0.979 | 0.981 0.997 1.016 | 1.027 1.035 ... 1.512
+
+**11 of 21 FrankenTorch nulls sit below 0.98 and only 2 inside the band.** A null
+below 1.0 means the arm's SECOND half is FASTER than its first — the arm is still
+speeding up while being measured. That is warmup, not noise, and it is one-sided.
+The incumbent skews the other way: 12 of 21 above 1.02, i.e. torch slows during the
+run.
+
+### 54c. Confirmed by turning the knob
+
+`FT_H2H_WARMUP=32` against the default 4, same binary, same 8 rounds:
+
+    warmup=4    FT nulls  0.794 0.845 0.878 0.902 0.905 0.908 0.910 0.914 0.922 0.927 0.975 ...
+    warmup=32   FT nulls  0.721 0.890 0.903 0.953 0.964 0.971 0.974 0.976 0.983 0.993 0.995 0.996 1.004 ...
+
+Inside the +/-0.02 band: **2 -> 5**. Median FT null **0.927 -> 0.983**. The
+distribution moves toward unity exactly as the warmup explanation predicts.
+
+**The harness warms 4 iterations because that is what the incumbent warms**
+(`frankentorch-2kgum` matched them deliberately). Matching the COUNT was right for
+fairness and wrong for sufficiency: 4 iterations warm torch and do not warm us.
+
+### 54d. The first both-nulls-PASS row in the campaign — and the gate refused it
+
+    prelu_noshortcut  MIN 1.46x FASTER  ratio 1.463 [0.980,1.552]
+                      PT null 0.997 PASS   FT null 0.996 PASS
+                      endpoint_gate PASS   series_gate DRIFTED (1.327x)
+                      verdict: not quotable — LOAD-DRIFTED
+
+Both nulls passed and the ENDPOINT gate passed. **Under the gate that existed
+before item 49, this row would have been banked.** The series gate saw a 1.327x
+mid-run excursion the endpoints missed and refused it.
+
+That is the first time the new gate has changed a banking decision, and it changed
+it away from a row I wanted. It is also the second live sighting of the blind spot
+in one turn — the glibc run reported `endpoint_gate=PASS series_gate=DRIFTED` too.
+
+### 54e. What to do next, in order
+
+1. **Raise the FrankenTorch warmup and stop matching the incumbent's count.**
+   Fairness requires each arm to be warm, not that both warm identically. This is
+   an env knob today and should become the default.
+2. Re-run at `FT_H2H_WARMUP=32`, 8 rounds, and expect several lanes to certify once
+   a window holds within 1.25x across the whole series.
+3. `group_norm_f32` remains blocked by the incumbent's one-sided null
+   (`uilzh`, 0.816-0.947 across every run), which no warmup of ours can fix.
