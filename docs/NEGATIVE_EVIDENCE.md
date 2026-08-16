@@ -20474,3 +20474,31 @@ on this lane in 8 of 8 invocations now, across two incumbent patch versions) but
 not be averaged into the 2.12.0 floor of 1.006x.
 
 Both are one invocation, so **candidates, not standings** (rule 4).
+
+### `l2zki` (conv3d) cannot be checked with the existing instrument — the lane is f64, the bead is f32
+
+Claimed `frankentorch-l2zki` ("direct tiled f32 Conv3d kernel without full im2col
+materialization", premise: *"Conv3d remains about 2.3x slower than PyTorch after the
+existing f32 im2col plus SGEMM path"*) and applied the `xdw0h` rule — re-establish
+the premise before spending a multi-session lever. **The premise can neither be
+confirmed nor refuted with the gauntlet harness, and it is worth saying why.**
+
+The harness's `conv3d` lane is **f64**: its Python arm builds inputs via
+`((torch.arange(n) % 251).double()) * 0.001 - 0.12`, and the FrankenTorch arm
+mirrors it. `l2zki` targets the **f32** no-grad NCDHW path. Different dtype,
+different code path — the f32 im2col+SGEMM route the bead is about is not the route
+this lane exercises.
+
+What the lane *does* say, across four invocations: FrankenTorch is **3.88x, 3.91x,
+3.99x and 4.12x slower** on f64 conv3d op-work. **Every one of those had failing A/A
+nulls**, so none is quotable; they are recorded only as a consistent direction, and
+they are *not* evidence about the bead's f32 claim.
+
+The trap to avoid here is the one `xdw0h` fell into from the other direction:
+reading a same-named lane as confirmation. A 3.9x f64 number sitting next to a
+"2.3x" f32 claim looks like corroboration — bigger, even — and it is not evidence
+about that claim at all. **Same op name, different dtype, is a different
+measurement.**
+
+Bead returned to open, unstarted, with this recorded. Checking cost one grep of the
+harness's input construction; the lever it asks for is multi-session.
