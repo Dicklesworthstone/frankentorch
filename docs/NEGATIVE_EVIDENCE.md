@@ -23672,3 +23672,58 @@ several of them redirected levers away from terms worth ~10% — but it should b
 stated plainly: **the campaign's actual deliverable is a certified vs-incumbent
 row, and I have not produced one locally.** The measurement path is now correct
 end to end; the remaining gap is one build flag and a quiet host.
+
+## 49. THE ALLOCATOR EXPERIMENT WAS CONFOUNDED — AND NULL FAILURES TRACK LOAD, NOT THE ALLOCATOR
+
+Item 48 named the allocator (glibc malloc rather than mimalloc) the prime suspect
+for zero lanes certifying. This is the attempt to test that without a build, and
+the honest outcome: **the test failed to test it**, and the data that came back
+argues for a different cause.
+
+### 49a. What was tried, and why it needed no build
+
+No shared mimalloc exists on this box (only a static `libmimalloc.a` from a debug
+build), so `LD_PRELOAD` was not available. Instead the SAME binary was re-run with
+glibc tuned toward steadiness — `MALLOC_ARENA_MAX=1`, `MALLOC_TRIM_THRESHOLD_=-1`,
+`MALLOC_MMAP_THRESHOLD_=1073741824`, `MALLOC_TOP_PAD_=268435456` — which suppresses
+arena growth, mid-run trimming, and mmap churn: the mechanisms item 48 proposed.
+
+### 49b. It is confounded and proves nothing about allocators
+
+    run              load_1m start -> end     drift        PT FAIL   FT FAIL   of
+    plain glibc      11.98 -> 33.52           VOID (2.8x)     15        13     21
+    plain glibc      17.78 -> 17.72           PASS            16        17     21
+    TUNED glibc      50.69 -> 93.30           VOID (1.84x)    19        19     21
+
+The tuned run landed on a host at **3-5x the load of the run it should be compared
+against**, and drifted. Its 19/19 cannot be attributed to the tuning. **I am not
+claiming the tuning failed to help; the run cannot say either way**, and reading it
+as a refutation would be exactly the error item 45 warns about — quoting a row the
+gates rejected.
+
+### 49c. What the three runs together DO show
+
+Null failures rise monotonically with load: **13-15 of 21 at load ~12-34, 16-17 at
+load ~18, 19 at load ~50-93.** Load alone tracks the failure rate across every run
+taken. The allocator hypothesis is not needed to explain the pattern, and it
+remains untested.
+
+This weakens item 48's framing. That item argued the allocator was a candidate
+*cause* because the drift gate had certified the host as steady — but the drift
+gate only checks the 1m load at two instants, start and end. The run-2 host read
+17.78 and 17.72 at those two points; that is consistent with a steady host and also
+consistent with a host oscillating between them. **A gate that samples an endpoint
+pair cannot certify stability in between**, which is a genuine limitation of the
+instrument and not something item 48 accounted for.
+
+### 49d. What would actually settle it
+
+Two runs on the SAME host condition, differing only in allocator — which now means
+waiting for a quiet window rather than tuning environment variables, because the
+confound is load and load is not under this pane's control. The `--features
+fair-alloc` build remains the right next step, but it must be paired with a
+same-window plain-glibc run to be worth anything.
+
+Until then the honest state is unchanged from item 48: **no certified vs-incumbent
+row exists locally**, and the reason is now more likely host load than allocator
+choice.
