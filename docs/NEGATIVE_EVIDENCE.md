@@ -22729,3 +22729,72 @@ Nine runs on one lane with a consistent 2.5-2.7x reading and no admissible pair 
 recording as a cost: the gate is expensive, and on this host the binding constraint is
 now the A/A nulls rather than drift. Whoever wants this standing should expect to spend
 runs, and should NOT read the consistency as licence to bank it.
+
+## 37. FIVE CONVINCING WRONG ANSWERS ON ONE BUG: THE ga99y ELIMINATION CHAIN
+
+`frankentorch-ga99y` — V's rows lose orthonormality on a near-rank-1/2 matrix at
+tiny scale, silently, while reconstruction and U stay perfect. It is a small bug.
+What makes it worth an item is that **five successive mechanisms were read off the
+source, each looked right, and each was refuted by a measurement costing minutes.**
+Three of the five were mine and were recorded on the bead where a peer could have
+acted on them.
+
+### 37a. The chain
+
+    HYPOTHESIS                                    REFUTED BY                          COST
+    1  V's deficient directions are never         row norms: every row is unit,        1 filtered
+       basis-completed the way U's are            none near zero, at every scale       test run
+    2  it needs rank-deficiency generally         rank x scale sweep: rank 3 and 4     1 build
+       (plus tiny scale)                          are clean at 1e-20; only 1 and 2 fail
+    3  near-threshold QR convergence flips        FT_SVD_FORCE_NR: forcing the NR      ZERO builds
+       `(x.abs()+anorm)==anorm` branches          reduction makes it clean
+    4  the qpe2n absolute rank tolerance          that is the U side; U is the half    reading
+                                                  that stays clean
+    5  the QR sweep corrupts a good P             P measured AS IT LEAVES the          1 build
+                                                  prologue is already 1.228e-2
+
+Result: the defect is inside `svd_blocked_bidiag_prologue`, and the remaining
+question is a single binary one — bad reflectors from `bidiag_blocked_f64`, or a
+bad expansion in `bidiag_form_p_f64`.
+
+### 37b. Why hypothesis 1 is the instructive failure
+
+It was not a guess. U's deficient columns really do get an explicit
+`complete_orthonormal_basis_f64` pass and V really has no equivalent — the
+asymmetry is right there and it explains the symptom. The prediction it makes is
+ZERO OR SHORT ROWS in Vh. Every row measured 1.000, and not one was near zero.
+
+**A mechanism that explains the symptom is not evidence for that mechanism.** The
+test is whether it predicts something the symptom does not already tell you, and
+then whether that prediction holds.
+
+### 37c. The cheapest refutation used a knob that already existed
+
+Hypothesis 3 cost **no rebuild at all**. `svd_use_blocked_bidiag` already honoured
+`FT_SVD_FORCE_NR`, added earlier so the incumbent reduction could be measured live
+against the same binary. Re-running the cached binary under it took
+n=64/rank-2/1e-20 from `1.839e-2` to `3.664e-15` and moved the whole investigation
+from "somewhere in the sweep" to "the blocked path".
+
+Worth generalising: **an A/B toggle added for perf measurement is also a
+correctness bisector.** Before building anything to localise a bug, grep for
+existing env switches over the suspect region — this codebase has several
+(`FT_SVD_FORCE_NR`, `FT_POOL_ZEROED_OUTPUT`, `FT_H2H_WARMUP`) and each one splits
+the search space for free.
+
+### 37d. The sentinel that could not have been reasoned to
+
+Hypothesis 5 is the one that needed instrumenting rather than thinking.
+`FT_SVD_FORCE_NR` swaps the prologue AND the `v` the sweep consumes, so however
+many times it is run it cannot separate "the prologue makes a bad P" from "the
+sweep breaks a good one". Only measuring P at the boundary between them answers
+it. **When a toggle changes two things at once, no number of runs of that toggle
+will tell you which one mattered.**
+
+### 37e. What it cost, and the standing lesson
+
+Two builds and one cached re-run, against five mechanisms that all read
+convincingly. The campaign already had "prove which path EXECUTES before fixing
+it"; this extends it: **prove which path executes, AND measure at the boundary
+between the paths you are choosing between, because a toggle that swaps both ends
+of a pipeline cannot attribute to either end.**
