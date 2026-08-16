@@ -1078,6 +1078,48 @@ LANES = {
         ),
     ];
 
+    // frankentorch-68pwz, NEGATIVE_EVIDENCE item 58: restrict the sweep to named
+    // lanes, so ROUND COUNT and WALL CLOCK stop being the same dial.
+    //
+    // The two gates had been deadlocked. A null needs a calm CI, which needs
+    // rounds: sweep_d's group_norm min nulls were 1.014 and 1.012 — INSIDE the
+    // +/-0.02 band — and still failed because the CI was [0.158,0.511], i.e.
+    // undecidable. The drift gate needs a short window: every 16-round sweep has
+    // drifted past 1.25x. Those pulled in opposite directions only because a sweep
+    // runs all 21 lanes, so more rounds always meant a longer run.
+    //
+    // Filtering to one lane makes a 16- or 24-round sweep SHORTER in wall clock
+    // than an 8-round sweep over 21 lanes, which buys tight CIs and low drift
+    // exposure at the same time. It changes no arm, no estimator and no gate — the
+    // remaining lanes are simply not measured.
+    //
+    // `FT_H2H_LANES` is a comma-separated list of substrings; a lane runs if any
+    // matches. Unset runs everything, so an unadorned invocation stays
+    // byte-comparable with every banked row.
+    let lanes = match std::env::var("FT_H2H_LANES") {
+        Err(_) => lanes,
+        Ok(spec) => {
+            let wanted: Vec<String> = spec
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let kept: Vec<_> = lanes
+                .into_iter()
+                .filter(|(name, _)| wanted.iter().any(|w| name.contains(w.as_str())))
+                .collect();
+            assert!(
+                !kept.is_empty(),
+                "FT_H2H_LANES={spec:?} matched no lane; refusing to run an empty sweep"
+            );
+            println!(
+                "lane_filter={spec:?} kept={} of the full set (frankentorch-68pwz item 58)",
+                kept.len()
+            );
+            kept
+        }
+    };
+
     // Our side warms here; the incumbent warmed itself before announcing ready.
     //
     // The COUNT must match the incumbent's, which warms `for _ in range(4)` per

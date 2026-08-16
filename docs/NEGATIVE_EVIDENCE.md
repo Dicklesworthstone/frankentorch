@@ -24309,3 +24309,77 @@ than treated as coincidence.
 WHAT THE BOARD NEEDS is a re-run on the corrected harness during a quiet window. The
 claim that this single fix recovers the board is UNTESTED, not refuted: no run yet exists
 in which the instrument was symmetric AND the host held still.
+
+## 58. THE FIRST CERTIFIED vs-PyTorch ROWS — LANE FILTERING BROKE THE GATE DEADLOCK
+
+Nine attempts produced nothing. The tenth produced three drift-clean runs and two
+certified rows, and the change was not another hypothesis about the host.
+
+ELF `171f84f8617e1b43...`, mimalloc (`--features fair-alloc`), local build via
+`RCH_CARGO_WRAPPER_BYPASS=1`, executable from `--message-format=json`, no `[RCH]`
+line. Incumbent PyTorch 2.12.1+cpu, self-reported, same invocation.
+`FT_H2H_LANES=group_norm_f32`, `FT_H2H_REPS=16`.
+
+### 58a. THE ROWS
+
+    group_norm_f32          MIN 5.83x SLOWER   ratio 0.171 [0.162,0.177]
+                            PT null 0.989 PASS   FT null 1.010 PASS
+                            load_series worst_drift 1.151x  PASS
+                            QUOTABLE under the min estimator
+
+    group_norm_f32_zeroed   MIN 5.63x SLOWER   ratio 0.178 [0.169,0.183]
+                            PT null 0.988 PASS   FT null 1.002 PASS
+                            load_series worst_drift 1.022x  PASS
+                            QUOTABLE under the min estimator
+
+    group_norm_f32_statskernels_recompute
+                            MIN 1.94x SLOWER   ratio 0.516 [0.481,0.575]
+                            PT null 0.998 PASS   FT null 1.005 PASS
+                            load_series worst_drift 1.055x  PASS
+
+**FrankenTorch is at least 5.63x SLOWER than PyTorch on `group_norm_f32`.** Quoted
+under the MIN estimator, which is the estimator its nulls were adjudicated with
+(rule 3). Conservative bound across the two certified group_norm rows: **at least
+5.63x slower**, and the point estimates agree with the 5.05-6.09x seen across ten
+prior runs and four ELFs.
+
+### 58b. What actually unblocked it
+
+The two gates were deadlocked, and item 57's dump showed why: a null needs a CALM
+CI, which needs rounds; the drift gate needs a SHORT window. Those conflict only
+because a sweep runs all 21 lanes, so more rounds always meant a longer run.
+
+`FT_H2H_LANES` breaks the coupling. Filtering to the group_norm family (6 lanes)
+makes a 16-round sweep SHORTER in wall clock than an 8-round sweep over 21 lanes:
+
+    config                        CI on the ratio      drift        certified
+    21 lanes, 8 rounds            [0.164,0.237]        1.257x       0 (missed by 0.007)
+    21 lanes, 8 rounds (sweep_d)  [0.158,0.511] WIDE   1.203x PASS  0
+     6 lanes, 24 rounds           [0.163,0.178]        1.378x       0
+     6 lanes, 16 rounds           [0.162,0.177]        1.151x PASS  1
+     6 lanes, 16 rounds           [0.169,0.183]        1.022x PASS  1
+     6 lanes, 16 rounds           [0.165,0.173]        1.055x PASS  1
+
+Three of three at the 6-lane/16-round setting passed drift and certified a row. The
+CI tightened ~3x against the 21-lane/8-round configuration at the same time.
+
+### 58c. Why the earlier reasoning kept failing
+
+Every prior explanation — allocator, warmup, host drift, estimator noise — treated
+certification as a property of the MACHINE. It was partly a property of the
+EXPERIMENT DESIGN: measuring 21 lanes per invocation forced a choice between
+statistical power and exposure to host movement, and neither choice could win.
+Nothing about the host changed between attempt nine and attempt ten.
+
+The one substantive thing the earlier work contributed was item 57's finding that
+the MIN estimator is robust to the sporadic 2-5x contention spikes the median is
+not. Both certified rows are min-estimator rows; neither would have certified under
+the median.
+
+### 58d. Scope, stated plainly
+
+These rows certify a LOSS, not a win. They also do not settle the other 15 lanes,
+which were not measured in these runs. The lane filter should now be used to
+certify the rest a family at a time, and `frankentorch-uilzh` — the incumbent's
+one-sided null on this lane — did NOT need fixing after all: with enough rounds in
+a short enough window, torch's null lands at 0.988-0.998.
