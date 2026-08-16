@@ -25597,3 +25597,111 @@ instrumentation from item 50 lets a row carry the evidence for it rather than as
     between them; it only says the width axis is real and where its optimum sits here.
   - **Whether it holds off this host.** The mechanism is a property of this box's
     frequency spread, which is exactly the thing that varies between machines.
+
+## 67. l2zki's DIRECT f32 CONV3D CANNOT BE BIT-EXACT, AND THE 4.06x STANDING THAT SIZES IT IS AN f64 MEASUREMENT
+
+Both findings come from the bead's own pre-specified first step, taken before any
+kernel was written. No harness change; ELF `6518d518...` at HEAD `03f244f2`,
+mimalloc, incumbent PyTorch 2.12.1+cpu.
+
+### 67a. `sgemm_bt` is not sequential-k-exact at ANY k
+
+A direct kernel accumulates one output element with a sequential-k loop. The f32
+path it would replace routes `gemm::sgemm_bt` -> `sgemm_mm` -> `matrixmultiply`.
+Worst bit delta between the two orders, m=4, n=8, deterministic non-dyadic inputs
+(dyadic inputs can sum exactly and would mask reassociation):
+
+    k       8   27  216  255  256  257  511  512  513  864 1023 1024 2048
+    delta   7   32    2    1    4    2   15   11   10   10   15   18   21
+
+**k=8 and k=27 are far below any panel boundary, so k-blocking is NOT the cause** —
+the microkernel contracts to FMA and/or carries several accumulators. No choice of k
+or tile shape avoids it. The f64 precedent
+(`conv3d_direct_3x3s1_matches_streamed_reference_bits`) coincided on a wider
+mantissa, not on a property that ports to f32.
+
+Worst RELATIVE error **2.390e-6**, about 20 f32 ULP — reassociation-shaped, not a
+bug, and it is the number a tolerance ratification actually needs.
+
+So l2zki is **BLOCKED on the same policy call the SIMD-exp work needed**, not closed
+and not ground at. Test kept as a tripwire: if `sgemm_bt` ever becomes
+sequential-k-exact it fails and the bead reverts to the cheap port it was filed as.
+
+### 67b. THE STANDING THAT SIZES THE BEAD MEASURES A DIFFERENT DTYPE AND A DIFFERENT GRAD MODE
+
+The bead proposes a direct **f32** kernel and is sized by conv3d's h2h standing
+(2.3x as filed, re-measured 4.06x). That lane cannot reach `conv3d_forward_f32`:
+
+- the Rust lane builds its leaf with `tensor_variable(values.to_vec(), shape, true)`
+  over `&[f64]`, so the tensor is F64 **and requires grad**;
+- the incumbent's `seq()` returns `.double()`, so torch is f64 too — which is why
+  parity passes;
+- ft-api gates `conv3d_forward_f32` on `DType::F32 && !in_grad && !w_grad && !b_grad`
+  (`crates/ft-api/src/lib.rs` ~31693). The lane fails BOTH conditions.
+
+**The 4.06x is an f64 with-grad number.** The f32 no-grad kernel this bead is about
+has no board standing at all; its only coverage is `ops_bench.rs`. This is the same
+class of error as the four stale-scorecard findings, but sharper: the figure is
+current, correctly measured, and about a different code path.
+
+A LEAD, NOT A FINDING: for the lane's shape (in_ch=32, out_ch=32, 3x3x3, stride 1)
+every condition of the f64 direct-kernel gate in `conv3d_forward_f64` holds
+(`kd==kh==kw==3`, `sd==sh==sw==1`, `in_ch>=8`, `out_ch>=8`, `out_ch%4==0`). If that
+holds at runtime, the f64 lane ALREADY runs the direct kernel and is still 4.06x
+slower — which would mean "go direct" is not the lever for the measured gap. **Not
+verified with a poison sentinel, so it is recorded as a lead**; the sentinel is the
+owed check before anyone acts on it.
+
+### 67c. What was landed instead, and why no ratio is quoted for it
+
+`conv3d_forward_f32` allocated all three of its buffers with `vec![0.0; n]` and then
+overwrote every element — a dead SERIAL first-touch in front of a parallel writer,
+the expand/transpose uninit vein. Now `build_uninit`. The per-tile panel was the
+largest of the three because it is re-created per tile, so the dead fill scaled with
+tile COUNT rather than with output size.
+
+Proof: `conv3d_forward_f32_uninit_route_matches_zero_initialized_reference_bits`
+compares bitwise against the previous zero-initialized body reproduced verbatim, over
+two shapes, with and without bias. A zeroed route would mask an unwritten element as
+`0.0`; the uninit route cannot, which is the failure mode worth catching. 647 tests
+pass, clippy clean.
+
+**NO RATIO IS QUOTED, because by 67b the board cannot execute this code.** Landing it
+on correctness plus the vein's precedent is honest; quoting the conv3d lane's number
+next to it would not be. An f32 no-grad standing on a lane that actually reaches the
+kernel is owed before this change can be credited with anything.
+
+### 67d. THE BOARD WAS RUN ANYWAY, IN A STABLE WINDOW, AND CERTIFIED NOTHING AT 64 THREADS
+
+Three full 21-lane sweeps, ELF `6518d518...`, private snapshot so a peer rebuild of
+the shared target cannot swap it mid-run. Per-arm host state recorded per sweep as
+the standing rule now requires:
+
+    sweep  pre-load 1m  idle MHz spread  in-measurement cross-core spread  drift    certified
+    c1     17.41        2.97x            median 2.882x (max 3.005x)        1.891x   0
+    c2     26.18        2.92x            median 2.885x (max 3.009x)        1.360x   0
+    c3     26.48        2.81x            median 2.843x (max 3.005x)        1.256x   0
+
+Parity `match` on all 21 lanes of all three sweeps, 0 MISMATCH.
+
+This is the window the operator called stable, and loadavg agrees — 1m/5m/15m sat at
+12-26 and converged. **All three sweeps still failed the series gate and certified
+nothing.** That is the sixth consecutive 64-thread full-board sweep on record to
+certify 0, across two separate windows, and it replicates item 66j-bis directly: the
+8-thread cells in that alternation certified 4, 5 and 6 under worse host conditions.
+
+It also answers a question 66d left open. The idle cross-core spread was 2.81-2.97x
+BEFORE each sweep and the in-measurement spread stayed at **median ~2.88x, max 3.0x**,
+while the post-sweep idle spread collapsed to 1.26-1.67x. **The spread does not close
+once our arm is running** — it closes only afterwards, when the parked cores that were
+at 1429 MHz have been woken. So a 64-wide join really is straddling a ~2.9x clock
+range for the whole measurement, which is the mechanism 66d proposed and this is the
+in-measurement evidence for it.
+
+Nothing new is banked from these three sweeps, and that is the result: on this board,
+at the shipped 64-thread default, a stable host is not sufficient to certify a row.
+
+A peer has since measured the width curve arm-internally (item 51 in their series) and
+found the optimum at **8, worth 1.663x**, with 4 slower again — so the width lever is
+now sized as well as established, and these three sweeps are the negative control for
+it at the shipped default.
