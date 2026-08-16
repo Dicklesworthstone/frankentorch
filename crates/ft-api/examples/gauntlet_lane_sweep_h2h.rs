@@ -1137,25 +1137,35 @@ LANES = {
     // the reasoning that produced it is still correct about BIAS; it was simply
     // answering the wrong question.
     //
-    // MATCHING THE COUNT WAS RIGHT FOR FAIRNESS AND WRONG FOR SUFFICIENCY. Four
-    // iterations warm torch. They do not warm us. Measured across 21 lanes on a
-    // drift-clean run, the MIN-estimator A/A nulls were:
+    // WHY 32, AND A SIGN ERROR IN THE ORIGINAL JUSTIFICATION — READ THIS BEFORE
+    // TRUSTING THE REASONING BELOW IT.
+    //
+    // Measured across 21 lanes on a drift-clean run, the MIN-estimator A/A nulls
+    // were:
     //
     //   FT  0.794 0.845 0.878 0.902 0.905 0.908 0.910 0.914 0.922 0.927 0.975 ...
     //
-    // Eleven of twenty-one below 0.98 and only two in band. A null below 1.0 means
-    // an arm's SECOND half is FASTER than its first — the arm is still speeding up
-    // while it is being measured. That is not noise and it is not the host; it is
-    // warmup, and it was ours.
+    // Eleven of twenty-one below 0.98 and only two in band. I originally wrote that
+    // a null below 1.0 means the SECOND half is FASTER — an arm still warming up.
+    // THAT IS BACKWARDS. The null is
+    // `median_ratio_ci(first_half, second_half) = median(first)/median(second)`
+    // over TIMES, so a value below 1.0 means the first half was CHEAPER and the
+    // SECOND HALF IS SLOWER. The arm DEGRADES across a round; it does not warm up.
+    // A cold arm would put the null ABOVE 1.0.
     //
-    // Re-running the same binary and rounds at 32 moved the in-band count 2 -> 5
-    // and the median FT null 0.927 -> 0.983, which is the direction and roughly
-    // the magnitude the explanation predicts.
+    // The empirical effect of raising the count is real and unchanged: the same
+    // binary and rounds at 32 moved the in-band count 2 -> 5 and the median FT null
+    // 0.927 -> 0.983. So 32 stays. But it was NOT fixing insufficient warmup, and
+    // the mechanism is still open — pre-touching more pages before the timed region
+    // plausibly reduces later allocator/page-fault work, which would attenuate a
+    // degradation rather than complete a warm-up.
     //
-    // Fairness requires each arm to be WARM, not that both warm identically. The
-    // incumbent still warms 4 in `harness_interleave::SAMPLE_LOOP_PY` and its own
-    // nulls skew the other way (12 of 21 ABOVE 1.02, i.e. torch SLOWS during a
-    // run), so raising torch's count would not help it and is left alone.
+    // The same inversion is corrected in NEGATIVE_EVIDENCE item 54.
+    //
+    // The incumbent's nulls skew the OTHER way (12 of 21 above 1.02), which under
+    // the corrected reading means torch's second half is FASTER — torch warms
+    // during the run where we degrade. Its count is left alone because more warmup
+    // is the right remedy for that direction and it already reads this variable.
     //
     // This does not reintroduce the frankentorch-2kgum bias. That bias came from
     // under-warming one arm relative to what IT needs; both arms are now warmed to

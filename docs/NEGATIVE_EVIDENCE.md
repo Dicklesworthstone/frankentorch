@@ -24843,3 +24843,65 @@ second relaxation would admit it on independent grounds.
 A failure to certify under load is not a loss. **Nor is a failure to certify at
 loadavg 15 with 1.032x drift — that one is the instrument's threshold, not the
 machine's.**
+
+## 64. SIGN ERROR IN ITEM 54: A NULL BELOW 1.0 IS DEGRADATION, NOT WARMUP
+
+Item 54 diagnosed 11 of 21 FrankenTorch A/A nulls below 0.98 as *"the arm's SECOND
+half is FASTER than its first — the arm is still speeding up while it is being
+measured. That is warmup, and it was ours."* **The direction is backwards.**
+
+### 64a. The convention, read off the code
+
+    median_ratio_ci(numerator, denominator) -> median(numerator) / median(denominator)
+    ...
+    median_ratio_ci(&ft_first_half[index], &ft_second_half[index])
+
+The values are TIMES. So the null is `median(first_half) / median(second_half)`, and
+
+    null < 1.0  =>  first half CHEAPER  =>  SECOND HALF SLOWER  =>  the arm DEGRADES
+    null > 1.0  =>  first half dearer   =>  second half faster  =>  the arm WARMS UP
+
+A cold arm puts the null ABOVE 1.0. Item 54 asserted the opposite and built a
+warmup explanation on it.
+
+### 64b. What survives and what does not
+
+**Survives:** the empirical effect. Raising the warmup default 4 -> 32 moved the
+in-band count 2 -> 5 and the median FT null 0.927 -> 0.983, measured on one binary
+across identical rounds. The default stays at 32 on that evidence.
+
+**Does not survive:** the mechanism. The arm was not cold; it was getting SLOWER as
+each round progressed. Why more pre-touching attenuates a degradation is now an
+open question — plausibly it front-loads page faults and allocator growth that
+would otherwise land inside the timed region — and it is no longer explained.
+
+**Also inverted:** item 54 read the incumbent's skew (12 of 21 above 1.02) as
+"torch SLOWS during a run". Under the corrected sign, torch's second half is
+FASTER — **torch warms up while we degrade.** The two arms move in opposite
+directions, which is the more interesting fact and the reverse of what item 54
+recorded.
+
+### 64c. This makes the peer's max_pool3d item the correct reading
+
+A peer's item (the `max_pool3d` ABBA row over six drift-clean runs) states our arm's
+nulls are below 1.0 in all six — 0.847, 0.855, 0.884, 0.955, 0.955, 0.965 — and
+concludes *"FrankenTorch's second-half samples are slower than its first-half"*.
+That is right, and it disagreed with my item 54. I checked the code rather than
+assuming the disagreement was theirs.
+
+So `max_pool3d` shows **intrinsic within-round degradation of our arm**, reproducibly,
+with drift excluded and warmup symmetric — and the same signature is present across
+many lanes, which item 54 mislabelled as warmup.
+
+### 64d. What I did NOT do
+
+I did not attempt a blind fix for the degradation. The obvious mechanism — buffer
+pool misses forcing fresh 8 MiB allocations per `max_pool3d` backward — is already
+REFUTED by `frankentorch-7zqbc`, which raised the pool hit rate from 45/134 to
+82/134, moved no lane's paired ratio at all, and cost 440 MiB of RSS. Landing a
+change against a mechanism this ledger has already measured as inert would be
+exactly the mistake items 36, 46 and 50 record.
+
+The corrected sign is itself the deliverable: three artifacts (item 54, the harness
+comment, and the mental model behind the warmup change) asserted a direction the
+arithmetic contradicts.
