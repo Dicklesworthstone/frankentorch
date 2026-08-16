@@ -8961,45 +8961,48 @@ pub fn max_pool3d_forward_with_indices_f64(
                         // max_pool1d over [1.0, 2.0, -inf, -inf] gives index 2,
                         // the window start, not 0. frankentorch-fmmns.
                         let mut arg = loc000;
-                        let candidate = input[ibase + loc000];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc000;
+                        let w = [
+                            input[ibase + loc000],
+                            input[ibase + loc001],
+                            input[ibase + loc010],
+                            input[ibase + loc011],
+                            input[ibase + loc100],
+                            input[ibase + loc101],
+                            input[ibase + loc110],
+                            input[ibase + loc111],
+                        ];
+                        let locs = [
+                            loc000, loc001, loc010, loc011, loc100, loc101, loc110, loc111,
+                        ];
+                        // frankentorch-87sz8: ask the NaN question ONCE for the
+                        // window instead of once per element. `acc |= v != v` is a
+                        // boolean OR — associative, no dependency on the running
+                        // max — so it unrolls into a few compares, while the fused
+                        // `v > m || v.is_nan()` carries a branch on `m` through
+                        // every element. On a NaN-free window `v > m` is
+                        // elementwise identical to the fused form, so the fast arm
+                        // is only taken where the two agree; otherwise the exact
+                        // scan runs and last-NaN-wins is preserved. Measured
+                        // 1.478x at this exact shape (ledger item 23), after item
+                        // 22 predicted from instruction counts that it would lose.
+                        let mut any_nan = false;
+                        for &v in &w {
+                            any_nan |= v != v;
                         }
-                        let candidate = input[ibase + loc001];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc001;
-                        }
-                        let candidate = input[ibase + loc010];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc010;
-                        }
-                        let candidate = input[ibase + loc011];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc011;
-                        }
-                        let candidate = input[ibase + loc100];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc100;
-                        }
-                        let candidate = input[ibase + loc101];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc101;
-                        }
-                        let candidate = input[ibase + loc110];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc110;
-                        }
-                        let candidate = input[ibase + loc111];
-                        if pool_max_beats(candidate, max_value) {
-                            max_value = candidate;
-                            arg = loc111;
+                        if any_nan {
+                            for (i, &candidate) in w.iter().enumerate() {
+                                if pool_max_beats(candidate, max_value) {
+                                    max_value = candidate;
+                                    arg = locs[i];
+                                }
+                            }
+                        } else {
+                            for (i, &candidate) in w.iter().enumerate() {
+                                if candidate > max_value {
+                                    max_value = candidate;
+                                    arg = locs[i];
+                                }
+                            }
                         }
                         let oidx = (oz * oh + oy) * ow + ox;
                         orow[oidx] = max_value;
