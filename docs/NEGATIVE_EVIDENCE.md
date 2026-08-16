@@ -22469,3 +22469,71 @@ binary is already on disk at `scratchpad/h2h_ap1.bin` and needs no build.
 WHAT REMAINS FOR WHOEVER PICKS THIS UP, in order: one certifying run of the existing
 binary (no build) closes 33b. Nothing else about this bead needs a build either — the
 lever is landed and gated.
+
+## 34. ERRATA: ITEM NUMBERS 26-32 ARE EACH USED TWICE — CITE THIS LEDGER BY TITLE, NOT BY NUMBER
+
+**Every item number from 26 to 32 currently identifies two different items.** Any
+commit message, bead, or mail that says "NEGATIVE_EVIDENCE item 29" is ambiguous,
+including several of mine.
+
+### 34a. The collision table
+
+    num  line   item
+    26   21150  THE GUARDRAIL IN ITEM 25 NEEDS ONE MORE CLAUSE (shared-drift)
+    26   21558  THE UNINIT LEVER IS WORTH 1.36x ON max_pool1d
+    27   21193  THE ARMS PERTURB EACH OTHER, AND SHORT LANES CANNOT SURVIVE IT
+    27   21766  THE UNINIT LEVER PAYS ON max_pool1d AND NOT ON avg_pool2d
+    28   21485  THE SVD VECTOR PHASE IS NOT THE QR REPLAY (O(m^4) basis completion)
+    28   21957  SVD ZERO-COLUMN SKIP AT 1.73x
+    29   21666  A CONFIRMED SVD CORRECTNESS RED (absolute rank tolerance)
+    29   22062  THE PREDICTOR MADE A PREDICTION AND IT WAS WRONG
+    30   21848  CORRECTION TO ITEM 29b (no perf cliff)
+    30   22195  THE UNINIT SCREEN, RUN OVER THE WHOLE CRATE
+    31   21899  SQUARE full_matrices WAS EXCLUDED FROM ITS OWN FAST PATHS
+    31   22246  THE max_pool1d LANE APPEARS TO HAVE FLIPPED
+    32   22288  THE PAIRED DESIGN CERTIFIED 4/4
+    32   22329  THE SVD VECTORS PHASE IS THE V-ACCUMULATION
+
+Items 33 and this one are unique. Everything at or below 25 is unique.
+
+### 34b. How it happened, which is the interesting part
+
+TWO PARALLEL SEQUENCES, and both authors computed "the next number" correctly from
+an incomplete view of the file.
+
+Items 26 and 27 were appended as **bold paragraphs** (`**26. TITLE**`), not as
+markdown headings (`## 26. TITLE`). A `grep '^## '` does not find them, and neither
+does `tail`. So:
+
+- I appended after them, saw `## 25` as the last heading, and wrote `## 26` — then
+  caught it only because a peer's mail happened to say "your item 27", and
+  renumbered to 28. That correction is recorded in `a1f08b2d`.
+- A peer appending around the same time saw the same `## 25` and started their own
+  `## 26`, `## 27`, ... sequence, which is now interleaved with mine.
+
+Neither of us did anything unreasonable. **The format was inconsistent, so the
+obvious way to compute the next number was wrong for both of us, in the same way,
+independently.** That is a property of the file, not of either author.
+
+### 34c. What to do
+
+**DO NOT RENUMBER.** Several commits already cite these numbers; renumbering would
+silently invalidate those citations and would race with agents appending right now.
+The duplication is ugly but it is inert — the errata above resolves any citation.
+
+**CITE BY TITLE, or by the bead id the item carries.** Every item names its bead.
+"NEGATIVE_EVIDENCE, the SVD vectors phase item (`r7jdo.1`)" is unambiguous and
+survives renumbering; "item 32" is not and does not.
+
+**BEFORE APPENDING**, grep BOTH forms and take the max:
+
+    grep -nE "^## [0-9]+\.|^\*\*[0-9]+\." docs/NEGATIVE_EVIDENCE.md | tail -5
+
+and prefer the `## N.` heading form so the next reader's grep finds it.
+
+The transferable point is not about markdown. **A shared append-only log whose
+entry ids are computed by each writer from a scan of the log will collide whenever
+two writers scan before either appends** — the numbering is a distributed counter
+with no coordination. Titles and bead ids are content-derived and cannot collide
+that way, which is why the fix is to stop citing the counter rather than to repair
+it.
