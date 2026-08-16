@@ -20344,3 +20344,39 @@ with `ft_core::buffer_pool` DISABLED.
 **Standing rule this suggests: when a bead's title contains a ratio, re-measure
 before working it, and put the fresh number in the bead rather than in a report.**
 The stale number is not merely wrong, it is actively allocating effort.
+
+**17. TWO TORCH INSTALLS ON ONE BOX, AND MY ROWS CITE THE WRONG ONE
+(2026-08-15).** `frankentorch-y4nj9` certified `max_pool3d_nopool` at 2.74x
+(median) / 2.99x (min), both nulls PASS, from `PYTORCH_PYTHON` =
+**2.12.1+cpu**. Item 16 certified the same lane at 2.85x (median), both nulls
+PASS, from **2.12.0+cpu**. The two agree to within ~4% and bracket each other,
+which is the campaign's first independent cross-agent replication of a certified
+row — but they are NOT the same measurement, because the incumbent moved.
+
+This box carries both:
+
+```
+/data/projects/frankentorch/.venv/bin/python   -> torch 2.12.0+cpu
+/data/tmp/torchvenv-2121/bin/python            -> torch 2.12.1+cpu   <- the pin
+```
+
+The campaign pin is 2.12.1 ("version IS the measurement"), and
+`gauntlet_lane_sweep_h2h` takes whatever `PYTORCH_PYTHON` names, defaulting to
+bare `python3`. Nothing warns you. **Every row I banked this session — including
+the `prelu_noshortcut` standing across nine invocations and item 16's
+max_pool3d — was measured against 2.12.0, not the pinned 2.12.1.**
+
+**They are not withdrawn, because the harness records what it actually ran**: the
+python arm self-reports `PT_TORCH_VERSION` before any timing (frankentorch-wnku0),
+so each row names its own incumbent and is internally consistent. They are
+RE-LABELLED: those rows are vs-2.12.0 rows, and per campaign law a delta whose
+incumbent arm moved is not comparable to a vs-2.12.1 row.
+
+**Two lessons, and the second is the general one.** Specific: point
+`PYTORCH_PYTHON` at `/data/tmp/torchvenv-2121/bin/python`, and treat a bare
+`python3` default as a provenance hole rather than a convenience. General:
+**provenance fields catch a mismatch only if two people compare them.** The
+version was printed in every one of my nine runs and I read past it every time;
+what surfaced it was a PEER's row citing a different value for the same lane.
+An arm that self-reports is necessary and not sufficient — someone has to diff
+the reports.
