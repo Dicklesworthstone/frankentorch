@@ -22154,3 +22154,40 @@ three predictions this screen has now made were wrong in a way no amount of sour
 reading would have caught — prelu had no defect to fix, group_norm had the defect and
 gains nothing from fixing it. The kernel-crate-wide sweep this bead exists to prevent
 would have "fixed" both.
+
+### 29e. DECIDED: the group_norm lane's incumbent null is broken by INTERLEAVING, not warm-up
+
+Item 27c refuted the warm-up hypothesis (16 iterations changed nothing). The remaining
+candidates were interleaving, torch-internal per-invocation state, and thermal effects.
+The discriminator named there has now been run: the incumbent arm ALONE, at the resized
+lane's exact shape, with no FrankenTorch in the process and no Rust build involved.
+
+    in-harness   PT null 0.867, 0.874, 0.900        one-sided, all below 1.0
+    alone        PT null 0.9675, 1.0369, 1.0517     straddles 1.0 (64 rounds, 3 runs)
+
+That is the same sign test that identified the original defect in item 24b: a null that
+fails in ONE direction is a property of the setup, and one that straddles 1.0 is noise.
+Alone, torch's arm is clean. Interleaved, it degrades one-sidedly every time.
+
+CAUSE CONFIRMED as MossyOtter's item 27 mechanism: our 64-thread bursts running between
+the incumbent's samples. It explains why warm-up cannot fix it — the perturbation
+recurs every round rather than being a fixed prologue cost — and why more rounds makes
+it worse rather than better.
+
+CAVEAT, stated because the absolute times invite a wrong reading: the standalone script
+clones its 25.7 MB leaf per sample where the harness does not, so alone-vs-harness
+ABSOLUTE times (7.8-8.1 ms vs 6.2-7.5 ms) are not comparable. The A/A null is a
+within-arm first-half/second-half ratio, so the clone cost sits in both halves and
+cancels; the null is the statistic being compared, and it is comparable.
+
+CONSEQUENCE. `frankentorch-68pwz` cannot be unblocked by any change to the group_norm
+LANE — not sizing (item 26e), not warm-up (27c). The fix is a change to the harness
+SHAPE: measure this lane with the arms ISOLATED rather than interleaved, accepting that
+isolation reintroduces the drift problem interleaving was built to solve
+(`frankentorch-6atx2`). That is a deliberate instrument decision with a real cost on
+both sides, and it belongs to whoever owns the harness rather than to this bead.
+
+This also bounds the sweep generally: any lane whose incumbent arm is short enough for
+our bursts to perturb it is unmeasurable in this harness at ANY size or warm-up. The
+monotone-in-duration table in MossyOtter's item 27 is the screen for which lanes those
+are.
