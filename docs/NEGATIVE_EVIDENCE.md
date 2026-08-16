@@ -20080,3 +20080,59 @@ NO evidence, and it must not be averaged in with the quotable ones.** The
 temptation on a busy host is to take the nine point estimates and average them.
 That would produce ~1.1x from a set in which four runs could not certify their own
 instrument.
+
+## 2026-08-16 — A 14-LANE ATTEMPT THAT CERTIFIED NOTHING, AND THE VERSION TRAP IT FOUND (`b8mo7`)
+
+Attempted to produce a defensible vs-PyTorch row. **Did not get one.** Recorded
+because a failed certification attempt carrying full provenance is evidence, and
+because it surfaced a trap that would otherwise have manufactured a bogus
+"replication".
+
+```
+executing_elf_sha256 = ac1156652bbd0b954278b5a11404d394a19aeb62337e948d7e2039dc353e2ea9
+build worker         = vmi1149989   (rch, cargo build -j2 --release --features fair-alloc)
+harness              = crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs
+measurement_host     = thinkstation1, 5975WX 32-Core, x86_64+avx2, powersave,
+                       rayon_threads=64, online_cpus=64, torch threads=8
+allocator            = mimalloc (--features fair-alloc)
+sampling             = balanced-square ABBAABBA, 32 rounds, 4 live samples/arm/round
+load                 = 7.10 -> 12.25
+incumbent            = PyTorch 2.12.1+cpu
+```
+
+**0 of 14 lanes quotable.** Two `PT PASS` in the whole sweep against 14
+`NULL-FAILED` lines. FrankenTorch was FASTER in four lanes with parity `match` —
+`avg_pool2d` 1.364 `[1.308,1.435]`, `avg_pool2d_nopool` 1.520 `[1.452,1.594]`,
+`prelu` 1.797 `[1.758,1.898]`, `prelu_noshortcut` 1.277 `[1.236,1.318]` — and not
+one of them may be quoted. The harness says so in its own output: *do not quote
+this row*.
+
+**The blocker is the incumbent's null, again.** `prelu_noshortcut` carried PT null
+OFFSET `0.979 [0.953,1.003]` while FrankenTorch's own null PASSED at `1.001`; under
+the min estimator PT null `0.967` FAIL against FT null `1.009` PASS. That is item
+14d's root cause reproduced: it is PyTorch's arm that will not hold still.
+
+### The version trap, which matters more than the failed attempt
+
+**This run's incumbent is torch 2.12.1+cpu. The banked six-run series used
+2.12.0+cpu.** The harness prints the governing rule itself — *"a delta whose
+incumbent arm moved (version, build, or measured time) is NOT a win"*. So even with
+passing nulls this run could not have extended or replicated that series; it would
+have been a different experiment wearing the same lane name.
+
+The trap is easy to walk into because the obvious move is the wrong one: the
+pinned local venv at `/data/tmp/torchvenv-2121` is *right there*, and using it to
+"add a replication" silently changes the incumbent. **A replication must pin the
+incumbent's patch version, not just the host, the harness and the ELF.** Add it to
+the provenance you record.
+
+Second consequence, smaller: this is another point against the load explanation
+14e already withdrew — 7.10 start reading 1.277 against series run 3's 6.39 start
+reading 1.114, ~15% apart at comparable load. The differing torch patch version is
+a confound, which is precisely why the point stands as *don't explain the spread*
+rather than as a new mechanism.
+
+**What survives is direction only.** `prelu_noshortcut` has now been FrankenTorch-
+faster in **7 of 7** invocations, across **two** incumbent patch versions, parity
+`match` every time. Direction is robust; magnitude is not. **No new standing is
+banked from this run**, and the floor stays 1.006x from the 2.12.0 series.
