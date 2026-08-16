@@ -25705,3 +25705,105 @@ A peer has since measured the width curve arm-internally (item 51 in their serie
 found the optimum at **8, worth 1.663x**, with 4 slower again — so the width lever is
 now sized as well as established, and these three sweeps are the negative control for
 it at the shipped default.
+
+## 68. THE conv3d DIRECT KERNEL IS A 1.5-3.3x PESSIMIZATION ABOVE in_ch=8 — THE GATE WAS VALIDATED AT THE ONE SHAPE WHERE IT WINS
+
+Item 67b left one thing open as a LEAD rather than a finding: whether the f64 conv3d
+lane already runs the direct 3x3x3 kernel, and therefore whether "go direct" — the
+lever `frankentorch-l2zki` proposes — is a lever at all. Settled here, and the answer
+inverts the bead.
+
+Probe: `crates/ft-api/examples/conv3d_route_gate_probe.rs`, arm-internal (no incumbent,
+no ratio, no drift gate). ELF `921cbb2c...`. Per-arm host state on the quoted run:
+**loadavg 25.13 / 21.00 / 22.36 pre, 17.26 / 19.43 / 21.57 post; CPU 3052-4074 MHz,
+cross-core spread 1.33x** (a second run at spread 1.00x and a third at 2.24-3.00x gave
+the same verdict, so the finding is not clock-shaped).
+
+### 68a. The gate is observable from outside, so no sentinel edit was needed
+
+`conv3d_forward_f64` routes to the direct kernel on
+
+    kd==kh==kw==3 && sd==sh==sw==1 && in_ch>=8 && out_ch>=8 && out_ch % 4 == 0
+
+`out_ch % 4 == 0` is a DISCONTINUITY reachable through the public API. Holding
+everything else fixed at the h2h lane's shape and normalising per output channel, the
+step lands exactly on the gate:
+
+    out_ch   route     min ms   ms/out_ch
+        28   DIRECT    10.002      0.3572
+        30   stream     2.296      0.0765
+        32   DIRECT    12.759      0.3987
+        34   stream     2.175      0.0640
+        36   DIRECT    12.586      0.3496
+
+A 5x step on a 2-channel change in `out_ch` is not a shape effect. **The gate is live,
+the lane takes the direct route, and the direct route is the slow one.** This is the
+sentinel item 67b said was owed, obtained without editing
+`ft-kernel-cpu/src/lib.rs` — which currently carries another agent's uncommitted work.
+
+### 68b. THE CROSSOVER: the gate is correct at in_ch=8 and wrong above it
+
+    in_ch      k   direct ms/ch   stream ms/ch   stream/direct
+        8    216         0.0585         0.0663          1.134x   <- direct WINS
+       12    324         0.0835         0.0549          0.658x
+       16    432         0.1100         0.0756          0.687x
+       24    648         0.1444         0.0810          0.561x
+       32    864         0.2282         0.1236          0.541x   <- the h2h lane
+       48   1296         0.2904         0.0884          0.304x
+
+**in_ch=8 is the only point measured where the direct kernel wins, and it is exactly
+the shape its proof test uses** (`conv3d_direct_3x3s1_matches_streamed_reference_bits`,
+in_ch=8, k=216). The gate then admits `in_ch >= 8` with NO CEILING. Everything above
+the validation point is a 1.5-3.3x loss, and the scored lane sits at in_ch=32.
+
+This is a general trap worth naming: **a fast path validated at one shape and gated on
+an open-ended inequality is only known to be right at the shape it was validated at.**
+The proof test and the gate were written together and agree with each other; neither
+witnesses the region where the gate actually fires in production.
+
+### 68c. MY OWN MECHANISM HYPOTHESIS WAS WRONG, AND ITS OWN TEST REFUTED IT
+
+I first read the gap as under-parallelization: the direct kernel does
+`par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)` over `batch*out_ch = 64` planes, i.e.
+**16 rayon tasks**, while the streamed path tiles into **256**. On 64 cores that strands
+three quarters of the box, which is a tidy story and it is not what is happening.
+
+At `RAYON_NUM_THREADS` of 8, 16 and 64 the ratio is 0.217x, 0.217x, 0.289x. **At 8
+threads, 16 tasks is ample parallelism and the gap does not close.** So the direct
+kernel is intrinsically slower per FLOP: a scalar four-accumulator loop against
+`matrixmultiply`'s blocked SIMD microkernel. Recorded because the parallelism story
+would have sent the fix in the wrong direction.
+
+### 68d. AND THE RE-GATE IS A TOLERANCE CHANGE, IN BOTH DIRECTIONS
+
+The obvious fix — narrow the gate so in_ch above ~8 uses the streamed route — is NOT
+bit-exact. Comparing the same 30 output channels computed via each route at the
+operative k (a 30-channel weight takes the streamed route; the same 30 channels inside a
+32-channel weight take the direct one):
+
+    compared 122880 outputs: 115364 differ
+    worst bit delta 28160, worst RELATIVE 4.770e-12
+
+So the two routes disagree at k=864 in f64. Two consequences, and the second is the
+uncomfortable one:
+
+1. Capturing the 1.5-3.3x win requires the same ratification path item 67a identified
+   for f32. It is now a WELL-POSED question rather than a vague block: 4.770e-12
+   relative in f64, to buy a measured 1.5-3.3x on a scored lane.
+2. **The shipped kernel's own safety argument does not reach the shapes it runs on.**
+   `conv3d_direct_3x3s1_matches_streamed_reference_bits` establishes bitwise agreement
+   at k=216 only. At k=864 the routes differ, and the direct one is what production
+   takes. Whatever bits the lane currently produces, they are not the bits that test
+   pins.
+
+### 68e. WHAT THIS RESOLVES
+
+- **The conv3d 4.06x standing STANDS.** It is a correct f64 with-grad measurement and
+  is not withdrawn. What was half-claimed was never the standing; it was the lever.
+- **l2zki's proposal is REFUTED BY MEASUREMENT, not blocked.** It asks to port the
+  direct kernel to f32. The direct kernel loses to im2col+GEMM everywhere above
+  in_ch=8, so porting it would ship a pessimization. Item 67a's f32 tolerance question
+  is therefore MOOT — there is no reason to ratify a tolerance for a kernel now
+  measured to be slower.
+- **The real lever is the opposite of the bead**, is larger than the bead's, and is
+  sized: re-gate above in_ch~8 for 1.5-3.3x, at a cost of 4.770e-12 relative.
