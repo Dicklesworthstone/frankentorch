@@ -20282,12 +20282,36 @@ at 16.70 and closed at 36.89. Two reasons, both actionable:
 1. **The 1-minute loadavg lags.** It is exponentially weighted, so it reports the
    minute that just passed. Flat means *the last minute* was flat, not that the
    next four will be — and a 32-round sweep takes about four.
-2. **The driver is peer builds, not load.** What ramps this host is an rch build
-   starting mid-run; loadavg is only a lagging proxy for that. `rch queue` is the
-   direct observation.
+2. **The driver is other LOCAL processes.** Something starting on this machine
+   mid-run is what ramps it; loadavg is only a lagging proxy for that.
 
-**Refined pre-flight, still to be validated:** check `rch queue` for the active
-build count *and their ages*, and prefer a window whose active builds are already
-old — past their compile peak — over one where loadavg merely looks flat. A build
-that starts at minute one of a four-minute sweep ruins it, and no amount of
-loadavg-watching predicts that.
+**CORRECTION, made within the hour and before anyone acted on it: my first version
+of this said to check `rch queue`. That is wrong.** rch builds execute on *remote
+workers* and put no load on `thinkstation1` at all, so the queue cannot predict
+this host's load. Checked directly:
+
+```
+%CPU  ELAPSED  COMMAND
+ 484      124  rustc          <- a LOCAL build, 2 minutes old and still ramping
+ 335      132  python
+ 233       55  rustc
+ 144      143  rustc
+99.9    49688  smartedgar     <- x3, ~100% each, running 13.8 HOURS
+```
+
+So the load has two quite different components, and only one is predictable:
+
+- **A constant floor** from long-running unrelated workloads — three `smartedgar`
+  processes had been pinning a core each for 13.8 hours. This is stable, and a
+  balanced square cancels it. It is *not* what breaks the null.
+- **Transient local builds and benches** — `rustc` at 484% CPU, two minutes old.
+  These are what ramp the host mid-run, and they are local, so nothing in `rch
+  queue` shows them.
+
+**Refined pre-flight, corrected:** before measuring, run
+`ps -eo pcpu,etimes,comm --sort=-pcpu | head` and look for `rustc`/`python`/bench
+processes with **high %CPU and LOW elapsed** — a build that is seconds old will
+ramp through your sweep, whereas one already thirty minutes in is part of the
+stable floor. This is the same instrument-hygiene point the peer-bench contention
+work made: `pgrep` first. A four-minute sweep cannot survive a build that starts at
+minute one, and neither loadavg nor `rch queue` will warn you.
