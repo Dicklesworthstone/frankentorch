@@ -57838,6 +57838,114 @@ mod tests {
         c
     }
 
+    /// Rank-deficient, uniformly scaled variant of [`bidiag_test_matrix`].
+    ///
+    /// The existing fixture fills uniformly from roughly `[-1, 1)` — full rank,
+    /// unit scale — which is the one regime `frankentorch-ga99y` does NOT
+    /// reproduce in. Every bidiag test used it, so the blocked-vs-unblocked oracle
+    /// had never seen a rank-deficient or scaled input. NEGATIVE_EVIDENCE item 38.
+    fn bidiag_test_matrix_rank_scaled(
+        m: usize,
+        n: usize,
+        seed: u64,
+        rank: usize,
+        scale: f64,
+    ) -> Vec<f64> {
+        let full = bidiag_test_matrix(m, n, seed);
+        let mut out = vec![0.0f64; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let src = if col < rank { col } else { col % rank.max(1) };
+                out[row * n + col] = full[row * n + src] * scale;
+            }
+        }
+        out
+    }
+
+    /// Worst `|P P^T - I|` over all row pairs.
+    fn bidiag_p_orthonormality_error(p: &[f64], n: usize) -> f64 {
+        let mut worst = 0.0f64;
+        for r1 in 0..n {
+            for r2 in r1..n {
+                let mut dot = 0.0f64;
+                for c in 0..n {
+                    dot += p[r1 * n + c] * p[r2 * n + c];
+                }
+                let want = if r1 == r2 { 1.0 } else { 0.0 };
+                worst = worst.max((dot - want).abs());
+            }
+        }
+        worst
+    }
+
+    /// P must be orthonormal, asserted DIRECTLY.
+    ///
+    /// `bidiag_unblocked_q_columns_are_orthonormal` does this for Q and nothing
+    /// did it for P: P appeared only inside `A ~ Q B P^T` reconstruction checks,
+    /// and a reconstruction check cannot see this class of error because the
+    /// offending rows sit on ZERO singular values and contribute nothing to the
+    /// product. NEGATIVE_EVIDENCE item 38.
+    #[test]
+    fn bidiag_p_rows_are_orthonormal() {
+        let (m, n) = (9usize, 6usize);
+        let mut packed = bidiag_test_matrix(m, n, 0xA11CE);
+        let (_d, _e, _tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+        let p = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+        let err = bidiag_p_orthonormality_error(&p, n);
+        assert!(err < 1e-9, "P P^T deviates from I by {err}");
+    }
+
+    /// THE DECISIVE EXPERIMENT for `frankentorch-ga99y`, using only existing
+    /// machinery plus a fixture.
+    ///
+    /// P measures 1.228e-2 leaving the blocked prologue at rank 2 / scale 1e-20 /
+    /// n = 64, while `FT_SVD_FORCE_NR` (the unblocked reduction) is clean. Running
+    /// BOTH reductions on that input separates the last two candidates:
+    ///
+    ///   * unblocked clean + blocked bad -> the blocked reduction packs bad
+    ///     reflectors, and `bidiag_form_p_f64` faithfully expands bad input;
+    ///   * both bad -> the expansion is at fault, or the reflectors are
+    ///     ill-conditioned for both paths.
+    ///
+    /// Prints both errors so a failure NAMES the case rather than only reporting
+    /// that the two differ.
+    #[test]
+    fn bidiag_blocked_vs_unblocked_p_orthonormality_rank_deficient_tiny_scale() {
+        let n = 64usize;
+        let seed = 0xA11CE;
+        let (rank, scale) = (2usize, 1e-20);
+
+        let mut packed_unblocked = bidiag_test_matrix_rank_scaled(n, n, seed, rank, scale);
+        let (_du, _eu, _tqu, taup_u) =
+            super::bidiag::bidiag_unblocked_f64(&mut packed_unblocked, n, n);
+        let p_unblocked = super::bidiag::bidiag_form_p_f64(&packed_unblocked, n, &taup_u);
+        let err_unblocked = bidiag_p_orthonormality_error(&p_unblocked, n);
+
+        let mut packed_blocked = bidiag_test_matrix_rank_scaled(n, n, seed, rank, scale);
+        let (_db, _eb, _tqb, taup_b) = super::bidiag::bidiag_blocked_f64(
+            &mut packed_blocked,
+            n,
+            n,
+            super::svd_bidiag_block_size(),
+        );
+        let p_blocked = super::bidiag::bidiag_form_p_f64(&packed_blocked, n, &taup_b);
+        let err_blocked = bidiag_p_orthonormality_error(&p_blocked, n);
+
+        let verdict = if err_unblocked < 1e-9 && err_blocked >= 1e-9 {
+            "BLOCKED REDUCTION at fault (unblocked clean)"
+        } else if err_unblocked >= 1e-9 && err_blocked >= 1e-9 {
+            "BOTH bad -> the EXPANSION or reflector conditioning, not blocking"
+        } else if err_unblocked >= 1e-9 {
+            "UNBLOCKED bad, blocked clean -- unexpected, re-read the fixture"
+        } else {
+            "neither reproduces -- fixture does not hit the configuration"
+        };
+        println!(
+            "ga99y oracle rank={rank} scale={scale:e} n={n}: unblocked |PP^T-I| \
+             {err_unblocked:.3e}, blocked {err_blocked:.3e} -- {verdict}"
+        );
+    }
+
     /// `Q * B * P^T` must reproduce the original matrix. This is the defining
     /// contract of the reduction: it catches a wrong reflector convention, a
     /// wrong sign, or a missed trailing update, none of which a "runs without
