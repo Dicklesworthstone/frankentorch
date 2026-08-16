@@ -21844,3 +21844,54 @@ interleaving and the lane needs isolating rather than warming.
 `frankentorch-uilzh` keeps that as its next action; `frankentorch-68pwz` stays blocked
 behind it. The knob stays in at its default of 4, which changes nothing already
 banked, and it earned its keep by refuting the hypothesis it was built to confirm.
+
+## 30. CORRECTION TO ITEM 29b: TWO OF THE THREE TOLERANCE SITES FAIL THE SAME WAY, NOT OPPOSITE WAYS
+
+Item 29b claimed `validate_rank_deficient_svd` fails in the OPPOSITE direction
+from `svd_tall` — that a large-magnitude matrix would produce residuals above its
+absolute `1e-8` and reject a correct fast-path result, giving "a perf cliff keyed
+to nothing but input magnitude". **That is wrong, and it was wrong because I
+grepped for the constant instead of reading what it was compared against.**
+
+Reading the validator properly, its substantive checks are ALREADY relative:
+
+    let allowed = 1e-8 * fast.abs().max(reference.abs()).max(1.0);   // singular values
+    if reconstruction > 1e-7 * frob.max(1.0) { return false; }       // reconstruction
+    if svd_columns_orthogonality_error(&result.u, result.m, result.k) > 1e-8 { ... }
+
+`frob` is the Frobenius norm of the ORIGINAL matrix, so a scaled-UP input scales
+its own tolerance and is fine. The orthogonality bound is genuinely scale-free —
+U is normalized — so an absolute `1e-8` is CORRECT there and should not be
+touched. The bare `tol = 1e-8` only guards a negativity check and an ordering
+check, neither of which rejects anything at large scale.
+
+**The actual defect is the `.max(1.0)` FLOOR**, which is the same defect item 29b
+attributed only to `pinv_moore_penrose_residual_ok`. Below unit scale the floor
+pins the tolerance at `1e-8` (or `1e-7`) while the true residual should be
+proportional to the input, so both validators stop being able to fail. For a
+matrix of magnitude 1e-16 the reconstruction check permits an error eight orders
+of magnitude larger than the matrix itself.
+
+So the corrected class is:
+
+- `svd_tall` (29832): **absolute, and it produced WRONG ANSWERS.** Fixed in
+  `73dc6e02`; this remains the only site of the three that was ever incorrect.
+- `validate_rank_deficient_svd`: relative with a `.max(1.0)` floor —
+  **too permissive below unit scale.** A validator that cannot fail.
+- `pinv_moore_penrose_residual_ok`: relative with a `.max(1.0)` floor — the same.
+
+**There is no perf cliff.** Anyone who went looking for one on the strength of
+item 29b would have found nothing, and I sent a peer at it specifically.
+
+The transferable rule is narrower and more useful than "grep for absolute
+tolerances": a hardcoded constant is not evidence of a scale bug, and a relative
+formula is not evidence against one. **What matters is whether the tolerance and
+the quantity it bounds scale together** — which means reading the comparison, not
+the constant. Two of my three sites were found by grep and only one of them was
+what the grep suggested.
+
+It also revises item 29's own framing. "The three fail in different directions,
+which is probably why the class went unnoticed" was a tidy explanation for
+something that is not true; two of the three fail identically, and the reason the
+class went unnoticed is simpler — every test in the suite runs at unit scale,
+where all three behave.
