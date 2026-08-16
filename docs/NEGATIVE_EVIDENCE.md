@@ -21373,3 +21373,104 @@ both failed without producing an artifact:
 Thirty minutes bought nothing on the second. Same-binary replication is the
 substitute that is actually obtainable, and it answers a different question — it
 shows one binary reproduces, not that the result survives a rebuild.
+
+---
+
+## 25. THE UNINIT FIRST-TOUCH LEVER DOES NOT PAY ON max_pool1d — MEASURED, NEGATIVE
+
+`frankentorch-3ja43` removed a dead `vec![0.0; numel]` from both max_pool1d
+forwards, so the parallel fill became the sole writer and the page first-toucher.
+The change is bit-exact and removes real dead work. **It does not make the lane
+faster, and the FrankenTorch arm reads slightly SLOWER after it.**
+
+### 25a. The row
+
+NEW binary, ELF `0164585567e3661d...`, BUILD WORKER `vmi1227854` (rch,
+`RCH_WORKER` unset, worker reported by the build), harness
+`gauntlet_lane_sweep_h2h.rs`, `same_host=thinkstation1`, mimalloc, balanced-square
+ABBAABBA 32 rounds, incumbent PyTorch 2.12.1+cpu. ELF read from the process
+self-report, not from the file on disk.
+
+    max_pool1d_nopool
+      u2  min 0.550 [0.512,0.570]  nulls 1.005 / 1.012 PASS  drift PASS  load 38.43 -> 32.10 (-16%)
+      u4  min 0.507 [0.495,0.528]  nulls 0.983 / 1.020 PASS  drift PASS  load 38.99 -> 42.21  (+8%)
+      CONSERVATIVE: at least 1.75x SLOWER, worst bound 0.570.
+
+    max_pool1d (pooled)
+      u4  min 0.558 [0.541,0.585]  nulls 1.004 / 0.995 PASS  drift PASS
+      CANDIDATE only — one certifying run.
+
+Against the pre-lever standings on ELF `1fa33e62b39e125e`: `max_pool1d_nopool` at
+least 1.76x SLOWER (worst bound 0.569, `frankentorch-07i34`) and `max_pool1d`
+pooled at least 1.58x SLOWER (`frankentorch-yd2w7`). **1.76x -> 1.75x is not a
+change.** The two standings' intervals overlap almost completely.
+
+### 25b. The absolute arm times say it more clearly than the ratio
+
+The ratio hides this because both arms move. The FrankenTorch arm alone, same lane,
+same harness, across binaries:
+
+    max_pool1d_nopool  FT(ms)      PT(ms)
+      OLD  h2 18.443  h4 18.435  h6 18.442  n1 18.459      10.593 10.525 10.658 10.573
+      NEW  u2 19.195  u4 19.078                            11.174 10.615
+
+    max_pool1d         FT(ms)      PT(ms)
+      OLD  h2 17.031  h4 17.034  h6 16.866  n1 16.965      10.930 10.478 10.499 10.427
+      NEW  u2 17.343  u4 17.322  u5 17.271                 11.115 10.360 10.373
+
+The old binary's FT arm is extraordinarily stable — four runs inside 0.024 ms on the
+nopool lane. The new binary sits 0.6-0.75 ms above it, far outside that spread. Both
+lanes moved the same way: **~3.5% slower on nopool, ~2% slower pooled.**
+
+THE INCUMBENT IS THE CONTROL, and it did not move with it. In `u4` and `u5` the PT
+arm reads 10.615 / 10.360 / 10.373, at or BELOW the old runs' minimum — so the host
+was not penalising the incumbent while these were taken. A slowdown that appears in
+the FrankenTorch arm of TWO independent lanes while the incumbent arm is unchanged
+or faster is not the host.
+
+### 25c. What this does and does not establish
+
+ESTABLISHED: the lever produced no measurable gain, and there is a consistent
+~2-3.5% slowdown in the FT arm between the two binaries.
+
+NOT ESTABLISHED: that MY lever caused the slowdown. This is a cross-binary
+comparison and the binaries differ by more than the lever — peer commits landed in
+between (`87sz8` max_pool3d work, the SVD phase-split work), and code layout alone
+moves timings at this magnitude. Attributing the 3.5% to the uninit change would be
+exactly the error this ledger keeps recording: reading a controlled conclusion off
+an uncontrolled comparison.
+
+The load levels also differ sharply — old runs at loadavg 20-26, new at 32-43 —
+though both sets pass the drift gate, and the incumbent-arm control above is the
+reason the comparison is worth anything at all despite that.
+
+### 25d. Consequences
+
+`frankentorch-lu3ht` (extend the lever to five sibling pooling forwards) is BLOCKED,
+not merely deprioritised. The conversions were written and then **taken back out of
+the working tree**: shipping five more untested conversions of a vein that just
+failed to pay, and may cost 2-3.5%, is the opposite of what the measurement
+licenses. The patch is preserved rather than discarded, so nothing is lost if the
+controlled A/B clears the lever.
+
+WHAT WOULD SETTLE IT is a same-binary A/B — one binary with a runtime toggle between
+the zeroed and uninit paths, both arms sampled in one invocation, which is how the
+buffer-pool question on this same lane was settled. Every conclusion in 25b is
+cross-binary and cannot be made causal without it.
+
+THE BROADER READING, which matters more than this one lane: the uninit first-touch
+lever has real wins behind it (expand/transpose materialization, the avg_pool2d
+backward). This is the first lane where it was measured against PyTorch and found to
+do nothing. The pattern is present at 75 further `let mut out = vec![0.0...` sites in
+ft-kernel-cpu, across the attention and normalization families. **Do not sweep
+them.** The one lane that has been measured says the dead init was not where the
+time went, and a 75-site sweep on that basis would be an unmeasured refactor of the
+whole kernel crate.
+
+WHY THE LEVER MIGHT NOT PAY HERE, offered as a hypothesis and not a finding: the
+buffers are `batch * ch * output_len` f64, and the pooling forward reads `kernel`
+times as many input elements as it writes output ones. If the lane is bound by the
+input read rather than the output write, removing one pass over the smaller buffer
+is not where the time is. `frankentorch-md74s` records a related cost still in the
+path — the grad forward clones the whole argmax sidecar, a full write of a buffer of
+exactly this size, which the lever does not touch.
