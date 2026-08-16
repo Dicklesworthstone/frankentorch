@@ -22284,3 +22284,44 @@ Whoever next gets a quiet host should take four runs of this lane and settle it.
 the single cheapest banked standing available — no build required, the binary is on
 disk — and it would convert the campaign's most-cited LOSS into a possible win or
 confirm the loss on current code.
+
+## 32. THE PAIRED DESIGN CERTIFIED 4/4 IN THE SAME RUNS WHERE THE UNPAIRED ONE CERTIFIED 0/4
+
+Item 31 recorded four runs that produced no quotable vs-PyTorch row, on a host an
+unrelated project held between loadavg 20 and 74. The SAME four runs certified the
+paired uninit A/B every time.
+
+    run   PAIRED max_pool1d uninit ON vs OFF        PT control    vs-PyTorch row
+     1    1.411x [1.352,1.458]   31/32 rounds       1.009         NOT quotable
+     2    1.325x [1.272,2.301]   28/32 rounds       1.002         NOT quotable
+     3    1.352x [1.324,1.414]   32/32 rounds       0.996         NOT quotable
+     4    1.367x [1.330,1.407]   32/32 rounds       0.999         NOT quotable
+
+Every incumbent control lands within 1% of 1.0 while, in those same invocations, the
+incumbent's own A/A null was failing at 0.944-1.056 and every drift gate was failing on
+magnitude.
+
+THE STANDING. Conservative claim for the uninit lever on max_pool1d is unchanged at
+**at least 1.27x FASTER**, worst bound 1.272 (run 2's lower bound), now replicated on a
+FIFTH binary — ELF `2fe20c331e265aa1...`, build worker vmi1227854. Run 2's interval is
+notably wide on the upper side ([1.272,2.301]) and is the run driving the conservative
+bound; it is counted rather than discarded because its lower bound is what the claim
+rests on and discarding a wide run would only flatter the number.
+
+WHY THIS IS THE USEFUL PART, and it is a controlled comparison rather than an argument:
+the paired rows and the refused rows come from the SAME RUNS, the same binary, the same
+host, the same minutes. The only difference is the design. A per-round difference
+between two adjacently-sampled arms cancels a drift that moves both; a ratio against an
+incumbent sampled in the same round does not, because the incumbent's own within-arm
+null is what the gate tests and drift breaks that by construction (item 18).
+
+CONSEQUENCE FOR HOW WE SPEND HOSTS. A busy shared box is not uniformly unmeasurable. It
+is unmeasurable for vs-INCUMBENT standings and perfectly measurable for paired
+FT-vs-FT lever questions. When the host is loud — which on this machine is most of the
+time — the right work is lever A/Bs with A/A controls, and vs-PyTorch standings should
+wait for a quiet window rather than burning runs into a gate that cannot pass.
+
+That also bounds the claim: a paired FT-vs-FT row is NOT a vs-PyTorch standing and never
+becomes one. It says this lever is worth 1.27x against its own predecessor. It says
+nothing about where the op stands against torch, which is exactly what item 31 could not
+determine on the same data.
