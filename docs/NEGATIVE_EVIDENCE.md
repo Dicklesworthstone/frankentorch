@@ -22242,3 +22242,45 @@ site happens to have a large output with trivial per-element work.
 
 DO NOT re-derive this. The screen is cheap to re-run and its answer will not change
 without new measurements.
+
+## 31. THE max_pool1d LANE APPEARS TO HAVE FLIPPED TO FrankenTorch-FASTER, AND IT IS NOT QUOTABLE
+
+Item 26d said the max_pool1d vs-PyTorch standings do NOT transfer across the
+lane-composition change, and that a new standing has to be measured fresh. Four
+attempts on ELF `2fe20c331e265aa1...` (build worker vmi1227854) produced NO certifying
+run, and the reason is worth recording along with what the rows suggest.
+
+    run   max_pool1d min-est      PT null        FT null        drift
+     1    1.143 [1.116,1.182]     0.992 PASS     0.964 FAIL     +291%
+     2    1.120 [1.065,1.198]     0.959 FAIL     1.002 PASS     +176%
+     3    1.094 [1.017,1.138]     0.944 FAIL     1.018 PASS     +67%
+     4    1.064 [1.036,1.110]     1.024 FAIL     0.989 PASS     +16%
+
+THE POINT ESTIMATES REPLICATE WELL — 1.143, 1.120, 1.094, 1.064, all FrankenTorch-
+FASTER, against banked standings of 1.58-1.76x SLOWER on the previous binaries. On its
+face the lane has flipped, by a factor of roughly 1.8x, entirely from the
+lane-composition change of items 26-27 rather than from any change to the op.
+
+IT IS STILL NOT QUOTABLE, and the reason is the fleet's own rule. MossyOtter's
+corrected guardrail says a failing A/A null is excusable only when two runs agree AND
+the failure is SHARED — both arms off in the same direction by a similar amount,
+consistent with the host moving under both. Here EXACTLY ONE ARM FAILS IN EVERY RUN,
+and it is not even the same arm each time. Nothing cancels in the paired ratio, so
+replication proves only that the bias is stable. Four agreeing runs do not rescue it.
+
+CAUSE OF THE HOST STATE, named so nobody re-runs into it: an unrelated project on this
+box (`smartedgar`, eight download shards) drove loadavg to 74 and held it between 20
+and 44 for the whole window. Every run's drift gate failed on magnitude. This is the
+condition the load-delta criterion predicts is unmeasurable, and it was.
+
+WHAT THIS DOES NOT LICENSE. The flip is NOT banked and must not be cited. The old
+standings (`yd2w7` at least 1.58x SLOWER pooled, `07i34` at least 1.75-1.76x SLOWER
+unpooled) stand for the binaries that produced them and say nothing about this one; the
+rows above say something about this one but not at gate quality. The honest state of
+this lane is: no current standing, with a strong unbanked suggestion that it is now
+FrankenTorch-faster.
+
+Whoever next gets a quiet host should take four runs of this lane and settle it. It is
+the single cheapest banked standing available — no build required, the binary is on
+disk — and it would convert the campaign's most-cited LOSS into a possible win or
+confirm the loss on current code.
