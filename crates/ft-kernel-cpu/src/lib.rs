@@ -24915,7 +24915,14 @@ fn pinv_moore_penrose_residual_ok(a: &[f64], pinv: &[f64], m: usize, n: usize) -
     for &v in a {
         max_abs = max_abs.max(v.abs());
     }
-    let tol = 1e-7 * max_abs.max(1.0) * (m.max(n) as f64);
+    // No `.max(1.0)` floor — frankentorch-qpe2n. The residual of `A P A - A` scales
+    // linearly with A, so the floor pinned this bound at ~1e-7 below unit scale
+    // while the quantity it bounds kept shrinking: for a matrix of magnitude 1e-16
+    // it accepted essentially any pinv. A validator that cannot fail is not a
+    // validator. The zero matrix is still fine: max_abs == 0 gives tol == 0, and
+    // the residual is exactly 0, so `0.0 > 0.0` is false.
+    #[allow(clippy::cast_precision_loss)]
+    let tol = 1e-7 * max_abs * (m.max(n) as f64);
 
     let mut ap = vec![0.0f64; m * m];
     gemm::dgemm(m, n, m, a, pinv, &mut ap);
@@ -29747,9 +29754,25 @@ fn validate_rank_deficient_svd(a: &[f64], result: &SvdResult) -> bool {
     if values_only.len() != result.s.len() {
         return false;
     }
+    // Tolerances are relative to the LARGEST singular value, with no `.max(1.0)`
+    // floor — frankentorch-qpe2n. The floor made both bounds absolute below unit
+    // scale: for a matrix of magnitude 1e-16 this permitted a singular-value error
+    // eight orders of magnitude larger than the matrix itself, so the validator
+    // could not fail and waved through whatever the fast path returned.
+    //
+    // Scaling by s_max and NOT by each s_i is the load-bearing detail. A
+    // rank-deficient input — precisely what this fast path is for — has s_i ~ 0 in
+    // the deficient columns, and a per-element relative bound would demand those
+    // agree to a relative 1e-8 that rounding cannot deliver, rejecting exactly the
+    // inputs the path exists to accept. Absolute-relative-to-s_max is the standard
+    // form and is what LAPACK's own error bounds use.
+    //
+    // The zero matrix falls out correctly: s_max == 0 makes every bound 0, the
+    // differences are 0, and `0 > 0` is false, while the idx == 0 guard below
+    // rejects it into the general path.
+    let s_max = values_only.iter().fold(0.0f64, |acc, &v| acc.max(v.abs()));
+    let allowed = 1e-8 * s_max;
     for (idx, (&fast, &reference)) in result.s.iter().zip(values_only.iter()).enumerate() {
-        let scale = fast.abs().max(reference.abs()).max(1.0);
-        let allowed = 1e-8 * scale;
         if idx == 0 && fast <= allowed {
             return false;
         }
@@ -29758,7 +29781,7 @@ fn validate_rank_deficient_svd(a: &[f64], result: &SvdResult) -> bool {
         }
     }
     let (reconstruction, frob) = svd_reconstruction_error(a, result);
-    if reconstruction > 1e-7 * frob.max(1.0) {
+    if reconstruction > 1e-7 * frob {
         return false;
     }
     if svd_columns_orthogonality_error(&result.u, result.m, result.k) > 1e-8 {
@@ -41331,6 +41354,101 @@ mod tests {
     /// so `reduced - values` is the reduced-vector cost and `full - reduced` is
     /// the full-U expansion. On a square matrix these two coincide and cannot be
     /// separated, which is why the shape is tall here.
+    /// frankentorch-qpe2n, sites 2 and 3 of the scale-blind tolerance class. A
+    /// validator's verdict must not depend on the MAGNITUDE of its input, only on
+    /// whether the result is right. The `.max(1.0)` floors made both bounds
+    /// absolute below unit scale, so the validators accepted anything there.
+    ///
+    /// The half that matters is the CORRUPTED case: before the fix, a result
+    /// wrong by a relative 1e-3 was still accepted at scale 1e-20, because the
+    /// floor left ~1e-8 of absolute slack against a matrix of size 1e-20. A test
+    /// that only checked "correct results still pass" would have passed then too.
+    #[test]
+    fn svd_validators_reject_a_wrong_result_at_every_input_scale() {
+        use super::{SvdResult, svd_contiguous_f64, validate_rank_deficient_svd};
+
+        let n = 64usize;
+        let mut z = 0x51ca_7e51_ca7e_u64;
+        // Rank-deficient by construction: two independent columns, repeated.
+        let mut base = vec![0.0f64; n * n];
+        for row in 0..n {
+            for col in 0..n {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                base[row * n + col] = if col < 2 {
+                    v
+                } else {
+                    base[row * n + (col % 2)]
+                };
+            }
+        }
+
+        for &exp in &[0i32, -8, -20] {
+            let scale = 10.0f64.powi(exp);
+            let a: Vec<f64> = base.iter().map(|v| v * scale).collect();
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let good = svd_contiguous_f64(&a, &meta, false).expect("svd");
+
+            // Report every sub-check before asserting, so a failure names the term
+            // rather than the function.
+            let values_only = super::svdvals_contiguous_f64(&a, &meta).expect("svdvals");
+            let s_max = values_only.iter().fold(0.0f64, |acc, &v| acc.max(v.abs()));
+            let worst_s = good
+                .s
+                .iter()
+                .zip(values_only.iter())
+                .map(|(&f, &r)| (f - r).abs())
+                .fold(0.0f64, f64::max);
+            let (recon, frob) = super::svd_reconstruction_error(&a, &good);
+            let ortho_u = super::svd_columns_orthogonality_error(&good.u, good.m, good.k);
+            let ortho_v = super::svd_rows_orthogonality_error(&good.vh, good.k, good.n);
+            println!(
+                "qpe2n scale 1e{exp}: s_max {s_max:.3e} worst|ds| {worst_s:.3e} \
+                 allowed {:.3e} | recon {recon:.3e} vs {:.3e} | orthoU {ortho_u:.3e} \
+                 orthoV {ortho_v:.3e} (both vs 1e-8)",
+                1e-8 * s_max,
+                1e-7 * frob
+            );
+
+            // Scale 1e-20 is EXCLUDED from this assertion, and not because it is
+            // inconvenient. At that scale the diagnostic above reports
+            // orthoV ~ 1.8e-2 against a 1e-8 bound on a rank-deficient input:
+            // Vh's rows stop being orthonormal, while U stays clean at ~4e-15 and
+            // every scale-relative check passes (worst|ds| is exactly 0 and the
+            // reconstruction is 1.6e-34 against an allowance of 1.8e-26). That is
+            // a SEPARATE defect in V's construction, filed as its own bead, and it
+            // is not what this test is about. Asserting it here would couple the
+            // validator fix to an unrelated bug and make both harder to land.
+            if exp > -20 {
+                assert!(
+                    validate_rank_deficient_svd(&a, &good),
+                    "a correct SVD must validate at scale 1e{exp}"
+                );
+            }
+
+            // Corrupt by a RELATIVE amount, so the wrongness is identical at every
+            // scale and only the validator's scale-sensitivity can change the
+            // verdict.
+            let s_max = good.s.iter().copied().fold(0.0f64, f64::max);
+            let mut bad = SvdResult {
+                u: good.u.clone(),
+                s: good.s.clone(),
+                vh: good.vh.clone(),
+                m: good.m,
+                n: good.n,
+                k: good.k,
+            };
+            bad.s[0] += 1e-3 * s_max;
+            assert!(
+                !validate_rank_deficient_svd(&a, &bad),
+                "a result wrong by a relative 1e-3 must be REJECTED at scale 1e{exp}"
+            );
+        }
+    }
+
     /// frankentorch-v09ms. For a SQUARE matrix the full and reduced SVD are the
     /// same decomposition (k = m = n), so once both are eligible for the square
     /// fast paths they take the SAME code path and must agree BIT-FOR-BIT.
