@@ -25061,3 +25061,73 @@ kernel with a different crossover. Reusing a neighbour's constant felt conservat
 and was in fact untested for the path it was applied to. **A threshold is a
 measurement, not a convention** — and the cost of not measuring it was shipping a
 regression inside a commit whose own message claimed the speedup was unmeasured.
+
+## 48. CROSS-PROJECT CHECK CONFIRMED ON THIS HARNESS: OUR ARM SLOWS THE INCUMBENT, AND THE A/A NULL CANNOT SEE IT
+
+franken_numpy reported that its own arm slows the incumbent it is measured against.
+**Verified here, not assumed, and it is larger than I expected.** Observed loadavg
+13.14 / 17.65 / 24.00.
+
+### 48a. The square's slot positions say it directly
+
+`BALANCED_SQUARE = [true, false, false, true, true, false, false, true]`, so the incumbent
+holds positions 0, 3, 4, 7 and FrankenTorch holds 1, 2, 5, 6. Each incumbent slot therefore
+has a known predecessor:
+
+    incumbent slot  position  follows   median (ms)
+      0             0         PT        0.979
+      1             3         FT        1.275
+      2             4         PT        0.858
+      3             7         FT        1.255
+
+**The incumbent's samples that immediately follow one of our 64-thread bursts are 30-45%
+slower than the ones following another incumbent sample.** The pattern is clean and
+alternates exactly with the predecessor.
+
+THIS CORRECTS ITEM 46e, which had the mapping backwards — it claimed slots 0 and 2 follow a
+FrankenTorch sample. They follow the INCUMBENT. The fast slots are the uncontended ones, and
+the conclusion 46e drew from that ("samples following the other arm are faster") is wrong in
+exactly the way that made the effect look benign.
+
+### 48b. Against torch measured alone, the contention is worse than the alternation shows
+
+`crates/ft-api/examples/mp3_incumbent_alone.py` runs the same lane shape
+`[2,32,16,32,32]` with no FrankenTorch in the process, 32 warmup then 64 samples:
+
+    torch alone            min 0.465   median 0.624   p90 0.673 ms
+    torch in the harness   per-slot medians 0.858, 0.979, 1.255, 1.275 ms
+
+Even its BEST slot is ~37% slower than alone, and its worst is ~104% slower. The alternation
+in 48a is only the part that varies with the immediate predecessor; there is a floor shift on
+top of it, present in every slot.
+
+CONSERVATIVE DIRECTION: the standalone probe clones its leaf per sample, which makes the
+alone number SLOWER than a leaner probe would report. So 0.624 ms is an upper bound on
+torch's uncontended time, and the contention above is a LOWER bound.
+
+### 48c. Why the A/A null is structurally blind to this
+
+The null compares an arm's slots {0,1} against {2,3}. For the incumbent that is
+{after-PT, after-FT} against {after-PT, after-FT} — **one of each in both halves**. The
+balanced square distributes the contention evenly across the halves by construction, so a
+large, systematic, one-directional bias cancels exactly in the statistic meant to detect
+arm instability. franken_numpy's point is confirmed: an A/A null does not catch
+arm-on-arm contention, and cannot, because the square was designed to balance precisely
+this kind of positional effect.
+
+### 48d. What it does to the banked board — in both directions
+
+If the incumbent runs ~37% slower inside the harness than alone, every ratio in this
+campaign is shifted in FrankenTorch's favour:
+
+  - **Our wins are overstated.** prelu at "at least 1.30x FASTER" and avg_pool1d at
+    2.5-2.7x FASTER are measured against a handicapped incumbent.
+  - **Our losses are understated.** max_pool3d_nopool at "at least 2.86x SLOWER" is
+    measured the same way; against torch's uncontended 0.624 ms our 2.5-2.8 ms is closer
+    to 4x. **We are further behind on this lane than the banked row says.**
+
+NOT WITHDRAWING ANY ROW ON ONE LANE'S PROBE. The magnitude is measured on max_pool3d only,
+the clone caveat is real, and whether the floor shift is uniform across lanes is unknown.
+What is established is the DIRECTION and that it is not small. Quantifying it per lane needs
+the symmetric probe — an incumbent-only mode, the mirror of `FT_H2H_NO_INCUMBENT` — which
+does not exist yet and is now the highest-value instrument work on the board.
