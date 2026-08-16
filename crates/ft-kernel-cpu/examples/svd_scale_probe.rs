@@ -300,7 +300,7 @@ fn v_orthogonality_rank_scale_sweep() {
     println!();
 
     let n = 64usize;
-    for &rank in &[2usize, 4, 8, 32, 64] {
+    for &rank in &[1usize, 2, 3, 4, 8, 32, 64] {
         // `rank` independent columns; the rest repeat them cyclically.
         let mut z = 0x51ca_7e51_ca7e_u64;
         let mut base = vec![0.0f64; n * n];
@@ -334,6 +334,42 @@ fn v_orthogonality_rank_scale_sweep() {
         println!();
     }
     println!("clean is ~1e-14; the bead's failing cell is rank 2 @ 1e-20 = 1.839e-2");
+
+    // Is the trigger ABSOLUTE rank, or the RATIO rank/n? Rank 2 held fixed while n
+    // varies separates them: absolute rank predicts failure at every n, a ratio
+    // predicts it only where 2/n is small.
+    println!();
+    println!("== ga99y: rank 2 held fixed, n varied (scale 1e-20) ==");
+    println!("{:>6}  {:>14}  {}", "n", "orthoV", "rank/n");
+    for &nn in &[16usize, 32, 64, 128] {
+        let mut z = 0x51ca_7e51_ca7e_u64;
+        let mut base = vec![0.0f64; nn * nn];
+        for row in 0..nn {
+            for col in 0..nn {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                base[row * nn + col] = if col < 2 {
+                    v
+                } else {
+                    base[row * nn + (col % 2)]
+                };
+            }
+        }
+        let a: Vec<f64> = base.iter().map(|v| v * 1e-20).collect();
+        let meta = TensorMeta::from_shape(vec![nn, nn], DType::F64, Device::Cpu);
+        match svd_contiguous_f64(&a, &meta, false) {
+            Ok(r) => {
+                let e = svd_rows_orthogonality_error_pub(&r.vh, r.k, r.n);
+                #[allow(clippy::cast_precision_loss)]
+                let ratio = 2.0 / nn as f64;
+                println!("{nn:>6}  {e:>14.3e}  {ratio:.4}");
+            }
+            Err(_) => println!("{nn:>6}  {:>14}", "err"),
+        }
+    }
 }
 
 /// Local copy of the orthogonality metric so the example does not depend on a
