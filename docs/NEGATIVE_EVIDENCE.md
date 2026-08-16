@@ -25460,22 +25460,46 @@ confound by construction:
     method                                              median gain   lanes faster
     best-case (min over all runs of each config)           1.36x         21/21
     pin1-3 (8t) against b3 (64t)                           1.28x         21/21
-    ALTERNATED 64t/8t, one ELF, one window                 1.32x         21/21
+    ALTERNATED 64t/8t, 3 pairs, one ELF, one window        1.29x         21/21
 
-The alternated pair is the decisive one: same private ELF `0914fa6c...`, neither
-cell pinned, `RAYON_NUM_THREADS` the only variable, and the cells interleaved so any
-monotone host trend is shared. Both cells DRIFTED on the host gate — irrelevant here,
-because this is our arm timed against itself, not a ratio.
+The alternation is the decisive one: same private ELF `0914fa6c...`, neither cell
+pinned, `RAYON_NUM_THREADS` the only variable, cells interleaved 64/8/64/8/64/8 so any
+monotone host trend is shared. This is our arm timed against itself, so no ratio and
+no drift gate is involved.
 
-    prelu_noshortcut          26.16 -> 15.05 ms   1.74x
-    avg_pool2d                 2.22 ->  1.14      1.94x
-    max_pool3d                 2.56 ->  1.43      1.79x
-    conv3d                    34.60 -> 26.19      1.32x
-    max_pool1d_nopool          8.66 ->  8.57      1.01x
+    avg_pool2d_zeroed          2.31 ->  1.21 ms   1.92x
+    avg_pool2d                 2.21 ->  1.18      1.88x
+    max_pool3d                 2.56 ->  1.44      1.78x
+    prelu_noshortcut          24.36 -> 15.05      1.62x
+    conv3d                    33.67 -> 26.19      1.29x
+    group_norm_f32_zeroed     34.63 -> 32.81      1.06x
+    max_pool1d                 8.34 ->  8.30      1.00x
 
-The gain is smallest on the lanes that were already near parity and largest on the
-heavier parallel ones, which is the signature of join overhead and clock-spread
-exposure rather than of a single bad kernel.
+The gain is smallest on the lanes already near parity and largest on the heavier
+parallel ones, which is the signature of join overhead and clock-spread exposure
+rather than of a single bad kernel.
+
+### 66j-bis. THE SAME ALTERNATION SHOWS THE 64-THREAD POOL IS WHAT MAKES THE BOARD UNDECIDABLE
+
+Certification counts from those six interleaved cells:
+
+    n64a  64t  drift 1.364x DRIFTED/DRIFTED   certified 0
+    n08a   8t  drift 1.734x DRIFTED/DRIFTED   certified 0
+    n64b  64t  drift 1.291x PASS/DRIFTED      certified 0
+    n08b   8t  drift 1.180x PASS/PASS         certified 4
+    n64c  64t  drift 1.234x PASS/PASS         certified 0
+    n08c   8t  drift 1.161x PASS/PASS         certified 5
+
+**`n64c` is drift-clean and certifies NOTHING; `n08c`, taken minutes later in the same
+alternation on the same binary, is drift-clean and certifies FIVE.** Every 64-thread
+cell certified 0, including the one that passed both host gates. The 8-thread cells
+also drifted less (1.161-1.734x against 1.234-1.364x is overlapping, so that part is
+not established — but the certification gap is not subtle).
+
+This separates two things item 62 and item 63 had entangled. Host quiet governs whether
+a sweep is ADMISSIBLE; **our own pool width governs whether an admissible sweep can
+DECIDE anything**, because a 64-wide join across a 2.86x clock spread injects
+within-arm variance that the A/A null reads as instrument failure.
 
 **The lever this implies is pool WIDTH, not the existing parallel thresholds.** Those
 constants (`PARALLEL_THRESHOLD`, `POOL_FWD_PARALLEL_MIN`, and the rest) decide WHETHER
