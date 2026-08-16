@@ -24437,3 +24437,63 @@ making the two arms symmetric. The certified rows in item 58 were therefore take
 under SYMMETRIC warmup, not the asymmetric configuration item 55 describes — the
 ELF is identical (`171f84f8617e1b43...`), so no re-measurement is needed, but the
 provenance note in item 58 should be read with this in mind.
+
+## 60. THE NULL BAND IS MISCALIBRATED FOR THIS HOST — THE STATISTIC IS UNBIASED, THE THRESHOLD IS NOT ACHIEVABLE
+
+Tested directly instead of hunting a fourth defect. The A/A null IS a
+self-comparison, so its observed distribution says what precision this host
+supports. 36 null observations from the certified-configuration runs (6 lanes, 16
+rounds, mimalloc, symmetric warmup 32, ELF `171f84f8617e1b43...`), both arms:
+
+    median = 0.9975
+    deciles  0.935 0.961 0.970 0.975 0.989 0.997 1.002 1.010 1.024 1.030 1.109
+
+    band      inside   share
+    +/-0.020   14/36    39%     <- the current gate
+    +/-0.030   22/36    61%
+    +/-0.050   32/36    89%
+    +/-0.075   35/36    97%
+
+### 60a. Unbiased, and refused anyway
+
+**The median is 0.9975 — within a quarter of a percent of unity.** After the warmup
+fix there is no systematic bias left in the statistic; the arms really are stable
+in expectation. What remains is spread, and the +/-0.02 gate admits only 39% of it.
+
+**So roughly 61% of rows are being refused on noise, not on a defect.** That is the
+definition of a miscalibrated threshold: it is asking for a precision the machine's
+noise floor does not deliver, on a statistic that is already centred correctly.
+
+To admit ~90% of genuinely-clean rows on this host the band would have to be
++/-0.05.
+
+### 60b. Why loosening it is NOT automatically right
+
+A wider band admits real within-run bias as well as noise. The correct band is a
+function of the EFFECT BEING CLAIMED, not of the host alone:
+
+- a **5.63x** loss survives 5% of null slop untouched — the claim is that
+  FrankenTorch is between roughly 5.4x and 5.9x slower, and no reading of a
+  +/-0.05 null changes that conclusion;
+- a **1.05x** win does not survive it at all — 5% of null slop is the entire
+  claimed effect.
+
+**The campaign has been applying one band to both.** That is the actual defect
+here, and it is in the protocol rather than in the code or the host.
+
+### 60c. What I am NOT doing
+
+I am not changing `MAX_LOAD_DRIFT` or the +/-0.02 constant. Every banked row in this
+ledger was adjudicated under them, and silently widening a gate would make new rows
+incomparable with old ones while appearing to improve the board. That decision
+belongs to the fleet, not to one pane mid-measurement.
+
+### 60d. The concrete proposal
+
+Tie the null band to the claimed ratio: require the null slop to be a small
+fraction of the effect, e.g. `band = min(0.05, |1 - ratio| / 4)`. Under that rule
+the two certified group_norm rows (5.63x, 5.83x) would pass comfortably, a 1.05x
+claim would need the current +/-0.02 or tighter, and no already-banked row changes
+status. Until such a rule is agreed, rows on this host should keep being taken
+filtered — which is the one configuration that certifies anything at all — and
+quoted with their null values printed so a reader can apply their own band.
