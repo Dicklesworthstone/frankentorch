@@ -40895,6 +40895,66 @@ mod tests {
     /// (`acc |= v != v` is a boolean OR, associative, so it may unroll and
     /// vectorise) followed by 131_072 windows that each cost 8 bare compares
     /// instead of 8 fused ones.
+    /// Where the max_pool3d BACKWARD's cost actually is, and whether it moves
+    /// (`frankentorch-87sz8`).
+    ///
+    /// The NaN fast path cannot help here: the backward has no max scan at all,
+    /// it is an index-driven scatter over the forward's saved offsets. Its cost is
+    /// the dense gradient buffer — 8 MiB on the scorecard lane — of which only
+    /// 12.5% of elements ever receive a value.
+    ///
+    /// `buffer_pool::take_filled` on a pool HIT does `clear()` then
+    /// `resize(len, value)`, which is a SERIAL fill. This box has 64 cores. So the
+    /// question is whether that fill parallelises, and the answer is not obvious:
+    /// `COPY_MATERIALIZE_PARALLEL_MIN` records that parallel materialisation LOSES
+    /// below ~4M elements because one thread already saturates the write path, and
+    /// this buffer is 1M elements. Measured rather than assumed, both arms on an
+    /// already-allocated buffer so only the fill is timed.
+    #[test]
+    fn max_pool3d_backward_buffer_fill_serial_vs_parallel() {
+        let n = 1 << 20; // 8 MiB of f64 — the scorecard lane's dense gradient
+        let reps = 15;
+        let mut serial_ns = Vec::with_capacity(reps);
+        let mut parallel_ns = Vec::with_capacity(reps);
+        let mut buf = vec![0.0f64; n];
+
+        for rep in 0..reps {
+            // Dirty it between arms so neither measures an already-zero buffer.
+            #[allow(clippy::cast_precision_loss)]
+            let dirt = rep as f64 + 1.0;
+            buf.iter_mut().for_each(|slot| *slot = dirt);
+            let t = std::time::Instant::now();
+            buf.clear();
+            buf.resize(n, 0.0);
+            serial_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(&buf);
+
+            buf.iter_mut().for_each(|slot| *slot = dirt);
+            let t = std::time::Instant::now();
+            buf.par_chunks_mut(1 << 14).for_each(|chunk| {
+                chunk.fill(0.0);
+            });
+            parallel_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(&buf);
+        }
+        assert!(
+            buf.iter().all(|v| v.to_bits() == 0.0f64.to_bits()),
+            "both fills must leave the buffer zeroed"
+        );
+
+        serial_ns.sort_unstable();
+        parallel_ns.sort_unstable();
+        #[allow(clippy::cast_precision_loss)]
+        let speedup = serial_ns[0] as f64 / parallel_ns[0] as f64;
+        println!(
+            "87sz8 dense-gradient fill, {n} f64 (8 MiB), threads={}: serial clear+resize {} ns, \
+             parallel par_chunks fill {} ns, speedup {speedup:.3}x (min of {reps}, interleaved)",
+            rayon::current_num_threads(),
+            serial_ns[0],
+            parallel_ns[0]
+        );
+    }
+
     #[test]
     fn max_pool3d_nan_check_hoisted_above_the_window_is_exact_and_reports_its_speedup() {
         let windows = 1 << 17;

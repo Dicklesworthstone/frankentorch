@@ -21062,3 +21062,43 @@ correction is cheap. **Measure the shape you intend to ship, not a proxy for it.
 Consequence: the shippable form is a per-window NaN pre-check inside the existing
 window loop — a local change — not the plane- or tensor-level dispatch item 22
 called "the only shape worth wiring".
+
+**24. THE max_pool3d BACKWARD IS AT ITS FLOOR FOR THIS ALGORITHM — three levers,
+three rejections (`frankentorch-87sz8`, 2026-08-16).** Item 19 attributed 60% of
+the lane's kernel time to the backward. Three distinct attacks on it have now been
+measured and all three lose:
+
+| lever | result |
+|---|---|
+| full-coverage single pass, no zeroing (item 20) | **0.663x** |
+| fresh `vec![0.0; n]` instead of the pool (item 21) | **0.981x** |
+| parallel `par_chunks` fill instead of serial `resize` | **0.875x** |
+
+The last is new. `buffer_pool::take_filled` on a pool hit does `clear()` then
+`resize(len, value)` — a SERIAL fill of 8 MiB on a machine with many cores, which
+looks like an obvious parallelisation target. It is not: rch worker
+`vmi1227854`, min of 15, both arms interleaved on an already-allocated buffer so
+only the fill is timed, serial 134_792 ns against parallel 154_071 ns.
+
+That is the crossover `COPY_MATERIALIZE_PARALLEL_MIN` already records — one thread
+saturates the write path below ~4M elements, and this buffer is 1M — confirmed on
+the exact buffer the backward uses rather than inherited from a note.
+
+**So the backward's cost is not a wrong choice, it is the work.** It must produce
+a dense 8 MiB gradient; the zeroing is the cheapest write the machine has; the
+scatter already touches only the argmax positions; and the non-overlapping
+specialisation already buys 1.25x over the generic route. Removing the zeroing
+makes it worse, changing where the memory comes from does nothing, and
+parallelising the fill makes it worse. **The next lever on max_pool3d is not in
+this kernel.**
+
+**Caveat these three rows share, stated because it is the one that could overturn
+them:** all ran on rch worker `vmi1227854` with `threads=10`, not on the 64-core
+measurement host. The parallel-fill row in particular is thread-count sensitive by
+construction — at 64 threads the parallel arm could plausibly win where it loses at
+10. These are single-worker, single-run internal kernel A/Bs and do NOT meet the
+fleet's replicated-standing convention (two runs, ideally two workers, both A/A
+nulls passing, worst bound quoted); that convention governs vs-PyTorch rows, and
+an FT-internal A/B has no incumbent arm to null against. Treat them as
+directional, and re-run the parallel-fill arm at 64 threads before ruling it out
+for this host.
