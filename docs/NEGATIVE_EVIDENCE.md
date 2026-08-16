@@ -23329,3 +23329,62 @@ factor, including the 33.8 ms completion cost and the 4430 ms pre-fix figure.
 machine: the 14.50x completion A/B and the reduce/formP/sweep splits stand. It is
 the absolute times and every cross-host vs-PyTorch comparison that must be retaken
 locally before being cited again.
+
+## 44. THE WORST LOCAL GAP IS group_norm_f32_zeroed AT ~5x — AND THE WHOLE INVOCATION IS VOID
+
+First full local ABBA sweep at HEAD, `RCH_CARGO_WRAPPER_BYPASS=1` exported so the
+FrankenTorch arm is a genuinely local binary rather than an rch-worker one.
+
+    executing_elf_sha256 = b6daceecb97022078dacb2161440b750baa47467110eccc63e7280ba7804e468
+                           (PROCESS SELF-REPORT this time, not a file digest)
+    incumbent            = PyTorch 2.12.1+cpu, self-reported by the arm, same invocation, threads=8
+    sampling             = balanced-square ABBAABBA, 16 rounds, four live samples per arm per round
+    allocator            = system (glibc malloc)
+    load_1m              = start 11.98 -> end 33.52
+
+### 44a. Nothing here is quotable, for TWO independent reasons
+
+**Load drifted 2.8x under the measurement.** The harness's own gate:
+`LOAD-DRIFTED — no row from this invocation is quotable, whatever its nulls say`.
+That is the correct verdict and it voids the entire run, including rows whose A/A
+nulls passed cleanly.
+
+**The allocator is wrong for comparison.** The build is a plain `--release`, so it
+carries glibc malloc, and the harness says so itself: *"re-run with
+`--features fair-alloc` before quoting"*. Every previously certified row used
+mimalloc. Even on a still host, nothing from this binary would have been
+comparable to the banked set.
+
+### 44b. The rows anyway, recorded because the ORDERING is informative
+
+    group_norm_f32_zeroed   FT 31.275 ms  PT  6.457 ms   4.84x SLOWER  (MIN 5.15x, ratio 0.194 [0.185,0.217])
+                            PT null 1.005 PASS   FT null 1.002 PASS   parity match
+    max_pool3d              FT  2.257 ms  PT  1.027 ms   2.20x SLOWER  (MIN 2.25x)
+                            PT null 1.099 FAIL  FT null 0.802 FAIL
+    avg_pool1d_dense_zeroed FT 16.723 ms  PT 10.452 ms   1.60x SLOWER  (MIN 1.71x)
+    avg_pool1d_dense        FT 12.542 ms  PT 10.835 ms   1.16x SLOWER
+    max_pool1d_zeroed       FT 11.470 ms  PT 10.482 ms   1.09x SLOWER
+
+**`group_norm_f32_zeroed` is the worst measured vs-incumbent gap this campaign
+currently has, and BOTH its nulls passed** (1.005 / 1.002) — it failed only on
+drift. That makes it the strongest candidate for a certified loss once the host
+holds still, and it displaces the SVD tall case I had been treating as the worst
+gap.
+
+### 44c. What this corrects about my own recent work
+
+The prelu row banked in item 43 came from ELF `9cc2503a62543378`. Rebuilding at
+HEAD produced `b6daceecb9702207` — **a different binary**, so that row was taken
+against a pre-`81d1cfea` kernel. It should be re-taken, and its provenance gap
+(file digest rather than process self-report) is now fixed by capturing the whole
+output instead of grepping for one lane.
+
+### 44d. The reusable point
+
+I ran the sweep, got a clean-looking 5.15x with two passing nulls, and it is still
+worth nothing — because a third gate caught what the nulls structurally cannot.
+**A/A nulls detect drift WITHIN an arm across a run; they cannot see the host
+moving under both arms together**, which is what a 11.98 -> 33.52 load ramp does.
+That is why the drift gate exists as a separate check rather than a refinement of
+the nulls, and this run is the cleanest demonstration of it so far: the two
+mechanisms disagreed, and the drift gate was right.
