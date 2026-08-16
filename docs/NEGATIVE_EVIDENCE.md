@@ -23264,3 +23264,68 @@ in this ledger should name the level of the memory hierarchy it assumed, because
 128 MiB-L3 machine the working sets in these lanes (1-33 MiB) mostly do NOT reach DRAM,
 and DRAM figures overstate their cost by an order of magnitude. The next step here is a
 measured phase split inside the backward, not another estimate.
+
+## 43. THE FIRST LOCALLY-MEASURED vs-PyTorch ROWS — AND THEY LOWER A BANKED FLOOR
+
+Every vs-PyTorch number this campaign banked before now was taken with the
+FrankenTorch arm built and run through `rch`. The `cargo` on PATH is an rch offload
+wrapper that is FAIL-CLOSED — it queues every build remotely and never runs local
+rustc — so `env -u CARGO_TARGET_DIR` alone was inert and the FT arm was executing on
+a worker while the incumbent ran on `thinkstation1`. `RCH_CARGO_WRAPPER_BYPASS=1`
+(the wrapper's own documented escape, and it must be EXPORTED so children inherit
+it) produces a genuinely local binary.
+
+### 43a. The rows
+
+Local ABBA, one invocation, no `[RCH]` line, incumbent PyTorch 2.12.1+cpu, host
+`thinkstation1`:
+
+    prelu             FT  9.400 ms  PT 17.076 ms  ratio 1.817 [1.691,1.968]
+                      PT null PASS [0.972,1.052]  FT null FAIL [1.044,1.364]  parity match
+    prelu_noshortcut  FT 12.468 ms  PT 17.104 ms  ratio 1.372 [1.194,1.439]
+                      PT null PASS [0.950,1.028]  FT null PASS [0.835,1.088]  parity match
+
+**Only `prelu_noshortcut` is quotable.** The `prelu` lane's FT-side A/A null fails
+ONE-SIDED at [1.044,1.364] — the defect shape already recorded in this ledger: a
+one-sided null is a property of the lane, not host noise, and the direction it
+fails in means the passing arm is the one not to trust.
+
+### 43b. It LOWERS the banked floor, and that is the point
+
+The standing on `prelu_noshortcut` was **at least 1.30x FASTER**, itself already
+walked down from 1.32x by additional replicates. This run's interval is
+`[1.194,1.439]`.
+
+A worst-bound claim is the minimum over a sample, so every added run can only lower
+it and none can raise it. **The floor is now at least 1.194x, not 1.30x.** The
+point estimate went UP (1.372 against ~1.30) while the floor went DOWN, which is
+exactly the pattern that tempts a wrong summary — quoting 1.37x here would be
+reporting the estimate and discarding the bound the standing is made of.
+
+### 43c. Provenance gaps in this row, stated rather than glossed
+
+- **The ELF is a FILE digest, not the process self-report.** `sha256sum` of the
+  binary gives `9cc2503a62543378`, but I filtered the harness's own provenance
+  block out with a `grep` for prelu lines and cannot recover what the process
+  reported about itself. The campaign's rule is to cite the self-report, precisely
+  because `target/release/examples/` is shared and can be swapped underneath a run.
+  Nothing was rebuilt between the run and the digest, so they are almost certainly
+  the same binary — "almost certainly" is not the standard this ledger uses.
+- **Allocator differs from the earlier certified rows.** Those were built with
+  `--features fair-alloc` (mimalloc); this was a plain release build, so the
+  allocator is the system one. That is a real arm difference against every row it
+  is being compared to.
+- **Load drift and round count were also filtered away**, so the drift gate's
+  verdict on this run is unknown.
+
+### 43d. What it does to the rest of the ledger
+
+The same bypass showed the SVD `256x32 full_matrices` shape at **3.09 ms locally
+against 20.5 ms on an rch worker** — remote timings inflated ~6.6x. So every
+MAGNITUDE quoted from a remote run in this ledger is suspect by roughly that
+factor, including the 33.8 ms completion cost and the 4430 ms pre-fix figure.
+
+**Paired FT-vs-FT ratios survive**, because both arms ran in one process on one
+machine: the 14.50x completion A/B and the reduce/formP/sweep splits stand. It is
+the absolute times and every cross-host vs-PyTorch comparison that must be retaken
+locally before being cited again.
