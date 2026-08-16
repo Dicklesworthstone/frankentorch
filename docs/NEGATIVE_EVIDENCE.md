@@ -23388,3 +23388,68 @@ moving under both arms together**, which is what a 11.98 -> 33.52 load ramp does
 That is why the drift gate exists as a separate check rather than a refinement of
 the nulls, and this run is the cleanest demonstration of it so far: the two
 mechanisms disagreed, and the drift gate was right.
+
+## 45. THE ~5x GROUP_NORM LOSS REPLICATES ACROSS TWO LOCAL RUNS — STILL NOT QUOTABLE, AND THE REASON MOVED
+
+Second local ABBA sweep on the SAME already-built binary as item 44, so the two
+runs differ only in the host.
+
+    executing_elf_sha256 = b6daceecb97022078dacb2161440b750baa47467110eccc63e7280ba7804e468
+    incumbent            = PyTorch 2.12.1+cpu, self-reported, same invocation, threads=8
+    allocator            = system (glibc malloc)
+    load_1m              = start 17.78 -> end 17.72   drift_gate=PASS
+
+### 45a. The two runs side by side
+
+    run 1 (item 44)  FT 31.275 ms  PT 6.457 ms  4.84x SLOWER  MIN 5.15x  ratio 0.194 [0.185,0.217]
+                     PT null 1.005 PASS   FT null 1.002 PASS   drift VOID
+    run 2 (this)     FT 33.671 ms  PT 6.922 ms  4.86x SLOWER  MIN 5.48x  ratio 0.183 [0.174,0.200]
+                     PT null 1.094 FAIL   FT null 0.995 PASS   drift PASS
+
+**The loss replicates tightly** — 4.84x and 4.86x on the median estimator, 5.15x
+and 5.48x on the min, across two runs whose CIs overlap. `group_norm_f32_zeroed` is
+the largest vs-incumbent gap this campaign has measured locally.
+
+**Neither run is quotable, and the blocking reason CHANGED between them.** Run 1
+had two clean nulls and was voided by a 2.8x load ramp. Run 2 held the host still
+(17.78 -> 17.72, drift PASS) and the INCUMBENT null failed instead, at 1.090
+median / 1.094 min, while FrankenTorch's stayed clean at 1.002 / 0.995.
+
+### 45b. Why the second failure is not excusable by replication
+
+Item 26's clause: replication excuses a failing null only when the drift is
+SHARED, because a shared ramp affects both arms and largely cancels in the ratio.
+This is the opposite case. The incumbent moved 9% within the run while
+FrankenTorch moved 0.5% — **one-sided**, so nothing cancels, and the direction of
+the bias is unknown rather than conservative.
+
+It is also the same lane-specific defect recorded twice before on GroupNorm f32
+(PT null 1.456/1.460 one-sided). Two independent runs, two different gates, same
+lane: the evidence that this lane's incumbent arm degrades within an invocation is
+now three-deep.
+
+### 45c. The allocator caveat applies to both runs
+
+Both used a plain `--release` build carrying glibc malloc; the harness prints
+*"re-run with `--features fair-alloc` before quoting"*. Every previously certified
+row used mimalloc. So even a run that passed drift AND both nulls would not be
+comparable to the banked set until the allocator matches.
+
+### 45d. Other lanes from the drift-clean run, for ordering only
+
+    max_pool3d_nopool        FT 2.672 ms  PT 0.920 ms  2.90x SLOWER
+    max_pool3d               FT 2.487 ms  PT 0.999 ms  2.49x SLOWER  (both nulls FAIL)
+    avg_pool1d_dense_zeroed  FT 16.960 ms PT 11.791 ms 1.44x SLOWER
+    avg_pool1d_dense         FT 12.239 ms PT 11.143 ms 1.10x SLOWER
+    max_pool1d_zeroed        FT 10.880 ms PT 10.192 ms 1.07x SLOWER
+
+**No lane in this invocation certified.** Every row carried at least one null that
+was FAIL or OFFSET. That is the honest state: the instrument is working and the
+host plus allocator are not yet good enough to bank anything from it.
+
+### 45e. What it takes to certify this
+
+Three things, none of them a code change: build with `--features fair-alloc`; find
+a window where the 1m load holds within 1.25x; and fix the GroupNorm lane's
+one-sided incumbent null, which is `frankentorch-uilzh` and is the standing blocker
+on this lane rather than a property of this run.
