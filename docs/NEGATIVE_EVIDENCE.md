@@ -19981,3 +19981,39 @@ summary, which needs no mechanism:
 of wrong claim to make and the easiest to avoid: do not explain a spread until
 the spread has stopped moving.** The number itself never depended on the
 explanation, which is why it is unaffected by withdrawing it.
+
+**15. THE SCALAR REDUCTION IS WORTH 7.5x, SO THE TOLERANCE QUESTION IS NOW WORTH
+ASKING (`frankentorch-zv1y1`, 2026-08-15).** The bead's whole purpose was to price
+this BEFORE anyone was asked to accept a rounding change, so the policy call could
+be made against a number instead of a hope.
+
+`harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs` breakdown block,
+`same_host=thinkstation1`, build worker `vmi1264463`, ELF `d8e61dce`, min of 9,
+both arms reading the SAME 1568-element group in the same cache state,
+interleaved rep by rep:
+
+| reduction over one group | time |
+|---|---|
+| sequential, one dependency chain (what every statistic pass does today) | 1.142 us |
+| same data, 8 independent accumulators | 0.151 us |
+| **headroom** | **7.563x** |
+
+That is far outside this instrument's noise and it is FrankenTorch-internal, so it
+needs no incumbent arm. Every per-group statistic in the f32 GroupNorm forward and
+backward is one of these chains: float addition is not associative, so LLVM may
+neither vectorise the loop nor break the chain, and at ~4 cycles of f32 add
+latency 1568 sequential adds is what 1.142 us buys.
+
+**This does NOT authorise the change.** Multi-accumulator reduction reassociates
+the sum and moves `mean`, then `rstd`, then every output element by an ULP. There
+is no bit-exact version. What makes it a policy question rather than a refusal:
+FrankenTorch does NOT match torch bit-for-bit on this op today either — the
+harness reports parity by TOLERANCE and says `match` — so the choice is not
+"bit-exact versus not", it is WHICH non-matching order, and the vectorised one is
+both faster and closer to what torch actually does. The decision belongs to the
+user; the number is now on the table.
+
+**Bounding what it would actually buy, so nobody reads 7.5x as a lane speedup:**
+the GroupNorm f32 kernels total ~0.81 ms and the reductions are a fraction of
+that, so the lane-level effect is bounded well below 7.5x. The honest framing is
+that the reduction PHASE has 7.5x of headroom, not the op.
