@@ -1295,6 +1295,7 @@ LANES = {
     }
 
     group_norm_f32_kernel_breakdown(&gnx, &gnw, &gnb);
+    max_pool3d_kernel_breakdown(&mp3);
 
     Ok(())
 }
@@ -1313,6 +1314,89 @@ LANES = {
 /// against a live arm while the full session lane reads 11.77x, i.e. the tape is
 /// not the term — so the next question is strictly which kernel, and guessing
 /// between three of them is how the last four levers on this lane were chosen.
+/// Where the `max_pool3d` lane's time actually is (`frankentorch-87sz8`).
+///
+/// The bead is titled "9.39x slower — largest confirmed vs-upstream gap". On the
+/// current instrument the lane measures ~2.85x (NEGATIVE_EVIDENCE item 16), and
+/// GroupNorm f32 at 6-7x is the larger loss — so the title is now mis-ranking the
+/// queue. Before spending another lever here, price the two kernels the lane
+/// actually calls, exactly as the GroupNorm breakdown did. That attribution is
+/// what redirected `frankentorch-dmpho` away from a phase that turned out not to
+/// be the term.
+///
+/// FrankenTorch-internal, min of N, so no incumbent arm and no ratio: this says
+/// which of OUR kernels to attack, not how we compare to torch.
+fn max_pool3d_kernel_breakdown(values: &[f64]) {
+    let (od, oh, ow) = (MP3_D / 2, MP3_H / 2, MP3_W / 2);
+    let reps = 9;
+    let mut fwd = Vec::with_capacity(reps);
+    let mut bwd = Vec::with_capacity(reps);
+    let mut bwd_generic = Vec::with_capacity(reps);
+
+    // Built once, outside every timed region: the backward needs an upstream
+    // gradient and the offsets the forward produced, and allocating either inside
+    // the clock would price harness bookkeeping as kernel cost.
+    let (_, offsets) = ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
+        values, MP3_N, MP3_C, MP3_D, MP3_H, MP3_W, 2, 2, 2, od, oh, ow, 2, 2, 2,
+    );
+    let dout = vec![1.0f64; MP3_N * MP3_C * od * oh * ow];
+
+    for _ in 0..reps {
+        let started = Instant::now();
+        let (out, args) = ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
+            values, MP3_N, MP3_C, MP3_D, MP3_H, MP3_W, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        fwd.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box((&out, &args));
+
+        // ROUTE-MATCHED. The lane is kernel 2x2x2 with stride 2x2x2, so
+        // `kd == sd && kh == sh && kw == sw` and ft-api's backward closure takes
+        // the NON-OVERLAPPING specialisation, not the generic scatter. Timing the
+        // generic one here would repeat NEGATIVE_EVIDENCE item 7f: a split whose
+        // two arms enter different kernels measures the routing, not the phase.
+        let started = Instant::now();
+        let din = ft_kernel_cpu::max_pool3d_backward_from_indices_nonoverlapping_f64(
+            &dout, &offsets, MP3_N, MP3_C, MP3_D, MP3_H, MP3_W, od, oh, ow,
+        );
+        bwd.push(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box(&din);
+
+        // The generic scatter beside it, on the same data in the same rep, so the
+        // specialisation's own payoff is visible rather than assumed.
+        let started = Instant::now();
+        let din_generic = ft_kernel_cpu::max_pool3d_backward_from_indices_f64(
+            &dout, &offsets, MP3_N, MP3_C, MP3_D, MP3_H, MP3_W, od, oh, ow,
+        );
+        bwd_generic.push(started.elapsed().as_secs_f64() * 1_000.0);
+        assert!(
+            din_generic
+                .iter()
+                .zip(din.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the non-overlapping specialisation must agree with the generic scatter bit for bit"
+        );
+        std::hint::black_box(&din_generic);
+    }
+
+    let floor = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[0]
+    };
+    let (fwd, bwd, bwd_generic) = (floor(fwd), floor(bwd), floor(bwd_generic));
+    let in_numel = MP3_N * MP3_C * MP3_D * MP3_H * MP3_W;
+    let out_numel = MP3_N * MP3_C * od * oh * ow;
+    println!(
+        "\nMAX_POOL3D KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of {reps}; NOT a ratio)\n  \
+         input numel={in_numel}  output numel={out_numel}  kernel 2x2x2 stride 2x2x2  rayon_threads={}\n  \
+         forward_with_indices_f64  {fwd:8.3} ms   reads {in_numel} elems, 8 comparisons per output\n  \
+         backward NONOVERLAPPING   {bwd:8.3} ms   the route ft-api actually takes (kernel == stride); scatters {out_numel} values into a dense {in_numel}-element buffer\n  \
+         backward generic scatter  {bwd_generic:8.3} ms   same data, same rep, bit-identical output — what the specialisation buys\n  \
+         total on the live route   {:8.3} ms",
+        rayon::current_num_threads(),
+        fwd + bwd,
+    );
+}
+
 fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32]) {
     let spatial = GN_H * GN_W;
     let channels_per_group = GN_C / GN_GROUPS;
