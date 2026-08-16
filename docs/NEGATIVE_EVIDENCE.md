@@ -22984,3 +22984,57 @@ the row format would be the thorough one.
 UNMEASURED BY ANY LANE: batch_norm1d and batch_norm2d_f32 have shortcuts but no h2h lane
 at all, so both their routes are dark. Not a defect, just a fact worth knowing before
 someone sizes a lever there.
+
+## 39. CORRECTION TO ITEM 38: AN ORACLE CANNOT DETECT A FAULT ITS REFERENCE SHARES
+
+Item 38 said `frankentorch-ga99y` sat in the intersection of two test gaps —
+fixtures that are all full-rank unit-scale, and P having no orthonormality
+assertion — and that **"either gap alone would have caught it."** Measurement says
+the first half of that is wrong.
+
+### 39a. The number that corrects it
+
+The decisive run, rank 2, scale 1e-20, n = 64, worst `|P P^T - I|`:
+
+    unblocked (the reference)   1.644e-8
+    blocked                     1.113e-2
+    BOTH BAD
+
+Neither meets the 1e-9 bound. The unblocked path is not a clean reference on this
+input — it degrades to `1.644e-8` against the `~1e-15` it reaches on benign input.
+Blocking then amplifies that by roughly 700,000x.
+
+### 39b. Why the fixture gap alone would NOT have caught it
+
+`bidiag_blocked_matches_unblocked_oracle` asserts that the two paths AGREE. Handed
+this fixture it would have seen a `1.1e-2` disagreement and reported it — but what
+it reports is "blocking changed the answer", and the natural reading of that is
+that the blocked panel drifted from a correct reference. **The reference is also
+wrong here, by seven orders of magnitude more than it should be.** A differential
+oracle has no way to say so: agreement and correctness are different properties,
+and it only measures the first.
+
+Only the missing assertion — `P P^T = I`, an ABSOLUTE invariant — would have
+caught the shared fault.
+
+### 39c. The sharper rule
+
+**Differential testing against a reference implementation is only as good as the
+reference, and it is structurally blind to any fault the two implementations
+share.** Two implementations of the same algorithm, written from the same paper by
+the same hand, share assumptions — here, whatever makes reflector generation
+fragile for a near-rank-2 matrix at 1e-20 is in both.
+
+Absolute invariants are not a weaker, lazier form of differential testing. They
+catch a class differential testing cannot reach. A kernel that produces an
+orthogonal factor should assert orthogonality against `I`, not against another
+implementation's orthogonal factor.
+
+This also revises what the fix must do. **A fix validated by making the blocked
+path match the unblocked one would be validated against something that is itself
+wrong** — it would land at `1.6e-8` and look like success against the oracle while
+still failing the invariant. Both halves need addressing, and the acceptance
+criterion is `P P^T = I` to 1e-9, not agreement with the reference.
+
+Item 38's second gap, and its general lessons about fixture regimes, stand
+unchanged. Only the "either gap alone" claim is withdrawn.
