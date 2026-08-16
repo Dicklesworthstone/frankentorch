@@ -52318,9 +52318,21 @@ impl FrankenTorchSession {
         )
     }
 
-    /// In-place hardshrink: x if |x| > lambd, else 0.
+    /// In-place hardshrink: zero the INSIDE region `[-lambd, lambd]`, keep `x` otherwise.
     ///
     /// Equivalent to `F.hardshrink(tensor, lambd)` in PyTorch (no native in-place).
+    ///
+    /// Written as `(x >= -λ && x <= λ) ? 0 : x` and **not** as `|x| > λ ? x : 0`, which is
+    /// the same for every finite input and differs at **NaN**: `NaN.abs() > λ` is false, so
+    /// the `abs` form zeroes NaN, while both compares of the range form are false so NaN
+    /// falls through and is kept. torch keeps it —
+    /// `F.hardshrink(tensor([nan]), 0.5)` is `nan` (`0x7ff8000000000000`), verified against
+    /// torch 2.12.1+cpu.
+    ///
+    /// This function used the `abs` form and therefore returned `0.0` for NaN while the
+    /// out-of-place `tensor_hardshrink` — whose own comment warns about exactly this
+    /// difference — returned NaN. Caught by `inplace_matches_out_of_place`
+    /// (frankentorch-jvst1); the two forms of one op must agree bit-for-bit.
     pub fn tensor_hardshrink_(
         &mut self,
         target: TensorNodeId,
@@ -52331,7 +52343,7 @@ impl FrankenTorchSession {
             target,
             Some(format!("lambd={lambd}")),
             |x| {
-                if x.abs() > lambd { x } else { 0.0 }
+                if x >= -lambd && x <= lambd { 0.0 } else { x }
             },
         )
     }
