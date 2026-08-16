@@ -19960,3 +19960,24 @@ do, and it means the honest claim is:
 embarrassment: the instrument was fixed first, then the number was replicated
 until it stopped moving, and it stopped at a much more modest place than where it
 started. A campaign that banks first invocations would have carried the 1.213x.
+
+**14e. THE LOAD EXPLANATION IN 14d IS REFUTED BY THE NEXT RUN.** 14d proposed
+that the standing "shrinks as the host fills", fitted to five points. Run 6, same
+binary and harness, started at load **12.80** — within 0.04 of run 5's 12.84 — and
+read **1.126x `[1.089,1.173]`, both nulls PASS**, against run 5's 1.055x. Two
+runs at the same load, 7% apart.
+
+So ambient load does not cleanly predict this lane's ratio, and the mechanism
+sentence in 14d should be read as withdrawn. What survives is the empirical
+summary, which needs no mechanism:
+
+> `prelu_noshortcut`, six invocations, ELF `9125c43489561480`, build worker
+> `vmi1227854`, `same_host=thinkstation1`, harness `gauntlet_lane_sweep_h2h.rs`,
+> 32 rounds: FrankenTorch FASTER in 6 of 6, parity `match` in 6 of 6, median point
+> estimates 1.048-1.180, both A/A nulls passing in 5 of 6, lowest confidence bound
+> across the quotable runs **1.006**.
+
+**A mechanism fitted to five points and refuted by the sixth is the cheapest kind
+of wrong claim to make and the easiest to avoid: do not explain a spread until
+the spread has stopped moving.** The number itself never depended on the
+explanation, which is why it is unaffected by withdrawing it.
