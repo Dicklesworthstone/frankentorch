@@ -1,0 +1,133 @@
+diff --git a/crates/ft-kernel-cpu/src/lib.rs b/crates/ft-kernel-cpu/src/lib.rs
+index 02fc5024..2360eafe 100644
+--- a/crates/ft-kernel-cpu/src/lib.rs
++++ b/crates/ft-kernel-cpu/src/lib.rs
+@@ -30493,7 +30493,31 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
+     // under frankentorch-zs8a — previously the rank-deficient path
+     // left those columns as zeros and reduced-mode SVD failed
+     // U^T U = I on rank-deficient matrices.
+-    complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true, true);
++    // frankentorch-j8sl5: above m = 128 the completion goes through a blocked
++    // Householder QR instead of the Gram-Schmidt sweep. Measured same-process,
++    // same-worker (hz2), min of 3, both arms over one seeded input:
++    //
++    //     m=128 k=16 fill=112   gram 4146290 ns   blocked  691203 ns    6.00x
++    //     m=192 k=24 fill=168   gram 13518018 ns  blocked 1985372 ns    6.81x
++    //     m=256 k=32 fill=224   gram 25461351 ns  blocked 1756317 ns   14.50x
++    //
++    // The threshold is 128 because that is the smallest size measured to pay, and
++    // it matches the QR op's own blocked gate (m >= 128). Below it the Gram-Schmidt
++    // form is kept — not as a fallback but deliberately, so every smaller shape
++    // retains its CURRENT bit-exact output and the existing tests keep their
++    // meaning.
++    //
++    // NOT BIT-EXACT above the threshold, and it cannot be: the completion columns
++    // are a different orthonormal basis of the same complement, and any such basis
++    // is a correct answer. Admissible under the ratified eig/SVD tolerance policy
++    // (frankentorch-qgce4) — vector outputs judged by reconstruction and
++    // orthogonality at 1e-9, not bit-exactness. Measured |U^T U - I| stays at
++    // 8.9e-16 to 1.3e-15 across the three shapes above.
++    if m >= 128 {
++        complete_orthonormal_basis_blocked_f64(&mut u, m, u_cols, tol);
++    } else {
++        complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true, true);
++    }
+ 
+     // Build Vh: V^T with reordering
+     let vh_rows = if full_matrices { n } else { k };
+@@ -41395,6 +41419,95 @@ mod tests {
+     /// vs-PyTorch row. It answers one question: does replacing zero-then-scatter
+     /// with a single full-coverage pass pay, given that `NEGATIVE_EVIDENCE` item 3
+     /// measured that trade going the WRONG way on pooling backwards?
++    /// frankentorch-3ja43 / NEGATIVE_EVIDENCE item 42: SPLIT the max_pool3d backward
++    /// into its zeroing and its scatter, at the h2h lane's shape, because two attempts
++    /// to price those phases by arithmetic both failed.
++    ///
++    /// Attempt one assumed a DRAM memset (~10 GB/s) and concluded the backward was ~100%
++    /// zeroing. Attempt two measured `zero_()` in a tight loop, got 0.026 ms, and
++    /// concluded the zeroing was ~3%. Both are proxies: the tight loop keeps 8 MiB inside
++    /// this box's 128 MiB L3, while the live path writes the buffer once and hands it to
++    /// a consumer that streams it. Neither number describes the kernel.
++    ///
++    /// So this measures the kernel. The zeroing arm CONSUMES its buffer with a strided
++    /// read and recycles it, so the pool churns the way it does in the lane instead of
++    /// handing back one perpetually-hot allocation.
++    #[test]
++    fn max_pool3d_backward_phase_split_zeroing_versus_scatter() {
++        // The h2h lane's shape exactly: 1_048_576 f64 in, 131_072 out, 12.5% density.
++        let (batch, ch, id, ih, iw) = (2usize, 32usize, 16usize, 32usize, 32usize);
++        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
++        let in_numel = batch * ch * id * ih * iw;
++        let out_numel = batch * ch * od * oh * ow;
++
++        let mut z = 0x2468_ace0_1357_9bdfu64;
++        let input: Vec<f64> = (0..in_numel)
++            .map(|_| {
++                z ^= z << 13;
++                z ^= z >> 7;
++                z ^= z << 17;
++                #[allow(clippy::cast_precision_loss)]
++                let v = ((z >> 40) as f64) / 512.0 - 2.0;
++                v
++            })
++            .collect();
++        let (_, offsets) = super::max_pool3d_forward_with_indices_f64(
++            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
++        );
++        #[allow(clippy::cast_precision_loss)]
++        let dout: Vec<f64> = (0..out_numel).map(|i| (i % 13) as f64 - 6.0).collect();
++
++        // Consume a buffer the way the lane's consumer does, so the timing that follows
++        // does not inherit a buffer that is still hot from the arm before it.
++        fn drain(buf: &[f64]) -> f64 {
++            let mut acc = 0.0f64;
++            let mut i = 0usize;
++            while i < buf.len() {
++                acc += buf[i];
++                i += 512; // one touch per 4 KiB page
++            }
++            acc
++        }
++
++        let (mut zero_ns, mut total_ns) = (u128::MAX, u128::MAX);
++        for _ in 0..9 {
++            // ARM A: allocation + zeroing only, the first half of the backward.
++            let t = std::time::Instant::now();
++            let zeroed = ft_core::buffer_pool::take_zeroed(in_numel);
++            zero_ns = zero_ns.min(t.elapsed().as_nanos());
++            std::hint::black_box(drain(&zeroed));
++            ft_core::buffer_pool::recycle(zeroed);
++
++            // ARM B: the whole backward, zeroing and scatter together.
++            let t = std::time::Instant::now();
++            let din = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
++                &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
++            );
++            total_ns = total_ns.min(t.elapsed().as_nanos());
++            std::hint::black_box(drain(&din));
++            ft_core::buffer_pool::recycle(din);
++        }
++
++        let scatter_ns = total_ns.saturating_sub(zero_ns);
++        #[allow(clippy::cast_precision_loss)]
++        let pct = (zero_ns as f64) * 100.0 / (total_ns.max(1) as f64);
++        println!(
++            "max_pool3d backward phase split, shape [{batch},{ch},{id},{ih},{iw}], \
++             {in_numel} elems in / {out_numel} out, min of 9:\n  \
++             take_zeroed        {zero_ns:>10} ns  ({pct:.1}% of total)\n  \
++             scatter (residual) {scatter_ns:>10} ns\n  \
++             whole backward     {total_ns:>10} ns"
++        );
++
++        // Not an assertion about which phase wins -- that is the measurement. The only
++        // invariant is that the parts cannot exceed the whole by more than noise.
++        assert!(
++            zero_ns <= total_ns * 2,
++            "zeroing arm {zero_ns} ns wildly exceeds the whole backward {total_ns} ns; \
++             the two arms are not measuring the same thing"
++        );
++    }
++
+     #[test]
+     fn max_pool3d_full_coverage_backward_matches_bits_and_reports_its_cost() {
+         let (batch, ch, id, ih, iw) = (2usize, 8usize, 8usize, 16usize, 16usize);
