@@ -30211,6 +30211,105 @@ fn svd_full_rank_square_deferred_left_fast_path(
 /// skipped. Against `-0.0` step 1 flips and step 3 could turn `-0.0` into
 /// `+0.0`; excluding it keeps the proof intact at the cost of a sweep that in
 /// practice never occurs.
+/// `frankentorch-j8sl5`: complete U's zero columns with a blocked Householder QR
+/// instead of Gram-Schmidt over standard basis vectors.
+///
+/// **NOT WIRED INTO PRODUCTION.** `svd_tall` still calls
+/// [`complete_orthonormal_basis_f64`]. This is the lever's implementation plus its
+/// tests, landed separately from the dispatch flip so the flip can be gated and
+/// measured on its own. It is `pub` and `doc(hidden)` rather than private so it is
+/// not dead code in the lib build.
+///
+/// WHY. The Gram-Schmidt completion is O(m^3) after `frankentorch-264q0` took it
+/// down from O(m^4), and it is still the dominant term in the worst vs-incumbent
+/// ratio this campaign has measured: torch does a 256x32 `full_matrices` SVD in
+/// 1.028 ms, FrankenTorch spends 33.8 ms in this completion alone. LAPACK never
+/// completes a basis by orthogonalising seeds — the orthogonal factor falls out of
+/// the accumulated Householder reflectors, expanded by `dorgqr`, which is blocked
+/// and GEMM-bound.
+///
+/// HOW. The already-filled columns of U are orthonormal (they are singular
+/// vectors). A Householder QR of that `m x filled` block yields
+/// `Q = [Q_filled, Q_perp]`, and the trailing `m - filled` columns of Q are an
+/// orthonormal basis of the complement — exactly the completion, obtained with no
+/// search, no rejection and no per-column sweep. The existing filled columns are
+/// left BIT-IDENTICAL: only the empty ones are written.
+///
+/// Handles the INTERLEAVED case (a rank-deficient input leaves zero columns among
+/// the singular vectors, not only after them) by gathering the filled column
+/// indices first and scattering Q's trailing columns back into the empty slots.
+///
+/// PARITY. The completion columns are a DIFFERENT orthonormal basis of the same
+/// complement, so this is not bit-exact against the Gram-Schmidt form. It is
+/// admissible only under the ratified eig/SVD tolerance policy
+/// (`frankentorch-qgce4`): vector outputs judged by reconstruction and
+/// orthogonality at 1e-9. Any orthonormal basis of the null space is a correct
+/// answer, which is why the tests below assert the INVARIANTS rather than the
+/// values.
+#[doc(hidden)]
+pub fn complete_orthonormal_basis_blocked_f64(u: &mut [f64], m: usize, u_cols: usize, tol: f64) {
+    if m == 0 || u_cols == 0 {
+        return;
+    }
+
+    // Which columns are already occupied? A filled column is normalised, so its
+    // squared norm is ~1; an unfilled one is exactly zero.
+    let mut filled_cols: Vec<usize> = Vec::new();
+    let mut empty_cols: Vec<usize> = Vec::new();
+    for j in 0..u_cols {
+        let mut norm_sq = 0.0f64;
+        for i in 0..m {
+            let v = u[i * u_cols + j];
+            norm_sq += v * v;
+        }
+        if norm_sq > tol * tol {
+            filled_cols.push(j);
+        } else {
+            empty_cols.push(j);
+        }
+    }
+    if empty_cols.is_empty() {
+        return;
+    }
+
+    // Gather the filled columns into an m x filled block for the QR. When nothing
+    // is filled the complement is all of R^m, and the identity is a valid basis.
+    let filled = filled_cols.len();
+    if filled == 0 {
+        for (slot, &j) in empty_cols.iter().enumerate() {
+            if slot < m {
+                for i in 0..m {
+                    u[i * u_cols + j] = if i == slot { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        return;
+    }
+
+    let mut block = vec![0.0f64; m * filled];
+    for (bj, &j) in filled_cols.iter().enumerate() {
+        for i in 0..m {
+            block[i * filled + bj] = u[i * u_cols + j];
+        }
+    }
+
+    // Same call shape as the QR op's blocked path: r_mat is m x n reduced in
+    // place, k reflectors, qcols output columns, Q returned m x qcols row-major.
+    let q = qr_householder_panel_blocked(&mut block, m, filled, filled.min(m), m);
+
+    // Q's trailing columns span the complement of the filled block. Scatter them
+    // into the empty slots; the filled columns are never touched.
+    for (slot, &j) in empty_cols.iter().enumerate() {
+        let qcol = filled + slot;
+        if qcol >= m {
+            break;
+        }
+        for i in 0..m {
+            u[i * u_cols + j] = q[i * m + qcol];
+        }
+    }
+}
+
 fn complete_orthonormal_basis_f64(
     u: &mut [f64],
     m: usize,
@@ -41681,6 +41780,138 @@ mod tests {
                 assert_eq!(x.to_bits(), y.to_bits(), "vh differs at n={n} idx={idx}");
             }
         }
+    }
+
+    /// frankentorch-j8sl5. The blocked-QR completion must satisfy the same
+    /// CONTRACT as the Gram-Schmidt one, not reproduce its values.
+    ///
+    /// Three properties, and the third is the one a weaker test would miss:
+    ///   1. U^T U = I -- the completion columns are orthonormal and orthogonal to
+    ///      the singular vectors;
+    ///   2. the already-filled columns are BIT-IDENTICAL, because they are the
+    ///      singular vectors and only the empty slots may be written;
+    ///   3. it works on INTERLEAVED input, where the zero columns sit among the
+    ///      filled ones rather than after them -- the rank-deficient case, and the
+    ///      one where a gather/scatter bug would show.
+    ///
+    /// It is deliberately NOT compared against `complete_orthonormal_basis_f64`
+    /// value-for-value: the two produce different orthonormal bases of the same
+    /// complement, both correct, and asserting equality would be asserting an
+    /// arbitrary choice.
+    #[test]
+    fn svd_blocked_basis_completion_satisfies_the_same_contract() {
+        use super::{complete_orthonormal_basis_blocked_f64, complete_orthonormal_basis_f64};
+
+        for &(m, k, u_cols, rank) in &[
+            (48usize, 6usize, 48usize, 6usize),
+            (40, 12, 40, 12),
+            (36, 4, 36, 4),
+            (32, 32, 32, 20),
+            (40, 10, 40, 6),
+        ] {
+            let seeded = orthonormal_seed_columns(m, k, u_cols, rank);
+            let mut blocked = seeded.clone();
+            complete_orthonormal_basis_blocked_f64(&mut blocked, m, u_cols, 1e-15);
+
+            // 1. U^T U = I.
+            for p in 0..u_cols {
+                for q in p..u_cols {
+                    let mut dot = 0.0f64;
+                    for i in 0..m {
+                        dot += blocked[i * u_cols + p] * blocked[i * u_cols + q];
+                    }
+                    let want = if p == q { 1.0 } else { 0.0 };
+                    assert!(
+                        (dot - want).abs() < 1e-9,
+                        "blocked completion UtU[{p},{q}] = {dot}, want {want} \
+                         (m={m} rank={rank})"
+                    );
+                }
+            }
+
+            // 2. the pre-filled columns are untouched, bit for bit.
+            for j in 0..u_cols {
+                let was_filled = (0..m)
+                    .map(|i| seeded[i * u_cols + j] * seeded[i * u_cols + j])
+                    .sum::<f64>()
+                    > 1e-30;
+                if was_filled {
+                    for i in 0..m {
+                        assert_eq!(
+                            seeded[i * u_cols + j].to_bits(),
+                            blocked[i * u_cols + j].to_bits(),
+                            "blocked completion rewrote a filled column j={j} i={i}"
+                        );
+                    }
+                }
+            }
+
+            // 3. the Gram-Schmidt form satisfies the same contract on the same
+            //    input, so a failure above is this implementation and not the
+            //    fixture.
+            let mut gram = seeded;
+            complete_orthonormal_basis_f64(&mut gram, m, u_cols, 1e-15, true, true);
+            for p in 0..u_cols {
+                let mut norm = 0.0f64;
+                for i in 0..m {
+                    norm += gram[i * u_cols + p] * gram[i * u_cols + p];
+                }
+                assert!(
+                    (norm - 1.0).abs() < 1e-9,
+                    "control: Gram-Schmidt column {p} is not unit ({norm})"
+                );
+            }
+        }
+    }
+
+    /// frankentorch-j8sl5, the interleaved edge the gather/scatter exists for:
+    /// zero columns BETWEEN filled ones, plus the degenerate all-empty case.
+    #[test]
+    fn svd_blocked_basis_completion_handles_interleaved_and_empty_input() {
+        use super::complete_orthonormal_basis_blocked_f64;
+
+        // Every column empty: any orthonormal basis is correct, and the identity
+        // is the one this returns.
+        let (m, u_cols) = (8usize, 8usize);
+        let mut all_empty = vec![0.0f64; m * u_cols];
+        complete_orthonormal_basis_blocked_f64(&mut all_empty, m, u_cols, 1e-15);
+        for p in 0..u_cols {
+            for q in p..u_cols {
+                let mut dot = 0.0f64;
+                for i in 0..m {
+                    dot += all_empty[i * u_cols + p] * all_empty[i * u_cols + q];
+                }
+                let want = if p == q { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - want).abs() < 1e-9,
+                    "all-empty completion UtU[{p},{q}] = {dot}"
+                );
+            }
+        }
+
+        // Filled columns at 0 and 3 only, so the empties straddle them.
+        let mut interleaved = vec![0.0f64; m * u_cols];
+        for i in 0..m {
+            interleaved[i * u_cols] = if i == 0 { 1.0 } else { 0.0 };
+            interleaved[i * u_cols + 3] = if i == 1 { 1.0 } else { 0.0 };
+        }
+        complete_orthonormal_basis_blocked_f64(&mut interleaved, m, u_cols, 1e-15);
+        for p in 0..u_cols {
+            for q in p..u_cols {
+                let mut dot = 0.0f64;
+                for i in 0..m {
+                    dot += interleaved[i * u_cols + p] * interleaved[i * u_cols + q];
+                }
+                let want = if p == q { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - want).abs() < 1e-9,
+                    "interleaved completion UtU[{p},{q}] = {dot}, want {want}"
+                );
+            }
+        }
+        // The two seeded columns must survive untouched.
+        assert_eq!(interleaved[0].to_bits(), 1.0f64.to_bits());
+        assert_eq!(interleaved[u_cols + 3].to_bits(), 1.0f64.to_bits());
     }
 
     /// frankentorch-264q0. The cursor form is what ships; the restarting form is
