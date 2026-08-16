@@ -21244,3 +21244,132 @@ drift problem the interleaving was designed to solve (`frankentorch-6atx2`). The
 honest options are a longer workload per sample for short ops, or accepting that
 sub-millisecond lanes need a different instrument. Both are deliberate design
 changes, not adjustments to make mid-measurement.
+
+---
+
+## 24. ELEVEN RUNS OF ONE BINARY: A FOURTH STANDING, A WITHDRAWN CANDIDATE, AND A WEAKENED CLAIM
+
+All rows below come from a SINGLE binary — ELF `1fa33e62b39e125e...`, BUILD WORKER
+`vmi1152480` (rch, `RCH_WORKER`-pinned, `-j2 --release --features fair-alloc`) —
+harness `crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1` (5975WX, avx2, powersave, rayon 64, torch threads 8),
+mimalloc, balanced-square ABBAABBA 32 rounds, incumbent PyTorch 2.12.1+cpu.
+Eleven invocations, `h1`-`h7` and `n1`,`n2`,`n4`,`n5`. Having eleven runs of ONE
+binary on ONE host is what makes items 24b and 24c below possible; no single run
+could have shown either.
+
+### 24a. FOURTH REPLICATED STANDING — max_pool1d (pooled) at least 1.58x SLOWER
+
+    h6  min 0.578 [0.553,0.633]  PT null 0.999 PASS  FT null 1.011 PASS  load 25.95 -> 25.51 (-2%)
+    n1  min 0.565 [0.545,0.580]  PT null 1.001 PASS  FT null 0.992 PASS  load 12.83 -> 15.01 (+17%)
+    parity match in both; min estimator in both.
+
+CONSERVATIVE CLAIM: **at least 1.58x SLOWER**, taking 0.633 — the most favourable
+ratio bound either run produced — and inverting it. Not the 1.73x headline.
+
+A third run passed both nulls (`n5`, min 0.585 [0.568,0.614]) and is EXCLUDED, not
+counted: its load drifted 9.11 -> 14.60 (+60%), which the drift gate
+(`frankentorch-2h8vi`, max 1.25x) and the load-delta rule both reject. Recorded
+because it cuts against me — including it would not have changed the claim, since
+0.633 remains the worst bound either way.
+
+Both counted runs would also pass the drift gate that landed in the harness after
+they were taken (-2% and +17%, against a 1.25x limit), so this standing is not an
+artifact of having been measured under a weaker gate.
+
+Pairs with the `max_pool1d_nopool` standing of at least 1.76x SLOWER
+(`frankentorch-07i34`): pooled 1.58x vs nopool 1.76x is the buffer pool's worth on
+this lane, consistent with the 7-8% estimated in `frankentorch-ylfu5`.
+
+### 24b. WITHDRAWN — the group_norm lanes have a ONE-SIDED A/A defect and are not gate-quotable
+
+`n1` certified `group_norm_f32_kernels` (min 0.149, nulls 1.005/1.015) and
+`group_norm_f32_kernels_serialfwd` (min 0.126, nulls 1.011/1.006). Both are
+**WITHDRAWN as candidates.** With eleven runs of the same binary in hand, those two
+passes are visibly the tail of a biased distribution rather than clean gates.
+
+FrankenTorch-side A/A null, `group_norm_f32_kernels`, all eleven runs:
+
+    1.159  1.181  1.166  1.178  1.204  1.137  1.185  1.015  1.307  1.158  1.073
+
+Eleven of eleven are ABOVE 1.0. Ten of eleven miss the +/-0.02 band, all on the
+same side. Same shape on `..._serialfwd`: ten of eleven above 1.0.
+
+Contrast `prelu_noshortcut` in the SAME eleven invocations:
+
+    1.028  0.950  1.040  1.036  0.980  1.076  1.029  0.996  1.000  1.003  1.031
+
+That straddles 1.0 — four below, seven above. THAT is what host noise looks like.
+
+THE DIAGNOSTIC, which generalises beyond this lane: **a null that fails in random
+directions is host noise; a null that fails in ONE direction is a defect in the
+lane.** Under a fair-coin null, eleven same-side results is p = 2^-11, about 1 in
+2000. Every previous discussion of null failures in this ledger treated them as
+noise to be waited out by re-running. On this lane, re-running cannot help: the bias
+does not average away, and the single passing run is the one you must NOT trust.
+
+Directionally, FT null > 1 means the FrankenTorch arm's later in-round samples run
+slower than its earlier ones. The balanced square cancels a stable offset between
+arms; it does not cancel a within-arm ramp (`frankentorch-6atx2`). So the measured
+ratio is biased by an unknown amount in an unknown direction, and the lane is
+untrustworthy in BOTH directions — this is not a "the real number is probably a bit
+better" caveat.
+
+CONSEQUENCE FOR `frankentorch-68pwz`: all three GroupNorm-vs-PyTorch numbers now on
+record remain UN-GATED — the stale 19.04x scorecard row, the 8.81-10.93x from
+`frankentorch-npod3`, and the 6.6-8.0x this harness reads. The bead still cannot be
+sized. It is blocked on fixing the lane's A/A bias, not on a lever.
+
+### 24c. WEAKENED — prelu_noshortcut is at least 1.30x FASTER, not the 1.32x banked in 28lhu
+
+Runs on this binary passing both nulls AND the drift/load-delta gate:
+
+    n1  min 1.372 [1.301,1.427]  nulls 1.007 / 0.996 PASS  load +17%
+    n4  min 1.512 [1.454,1.579]  nulls 0.993 / 1.003 PASS  load  -6%
+
+together with the two previously banked runs (`vhgue` [1.458,1.598] and `28lhu` run
+B [1.321,1.435]). The worst bound over all four is now **1.301**, so the standing is
+**at least 1.30x FASTER**, superseding the "at least 1.32x" banked in
+`frankentorch-28lhu`. The lane is still the campaign's first certified win; the
+claim is simply one point weaker than stated.
+
+THE GENERAL POINT, which applies to every conservative bound in this ledger: **more
+replication can only move a worst-bound claim DOWN.** A bound quoted from two runs
+is not a floor that further work will confirm — it is the minimum of a sample, and
+every run added can weaken it and never strengthen it. The 1.32x was not wrong when
+banked, but "at least" claimed more stability than two runs support. Bounds quoted
+from small samples should be re-checked as runs accumulate, and this one will drift
+lower again if a fifth certifying run comes in below 1.301.
+
+Two further runs passed both nulls and are DISCARDED on drift: `h5` (load +215%,
+min 1.393 [1.346,1.471]) and `n2` (+94%, min 1.412 [1.335,1.462]). They are
+recorded because they bound the load-delta criterion from the other side: nulls CAN
+pass cleanly on a badly drifting host, so a passing null is not evidence the host
+held still. The gates are independent and both are required.
+
+### 24d. OPERATIONAL — the shared `target/` binary is not a stable measurement artifact
+
+Mid-turn, a peer's rebuild replaced `target/release/examples/gauntlet_lane_sweep_h2h`
+underneath an in-progress series: ELF `1fa33e62b39e125e` -> `1d0cb7f2c88fa645`,
+between two of my runs. Every standing banked this session cites the old ELF.
+
+The series survived only because the binary had been copied to a private path before
+a build was started; eight of the eleven rows in item 24 were taken from that copy.
+
+RULE: **copy the measured binary to a private path and measure THAT.** A row citing
+an ELF you no longer possess cannot be extended, re-checked, or replicated
+same-binary — and on a shared checkout you do not control when it disappears. This
+is the concrete fix for the problem `frankentorch-28lhu` had to disclose, where a
+pair of runs replicated across two different ELFs because peers kept rebuilding
+between them.
+
+CROSS-WORKER REPLICATION IS NOT AVAILABLE ON DEMAND. Two attempts to build the same
+harness on a second worker, so that a standing could cite two independent builders,
+both failed without producing an artifact:
+
+    vmi1149989   [RCH-I003] requested worker set refused (no_free_slots)
+    vmi1153651   [RCH-E104] SSH command timed out after 1800s, no local fallback
+
+Thirty minutes bought nothing on the second. Same-binary replication is the
+substitute that is actually obtainable, and it answers a different question — it
+shows one binary reproduces, not that the result survives a rebuild.
