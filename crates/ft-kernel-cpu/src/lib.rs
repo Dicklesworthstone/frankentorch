@@ -28919,6 +28919,134 @@ mod bidiag {
     /// `dorgbr('P')`. Reflector `i` lives in row `i` right of the superdiagonal
     /// and touches rows `i+1..n`; by the same identity argument as
     /// [`bidiag_form_q_f64`] only columns `i+1..n` can be nonzero there.
+    /// Blocked (compact-WY) form of [`bidiag_form_p_f64`] — `frankentorch-4zjaa`.
+    ///
+    /// The unblocked version walks reflectors one at a time, doing a rank-1 update
+    /// over the trailing submatrix each time: O(n) passes over O(n^2) data, BLAS-2,
+    /// no GEMM. Measured at **31.6% of a square SVD** and rising with n
+    /// (NEGATIVE_EVIDENCE item 36), sitting beside a reduction that is already
+    /// blocked and GEMM-bound.
+    ///
+    /// Reflector `i` acts on the trailing block `[i+1, n)`, so a panel of `nb`
+    /// consecutive reflectors starting at `p0` shares the block `[p0+1, n)` with a
+    /// STAIRCASE `V`: column `j` of the panel is zero above row `j`, unit at row
+    /// `j`, and packed thereafter. That is exactly LAPACK's `dorgbr('P')` layout,
+    /// and it lets the panel apply as `I - V T V^T` in three GEMMs instead of `nb`
+    /// rank-1 sweeps.
+    ///
+    /// `T` is built by the same `dlarft` recurrence already inlined in
+    /// `symmetric_to_banded_values_f64` (direction 'F', storev 'C'); this mirrors
+    /// it rather than inventing it.
+    ///
+    /// NOT bit-identical to the unblocked form — it reassociates the same
+    /// arithmetic — so it is admissible only under the ratified eig/SVD tolerance
+    /// policy (`frankentorch-qgce4`). The accompanying test asserts agreement with
+    /// the unblocked oracle to 1e-11 and orthonormality of the result, rather than
+    /// equality.
+    pub(crate) fn bidiag_form_p_blocked_f64(
+        packed: &[f64],
+        n: usize,
+        taup: &[f64],
+        nb: usize,
+    ) -> Vec<f64> {
+        let nb = nb.max(1);
+        let mut p = vec![0.0f64; n * n];
+        for (i, row) in p.chunks_exact_mut(n).enumerate() {
+            row[i] = 1.0;
+        }
+        if n < 2 {
+            return p;
+        }
+
+        // Panels are applied in the same order the unblocked loop uses: the
+        // highest-index reflectors first, so the product composes as
+        // H_0 H_1 ... H_{n-1}.
+        let mut panel_end = n - 1; // last reflector index with a non-empty block
+        loop {
+            let w = nb.min(panel_end + 1);
+            let p0 = panel_end + 1 - w;
+            let row0 = p0 + 1;
+            let nrows = n - row0;
+
+            // Staircase V (nrows x w) and its transpose, plus the panel's taus.
+            let mut vmat = vec![0.0f64; nrows * w];
+            let mut taus = vec![0.0f64; w];
+            for j in 0..w {
+                let i = p0 + j;
+                taus[j] = taup[i];
+                if taup[i] == 0.0 {
+                    continue;
+                }
+                vmat[j * w + j] = 1.0;
+                for k in 1..(n - i - 1) {
+                    vmat[(j + k) * w + j] = packed[i * n + i + 1 + k];
+                }
+            }
+
+            // Compact-WY T, mirroring the dlarft recurrence used elsewhere in this
+            // file: T[j][j] = tau_j, T[0:j, j] = -tau_j * T[0:j,0:j] @ (V^T v_j).
+            let mut tmat = vec![0.0f64; w * w];
+            for j in 0..w {
+                let tau = taus[j];
+                tmat[j * w + j] = tau;
+                if tau == 0.0 {
+                    continue;
+                }
+                for q in 0..j {
+                    let mut z = 0.0;
+                    for r in j..nrows {
+                        z += vmat[r * w + q] * vmat[r * w + j];
+                    }
+                    tmat[q * w + j] = z;
+                }
+                let mut tcol = vec![0.0f64; j];
+                for q in 0..j {
+                    let mut sum = 0.0;
+                    for s in q..j {
+                        sum += tmat[q * w + s] * tmat[s * w + j];
+                    }
+                    tcol[q] = -tau * sum;
+                }
+                for q in 0..j {
+                    tmat[q * w + j] = tcol[q];
+                }
+            }
+
+            // Gather the trailing block, apply (I - V T V^T) from the left with
+            // three GEMMs, scatter back.
+            let mut block = vec![0.0f64; nrows * nrows];
+            for r in 0..nrows {
+                let src = (row0 + r) * n + row0;
+                block[r * nrows..(r + 1) * nrows]
+                    .copy_from_slice(&p[src..src + nrows]);
+            }
+            let mut vt = vec![0.0f64; w * nrows];
+            for r in 0..nrows {
+                for j in 0..w {
+                    vt[j * nrows + r] = vmat[r * w + j];
+                }
+            }
+            let mut w1 = vec![0.0f64; w * nrows];
+            super::gemm::dgemm(w, nrows, nrows, &vt, &block, &mut w1); // V^T B
+            let mut w2 = vec![0.0f64; w * nrows];
+            super::gemm::dgemm(w, w, nrows, &tmat, &w1, &mut w2); // T (V^T B)
+            let mut upd = vec![0.0f64; nrows * nrows];
+            super::gemm::dgemm(nrows, w, nrows, &vmat, &w2, &mut upd); // V (T V^T B)
+            for r in 0..nrows {
+                let dst = (row0 + r) * n + row0;
+                for c in 0..nrows {
+                    p[dst + c] = block[r * nrows + c] - upd[r * nrows + c];
+                }
+            }
+
+            if p0 == 0 {
+                break;
+            }
+            panel_end = p0 - 1;
+        }
+        p
+    }
+
     pub(crate) fn bidiag_form_p_f64(packed: &[f64], n: usize, taup: &[f64]) -> Vec<f64> {
         let mut p = vec![0.0f64; n * n];
         for (i, row) in p.chunks_exact_mut(n).enumerate() {
@@ -58318,6 +58446,50 @@ mod tests {
             }
         }
         c
+    }
+
+    /// frankentorch-4zjaa: the blocked compact-WY `form_p` must agree with the
+    /// unblocked one it replaces.
+    ///
+    /// The unblocked implementation is a valid ORACLE here, and only here: item 39
+    /// showed it degrades at rank <= 2 and scale <= ~1e-15, so this test stays on
+    /// well-conditioned unit-scale input where both are sound. Agreement is
+    /// asserted to 1e-11 rather than bit-for-bit, because blocking reassociates the
+    /// same arithmetic — admissible under the ratified eig/SVD tolerance policy.
+    ///
+    /// Sizes straddle the block width so the panel loop runs with a full panel, a
+    /// partial trailing panel, and n smaller than one panel.
+    #[test]
+    fn bidiag_blocked_form_p_matches_the_unblocked_expansion() {
+        for &(m, n) in &[(9usize, 6usize), (24, 16), (40, 33), (12, 3), (5, 1)] {
+            for &nb in &[1usize, 4, 16] {
+                let mut packed = bidiag_test_matrix(m, n, 0xC0FFEE ^ (m * 131 + n) as u64);
+                let (_d, _e, _tauq, taup) =
+                    super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+
+                let reference = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+                let blocked = super::bidiag::bidiag_form_p_blocked_f64(&packed, n, &taup, nb);
+
+                assert_eq!(reference.len(), blocked.len());
+                let mut worst = 0.0f64;
+                for (a, b) in reference.iter().zip(blocked.iter()) {
+                    worst = worst.max((a - b).abs());
+                }
+                assert!(
+                    worst < 1e-11,
+                    "blocked form_p differs from the unblocked oracle by {worst} \
+                     at m={m} n={n} nb={nb}"
+                );
+
+                // And it must be orthonormal in its own right -- agreeing with a
+                // reference is not the same as being correct (item 39).
+                let err = bidiag_p_orthonormality_error(&blocked, n);
+                assert!(
+                    err < 1e-9,
+                    "blocked form_p P P^T deviates from I by {err} at m={m} n={n} nb={nb}"
+                );
+            }
+        }
     }
 
     /// Rank-deficient, uniformly scaled variant of [`bidiag_test_matrix`].

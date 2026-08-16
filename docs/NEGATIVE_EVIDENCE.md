@@ -24905,3 +24905,54 @@ exactly the mistake items 36, 46 and 50 record.
 The corrected sign is itself the deliverable: three artifacts (item 54, the harness
 comment, and the mental model behind the warmup change) asserted a direction the
 arithmetic contradicts.
+
+### 46e. THE SLOT DUMP CORRECTS ME TWICE — the ordering hypothesis is wrong, and "intrinsic, confirmed" was too strong
+
+`FT_H2H_DUMP_SLOTS` already existed (68pwz), so 46d's hypothesis was testable without a
+build. It is wrong, and the same dump weakens item 46's conclusion. Observed loadavg
+13.06 / 31.71 — not a certification window, and nothing here is a ratio claim.
+
+32 rounds, `max_pool3d_nopool`, per-slot medians across the round series:
+
+    FT per-slot median   [3.414, 3.348, 3.524, 2.844]
+    PT per-slot median   [0.979, 1.275, 0.858, 1.255]
+
+**There IS a large positional structure, but the square already cancels it.** In ABBAABBA
+the incumbent's slots 0 and 2 sit immediately after a FrankenTorch sample and its slots 1
+and 3 after another incumbent sample. The fast slots are exactly 0 and 2 (0.979, 0.858)
+and the slow ones exactly 1 and 3 (1.275, 1.255) — a ~30% swing with a clean structural
+explanation.
+
+That does not corrupt the null, because the null compares slots {0,1} against {2,3} and
+**each half contains one of each kind**. The balanced square is doing precisely the job it
+was designed for. 46d supposed the halves differed by construction; they do not, and the
+hypothesis is refuted. Direction was also backwards from my guess: samples following the
+other arm are FASTER here, not slower.
+
+### 46f. And item 46's "intrinsic to our arm, confirmed" does not survive a seventh run
+
+Item 46 rested on the FT null being below 1.0 in six drift-clean runs. This run makes it
+**six of seven**:
+
+    FT null, this run   median-reduced 1.0915   min-reduced 1.0726   (ABOVE 1.0)
+    PT null, this run   median-reduced 1.0672   min-reduced 1.1169
+
+Both arms failed high together — which is the SHARED pattern that the guardrail treats as
+excusable drift, the opposite of the one-sided signature item 46 reported.
+
+So "the degradation is intrinsic to our arm" is now an over-claim on my part. What the
+seven runs actually support is weaker and duller: this lane's nulls are noisy and usually
+but not always below 1.0 on our side. That is consistent with 68pwz's finding that the
+gate rejects SPORADIC CONTENDED SAMPLES rather than a bias — one spike inside a two-sample
+half drags that half, and which half it lands in is luck.
+
+I recorded the same trap in item 43c and then walked back into it: five-of-six looked
+one-sided, six-of-six looked confirmed, seven-of-seven does not exist. **A run count is
+not a mechanism.** The correct statement is that no clean mechanism has been demonstrated
+for this lane, three have now been refuted (accumulation, load, sampling order), and the
+lane remains ungateable for reasons that are still not understood.
+
+WHAT WOULD ACTUALLY SETTLE IT is still isolation — our arm with no incumbent co-process —
+because every hypothesis above lives or dies on whether the co-process is present. That
+needs the harness flag that does not exist yet, and it is the one build worth spending
+here.
