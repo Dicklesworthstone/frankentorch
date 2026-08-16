@@ -9080,7 +9080,7 @@ pub fn max_pool3d_forward_with_indices_f64(
                         // 22 predicted from instruction counts that it would lose.
                         let mut any_nan = false;
                         for &v in &w {
-                            any_nan |= v != v;
+                            any_nan |= v.is_nan();
                         }
                         if any_nan {
                             for (i, &candidate) in w.iter().enumerate() {
@@ -29853,6 +29853,91 @@ fn svd_full_rank_square_deferred_left_fast_path(
 }
 
 /// SVD for tall/square matrices (m >= n) via Golub-Reinsch bidiagonalization.
+/// Fill every all-zero column of `u` (row-major, `m` x `u_cols`) with a unit vector
+/// orthogonal to the columns already set, by Gram-Schmidt against the standard
+/// basis vectors `e_0, e_1, ...`.
+///
+/// `advance_cursor` selects the shipped form. Passing `false` reproduces the form
+/// that shipped before `frankentorch-264q0`, which restarts the seed search at
+/// `e_0` for every column; it is retained ONLY so a test can prove the two agree
+/// bit-for-bit, and nothing in production passes `false`.
+///
+/// WHY THE CURSOR IS BIT-EXACT. A seed that fails for column `j` does so because
+/// it lies in the span of the columns already set. That span only GROWS as later
+/// columns are filled, so the same seed must fail for every `j' > j` — failure is
+/// monotone. Skipping consumed seeds therefore cannot change WHICH seed wins, and
+/// the winning seed's Gram-Schmidt arithmetic does not depend on how many seeds
+/// were tried before it, so the value written is identical. Verified bit-for-bit
+/// by `svd_basis_completion_cursor_matches_the_restarting_search_bitwise`,
+/// including the rank-deficient shapes where completion columns are INTERLEAVED
+/// among real singular vectors.
+///
+/// WHY IT MATTERS. Under the restarting form every seed consumed by an earlier
+/// completion column still costs a full sweep against all `u_cols` columns before
+/// it is rejected, so the doomed attempts grow linearly with the column index:
+/// `sum_j (j-k)` ~ `(m-k)^2 / 2` sweeps of `2m^2` work. Tall + `full_matrices`
+/// leaves `m - k` columns unfilled, and a 128x8 matrix — 1024 elements — spent
+/// 255 MILLISECONDS here. Measured growth of the full-U term was steeper still
+/// (exponent 4.85 to 5.94 across 32/64/96/128), so `m^4` is a floor rather than a
+/// fit; the residual factor is not accounted for. NEGATIVE_EVIDENCE item 29.
+fn complete_orthonormal_basis_f64(
+    u: &mut [f64],
+    m: usize,
+    u_cols: usize,
+    tol: f64,
+    advance_cursor: bool,
+) {
+    let mut cursor = 0usize;
+    for j in 0..u_cols {
+        // Check if column j is currently zero (norm < tol).
+        let mut existing_norm_sq = 0.0f64;
+        for i in 0..m {
+            let v = u[i * u_cols + j];
+            existing_norm_sq += v * v;
+        }
+        if existing_norm_sq > tol * tol {
+            continue;
+        }
+
+        // Try standard basis vectors until one produces a non-degenerate
+        // residual after Gram-Schmidt. In a rank-r system with m-r missing
+        // columns, at most r of the basis vectors can lie entirely in the
+        // existing column span, so a fresh one is always available.
+        let first_seed = if advance_cursor { cursor } else { 0 };
+        for seed in first_seed..m {
+            let mut col = vec![0.0f64; m];
+            col[seed] = 1.0;
+            // Orthogonalize against all previously-set columns of u
+            // (this includes both already-normalized SVD columns and
+            // any earlier basis-completion columns we just filled).
+            for prev in 0..u_cols {
+                if prev == j {
+                    continue;
+                }
+                let mut dot = 0.0;
+                for i in 0..m {
+                    dot += col[i] * u[i * u_cols + prev];
+                }
+                for i in 0..m {
+                    col[i] -= dot * u[i * u_cols + prev];
+                }
+            }
+            let mut norm = 0.0f64;
+            for item in col.iter().take(m) {
+                norm += item * item;
+            }
+            let norm = norm.sqrt();
+            if norm > tol {
+                for i in 0..m {
+                    u[i * u_cols + j] = col[i] / norm;
+                }
+                cursor = seed + 1;
+                break;
+            }
+        }
+    }
+}
+
 fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdResult, KernelError> {
     let k = n; // since m >= n, k = min(m,n) = n
     let tol = 1e-15;
@@ -29930,53 +30015,7 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
     // under frankentorch-zs8a — previously the rank-deficient path
     // left those columns as zeros and reduced-mode SVD failed
     // U^T U = I on rank-deficient matrices.
-    for j in 0..u_cols {
-        // Check if column j is currently zero (norm < tol).
-        let mut existing_norm_sq = 0.0f64;
-        for i in 0..m {
-            let v = u[i * u_cols + j];
-            existing_norm_sq += v * v;
-        }
-        if existing_norm_sq > tol * tol {
-            continue;
-        }
-
-        // Try standard basis vectors e_0, e_1, ... e_{m-1} until one
-        // produces a non-degenerate residual after Gram-Schmidt. In
-        // a rank-r system with m-r missing columns, at most r of the
-        // basis vectors can lie entirely in the existing column span,
-        // so a fresh one is always available within m tries.
-        for seed in 0..m {
-            let mut col = vec![0.0f64; m];
-            col[seed] = 1.0;
-            // Orthogonalize against all previously-set columns of u
-            // (this includes both already-normalized SVD columns and
-            // any earlier basis-completion columns we just filled).
-            for prev in 0..u_cols {
-                if prev == j {
-                    continue;
-                }
-                let mut dot = 0.0;
-                for i in 0..m {
-                    dot += col[i] * u[i * u_cols + prev];
-                }
-                for i in 0..m {
-                    col[i] -= dot * u[i * u_cols + prev];
-                }
-            }
-            let mut norm = 0.0f64;
-            for item in col.iter().take(m) {
-                norm += item * item;
-            }
-            let norm = norm.sqrt();
-            if norm > tol {
-                for i in 0..m {
-                    u[i * u_cols + j] = col[i] / norm;
-                }
-                break;
-            }
-        }
-    }
+    complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true);
 
     // Build Vh: V^T with reordering
     let vh_rows = if full_matrices { n } else { k };
@@ -41063,6 +41102,186 @@ mod tests {
     /// only worth doing if the replay is where the time is, and this says whether
     /// it is. Run across sizes because the two phases scale differently:
     /// bidiagonalisation is a deterministic O(m n^2), the replay is iterative.
+    /// Second-level attribution: WITHIN the vectors, where does the time go?
+    /// (`frankentorch-svd-blocked-bidiag-r7jdo.1`)
+    ///
+    /// The first split found the vectors are 44-62% of a square SVD, i.e. the
+    /// bead's QR-replay target is the smaller half. This splits the vectors
+    /// themselves, again with public APIs only, using a TALL matrix so the three
+    /// calls isolate three phases:
+    ///
+    ///   `svdvals(m,n)`               bidiagonalisation + bidiagonal-QR replay
+    ///   `svd(full_matrices=false)`   the above + REDUCED U (m x n) and V (n x n)
+    ///   `svd(full_matrices=true)`    the above + FULL U (m x m) expansion
+    ///
+    /// so `reduced - values` is the reduced-vector cost and `full - reduced` is
+    /// the full-U expansion. On a square matrix these two coincide and cannot be
+    /// separated, which is why the shape is tall here.
+    /// frankentorch-264q0. The cursor form is what ships; the restarting form is
+    /// what it replaced. They must agree BIT-FOR-BIT, and the rank-deficient rows
+    /// are the ones that matter — there the completion columns are INTERLEAVED
+    /// among real singular vectors, which is where a cursor could plausibly skip a
+    /// seed it still needed. It cannot: the span of set columns only grows, so
+    /// once `e_s` has been absorbed it stays absorbed.
+    #[test]
+    fn svd_basis_completion_cursor_matches_the_restarting_search_bitwise() {
+        use super::complete_orthonormal_basis_f64;
+
+        // (m, k, u_cols, rank) -- rank < k builds the interleaved case.
+        for &(m, k, u_cols, rank) in &[
+            (48usize, 6usize, 48usize, 6usize),
+            (40, 12, 40, 12),
+            (36, 4, 36, 4),
+            (32, 32, 32, 20),
+            (40, 10, 40, 6),
+        ] {
+            let seeded = orthonormal_seed_columns(m, k, u_cols, rank);
+            let mut restarting = seeded.clone();
+            let mut cursored = seeded;
+
+            let t0 = std::time::Instant::now();
+            complete_orthonormal_basis_f64(&mut restarting, m, u_cols, 1e-15, false);
+            let restart_ns = t0.elapsed().as_nanos();
+            let t1 = std::time::Instant::now();
+            complete_orthonormal_basis_f64(&mut cursored, m, u_cols, 1e-15, true);
+            let cursor_ns = t1.elapsed().as_nanos();
+
+            for (idx, (a, b)) in restarting.iter().zip(cursored.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cursor changed a value: m={m} k={k} rank={rank} idx={idx}"
+                );
+            }
+
+            // U^T U = I, checked independently of the bit-identity above so a
+            // shared bug in both forms cannot pass this test.
+            for p in 0..u_cols {
+                for q in p..u_cols {
+                    let mut dot = 0.0f64;
+                    for i in 0..m {
+                        dot += cursored[i * u_cols + p] * cursored[i * u_cols + q];
+                    }
+                    let want = if p == q { 1.0 } else { 0.0 };
+                    assert!(
+                        (dot - want).abs() < 1e-11,
+                        "UtU off diagonal: m={m} p={p} q={q} dot={dot}"
+                    );
+                }
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            let speedup = restart_ns as f64 / cursor_ns.max(1) as f64;
+            println!(
+                "264q0 basis completion m={m} k={k} u_cols={u_cols} rank={rank}: \
+                 restarting {restart_ns} ns, cursor {cursor_ns} ns ({speedup:.2}x)"
+            );
+        }
+    }
+
+    /// `m x u_cols` with `rank` orthonormal leading columns and the rest zero —
+    /// the state `svd_tall` hands to the basis completion.
+    fn orthonormal_seed_columns(m: usize, k: usize, u_cols: usize, rank: usize) -> Vec<f64> {
+        let mut z = 0x5eed_1234_9abc_u64;
+        let mut raw = vec![0.0f64; m * k];
+        for x in raw.iter_mut() {
+            z ^= z << 13;
+            z ^= z >> 7;
+            z ^= z << 17;
+            #[allow(clippy::cast_precision_loss)]
+            let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+            *x = v;
+        }
+        // Modified Gram-Schmidt on the first `rank` columns.
+        let mut u = vec![0.0f64; m * u_cols];
+        let mut filled = 0usize;
+        for j in 0..rank.min(k) {
+            let mut col: Vec<f64> = (0..m).map(|i| raw[i * k + j]).collect();
+            for prev in 0..filled {
+                let mut dot = 0.0f64;
+                for i in 0..m {
+                    dot += col[i] * u[i * u_cols + prev];
+                }
+                for i in 0..m {
+                    col[i] -= dot * u[i * u_cols + prev];
+                }
+            }
+            let norm = col.iter().fold(0.0f64, |acc, v| acc + v * v).sqrt();
+            if norm > 1e-12 {
+                for i in 0..m {
+                    u[i * u_cols + filled] = col[i] / norm;
+                }
+                filled += 1;
+            }
+        }
+        u
+    }
+
+    #[test]
+    fn svd_vector_phase_split_reduced_versus_full_u() {
+        // Shapes kept small deliberately: full_matrices=true on a tall matrix builds
+        // an m x m U, and completing that basis was O(m^4) or worse before
+        // frankentorch-264q0 -- a first attempt at
+        // (2048,128) ran past the 1800s SSH limit without finishing, which is
+        // itself a data point about that path's cost.
+        for &(m, n) in &[(256usize, 32usize), (512, 32), (256, 64)] {
+            let mut z = 0xa5a5_1234_u64;
+            let data: Vec<f64> = (0..m * n)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 40) as f64) / 1024.0 - 1.0;
+                    v
+                })
+                .collect();
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![m, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+
+            let reps = 3;
+            let (mut vals, mut red, mut full) = (
+                Vec::with_capacity(reps),
+                Vec::with_capacity(reps),
+                Vec::with_capacity(reps),
+            );
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                let a = super::svdvals_contiguous_f64(&data, &meta).expect("svdvals");
+                vals.push(t.elapsed().as_nanos());
+                std::hint::black_box(&a);
+
+                let t = std::time::Instant::now();
+                let b = super::svd_contiguous_f64(&data, &meta, false).expect("reduced");
+                red.push(t.elapsed().as_nanos());
+                std::hint::black_box(&b);
+
+                let t = std::time::Instant::now();
+                let c = super::svd_contiguous_f64(&data, &meta, true).expect("full");
+                full.push(t.elapsed().as_nanos());
+                std::hint::black_box(&c);
+            }
+            vals.sort_unstable();
+            red.sort_unstable();
+            full.sort_unstable();
+            let (v, r, f) = (vals[0], red[0], full[0]);
+            #[allow(clippy::cast_precision_loss)]
+            let ff = f as f64;
+            println!(
+                "r7jdo.1 svd vector split {m}x{n}: values {v} ns, reduced {r} ns, full {f} ns \
+                 | reduced-vectors {} ns ({:.1}% of full), full-U expansion {} ns ({:.1}% of full) \
+                 (min of {reps}, interleaved)",
+                r.saturating_sub(v),
+                100.0 * (r.saturating_sub(v)) as f64 / ff,
+                f.saturating_sub(r),
+                100.0 * (f.saturating_sub(r)) as f64 / ff,
+            );
+        }
+    }
+
     #[test]
     fn svd_phase_split_values_only_versus_full_factorisation() {
         for &(m, n) in &[(128usize, 128usize), (256, 256), (384, 384)] {
