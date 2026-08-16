@@ -20315,3 +20315,32 @@ ramp through your sweep, whereas one already thirty minutes in is part of the
 stable floor. This is the same instrument-hygiene point the peer-bench contention
 work made: `pgrep` first. A four-minute sweep cannot survive a build that starts at
 minute one, and neither loadavg nor `rch queue` will warn you.
+
+**16. A SECOND STALE HEADLINE ROW: max_pool3d is ~2.85x, not 9.39x
+(`frankentorch-87sz8`, 2026-08-15).** Same shape as item 7e, found the same way —
+by measuring the row a bead was steering by instead of inheriting it.
+
+`harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1`, build worker `vmi1227854`, ELF `9125c43489561480`, 32
+rounds, live PyTorch 2.12.0+cpu interleaved per round, parity `match`:
+
+| lane | FT | PT | median | nulls |
+|---|---|---|---|---|
+| `max_pool3d_nopool` | 2.702 ms | 0.948 ms | **2.85x SLOWER** | PT PASS `[0.928,1.079]`, FT PASS `[0.940,1.085]` — QUOTABLE |
+| `max_pool3d` (pool ON) | 2.442 ms | 0.999 ms | 2.44x SLOWER | both FAIL — not quotable |
+
+`frankentorch-87sz8` is titled "largest confirmed vs-upstream gap" at 9.39x. On
+the current instrument the defensible number is about **2.85x**, and the largest
+loss is now GroupNorm f32 at 6-7x. **A bead whose title carries a number becomes a
+priority signal, and a stale one silently mis-ranks the queue** — this is the
+second time in this campaign (7e was the GroupNorm 19.04x that was really
+8.81-10.93x).
+
+Two cautions attached to the new number rather than left implicit: it is ONE
+invocation, and items 14b-14e show single-invocation rows moving 5-9% before they
+settle; and the quotable arm is the `_nopool` twin, so 2.85x describes this lane
+with `ft_core::buffer_pool` DISABLED.
+
+**Standing rule this suggests: when a bead's title contains a ratio, re-measure
+before working it, and put the fresh number in the bead rather than in a report.**
+The stale number is not merely wrong, it is actively allocating effort.
