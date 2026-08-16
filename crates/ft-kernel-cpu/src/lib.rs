@@ -41864,6 +41864,73 @@ mod tests {
         }
     }
 
+    /// frankentorch-j8sl5: the A/B that decides whether the dispatch flip is worth
+    /// making, run as a test so it needs no separate binary and no cross-build
+    /// comparison.
+    ///
+    /// Both completions run in ONE process on ONE worker over the SAME seeded
+    /// input, interleaved rep by rep, min of 3 — the only shape of comparison this
+    /// campaign trusts, because absolute times swing ~1.5x across the worker fleet.
+    ///
+    /// SHAPES ARE TALL ON PURPOSE. The completion only exists when `m > k`, so a
+    /// square input would report a no-op and read as "no win". `m - k` is the
+    /// number of columns to fill and is what the cost scales with: 256x32 leaves
+    /// 224 of them, which is the configuration where the completion measured
+    /// 33.8 ms against torch's 1.028 ms for the entire SVD.
+    ///
+    /// Reports rather than asserts a threshold: the number is the deliverable, and
+    /// a hard-coded speedup assertion would be a flaky test on a shared fleet.
+    #[test]
+    fn svd_basis_completion_blocked_versus_gram_schmidt_ab() {
+        use super::{complete_orthonormal_basis_blocked_f64, complete_orthonormal_basis_f64};
+
+        for &(m, k) in &[(128usize, 16usize), (192, 24), (256, 32)] {
+            let u_cols = m;
+            let seeded = orthonormal_seed_columns(m, k, u_cols, k);
+
+            let mut gram_ns = u128::MAX;
+            let mut blocked_ns = u128::MAX;
+            for _ in 0..3 {
+                let mut gram = seeded.clone();
+                let t0 = std::time::Instant::now();
+                complete_orthonormal_basis_f64(&mut gram, m, u_cols, 1e-15, true, true);
+                gram_ns = gram_ns.min(t0.elapsed().as_nanos());
+
+                let mut blocked = seeded.clone();
+                let t1 = std::time::Instant::now();
+                complete_orthonormal_basis_blocked_f64(&mut blocked, m, u_cols, 1e-15);
+                blocked_ns = blocked_ns.min(t1.elapsed().as_nanos());
+            }
+
+            // Both arms must still be correct, or the timing means nothing.
+            let mut blocked = seeded;
+            complete_orthonormal_basis_blocked_f64(&mut blocked, m, u_cols, 1e-15);
+            let mut worst = 0.0f64;
+            for p in 0..u_cols {
+                for q in p..u_cols {
+                    let mut dot = 0.0f64;
+                    for i in 0..m {
+                        dot += blocked[i * u_cols + p] * blocked[i * u_cols + q];
+                    }
+                    let want = if p == q { 1.0 } else { 0.0 };
+                    worst = worst.max((dot - want).abs());
+                }
+            }
+            assert!(
+                worst < 1e-9,
+                "blocked completion UtU off by {worst} at m={m}"
+            );
+
+            #[allow(clippy::cast_precision_loss)]
+            let speedup = gram_ns as f64 / blocked_ns.max(1) as f64;
+            println!(
+                "j8sl5 completion A/B m={m} k={k} fill={} : gram-schmidt {gram_ns} ns, \
+                 blocked-qr {blocked_ns} ns ({speedup:.2}x), max|UtU-I| {worst:.3e}",
+                m - k
+            );
+        }
+    }
+
     /// frankentorch-j8sl5, the interleaved edge the gather/scatter exists for:
     /// zero columns BETWEEN filled ones, plus the degenerate all-empty case.
     #[test]
