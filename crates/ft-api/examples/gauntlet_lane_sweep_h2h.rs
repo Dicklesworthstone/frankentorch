@@ -912,9 +912,21 @@ LANES = {
     ];
 
     // Our side warms here; the incumbent warmed itself before announcing ready.
+    //
+    // The COUNT must match the incumbent's, which warms `for _ in range(4)` per
+    // lane in `harness_interleave::SAMPLE_LOOP_PY` (frankentorch-6atx2). It used
+    // to be 3 here against torch's 4 (frankentorch-2kgum). That asymmetry was
+    // conservative for every row this campaign has quoted -- under-warming OUR
+    // arm makes our times slower, which UNDERSTATES a FrankenTorch-faster ratio,
+    // and every certified row so far is FrankenTorch-faster. But the SIGN of that
+    // bias is a property of which arm happens to be faster, not of the
+    // instrument: the first time a lane is quoted where torch is ahead, the same
+    // asymmetry inflates instead. An instrument must not have a bias whose
+    // direction depends on the answer.
+    const WARMUP_ITERS: usize = 4;
     for (_, run_lane) in &lanes {
         let mut warm = 0.0;
-        for _ in 0..3 {
+        for _ in 0..WARMUP_ITERS {
             warm += run_lane().0;
         }
         std::hint::black_box(warm);
