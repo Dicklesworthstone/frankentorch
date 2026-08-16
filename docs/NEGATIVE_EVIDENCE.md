@@ -22568,3 +22568,69 @@ suggestion of a flip — and ten agreeing runs do not change it. Recorded rather
 banked because "ten runs all agree" is precisely the argument that would justify
 lowering the bar, and the bar is the only reason any row in this ledger is worth
 anything. One admissible run still closes it; the binary is on disk and needs no build.
+
+## 35. CORRECTION TO MY OWN SELF-LOAD BOUND — THE HARNESS NOW COSTS ~20 LOAD UNITS, NOT 0.62, AND A QUIET HOST IS THE WORST PLACE TO START
+
+(Numbered 35 to avoid the 26-32 collision documented in the errata above. See 35d.)
+
+### 35a. The measurement
+
+Five back-to-back runs of the same binary, same lanes, nothing changed between them:
+
+    run   load_1m start -> end        drift gate
+    q1     9.10 -> 27.96  (+207%)     LOAD-DRIFTED
+    q2    25.19 -> 33.56   (+33%)     LOAD-DRIFTED
+    q3    32.89 -> 31.69    (-4%)     PASS
+    q4    32.31 -> 32.81    (+2%)     PASS
+    q5    29.88 -> 60.55  (+103%)     LOAD-DRIFTED  (external interference)
+
+The two runs that PASSED are the two that STARTED at roughly 32 — which is the level
+the harness itself sustains once running. Load decays back to 8-12 within a few minutes
+of the last run, so ~20-24 of that 32 is the sweep's own 64-thread burst plus whatever
+else is resident.
+
+### 35b. This CORRECTS a bound I banked myself
+
+`frankentorch-5q3io` confound-checked the load-delta criterion and concluded the
+harness's own contribution was bounded near **+0.62 absolute**, derived from the
+quietest certifying run then available (8.63 -> 9.25). That number is now wrong by more
+than an order of magnitude: q1 moved +18.9 on an idle start.
+
+WHY IT MOVED, and it is partly my doing: the sweep has gained lanes since that bound was
+taken — `max_pool1d_zeroed`, `avg_pool2d_zeroed`, `group_norm_f32_zeroed`, `avg_pool1d`
+and `avg_pool1d_zeroed`, five of which I added for A/B work — so each round now does
+substantially more work than the round 5q3io measured. **A self-load bound is a property
+of the harness at a point in time, not a constant**, and nothing in the row format
+records lane count, so the bound silently rotted while every gate kept citing it.
+
+The load-delta criterion itself survives — external load change still predicts
+certification — but the claim that the harness's own contribution is negligible does
+not, and any argument that leaned on "self-load is under 10% of the signal" needs
+re-deriving at the current lane count.
+
+### 35c. THE ACTIONABLE RULE: run back-to-back, and discard the first run after idle
+
+The drift gate is RELATIVE (max 1.25x), so the harness's own +20 is a catastrophic
+delta from an idle start (9 -> 28 is +207%) and a negligible one from its own steady
+state (32 -> 32). The counter-intuitive consequence:
+
+**Waiting for a quiet host makes the drift gate HARDER to pass, not easier.**
+
+The first run after an idle period is close to guaranteed to fail on drift no matter how
+clean the measurement is. Runs two onward start where the previous run left the machine.
+So: fire one warm-up run, discard it without reading it, and measure from the second.
+That is not p-hacking — the discard rule is fixed in advance and applies to the first run
+unconditionally, whatever it says.
+
+This explains a pattern visible across this whole session's rows in hindsight: the
+certifications came at starting loads of 20-38 (h2, h4, h6, u2, u4), and the failures
+clustered on runs started from a quiet box. I read that as "busy host, bad luck" at the
+time. It was the opposite.
+
+### 35d. On the duplicate item numbers
+
+Numbers 26-32 each identify two items (errata item 34). I considered renumbering my
+seven, and did not: there are 22 in-file cross-references to those numbers, plus
+citations in commits, beads and mail that I cannot rewrite, and a blind renumber under a
+no-build window would trade one ambiguity for a worse one. Adopting the errata's
+resolution instead — **cite by title, not number** — and numbering forward from 35.
