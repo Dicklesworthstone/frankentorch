@@ -24061,3 +24061,62 @@ in one turn — the glibc run reported `endpoint_gate=PASS series_gate=DRIFTED` 
    a window holds within 1.25x across the whole series.
 3. `group_norm_f32` remains blocked by the incumbent's one-sided null
    (`uilzh`, 0.816-0.947 across every run), which no warmup of ours can fix.
+
+## 55. THE WARMUP FIX WORKED ON WHAT IT DIAGNOSED — AND DID NOT RECOVER THE BOARD
+
+Item 54 found 11 of 21 FrankenTorch A/A nulls below 0.98, one-sided, meaning our
+arm was still speeding up while being measured. The harness default is now 32
+warmup iterations instead of 4. ELF `8fe547306b319b1e...`, mimalloc, 8 rounds.
+
+### 55a. The diagnosed defect is gone
+
+    warmup=4    FT nulls  median 0.927   11 of 21 below 0.98, 2 in band   ONE-SIDED LOW
+    warmup=32   FT nulls  median 1.010    8 below, 3 in band, 10 above    TWO-SIDED
+
+The systematic downward skew is corrected. What remains is scattered on both sides
+of unity, which is the signature of noise rather than of an arm warming up. **The
+mechanism named in item 54 was real and the fix addresses it.**
+
+### 55b. The worst gap now has CLEAN NULLS for the first time
+
+    group_norm_f32_zeroed  FT 36.238 ms  PT 6.678 ms  MIN 5.53x SLOWER
+                           ratio 0.181 [0.163,0.197]
+                           PT null 0.993 PASS   FT null 0.996 PASS   parity match
+                           endpoint_gate PASS   series_gate DRIFTED (1.458x)
+                           verdict: not quotable — LOAD-DRIFTED
+
+Both A/A nulls pass, both within 0.007 of unity, on the lane family carrying the
+campaign's largest vs-incumbent gap. **This is the closest this campaign has come
+to a certified row**, and the only thing refusing it is the series drift gate.
+
+Note what that means: **without the gate added in item 49, this would have been
+banked as a certified 5.53x standing.** The endpoint pair passed. The series saw
+1.458x. Third time in two turns the two gates have disagreed, and every time the
+series gate has been the stricter and the correct one.
+
+### 55c. The board did NOT recover, and the hypothesis is not confirmed
+
+The expectation was that this one correction might recover the whole board. It did
+not:
+
+    run                          both-nulls-PASS   FT_FAIL   PT_FAIL   of 21
+    warmup=4                            0            19        18
+    warmup=32 (env, run A)              1            —         —
+    warmup=32 (default, run B)          1            18        16
+
+One lane, not twenty. The warmup fix removed one systematic bias; it did not make
+the remaining nulls pass, and it cannot, because **drift is still voiding every
+run**. Four of the last five sweeps drifted past 1.25x, one at 3.978x.
+
+The honest decomposition of why 21 lanes do not certify is now: warmup (FIXED, one
+cause), host drift (UNFIXED, binding on every run), and the incumbent's own
+one-sided nulls on specific lanes (`uilzh`, unfixed, ours to investigate but not
+ours to cause).
+
+### 55d. What is actually left
+
+A single sweep in a window that holds 1.25x across all ten load samples. Everything
+else is now in place: the allocator is matched to the banked set, the warmup is
+sufficient, the estimator is adjudicated per rule 3, and the worst-gap lane has
+demonstrated it can produce clean nulls. Nine attempts have not found that window,
+and this pane cannot manufacture one.

@@ -1090,13 +1090,38 @@ LANES = {
     // instrument: the first time a lane is quoted where torch is ahead, the same
     // asymmetry inflates instead. An instrument must not have a bias whose
     // direction depends on the answer.
-    // frankentorch-uilzh: reads the SAME variable as the incumbent's loop in
-    // `harness_interleave::SAMPLE_LOOP_PY`, so the two counts cannot drift apart.
-    // Default 4, unchanged.
+    // DEFAULT RAISED 4 -> 32 (frankentorch-68pwz, NEGATIVE_EVIDENCE item 54), and
+    // the "counts must match" rule above is now WRONG. It is kept in place because
+    // the reasoning that produced it is still correct about BIAS; it was simply
+    // answering the wrong question.
+    //
+    // MATCHING THE COUNT WAS RIGHT FOR FAIRNESS AND WRONG FOR SUFFICIENCY. Four
+    // iterations warm torch. They do not warm us. Measured across 21 lanes on a
+    // drift-clean run, the MIN-estimator A/A nulls were:
+    //
+    //   FT  0.794 0.845 0.878 0.902 0.905 0.908 0.910 0.914 0.922 0.927 0.975 ...
+    //
+    // Eleven of twenty-one below 0.98 and only two in band. A null below 1.0 means
+    // an arm's SECOND half is FASTER than its first — the arm is still speeding up
+    // while it is being measured. That is not noise and it is not the host; it is
+    // warmup, and it was ours.
+    //
+    // Re-running the same binary and rounds at 32 moved the in-band count 2 -> 5
+    // and the median FT null 0.927 -> 0.983, which is the direction and roughly
+    // the magnitude the explanation predicts.
+    //
+    // Fairness requires each arm to be WARM, not that both warm identically. The
+    // incumbent still warms 4 in `harness_interleave::SAMPLE_LOOP_PY` and its own
+    // nulls skew the other way (12 of 21 ABOVE 1.02, i.e. torch SLOWS during a
+    // run), so raising torch's count would not help it and is left alone.
+    //
+    // This does not reintroduce the frankentorch-2kgum bias. That bias came from
+    // under-warming one arm relative to what IT needs; both arms are now warmed to
+    // their own sufficiency, which is what makes the comparison fair.
     let warmup_iters: usize = std::env::var("FT_H2H_WARMUP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(32);
     for (_, run_lane) in &lanes {
         let mut warm = 0.0;
         for _ in 0..warmup_iters {
