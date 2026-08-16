@@ -20502,3 +20502,42 @@ measurement.**
 
 Bead returned to open, unstarted, with this recorded. Checking cost one grep of the
 harness's input construction; the lever it asks for is multi-session.
+
+### `68pwz` was sized against the 19.04x that item 7e had already retired — and three GroupNorm numbers are circulating
+
+`frankentorch-68pwz` (P1, "fuse f32 GroupNorm and BatchNorm2d engine paths") is
+filed against *"GroupNorm f32 is 19.04x ... slower than PyTorch on the scorecard"*.
+**That figure was already refuted before the bead was written**: item 7e records
+`frankentorch-npod3` re-measuring the same scorecard row against a live arm and
+finding **8.81-10.93x**, because 19.04x predated the f32 affine-grad fused path
+added by `48w0b`.
+
+The useful part is that **three different numbers now exist for "GroupNorm f32 vs
+PyTorch", and they are not interchangeable**:
+
+| figure | scope | status |
+|---|---|---|
+| **19.04x** | scorecard train step `[8,64,28,28]`, groups 32, affine grads, sum loss | **stale**, retired by 7e |
+| **8.81-10.93x** | same train-step scope, live session path | current honest train-step figure (`npod3`) |
+| **5.66x** | **op work only**, `group_norm_f32_statskernels` | **CERTIFIED** — both nulls PASS, parity match, min estimator (`vhgue`) |
+
+The op-work figures are not comparable to the train-step ones: op work times
+forward+backward with the leaf built *outside* the timer, while the train-step row
+includes the per-iteration input rebuild and the tape. The plain `group_norm_f32`
+op-work lane reads 5.61-5.81x across runs, nulls failing.
+
+**A lever aimed at "the 19.04x" is aimed at a number that no longer exists.** Aimed
+at 8.81-10.93x it is a real train-step gap; aimed at 5.66x it is the kernel gap.
+Those are different levers with different payoffs, and a bead should say which.
+
+This is the third bead in one session whose founding number did not survive
+contact — after `xdw0h` (a WIDE, undecidable row quoted as a 3.08x loss) and
+`l2zki` (an f32 claim checked against an f64 lane). The common failure is not bad
+measurement; it is a **number outliving its scope**. Before spending a
+multi-session lever, check that the founding row is (a) still current, (b) still
+quotable, and (c) measured at the scope the lever will move.
+
+The BatchNorm2d half of `68pwz` remains **unverified**: its "about 5.7x" has not
+been re-established, and BatchNorm2d has **no lane in the h2h harness**, so it
+cannot be checked with the trusted instrument at all. Adding one means a second
+instrument, with the divergence risk item 11 records.
