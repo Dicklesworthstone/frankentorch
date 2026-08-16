@@ -43,11 +43,33 @@ Four rules follow, and they are separate because they fail separately:
    runs**, carry the round count, and re-run before calling a row a standing.
    Two runs cost eleven minutes there.
 
-**The current state of the campaign under these rules, so nobody overstates it:**
-exactly one certified vs-PyTorch row exists — `prelu_noshortcut`, replicated in
-two invocations with all four nulls passing, defensible at **at least 1.07x**
-(the lowest bound either run produced, not the 1.213x headline). One of fourteen
-lanes became quotable. Everything else remains uncertified.
+**The current state of the campaign under these rules, so nobody overstates it.**
+Exactly one vs-PyTorch row is quotable — `prelu_noshortcut` — and the honest
+statement of it is the empirical one from item 14e, which needs no mechanism:
+
+> six invocations, ELF `9125c43489561480`, build worker `vmi1227854`,
+> `same_host=thinkstation1`, harness `gauntlet_lane_sweep_h2h.rs`, 32 rounds:
+> FrankenTorch FASTER in 6 of 6, parity `match` in 6 of 6, median point estimates
+> **1.048-1.180**, both A/A nulls passing in 5 of 6, lowest confidence bound across
+> the quotable runs **1.006**.
+
+One of fourteen lanes became quotable. Everything else remains uncertified.
+
+**This paragraph has itself been wrong twice, which is the rules working.** It
+first read "at least 1.213x" (one run, min estimator), then "at least 1.07x" (two
+runs, median) — the figure this sentence carried until item 14d replicated to five
+runs and put the floor at **1.006x**, and 14e added a sixth. Each correction was
+downward and each came from one more replication, exactly as rule 4 predicts. Two
+lessons worth keeping:
+
+- **A summary at the top of a file goes stale silently.** The floor was corrected
+  in item 14d near the bottom while this paragraph kept quoting the superseded
+  1.07x. If you revise a banked number, grep the file for the old one — the
+  most-read copy is the one nobody remembers to update.
+- **Do not explain a spread until it stops moving.** 14d fitted "the standing
+  shrinks as the host fills" to five points; run 6 started within 0.04 of run 5's
+  load and read 7% higher, refuting it. The number never depended on the mechanism,
+  which is why withdrawing the mechanism left it intact.
 
 ### Retro-flag of everything above this line's adoption date
 
@@ -19879,10 +19901,18 @@ That is a 5-9% over-claim avoided by spending eleven extra minutes, and it is th
 concrete argument for the rule in 14b: a row from a single invocation is a
 candidate, not a standing.
 
-**BANKED CLAIM: FrankenTorch is at least 1.07x faster than PyTorch 2.12.0+cpu on
+**BANKED CLAIM (SUPERSEDED — see 14d/14e below; the floor is 1.006x, not 1.07x):
+FrankenTorch is at least 1.07x faster than PyTorch 2.12.0+cpu on
 `prelu_noshortcut`** (PReLU f64 train step `[32,512,256]`, sum shortcut defeated
 via its hook exit), taking the lowest confidence bound any of the three runs
 produced. Not the best run's point estimate, and not the best estimator's.
+
+> Left in place rather than rewritten, because the sequence 1.213x → 1.07x →
+> 1.006x is itself the evidence for rule 4 and deleting the intermediate step would
+> hide it. But it is marked here so a reader who stops at this line does not carry
+> the superseded number away — the correction is ~30 lines below, and a claim
+> stated as **BANKED** needs its retraction attached to it, not merely filed after
+> it.
 
 ## 2026-08-16 — REFUSAL ROW: `ft-conformance` cannot be scheduled on 6/10 of the fleet
 
