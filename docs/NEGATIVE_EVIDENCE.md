@@ -21146,3 +21146,46 @@ middle of chasing a standing.
 **Standing for conv3d, stated at the strength the evidence supports:** FrankenTorch
 is about **4.06x SLOWER** than PyTorch 2.12.1+cpu on this lane, reproduced twice,
 NOT null-certified. Worst bound either run produced: `0.239` (4.18x slower).
+
+**26. THE GUARDRAIL IN ITEM 25 NEEDS ONE MORE CLAUSE: replication excuses a
+failing null only when the drift is SHARED (`frankentorch-68pwz`, 2026-08-16).**
+Applying item 25's rule to GroupNorm within the hour exposed the case it does not
+cover.
+
+Two independent runs, same binary (ELF `1d0cb7f2c88fa645`),
+`same_host=thinkstation1`, `harness=gauntlet_lane_sweep_h2h.rs`, 32 rounds,
+incumbent PyTorch 2.12.1+cpu, parity `match` both:
+
+| run | load | FT | PT | ratio | PT null | FT null |
+|---|---|---|---|---|---|---|
+| A | 7.50 -> 13.63 | 2.006 ms | 0.317 ms | 0.158 `[0.141,0.166]` | **1.456 FAIL** | 1.022 |
+| B | 12.15 -> 18.14 | 1.903 ms | 0.289 ms | 0.152 `[0.138,0.169]` | **1.460 FAIL** | 1.027 |
+
+By item 25's rule this looks bankable: two runs, overlapping intervals, point
+estimates 4% apart. **It is not, and the reason is which null failed.**
+
+In conv3d (item 25) BOTH nulls read 1.03-1.05 — both arms drifted together, the
+host moved under both, and the paired ratio cancels exactly that. Here the
+FrankenTorch arm is stable (1.02) while the INCUMBENT alone degrades ~46% between
+its first and second halves — and it does so REPRODUCIBLY, 1.456 then 1.460. That
+is not host drift. That is torch's own arm getting systematically slower over the
+course of a run on this lane.
+
+**When only one arm degrades, the shared-drift cancellation argument does not
+apply, and replication may simply be reproducing a systematic bias rather than
+converging on a true ratio.** Two runs agreeing tells you the bias is stable; it
+does not tell you the number is right.
+
+**Refined rule, superseding item 25's clause:**
+
+> A failing A/A null is excusable only when (a) two independent runs agree with
+> overlapping intervals, AND (b) the null failure is SHARED — both arms' nulls
+> off in the same direction by a similar amount, consistent with the host moving
+> under both. If ONE arm's null fails while the other is clean, the ratio is
+> suspect no matter how well it replicates, because nothing cancels.
+
+So GroupNorm f32 is recorded as **~6.3-6.6x slower, NOT bankable**, worst bound
+`0.138` (7.25x). And a separate question is now open that is worth more than the
+lever: **why does torch's GroupNorm f32 arm slow by 46% within a single
+invocation, reproducibly?** Answering that may fix the measurement for every
+GroupNorm row this campaign has taken.
