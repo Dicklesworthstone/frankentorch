@@ -1127,7 +1127,22 @@ LANES = {
     // every CPU must be idle. Each arm's own half-vs-half A/A null remains a
     // mandatory gate; a failed row is refused rather than averaged into a ratio.
 
+    // frankentorch-68pwz / NEGATIVE_EVIDENCE item 49: sample the load EVERY ROUND,
+    // not just at the two endpoints. The endpoint pair cannot see a mid-run
+    // excursion — a real run read 17.78 at start and 17.72 at end and was certified
+    // steady, and those two numbers are equally consistent with a host that climbed
+    // to 60 in between. The balanced square interleaves arms throughout, so an
+    // excursion lands on some samples and not others, which is exactly the confound
+    // the gate exists to catch.
+    let mut load_series: Vec<f64> = Vec::with_capacity(reps + 2);
+    if let Some(l) = load_at_start {
+        load_series.push(l);
+    }
+
     for _ in 0..reps {
+        if let Some(l) = ft_api::harness_provenance::load_average_1m() {
+            load_series.push(l);
+        }
         for (index, (name, run_lane)) in lanes.iter().enumerate() {
             let mut incumbent_slots = Vec::with_capacity(4);
             let mut ft_slots = Vec::with_capacity(4);
@@ -1189,8 +1204,26 @@ LANES = {
     // separated by nothing but the host filling up mid-run. The balanced square
     // protects against a step between arms, not against drift under both.
     let load_at_end = ft_api::harness_provenance::load_average_1m();
-    let load_quotable =
+    if let Some(l) = load_at_end {
+        load_series.push(l);
+    }
+    // The SERIES gate is authoritative; the endpoint gate is still computed and
+    // printed so the two can be compared on real runs. It is strictly stricter —
+    // identical when the extremes are the endpoints, refusing more otherwise — so
+    // this can only reject runs the old gate accepted, never the reverse.
+    let endpoint_quotable =
         ft_api::harness_provenance::load_drift_is_quotable(load_at_start, load_at_end);
+    let load_quotable = ft_api::harness_provenance::load_series_is_quotable(&load_series);
+    let series_drift = ft_api::harness_provenance::load_series_drift(&load_series);
+    println!(
+        "load_series n={} worst_drift={} endpoint_gate={} series_gate={} \
+         (frankentorch-68pwz item 49: the endpoint pair cannot see a mid-run excursion; \
+         a divergence between these two gates IS the finding)",
+        load_series.len(),
+        series_drift.map_or_else(|| "unknown".to_owned(), |d| format!("{d:.3}x")),
+        if endpoint_quotable { "PASS" } else { "DRIFTED" },
+        if load_quotable { "PASS" } else { "DRIFTED" }
+    );
     let fmt_load = |value: Option<f64>| {
         value.map_or_else(|| "unknown".to_owned(), |load| format!("{load:.2}"))
     };
