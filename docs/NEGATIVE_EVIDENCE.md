@@ -25246,3 +25246,270 @@ in the incumbent child, plus a decision about what "comparable" means when one a
 64 threads and the other 8 — pinning both to the same 8 cores would cripple the design
 under test rather than measure it. That is a genuine instrument-design question and is
 filed rather than guessed at.
+
+## 66. THE BOARD HAS BEEN MEASURING OUR 64-THREAD POOL AGAINST TORCH'S 8 — MATCHING THE BUDGET IS 1.36x FASTER ON 21/21 LANES AND MAKES THE BOARD DECISIVE
+
+Twenty-two full 21-lane sweeps in one session. No lane filter, symmetric warmup
+32, 16 rounds, mimalloc on every sweep (self-reported), incumbent PyTorch
+2.12.1+cpu, `same_host=thinkstation1`. Parity `match` on every lane of every
+sweep — **0 MISMATCH in 21 x 22 rows**.
+
+### 66a. Provenance: the shared binary was rebuilt under me three times
+
+The runner hashes the ELF and reads `git rev-parse HEAD` per sweep, which is the
+only reason this surfaced instead of being silently averaged:
+
+    q1                              aeed1bfd...  HEAD 5e4911c8  (my build)
+    q2-q4, p1-p3, alt x6, pin1-3    e8e8bb1f...  HEAD 1033c885  (peer build)
+    t1                              e8e8bb1f...  then panicked mid-run
+    t2                              85b06187...  peer rebuild, uncommitted tree
+    attribution cells               0914fa6c...  private snapshot, see 66f
+
+`t1` died in `harness_provenance.rs:166` — `sha256sum failed` — because the
+executable was replaced while it ran, so `current_exe()` resolved to a deleted
+path. **The harness's own refusal to print ratios it cannot attribute to a binary
+is what caught this.** That assertion earns its keep.
+
+`aeed1bfd` and `e8e8bb1f` are behaviourally identical for a default sweep, and this
+was CHECKED, not assumed: `52802643` is comment-only (`git show | grep -v '^[+-] *//'`
+yields no code lines), `8e009543`'s `ft-kernel-cpu` hunk is inside `mod tests`, and
+`1033c885`'s harness hunk is entirely gated behind `FT_H2H_NO_FT_ARM`, never set here.
+
+### 66b. THE FULL BOARD CERTIFIED 2 OF 21 AT LOADAVG 69 — ITEM 62'S QUIET-HOST STORY DOES NOT HOLD
+
+    sweep  pre-load 1m   worst_drift   endpoint/series    certified
+    q1     69.34         1.187x        PASS / PASS        2
+    q2     59.05         1.130x        PASS / PASS        0
+    q3     63.17         1.645x        DRIFTED / DRIFTED  0
+    q4     41.68         1.286x        PASS / DRIFTED     0
+
+Item 62 read the board certifying 0 in six attempts "every one at loadavg 26-90"
+and 2 at loadavg ~15-20, and concluded contention was substantially the story.
+`q1` is a direct counterexample: drift 1.187x, both gates PASS, **two rows
+certified at loadavg 69.34**. The two drift-clean sweeps here are the two BUSIEST
+of the four, and the quietest (`q4`) drifted. Whatever admits a sweep, it is not
+loadavg.
+
+`q1`'s certified rows:
+
+    max_pool1d_nopool      MIN 1.07x SLOWER  0.932 [0.828,1.003]  PT 0.982 FT 0.990
+    group_norm_f32_zeroed  MIN 5.87x SLOWER  0.170 [0.154,0.202]  PT 1.019 FT 1.018
+
+### 66c. THE SAME LANE, SAME BINARY, SAME VENV READS 0.92 OR 1.39 DEPENDING ON THE HOST
+
+`max_pool1d_nopool` across twelve unpinned sweeps, sorted by our own arm's absolute
+time — the best available proxy for how much machine the run actually got:
+
+    run  venv    FT ms   PT ms   min-ratio
+    q1   OTHER  16.314  13.835     0.932   <- CERTIFIED
+    q2   OTHER  16.144  13.446     0.923
+    q3   OTHER  12.039  11.500     0.931
+    q4   OTHER  11.058  11.219     0.981
+    a2   OTHER  10.375  10.671     1.121
+    b2   PIN     9.911  10.811     1.071
+    a3   OTHER   9.841  10.621     1.225
+    b1   PIN     9.288  10.371     1.130
+    p1   PIN     9.020  10.494     1.090
+    p2   PIN     8.677  10.029     1.225
+    a1   OTHER   8.631  10.292     1.225
+    p3   PIN     8.342  10.309     1.394
+
+Pearson r between our arm's time and the ratio is **-0.788** over n=12. The ratio
+spans **0.923 to 1.394 (1.51x)** on one lane, one estimator — and it CROSSES 1.0,
+so the standing's DIRECTION is a property of the host, not of the code.
+
+**This reconciles three campaign answers rather than refuting any.** Item 25's "at
+least 1.75x SLOWER" (our arm at 18.4-19.2 ms), item 62's certified "1.34x FASTER"
+`[1.165,1.453]`, and `q1`'s certified "1.07x SLOWER" at loadavg 69 are all correct
+readings of different machines. **Two CERTIFIED rows on the same lane disagree in
+direction, and both passed every gate the harness has.**
+
+### 66d. THE MECHANISM: OUR ARM IS ~2x MORE HOST-SENSITIVE THAN THE INCUMBENT
+
+Across those twelve sweeps our arm swings **1.96x** (8.342 -> 16.314 ms); the
+incumbent swings **1.38x** (10.029 -> 13.835 ms), and outside the two busiest
+sweeps it holds 10.0-11.2 ms, a 1.12x band.
+
+`torch.set_num_threads(8)` is hard-coded in the harness; our arm takes
+`rayon::current_num_threads()` = 64. This box is a Threadripper PRO 5975WX
+(32 physical cores + SMT) under `amd-pstate-epp` / **`powersave`**, and per-core
+clock at a single instant spans **1429-4093 MHz, a 2.86x spread** — independently
+matching frankenfs's 2.879x and a peer's 2.812x. A data-parallel join over 64
+threads completes at the pace of the slowest core it landed on; torch needs eight
+good cores and is far likelier to get them.
+
+The spread is largest when the host is PARTIALLY idle and collapses to **1.02x**
+when a sweep saturates the box, so it is occupancy-dependent and unreadable from
+loadavg. A 2 s sampler over cores 0-7 caught them moving 1429 -> 3940 MHz inside
+one interval, with the working mean varying ~10% across four consecutive samples.
+
+### 66e. PINNING BOTH ARMS TO ONE CORE SET IS THE FIX, AND IT IS LARGE
+
+Three sweeps with both arms on cores 0-7 (distinct physical cores) and
+`RAYON_NUM_THREADS=8`, matching torch's 8 — the harness confirms `rayon_threads=8
+online_cpus=8`. Our arm's run-to-run spread, board-wide:
+
+    configuration                      median FT spread   worst
+    64 threads, unpinned (q1-q4)             1.628x       2.768x
+     8 threads, pinned    (pin1-3)           1.047x       1.205x
+
+**Improved on 21 of 21 lanes.** The worst pinned lane is steadier than the
+BEST unpinned one. `group_norm_f32_zeroed` reads 31.381 / 31.324 / 30.32 ms.
+
+And our arm is faster in ABSOLUTE terms on 8 pinned cores than on 64 unpinned ones,
+on **21 of 21 lanes**, median **1.28x**, up to 2.53x:
+
+    prelu                     23.70 -> 11.22 ms   2.11x
+    prelu_noshortcut          35.46 -> 15.64      2.27x
+    avg_pool1d_dense          27.86 -> 11.01      2.53x
+    conv3d                    34.66 -> 27.05      1.28x
+    group_norm_f32_zeroed     36.62 -> 31.38      1.17x
+
+That is not a measurement artefact — it is our own arm, timed against itself.
+**On this board, the default 64-thread rayon pool is a net loss on every lane.**
+It is consistent with the standing note that ft-kernel-cpu's parallel gates are
+tuned too eagerly for a 64-core host.
+
+### 66f. A VENV DIFFERENCE WAS SUSPECTED AND IS REFUTED
+
+Two installs both self-report `2.12.1+cpu`:
+`/data/projects/.venvs/frankentorch-pytorch-cpu` (Python 3.13) and the campaign pin
+`/data/tmp/torchvenv-2121` (Python 3.12). Three sweeps against the pin read
+1.090 / 1.225 / 1.394 where four against the other read 0.923-0.981 — which looked
+like the install flipping the sign of a standing.
+
+It was the confound in 66c: the pinned sweeps ran later, on a freer host. An
+ALTERNATED A/B/A/B/A/B, which shares any monotone host trend between cells, settles it:
+
+    OTHER  a1 1.225   a2 1.121   a3 1.225
+    PIN    b1 1.130   b2 1.071   b3 1.027
+
+Both installs land in one band, and our own arm's times do not split by venv
+(8.631/10.375/9.841 OTHER against 9.288/9.911/10.228 PIN). **The venv is not the
+explanation.** Recording it was still right; alternation is what separated the
+hypotheses, and I had the wrong answer until I ran it.
+
+### 66g. Ratio stability is a per-lane property, and not simply "big effects are stable"
+
+Ratio spread across `q1`-`q4` ran from 1.055x (`group_norm_f32_zeroed`) to 2.217x
+(`prelu_noshortcut`). Sorted by how far the ratio moved as the host freed up:
+
+    prelu                     0.348 -> 0.724   2.08x
+    prelu_noshortcut          0.242 -> 0.501   2.07x
+    conv3d                    0.121 -> 0.182   1.50x
+    group_norm_f32_zeroed     0.170 -> 0.170   1.00x
+    avg_pool1d                1.313 -> 1.127   0.86x
+    gn_f32_kernels_serialfwd  0.374 -> 0.319   0.85x
+
+It moves in BOTH directions, by up to 2x. `conv3d` sits at 0.12 and still moved
+1.50x, so distance from parity does not predict stability.
+`group_norm_f32_zeroed` is the one genuinely invariant lane, which is why it is the
+row this campaign keeps certifying.
+
+### 66h. What the existing gates cannot see
+
+The drift gate compares load samples WITHIN a run; the A/A nulls compare an arm's
+first half against its second WITHIN a run. Both are blind to the run's absolute
+core availability and clock, which are near-constant within a sweep and different
+between sweeps — precisely the variable 66c is sorted by. **A row can pass drift,
+pass both nulls, show `match` parity, and still be a measurement of the machine.**
+
+Under pinning the drift gate becomes actively mismatched: it reads whole-host
+loadavg while our arms occupy eight cores it does not distinguish. All three pinned
+sweeps failed the series gate on host load that no longer applied to them.
+
+### 66i. AT A MATCHED THREAD BUDGET THE BOARD BECOMES DECISIVE — 5 TO 8 ROWS PER SWEEP
+
+`torch.set_num_threads(8)` is hard-coded; our arm has been taking 64. Six further
+sweeps alternated `RAYON_NUM_THREADS=8` unpinned against 8-pinned, one private ELF
+`0914fa6c...` (see 66f). Four were drift-clean, and they certified:
+
+    sweep        threads   pinned   drift              certified
+    u1           8         no       1.089x PASS/PASS   5
+    u2           8         no       1.107x PASS/PASS   6
+    k2           8         yes      1.166x PASS/PASS   8
+    u3           8         no       1.219x PASS/PASS   6
+
+**The campaign's previous record for a full-board sweep was 2.** Rows certifying in
+more than one drift-clean sweep, min estimator, all parity `match`:
+
+    lane                                   cert   ratios
+    group_norm_f32_zeroed                  4/4    0.185 0.189 0.257 0.183
+    group_norm_f32_kernels_serialfwd       3/4    0.423 0.535 0.399
+    prelu                                  3/4    1.491 1.518 1.666   <- WIN
+    group_norm_f32_statskernels            2/4    1.782 1.893         <- WIN
+    group_norm_f32_kernels                 2/4    1.259 1.439         <- WIN
+    group_norm_f32_statskernels_recompute  2/4    1.248 1.464         <- WIN
+    prelu_noshortcut                       2/4    1.133 1.111         <- WIN
+    max_pool1d_zeroed                      2/4    0.832 0.941
+
+`prelu` is the strongest: three certifications with every CI entirely above 1.0, so
+**at least 1.449x FASTER** on the conservative bound at a matched thread budget.
+
+**THESE ARE NOT PRODUCT-CONFIGURATION ROWS.** They describe FrankenTorch at 8 rayon
+threads against torch at 8, which is a matched-budget comparison; the shipped default
+is 64. Both questions are legitimate and they are different questions, so the rows are
+labelled rather than merged with the 64-thread board.
+
+### 66j. The 64t -> 8t gain is confirmed three independent ways
+
+The first two comparisons were across runs taken at different times, so each was
+confounded with host occupancy. Three routes now agree, and the third removes the
+confound by construction:
+
+    method                                              median gain   lanes faster
+    best-case (min over all runs of each config)           1.36x         21/21
+    pin1-3 (8t) against b3 (64t)                           1.28x         21/21
+    ALTERNATED 64t/8t, one ELF, one window                 1.32x         21/21
+
+The alternated pair is the decisive one: same private ELF `0914fa6c...`, neither
+cell pinned, `RAYON_NUM_THREADS` the only variable, and the cells interleaved so any
+monotone host trend is shared. Both cells DRIFTED on the host gate — irrelevant here,
+because this is our arm timed against itself, not a ratio.
+
+    prelu_noshortcut          26.16 -> 15.05 ms   1.74x
+    avg_pool2d                 2.22 ->  1.14      1.94x
+    max_pool3d                 2.56 ->  1.43      1.79x
+    conv3d                    34.60 -> 26.19      1.32x
+    max_pool1d_nopool          8.66 ->  8.57      1.01x
+
+The gain is smallest on the lanes that were already near parity and largest on the
+heavier parallel ones, which is the signature of join overhead and clock-spread
+exposure rather than of a single bad kernel.
+
+**The lever this implies is pool WIDTH, not the existing parallel thresholds.** Those
+constants (`PARALLEL_THRESHOLD`, `POOL_FWD_PARALLEL_MIN`, and the rest) decide WHETHER
+to parallelize; this is about how many workers run once that decision is taken. It is
+an un-probed axis and it is worth a bead.
+
+### 66k. What holds
+
+- `group_norm_f32_zeroed` at **MIN 5.87x SLOWER `[0.154,0.202]`**, certified in
+  `q1` (drift-clean, both nulls PASS, parity match), consistent with item 62's
+  `[0.173,0.198]` and item 63's converged series, and invariant across a 1.47x host
+  swing. **This row holds.**
+- `q1`'s `max_pool1d_nopool` row is withdrawn as a STANDING — as is item 62's. Each
+  is a valid measurement of its own machine; the lane sits near parity and its
+  direction is not resolvable on this host without controlling core availability.
+- Parity held everywhere: 0 MISMATCH, 21 lanes x 22 sweeps.
+- At a matched thread budget, `prelu` **at least 1.449x FASTER** and
+  `group_norm_f32_statskernels` **at least 1.717x FASTER**, each certified in
+  multiple drift-clean sweeps — explicitly 8-vs-8 rows, not product-default rows.
+
+### 66l. Answering item 50's open instrument question
+
+Item 50 implemented per-arm clock recording, left pinning unimplemented, and filed
+the design question: *"pinning both to the same 8 cores would cripple the design
+under test rather than measure it."* Two things here bear on it, both measured:
+
+1. **Pinning needs no code today.** `taskset -c 0-7` on the harness process is
+   inherited by the incumbent child, verified by reading `taskset -cp` on both PIDs
+   (harness and its `torchvenv-2121` python both reported `0-7`). `sched_setaffinity`
+   in Rust plus `os.sched_setaffinity` in the child is a nicer interface, not a
+   prerequisite.
+2. **It does not cripple our arm — the 64-thread default does.** Our arm is faster at
+   8 threads than at 64 on **21 of 21 lanes**, so restricting it is not a handicap.
+   And affinity is the small term: pinned-vs-unpinned at 8 threads is a median
+   **0.975x** (range 0.859-2.080x), the outliers being the three ~1.2 ms lanes that
+   pinning hurts. **Match the thread budget; pinning is optional and mildly harmful
+   on the smallest lanes.**
