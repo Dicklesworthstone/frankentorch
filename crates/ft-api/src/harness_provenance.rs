@@ -326,6 +326,75 @@ pub fn load_drift_is_quotable(start: Option<f64>, end: Option<f64>) -> bool {
     drift <= MAX_LOAD_DRIFT
 }
 
+/// Whether the host stayed put, judged over a SERIES of load samples rather than
+/// an endpoint pair.
+///
+/// `frankentorch-68pwz`, NEGATIVE_EVIDENCE item 49. [`load_drift_is_quotable`]
+/// compares only the first and last reading, and that is a real blind spot: a run
+/// measured at `17.78` and `17.72` passes, and those two numbers are equally
+/// consistent with a steady host and with one that climbed to 60 and came back.
+/// The arms of a balanced square are interleaved THROUGHOUT the run, so a mid-run
+/// excursion lands on some samples and not others — precisely the confound the
+/// gate exists to catch, and precisely the one an endpoint pair cannot see.
+///
+/// I hit this myself: item 49's allocator experiment was invalidated by load, and
+/// the run I was comparing it against had been certified steady by exactly this
+/// two-point check.
+///
+/// The rule is unchanged — DRIFT IN EITHER DIRECTION, not level — but it is now
+/// evaluated as `max(samples) / min(samples)`, which is the endpoint check when
+/// the extremes happen to be the endpoints and strictly stricter otherwise. It can
+/// only reject runs the old gate accepted; it never accepts one the old gate
+/// refused.
+///
+/// Fewer than two samples cannot show drift, so they are not quotable: a missing
+/// signal must not read as a passing one, the same reasoning as the `None` arm of
+/// the pairwise gate.
+#[must_use]
+pub fn load_series_is_quotable(samples: &[f64]) -> bool {
+    if samples.len() < 2 {
+        return false;
+    }
+    let floor = 1.0_f64;
+    let mut lo = f64::INFINITY;
+    let mut hi = 0.0_f64;
+    for &s in samples {
+        if !s.is_finite() || s < 0.0 {
+            // A malformed reading fails closed rather than being skipped, so a
+            // partly-unreadable series cannot masquerade as a clean one.
+            return false;
+        }
+        let v = s.max(floor);
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    hi / lo <= MAX_LOAD_DRIFT
+}
+
+/// The worst drift in a series, for reporting alongside a row.
+///
+/// Returns `None` for a series too short or malformed to judge, matching
+/// [`load_series_is_quotable`] so a row cannot print a reassuring number while the
+/// gate refuses it.
+#[must_use]
+pub fn load_series_drift(samples: &[f64]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let floor = 1.0_f64;
+    let mut lo = f64::INFINITY;
+    let mut hi = 0.0_f64;
+    for &s in samples {
+        if !s.is_finite() || s < 0.0 {
+            return None;
+        }
+        let v = s.max(floor);
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    Some(hi / lo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +659,86 @@ mod tests {
             VERSION_PROBE_PY.contains(VERSION_MARKER.trim_end()),
             "probe `{VERSION_PROBE_PY}` must print marker `{VERSION_MARKER}`"
         );
+    }
+
+    /// THE BLIND SPOT ITEM 49 FOUND, encoded so it cannot come back.
+    ///
+    /// The real run that motivated this read `17.78` at start and `17.72` at end
+    /// and was certified steady. Those same endpoints are equally consistent with
+    /// a host that climbed to 60 in the middle — and the balanced square samples
+    /// throughout, so a mid-run excursion hits some samples and not others. The
+    /// pairwise gate accepts both; the series gate must separate them.
+    #[test]
+    fn series_gate_catches_the_mid_run_excursion_the_pairwise_gate_cannot_see() {
+        let endpoints_only = (Some(17.78_f64), Some(17.72_f64));
+        assert!(
+            load_drift_is_quotable(endpoints_only.0, endpoints_only.1),
+            "the pairwise gate accepted this real run, which is the premise"
+        );
+
+        // Same endpoints, steady throughout: both gates agree it is quotable.
+        let steady = [17.78, 17.80, 17.69, 17.75, 17.72];
+        assert!(load_series_is_quotable(&steady));
+
+        // Same endpoints, 3.4x excursion in the middle: the pairwise gate still
+        // says yes and is WRONG; the series gate refuses.
+        let excursion = [17.78, 42.0, 60.5, 25.1, 17.72];
+        assert!(
+            !load_series_is_quotable(&excursion),
+            "a 60.5/17.72 = 3.4x mid-run excursion must not be quotable"
+        );
+        let drift = load_series_drift(&excursion).expect("series is judgeable");
+        assert!(
+            (drift - 60.5 / 17.72).abs() < 1e-9,
+            "reported drift {drift} should be max/min over the whole series"
+        );
+    }
+
+    /// The series gate must never ACCEPT what the pairwise gate rejected — it is
+    /// strictly stricter, not merely different. Checked on the two real voided
+    /// runs from items 44 and 49.
+    #[test]
+    fn series_gate_is_strictly_stricter_than_the_pairwise_gate() {
+        // Item 44: 11.98 -> 33.52, VOID under both.
+        assert!(!load_drift_is_quotable(Some(11.98), Some(33.52)));
+        assert!(!load_series_is_quotable(&[11.98, 20.0, 33.52]));
+
+        // Item 49: 50.69 -> 93.30, VOID under both.
+        assert!(!load_drift_is_quotable(Some(50.69), Some(93.30)));
+        assert!(!load_series_is_quotable(&[50.69, 70.0, 93.30]));
+
+        // When the extremes ARE the endpoints, the two gates coincide exactly.
+        for &(a, b) in &[(8.63_f64, 9.25_f64), (23.05, 29.09), (7.10, 12.25)] {
+            assert_eq!(
+                load_drift_is_quotable(Some(a), Some(b)),
+                load_series_is_quotable(&[a, b]),
+                "gates must agree on the two-sample case ({a} -> {b})"
+            );
+        }
+    }
+
+    /// A missing or malformed signal must fail closed, matching the `None` arm of
+    /// the pairwise gate. A partly-unreadable series must not read as clean.
+    #[test]
+    fn series_gate_fails_closed_on_short_or_malformed_input() {
+        assert!(!load_series_is_quotable(&[]));
+        assert!(!load_series_is_quotable(&[12.0]));
+        assert!(!load_series_is_quotable(&[12.0, f64::NAN, 12.1]));
+        assert!(!load_series_is_quotable(&[12.0, -1.0, 12.1]));
+        assert!(!load_series_is_quotable(&[12.0, f64::INFINITY]));
+
+        assert_eq!(load_series_drift(&[]), None);
+        assert_eq!(load_series_drift(&[12.0]), None);
+        assert_eq!(load_series_drift(&[12.0, f64::NAN]), None);
+    }
+
+    /// The 1.0 floor that keeps an idle host from reading as drift, carried over
+    /// from the pairwise gate: 0.2 -> 0.5 is 2.5x and means nothing.
+    #[test]
+    fn series_gate_floors_an_idle_host_the_same_way() {
+        assert!(load_series_is_quotable(&[0.2, 0.5, 0.31]));
+        assert!(load_series_is_quotable(&[0.0, 0.9, 0.4]));
+        // Above the floor the ratio bites again.
+        assert!(!load_series_is_quotable(&[1.0, 1.4, 1.1]));
     }
 }
