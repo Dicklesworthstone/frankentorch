@@ -41973,6 +41973,81 @@ mod tests {
         }
     }
 
+    /// frankentorch-68pwz: price the f64 gradient round trip at the
+    /// `group_norm_f32` lane's exact size, BEFORE rewriting the engine's dtype
+    /// handling. Reports the number; the number is the deliverable.
+    #[test]
+    fn group_norm_f32_prices_the_f64_gradient_round_trip() {
+        // frankentorch-68pwz. The group_norm_f32 lane is 5.33x SLOWER than torch
+        // (34.167 ms vs 6.412 ms) while its KERNELS are 1.54x FASTER (4.298 ms),
+        // so ~30 ms — 87.4% of the lane — is engine, not kernel
+        // (NEGATIVE_EVIDENCE item 46).
+        //
+        // The harness doc names a specific suspect: the tape's gradient space is
+        // f64 even for an f32 op, because
+        // apply_function_f32_output_with_create_graph_borrowed_inputs takes
+        // `&[&[f64]]` and returns `Vec<Option<Vec<f64>>>`. So every f32 backward
+        // DOWNCASTS the incoming gradient and UPCASTS its results — two full-size
+        // conversions plus their allocations.
+        //
+        // PRICE IT BEFORE REWRITING THE ENGINE'S DTYPE HANDLING. If two
+        // conversions at the lane's real size cost well under a millisecond, this
+        // hypothesis cannot account for ~30 ms and the rewrite would be aimed at
+        // the wrong term — the same mistake items 36 and 46 already record.
+        //
+        // Size is the lane's exactly: GN_N*GN_C*GN_H*GN_W = 8*64*28*28 = 401,408.
+        let numel = 8usize * 64 * 28 * 28;
+        assert_eq!(numel, 401_408, "lane size drifted from the measured row");
+
+        let grad_f64: Vec<f64> = (0..numel)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let v = (i % 1024) as f64;
+                v * 1e-3 - 0.5
+            })
+            .collect();
+
+        let mut down_ns = u128::MAX;
+        let mut up_ns = u128::MAX;
+        let mut down_sum = 0.0f32;
+        let mut up_sum = 0.0f64;
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            #[allow(clippy::cast_possible_truncation)]
+            let as_f32: Vec<f32> = grad_f64.iter().map(|&g| g as f32).collect();
+            down_ns = down_ns.min(t0.elapsed().as_nanos());
+
+            let t1 = std::time::Instant::now();
+            let back_f64: Vec<f64> = as_f32.iter().map(|&g| f64::from(g)).collect();
+            up_ns = up_ns.min(t1.elapsed().as_nanos());
+
+            // Consume both so neither conversion is elided.
+            down_sum += as_f32[numel - 1];
+            up_sum += back_f64[numel - 1];
+        }
+        assert!(down_sum.is_finite() && up_sum.is_finite());
+
+        let round_trip_ns = down_ns + up_ns;
+        #[allow(clippy::cast_precision_loss)]
+        let round_trip_ms = round_trip_ns as f64 / 1.0e6;
+        #[allow(clippy::cast_precision_loss)]
+        let share_of_engine = 100.0 * round_trip_ms / 30.0;
+        println!(
+            "68pwz f64 gradient round trip at numel={numel}: down {down_ns} ns, up {up_ns} ns, \
+             total {round_trip_ms:.3} ms = {share_of_engine:.2}% of the ~30 ms engine term"
+        );
+
+        // No threshold assertion: the NUMBER is the deliverable and a hard-coded
+        // bound would be flaky on a shared host. But a round trip cannot be
+        // negative-cost, and if it somehow measures as free the conversions were
+        // optimised away and the row means nothing.
+        assert!(
+            round_trip_ns > 0,
+            "conversion round trip measured as zero — it was elided, so this \
+             row cannot price anything"
+        );
+    }
+
     /// frankentorch-j8sl5: the A/B that decides whether the dispatch flip is worth
     /// making, run as a test so it needs no separate binary and no cross-build
     /// comparison.

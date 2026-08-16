@@ -23560,3 +23560,55 @@ checked. The cost of checking was one grep of the lane table. **When a lane name
 carries a modifier, read what the modifier does before treating the lane as the
 target** — the same class of error as assuming a bead's title names its dominant
 term, which this ledger has now recorded three times on SVD.
+
+## 47. THE prelu FLOOR CONFIRMED ON A SECOND BINARY — AND THE NEXT LEVER'S PREREQUISITE TEST
+
+Two things, both from the drift-clean local run already captured for item 45. No
+new build: disk sat at 43G, one gig above the hard stop, for the whole turn.
+
+### 47a. The prelu floor holds at ~1.19 across two different binaries
+
+Item 43 banked `prelu_noshortcut` at 1.372x [1.194,1.439] and lowered the standing
+floor from 1.30x to 1.194x. That row came from ELF `9cc2503a62543378`, which the
+next rebuild revealed was a PRE-`81d1cfea` binary. The drift-clean run on the
+current binary, ELF `b6daceecb9702207`:
+
+    prelu_noshortcut  FT 14.414 ms  PT 19.041 ms  1.32x FASTER  ratio 1.321 [1.196,1.426]
+                      MIN 1.44x FASTER  ratio 1.436 [1.345,1.529]
+                      PT null 1.006 PASS   FT null 0.925 FAIL   parity match
+    prelu             FT  9.458 ms  PT 18.570 ms  1.96x FASTER  ratio 1.963 [1.694,2.080]
+                      MIN 1.99x FASTER  PT null 0.982 PASS  FT null 1.023 FAIL
+
+**Neither is quotable** — the FrankenTorch-side A/A null fails on both lanes, the
+same one-sided defect this lane showed in item 43. But the lower bound lands at
+**1.196**, against 1.194 from the other binary. **The floor is ~1.19 on two
+independent binaries**, so the walk-down from 1.30x is not an artifact of the stale
+build, which was the obvious way it could have been wrong.
+
+### 47b. Pricing the f64 gradient round trip before rewriting anything
+
+Item 46 established that `group_norm_f32` is 5.33x slower while its kernels are
+1.54-1.83x FASTER, leaving ~30 ms — 87.4% of the lane — in the engine. The harness
+doc names a specific suspect:
+`apply_function_f32_output_with_create_graph_borrowed_inputs` takes `&[&[f64]]` and
+returns `Vec<Option<Vec<f64>>>`, so the tape's gradient space is f64 even for an
+f32 op and every f32 backward downcasts its incoming gradient and upcasts its
+results — two full-size conversions over 401,408 elements.
+
+`group_norm_f32_prices_the_f64_gradient_round_trip` measures exactly that, at the
+lane's exact size, and reports the cost as a percentage of the ~30 ms engine term.
+
+**It exists to be allowed to fail.** If two conversions of 401,408 f64s cost well
+under a millisecond, the hypothesis cannot account for 30 ms and the dtype rewrite
+would be aimed at the wrong term. This ledger has already recorded that mistake
+twice — item 36 (a D&C rewrite aimed at 10.5%) and item 46 (four levers aimed at
+the 12.6% that was already winning). Pricing the suspect costs one test; being
+wrong about it costs a multi-session engine change.
+
+The test asserts no threshold — a hard bound would be flaky on a shared host — but
+it does assert the round trip measured as non-zero, because a conversion optimised
+away would report as free and the row would mean nothing.
+
+**UNCOMPILED**: written under the no-cold-build rule, rustfmt-parsed, additive,
+test-only, and mirroring timing tests already passing in this module (item 41's
+constraints).
