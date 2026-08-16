@@ -25906,3 +25906,70 @@ sites are numel-scaled and were converted; the rest are per-channel, index, or g
 buffers where the helper's gate keeps them serial. A sweep for other numel-scaled
 widenings on the f32 surface is owed and is likely the same vein — this one was worth
 20 ms on a single lane.
+
+## 70. conv3d's BACKWARD IS 63% OF THE LANE — ITEM 68's FORWARD LEVER IS WORTH 1.20x, NOT 1.85x
+
+Every conv3d measurement this campaign has taken, item 68's route probe included, priced
+the FORWARD. The scored lane times forward + loss_sum + backward, so the split decides
+what any lever is worth, and it had never been read.
+
+Probe: `crates/ft-api/examples/conv3d_phase_probe.rs`, arm-internal — no incumbent, no
+ratio, no drift gate. Per-arm host state: **loadavg 18.42 / 19.62 / 21.14; CPU
+1429-4068 MHz, cross-core spread 2.85x pre and 1.77x post.** 64 rayon threads.
+
+### 70a. The split
+
+    phase                              min ms    share
+    forward (direct 3x3s1 route)        6.077     37.1%
+    backward (ones-dout fast path)     10.290     62.9%
+    forward + backward                 16.367
+
+The lane's loss is `out.sum()`, so its upstream gradient is exactly all-ones and
+`conv3d_backward_f64` takes its `conv3d_backward_ones_dout_f64` branch. That is
+reproduced here rather than assumed — the probe passes an all-ones `dout` and, as a
+control, a non-ones one:
+
+    backward (non-ones dout)           18.030
+    the ones-dout fast path is already worth 1.75x
+
+### 70b. THIS RE-SIZES ITEM 68 AND `frankentorch-conv3d-direct-gate-misset-w3pol`
+
+Item 68 measured the direct-kernel gate as a 1.5-3.3x pessimization and filed the re-gate
+as worth that much, pending a tolerance call. Against the whole lane it is worth far
+less. Taking item 68's in_ch=32 figure (stream/direct 0.541, so ~1.85x on the forward):
+
+    forward 6.077 -> ~3.29 ms, lane 16.367 -> ~13.58 ms  =  1.20x
+
+**A 1.85x forward lever is a 1.20x lane lever**, because the forward is only 37% of the
+work. That does not withdraw the re-gate — it is still a real 1.85x on a real phase — but
+anyone weighing it against a tolerance ratification should weigh 1.20x, not 1.85x. Filed
+back onto w3pol.
+
+### 70c. The backward is the untouched majority, and it is not reachable from here
+
+At 10.29 ms the backward is the larger phase and no lever has ever been aimed at it. It
+lives in `ft-kernel-cpu`'s `conv3d_backward_ones_dout_f64`. **That file has carried
+another agent's uncommitted work throughout this session** (145 lines,
+`PARALLEL_TARGET_WORKERS` for `frankentorch-rayon-pool-width-qq8as`), so a change there
+could not be committed without taking their work with it. Recorded as the reason this
+item ships a measurement and not a fix, and left for whoever holds the file next.
+
+### 70d. WHILE HERE: the GroupNorm engine term is now at its floor
+
+Item 69 cut the f32 GroupNorm engine term from 25.69 ms to 5.45 ms. What remains is
+almost entirely the widen it made parallel, not overhead around it:
+
+    parallel widen, measured standalone     4.566 ms
+    engine term after the fix               5.45 ms
+
+So **~84% of the remaining engine term IS the widen**, and ~0.9 ms is tape and dispatch.
+The gradient accumulation path was checked and is already clean —
+`accumulate_tensor_gradient_owned` MOVES the buffer when the slot is empty rather than
+copying, and parallelizes above 1<<15 when it does not.
+
+The only remaining lever on that term is to stop widening at all, i.e. store f32
+gradients natively in the tape instead of converting every f32 gradient to `Vec<f64>`.
+That is an architectural change to the tape's storage, not a local fix, and it is the
+honest next target for `68pwz` rather than any further fusion. **A second fusion lever
+aimed at the GroupNorm kernels would now be aimed at a phase that is 4.8 ms out of 10.3
+and already 1.32x FASTER than the incumbent.**
