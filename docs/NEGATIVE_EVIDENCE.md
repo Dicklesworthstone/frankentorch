@@ -19792,3 +19792,37 @@ distortion, and thirteen rows still fail on their own merits.
 buffer-pool pair, median `0.965x` versus min `1.005x`. The harness flags that as
 unusable under either rather than letting a reader pick. That flag is the
 guardrail against exactly the temptation this entry could otherwise create.
+
+**14b. THE CERTIFIED ROW REPLICATES — AND THE WITHIN-RUN CI UNDERSTATES
+BETWEEN-RUN VARIATION (`frankentorch-rled4`, 2026-08-15).** Item 14's row was one
+invocation, and one invocation is not replication. Re-run on the SAME binary (ELF
+`9125c43489561480`, build worker `vmi1227854`, harness
+`gauntlet_lane_sweep_h2h.rs`, `same_host=thinkstation1`, 32 rounds), second
+invocation at load 6.32 -> 17.23 against the first at 5.91 -> 16.16:
+
+| run | median estimator | PT null | min estimator | PT null |
+|---|---|---|---|---|
+| 1 | 1.180x `[1.140,1.222]` | PASS `[0.971,1.014]` | 1.213x `[1.184,1.239]` | 1.007 PASS |
+| 2 | 1.113x `[1.075,1.143]` | PASS `[0.985,1.035]` | 1.175x `[1.129,1.213]` | 1.007 PASS |
+
+**The win replicates**: FrankenTorch ahead of a live torch arm on
+`prelu_noshortcut` in two independent invocations, all four nulls passing, parity
+`match` both times. The defensible claim is the conservative one — **at least
+1.07x**, the lowest bound either run produced — not the 1.213x headline of the
+better run.
+
+**The methodological finding is the more useful half. The two median CIs barely
+touch** (`[1.140,1.222]` versus `[1.075,1.143]`, overlapping only at 1.140-1.143)
+while the two min CIs overlap comfortably (`[1.184,1.239]` versus
+`[1.129,1.213]`). A confidence interval computed WITHIN one invocation describes
+resampling noise inside that invocation; it does not describe the host drifting
+between invocations, and here the between-run drift is larger than the median's
+within-run interval says it should be. So:
+
+- **a within-run CI is not a licence to compare across runs**, which is the same
+  boundary item 6 drew for A/A nulls, now measured on a real row;
+- the min estimator is better behaved on this axis too — it was adopted for
+  stability of the point estimate and turns out to also produce intervals that
+  survive replication;
+- **any row banked from a single invocation should carry its round count and be
+  re-run before it is quoted as a standing.** Two runs cost eleven minutes here.
