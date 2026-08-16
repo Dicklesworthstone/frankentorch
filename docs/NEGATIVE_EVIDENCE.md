@@ -22325,3 +22325,79 @@ That also bounds the claim: a paired FT-vs-FT row is NOT a vs-PyTorch standing a
 becomes one. It says this lever is worth 1.27x against its own predecessor. It says
 nothing about where the op stands against torch, which is exactly what item 31 could not
 determine on the same data.
+
+## 32. THE SVD VECTORS PHASE IS THE V-ACCUMULATION AND NOTHING ELSE — TWO LEVERS RETIRED WITHOUT BUILDING THEM
+
+`frankentorch-svd-blocked-bidiag-r7jdo.1` has been carried on the attribution
+"vectors are 44-62% of a square SVD". Three things about that turned out to need
+correcting, and the third kills two candidate levers outright.
+
+### 32a. The 44-62% figure was one run, and n=256 is not reproducible
+
+Re-measured after `v09ms`, min of 5 interleaved, two runs on two workers:
+
+    n        run 1 (vmi1149989)   run 2 (vmi1227854)
+    128      56.9%                62.4%
+    256      29.0%                59.2%
+    384      71.7%                77.3%
+
+The n=256 cell moves by a factor of two between runs. Its `svdvals` arm read
+20.525 ms in run 1 against 12.999 ms in run 2 — a 1.58x swing in a path that
+`v09ms` does not touch and that has no `full_matrices` dependence at all, so that
+is worker variance and not a change. **Discounting that cell, vectors are 57-77%
+and RISING with n** — the target is real and LARGER than the number the bead was
+filed under, but the original figure should not have been quoted to three
+significant digits off a single run.
+
+### 32b. The path was assumed; it is now proved
+
+`SVD_DEFERRED_LEFT_HITS` counts successful takes of the deferred-left square fast
+path. At n = 128, 256, 384 a square `full_matrices=true` SVD reports **hits = 1 at
+every size** — it takes the deferred-left path, which builds U as a single
+parallel `A*V/S` GEMM rather than accumulating left Givens rotations.
+
+This mattered because the two have disjoint levers, and a plausible hypothesis
+(vectors rising with n because the fast path bails at larger n and falls back to
+left-Givens accumulation) was **REFUTED** by the counter. Source reading would have
+supported it.
+
+### 32c. Inside the vectors phase, the GEMM and the assemble are noise
+
+Three nanosecond accumulators split the deferred-left path, min of 3 whole calls,
+rch worker `vmi1293453`:
+
+    n     bidiag+V ns    A*V gemm ns    assemble ns       total ns   split
+    128       3046279         101122          77516        3224917   94.5% / 3.1% / 2.4%
+    256     190514279         929675         709133      192153087   99.1% / 0.5% / 0.4%
+    384     211694530        3222303        1361742      216278575   97.9% / 1.5% / 0.6%
+
+**TWO LEVERS ARE RETIRED BY THIS TABLE, NEITHER OF WHICH WAS BUILT:**
+
+- *Route `A*V` through the tiled/packed GEMM.* It is already `gemm::dgemm`, which
+  is parallel (`par_chunks_mut`), and it is **0.5-3.1%** of the phase. Making it
+  infinitely fast wins at most 3%.
+- *Parallelize the final assemble loop.* It is genuinely serial and genuinely
+  O(n²), and it is **0.4-2.4%**. Same verdict.
+
+Both looked reasonable from the source. The serial assemble in particular is the
+exact shape this campaign has repeatedly paid for parallelizing
+(`project_outer_gate_serial_vein`), and it would have been a real 2-3x on its own
+term while moving the op by under 1%.
+
+### 32d. Where the time actually is
+
+`golub_reinsch_svd_right_only` is 94.5-99.1% of the deferred-left path. That call
+contains the bidiagonalisation — which `svdvals` also performs — plus the QR sweep
+WITH V accumulation. Cross-referencing the values-only arm (13-20 ms at n=256,
+~29 ms at n=384) against `right_only` (190 ms and 212 ms) puts the marginal
+V-accumulation at roughly 85-90% of a square SVD.
+
+Two honesty notes on that inference. It crosses runs on different workers, so it
+sizes rather than certifies; and the table's own n=256 (190 ms) against n=384
+(212 ms) is nearly flat where the work grows 3.4x, which is not credible and marks
+that run as contended. **The within-call SPLIT is what this item banks** — it is
+paired inside one call and agrees across three sizes — not the absolute times.
+
+The reusable rule: a phase attribution licenses a lever only at the granularity it
+was measured. "Vectors are 57-77%" is true and was not enough; it would have
+funded two levers worth a combined 3%.

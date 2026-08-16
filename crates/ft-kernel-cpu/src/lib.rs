@@ -11098,9 +11098,50 @@ pub fn avg_pool1d_backward_scalar_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
-    // frankentorch-7zqbc: pooled dense gradient (accumulating route — zeros kept).
-    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
+    let numel = batch * ch * len;
     let g = upstream / kernel as f64;
+
+    // frankentorch-372h8: TOTAL-COVERAGE case — the windows tile the input exactly, so
+    // the fill below writes EVERY element and the zero-init underneath it is 100% dead.
+    // At the scorecard shape [8,64,8192] that is 33.5 MB of memset thrown away per
+    // backward, for a kernel whose per-element work is a single store.
+    //
+    // This is the one profile the uninit vein actually pays on (item 30: one win in
+    // four attempts, and that win had both the largest zeroed-bytes-per-work ratio AND
+    // a buffer pool behind it keeping memory dirty). `take_zeroed` draws from that same
+    // pool, so the memory here is recycled and dirty and the memset is real work rather
+    // than free kernel zero pages — which is the mechanism from item 29d, not a guess.
+    //
+    // `covered_len == len` is the strict form: `<= len` would leave a trailing run
+    // unwritten, and against an uninitialized buffer that run is garbage rather than the
+    // zeros the gradient requires. The partial-coverage case falls through to the
+    // existing zeroed paths unchanged.
+    if !pool_output_zeroed()
+        && stride == kernel
+        && g.is_finite()
+        && g != 0.0
+        && let Some(covered_len) = output_len.checked_mul(kernel)
+        && covered_len == len
+    {
+        let fill_all = |dp: &mut [f64]| {
+            dp.par_chunks_mut(len).for_each(|drow| drow.fill(g));
+        };
+        // Take a parked buffer when one exists — its pages are already committed, so
+        // the fill is the only thing touching the memory — and fall back to
+        // `build_uninit`, NOT to a zeroed allocation, which is the correction recorded
+        // at the avg_pool2d sibling: a `vec![0.0; len]` miss path hands this site the
+        // very memset the lever exists to remove.
+        return match ft_core::buffer_pool::try_take_exact(numel) {
+            Some(mut pooled) => {
+                fill_all(&mut pooled);
+                pooled
+            }
+            None => build_uninit(numel, fill_all),
+        };
+    }
+
+    // frankentorch-7zqbc: pooled dense gradient (accumulating route — zeros kept).
+    let mut din = ft_core::buffer_pool::take_zeroed(numel);
     if stride == kernel
         && g.is_finite()
         && g != 0.0
@@ -29818,6 +29859,43 @@ fn svd_rank_deficient_square_fast_path(
     }
 }
 
+/// Sentinel for `frankentorch-r7jdo.1`: counts SUCCESSFUL takes of the
+/// deferred-left square fast path. Source reading has produced confident wrong
+/// answers about which SVD path executes before (NEGATIVE_EVIDENCE item 12), so
+/// the phase attribution names the path it measured instead of assuming it.
+/// Measurement-only; nothing in production reads it.
+#[doc(hidden)]
+pub static SVD_DEFERRED_LEFT_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read and reset the deferred-left take counter.
+#[doc(hidden)]
+pub fn svd_deferred_left_hits_take() -> usize {
+    SVD_DEFERRED_LEFT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Nanosecond accumulators splitting the deferred-left path into its three parts,
+/// for `frankentorch-r7jdo.1`. The square phase split says VECTORS are 57-77% of a
+/// square SVD; this says which THIRD of the vector work that is, so a lever aims at
+/// a measured term instead of an assumed one. Measurement-only.
+#[doc(hidden)]
+pub static SVD_DL_QR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static SVD_DL_GEMM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static SVD_DL_ASSEMBLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read and reset the deferred-left phase timers as `(qr_ns, gemm_ns, assemble_ns)`.
+#[doc(hidden)]
+pub fn svd_deferred_left_phase_ns_take() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SVD_DL_QR_NS.swap(0, Relaxed),
+        SVD_DL_GEMM_NS.swap(0, Relaxed),
+        SVD_DL_ASSEMBLE_NS.swap(0, Relaxed),
+    )
+}
+
 fn svd_full_rank_square_deferred_left_fast_path(
     a: &[f64],
     m: usize,
@@ -29839,7 +29917,12 @@ fn svd_full_rank_square_deferred_left_fast_path(
     }
 
     let mut scratch = a.to_vec();
+    let phase_t0 = std::time::Instant::now();
     let (w_bidiag, v) = golub_reinsch_svd_right_only(&mut scratch, m, n)?;
+    SVD_DL_QR_NS.fetch_add(
+        phase_t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if !w_bidiag.iter().all(|value| value.is_finite()) || !v.iter().all(|value| value.is_finite()) {
         return Ok(None);
     }
@@ -29854,8 +29937,14 @@ fn svd_full_rank_square_deferred_left_fast_path(
     order.sort_by(|&lhs, &rhs| w_bidiag[rhs].total_cmp(&w_bidiag[lhs]));
 
     let mut av = vec![0.0f64; m * n];
+    let phase_t1 = std::time::Instant::now();
     gemm::dgemm(m, n, n, a, &v, &mut av);
+    SVD_DL_GEMM_NS.fetch_add(
+        phase_t1.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
+    let phase_t2 = std::time::Instant::now();
     let mut s = Vec::with_capacity(n);
     let mut u = vec![0.0f64; m * n];
     let mut vh = vec![0.0f64; n * n];
@@ -29871,6 +29960,11 @@ fn svd_full_rank_square_deferred_left_fast_path(
         }
     }
 
+    SVD_DL_ASSEMBLE_NS.fetch_add(
+        phase_t2.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    SVD_DEFERRED_LEFT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(Some(SvdResult {
         u,
         s,
@@ -41338,6 +41432,66 @@ mod tests {
                 "264q0 basis completion m={m} k={k} u_cols={u_cols} rank={rank}: \
                  restarting {restart_ns} ns, cursor {cursor_ns} ns ({speedup:.2}x)"
             );
+        }
+    }
+
+    /// frankentorch-372h8: the total-coverage avg_pool1d scalar backward must agree
+    /// BIT-FOR-BIT with the zeroed route it replaces, and must NOT engage where
+    /// coverage is partial — there the untouched trailing run has to stay zero, and
+    /// against an uninitialized buffer it would be garbage instead.
+    ///
+    /// Both arms run in ONE process via the `set_pool_output_zeroed` toggle, so this
+    /// compares the two routes rather than two binaries.
+    #[test]
+    fn avg_pool1d_scalar_backward_total_coverage_matches_the_zeroed_route_bitwise() {
+        // (batch, ch, len, kernel, stride, output_len, engages?)
+        let cases = [
+            // exact tiling: the lever's case
+            (2usize, 3usize, 64usize, 2usize, 2usize, 32usize, true),
+            (1, 1, 96, 3, 3, 32, true),
+            // trailing run outside every window -> must NOT engage
+            (2, 3, 65, 2, 2, 32, false),
+            (1, 2, 100, 3, 3, 33, false),
+            // overlap -> accumulating route, must NOT engage
+            (1, 2, 64, 3, 1, 62, false),
+        ];
+        for &(b, c, len, k, st, ol, engages) in &cases {
+            for &upstream in &[1.25f64, -0.5, 0.0, f64::NAN, f64::INFINITY] {
+                let previous = super::set_pool_output_zeroed(true);
+                let zeroed = super::avg_pool1d_backward_scalar_f64(upstream, b, c, len, k, ol, st);
+                super::set_pool_output_zeroed(false);
+                let levered = super::avg_pool1d_backward_scalar_f64(upstream, b, c, len, k, ol, st);
+                super::set_pool_output_zeroed(previous);
+
+                assert_eq!(zeroed.len(), levered.len());
+                for (i, (a, x)) in zeroed.iter().zip(levered.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        x.to_bits(),
+                        "372h8 mismatch at b={b} c={c} len={len} k={k} stride={st} \
+                         upstream={upstream} idx={i}: zeroed={a} levered={x}"
+                    );
+                }
+
+                // The guard itself: with a non-finite or zero `g`, or partial
+                // coverage, the lever must decline and leave the zeroed route to run.
+                // Checked through behaviour rather than a flag — every element outside
+                // the covered run must be exactly +0.0.
+                if !engages {
+                    let covered = ol * st + k.saturating_sub(st);
+                    let covered = covered.min(len);
+                    for plane in 0..b * c {
+                        for i in covered..len {
+                            assert_eq!(
+                                levered[plane * len + i].to_bits(),
+                                0.0f64.to_bits(),
+                                "372h8 left garbage outside coverage: len={len} k={k} \
+                                 stride={st} idx={i}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -22,7 +22,9 @@
 //! Run: `cargo run -q --release -p frankentorch-kernel-cpu --example svd_scale_probe`
 
 use ft_core::{DType, Device, TensorMeta};
-use ft_kernel_cpu::svd_contiguous_f64;
+use ft_kernel_cpu::{
+    svd_contiguous_f64, svd_deferred_left_hits_take, svd_deferred_left_phase_ns_take,
+};
 
 /// Well-conditioned deterministic fill, same xorshift family as `svd_golden`.
 fn deterministic_matrix(m: usize, n: usize, seed: u64) -> Vec<f64> {
@@ -206,10 +208,86 @@ fn square_fast_path_gate_probe() {
     }
 }
 
+/// `frankentorch-r7jdo.1`. The square phase split says the VECTORS phase is 57-77%
+/// of a square SVD and rising with n. Before aiming a lever at it, name the path
+/// that actually runs: the deferred-left fast path computes U as a single parallel
+/// `A*V/S` GEMM, whereas the general Golub-Reinsch path accumulates left Givens
+/// rotations, and those two have completely different levers. Source reading has
+/// been wrong about this before, so this counts takes instead of assuming.
+fn deferred_left_sentinel_probe() {
+    println!();
+    println!("== r7jdo.1: which path does a square full SVD actually take? ==");
+    println!(
+        "{:>8}  {:>14}  {:>14}  {}",
+        "n", "full ns", "hits", "path taken"
+    );
+    for &n in &[128usize, 256, 384] {
+        let a = deterministic_matrix(n, n, 0x9e37_79b9_7f4a_7c15);
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let _ = svd_deferred_left_hits_take();
+        let t = std::time::Instant::now();
+        let _ = svd_contiguous_f64(&a, &meta, true);
+        let ns = t.elapsed().as_nanos();
+        let hits = svd_deferred_left_hits_take();
+        let path = if hits > 0 {
+            "deferred-left fast path (A*V/S GEMM)"
+        } else {
+            "GENERAL Golub-Reinsch (left-Givens accumulation)"
+        };
+        println!("{n:>8}  {ns:>14}  {hits:>14}  {path}");
+    }
+}
+
+/// Sub-split of the vectors phase, `frankentorch-r7jdo.1`. Knowing vectors are
+/// 57-77% of a square SVD does not say which lever to build; the deferred-left path
+/// has three parts with three completely different remedies, so this prices them.
+/// Min of 3 by re-running and taking the cheapest whole call's split.
+fn deferred_left_phase_split() {
+    println!();
+    println!("== r7jdo.1: inside the vectors phase, deferred-left path ==");
+    println!(
+        "{:>6}  {:>13}  {:>13}  {:>13}  {:>13}  {}",
+        "n", "bidiag+V ns", "A*V gemm ns", "assemble ns", "total ns", "dominant term"
+    );
+    for &n in &[128usize, 256, 384] {
+        let a = deterministic_matrix(n, n, 0x9e37_79b9_7f4a_7c15);
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let mut best = (u64::MAX, 0u64, 0u64, 0u64);
+        for _ in 0..3 {
+            let _ = svd_deferred_left_phase_ns_take();
+            let _ = svd_contiguous_f64(&a, &meta, true);
+            let (qr, gemm, asm) = svd_deferred_left_phase_ns_take();
+            let total = qr + gemm + asm;
+            if total < best.0 {
+                best = (total, qr, gemm, asm);
+            }
+        }
+        let (total, qr, gemm, asm) = best;
+        let dominant = if qr >= gemm && qr >= asm {
+            "bidiag+V accumulation"
+        } else if gemm >= asm {
+            "A*V gemm"
+        } else {
+            "assemble (SERIAL O(n^2))"
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let pct = |x: u64| 100.0 * x as f64 / total.max(1) as f64;
+        println!(
+            "{n:>6}  {qr:>13}  {gemm:>13}  {asm:>13}  {total:>13}  {dominant} \
+             ({:.1}% / {:.1}% / {:.1}%)",
+            pct(qr),
+            pct(gemm),
+            pct(asm)
+        );
+    }
+}
+
 fn main() {
     scale_probe();
     full_u_cost_probe();
     square_fast_path_gate_probe();
+    deferred_left_sentinel_probe();
+    deferred_left_phase_split();
     println!();
     if !scale_regression_gate() {
         std::process::exit(1);
