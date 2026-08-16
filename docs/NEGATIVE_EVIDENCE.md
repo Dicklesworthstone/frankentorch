@@ -21578,6 +21578,10 @@ byte-identical code under both lane names, so `PT(off)/PT(on)` must land near 1.
 CONSERVATIVE CLAIM: **at least 1.36x FASTER**, taking 1.362 — the lowest bound
 either run produced — not the 1.485x headline.
 
+> **WEAKENED to at least 1.27x by item 27b**, on five readable runs across three
+> binaries. The lowest bound any produced is 1.272. The lever did not get worse;
+> two runs did not support the strength of the claim.
+
 ### 26b. The A/A control, which is what makes 26a believable
 
 Adding the twin lane moved the BASE lane from 17.3 ms to 8.6 ms. Lane composition
@@ -21756,3 +21760,87 @@ inputs the op is correct.
 Filed as `frankentorch-qpe2n` (the RED), `frankentorch-264q0` (the O(m^4/m^5)
 completion), with `frankentorch-tfnap` and `frankentorch-v09ms` as smaller levers
 on the same loop.
+
+---
+
+## 27. THE UNINIT LEVER PAYS ON max_pool1d AND NOT ON avg_pool2d — THE FAMILY DOES NOT INHERIT
+
+Item 26 warned that the sibling forwards must not be assumed to inherit max_pool1d's
+result. They do not. Measured with the same toggle and the same A/A control, on one
+binary, in the same invocations.
+
+### 27a. Two lanes, one binary, opposite answers
+
+    max_pool1d   uninit ON vs OFF
+      r1  1.323x [1.272,1.389]  32/32 rounds  PT control 1.010
+      r2  1.429x [1.383,1.455]  32/32 rounds  PT control 1.012
+      r3  1.385x [1.335,1.411]  32/32 rounds  PT control 1.011
+
+    avg_pool2d   uninit ON vs OFF
+      r1  0.996x [0.934,1.052]  17/32 rounds  PT control 0.972   UNDECIDED
+      r3  1.011x [0.954,1.065]  16/32 rounds  PT control 1.001   UNDECIDED
+      (r2 discarded: PT control 1.083, past the 5% readability threshold)
+
+    A/A control, both arms zeroed, same binary
+      max_pool1d 1.021 [0.988,1.038]  PT 1.025      avg_pool2d 0.984 [0.933,1.050]  PT 1.025
+
+REPLICATED NEGATIVE for avg_pool2d: two readable runs, both bracketing 1.0, both
+splitting rounds near even (17/32, 16/32). The lever does nothing there.
+
+WHY THE TWO DIFFER, and it is the mechanism item 26c predicted rather than a new one:
+the size of the write removed, relative to the work done. max_pool1d allocates TWO
+buffers of `8*64*4096` f64 — 32 MB of zeroing — for a kernel whose per-output work is
+two comparisons. avg_pool2d allocates ONE buffer of `8*64*32*32` f64, 4 MB, for a
+kernel doing four reads, three adds and a divide per output. Eight times less zeroing
+against more work per element, and the lever disappears into the noise.
+
+SO THE PREDICTOR IS zeroed-bytes-per-unit-work, not "is a pooling forward". The five
+other siblings landed in `frankentorch-lu3ht` sit on no lane and are unmeasured; on
+this evidence some of them are worth nothing, and that is fine — they remain
+bit-exact removals of dead work, landed as such and NOT as measured wins.
+
+### 27b. max_pool1d's conservative bound WEAKENS to at least 1.27x
+
+Five readable A/B runs now exist across three binaries: 1.485, 1.406, 1.323, 1.429,
+1.385. The lowest bound any of them produced is **1.272**, from r1 above.
+
+    SUPERSEDES item 26a's "at least 1.36x FASTER" -> at least 1.27x FASTER.
+
+This is the third time this session that adding runs has moved one of my own
+worst-bound claims DOWN (prelu 1.32 -> 1.30, and now 1.36 -> 1.27), which is exactly
+what item 24c said would keep happening: a worst bound is the minimum of a sample,
+and every run added can lower it and none can raise it. The lever is not weaker than
+it was; the claim was stronger than five runs support.
+
+The A/A control replicates too, on a second binary — 1.021 [0.988,1.038] against
+1.017 [0.994,1.064] — so the pairing itself is now replicated, not just the effect.
+
+### 27c. REFUTED: more warm-up does NOT fix the incumbent's null on the resized group_norm lane
+
+Item 26e diagnosed the resized lane's failing PT null (0.867-0.900, second half
+faster) as torch still warming up inside the measurement, and named the fix: raise
+the warm-up count. `FT_H2H_WARMUP` was added for exactly this, matched on both arms
+from one variable, default 4.
+
+At 16 warm-up iterations — four times the default — the null is unchanged:
+
+    FT_H2H_WARMUP=16   group_norm_f32  PT 6.561 ms  PT null 0.874 FAIL  FT null 1.013 FAIL
+                       drift gate PASS
+
+0.874 against 0.867-0.900 at four iterations. **The hypothesis is refuted.** Whatever
+makes torch's second half faster than its first on this lane is not a fixed warm-up
+cost that a longer prologue absorbs, because sixteen iterations of the identical work
+do not absorb it.
+
+What that leaves, none of which this row can separate: the effect is caused by the
+interleaving itself (our 64-thread bursts running between the incumbent's samples,
+which is MossyOtter's item 27 mechanism and would not be fixed by ANY amount of
+warm-up, since the perturbation recurs every round); or torch has per-invocation
+state that resets and re-amortises; or it is a frequency/thermal effect that tracks
+the round structure. The cheap discriminator is to run the incumbent arm ALONE at
+this size with no FrankenTorch lanes in the process — if the null goes clean, it is
+interleaving and the lane needs isolating rather than warming.
+
+`frankentorch-uilzh` keeps that as its next action; `frankentorch-68pwz` stays blocked
+behind it. The knob stays in at its default of 4, which changes nothing already
+banked, and it earned its keep by refuting the hypothesis it was built to confirm.
