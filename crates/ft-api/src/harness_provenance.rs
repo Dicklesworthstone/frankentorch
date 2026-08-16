@@ -270,10 +270,8 @@ pub fn measurement_host_block(rayon_threads: usize) -> String {
          rayon_threads={rayon_threads} online_cpus={}\n\
          host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured \
          elsewhere is not comparable to this one, A/A PASS or not",
-        std::thread::available_parallelism().map_or_else(
-            |_| "unknown".to_owned(),
-            |count| count.get().to_string()
-        )
+        std::thread::available_parallelism()
+            .map_or_else(|_| "unknown".to_owned(), |count| count.get().to_string())
     )
 }
 
@@ -298,7 +296,10 @@ mod tests {
         ] {
             assert!(block.contains(field), "missing {field} in:\n{block}");
         }
-        assert!(!block.contains("cpu=\"\""), "cpu must not be blank:\n{block}");
+        assert!(
+            !block.contains("cpu=\"\""),
+            "cpu must not be blank:\n{block}"
+        );
     }
 
     #[test]

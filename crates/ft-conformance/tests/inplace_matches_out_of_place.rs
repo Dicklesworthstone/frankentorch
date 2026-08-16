@@ -282,3 +282,189 @@ fn the_comparator_catches_one_ulp_and_signed_zero() {
         "identical inputs must produce no findings"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 2: the scalar-arg and binary forms (frankentorch-jvst1)
+// ---------------------------------------------------------------------------
+
+/// A second operand that straddles boundaries in its own right.
+///
+/// A binary op can branch on **either** side — division by zero, `atan2`'s quadrant
+/// selection, the sign rules of `remainder` — so holding the right-hand side at a constant
+/// would leave half of each op's branch structure untested.
+fn rhs_payload() -> Vec<f64> {
+    const RHS: [f64; 9] = [2.0, -2.0, 0.5, -0.5, 1.0, -1.0, 3.0, -3.0, 0.25];
+    let b = boundaries();
+    let mut v: Vec<f64> = (0..N).map(|i| RHS[i % RHS.len()]).collect();
+    // Boundary values on the right-hand side too, offset from the left's so the pair
+    // (lhs, rhs) hits combinations like (0.0, NaN) and (inf, 0.0) rather than only the
+    // diagonal (0.0, 0.0), (NaN, NaN).
+    for (k, val) in b.iter().enumerate() {
+        v[k] = b[(k + 3) % b.len()];
+        v[N / 2 + k] = *val;
+        v[N - b.len() + k] = b[(b.len() - 1) - k];
+    }
+    v
+}
+
+/// An op taking one extra scalar argument, applied identically to both forms.
+struct ScalarPair {
+    name: &'static str,
+    out_of_place: fn(&mut FrankenTorchSession, TensorNodeId) -> TensorNodeId,
+    in_place: fn(&mut FrankenTorchSession, TensorNodeId),
+}
+
+/// **The arguments are matched deliberately, and that is the whole difficulty.**
+///
+/// `q06x9` found `tensor_hardtanh_(t, min, max)` against `tensor_hardtanh(x)`, which
+/// hardcodes torch's defaults. The same trap appears twice more here: `tensor_leaky_relu_`
+/// takes an explicit slope where `tensor_leaky_relu` hardcodes `0.01`, and `tensor_elu_`
+/// takes alpha where `tensor_elu` hardcodes `1.0`. Passing anything else would compare two
+/// *different* ops and either fail spuriously or — worse — pass while measuring nothing.
+fn scalar_pairs() -> Vec<ScalarPair> {
+    vec![
+        // EXCLUDED, deliberately: `tensor_add_scalar_` exists in-place but there is no
+        // out-of-place `tensor_add_scalar` to compare it against — unlike `mul_scalar`,
+        // which has both. Nothing to assert here, so it is named rather than silently
+        // dropped; whether the missing out-of-place form is a surface gap is a separate
+        // question from whether the two forms agree.
+        ScalarPair {
+            name: "mul_scalar",
+            out_of_place: |s, x| s.tensor_mul_scalar(x, -1.25).unwrap(),
+            in_place: |s, t| s.tensor_mul_scalar_(t, -1.25).unwrap(),
+        },
+        ScalarPair {
+            name: "pow",
+            out_of_place: |s, x| s.tensor_pow(x, 2.0).unwrap(),
+            in_place: |s, t| s.tensor_pow_(t, 2.0).unwrap(),
+        },
+        ScalarPair {
+            name: "clamp",
+            out_of_place: |s, x| s.tensor_clamp(x, -1.0, 1.0).unwrap(),
+            in_place: |s, t| s.tensor_clamp_(t, -1.0, 1.0).unwrap(),
+        },
+        // 0.01 is what the out-of-place form hardcodes; anything else compares two ops.
+        ScalarPair {
+            name: "leaky_relu",
+            out_of_place: |s, x| s.tensor_leaky_relu(x).unwrap(),
+            in_place: |s, t| s.tensor_leaky_relu_(t, 0.01).unwrap(),
+        },
+        // Likewise alpha = 1.0 for elu.
+        ScalarPair {
+            name: "elu",
+            out_of_place: |s, x| s.tensor_elu(x).unwrap(),
+            in_place: |s, t| s.tensor_elu_(t, 1.0).unwrap(),
+        },
+        ScalarPair {
+            name: "softshrink",
+            out_of_place: |s, x| s.tensor_softshrink(x, 0.5).unwrap(),
+            in_place: |s, t| s.tensor_softshrink_(t, 0.5).unwrap(),
+        },
+        ScalarPair {
+            name: "hardshrink",
+            out_of_place: |s, x| s.tensor_hardshrink(x, 0.5).unwrap(),
+            in_place: |s, t| s.tensor_hardshrink_(t, 0.5).unwrap(),
+        },
+        ScalarPair {
+            name: "threshold",
+            out_of_place: |s, x| s.tensor_threshold(x, 1.0, 9.0).unwrap(),
+            in_place: |s, t| s.tensor_threshold_(t, 1.0, 9.0).unwrap(),
+        },
+    ]
+}
+
+/// An op taking a second tensor.
+struct BinaryPair {
+    name: &'static str,
+    out_of_place: fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId) -> TensorNodeId,
+    in_place: fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId),
+}
+
+fn binary_pairs() -> Vec<BinaryPair> {
+    vec![
+        BinaryPair {
+            name: "add",
+            out_of_place: |s, a, b| s.tensor_add(a, b).unwrap(),
+            in_place: |s, t, b| s.tensor_add_(t, b).unwrap(),
+        },
+        BinaryPair {
+            name: "mul",
+            out_of_place: |s, a, b| s.tensor_mul(a, b).unwrap(),
+            in_place: |s, t, b| s.tensor_mul_(t, b).unwrap(),
+        },
+        BinaryPair {
+            name: "div",
+            out_of_place: |s, a, b| s.tensor_div(a, b).unwrap(),
+            in_place: |s, t, b| s.tensor_div_(t, b).unwrap(),
+        },
+        BinaryPair {
+            name: "atan2",
+            out_of_place: |s, a, b| s.tensor_atan2(a, b).unwrap(),
+            in_place: |s, t, b| s.tensor_atan2_(t, b).unwrap(),
+        },
+    ]
+}
+
+/// Scalar-argument in-place ops must match their out-of-place siblings.
+#[test]
+fn scalar_arg_in_place_ops_match_their_out_of_place_siblings() {
+    let vals = payload();
+    let mut failures = Vec::new();
+    for p in scalar_pairs() {
+        let oop = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable(vals.clone(), vec![N], false)
+                .expect("leaf");
+            let out = (p.out_of_place)(&mut s, x);
+            s.tensor_values(out).expect("values")
+        };
+        let ip = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let t = s
+                .tensor_variable(vals.clone(), vec![N], false)
+                .expect("leaf");
+            (p.in_place)(&mut s, t);
+            s.tensor_values(t).expect("values")
+        };
+        failures.extend(diff(p.name, &vals, &oop, &ip));
+    }
+    assert!(
+        failures.is_empty(),
+        "scalar-argument in-place ops disagree with their out-of-place siblings \
+         (frankentorch-jvst1):\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Binary in-place ops must match too, with a right-hand side that also straddles
+/// boundaries so combinations like `(0.0, NaN)` and `(inf, 0.0)` are exercised.
+#[test]
+fn binary_in_place_ops_match_their_out_of_place_siblings() {
+    let lhs = payload();
+    let rhs = rhs_payload();
+    let mut failures = Vec::new();
+    for p in binary_pairs() {
+        let oop = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_variable(lhs.clone(), vec![N], false).expect("lhs");
+            let b = s.tensor_variable(rhs.clone(), vec![N], false).expect("rhs");
+            let out = (p.out_of_place)(&mut s, a, b);
+            s.tensor_values(out).expect("values")
+        };
+        let ip = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let t = s.tensor_variable(lhs.clone(), vec![N], false).expect("lhs");
+            let b = s.tensor_variable(rhs.clone(), vec![N], false).expect("rhs");
+            (p.in_place)(&mut s, t, b);
+            s.tensor_values(t).expect("values")
+        };
+        failures.extend(diff(p.name, &lhs, &oop, &ip));
+    }
+    assert!(
+        failures.is_empty(),
+        "binary in-place ops disagree with their out-of-place siblings \
+         (frankentorch-jvst1):\n{}",
+        failures.join("\n")
+    );
+}
