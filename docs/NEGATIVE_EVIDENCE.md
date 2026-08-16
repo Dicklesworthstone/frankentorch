@@ -23144,3 +23144,62 @@ whose drift gate PASSED, so none of them carries this bias. What it invalidates 
 temptation — recorded in item 31a, where ten agreeing drifted runs sat there looking
 quotable — to treat consistency across rejected runs as a reason to relax the gate. The
 ten agreed with each other; on this evidence they would also have been biased together.
+
+## 41. LANDING CODE YOU CANNOT COMPILE: THE FIVE CONSTRAINTS THAT MAKE IT DEFENSIBLE
+
+The build budget produced a situation this campaign had not faced: a turn where
+real code was wanted and no build was available. `969ffdfa` and `e2bb194a` are both
+**uncompiled commits on shared main**. That is normally indefensible, and the
+reason it was acceptable here is entirely about how they were shaped — so the
+shape is worth writing down rather than reinvented under pressure next time.
+
+### 41a. Why it is dangerous at all
+
+An uncompiled commit on a shared branch does not fail for its author. It fails for
+**the next agent who runs a gate**, who has no reason to suspect the tree and will
+spend their build budget bisecting someone else's mistake. On a fleet where builds
+are the scarce resource, that is the expensive failure — not the broken code, the
+stolen build.
+
+### 41c. The five constraints
+
+1. **ADDITIVE ONLY.** No existing line modified. A revert is `git revert <sha>`
+   with no merge reasoning and no lost work.
+2. **UNREFERENCED BY PRODUCTION.** Nothing on a shipping path calls it, so the
+   worst case is a compile error, never a behaviour change. The lever's dispatch
+   flip was deliberately held back for exactly this reason — flipping it would have
+   changed tall `full_matrices` output values, which is precisely the class of
+   change that cannot be landed unverified.
+3. **PARSE-CHECKED.** `cargo fmt` parses without compiling and writes nothing to
+   the target tree, so it costs no disk and rules out the whole syntax-error class.
+   It does not rule out type errors, and the commit must not pretend otherwise.
+4. **MIRRORED, NOT INVENTED.** The one risky call was copied in shape from a
+   confirmed working call site in the same file rather than inferred from the
+   signature. Novel numerics written blind would not have been defensible.
+5. **ANNOUNCED, WITH THE FAILURE MODES NAMED.** The commit message and a mail to
+   peers say it is uncompiled, name the single sha to revert, and list the two most
+   likely breakages in order. The point is that nobody spends a build discovering
+   what the author already knew.
+
+### 41d. What it does NOT license
+
+Not production changes. Not modifications to existing code. Not anything whose
+failure mode is a wrong answer rather than a failed compile. The distinction is the
+whole argument: **an additive, unreferenced, announced compile error costs one
+revert; an unverified behaviour change costs a wrong result nobody is looking
+for.**
+
+And it is a stopgap, not a workflow. The obligation to compile it transfers to the
+next turn with disk, and it is the first thing that turn should do — before any new
+measurement, because the hazard is already on main and belongs to whoever put it
+there.
+
+### 41e. The honest cost
+
+Two commits are sitting on main that may not build. rustfmt and a mirrored call
+site make that unlikely but not impossible, and the two candidates are named: a
+type mismatch in the `qr_householder_panel_blocked` call, or a clippy
+`needless_range_loop` under `-D warnings`. If either fires, the fleet loses one
+build to a revert. That was the price of the instruction to write real code on a
+build-free turn, and it is a price worth stating rather than hiding behind "it will
+probably be fine".
