@@ -24497,3 +24497,66 @@ claim would need the current +/-0.02 or tighter, and no already-banked row chang
 status. Until such a rule is agreed, rows on this host should keep being taken
 filtered — which is the one configuration that certifies anything at all — and
 quoted with their null values printed so a reader can apply their own band.
+
+## 45. FULL SWEEP CERTIFIES 0 OF 21 ON DRIFT ALONE — AND WITH DRIFT REMOVED, max_pool3d's FT-ARM DEFECT IS CONFIRMED
+
+Two results from one binary, ELF
+`171f84f8617e1b43b81818a5873bc156cc99dea590aad4bfc6db21398761ead0`, symmetric warmup 32 on
+both arms, 32 rounds, PyTorch 2.12.1+cpu, `same_host=thinkstation1`.
+
+### 45a. The full 21-lane sweep certifies nothing, and the blocker has MOVED
+
+    run  worst_drift  endpoint_gate  series_gate  lanes certified
+     1   1.421x       PASS           DRIFTED      0 of 21
+     2   1.635x       DRIFTED        DRIFTED      0 of 21
+     3   2.446x       DRIFTED        DRIFTED      0 of 21
+
+Run 1 is the one worth staring at: its endpoint pair reads 26.72 -> 27.29, a +2% move that
+passes, while the per-round series caught a **1.421x mid-run excursion**. The new series
+gate (`68pwz` item 49) sees what the endpoint pair structurally cannot, and it is the
+right gate.
+
+**The blocker is no longer the nulls.** Under warmup 4 the FT nulls failed one-sided low;
+at symmetric warmup 32 they are near 1.0, and what now rejects every row is drift.
+
+### 45b. WHY THE LANE FILTER WORKS — it buys EXPOSURE TIME, not just quiet
+
+The same binary, same host, same minutes, filtered to one op:
+
+    full sweep (21 lanes)     worst_drift 1.421x, 1.635x, 2.446x    all DRIFTED
+    filtered (max_pool3d)     worst_drift 1.043x, 1.000x, 1.000x    all PASS
+
+A full sweep runs long enough that a mid-run excursion is near-certain on this box; a
+filtered run is short enough to fit between them. So the lane filter's benefit is not only
+less inter-lane interference — it is **less wall-clock exposure to external drift**, and on
+a shared box that is the larger term. That is the mechanism behind the first certified
+rows, and it predicts the filter will keep working exactly as long as runs stay short.
+
+### 45c. With drift excluded, the max_pool3d FT-arm defect is CONFIRMED
+
+Item 43 called this one-sided from three runs; item 43c weakened it to 5-of-6 and flagged
+that host load confounded every attempt. The filtered runs remove that confound — their
+drift gates PASS — and the defect survives:
+
+    run  drift        min ratio              PT null       FT null
+     A   1.043x PASS  0.341 [0.322,0.360]    0.986 PASS    0.955 FAIL
+     B   1.000x PASS  0.356 [0.333,0.368]    0.982 PASS    0.955 FAIL
+     C   1.000x PASS  0.347 [0.327,0.363]    0.949 FAIL    0.965 FAIL
+     (max_pool3d pooled, run C: 0.333 [0.314,0.369], PT 0.998 PASS, FT 0.925 FAIL)
+
+Our arm's null is below 1.0 in all three, at 0.955, 0.955, 0.965 — tight enough that this
+is a stable property of the lane, not scatter. **On three runs whose drift gates passed,
+FrankenTorch's second-half samples are reproducibly ~4% slower than its first-half.** That
+is intrinsic to our arm on this lane and cannot be blamed on the host.
+
+Nine of ten runs across items 43, 43c and here now have this lane's FT null below 1.0.
+
+THE ROW, still NOT QUOTABLE: 2.81x-2.93x SLOWER (min estimator, arms 2.536 ms vs
+0.859 ms). The magnitude agrees with the banked at-least-2.86x from `28lhu`, so the number
+is not in question. The gate is, and it will stay that way until the within-run
+degradation is explained — no lever on this op can be certified before then.
+
+WHAT IT IS NOT: drift (gates pass), warmup (symmetric at 32), or inter-lane interference
+(the filtered run has one op). What remains is something that makes our own arm slower as
+a run proceeds — allocator growth, the tape, or thermal on a 64-thread burst — and
+distinguishing those needs an in-process phase split, not another sweep.
