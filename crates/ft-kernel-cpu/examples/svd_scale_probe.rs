@@ -166,9 +166,50 @@ fn scale_regression_gate() -> bool {
     }
 }
 
+/// `frankentorch-v09ms`. Both square fast paths bail on `if full_matrices || m != n
+/// || n < 64`, so a SQUARE matrix gets them at `full_matrices=false` and gets
+/// neither at `full_matrices=true` — even though for m == n the two calls are the
+/// same decomposition and U is m x m either way. This prices that gate. If the two
+/// read the same, the gate costs nothing and the bead should be closed rather than
+/// acted on.
+fn square_fast_path_gate_probe() {
+    println!();
+    println!("== v09ms: square full_matrices vs reduced, at and below the n>=64 gate ==");
+    println!(
+        "{:>8}  {:>14}  {:>14}  {:>12}  {}",
+        "n", "reduced ns", "full ns", "full/reduced", "fast paths eligible"
+    );
+    for &n in &[48usize, 64, 96, 128] {
+        let a = deterministic_matrix(n, n, 0x0bad_c0ff_ee12_3456);
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let mut red = u128::MAX;
+        let mut full = u128::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = svd_contiguous_f64(&a, &meta, false);
+            red = red.min(t.elapsed().as_nanos());
+            let t = std::time::Instant::now();
+            let _ = svd_contiguous_f64(&a, &meta, true);
+            full = full.min(t.elapsed().as_nanos());
+        }
+        // n < 64 is the control: there NEITHER call is eligible, so any ratio away
+        // from 1.0 at n=48 is measuring something other than the gate.
+        let eligible = if n >= 64 {
+            "reduced only"
+        } else {
+            "neither (control)"
+        };
+        println!(
+            "{n:>8}  {red:>14}  {full:>14}  {:>12.2}x  {eligible}",
+            full as f64 / red.max(1) as f64
+        );
+    }
+}
+
 fn main() {
     scale_probe();
     full_u_cost_probe();
+    square_fast_path_gate_probe();
     println!();
     if !scale_regression_gate() {
         std::process::exit(1);

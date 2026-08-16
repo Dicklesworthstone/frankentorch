@@ -29716,9 +29716,16 @@ fn svd_rank_deficient_square_fast_path(
     a: &[f64],
     m: usize,
     n: usize,
-    full_matrices: bool,
+    _full_matrices: bool,
 ) -> Result<Option<SvdResult>, KernelError> {
-    if full_matrices || m != n || n < 64 {
+    // `full_matrices` is deliberately NOT a disqualifier — frankentorch-v09ms.
+    // The gate is `m == n`, and for a square matrix the full and reduced SVD are
+    // the SAME decomposition: k = m = n, so full's (m x m, n x n) and reduced's
+    // (m x k, k x n) are the same shapes, not merely compatible ones. Excluding
+    // full_matrices here cost 1.52-1.60x at n = 64/96/128, with n = 48 reading
+    // 0.95x as the control (below the gate neither call is eligible, and the two
+    // agree). NEGATIVE_EVIDENCE item 31.
+    if m != n || n < 64 {
         return Ok(None);
     }
     if !a.iter().all(|value| value.is_finite()) {
@@ -29798,11 +29805,16 @@ fn svd_full_rank_square_deferred_left_fast_path(
     a: &[f64],
     m: usize,
     n: usize,
-    full_matrices: bool,
+    _full_matrices: bool,
 ) -> Result<Option<SvdResult>, KernelError> {
     // For well-conditioned reduced square SVD, V and S determine U as A*V/S.
     // That avoids the expensive left-Givens accumulation in the QR sweep.
-    if full_matrices || m != n || n < 64 {
+    //
+    // `full_matrices` is deliberately NOT a disqualifier — frankentorch-v09ms; see
+    // svd_rank_deficient_square_fast_path for the reasoning and the measurement.
+    // A*V/S produces the full m x m U for a square input because k == m, so there
+    // is nothing left to complete and no basis-completion pass is needed.
+    if m != n || n < 64 {
         return Ok(None);
     }
     if !a.iter().all(|value| value.is_finite()) {
@@ -41208,6 +41220,48 @@ mod tests {
     /// so `reduced - values` is the reduced-vector cost and `full - reduced` is
     /// the full-U expansion. On a square matrix these two coincide and cannot be
     /// separated, which is why the shape is tall here.
+    /// frankentorch-v09ms. For a SQUARE matrix the full and reduced SVD are the
+    /// same decomposition (k = m = n), so once both are eligible for the square
+    /// fast paths they take the SAME code path and must agree BIT-FOR-BIT.
+    ///
+    /// Sizes straddle the `n >= 64` fast-path gate deliberately. The existing
+    /// `tensor_linalg_svd_full_square_batched_grad_matches_reduced` runs at n = 5,
+    /// where neither call is eligible, so it would pass no matter how this gate
+    /// were wired — that is why it did not catch the exclusion in the first place.
+    #[test]
+    fn svd_square_full_matrices_matches_reduced_bitwise_across_the_fast_path_gate() {
+        use super::svd_contiguous_f64;
+
+        for &n in &[48usize, 64, 96] {
+            let mut z = 0x0bad_c0ff_ee12_3456_u64;
+            let a: Vec<f64> = (0..n * n)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                    v
+                })
+                .collect();
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let reduced = svd_contiguous_f64(&a, &meta, false).expect("reduced svd");
+            let full = svd_contiguous_f64(&a, &meta, true).expect("full svd");
+
+            assert_eq!(full.u.len(), reduced.u.len(), "u shape differs at n={n}");
+            assert_eq!(full.vh.len(), reduced.vh.len(), "vh shape differs at n={n}");
+            for (idx, (x, y)) in full.s.iter().zip(reduced.s.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "s differs at n={n} idx={idx}");
+            }
+            for (idx, (x, y)) in full.u.iter().zip(reduced.u.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "u differs at n={n} idx={idx}");
+            }
+            for (idx, (x, y)) in full.vh.iter().zip(reduced.vh.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "vh differs at n={n} idx={idx}");
+            }
+        }
+    }
+
     /// frankentorch-264q0. The cursor form is what ships; the restarting form is
     /// what it replaced. They must agree BIT-FOR-BIT, and the rank-deficient rows
     /// are the ones that matter — there the completion columns are INTERLEAVED
