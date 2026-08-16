@@ -12857,37 +12857,37 @@ pub fn conv3d_forward_f32(
             .for_each(|(ti, oflat_tile)| {
                 let m0 = ti * tile;
                 let rows = oflat_tile.len() / out_ch;
-            // The panel is fully rewritten below for every (c, kd, kh) triple, so
-            // it too needs no zero pass; it is re-created per tile, which made the
-            // dead fill scale with tile count rather than with output size.
-            let ptile = build_uninit(rows * patch_width, |ptile| {
-                for r in 0..rows {
-                    let row = m0 + r;
-                    let b = row / patch_count;
-                    let pc = row % patch_count;
-                    let base_d = (pc / (oh * ow)) * sd;
-                    let rem = pc % (oh * ow);
-                    let base_h = (rem / ow) * sh;
-                    let base_w = (rem % ow) * sw;
-                    let batch_off = b * in_ch * pd * ph * pw;
-                    let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                    for c in 0..in_ch {
-                        let ch_off = batch_off + c * pd * ph * pw;
-                        let pch = c * kd * kh * kw;
-                        for kdd in 0..kd {
-                            let d_off = ch_off + (base_d + kdd) * ph * pw;
-                            let pkd = pch + kdd * kh * kw;
-                            for kr in 0..kh {
-                                let irow = d_off + (base_h + kr) * pw + base_w;
-                                let prow_off = pkd + kr * kw;
-                                prow[prow_off..(kw + prow_off)]
-                                    .copy_from_slice(&padded[irow..(kw + irow)]);
+                // The panel is fully rewritten below for every (c, kd, kh) triple, so
+                // it too needs no zero pass; it is re-created per tile, which made the
+                // dead fill scale with tile count rather than with output size.
+                let ptile = build_uninit(rows * patch_width, |ptile| {
+                    for r in 0..rows {
+                        let row = m0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_d = (pc / (oh * ow)) * sd;
+                        let rem = pc % (oh * ow);
+                        let base_h = (rem / ow) * sh;
+                        let base_w = (rem % ow) * sw;
+                        let batch_off = b * in_ch * pd * ph * pw;
+                        let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                        for c in 0..in_ch {
+                            let ch_off = batch_off + c * pd * ph * pw;
+                            let pch = c * kd * kh * kw;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * ph * pw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = pkd + kr * kw;
+                                    prow[prow_off..(kw + prow_off)]
+                                        .copy_from_slice(&padded[irow..(kw + irow)]);
+                                }
                             }
                         }
                     }
-                }
-            });
-            gemm::sgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
+                });
+                gemm::sgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
             });
     });
     // Same story for the NCDHW transpose: `par_chunks_mut(patch_count)` assigns
@@ -45132,7 +45132,20 @@ mod tests {
         let mut worst_relative = 0.0f64;
 
         for &k in &[
-            1usize, 8, 27, 216, 255, 256, 257, 511, 512, 513, OPERATIVE_K, 1023, 1024, 2048,
+            1usize,
+            8,
+            27,
+            216,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            OPERATIVE_K,
+            1023,
+            1024,
+            2048,
         ] {
             let a: Vec<f32> = (0..m * k).map(|i| value(i as u64)).collect();
             let b: Vec<f32> = (0..n * k).map(|i| value(1_000_000 + i as u64)).collect();
@@ -45189,6 +45202,140 @@ mod tests {
             "relative gap {worst_relative:.3e} is larger than a reassociation effect; \
              re-examine before treating this as a tolerance question"
         );
+    }
+
+    /// frankentorch-l2zki: `conv3d_forward_f32` now builds its three buffers with
+    /// `build_uninit` instead of `vec![0.0; n]`. Only the allocation's
+    /// initialization changed — no arithmetic moved — so the output must be
+    /// BITWISE identical to the zero-initialized form.
+    ///
+    /// The reference below is the previous body verbatim, zeroed allocations and
+    /// all. If a future edit lets any element go unwritten, the uninit route reads
+    /// garbage and this test sees it; a zeroed route would silently return 0.0
+    /// instead, which is exactly the failure mode worth catching.
+    #[test]
+    fn conv3d_forward_f32_uninit_route_matches_zero_initialized_reference_bits() {
+        #[allow(clippy::too_many_arguments)]
+        fn zero_initialized_reference(
+            padded: &[f32],
+            weight_flat: &[f32],
+            bias: Option<&[f32]>,
+            batch: usize,
+            in_ch: usize,
+            pd: usize,
+            ph: usize,
+            pw: usize,
+            kd: usize,
+            kh: usize,
+            kw: usize,
+            od: usize,
+            oh: usize,
+            ow: usize,
+            sd: usize,
+            sh: usize,
+            sw: usize,
+            out_ch: usize,
+        ) -> Vec<f32> {
+            use rayon::prelude::*;
+            let patch_width = in_ch * kd * kh * kw;
+            let patch_count = od * oh * ow;
+            let flat = batch * patch_count;
+            let nthreads = rayon::current_num_threads().max(1);
+            let cap = (1usize << 16).div_ceil(patch_width.max(1)).max(1);
+            let tile = flat.div_ceil(nthreads * 4).clamp(1, cap);
+            let mut out_flat = vec![0.0f32; flat * out_ch];
+            out_flat
+                .par_chunks_mut(tile * out_ch)
+                .enumerate()
+                .for_each(|(ti, oflat_tile)| {
+                    let m0 = ti * tile;
+                    let rows = oflat_tile.len() / out_ch;
+                    let mut ptile = vec![0.0f32; rows * patch_width];
+                    for r in 0..rows {
+                        let row = m0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_d = (pc / (oh * ow)) * sd;
+                        let rem = pc % (oh * ow);
+                        let base_h = (rem / ow) * sh;
+                        let base_w = (rem % ow) * sw;
+                        let batch_off = b * in_ch * pd * ph * pw;
+                        let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                        for c in 0..in_ch {
+                            let ch_off = batch_off + c * pd * ph * pw;
+                            let pch = c * kd * kh * kw;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * ph * pw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = pkd + kr * kw;
+                                    prow[prow_off..(kw + prow_off)]
+                                        .copy_from_slice(&padded[irow..(kw + irow)]);
+                                }
+                            }
+                        }
+                    }
+                    super::gemm::sgemm_bt(
+                        rows,
+                        patch_width,
+                        out_ch,
+                        &ptile,
+                        weight_flat,
+                        oflat_tile,
+                    );
+                });
+            let mut out = vec![0.0f32; batch * out_ch * patch_count];
+            out.par_chunks_mut(patch_count)
+                .enumerate()
+                .for_each(|(idx, orow)| {
+                    let n = idx / out_ch;
+                    let oc = idx % out_ch;
+                    let bo = bias.map_or(0.0, |bb| bb[oc]);
+                    for p in 0..patch_count {
+                        orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+                    }
+                });
+            out
+        }
+
+        // Two batches so the NCDHW transpose crosses a batch boundary, and a
+        // non-trivial in_ch so the panel spans several channels per row.
+        for &(batch, in_ch, out_ch, pd, ph, pw) in &[
+            (1usize, 8usize, 8usize, 5usize, 5usize, 5usize),
+            (2, 4, 12, 6, 5, 4),
+        ] {
+            let (kd, kh, kw) = (3usize, 3usize, 3usize);
+            let (od, oh, ow) = (pd - kd + 1, ph - kh + 1, pw - kw + 1);
+            let padded: Vec<f32> = (0..batch * in_ch * pd * ph * pw)
+                .map(|index| (index % 37) as f32 * 0.031_25 - 0.5)
+                .collect();
+            let weight: Vec<f32> = (0..out_ch * in_ch * kd * kh * kw)
+                .map(|index| (index % 23) as f32 * 0.015_625 - 0.171_875)
+                .collect();
+            let bias: Vec<f32> = (0..out_ch).map(|c| c as f32 * 0.125).collect();
+
+            for maybe_bias in [Some(&bias[..]), None] {
+                let got = super::conv3d_forward_f32(
+                    &padded, &weight, maybe_bias, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow,
+                    1, 1, 1, out_ch,
+                );
+                let want = zero_initialized_reference(
+                    &padded, &weight, maybe_bias, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow,
+                    1, 1, 1, out_ch,
+                );
+                assert_eq!(got.len(), want.len());
+                for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "conv3d_forward_f32 uninit route diverged at {index} \
+                         (batch={batch} in_ch={in_ch} out_ch={out_ch} bias={})",
+                        maybe_bias.is_some()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
