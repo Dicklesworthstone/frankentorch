@@ -40841,6 +40841,118 @@ mod tests {
         );
     }
 
+    /// Two remaining `frankentorch-87sz8` questions, priced with the same rig.
+    ///
+    /// Neither adds production code: both arms of each pair are written here from
+    /// the primitives the kernels already use, so this measures the trade rather
+    /// than shipping a variant to measure it.
+    ///
+    /// (1) WHAT DID NaN CORRECTNESS COST THE FORWARD? `frankentorch-fmmns`
+    /// replaced a bare `v > m` with `pool_max_beats`, i.e.
+    /// `v > m || v.is_nan()`. The `||` short-circuits, but `is_nan` is still
+    /// evaluated for every element that does NOT beat the running max — which is
+    /// most of them. Correctness outranks speed and the check stays regardless;
+    /// the campaign should still know the number.
+    ///
+    /// (2) IS THE POOL STILL THE RIGHT SOURCE FOR THE DENSE GRADIENT? The backward
+    /// takes a recycled buffer and memsets it. A fresh `vec![0.0; n]` gets
+    /// pre-zeroed pages from the kernel instead — no memset, but a minor fault per
+    /// page on first touch. `NEGATIVE_EVIDENCE` item 8 says recycling won at the
+    /// lane; this re-checks it at the buffer size the scorecard lane actually uses.
+    #[test]
+    fn max_pool3d_prices_the_nan_check_and_the_gradient_buffer_source() {
+        // (1) The NaN check, on a realistic max-scan shape.
+        let n = 1 << 20;
+        let mut z = 0x0dd_c0ffee_u64;
+        let data: Vec<f64> = (0..n)
+            .map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                #[allow(clippy::cast_precision_loss)]
+                let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                v
+            })
+            .collect();
+
+        let reps = 15;
+        let mut bare_ns = Vec::with_capacity(reps);
+        let mut nan_ns = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let mut m = f64::NEG_INFINITY;
+            let mut arg = 0usize;
+            for (i, &v) in data.iter().enumerate() {
+                if v > m {
+                    m = v;
+                    arg = i;
+                }
+            }
+            bare_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box((m, arg));
+
+            let t = std::time::Instant::now();
+            let mut m = f64::NEG_INFINITY;
+            let mut arg = 0usize;
+            for (i, &v) in data.iter().enumerate() {
+                if super::pool_max_beats(v, m) {
+                    m = v;
+                    arg = i;
+                }
+            }
+            nan_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box((m, arg));
+        }
+        bare_ns.sort_unstable();
+        nan_ns.sort_unstable();
+        #[allow(clippy::cast_precision_loss)]
+        let nan_cost = nan_ns[0] as f64 / bare_ns[0] as f64;
+        println!(
+            "87sz8/fmmns NaN-check cost over {n} elems: bare `>` {} ns, pool_max_beats {} ns, \
+             ratio {nan_cost:.3}x (min of {reps}, interleaved; correctness keeps the check \
+             whatever this says)",
+            bare_ns[0], nan_ns[0]
+        );
+
+        // (2) Where the dense gradient buffer should come from, at the lane's size.
+        let dense = 1 << 20; // 8 MiB of f64, the scorecard lane's gradient
+        let stride = 8; // one argmax per 2x2x2 window
+        let mut pooled_ns = Vec::with_capacity(reps);
+        let mut fresh_ns = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let mut buf = ft_core::buffer_pool::take_zeroed(dense);
+            let mut i = 0;
+            while i < dense {
+                buf[i] = 1.0;
+                i += stride;
+            }
+            pooled_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(&buf);
+            drop(buf);
+
+            let t = std::time::Instant::now();
+            let mut buf = vec![0.0f64; dense];
+            let mut i = 0;
+            while i < dense {
+                buf[i] = 1.0;
+                i += stride;
+            }
+            fresh_ns.push(t.elapsed().as_nanos());
+            std::hint::black_box(&buf);
+        }
+        pooled_ns.sort_unstable();
+        fresh_ns.sort_unstable();
+        #[allow(clippy::cast_precision_loss)]
+        let pool_speedup = fresh_ns[0] as f64 / pooled_ns[0] as f64;
+        println!(
+            "87sz8 dense-gradient source, {dense} f64 with 1-in-{stride} scatter: \
+             buffer_pool::take_zeroed {} ns, fresh vec![0.0; n] {} ns, pool speedup \
+             {pool_speedup:.3}x (min of {reps}, interleaved)",
+            pooled_ns[0], fresh_ns[0]
+        );
+    }
+
     #[test]
     fn max_pool3d_nonoverlapping_dense_backward_matches_accumulating_bits() {
         let (batch, ch, id, ih, iw) = (2usize, 3usize, 4usize, 6usize, 6usize);

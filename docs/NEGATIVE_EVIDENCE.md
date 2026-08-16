@@ -20792,3 +20792,49 @@ already the cheapest available write; and the non-overlapping specialisation
 already buys 1.25x over the generic scatter. The remaining lever is not in this
 kernel's write pattern — it is either the 8 comparisons per output in the forward
 (0.582 ms) or the ~half of the lane that sits outside these two kernels entirely.
+
+**21. THE NaN-CORRECTNESS FIX COST 1.9x ON THE MAX SCAN, and the buffer pool
+shows no advantage on this path (`frankentorch-87sz8`, 2026-08-16).** Two rows,
+same rig as item 20: rch worker `vmi1227854`, both arms interleaved rep by rep in
+one process on the same data, min of 15. FrankenTorch-internal, so no incumbent
+arm and no vs-PyTorch claim.
+
+**(1) What NaN correctness cost.** `frankentorch-fmmns` replaced a bare `v > m`
+with `pool_max_beats(v, m)` = `v > m || v.is_nan()`, because a bare `>` skips NaN
+where torch propagates it. Over 1,048,576 elements:
+
+| scan | time |
+|---|---|
+| bare `v > m` | 632_017 ns |
+| `pool_max_beats` (correct) | 1_204_596 ns |
+| **cost of correctness** | **1.906x** |
+
+The `||` short-circuits, but `is_nan` is evaluated for every element that does not
+beat the running max — which is nearly all of them — so the branch is paid ~n
+times, not ~log n. **The check stays: correctness outranks speed and torch
+propagates NaN.** But 1.9x on the inner loop of every max-pool forward is worth
+knowing, and it makes a cheaper EXACT formulation a lever with a measured prize
+rather than a micro-optimisation. The forward is 0.582 ms of the lane's 1.445 ms
+of kernel time (item 19), so the recoverable ceiling is real.
+
+**(2) Where the dense gradient should come from.** The backward takes a recycled
+buffer from `ft_core::buffer_pool` and memsets it; a fresh `vec![0.0; n]` instead
+gets pre-zeroed pages from the kernel and pays a minor fault per page. At the
+scorecard lane's buffer size with its access pattern (1_048_576 f64, one write per
+8 elements):
+
+| source | time |
+|---|---|
+| `buffer_pool::take_zeroed` | 365_849 ns |
+| fresh `vec![0.0; n]` | 358_967 ns |
+| **pool speedup** | **0.981x — the pool is 2% SLOWER here** |
+
+**This does NOT refute item 8**, and the difference matters. Item 8 measured the
+pool at the LANE, in a live session, paired, and found 1.138x — in a context where
+the autograd tape holds many live tensors and the allocator is not fresh. This is
+an isolated microbenchmark with nothing else live, which is precisely the setup
+the in-situ-over-standalone finding warns about: a standalone ladder inverted in
+situ once already. What it does establish is that **the pool's advantage on this
+specific path is not large enough to survive a change of context**, so a future
+lever that removes the pool from this backward should be measured at the lane and
+cannot be waved away with "the pool is obviously faster".
