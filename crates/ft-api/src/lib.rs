@@ -34845,7 +34845,7 @@ impl FrankenTorchSession {
             let sum_sidecar_for_forward = std::sync::Arc::clone(&sum_sidecar);
             let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
-                move |ctx, ins| {
+                move |_ctx, ins| {
                     let (iv, _) = ins[0];
                     let (out, arg_offsets, sum) =
                         ft_kernel_cpu::max_pool3d_forward_with_indices_and_sum_f64(
