@@ -21102,3 +21102,47 @@ nulls passing, worst bound quoted); that convention governs vs-PyTorch rows, and
 an FT-internal A/B has no incumbent arm to null against. Treat them as
 directional, and re-run the parallel-fill arm at 64 threads before ruling it out
 for this host.
+
+**25. THE A/A NULL IS NEITHER NECESSARY NOR SUFFICIENT — conv3d replicates to
+three significant figures while failing its nulls twice (`frankentorch-l2zki`,
+2026-08-16).** Item 18 showed a passing null is not SUFFICIENT: two runs certified
+opposite directions with every null green. This is the other half.
+
+Two independent invocations, same binary (ELF `1fa33e62b39e125e`, build worker
+recorded from the rch log), `same_host=thinkstation1`,
+`harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, 32 rounds, incumbent
+PyTorch 2.12.1+cpu interleaved per round, parity `match` both times:
+
+| run | load start -> end | FT | PT | ratio | nulls |
+|---|---|---|---|---|---|
+| A | 6.58 -> 18.77 | 27.605 ms | 6.795 ms | **0.246 `[0.239,0.254]`** (4.06x SLOWER) | PT 1.041 FAIL, FT 1.050 FAIL |
+| B | 16.35 -> 12.79 | 26.957 ms | 6.637 ms | **0.246 `[0.242,0.252]`** (4.06x SLOWER) | PT 1.046 FAIL, FT 1.033 FAIL |
+
+**The point estimate is identical to three significant figures across two runs
+whose loads went in OPPOSITE directions, and both rows are refused.** Under the
+replicated-standing convention this is not bankable, and it is not being banked.
+But the reason the nulls fail is worth understanding rather than working around:
+each null compares an arm's first half against its own second half, so it detects
+the arm DRIFTING within the run. Here both arms drift together — the host moves
+under both — so each null reads 1.03-1.05 while the RATIO, which cancels the
+shared drift, is stable.
+
+**That is the interleaved design working exactly as intended and the gate not
+knowing it.** The null is a per-arm stability check; the paired ratio is robust to
+precisely the disturbance the null is detecting.
+
+**So: a passing null does not certify a row (item 18), and a failing null does not
+refute one (here).** What actually distinguishes conv3d from the `prelu` case of
+item 18 is REPLICATION — conv3d's estimate reproduces across runs and directions
+of load, `prelu`'s flipped sign. Replication is doing the work the nulls were
+being asked to do.
+
+Recorded rather than acted on: I am NOT proposing to relax the gate. A gate that
+rejects reproducible rows is expensive but safe; the fix, if one is wanted, is to
+report the paired-ratio stability ACROSS runs as a first-class signal beside the
+within-run nulls, and that is a change to make deliberately rather than in the
+middle of chasing a standing.
+
+**Standing for conv3d, stated at the strength the evidence supports:** FrankenTorch
+is about **4.06x SLOWER** than PyTorch 2.12.1+cpu on this lane, reproduced twice,
+NOT null-certified. Worst bound either run produced: `0.239` (4.18x slower).
