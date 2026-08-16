@@ -15,7 +15,7 @@ paid for it separately:
   sub-claim** doing it: "the deferral parallel cost is gone" read **1.004x** on
   one host and **0.928x** on another, so the cost is still ~7.8%.
 
-Two rules follow, and they are separate:
+Four rules follow, and they are separate because they fail separately:
 
 1. **Name the worker.** Both arms must be shown to have run on the **same machine
    in the same invocation**. A row that cannot say where it ran is not comparable
@@ -26,6 +26,28 @@ Two rules follow, and they are separate:
    reads **0.991x** from the paired h2h lane and **4.0x** from the kernel
    breakdown — same binary, same invocation, same machine. **When two harnesses
    disagree, the disagreement is the finding.** Do not pick between them.
+3. **Name the estimator, and quote the row under both.** Added after
+   `frankentorch-rled4` measured the median estimator's own reading moving
+   **33-51% on ambient load alone** — larger than any lever this campaign has
+   produced. A lever worth 8-15% cannot be certified by an instrument that noisy.
+   Every paired comparison reports per-round **median** and per-round **min**,
+   and **each row's A/A nulls are adjudicated under the estimator that row is
+   quoted with** — a null judged on the noisier estimator is what had been
+   vetoing clean rows. Where the two estimators **disagree in direction**, that is
+   a red flag to record, not to resolve by preference. Full evidence: item 14.
+4. **Replicate before quoting a standing.** A within-run CI describes resampling
+   noise *inside* one invocation and is **not a licence to compare across runs**.
+   Item 14b measured this on the certified row: two invocations of the same binary
+   gave median CIs that barely touch (`[1.140,1.222]` vs `[1.075,1.143]`) while
+   the min CIs overlapped comfortably. Quote the **conservative bound across
+   runs**, carry the round count, and re-run before calling a row a standing.
+   Two runs cost eleven minutes there.
+
+**The current state of the campaign under these rules, so nobody overstates it:**
+exactly one certified vs-PyTorch row exists — `prelu_noshortcut`, replicated in
+two invocations with all four nulls passing, defensible at **at least 1.07x**
+(the lowest bound either run produced, not the 1.213x headline). One of fourteen
+lanes became quotable. Everything else remains uncertified.
 
 ### Retro-flag of everything above this line's adoption date
 
@@ -57,6 +79,17 @@ evidence that it survives a change of machine. franken_numpy's retraction is the
 reason that distinction is not pedantry — that check came back *both* ways, 1.004x
 on one host and 0.928x on another. Also unaudited on the same grounds: 302 dirs
 under `artifacts/perf` and 24 under `tests/artifacts/perf`.
+
+**The flag widened when rule 3 arrived, and it widened to nearly everything.**
+Rules 1-2 scoped rows by *machine*; rule 3 scopes them by *estimator*. Every row
+banked before `rled4` was quoted under the median estimator alone — the one since
+measured to move 33-51% on ambient load. So the honest scope is not just "534
+sections may not be cross-machine comparable" but **"essentially every pre-`rled4`
+ratio in this file is a median-estimator reading whose instrument is noisier than
+most of the levers it was used to judge."** That is uncomfortable and it is the
+point: it is why exactly one row is certified today, and why the correct response
+to a banked 1.1x from last month is to re-measure it under both estimators rather
+than to cite it.
 
 Deletion condition for this section: when no unprovenanced ratio section remains
 below it.
