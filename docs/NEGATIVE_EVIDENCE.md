@@ -20189,3 +20189,73 @@ Two transferable points:
 - **Re-read a bead's founding evidence before optimizing against it**, especially
   one filed days earlier on a busy host. Checking cost one run; the phase-split it
   asks for is a multi-session lever.
+
+## 2026-08-16 — CERTIFIED ROW (a loss): `max_pool3d_nopool` is 2.74-2.99x SLOWER (`y4nj9`)
+
+The first row this session to clear the full gate. **It is a loss**, and that is
+why it is worth banking: a certified number is worth more to this campaign than
+another undecidable lane.
+
+```
+lane    max_pool3d_nopool   (max_pool3d f64 op work, FrankenTorch buffer pool DISABLED)
+        FT 2.733 ms    PT 0.998 ms
+MEDIAN  ratio 0.365 [0.334,0.382]  = FT 2.74x SLOWER   PT null PASS [0.931,1.071]
+                                                        FT null PASS [0.874,1.057]
+MIN     ratio 0.335 [0.313,0.350]  = FT 2.99x SLOWER   PT null 0.995 PASS
+                                                        FT null 0.988 PASS
+parity  match       harness verdict: "QUOTABLE under the min estimator"
+```
+
+Both estimators agree on direction; both null point estimates sit within ±0.02 of
+1.0 (0.995 and 0.988), which is what rule 3 requires.
+
+```
+executing_elf_sha256 = ac1156652bbd0b954278b5a11404d394a19aeb62337e948d7e2039dc353e2ea9
+build worker         = vmi1149989  (rch, cargo build -j2 --release --features fair-alloc)
+harness              = crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs
+measurement_host     = thinkstation1, 5975WX 32-Core, x86_64+avx2, powersave,
+                       rayon_threads=64, online_cpus=64, torch threads=8
+allocator            = mimalloc (--features fair-alloc)
+sampling             = balanced-square ABBAABBA, 32 rounds, 4 live samples/arm/round
+incumbent            = PyTorch 2.12.1+cpu
+load                 = 8.63 -> 9.25
+```
+
+### Why this run certified and two others did not: stability, not level
+
+Three invocations of the **same binary**, same host, same day:
+
+| load start -> end | change | outcome |
+|---|---|---|
+| 7.10 -> 12.25 | +72% | 0 of 14 lanes quotable (`b8mo7`) |
+| **8.63 -> 9.25** | **+7%** | **`max_pool3d_nopool` QUOTABLE** |
+| 8.42 -> 17.24 | +105% | 0 of 14 quotable, nulls failed |
+
+**The certifying run did not have the lowest load — it had the flattest.** A
+balanced square cancels a stable offset but not a ramp, so what breaks the A/A null
+is the host *changing* during the run, not the host being busy. Sampling
+`/proc/loadavg` for ~30s and starting when it is flat is cheaper and far more
+effective than waiting for an idle machine, which on this box never arrives.
+
+### Replication status
+
+**One invocation: a CANDIDATE, not a standing** (rule 4). Run 2, at load
+8.42 -> 17.24, read FT **2.83x** slower median / **3.10x** min — agreeing closely
+with this row in direction and magnitude — but its nulls FAILED (FT 0.850, PT
+1.065 under min). Per item 14d that makes it **no evidence**, so it is not averaged
+in; it is noted only to record that a companion run did not contradict the result.
+
+### Bearing on `87sz8`
+
+`frankentorch-87sz8` is filed as "max_pool3d op work 9.39x slower — largest
+confirmed vs-upstream gap". This certified row is the **nopool** variant at
+2.74-2.99x, and the pooled `max_pool3d` lane in the same invocation read 2.44x
+slower with failing nulls. Neither is 9.39x. That does **not** refute 87sz8 — the
+measurement scopes may differ — but its headline should be re-established under the
+current gate before a multi-session lever is spent against it, which is precisely
+the lesson `xdw0h` taught when its 3.08x turned out to be an undecidable row.
+
+**What this buys:** a real, gated target. `max_pool3d` without the buffer pool is
+genuinely ~2.7-3.0x behind PyTorch on op work, both arms live in one invocation,
+both nulls passing, parity `match`. Whoever optimizes that lane now has a number
+they can be held to.
