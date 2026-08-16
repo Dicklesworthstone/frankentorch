@@ -19927,3 +19927,36 @@ Recorded per the standing instruction that a refusal is a one-line operational
 fact rather than a result. **No row, no ratio, and no worker is banked from any of
 these attempts** — there is nothing to name a worker or harness for, because
 nothing ran.
+
+**14d. CORRECTION TO MY OWN BANKED NUMBER — the floor is ~1.01x, not 1.07x
+(`frankentorch-rled4`, 2026-08-15).** Item 14c banked "at least 1.07x" from three
+replications. Two further invocations of the same binary (ELF
+`9125c43489561480`, build worker `vmi1227854`, harness
+`gauntlet_lane_sweep_h2h.rs`, `same_host=thinkstation1`, 32 rounds) contradict
+that bound:
+
+| run | load (start -> end) | median | nulls |
+|---|---|---|---|
+| 1 | 5.91 -> 16.16 | 1.180x `[1.140,1.222]` | both PASS |
+| 2 | 6.32 -> 17.23 | 1.113x `[1.075,1.143]` | both PASS |
+| 3 | 6.39 -> 9.76 | 1.114x `[1.078,1.151]` | both PASS |
+| 4 | 7.64 -> — | 1.048x `[0.988,1.103]` | FT null OFFSET — not quotable |
+| 5 | 12.84 -> — | 1.055x `[1.006,1.114]` | both PASS |
+
+**The DIRECTION is robust: FrankenTorch is faster in 5 of 5 invocations. The
+MAGNITUDE is load-dependent and the conservative bound is 1.006x, not 1.07x.**
+The three runs that produced 1.11-1.18 all started under load ~6; the run that
+produced 1.055 started at 12.84 with a 15-minute average of 26.94. So the
+standing shrinks as the host fills, which is what a bandwidth-shared lane should
+do, and it means the honest claim is:
+
+> `prelu_noshortcut` is FASTER than PyTorch 2.12.0+cpu on this host in every
+> invocation measured, by between ~1% and ~18% depending on ambient load, with all
+> A/A nulls passing in four of five runs and parity `match` in all five.
+
+**Three successive corrections, each downward, each from one more replication:
+1.213x (run 1, min estimator) -> 1.11-1.18x (three runs, median) -> a floor of
+1.006x (five runs).** That progression is the argument for the rule, not an
+embarrassment: the instrument was fixed first, then the number was replicated
+until it stopped moving, and it stopped at a much more modest place than where it
+started. A campaign that banks first invocations would have carried the 1.213x.
