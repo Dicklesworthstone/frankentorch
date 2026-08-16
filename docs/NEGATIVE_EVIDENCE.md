@@ -20989,3 +20989,37 @@ null failed in the same invocation. Small delta remains necessary, not sufficien
 it isolates the kernel from the pooling allocator. The pooled `max_pool1d` lane read
 1.64-1.74x slower in the same runs with failing nulls. Whoever attacks `max_pool1d`
 now has a gated target that is not confounded by the buffer pool.
+
+### Follow-on (`ylfu5`): what the buffer pool is actually worth on this lane, ~7-8%
+
+The pooled lane has since certified too, so both sides of `max_pool1d` now have
+gated numbers from the **same binary and harness**:
+
+| lane | status | min-estimator ratio |
+|---|---|---|
+| `max_pool1d_nopool` (pool **off**) | **standing**, 2 admissible runs | 0.535 `[0.504,0.569]`, 0.539 `[0.518,0.559]` |
+| `max_pool1d` (pool **on**) | candidate, 1 admissible run | 0.578 `[0.553,0.633]`, nulls 0.999 / 1.011 PASS |
+
+A **higher** ratio is better here (closer to 1.0 is closer to PyTorch). Pooled 0.578
+against nopool ~0.537 puts the buffer pool at roughly **7-8%** on this lane — it
+moves FrankenTorch from ~1.86x slower to ~1.73x slower. **The pool helps and does not
+come close to closing the gap; the kernel is still the dominant term.**
+
+**Why this is suggestive and not certified.** The two certified rows come from
+*different invocations*. A ratio-of-ratios across invocations is weaker than a
+same-invocation paired comparison — and the harness already supports paired lanes,
+which is exactly how the `prelu` and `group_norm` pairs are measured. **The right
+next step is a paired nopool-vs-pooled `max_pool1d` lane in one invocation with its
+own incumbent control**, which would make this a certified statement about the pool
+instead of an inference from two rows.
+
+Relevant to `frankentorch-9pafs` (thread-local backward grad-buffer pool): that bead
+proposes *extending* pooling. This is the first gated evidence of what pooling is
+currently **worth** on a specific lane — single-digit percent, not a multiple —
+which is worth knowing before sizing that lever.
+
+**A new shape of load-delta evidence, from the run that failed to replicate the
+pooled lane:** its load *dropped* 21.04 → 15.69 (**−25%**) and it certified nothing.
+Every previous failure was an upward ramp. So it is the **magnitude** of change that
+breaks the null, not its direction — **a decaying host is as bad as a filling one.**
+That sharpens the criterion without changing it.
