@@ -19883,3 +19883,47 @@ candidate, not a standing.
 `prelu_noshortcut`** (PReLU f64 train step `[32,512,256]`, sum shortcut defeated
 via its hook exit), taking the lowest confidence bound any of the three runs
 produced. Not the best run's point estimate, and not the best estimator's.
+
+## 2026-08-16 — REFUSAL ROW: `ft-conformance` cannot be scheduled on 6/10 of the fleet
+
+Not a measurement and not a result — a **scheduling refusal**, recorded because it
+was mistaken for transient contention for roughly ninety minutes of wall clock and
+because the fix is not "retry".
+
+Eight consecutive inline attempts at
+`cargo test -p ft-conformance --test <...>` were refused, `REAL_EXIT=103`:
+
+```
+[RCH] remote required; refusing local fallback
+  (no admissible workers: insufficient_slots=3,
+   insufficient_total_slots=6, active_project_exclusion=1) — retryable
+```
+
+**Read the breakdown, not the headline.** At the last attempt the fleet reported
+`10/10 healthy, 17/49 slots available` — i.e. not busy in the ordinary sense — and
+the refusal still decomposed as: 3 workers with insufficient *free* slots, 1 worker
+excluded because it was already building this project (a 13m33s
+`frankentorch-api --tests` release build), and **6 workers with insufficient TOTAL
+slots**. That last class is a *capacity* statement, not an availability one: six of
+ten workers can never serve this job, whatever the load, because their total slot
+count is below what a `ft-conformance` test build requests. `ft-conformance`
+depends on `ft-api` (167k lines), so its request is large.
+
+Consequences worth carrying:
+
+- **`— retryable` is misleading for this refusal class.** Retrying re-rolls the
+  three availability-limited workers and the one exclusion; it cannot change the
+  six capacity-limited ones. Backing off and retrying in place is close to a
+  no-op, which is exactly what happened here.
+- **The exclusion compounds it.** `active_project_exclusion` removes any worker
+  already building frankentorch, so a single long peer build on one of the four
+  eligible machines drops the pool to three.
+- **The honest operational reading:** a large-crate test in this workspace is
+  schedulable on at most 4 of 10 workers, minus whatever peers hold. That is a
+  property of the job's slot request versus the fleet's shape, and it belongs in a
+  bead against the harness/tooling, not in another round of retries.
+
+Recorded per the standing instruction that a refusal is a one-line operational
+fact rather than a result. **No row, no ratio, and no worker is banked from any of
+these attempts** — there is nothing to name a worker or harness for, because
+nothing ran.
