@@ -23727,3 +23727,47 @@ same-window plain-glibc run to be worth anything.
 Until then the honest state is unchanged from item 48: **no certified vs-incumbent
 row exists locally**, and the reason is now more likely host load than allocator
 choice.
+
+### 43c. A ROUNDS SWEEP THAT DID NOT SEPARATE THE HYPOTHESES, AND A WEAKER CLAIM THAN 43 MADE
+
+Item 43 called the FT-arm null failure on this lane one-sided from three runs. Three more
+runs at different round counts, same binary, same lane, put that claim on firmer footing
+in one direction and weaken it in another.
+
+    REPS   load_1m start -> end     PT null        FT null
+      8    29.82 -> 35.76           1.102 FAIL     0.912 FAIL
+     16    34.23 -> 27.82           1.054 FAIL     1.010 PASS
+     32    16.46 -> 19.59           0.988 PASS     0.868 FAIL
+     32    16.72 -> 28.88           0.983 PASS     0.942 FAIL
+     32    32.33 -> 87.78           0.987 PASS     0.974 FAIL
+     64    26.88 -> 30.92           1.025 FAIL     0.947 FAIL
+
+THE INTENDED EXPERIMENT FAILED. The idea was that if our arm degrades PROGRESSIVELY
+within a run, more rounds should make the FT null worse, and if it is a fixed early-warmup
+artifact, more rounds should dilute it and make it better. Neither shows: 0.912 at 8
+rounds, 1.010 at 16, 0.868-0.974 at 32, 0.947 at 64. **No trend in round count.**
+
+The reason is a confound I should have controlled before running: the three 32-round runs
+were taken at loadavg 16-32 and the 8/16/64-round runs at 27-41, so host load varies
+across the arms of the comparison and is the larger effect. A rounds sweep is only
+interpretable if load is held, and on this box it cannot be held by waiting — item 35
+established that the harness self-loads ~20 and item 38 that the ratio itself moves with
+excursion. **This comparison should have been run interleaved, round-count alternating
+within one session, exactly as the lane comparisons are.** Recorded as a design error
+rather than a result.
+
+WHAT DOES SURVIVE, weaker than item 43 stated: across all six runs the FT null is below
+1.0 in FIVE (0.868, 0.912, 0.942, 0.947, 0.974) and above in ONE (1.010). Directionally
+one-sided, mean ~0.94 — but 5-of-6 is not the 11-of-11 that made the group_norm diagnosis
+(item 24b) decisive, and one clean pass at 16 rounds shows the failure is not
+deterministic. Item 43's "fails in all three" was true of its three runs and is not the
+general behaviour of the lane.
+
+The incumbent's null is the mirror image and is worth noting: it PASSED in all three
+32-round runs and FAILED in all three others, which tracks host load rather than round
+count. That is the shared-drift mechanism doing what it should.
+
+CONCLUSION UNCHANGED WHERE IT MATTERS: no run of this lane has yet cleared both nulls and
+the drift gate together, so it remains ungateable and no lever can be certified on it.
+The discriminator is still isolation — run our arm alone at this shape — and that needs a
+binary this session cannot build.
