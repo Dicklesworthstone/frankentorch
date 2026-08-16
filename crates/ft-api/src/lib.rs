@@ -18486,11 +18486,20 @@ impl FrankenTorchSession {
         tensor2: TensorNodeId,
         value: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        // No-grad fast path mirroring tensor_addcmul: the composed div + scale + add (3 passes)
+        // No-grad fast path mirroring tensor_addcmul: the composed scale + div + add (3 passes)
         // measured 3.36x SLOWER than torch's fused addcdiv. For no-grad equal-shape contiguous
-        // f64, borrow all three and compute input + value*(t1/t2) in ONE parallel pass. Bit-
-        // exact (same t1/t2 quotient then value scale then add). grad / non-f64 / non-contiguous
-        // / broadcast fall through.
+        // f64, borrow all three and compute input + (value*t1)/t2 in ONE parallel pass.
+        // grad / non-f64 / non-contiguous / broadcast fall through.
+        //
+        // THE ASSOCIATION IS LOAD-BEARING: torch computes input + (value * t1) / t2, NOT
+        // input + value * (t1 / t2). Measured on torch 2.12.1+cpu over 400 random f64 cases —
+        // (value*t1)/t2 matched 400/400, value*(t1/t2) only 329/400.
+        //
+        // This path and the composed fallback BOTH used the v*(t1/t2) form and were verified
+        // "bit-exact" against each other, which is exactly why it survived: a fused==compose
+        // lock test passes while both arms are wrong versus real torch (the lerp-FMA trap,
+        // frankentorch-lerp parity). Found by comparing against the IN-PLACE sibling, which
+        // happened to have the right association. frankentorch-5fppy.
         if !self.tensor_requires_grad(input)?
             && !self.tensor_requires_grad(tensor1)?
             && !self.tensor_requires_grad(tensor2)?
@@ -18515,7 +18524,7 @@ impl FrankenTorchSession {
                             use rayon::prelude::*;
                             let out: Vec<f64> = (0..id.len())
                                 .into_par_iter()
-                                .map(|i| id[i] + value * (d1[i] / d2[i]))
+                                .map(|i| id[i] + (value * d1[i]) / d2[i])
                                 .collect();
                             Some(out)
                         } else {
@@ -18530,10 +18539,13 @@ impl FrankenTorchSession {
                 }
             }
         }
-        // F32 sibling: the composed path (div f32 -> scale_by_constant = mul by `value as f32`
-        // -> add, all f32) is 3 passes = ~7.5x SLOWER than torch's fused addcdiv. One parallel
-        // pass with the IDENTICAL f32 arithmetic `id[i] + (d1[i]/d2[i]) * (value as f32)` is
-        // BIT-EXACT with the compose (same f32 quotient, same f32 scalar, same f32 order).
+        // F32 sibling: the composed path (scale f32 -> div f32 -> add, all f32) is 3 passes =
+        // ~7.5x SLOWER than torch's fused addcdiv. One parallel pass with the IDENTICAL f32
+        // arithmetic `id[i] + (vf * d1[i]) / d2[i]` is bit-exact with that compose.
+        //
+        // Same association as the f64 path above and for the same reason: torch scales BEFORE
+        // dividing. This expression previously read `(d1[i]/d2[i]) * vf`, matching a composed
+        // path that was itself wrong versus torch. frankentorch-5fppy.
         if !self.tensor_requires_grad(input)?
             && !self.tensor_requires_grad(tensor1)?
             && !self.tensor_requires_grad(tensor2)?
@@ -18559,7 +18571,7 @@ impl FrankenTorchSession {
                             let vf = value as f32;
                             let out: Vec<f32> = (0..id.len())
                                 .into_par_iter()
-                                .map(|i| id[i] + (d1[i] / d2[i]) * vf)
+                                .map(|i| id[i] + (vf * d1[i]) / d2[i])
                                 .collect();
                             Some(out)
                         } else {
@@ -18574,9 +18586,13 @@ impl FrankenTorchSession {
                 }
             }
         }
-        let quot = self.tensor_div(tensor1, tensor2)?;
-        let scaled = self.scale_by_constant(quot, value)?;
-        self.tensor_add(input, scaled)
+        // SCALE FIRST, then divide: torch computes input + (value * tensor1) / tensor2, not
+        // input + value * (tensor1 / tensor2). The two differ in rounding — measured on torch
+        // 2.12.1+cpu, 400 random f64 cases matched (value*t1)/t2 400/400 and v*(t1/t2) only
+        // 329/400. frankentorch-5fppy.
+        let scaled = self.scale_by_constant(tensor1, value)?;
+        let quot = self.tensor_div(scaled, tensor2)?;
+        self.tensor_add(input, quot)
     }
 
     /// In-place addcmul: target += value * tensor1 * tensor2.

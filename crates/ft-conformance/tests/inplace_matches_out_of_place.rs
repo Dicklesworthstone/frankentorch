@@ -468,3 +468,269 @@ fn binary_in_place_ops_match_their_out_of_place_siblings() {
         failures.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 3: the matmul family (frankentorch-5fppy)
+// ---------------------------------------------------------------------------
+
+/// These ops take several tensor operands with shape relationships, so they cannot share
+/// the flat payload the earlier rounds use. Each case builds its own operands and runs the
+/// op either in place or out of place, selected by `in_place`, returning the resulting
+/// values so the two can be compared bit-for-bit.
+///
+/// **A different risk profile from rounds 1-2.** These route through GEMM-like kernels with
+/// their own blocking and parallel gates, so a divergence here would most likely be a
+/// re-association showing up in the last bits across many elements, rather than the clean
+/// NaN-vs-0.0 split `hardshrink_` produced. That is still a defect — the two forms are the
+/// same op — and the comparison stays exact rather than being softened to a tolerance.
+struct MatCase {
+    name: &'static str,
+    run: fn(&mut FrankenTorchSession, bool) -> Vec<f64>,
+}
+
+/// Deterministic, varied, and small in magnitude so a GEMM accumulation stays well inside
+/// f64 range — the point is bit-equality of two implementations, not stressing the numerics.
+fn seq(n: usize, offset: usize) -> Vec<f64> {
+    const T: [f64; 13] = [
+        0.5, -0.25, 1.5, -0.75, 2.25, -1.25, 0.125, -0.0625, 3.5, -2.5, 0.875, -1.75, 1.0,
+    ];
+    (0..n).map(|i| T[(i + offset) % T.len()]).collect()
+}
+
+fn mat_cases() -> Vec<MatCase> {
+    vec![
+        MatCase {
+            name: "addmm",
+            run: |s, ip| {
+                // input [64,32], mat1 [64,48], mat2 [48,32]
+                let inp = s
+                    .tensor_variable(seq(64 * 32, 0), vec![64, 32], false)
+                    .unwrap();
+                let m1 = s
+                    .tensor_variable(seq(64 * 48, 3), vec![64, 48], false)
+                    .unwrap();
+                let m2 = s
+                    .tensor_variable(seq(48 * 32, 7), vec![48, 32], false)
+                    .unwrap();
+                if ip {
+                    s.tensor_addmm_(inp, m1, m2, 0.75, 1.25).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_addmm(inp, m1, m2, 0.75, 1.25).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+        MatCase {
+            name: "baddbmm",
+            run: |s, ip| {
+                // input [4,16,12], batch1 [4,16,20], batch2 [4,20,12]
+                let inp = s
+                    .tensor_variable(seq(4 * 16 * 12, 1), vec![4, 16, 12], false)
+                    .unwrap();
+                let b1 = s
+                    .tensor_variable(seq(4 * 16 * 20, 5), vec![4, 16, 20], false)
+                    .unwrap();
+                let b2 = s
+                    .tensor_variable(seq(4 * 20 * 12, 9), vec![4, 20, 12], false)
+                    .unwrap();
+                if ip {
+                    s.tensor_baddbmm_(inp, b1, b2, 0.5, 1.5).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_baddbmm(inp, b1, b2, 0.5, 1.5).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+        MatCase {
+            name: "addbmm",
+            run: |s, ip| {
+                // input [16,12], batch1 [4,16,20], batch2 [4,20,12] — reduces over the batch,
+                // so this is the case where accumulation ORDER is most likely to differ.
+                let inp = s
+                    .tensor_variable(seq(16 * 12, 2), vec![16, 12], false)
+                    .unwrap();
+                let b1 = s
+                    .tensor_variable(seq(4 * 16 * 20, 6), vec![4, 16, 20], false)
+                    .unwrap();
+                let b2 = s
+                    .tensor_variable(seq(4 * 20 * 12, 11), vec![4, 20, 12], false)
+                    .unwrap();
+                if ip {
+                    s.tensor_addbmm_(inp, b1, b2, 0.25, 1.75).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_addbmm(inp, b1, b2, 0.25, 1.75).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+        MatCase {
+            name: "addmv",
+            run: |s, ip| {
+                // input [64], mat [64,48], vec [48]
+                let inp = s.tensor_variable(seq(64, 4), vec![64], false).unwrap();
+                let mat = s
+                    .tensor_variable(seq(64 * 48, 8), vec![64, 48], false)
+                    .unwrap();
+                let v = s.tensor_variable(seq(48, 12), vec![48], false).unwrap();
+                if ip {
+                    s.tensor_addmv_(inp, mat, v, 0.5, 2.0).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_addmv(inp, mat, v, 0.5, 2.0).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+        MatCase {
+            name: "addr",
+            run: |s, ip| {
+                // input [64,32], vec1 [64], vec2 [32]
+                let inp = s
+                    .tensor_variable(seq(64 * 32, 5), vec![64, 32], false)
+                    .unwrap();
+                let v1 = s.tensor_variable(seq(64, 2), vec![64], false).unwrap();
+                let v2 = s.tensor_variable(seq(32, 10), vec![32], false).unwrap();
+                if ip {
+                    s.tensor_addr_(inp, v1, v2, 1.25, 0.75).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_addr(inp, v1, v2, 1.25, 0.75).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+        MatCase {
+            name: "addcmul",
+            run: |s, ip| {
+                // Elementwise, so this one crosses the parallel gate like rounds 1-2 and
+                // carries boundary values.
+                let mut a = seq(70_000, 0);
+                let b = boundaries();
+                for (k, v) in b.iter().enumerate() {
+                    a[k] = *v;
+                    a[35_000 + k] = *v;
+                }
+                let inp = s.tensor_variable(a, vec![70_000], false).unwrap();
+                let t1 = s
+                    .tensor_variable(seq(70_000, 4), vec![70_000], false)
+                    .unwrap();
+                let t2 = s
+                    .tensor_variable(seq(70_000, 9), vec![70_000], false)
+                    .unwrap();
+                if ip {
+                    s.tensor_addcmul_(inp, t1, t2, 1.5).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_addcmul(inp, t1, t2, 1.5).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+        MatCase {
+            name: "addcdiv",
+            run: |s, ip| {
+                let mut a = seq(70_000, 1);
+                let b = boundaries();
+                for (k, v) in b.iter().enumerate() {
+                    a[k] = *v;
+                    a[35_000 + k] = *v;
+                }
+                let inp = s.tensor_variable(a, vec![70_000], false).unwrap();
+                let t1 = s
+                    .tensor_variable(seq(70_000, 6), vec![70_000], false)
+                    .unwrap();
+                // Divisor: no zeros, so the lane tests the op rather than division by zero,
+                // which addcmul's boundary set already covers on the accumulator side.
+                let t2 = s
+                    .tensor_variable(seq(70_000, 2), vec![70_000], false)
+                    .unwrap();
+                if ip {
+                    s.tensor_addcdiv_(inp, t1, t2, 0.75).unwrap();
+                    s.tensor_values(inp).unwrap()
+                } else {
+                    let o = s.tensor_addcdiv(inp, t1, t2, 0.75).unwrap();
+                    s.tensor_values(o).unwrap()
+                }
+            },
+        },
+    ]
+}
+
+/// The matmul-family in-place ops must match their out-of-place siblings bit-for-bit.
+#[test]
+fn matmul_family_in_place_ops_match_their_out_of_place_siblings() {
+    let mut failures = Vec::new();
+    for c in mat_cases() {
+        let oop = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            (c.run)(&mut s, false)
+        };
+        let ip = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            (c.run)(&mut s, true)
+        };
+        // No per-element input to quote here (operands differ per op), so the values
+        // themselves carry the diagnosis.
+        let vals = vec![f64::NAN; oop.len().max(ip.len())];
+        failures.extend(diff(c.name, &vals, &oop, &ip));
+    }
+    assert!(
+        failures.is_empty(),
+        "matmul-family in-place ops disagree with their out-of-place siblings \
+         (frankentorch-5fppy). These are the same op; a re-association difference between \
+         the two forms is a defect, not a tolerance question:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// `addcdiv` scales BEFORE dividing, like torch — pinned against torch's values, not against
+/// FrankenTorch's own other form.
+///
+/// This is the test that actually decides the question. The in-place/out-of-place sweep above
+/// found that the two forms disagreed, but a disagreement says only that one of them is wrong,
+/// not which. torch is the arbiter:
+///
+/// ```text
+/// torch.addcdiv(tensor([0.5]), tensor([2.25]), tensor([-1.75]), value=0.75)
+///   -> -0.4642857142857143   (0xbfddb6db6db6db6e)
+/// input + (value*t1)/t2      -> 0xbfddb6db6db6db6e   MATCHES
+/// input + value*(t1/t2)      -> 0xbfddb6db6db6db70   differs by 2 ULP
+/// ```
+///
+/// Measured over 400 random f64 cases on torch 2.12.1+cpu, `(value*t1)/t2` matched **400/400**
+/// and `value*(t1/t2)` only **329/400**. FrankenTorch's out-of-place form used the latter in
+/// all three of its paths — f64 fast, f32 fast, and the composed fallback — and they were
+/// verified bit-exact *against each other*, which is why it survived: a fused==compose lock
+/// test passes while both arms are wrong versus real torch. frankentorch-5fppy.
+#[test]
+fn addcdiv_scales_before_dividing_like_torch() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let inp = s.tensor_variable(vec![0.5], vec![1], false).unwrap();
+    let t1 = s.tensor_variable(vec![2.25], vec![1], false).unwrap();
+    let t2 = s.tensor_variable(vec![-1.75], vec![1], false).unwrap();
+    let out = s.tensor_addcdiv(inp, t1, t2, 0.75).unwrap();
+    let got = s.tensor_values(out).unwrap()[0];
+
+    // torch 2.12.1+cpu, bit pattern captured from the oracle.
+    let want = f64::from_bits(0xbfdd_b6db_6db6_db6e);
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "addcdiv must equal torch's input + (value*t1)/t2 = {want:?} (0x{:016x}), got {got:?} \
+         (0x{:016x}). The other association, input + value*(t1/t2), gives \
+         0xbfddb6db6db6db70 and is what this op used to compute.",
+        want.to_bits(),
+        got.to_bits()
+    );
+
+    // And the wrong association must be genuinely distinguishable here, or the test is vacuous.
+    let wrong = 0.5_f64 + 0.75 * (2.25 / -1.75);
+    assert_ne!(
+        wrong.to_bits(),
+        want.to_bits(),
+        "this fixture must separate the two associations"
+    );
+}
