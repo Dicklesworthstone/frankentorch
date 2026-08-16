@@ -23453,3 +23453,52 @@ Three things, none of them a code change: build with `--features fair-alloc`; fi
 a window where the 1m load holds within 1.25x; and fix the GroupNorm lane's
 one-sided incumbent null, which is `frankentorch-uilzh` and is the standing blocker
 on this lane rather than a property of this run.
+
+## 43. max_pool3d_nopool HAS A ONE-SIDED FT-ARM A/A DEFECT — THREE ABBA RUNS, NONE QUOTABLE
+
+Ran the campaign's worst measured vs-incumbent lane ABBA in single invocations to
+re-bank its row. The magnitude reproduces; the GATE does not, and the failure has the
+signature this ledger already treats as disqualifying.
+
+    ELF 79ee86ea22be30155801b3c7948beed8f93b4e3a6c212f232312ee7d6a28a85c
+    harness gauntlet_lane_sweep_h2h.rs, balanced-square ABBAABBA, 32 rounds,
+    same_host=thinkstation1, incumbent PyTorch 2.12.1+cpu, min estimator
+
+    run  load_1m          drift   min ratio              PT null       FT null
+     1   16.46 -> 19.59   PASS    0.378 [0.352,0.396]    0.988 PASS    0.868 FAIL
+     2   16.72 -> 28.88   FAIL    0.349 [0.333,0.364]    0.983 PASS    0.942 FAIL
+     3   32.33 -> 87.78   FAIL    0.349 [0.332,0.397]    0.987 PASS    0.974 FAIL
+
+**The incumbent's null passes in all three. FrankenTorch's fails in all three, and always
+BELOW 1.0** — its second-half samples are slower than its first-half. That is one-sided
+degradation in our arm, not host drift: drift moves both arms and would show up in the
+incumbent's null too, and it does not. Run 1 makes the point cleanly, because its drift
+gate PASSED and the FT null still failed at 0.868.
+
+NOT QUOTABLE, by the shared-drift clause: a failing null is excusable only when the
+failure is SHARED between arms by a similar amount. Here exactly one arm fails, every
+time. Three agreeing runs do not rescue it — item 38 showed that agreement among rejected
+runs is evidence of a stable disturbance, not of a stable number.
+
+### 43a. What this means for the banked standing
+
+`frankentorch-28lhu` banked this lane at **at least 2.86x SLOWER** from two runs whose
+nulls both passed. The point estimates here — 2.64x, 2.87x, 2.87x — agree with it, so the
+MAGNITUDE is not in doubt. What is now in doubt is whether those two certifying runs were
+clean or were the passing tail of a one-sided distribution, which is exactly the trap
+item 24b caught on group_norm, where one run in eleven passed by luck and two candidates
+had to be withdrawn.
+
+I am NOT withdrawing 28lhu on three runs of a later binary; the code has changed
+underneath it and the comparison is not like-for-like. I am recording that its gate is
+suspect and that anyone re-banking this lane should collect the FT-null SIGN across runs
+before trusting a pass.
+
+### 43b. The lane is currently ungateable, which redirects the work
+
+Whatever is degrading our arm within a run has to be found before this lane can be
+gated again, and no kernel lever can be certified on it until then. That places it in
+the same bucket as group_norm (item 29e): the defect is in how the lane is measured, not
+in the op. The cheap discriminator that settled group_norm applies here too — run the
+FrankenTorch arm ALONE at this shape, no incumbent co-process, and see whether the
+one-sided drop survives isolation.
