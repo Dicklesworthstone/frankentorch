@@ -22191,3 +22191,54 @@ This also bounds the sweep generally: any lane whose incumbent arm is short enou
 our bursts to perturb it is unmeasurable in this harness at ANY size or warm-up. The
 monotone-in-duration table in MossyOtter's item 27 is the screen for which lanes those
 are.
+
+## 30. THE UNINIT SCREEN, RUN OVER THE WHOLE CRATE: THE VEIN IS EXHAUSTED AND 79 SITES WOULD HAVE BEEN BUGS
+
+`frankentorch-jlcmi` existed to run the item-28d screen over the crate instead of
+sweeping it. It has been run. The verdict is that the vein is done, and the screen's
+main value turned out to be telling you where NOT to touch.
+
+    879  `let mut X = vec![0.0...]` sites in ft-kernel-cpu
+    ---
+     79  ACCUMULATE into the buffer (`dweight[j] += ...`, `p_col_sum[j] += ...`)
+    120  chunked full-overwrite candidates
+     50  iter_mut candidates
+    313  indexed writes, coverage unverified
+    317  unclear
+
+**THE 79 ARE THE HEADLINE.** At those sites the zero-init is LOAD-BEARING: the kernel
+accumulates into the buffer, so an uninitialized allocation is not a no-op speed-up, it
+is a correctness bug that would produce garbage gradients. Spot-checked three
+(`sdpa_backward_f32_unit_dout` p_col_sum, `layer_norm_backward_f64` dweight twice) and
+all three are genuine accumulations. A crate-wide sweep of the "dead zero-init" pattern
+— which is exactly what this bead was filed to prevent — would have written 79 bugs
+into backward kernels, where they produce wrong numbers rather than crashes.
+
+WHAT THE SCREEN FOUND WORTH DOING: nothing new. The 170 chunked/iter_mut candidates are
+dominated by BACKWARD kernels (batch_norm_backward, sdpa_backward x4, layer_norm_backward
+x3, conv/depthwise/conv_transpose backward, rms_norm_backward) and by
+`transpose_batched_materialize_f32`, which already uses the uninit lever. None sits on a
+live h2h lane, so none can be A/B'd against a real incumbent without building a lane
+first — and the measured record says the expected return does not justify that.
+
+THE MEASURED RECORD, which is what closes this:
+
+    max_pool1d f64    PAYS      1.27-1.49x, replicated across 4 binaries
+    avg_pool2d f64    NOTHING   replicated negative, A/A control passing
+    group_norm f32    NOTHING   replicated negative, prediction refuted (item 29)
+    prelu f64         N/A       no dead init to remove; `collect()` writes once
+
+One win in four attempts, and the one win is on the site with the largest
+zeroed-bytes-per-work ratio AND a buffer pool behind it keeping memory dirty. Two of
+the three predictions the screen made were wrong in ways no source reading could catch.
+
+CLOSING THE VEIN. The remaining candidates are lower-ratio than the two that already
+measured at nothing, and each would cost a lane, a build, an A/B and an A/A to learn
+that. On a host where disk is one large build from its floor, that is not a good trade.
+The lever stays available — `build_pool_output` / `build_pool_output_pair` and
+`set_pool_output_zeroed` are in place and extend to any kernel for free — and the right
+time to reach for it is when a lane is ALREADY being measured for another reason and the
+site happens to have a large output with trivial per-element work.
+
+DO NOT re-derive this. The screen is cheap to re-run and its answer will not change
+without new measurements.
