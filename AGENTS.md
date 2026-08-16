@@ -703,6 +703,20 @@ rch exec -- cargo test --release -j2 -p frankentorch-autograd --lib    # EXIT=0,
 other franken\* projects already do. It costs some build parallelism on the worker
 and buys a tenfold larger eligible pool.
 
+**But scope it per-crate: `-j2 --workspace` exceeds the SSH limit.** Measured
+2026-08-15: `cargo test --release -j2 --workspace` died with
+`SSH command timed out after 1800s` on `vmi1264463`, `REAL_EXIT=1`, zero test
+lines — the reduced parallelism that buys admission also makes the whole-workspace
+run too slow for the 30-minute transport window. Per-crate at `-j2` is well inside
+it, and gates the same code:
+
+```bash
+rch exec -- cargo test --release -j2 -p frankentorch-autograd --lib   # 492 passed, hz2
+rch exec -- cargo test --release -j2 -p frankentorch-api --lib        # 2571 passed, hz2
+```
+
+So the working recipe is `-j2` PLUS `-p <crate>`, not `-j2` alone.
+
 **Second escape, for when even that is refused:** build the test binary on the
 4-slot BUILD lane and execute it locally, which is exactly what the h2h harness
 already does for its PyTorch arm:
