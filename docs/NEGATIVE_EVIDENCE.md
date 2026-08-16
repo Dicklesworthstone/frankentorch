@@ -26026,3 +26026,79 @@ change a bit, which is the property any future width work will need. And keeping
 refutation executable is the same discipline the full-coverage max_pool3d backward already
 follows — anyone proposing chunk-coarsening again has to beat 0.922x rather than re-derive
 the intuition.
+
+## 71. group_norm RE-CERTIFIED AFTER THE WIDEN FIX — 5.41x SLOWER TO AT MOST 2.06x, AND THE OUTLIER IS THE INCUMBENT'S
+
+Item 69 landed the fix (commit `69cb9a38`) and measured it in situ, but could not
+CERTIFY it: the group_norm lanes kept failing on the incumbent's own A/A null. Closed
+here using the technique item 58 established for exactly this family — `FT_H2H_LANES`
+filters to `group_norm_f32`, which makes a 16-round run short enough for the drift gate.
+
+Six runs, `RAYON_NUM_THREADS=8`, `FT_H2H_REPS=16`, ELF `69679ab6...`, private snapshot so
+a peer rebuild could not swap the binary mid-measurement. **All six drift-clean; five
+certified.** Parity `match` throughout, 0 MISMATCH.
+
+    run   drift    gates      FT ms   PT ms   min-ratio            PT null  FT null  cert
+    g1    1.063x   PASS/PASS  10.912   6.212  0.567 [0.528,0.584]  1.017 P  0.992 P  CERT
+    g2    1.063x   PASS/PASS  11.215   3.610  0.273 [0.211,0.304]  1.011 P  0.994 P  CERT
+    g3    1.144x   PASS/PASS  11.135   6.376  0.545 [0.514,0.564]  0.992 P  1.017 P  CERT
+    g4    1.159x   PASS/PASS  11.303   6.248  0.506 [0.486,0.553]  0.991 P  0.988 P  CERT
+    g5    1.019x   PASS/PASS  11.322   6.316  0.527 [0.504,0.565]  1.010 P  1.001 P  CERT
+    g6    1.064x   PASS/PASS  11.391   6.576  0.561 [0.531,0.587]  1.045 F  1.013 P  -
+
+Per-arm host state: loadavg 10.89-14.31 pre across the six, CPU 1429-4295 MHz with
+cross-core spread 2.85-3.01x.
+
+### 71a. g2 IS AN OUTLIER ON THE INCUMBENT SIDE, AND IT IS EXCLUDED BY THE HARNESS'S OWN RULE
+
+g2's ratio of 0.273 is half of every other run's. Our arm did not move — 11.215 ms
+against 10.912-11.391 everywhere else. **The incumbent's arm read 3.610 ms against
+6.212-6.576 in the other five**, i.e. torch ran 1.7x faster in that one run.
+
+The harness prints `incumbent_rule=a delta whose incumbent arm moved (version, build, or
+measured time) is NOT a win` on every invocation. g2's incumbent MEASURED TIME moved, so
+g2 is excluded on that stated rule rather than by picking the answer I preferred. It
+passed drift and both nulls — **another certified row that is an outlier, exactly the
+failure mode item 66c recorded, and this time the gates again did not catch it.**
+
+### 71b. THE CERTIFIED STANDING
+
+Four certifications survive (g1, g3, g4, g5; g6's incumbent null failed at 1.045):
+
+    point estimates   0.567  0.545  0.506  0.527      median 0.536
+    worst CI lower bound  0.486   =>  AT MOST 2.06x SLOWER
+
+Against the previously banked certified `0.185` = 5.41x SLOWER, that is a **2.63x
+improvement on the conservative bound**. The lane is still slower than the incumbent; it
+is no longer 5x slower.
+
+### 71c. Attribution, including what is NOT mine
+
+The engine term (session lane minus kernels lane, within each run) now reads:
+
+    g1 3.876   g3 4.016   g4 3.748   g5 3.788   g6 3.582    mean 3.802 ms
+
+against 25.69 ms before the fix. That decomposition is the part attributable to the widen.
+
+PROVENANCE, CHECKED RATHER THAN ASSUMED. Mid-session another agent's
+`PARALLEL_TARGET_WORKERS` work sat uncommitted in `ft-kernel-cpu`, and when they landed
+it (`43099b67`) the lever was **measured and REJECTED**, its default left at 0. That
+raised a real risk that these six runs had certified a configuration which no longer
+ships. Rebuilding at HEAD produces the **identical ELF `69679ab6...`** as the snapshot
+these runs used, so the binary IS the HEAD build and the rejected lever was already back
+at 0 when it was compiled. The row stands as a HEAD row.
+
+ONE THING IS STILL UNEXPLAINED and is recorded rather than smoothed over:
+`group_norm_f32_kernels` reads 7.0-7.8 ms in these filtered runs against 4.8-4.9 ms on
+the 21-lane board earlier. The filtered configuration runs 6 lanes instead of 21, which
+should if anything help. Whatever moved it is not identified, and it is why the certified
+ratio is quoted as a standing of the current tree rather than as a measurement of my
+patch alone — the engine-term decomposition above is the part attributable to the widen,
+and it subtracts the kernels lane on both sides.
+
+### 71d. What this is and is not
+
+It is a **matched-thread-budget** row: `RAYON_NUM_THREADS=8` against torch's hard-coded
+8, with the family filter. It is not a shipped-default (64-thread) row, and the two are
+not interchangeable — item 66 records why. A 64-thread certification of this family has
+never succeeded and is not claimed here.
