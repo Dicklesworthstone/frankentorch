@@ -23932,3 +23932,63 @@ property of the lane or the build:
 a standing needs a host that holds within 1.25x for the length of a sweep, and this
 pane has not been offered one in seven tries. Recording it here so the replication
 is not lost the next time someone asks what the worst gap is.
+
+## 53. HALVING THE SWEEP PASSED THE DRIFT GATE FOR THE FIRST TIME — AND MOVED THE BLOCKER TO THE INCUMBENT'S NULL
+
+Eighth ABBA attempt on `group_norm_f32`, and the first with a clean host verdict.
+Zero builds; reused the mimalloc binary,
+ELF `4831383ca3aa28971ce62f7a07141da98e143ff973eccca5a7dc72223430153c`.
+
+### 53a. The change, and why it went against the harness's own advice
+
+`FT_H2H_REPS=8` — half the default 16, at the floor the harness permits.
+
+The knob's doc argues the opposite: *"More rounds is the only knob that narrows a
+null CI without touching the estimator, so a measurement session on a busy host can
+buy decidability with wall-clock."* That advice targets **WIDE** nulls, which are
+undecidable. Mine were not wide — the previous run's FrankenTorch null was
+`[0.966,1.061]`, comfortably decidable — they were being voided by **drift**, and
+every one of seven runs died that way. A longer sweep buys tighter nulls at the
+cost of a longer window for the host to move in, which is the wrong trade when
+drift is the binding gate.
+
+### 53b. It worked, on the gate that had never once passed
+
+    load_series n=10   worst_drift 1.195x   endpoint_gate PASS   series_gate PASS
+
+**First drift PASS in eight attempts.** Seven full-length sweeps drifted 1.47x to
+2.8x; the half-length one held at 1.195x. The host did not become quieter — the
+window became shorter than the host's excursions.
+
+### 53c. The row, and the blocker that replaced drift
+
+    group_norm_f32  FT 32.825 ms  PT 6.506 ms  5.05x SLOWER  ratio 0.198 [0.177,0.211]
+                    PT null 0.921 FAIL [0.836,0.997]   FT null 0.995 PASS [0.948,1.066]
+                    MIN 6.05x  ratio 0.165 [0.146,0.186]  PT 0.826 FAIL  FT 1.027 FAIL
+                    parity match
+
+Still not quotable — but **for a different reason, and a more specific one.** The
+FrankenTorch arm's null PASSES on the median at 0.995. The INCUMBENT's fails at
+0.921, one-sided. That is `frankentorch-uilzh`, the lane defect recorded three
+times before on GroupNorm f32, now isolated as the sole remaining blocker on this
+lane once drift is removed.
+
+### 53d. The trade-off, measured rather than assumed
+
+    reps   drift verdict        PT null FAIL   FT null FAIL   of 21
+    16     DRIFTED (1.47-2.8x)      17-18          19-21
+     8     PASS (1.195x)             18             19
+
+Halving the sweep did NOT meaningfully worsen the nulls — 18/19 against 17-21 — and
+it fixed the gate that had blocked every previous run. **The two gates were not in
+tension here, which is the useful part**: I expected to trade null quality for drift
+and did not have to.
+
+### 53e. Where this leaves the campaign's worst gap
+
+`group_norm_f32` is now 5.05-5.57x SLOWER across five runs. Drift is solved. The
+remaining blocker is `uilzh` — torch's own arm degrading within an invocation on
+this specific lane — which is neither a FrankenTorch defect nor something more
+rounds or a quieter host will fix. It needs the lane itself investigated, and it is
+the single thing standing between this campaign and its first certified
+vs-incumbent row.
