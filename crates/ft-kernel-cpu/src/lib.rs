@@ -41405,10 +41405,29 @@ mod tests {
             let (recon, frob) = super::svd_reconstruction_error(&a, &good);
             let ortho_u = super::svd_columns_orthogonality_error(&good.u, good.m, good.k);
             let ortho_v = super::svd_rows_orthogonality_error(&good.vh, good.k, good.n);
+            // Sentinel for frankentorch-ga99y: is V's problem that its deficient
+            // rows are NOT UNIT (never normalized / left zero), or that they are
+            // unit but MUTUALLY NON-ORTHOGONAL (never completed against each
+            // other)? Row norms separate the two without reading the source.
+            let mut min_row = f64::INFINITY;
+            let mut max_row: f64 = 0.0;
+            let mut near_zero_rows = 0usize;
+            for r in 0..good.k {
+                let norm = (0..good.n)
+                    .map(|c| good.vh[r * good.n + c] * good.vh[r * good.n + c])
+                    .sum::<f64>()
+                    .sqrt();
+                min_row = min_row.min(norm);
+                max_row = max_row.max(norm);
+                if norm < 0.5 {
+                    near_zero_rows += 1;
+                }
+            }
             println!(
                 "qpe2n scale 1e{exp}: s_max {s_max:.3e} worst|ds| {worst_s:.3e} \
                  allowed {:.3e} | recon {recon:.3e} vs {:.3e} | orthoU {ortho_u:.3e} \
-                 orthoV {ortho_v:.3e} (both vs 1e-8)",
+                 orthoV {ortho_v:.3e} (both vs 1e-8) | Vh row norms \
+                 [{min_row:.3e}, {max_row:.3e}] near-zero rows {near_zero_rows}",
                 1e-8 * s_max,
                 1e-7 * frob
             );
