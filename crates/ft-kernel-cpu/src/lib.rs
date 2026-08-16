@@ -10925,8 +10925,55 @@ pub fn avg_pool1d_backward_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
+    // frankentorch-yc7ud: TOTAL-COVERAGE case, the dense sibling of the scalar lever
+    // in 372h8. When the windows tile the input exactly, each element is touched by
+    // exactly ONE window, so the `+=` below reads a cell that is still the initial
+    // +0.0 — and `x += g` on a +0.0 cell is `0.0 + g`. A direct store of `0.0 + g`
+    // into an UNINITIALIZED buffer is therefore bit-identical, including for a
+    // negative-zero or NaN `g`. The store must be `0.0 + g` and NOT a bare `g`:
+    // `-0.0 + 0.0` is `+0.0` but a bare store keeps `-0.0`, and LLVM cannot fold the
+    // add away for that same reason, so the exactness is not wishful.
+    //
+    // `covered_len == len` is STRICT. With `<=` a trailing run is never written, and
+    // against an uninitialized buffer that run is garbage rather than the zeros the
+    // gradient requires. Overlap, gaps and partial coverage all fall through to the
+    // accumulating route below, unchanged.
+    //
+    // Unlike the scalar route, `g` varies per output window here, so this is a
+    // strided store rather than a `fill()` — the coverage argument is identical, the
+    // write pattern is not, and the two are measured separately.
+    let numel = batch * ch * len;
+    if !pool_output_zeroed()
+        && stride == kernel
+        && let Some(covered_len) = output_len.checked_mul(kernel)
+        && covered_len == len
+    {
+        let fill_all = |dp: &mut [f64]| {
+            dp.par_chunks_mut(len)
+                .enumerate()
+                .for_each(|(plane, drow)| {
+                    let dbase = plane * output_len;
+                    let div = kernel as f64;
+                    for ox in 0..output_len {
+                        let g = dout[dbase + ox] / div;
+                        let start = ox * stride;
+                        for kx in 0..kernel {
+                            drow[start + kx] = 0.0 + g;
+                        }
+                    }
+                });
+        };
+        return match ft_core::buffer_pool::try_take_exact(numel) {
+            Some(mut pooled) => {
+                fill_all(&mut pooled);
+                pooled
+            }
+            None => build_uninit(numel, fill_all),
+        };
+    }
+
     // frankentorch-7zqbc: pooled dense gradient (accumulating route — zeros kept).
-    let mut din = ft_core::buffer_pool::take_zeroed(batch * ch * len);
+    let mut din = ft_core::buffer_pool::take_zeroed(numel);
     // frankentorch-o5t00 — DO NOT GATE. The L3-residency serial gate that gives
     // 1.4-2.2x on the max_pool SCATTER backwards was measured here and is a LOSS:
     // control-normalised 1.266 (i.e. ~1.27x SLOWER), 95% CI [1.108, 1.502], entirely
@@ -41695,6 +41742,54 @@ mod tests {
                 "264q0 basis completion m={m} k={k} u_cols={u_cols} rank={rank}: \
                  restarting {restart_ns} ns, cursor {cursor_ns} ns ({speedup:.2}x)"
             );
+        }
+    }
+
+    /// frankentorch-yc7ud: the total-coverage DENSE avg_pool1d backward must agree
+    /// BIT-FOR-BIT with the accumulating route it replaces, and must decline wherever
+    /// coverage is partial — there the untouched run has to stay zero, and against an
+    /// uninitialized buffer it would be garbage.
+    ///
+    /// `dout` deliberately carries negative zero, NaN and infinity: the exactness
+    /// argument turns on `x += g` being `0.0 + g` on a still-zero cell, which is the
+    /// step that a bare store would break for a negative-zero `g`.
+    #[test]
+    fn avg_pool1d_dense_backward_total_coverage_matches_the_accumulating_route_bitwise() {
+        // (batch, ch, len, kernel, stride, output_len)
+        let cases = [
+            (2usize, 3usize, 64usize, 2usize, 2usize, 32usize), // exact tiling
+            (1, 1, 96, 3, 3, 32),                               // exact tiling, k=3
+            (2, 3, 65, 2, 2, 32),                               // trailing element
+            (1, 2, 100, 3, 3, 33),                              // trailing run
+            (1, 2, 64, 3, 1, 62),                               // overlap
+            (1, 2, 64, 2, 4, 16),                               // gaps
+        ];
+        for &(b, c, len, k, st, ol) in &cases {
+            let dout: Vec<f64> = (0..b * c * ol)
+                .map(|i| match i % 17 {
+                    3 => -0.0,
+                    7 => f64::NAN,
+                    11 => f64::INFINITY,
+                    13 => 0.0,
+                    _ => ((i * 31 % 53) as f64) * 0.25 - 6.0,
+                })
+                .collect();
+
+            let previous = super::set_pool_output_zeroed(true);
+            let accum = super::avg_pool1d_backward_f64(&dout, b, c, len, k, ol, st);
+            super::set_pool_output_zeroed(false);
+            let levered = super::avg_pool1d_backward_f64(&dout, b, c, len, k, ol, st);
+            super::set_pool_output_zeroed(previous);
+
+            assert_eq!(accum.len(), levered.len());
+            for (i, (a, x)) in accum.iter().zip(levered.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    x.to_bits(),
+                    "yc7ud mismatch b={b} c={c} len={len} k={k} stride={st} idx={i}: \
+                     accumulating={a} levered={x}"
+                );
+            }
         }
     }
 

@@ -284,6 +284,36 @@ where
     (elapsed, checksum)
 }
 
+/// frankentorch-yc7ud: forward + SQUARED-sum loss + backward. The squared loss is the
+/// whole point: `timed_op` uses a plain `tensor_sum`, which fires the pooling ops'
+/// scalar sum-shortcut and routes the backward through
+/// `avg_pool1d_backward_scalar_f64`. With `sum(out * out)` the upstream gradient is
+/// `2*out` rather than a uniform scalar, the shortcut does not fire, and the DENSE
+/// `avg_pool1d_backward_f64` runs — which is the route yc7ud's lever is in and which no
+/// existing lane exercised.
+fn timed_op_sq<F>(values: &[f64], shape: Vec<usize>, build: F) -> (f64, f64)
+where
+    F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> ft_autograd::TensorNodeId,
+{
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), shape, true)
+        .expect("leaf");
+    let started = Instant::now();
+    let out = build(&mut session, x);
+    let sq = session.tensor_mul(out, out).expect("square");
+    let loss = session.tensor_sum(sq).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// GroupNorm f32 train step: f32 input leaf plus f32 affine parameters, all three
 /// requiring grad, with every leaf built before the declared timed region.
 ///
@@ -696,6 +726,14 @@ LANES = {
     # frankentorch-372h8: avg_pool1d on the same tensor, exact 2/2 tiling.
     "avg_pool1d": (mp1, lambda x: Fn.avg_pool1d(x,2,2)),
     "avg_pool1d_zeroed": (mp1, lambda x: Fn.avg_pool1d(x,2,2)),
+    # frankentorch-yc7ud: the incumbent twins for the dense-route lanes. The FT
+    # side squares before summing; torch is byte-identical code under both names,
+    # which is what makes PT(off)/PT(on) a free control.
+    # SQUARED on this side too: the loop does fn(x).sum().backward(), so returning the
+    # square makes the incumbent's loss sum(out*out) and matches what the FT arm times.
+    # Without it the two arms would measure different work and parity would mismatch.
+    "avg_pool1d_dense": (mp1, lambda x: Fn.avg_pool1d(x,2,2)**2),
+    "avg_pool1d_dense_zeroed": (mp1, lambda x: Fn.avg_pool1d(x,2,2)**2),
     # frankentorch-lu3ht: incumbent twin for the avg_pool2d uninit A/B.
     "avg_pool2d_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
@@ -865,6 +903,27 @@ LANES = {
                 timed_op(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
                     s.functional_avg_pool1d(x, 2, 2).expect("avg_pool1d")
                 })
+            }),
+        ),
+        (
+            // frankentorch-yc7ud: squared loss, so the sum-shortcut does NOT fire and
+            // the DENSE backward runs. Same tensor and tiling as the avg_pool1d lane.
+            "avg_pool1d_dense",
+            Box::new(|| {
+                timed_op_sq(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_avg_pool1d(x, 2, 2).expect("avg_pool1d")
+                })
+            }),
+        ),
+        (
+            "avg_pool1d_dense_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_op_sq(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_avg_pool1d(x, 2, 2).expect("avg_pool1d")
+                });
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
             }),
         ),
         (

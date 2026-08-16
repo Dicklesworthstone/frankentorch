@@ -22862,3 +22862,63 @@ The decisive experiment for ga99y now needs no new machinery — only a fixture:
 the existing blocked-vs-unblocked oracle on a rank-2, 1e-20 input. Divergence
 indicts the reduction's reflectors; agreement with both non-orthonormal indicts
 `bidiag_form_p_f64`'s expansion.
+
+## 36. THE DENSE avg_pool1d BACKWARD LEVER — at least 1.27x, AND THE VEIN'S FIRST CORRECT PREDICTION
+
+`frankentorch-yc7ud` carried the same total-coverage argument as the scalar lever
+(372h8) into `avg_pool1d_backward_f64`, the route taken whenever the loss is NOT a
+plain sum. It pays, and it pays LESS than its sibling — which is what the bead said
+would happen and why it was filed separately.
+
+### 36a. The standing
+
+ELF `79ee86ea22be3015...`, build worker `vmi1293453`. Paired `avg_pool1d_dense` against
+`avg_pool1d_dense_zeroed`, arms adjacent in one round:
+
+    d1  1.332x [1.271,1.398]  32/32 rounds  PT control 1.032
+    d3  1.364x [1.301,1.405]  32/32 rounds  PT control 1.047
+    d4  1.357x [1.326,1.399]  32/32 rounds  PT control 1.007
+    (d2 discarded: PT control 1.079, past the 5% readability threshold)
+
+    A/A, both arms zeroed:  0.986x [0.936,1.028]  PT control 1.030  UNDECIDED
+
+CONSERVATIVE CLAIM: **at least 1.27x FASTER**, taking 1.271 — the lowest bound any
+readable run produced — not the 1.36x headline.
+
+THE A/A TOOK TWO ATTEMPTS and the first is recorded rather than buried: attempt one read
+0.986 with a PT control of 1.064, past threshold, so it was UNREADABLE and could not be
+used even though its point estimate was exactly what the lever's absence predicts. A
+control that says what you want but fails its own gate is not a control.
+
+### 36b. The prediction was correct, which is new for this vein
+
+`yc7ud` said, before any of this ran: "`g` varies per output window here, so the fill is
+a strided store rather than a `fill()`. The coverage argument is unchanged; the write
+pattern is not, so the measured value may well differ from the scalar route's 2.44x."
+
+    scalar route (372h8)   at least 2.44x   contiguous `fill(g)` over the whole plane
+    dense route  (yc7ud)   at least 1.27x   strided stores, one `g` per output window
+
+Roughly half the value, from the same amount of zeroing removed, differing only in how
+the replacement writes. This is the FIRST prediction this vein's reasoning has got right
+— the two before it were both wrong (prelu had no dead init to remove; group_norm had
+the defect and gained nothing). Recorded with that record attached, because one correct
+prediction after two wrong ones is weak evidence that the model is now right, and the
+honest reading is that the mechanism is better understood for POOLING backwards
+specifically, not in general.
+
+### 36c. The lane had to be built to exist
+
+No existing lane exercised this route. `timed_op` uses a plain `tensor_sum`, which fires
+the pooling scalar sum-shortcut and routes the backward through
+`avg_pool1d_backward_scalar_f64`. The new lane uses `sum(out * out)`, so the upstream
+gradient is `2*out` rather than a uniform scalar, the shortcut declines, and the dense
+route runs. The incumbent twin squares too (`Fn.avg_pool1d(x,2,2)**2`) so both arms time
+the same work — without that the arms would have measured different computations and
+parity would have failed. Parity reports `match` on the new lanes, which is the check
+that the two sides really are doing the same thing.
+
+This is worth stating as a general point about the harness: a route with a shortcut in
+front of it is INVISIBLE to every lane whose loss triggers the shortcut. Two levers in
+this family (372h8, yc7ud) sit on routes distinguished only by the caller's loss shape,
+and measuring either required knowing which one the lane selects.
