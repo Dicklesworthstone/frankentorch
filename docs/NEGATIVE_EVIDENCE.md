@@ -20667,3 +20667,50 @@ It fails loudly rather than silently, which is the good case — but it means "n
 the build worker" is not only for comparability: **some workers cannot produce a
 binary this measurement host can run at all.** Rebuilding on `vmi1293453` fixed
 it. Check `ldd` for `not found` before trusting a fresh binary.
+
+## 2026-08-16 — Load DELTA predicts certification; absolute load does not (`vnnts`)
+
+Seven invocations of the h2h harness on `thinkstation1` this session — same
+harness, 32 rounds each. Sorted by how far the 1-minute loadavg **moved across the
+run**, certified and non-certified separate perfectly:
+
+| load start → end | delta | outcome |
+|---|---|---|
+| 8.63 → 9.25 | **+7%** | `max_pool3d_nopool` QUOTABLE (`y4nj9`) |
+| 23.05 → 29.09 | **+26%** | `prelu_noshortcut` + `group_norm_f32_statskernels` QUOTABLE (`vhgue`) |
+| 12.96 → 21.97 | +69% | 0 of 14 |
+| 7.10 → 12.25 | +72% | 0 of 14 (`b8mo7`) |
+| 8.42 → 17.24 | +105% | 0 of 14 |
+| 8.10 → 16.75 | +107% | 0 of 14 |
+| 16.70 → 36.89 | +121% | 0 of 14 |
+
+**Two certified at ≤+26%. Five failed at ≥+69%. No overlap, and nothing in the gap
+between.**
+
+**Absolute load does not predict the outcome and actively misleads.** The best run
+*started at 23.05* — the highest starting load of the seven — and certified two
+lanes, while a run starting at 7.10, the second lowest, certified nothing. Waiting
+for a quiet machine is waiting for the wrong thing, and on a host where three
+unrelated processes have pinned a core each for fifteen hours, quiet never arrives.
+
+The mechanism is already established, now quantified: the harness samples both arms
+in a balanced square, which cancels a **stable offset** — that is what it is for —
+but cannot cancel a **ramp**, because the square's later cells are systematically
+slower than its earlier ones. The A/A null is exactly the instrument that detects
+this, which is why the null fails rather than the ratio looking odd.
+
+**The practical consequence is about ordering, and it is free.** Pre-flight is
+cheap but unreliable: the 1-minute average is exponentially weighted and lags, so it
+describes the minute that has passed, not the four minutes ahead — I tried it
+repeatedly this session and it failed about as often as it worked. **Post-hoc
+admissibility is the real win.** The run already knows its own load delta, so a run
+that moved ≥ ~+50% can be discarded *before its ratios are read*. That ordering is
+the whole point: deciding admissibility from a number you have already looked at is
+not a gate. **Record load delta as a provenance field** next to worker, harness and
+ELF — it is the one field that says whether the instrument held still while it
+measured.
+
+Bounding the claim: seven runs, one host, one harness. The +26/+69 boundary is
+where the gap happens to fall in this sample, not a measured threshold. The honest
+reading is "small deltas certified, large ones did not, crossover somewhere between"
+— re-derive it if the host, round count or lane set changes.
