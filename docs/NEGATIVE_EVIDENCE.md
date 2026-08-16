@@ -20588,3 +20588,82 @@ produced *before* this, from a binary that happened to come off a compatible wor
 **If the harness dies with a GLIBC error, the binary is not yours and not runnable
 — that is a scheduling outcome, not a local toolchain problem.** Filed as `tdpzf`
 with the candidate fixes; rch scheduling is not a measurement pane's to change.
+
+### …and it has a working mitigation: `RCH_WORKER` pins the build
+
+The blocker is **mitigable today, without touching shared rch config.** `rch` reads
+an `RCH_WORKER` environment variable — found with `strings` on the binary, because
+it is **not** listed in `rch exec --help`. Setting it to a worker whose glibc is not
+newer than the measurement host produces a runnable harness. Prefix the usual
+`rch exec` build with `RCH_WORKER=vmi1149989` and it pins.
+
+Verified end to end: the log confirms the pin
+(`.rch-target-vmi1149989-pool-…`, `[RCH] remote vmi1149989`, 8m58s) and the
+resulting binary **executes on `thinkstation1`**, where the two previous unpinned
+builds died in the loader. ELF `de31b539ff417d4e`, and a full 14-lane sweep ran to
+completion on it.
+
+**Why this matters beyond unblocking a run:** it closes the build-provenance gap
+that forced the `vhgue` rows to be banked with an unknown builder. With the pin a
+measured row can name the worker that *built* the binary as well as the host that
+ran it, which is what rule 1 has been asking for all along. Every future row from
+this harness should carry its `RCH_WORKER`.
+
+Known-good so far: **`vmi1149989`** (glibc ≤2.42, runs here). Known-bad: **`hz1`**
+(emits `GLIBC_2.43`). The rest are untested — `rch workers list` does not report
+glibc, so the safe set has to be discovered by trying, which is itself part of the
+argument for fixing this properly.
+
+A workaround, not a fix. `tdpzf`'s real remedies — a glibc-aware worker filter, or
+refusing to return an artifact the requester cannot execute — still belong to
+whoever owns rch. But nobody needs to be blocked meanwhile.
+
+**19. max_pool3d ATTRIBUTED, and a worker that cannot produce a runnable binary
+(`frankentorch-87sz8`, 2026-08-15).**
+
+Route-matched breakdown, `harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`,
+`same_host=thinkstation1`, build worker `vmi1293453`, ELF `de31b539`, min of 9,
+FrankenTorch-internal (no incumbent arm, so no ratio):
+
+| kernel | time |
+|---|---|
+| `max_pool3d_forward_with_indices_f64` | 0.582 ms |
+| `max_pool3d_backward_from_indices_nonoverlapping_f64` (**the live route**) | **0.862 ms** |
+| `max_pool3d_backward_from_indices_f64` (generic, same data, same rep) | 1.078 ms |
+| total on the live route | 1.445 ms |
+
+**The backward is 60% of the lane's kernel time**, and the non-overlapping
+specialisation already buys 1.25x over the generic scatter — asserted bit-identical
+on every rep rather than assumed.
+
+**Route-matching mattered here and was nearly got wrong.** The first version of
+this breakdown timed the GENERIC backward. ft-api's closure computes
+`kd == sd && kh == sh && kw == sw` and takes the non-overlapping specialisation for
+this lane, so the generic figure would have been item 7f again: a split whose arms
+enter different kernels measures the routing, not the phase. Caught by reading the
+dispatch before publishing, which is the only reason this entry is not another
+retraction.
+
+**The lever this points at, and why it is NOT yet claimed.** The backward calls
+`buffer_pool::take_zeroed(1_048_576)` — an 8 MiB zeroing pass — and then scatters
+131,072 values into it, a density of 12.5%. Windows tile the input exactly, so a
+single full-coverage pass writing the gradient at each argmax and 0.0 at the other
+seven positions would cover every element once and drop the zeroing entirely.
+**But item 3 already measured this exact trade in the other direction**: dense
+arithmetic writes parallelise, sparse scatters do not, and a `memset` is
+bandwidth-optimal in a way per-element stores are not. Replacing one sequential
+8 MiB memset plus 131K scattered writes with 1M individual writes may well be
+SLOWER. It needs a paired twin lane, not an assumption.
+
+**Separately: a build worker can make a measurement impossible, not merely
+different.** The same source built on `hz1` produced a binary requiring
+`GLIBC_2.43`, which `thinkstation1` does not have:
+
+```
+./gauntlet_lane_sweep_h2h: /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.43' not found
+```
+
+It fails loudly rather than silently, which is the good case — but it means "name
+the build worker" is not only for comparability: **some workers cannot produce a
+binary this measurement host can run at all.** Rebuilding on `vmi1293453` fixed
+it. Check `ldd` for `not found` before trusting a fresh binary.
