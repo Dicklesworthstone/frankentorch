@@ -21189,3 +21189,58 @@ So GroupNorm f32 is recorded as **~6.3-6.6x slower, NOT bankable**, worst bound
 lever: **why does torch's GroupNorm f32 arm slow by 46% within a single
 invocation, reproducibly?** Answering that may fix the measurement for every
 GroupNorm row this campaign has taken.
+
+**27. THE ARMS PERTURB EACH OTHER, AND SHORT LANES CANNOT SURVIVE IT
+(`frankentorch-68pwz`, 2026-08-16).** Item 26 left a question open: why does
+torch's GroupNorm f32 arm degrade ~46% between its halves, reproducibly (1.456,
+1.460)? Answered, and the answer indicts the harness rather than torch.
+
+**Torch alone does the OPPOSITE.** Standalone loop, same shape, same pinned
+interpreter (2.12.1+cpu), `torch.set_num_threads(8)`, 8 warmup iterations then 160
+timed, medians per block of 40:
+
+```
+0.1764 ms  ->  0.1485  ->  0.1507  ->  0.1518      second half / first half = 0.883
+```
+
+Torch WARMS UP and then holds flat. It does not degrade in isolation at all — so
+the 1.46 seen in the harness is not a torch property, it is manufactured by the
+measurement.
+
+**What the harness adds is the other arm.** The balanced square interleaves: our
+lanes run between the incumbent's samples, at 64 rayon threads, evicting caches
+and loading the machine. If that interference grows across a run — pool filling,
+tape growing, memory pressure accumulating — the incumbent's later samples are
+slower than its earlier ones, and its null fails ONE-SIDEDLY while ours stays
+clean. That is exactly the signature item 26 recorded: FT null 1.02, PT null 1.46.
+
+**And it scales with lane length, which is the confirming prediction:**
+
+| lane | PT arm time | PT A/A null |
+|---|---|---|
+| `group_norm_f32` | 0.289 ms | **1.456** |
+| `max_pool3d_nopool` | 0.948 ms | 1.000 |
+| `conv3d` | 6.637 ms | 1.046 |
+| `prelu` | 17.9 ms | 0.980 |
+
+A 0.29 ms incumbent sample is dominated by whatever the neighbouring arm left in
+the caches; a 17.9 ms one absorbs it. **The shorter the lane, the less measurable
+it is by this harness**, and the effect is monotone across four lanes spanning 60x
+in duration.
+
+**Consequences, and they are not small:**
+
+- GroupNorm f32 (0.29 ms incumbent) is at the bottom of that table. Its standing
+  cannot be obtained from this harness as built, which is why item 26 refused it
+  and why no fusion lever aimed at it could be evaluated either.
+- The one-sided null failure is a DETECTOR for this, not just an obstacle. Item
+  26's clause (b) — reject when only one arm's null fails — turns out to be
+  rejecting precisely the lanes where inter-arm interference dominates.
+- This is not fixed by more rounds. More rounds means more interference, not less.
+
+**What would fix it, recorded rather than built:** separate the arms in time (run
+all of one arm's samples for a lane, then the other's) and you reintroduce the
+drift problem the interleaving was designed to solve (`frankentorch-6atx2`). The
+honest options are a longer workload per sample for short ops, or accepting that
+sub-millisecond lanes need a different instrument. Both are deliberate design
+changes, not adjustments to make mid-measurement.
