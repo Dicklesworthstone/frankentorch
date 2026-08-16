@@ -20942,3 +20942,50 @@ So the next step on this bead is not "apply the fast path to `pool_max_beats`" �
 that would be slower. It is a plane-level NaN pre-check dispatching to a NaN-free
 window specialisation, and it must be measured at the kernel, not at this
 microbenchmark, before it is believed.
+
+## 2026-08-16 — THIRD REPLICATED STANDING (`07i34`): `max_pool1d_nopool` ≥1.76x SLOWER, same binary twice
+
+A third replicated standing, and methodologically the cleanest so far: **both
+certifying runs used the same binary**, so this replicates the *binary*, not merely
+the lane.
+
+| run | min-estimator ratio | PT null | FT null | load |
+|---|---|---|---|---|
+| 1 | 0.535 `[0.504,0.569]` = **1.87x SLOWER** | 1.005 PASS | 0.993 PASS | 20.13 → 19.50 (−3%) |
+| 2 | 0.539 `[0.518,0.559]` = **1.86x SLOWER** | 1.002 PASS | 1.008 PASS | 26.29 → 25.17 (−4%) |
+
+> **Conservative claim: FrankenTorch is at least 1.76x SLOWER on this lane.** That
+> takes 0.569 — the most favourable ratio bound either run produced — and inverts it.
+> Not the 1.87x headline, and not either run's point estimate.
+
+```
+executing_elf_sha256 = 1fa33e62b39e125e69f2d2e29a9e533bdd505e3d2f6a7dd3661561e5eee7c5a8
+BUILD WORKER         = vmi1152480  (rch, RCH_WORKER-pinned, -j2 --release --features fair-alloc)
+harness              = crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs
+measurement_host     = thinkstation1, 5975WX 32-Core, avx2, powersave, rayon 64, torch threads 8
+allocator            = mimalloc      sampling = balanced-square ABBAABBA, 32 rounds
+incumbent            = PyTorch 2.12.1+cpu
+```
+
+**Same-binary replication, which `28lhu` could not claim.** That earlier pair
+replicated across two *different* ELFs, because peers kept rebuilding the shared
+`target/` binary between runs. Here both runs are ELF `1fa33e62b39e125e`, built by
+me on a named worker via the `RCH_WORKER` pin. **The two claims differ in kind:**
+`28lhu` shows a lane's behaviour survives code churn; this shows one binary
+reproduces. Both are worth having and they are not interchangeable.
+
+**The median arm is a candidate, not part of the standing.** Run 2's median also
+cleared (0.571 `[0.549,0.592]` = 1.75x slower, both nulls PASS, no `NULL-FAILED`
+line), but run 1's median **failed** its FT null at 0.972. So the standing is under
+the **min** estimator only. Recorded rather than quietly folded in, because quoting
+"certified under both estimators" would be false.
+
+Both certifying runs had **flat load** (−3%, −4%), consistent with the load-delta
+criterion — and consistent with its known limit, since two runs this turn at +38%
+and +33% certified nothing while a −4% run certified this lane even as `avg_pool2d`'s
+null failed in the same invocation. Small delta remains necessary, not sufficient.
+
+**What the lane is:** `max_pool1d` with the FrankenTorch buffer pool **disabled**, so
+it isolates the kernel from the pooling allocator. The pooled `max_pool1d` lane read
+1.64-1.74x slower in the same runs with failing nulls. Whoever attacks `max_pool1d`
+now has a gated target that is not confounded by the buffer pool.
