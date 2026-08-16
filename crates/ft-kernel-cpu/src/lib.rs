@@ -2492,6 +2492,74 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
 /// This is the CHUNK-SIZE shape of the fix rather than a global pool cap — it groups
 /// planes so the split creates about this many chunks, leaving `rayon`'s pool untouched
 /// so nothing else in the process changes width underneath it.
+/// frankentorch-rayon-pool-width-qq8as: a NARROW rayon pool that a kernel can run its
+/// parallel region on, leaving the process-wide pool alone.
+///
+/// This is the shape item 52 pointed at. Three candidates were on the table -- global pool
+/// cap, per-op width cap, chunk-size change -- and the chunk-size one is REFUTED (0.922x,
+/// item 52) because it repartitions the work while leaving 64 threads spun up. Item 51
+/// showed the win comes from shrinking the POOL: `RAYON_NUM_THREADS=8` is 1.663x faster
+/// than 64 on this lane, because a 64-wide join waits on whichever core is parked near
+/// 1.9 GHz while an 8-wide join fits inside the fast set (cross-core spread 2.86-3.00x).
+///
+/// A per-op pool gets that without a global cap, which matters because the global width is
+/// right for some ops and wrong for others -- the bead's own data shows gains from 1.01x
+/// to 1.94x across lanes, so one number cannot be correct everywhere.
+///
+/// UNMEASURED AS OF THIS COMMIT. `install` has its own cost, and whether a persistent
+/// narrow pool beats the ambient one in situ is exactly the question item 52's failure
+/// says to answer by measuring rather than by reasoning.
+static NARROW_POOL_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable the narrow pool, returning the previous setting.
+///
+/// An `AtomicBool` so a paired lane can flip it inside ONE process. The pool's WIDTH is
+/// fixed at first use and cannot be flipped, so an A/B varies only whether the narrow pool
+/// is used -- which is the comparison that matters.
+pub fn set_narrow_pool_enabled(enabled: bool) -> bool {
+    NARROW_POOL_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The narrow pool, built once. Width comes from `FT_NARROW_POOL_WIDTH`, defaulting to 8
+/// because that is where item 51's measured curve turns: 64 -> 1.904 ms, 32 -> 1.623,
+/// 16 -> 1.291, **8 -> 1.145**, 4 -> 1.195.
+///
+/// `None` if the pool cannot be built, in which case callers fall back to the ambient
+/// pool rather than failing -- a measurement knob must not be able to break a kernel.
+fn narrow_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let width = std::env::var("FT_NARROW_POOL_WIDTH")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|w| *w > 0)
+            .unwrap_or(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .thread_name(|i| format!("ft-narrow-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Run a parallel region on the narrow pool when it is enabled, otherwise inline on the
+/// ambient pool.
+///
+/// The PARTITION is untouched -- callers keep their existing `par_chunks_mut` split -- so
+/// this changes only how many workers execute it. That is what makes the bit-exactness
+/// argument trivial: the same chunks do the same writes in the same order within a chunk,
+/// and chunks were already independent.
+fn with_narrow_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if NARROW_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(pool) = narrow_pool() {
+            return pool.install(f);
+        }
+    }
+    f()
+}
+
 /// **DEFAULT 0 = REJECTED.** Capping the CHUNK COUNT does NOT reproduce the win that
 /// capping the POOL does, and shipping it on was a regression. Measured ABBA, one ELF,
 /// arm-internal, loadavg 15.65-18.68 throughout, cross-core spread 2.7-2.9x:
@@ -10082,19 +10150,23 @@ pub fn max_pool3d_backward_from_indices_nonoverlapping_f64(
     // planes so the split yields ~8 chunks is bit-identical (each plane's writes are
     // independent of the grouping) and measured 1.663x faster on this lane.
     let group = planes_per_chunk(batch * ch);
-    din.par_chunks_mut(plane_len * group)
-        .enumerate()
-        .for_each(|(chunk_index, chunk)| {
-            for (offset, drow) in chunk.chunks_mut(plane_len).enumerate() {
-                let plane = chunk_index * group + offset;
-                let dbase = plane * out_plane_len;
-                for (out_index, &arg_offset) in
-                    arg_offsets[dbase..dbase + out_plane_len].iter().enumerate()
-                {
-                    drow[arg_offset as usize] = 0.0_f64 + dout[dbase + out_index];
+    // frankentorch-rayon-pool-width-qq8as: the partition is unchanged; only the pool that
+    // executes it changes when the narrow pool is enabled.
+    with_narrow_pool(|| {
+        din.par_chunks_mut(plane_len * group)
+            .enumerate()
+            .for_each(|(chunk_index, chunk)| {
+                for (offset, drow) in chunk.chunks_mut(plane_len).enumerate() {
+                    let plane = chunk_index * group + offset;
+                    let dbase = plane * out_plane_len;
+                    for (out_index, &arg_offset) in
+                        arg_offsets[dbase..dbase + out_plane_len].iter().enumerate()
+                    {
+                        drow[arg_offset as usize] = 0.0_f64 + dout[dbase + out_index];
+                    }
                 }
-            }
-        });
+            });
+    });
     din
 }
 
@@ -42514,6 +42586,67 @@ mod tests {
                     x.to_bits(),
                     "yc7ud mismatch b={b} c={c} len={len} k={k} stride={st} idx={i}: \
                      accumulating={a} levered={x}"
+                );
+            }
+        }
+    }
+
+    /// frankentorch-rayon-pool-width-qq8as: running the same partition on a NARROW pool
+    /// must not change a bit. The chunks and their writes are identical; only the number
+    /// of workers executing them differs, and chunks were already independent.
+    ///
+    /// Both settings run in ONE process so this compares the two pools rather than two
+    /// binaries, and the shapes include a plane count below the pool width, where a narrow
+    /// pool has more workers than chunks.
+    #[test]
+    fn max_pool3d_backward_narrow_pool_is_bit_identical() {
+        for &(batch, ch, id, ih, iw) in &[
+            (2usize, 32usize, 8usize, 8usize, 8usize),
+            (1, 4, 8, 8, 8),
+        ] {
+            let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+            let in_numel = batch * ch * id * ih * iw;
+            let out_numel = batch * ch * od * oh * ow;
+            let mut z = 0xd1b5_4a32_d192_ed03u64;
+            let input: Vec<f64> = (0..in_numel)
+                .map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 40) as f64) / 512.0 - 2.0;
+                    v
+                })
+                .collect();
+            let (_, offsets) = super::max_pool3d_forward_with_indices_f64(
+                &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let dout: Vec<f64> = (0..out_numel)
+                .map(|i| match i % 11 {
+                    3 => -0.0,
+                    7 => f64::NAN,
+                    _ => (i % 13) as f64 - 6.0,
+                })
+                .collect();
+
+            let previous = super::set_narrow_pool_enabled(false);
+            let ambient = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
+                &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+            );
+            super::set_narrow_pool_enabled(true);
+            let narrow = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
+                &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
+            );
+            super::set_narrow_pool_enabled(previous);
+
+            assert_eq!(ambient.len(), narrow.len());
+            for (i, (a, b)) in ambient.iter().zip(narrow.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "narrow pool changed a bit at planes={} idx={i}",
+                    batch * ch
                 );
             }
         }
