@@ -696,6 +696,8 @@ LANES = {
     # frankentorch-lu3ht: incumbent twin for the avg_pool2d uninit A/B.
     "avg_pool2d_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # frankentorch-jlcmi: incumbent twin for the group_norm uninit A/B.
+    "group_norm_f32_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # The FrankenTorch side of this second name calls the two f32 kernels
     # DIRECTLY, with no session and no tape, to price the engine and the f64
     # grad-space conversions separately from the kernel. The incumbent is the
@@ -911,6 +913,20 @@ LANES = {
         (
             "group_norm_f32",
             Box::new(|| timed_group_norm_f32(&gnx, &gnw, &gnb)),
+        ),
+        (
+            // frankentorch-jlcmi: the uninit twin for the group_norm forward, chosen
+            // by the item 28d predictor BEFORE measuring — 25.7 MB of zeroing for a
+            // few SIMD ops per element is the max_pool1d profile (which pays), not
+            // the avg_pool2d one (which does not). Prediction registered in the
+            // bead; this lane is what tests it.
+            "group_norm_f32_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_group_norm_f32(&gnx, &gnw, &gnb);
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
+            }),
         ),
         (
             "group_norm_f32_kernels",

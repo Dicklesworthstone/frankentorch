@@ -6405,7 +6405,13 @@ pub fn group_norm_forward_f32_scheduled(
 ) -> Vec<f32> {
     let group_numel = cpg * spatial;
     let inv_m = 1.0 / group_numel as f32;
-    let mut out = vec![0.0f32; batch * num_groups * group_numel];
+    // frankentorch-jlcmi: UNINITIALIZED output behind the yu1zm toggle. Coverage is
+    // total — `group_norm_write_group_f32` assigns every element of `orow` across
+    // `local_channel in 0..cpg`, each spanning a full `spatial` run, and every chunk
+    // is visited. Selected by the item 28d predictor rather than by family: 25.7 MB
+    // of zeroing for a handful of SIMD ops per element is the max_pool1d profile,
+    // not the avg_pool2d one.
+    let numel = batch * num_groups * group_numel;
     let group_fn = |grp: usize, orow: &mut [f32]| {
         let g = grp % num_groups;
         let base = grp * group_numel;
@@ -6426,16 +6432,17 @@ pub fn group_norm_forward_f32_scheduled(
     // Reduce-then-scale over groups; the caller supplied the schedule. See
     // `group_norm_parallel_pays` for why the number of GROUPS decides it and not
     // the element count alone.
-    if parallel {
-        out.par_chunks_mut(group_numel)
-            .enumerate()
-            .for_each(|(grp, orow)| group_fn(grp, orow));
-    } else {
-        out.chunks_mut(group_numel)
-            .enumerate()
-            .for_each(|(grp, orow)| group_fn(grp, orow));
-    }
-    out
+    build_pool_output(numel, |out| {
+        if parallel {
+            out.par_chunks_mut(group_numel)
+                .enumerate()
+                .for_each(|(grp, orow)| group_fn(grp, orow));
+        } else {
+            out.chunks_mut(group_numel)
+                .enumerate()
+                .for_each(|(grp, orow)| group_fn(grp, orow));
+        }
+    })
 }
 
 /// The per-group normalize-and-affine write shared by every f32 GroupNorm
@@ -6566,7 +6573,15 @@ pub fn group_norm_forward_f32_with_cpg2_stats(
     let group_numel = CPG * spatial;
     let inv_m = 1.0 / group_numel as f32;
     let groups = batch * num_groups;
-    let mut out = vec![0.0f32; groups * group_numel];
+    // frankentorch-jlcmi: UNINITIALIZED output behind the yu1zm toggle. THIS is the
+    // variant the h2h `group_norm_f32` lane executes — the ft-api dispatch picks it
+    // whenever `cpg == 2`, which the lane's 64 channels over 32 groups satisfies.
+    // Converting only the `_scheduled` sibling measured a function that never ran on
+    // that lane and produced a false negative; see NEGATIVE_EVIDENCE item 29.
+    //
+    // `stats` is left alone: it is a small per-group Vec, not a numel-sized buffer,
+    // and every slot is assigned through `*slot = ...` anyway.
+    let numel = groups * group_numel;
     let mut stats = vec![
         GroupNormCpg2StatsF32 {
             mean: 0.0,
@@ -6609,17 +6624,19 @@ pub fn group_norm_forward_f32_with_cpg2_stats(
         };
         group_norm_write_group_f32(xb, orow, weight, bias, g, CPG, spatial, mean, rstd);
     };
-    if group_norm_parallel_pays(groups, groups * group_numel) {
-        out.par_chunks_mut(group_numel)
-            .zip(stats.par_iter_mut())
-            .enumerate()
-            .for_each(|(grp, (orow, slot))| group_fn(grp, orow, slot));
-    } else {
-        out.chunks_mut(group_numel)
-            .zip(stats.iter_mut())
-            .enumerate()
-            .for_each(|(grp, (orow, slot))| group_fn(grp, orow, slot));
-    }
+    let out = build_pool_output(numel, |out| {
+        if group_norm_parallel_pays(groups, numel) {
+            out.par_chunks_mut(group_numel)
+                .zip(stats.par_iter_mut())
+                .enumerate()
+                .for_each(|(grp, (orow, slot))| group_fn(grp, orow, slot));
+        } else {
+            out.chunks_mut(group_numel)
+                .zip(stats.iter_mut())
+                .enumerate()
+                .for_each(|(grp, (orow, slot))| group_fn(grp, orow, slot));
+        }
+    });
     (out, stats)
 }
 

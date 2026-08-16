@@ -22056,3 +22056,101 @@ per element AND the allocation is served from a warm allocator, expect a real wi
 the kernel does substantial work per output element, or the buffer is small, expect
 nothing. Do not apply it to the remaining ~75 sites on family resemblance — measure the
 ones where the ratio is favourable and leave the rest as they are.
+
+---
+
+## 29. THE PREDICTOR MADE A PREDICTION AND IT WAS WRONG — AND I NEARLY BANKED THE REFUTATION FROM DEAD CODE
+
+Item 28d named a predictor for the uninit first-touch lever: zeroed bytes actually
+memset, per unit of kernel work. `frankentorch-jlcmi` was filed to USE it. This is the
+first registered prediction it made, and the prediction failed.
+
+### 29a. The prediction, registered before measuring
+
+Applying the predictor to every live h2h lane:
+
+    lane             output zeroed   per-output work           predicted
+    max_pool1d f64      33.6 MB      2 compares                PAYS (measured 1.27-1.49x)
+    avg_pool2d f64       4.2 MB      4 reads, 3 adds, 1 div    NOTHING (measured nothing)
+    prelu f64           33.6 MB      1 compare, 1 mul          PAYS
+    group_norm f32      25.7 MB      a few SIMD ops            PAYS
+    max_pool3d f64       1.0 MB      8 compares                marginal
+    conv3d f64           1.0 MB      864 MACs                  NOTHING
+
+`prelu` fell out immediately for a reason worth recording: it has no dead init at all.
+Its forward is `par_iter().map().collect()`, which allocates and writes each element
+once. **The predictor ranks SHAPE; a site must also actually have the defect**, and
+the most favourable shape in the sweep did not.
+
+That left `group_norm f32` — 25.7 MB zeroed, a handful of SIMD ops per element, the
+max_pool1d profile. Predicted to pay.
+
+### 29b. It does not pay. Replicated, with the A/A control passing
+
+    group_norm_f32   uninit ON vs OFF
+      r1  1.024x [0.991,1.040]  20/32 rounds  PT control 1.003
+      r2  0.996x [0.983,1.014]  13/32 rounds  PT control 1.049 (marginal, at the 5% edge)
+    A/A, both arms zeroed
+          0.979x [0.960,1.004]  PT control 1.011
+
+    max_pool1d in the SAME invocations: 1.368x, 1.463x, PT controls 1.010 / 1.009
+    A/A: 1.005x [0.984,1.063]
+
+Both A/B runs bracket 1.0, and the A/B distribution is indistinguishable from the A/A.
+The mechanism is demonstrably live in these very binaries — max_pool1d reads 1.37-1.46x
+in the same invocations — so this is not a dead toggle or a bad host.
+
+PREDICTION REFUTED. Bytes-zeroed per unit work is NOT sufficient.
+
+### 29c. THE NEAR-MISS: the first refutation was measured on a function that never ran
+
+Before the rows above, I converted `group_norm_forward_f32_scheduled` and measured
+0.988x and 0.976x — and was ready to bank "prediction refuted" on that.
+
+It would have been worthless. The ft-api dispatch reads:
+
+    let out = if cpg == 2 {
+        ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(...)
+    } else {
+        ft_kernel_cpu::group_norm_forward_f32(...)
+    };
+
+The lane is 64 channels over 32 groups, so `cpg == 2`, so it takes the cpg2 variant —
+which I had not converted. **I measured a toggle on a function the lane never
+executes.** Converting the real path moved the point estimate from 0.976-0.988 to
+0.996-1.024, a shift of about 4%: the lever IS doing something once it is actually in
+the path, just not enough to clear the interval.
+
+What makes this dangerous is that the false version was CONSISTENT and REPLICATED —
+two runs, tight intervals, a passing A/A, and a conclusion that happened to match the
+one the correct measurement later gave. A confirming result from dead code is
+indistinguishable from a real one by any statistic in the row.
+
+THE RULE, which this ledger already carries for bugs and now carries for LEVERS:
+**prove the path executes before measuring it.** A dispatch on a shape parameter
+(`cpg == 2` here) is exactly where a plausible-looking conversion lands in a sibling
+that never runs. Cheapest check is to read the dispatch; next cheapest is a poison
+return.
+
+### 29d. What the failure teaches about the predictor
+
+The deciding term is the one item 26c already flagged as invisible: whether the
+allocation is served from RECYCLED DIRTY memory (a real memset, lever pays) or a FRESH
+`mmap` (kernel-supplied zero pages, lever worth nothing). Bytes and arithmetic are
+both observable in the source; this one is not.
+
+The sharpest available reading of why max_pool1d differs from group_norm: max_pool1d's
+buffers are recycled by `ft_core::buffer_pool`, which exists precisely to keep memory
+warm and therefore DIRTY, so its calloc has real zeroing to do. group_norm allocates
+one large f32 buffer per sample with no pool behind it, and a large block freed and
+re-allocated is a plausible candidate for being returned to and re-served by the OS
+already zeroed. Offered as the leading hypothesis; it is consistent with every row in
+items 25-29 and I have not instrumented the allocator to confirm it.
+
+REVISED GUIDANCE for `frankentorch-jlcmi`: the ranking by bytes-per-work is still worth
+computing, but it is a SCREEN and not a predictor. It tells you where the lever COULD
+matter; only a paired A/B with an A/A control tells you whether it does. Two of the
+three predictions this screen has now made were wrong in a way no amount of source
+reading would have caught — prelu had no defect to fix, group_norm had the defect and
+gains nothing from fixing it. The kernel-crate-wide sweep this bead exists to prevent
+would have "fixed" both.
