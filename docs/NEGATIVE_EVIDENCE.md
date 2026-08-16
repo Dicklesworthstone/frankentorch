@@ -20380,3 +20380,45 @@ version was printed in every one of my nine runs and I read past it every time;
 what surfaced it was a PEER's row citing a different value for the same lane.
 An arm that self-reports is necessary and not sufficient — someone has to diff
 the reports.
+
+**18. `prelu_noshortcut` CANNOT BE CERTIFIED ON THIS HOST TODAY — two pinned runs
+disagree in DIRECTION (`frankentorch-sif8w`, 2026-08-15).** The bead pre-specified
+this outcome so it could not be retried away, and it happened.
+
+Both runs: `harness=crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, ELF
+`ac1156652bbd0b95`, `same_host=thinkstation1`, 32 rounds, incumbent self-reported
+**PyTorch 2.12.1+cpu** (the pin), parity `match`:
+
+| run | load | median estimator | min estimator |
+|---|---|---|---|
+| 1 | 21.8 -> 28.3 | not quotable (FT null OFFSET) | **1.16x SLOWER**, PT null 0.998 PASS, FT null 1.003 PASS |
+| 2 | 21.9 -> 30.8 | **1.15x FASTER**, PT null PASS `[0.993,1.029]`, FT null PASS `[0.836,1.145]` | not quotable (FT null FAIL) |
+
+**Each run certified a verdict, under a different estimator, in the opposite
+direction.** 1.16x slower and 1.15x faster are not a spread, they are a
+contradiction, and no averaging of them is meaningful. The nine earlier
+invocations on 2.12.0 read 1.01-1.25x FASTER; run 1 here reads SLOWER. The
+distinguishing variable is not the incumbent version — FrankenTorch's own arm read
+23.0 ms in run 1 against 14.5-18.3 ms typical, i.e. OUR side degraded — it is that
+this host is now loaded enough that a 10-15% effect is below its resolution.
+
+**The transferable point is about what an A/A null does NOT certify.** Both nulls
+passed in both runs. A null establishes that an arm was STABLE WITHIN the
+invocation; it says nothing about whether the invocation was REPRESENTATIVE. A run
+where every arm is uniformly 40% slow can have immaculate nulls. Load is not in the
+null, and neither is anything else that moves both halves together.
+
+**Banked instead, because it survives all of it: `max_pool3d_nopool` is a LOSS of
+roughly 2.7-3.2x.** Five independent readings, two agents, two torch builds:
+
+| source | incumbent | reading | certified? |
+|---|---|---|---|
+| `frankentorch-y4nj9` | 2.12.1 | 2.74x median / 2.99x min | YES, all four nulls PASS |
+| item 16 (mine) | 2.12.0 | 2.85x median | YES, both nulls PASS |
+| this bead, run 1 | 2.12.1 | 3.18x | no (both OFFSET) |
+| this bead, run 2 | 2.12.1 | 2.86x | no (both OFFSET) |
+
+A loss that reproduces across two agents, two incumbent builds and four
+invocations at 2.74-3.18x is worth more than a 1.1x win that flips sign under
+load. **The certified row this campaign has is a LOSS, and that is the honest
+state of the board.**
