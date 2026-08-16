@@ -23038,3 +23038,64 @@ criterion is `P P^T = I` to 1e-9, not agreement with the reference.
 
 Item 38's second gap, and its general lessons about fixture regimes, stand
 unchanged. Only the "either gap alone" claim is withdrawn.
+
+## 40. CHECK WHETHER A MECHANISM IS NUMERICALLY REACHABLE BEFORE SPENDING A BUILD ON IT
+
+`frankentorch-ga99y` has now had six proposed mechanisms. The first five each cost
+a run. The sixth cost two constants, and the difference is a rule worth having.
+
+### 40a. The sixth candidate, and why it was compelling
+
+`house_gen_strided_f64` documents itself as `dlarfg` and omits two things real
+`dlarfg` does:
+
+- **`safmin` rescaling.** LAPACK checks `|beta| < safmin = tiny/eps` and, if so,
+  scales the vector up, recomputes, and scales back — precisely because `xnorm`
+  and `beta` are inaccurate below that.
+- **A scaled norm.** LAPACK accumulates via `dnrm2`; this sums raw squares,
+  `tail_sq += value*value`.
+
+Both are real divergences from the named algorithm, and a missing
+small-magnitude guard in reflector generation is *exactly* the shape of a bug that
+produces a non-orthonormal factor at tiny scale. It is the most plausible candidate
+this bug has had.
+
+### 40b. Two constants killed it
+
+    tiny        = 2.2251e-308
+    eps         = 2.2204e-16
+    safmin      = tiny / eps      = 1.0021e-292
+    sqrt(tiny)                    = 1.4917e-154
+
+`ga99y` reproduces at scale `1e-20`, so `beta ~ 1e-20` — **272 orders of magnitude
+above `safmin`**. The guard would not fire even if it existed. And the deficient
+entries are `~1e-35`, whose squares are `~1e-70`, nowhere near the `1.49e-154`
+where the unscaled sum would underflow. **Both mechanisms are unreachable at the
+scale where the bug lives.**
+
+Filed separately as `frankentorch-i3nqm` (P3), with the scales where it *would*
+bite, because the divergence is real even though it is not this bug.
+
+### 40c. The rule
+
+**Before spending a build on a proposed mechanism, ask what input range it
+requires, and whether the failing case is in that range.** A mechanism can be
+real, correctly identified in the source, and still be incapable of producing the
+observed failure — because it lives at a magnitude the reproduction never reaches.
+
+This is cheap in a way the other refutations were not. Hypotheses 1 through 5 all
+concerned structure — which pass runs, which factor is completed, which branch is
+taken — and structure has to be measured. Hypothesis 6 concerned *magnitude*, and
+magnitude can be bounded on paper.
+
+The practical form: when a candidate is a guard, a threshold, a clamp, or an
+underflow, look up the constant and compare it to the working scale first. It is a
+two-line calculation and it either kills the hypothesis outright or promotes it to
+worth-a-build.
+
+### 40d. What it does not license
+
+It does not license reasoning about mechanisms whose *structure* is in question —
+that is what the first five hypotheses were, and reading the source supported every
+one of them convincingly before measurement killed it. The distinction is narrow
+and worth respecting: **bound magnitudes on paper, measure structure.**
