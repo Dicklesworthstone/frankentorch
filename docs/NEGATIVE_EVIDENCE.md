@@ -23203,3 +23203,64 @@ type mismatch in the `qr_householder_panel_blocked` call, or a clippy
 build to a revert. That was the price of the instruction to write real code on a
 build-free turn, and it is a price worth stating rather than hiding behind "it will
 probably be fine".
+
+## 42. max_pool3d ATTRIBUTION — AND A BANDWIDTH ESTIMATE OF MINE THAT WAS WRONG BY 25x
+
+Measured attribution, harness breakdown, ELF `79ee86ea22be3015`, min of 9, 64 rayon
+threads, `[2,32,16,32,32]` kernel 2x2x2 stride 2x2x2:
+
+    forward_with_indices_f64     0.597 ms
+    backward NONOVERLAPPING      0.876 ms   scatters 131_072 values into 1_048_576 elems
+    total on the live route      1.474 ms
+    FT lane total                2.410 ms   (so ~0.94 ms, 39%, is NON-kernel overhead)
+    PT lane total                0.908 ms
+
+**FrankenTorch's kernels alone cost more than torch's entire step**, so the gap is not
+hiding in ft-api overhead even though 39% of the lane is overhead.
+
+### 42a. THE INFERENCE I ALMOST BANKED, AND WHY IT WAS WRONG
+
+I wrote, and nearly committed: the dense gradient is 8 MiB, an 8 MiB memset at ~10 GB/s
+is ~0.8 ms, the measured backward is 0.876 ms, therefore **the backward is essentially
+all zeroing and the scatter is nearly free**. It is a clean-looking argument and every
+number in it is real except the one I assumed.
+
+Measured instead of assumed, on this box, bulk-timed over 200 iterations:
+
+    held.zero_()        0.0262 ms/call    8 MiB, dirty buffer
+    torch.zeros(N)      0.0205 ms/call
+    torch.empty(N)      0.0014 ms/call    allocation only
+
+**Zeroing 8 MiB costs 0.026 ms, not 0.8 ms — my estimate was 25x too high.** The reason
+is this machine: a 5975WX has 128 MiB of L3, so an 8 MiB buffer touched repeatedly is
+L3-resident and a memset over it runs at ~320 GB/s, not at the DRAM figure I plugged in.
+
+A FIRST PROBE OF MINE ALSO REPORTED ~3 ms FOR THE SAME OPERATION and I did not believe
+it, because it contradicted a row I already trusted: torch's whole step measures 0.908 ms
+and cannot contain a 3 ms zeroing. That probe timed a `.item()` sync and a fresh
+allocation's page faults per rep rather than the fill. **The internal contradiction is
+what caught both errors** — the first probe against a banked row, the ledger draft
+against the corrected probe.
+
+### 42b. What the attribution actually leaves
+
+The zeroing is ~3% of the 0.876 ms backward, so it is NOT the target and the
+allocator-toggle lever I was about to write is pointless. What remains inside that
+backward is the scatter itself: 131_072 index conversions (`arg_offsets[i] as usize`,
+f64 to usize) and 131_072 dependent writes, plus streaming 1 MiB of `arg_offsets` and
+1 MiB of `dout`. That is ~6.7 ns per scattered element, which is high enough to be worth
+a phase split INSIDE the kernel before any lever is chosen.
+
+IT ALSO RE-EXPLAINS THE REJECTED FULL-COVERAGE LEVER, correctly this time. That rewrite
+measured 1.51x SLOWER, and I had attributed it to "replacing an optimized memset with
+hand-written stores". Wrong mechanism. The real one is volume: full-coverage performs
+1_048_576 stores where zero-then-scatter performs a cheap fill plus 131_072 stores. It
+does **8x the store work**, so it loses — and it would lose even if the fill were free.
+
+### 42c. Standing lesson
+
+**Do not price a phase from an assumed bandwidth.** Every bandwidth-derived attribution
+in this ledger should name the level of the memory hierarchy it assumed, because on a
+128 MiB-L3 machine the working sets in these lanes (1-33 MiB) mostly do NOT reach DRAM,
+and DRAM figures overstate their cost by an order of magnitude. The next step here is a
+measured phase split inside the backward, not another estimate.
