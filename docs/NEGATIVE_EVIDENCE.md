@@ -24956,3 +24956,58 @@ WHAT WOULD ACTUALLY SETTLE IT is still isolation — our arm with no incumbent c
 because every hypothesis above lives or dies on whether the co-process is present. That
 needs the harness flag that does not exist yet, and it is the one build worth spending
 here.
+
+## 47. ISOLATION FINDS THE MECHANISM: OUR ARM RAMPS +15-19% WITHIN EVERY ROUND, AND INTERLEAVING WAS HIDING IT
+
+`FT_H2H_NO_INCUMBENT` keeps our four slots in their balanced-square positions and runs no
+incumbent work between them. Everything else — warmup, rounds, reduction, the null — is
+identical, so the co-process is the only variable. Observed loadavg 18.12-28.14 across the
+runs below; none of this is a ratio claim.
+
+    mode          per-slot median (ms)              slot0->slot3   FT null (min-reduced)
+    interleaved   [3.414, 3.348, 3.524, 2.844]      non-monotone   1.0726
+    isolated #1   [2.443, 2.609, 2.659, 2.898]      +18.6%         0.9480
+    isolated #2   [2.393, 2.617, 2.702, 2.753]      +15.0%         0.9571
+
+**In isolation our arm slows MONOTONICALLY across the four slots of every round, by 15-19%,
+and it replicates.** Slots {0,1} average 2.53 ms against {2,3} at 2.78 ms, which is a null
+of 0.91 — the one-sided-low signature, arithmetically accounted for.
+
+### 47a. This is the opposite of what I predicted, twice
+
+Item 46d predicted the null came from the interleaving and would VANISH under isolation.
+Item 46f then walked that back to "no mechanism demonstrated". Both were wrong in the same
+direction: isolation does not remove the effect, **it reveals it**. Interleaved, the
+per-slot medians are non-monotone and the null wandered above and below 1.0 across seven
+runs; isolated, the ramp is clean and the null is stable at 0.948 / 0.957.
+
+The co-process was adding perturbation that MASKED a real within-round ramp — sometimes
+flipping the null's sign, which is exactly why a run count never converged on a mechanism.
+
+### 47b. It also explains the rest of the file
+
+  - **Why 8 rounds showed the full effect (46c).** The ramp is WITHIN a round and resets
+    each round, so it is not diluted or deepened by round count. Accumulation was refuted
+    for the right reason.
+  - **Why the null failed one-sided-low so often (43, 46).** Slots {0,1} are the fast half
+    of every round by construction of the ramp.
+  - **Why the positional structure did not corrupt the null (46e).** That was the
+    INCUMBENT's alternating pattern, which the square does cancel. Ours is a monotone ramp,
+    which the square does NOT cancel, because both of its halves are ordered in time.
+
+### 47c. What it costs, and what it forecloses
+
+The co-process is expensive: our arm's slot medians run 2.4-2.9 ms isolated against
+2.8-3.5 ms interleaved, so **interleaving costs our arm roughly 20-25%** on this lane. That
+is a measurement artifact sitting inside every interleaved row, on both arms.
+
+And the A/A null on this lane can never pass while the ramp exists, at any host load, with
+or without a co-process. That is not a lane defect to be waited out — it is the instrument
+measuring a real property of our arm. No max_pool3d lever can be certified until either the
+ramp is removed or the null is computed in a way that is blind to within-round order.
+
+LEADING CANDIDATE, untested: frequency or thermal. A 64-thread burst runs the first slot at
+boost clock and later slots throttled; the incumbent's 8 threads are far less affected,
+which fits its much smaller and non-monotone slot structure. Falsifiable by reading
+per-slot CPU frequency, or by inserting an idle gap between slots and seeing whether the
+ramp flattens.

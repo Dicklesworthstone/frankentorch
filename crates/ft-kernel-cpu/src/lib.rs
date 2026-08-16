@@ -58515,6 +58515,34 @@ mod tests {
         }
     }
 
+    /// frankentorch-4zjaa: the owed post-fix ratio for the blocked `form_p`.
+    ///
+    /// FT-vs-FT, so this is MAINTENANCE evidence under section 1, not a win — it
+    /// says the lever pays, not that it beats the incumbent. Both implementations
+    /// run in ONE process over the SAME packed reflectors, interleaved, min of 3.
+    #[test]
+    fn bidiag_form_p_blocked_versus_unblocked_ab() {
+        for &n in &[64usize, 128, 256] {
+            let mut packed = bidiag_test_matrix(n, n, 0xAB0007 ^ n as u64);
+            let (_d, _e, _tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, n, n);
+            let nb = super::svd_bidiag_block_size();
+
+            let (mut un_ns, mut bl_ns) = (u128::MAX, u128::MAX);
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let a = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+                un_ns = un_ns.min(t0.elapsed().as_nanos());
+                let t1 = std::time::Instant::now();
+                let b = super::bidiag::bidiag_form_p_blocked_f64(&packed, n, &taup, nb);
+                bl_ns = bl_ns.min(t1.elapsed().as_nanos());
+                assert_eq!(a.len(), b.len());
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let speedup = un_ns as f64 / bl_ns.max(1) as f64;
+            println!("4zjaa form_p n={n} nb={nb}: unblocked {un_ns} ns, blocked {bl_ns} ns ({speedup:.2}x)");
+        }
+    }
+
     /// Rank-deficient, uniformly scaled variant of [`bidiag_test_matrix`].
     ///
     /// The existing fixture fills uniformly from roughly `[-1, 1)` — full rank,

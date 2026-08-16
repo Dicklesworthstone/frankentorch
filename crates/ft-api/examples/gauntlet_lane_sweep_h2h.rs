@@ -1216,6 +1216,15 @@ LANES = {
         load_series.push(l);
     }
 
+    // frankentorch-pbkvs: see the ISOLATION PROBE note in the slot loop below.
+    let isolate_arm = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
+    if isolate_arm {
+        println!(
+            "ISOLATION MODE (FT_H2H_NO_INCUMBENT): no incumbent work runs between our \
+             samples. Every PT column and every vs-PyTorch ratio below is a PLACEHOLDER \
+             and carries no claim. Read the FT A/A null and nothing else."
+        );
+    }
     for _ in 0..reps {
         if let Some(l) = ft_api::harness_provenance::load_average_1m() {
             load_series.push(l);
@@ -1225,6 +1234,26 @@ LANES = {
             let mut ft_slots = Vec::with_capacity(4);
             for incumbent_slot in BALANCED_SQUARE {
                 if incumbent_slot {
+                    // frankentorch-pbkvs: ISOLATION PROBE. With `FT_H2H_NO_INCUMBENT`
+                    // set, our four slots keep their positions in the balanced square
+                    // but NO incumbent work runs between them. Everything else --
+                    // warmup, round count, reduction, the null -- is identical, so the
+                    // co-process is the only variable.
+                    //
+                    // It exists because three hypotheses for this lane's one-sided FT
+                    // null (accumulation, host load, sampling order) are all refuted,
+                    // and every survivor lives or dies on whether the co-process is
+                    // present. If the null goes clean here, the interleaved null is
+                    // partly measuring the interleaving -- which would bear on every
+                    // A/A null read on a contended lane, INCLUDING ones that passed.
+                    //
+                    // The incumbent columns are placeholders in this mode and every
+                    // vs-PyTorch number in the output is meaningless; the banner says
+                    // so, and only the FT null should be read.
+                    if isolate_arm {
+                        incumbent_slots.push(1.0);
+                        continue;
+                    }
                     let (ms, grad) = incumbent_sample(&mut stdin, &mut reader, name)?;
                     incumbent_slots.push(ms);
                     pt_grads[index] = Some(grad);
