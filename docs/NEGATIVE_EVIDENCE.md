@@ -24683,3 +24683,59 @@ The next step is an in-process phase split of OUR arm across the run — first-h
 second-half, with per-round timings retained — to see whether the slowdown is uniform or
 concentrated, and whether it tracks a counter we can read (allocator growth, tape length)
 rather than one we can only guess at.
+
+## 62. THE FULL 21-LANE BOARD CERTIFIES WHEN THE HOST IS QUIET — CONTENTION WAS THE STORY
+
+Run in the quiet window (loadavg had fallen from 26 to 14.6). Two full-board
+sweeps, same binary as every certified row: ELF `171f84f8617e1b43...`, mimalloc,
+symmetric warmup 32, 16 rounds, no lane filter, incumbent PyTorch 2.12.1+cpu.
+
+    sweep   worst_drift   series_gate   certified
+    q1      1.573x        DRIFTED       0
+    q2      1.162x        PASS          2
+
+**q2 is the first drift-clean 21-lane sweep on record, and it certified two rows:**
+
+    max_pool1d_nopool      MIN 1.34x FASTER   ratio 1.336 [1.165,1.453]
+                           PT null 1.016 PASS   FT null 1.017 PASS
+    group_norm_f32_zeroed  MIN 5.48x SLOWER   ratio 0.183 [0.173,0.198]
+                           PT null 0.999 PASS   FT null 0.999 PASS
+
+Both QUOTABLE under MIN. `max_pool1d_nopool` is a NEW certified win — at least
+**1.165x FASTER** on the CI floor — on a lane outside the group_norm family, so
+this is the first certified row from the wider board.
+
+### 62a. This substantially confirms the contention explanation
+
+Frankenmermaid independently found its per-CPU exclusivity gate unachievable on
+this host. The evidence here agrees:
+
+- the full board certified **0** in six earlier attempts, every one of them at
+  loadavg 26-90;
+- at loadavg ~15-20 it certified **2**, with drift falling to 1.162x;
+- nothing about the binary, the estimator, the warmup or the gates changed between
+  those attempts — only the machine.
+
+### 62b. But contention is not the WHOLE story, and the numbers say so
+
+Even in the drift-clean full sweep, only **2 of 21** lanes certified. Eight lanes
+passed the incumbent's null and six passed FrankenTorch's, but only two passed
+both simultaneously. The filtered configuration certifies **1-3 of 6** in the same
+family under the same host.
+
+So quiet helps, and it is not sufficient. Both remain true:
+
+- **contention** sets whether a sweep is admissible at all (the drift gate), and
+- **the +/-0.02 null band** (item 60, 39% admission on an unbiased statistic) still
+  refuses most lanes once it is.
+
+A quiet host raises the certification rate from 0/21 to 2/21. Item 60's proposed
+effect-scaled band would raise it further, and the two changes are independent.
+
+### 62c. What this revises
+
+Item 59 concluded the lane filter is "load-bearing, not an optimisation" and that
+sweeping 21 lanes "has produced an unquotable run in every attempt on record". The
+second half is now false — q2 is quotable. The first half stands in weaker form:
+the filter makes certification reliable on a contended host, and is unnecessary on
+a quiet one. **It is a contention mitigation, not a requirement.**
