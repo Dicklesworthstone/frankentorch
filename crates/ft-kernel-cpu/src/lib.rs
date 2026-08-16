@@ -29989,15 +29989,38 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
 
     let s: Vec<f64> = order.iter().map(|&i| singular_values[i]).collect();
 
-    // Build U: normalize columns of `work` by singular values, reorder
+    // Build U: normalize columns of `work` by singular values, reorder.
+    //
+    // The rank test is RELATIVE to the largest singular value (LAPACK's
+    // convention), NOT the absolute `tol` above — frankentorch-qpe2n. Singular
+    // values scale linearly with the input, so an absolute threshold here made
+    // the classification depend on the MAGNITUDE of A rather than on its
+    // conditioning: uniformly scaling a perfectly well-conditioned matrix down
+    // tripped the test on every column at once, left them all zero, and let the
+    // basis completion below overwrite U with standard-basis vectors. S and Vh
+    // stayed correct, and U came out flawlessly orthonormal while having nothing
+    // to do with A — `max|UtU-I|` was EXACTLY 0.0 on the broken rows, which is
+    // why every orthonormality check passed and only reconstruction failed, at
+    // 100%. Measured cliff before the fix, 8x4 well-conditioned f64: fine at a
+    // 1e-14 scaling, `max|USVt-A|/|A|` = 0.997 at 1e-15 and 2.368 at 1e-16.
+    //
+    // `tol` itself stays absolute and is still the right test for the completion,
+    // which compares unit-scale quantities: an unfilled column is exactly zero, a
+    // filled one is normalized to 1, and the Gram-Schmidt residual it screens is a
+    // unit basis vector's. Only THIS test is scale-dependent.
+    //
+    // s_max == 0 (the zero matrix) gives rank_tol == 0, every column is completed,
+    // and any orthonormal U is a correct answer there.
     let u_cols = if full_matrices { m } else { k };
+    #[allow(clippy::cast_precision_loss)]
+    let rank_tol = f64::EPSILON * (m.max(n) as f64) * col_norms.iter().copied().fold(0.0, f64::max);
     let mut u = vec![0.0f64; m * u_cols];
     for (new_j, &old_j) in order.iter().enumerate() {
         if new_j >= u_cols {
             break;
         }
         let norm = col_norms[old_j];
-        if norm > tol {
+        if norm > rank_tol {
             for i in 0..m {
                 u[i * u_cols + new_j] = work[i * n + old_j] / norm;
             }

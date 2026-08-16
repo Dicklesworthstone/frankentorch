@@ -134,7 +134,43 @@ fn full_u_cost_probe() {
     println!("full-U term by ~16 while the reduced call grows ~linearly in m.");
 }
 
+/// Exit non-zero if any scale reconstructs badly, so this file is a regression
+/// gate and not merely a report. `frankentorch-qpe2n` made every scale at or below
+/// 1e-15 fail; a rebuilt binary that still fails them should not look like a pass.
+fn scale_regression_gate() -> bool {
+    let (m, n) = (8usize, 4usize);
+    let base = deterministic_matrix(m, n, 0x9e37_79b9_7f4a_7c15);
+    let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+    let mut worst_scale = None;
+    for exp in [0i32, -8, -12, -14, -15, -16, -17, -20, -30, -60, -150] {
+        let scale = 10.0f64.powi(exp);
+        let a: Vec<f64> = base.iter().map(|v| v * scale).collect();
+        let Ok(r) = svd_contiguous_f64(&a, &meta, false) else {
+            worst_scale = Some(exp);
+            continue;
+        };
+        let (rel, orth) = reconstruction_error(&a, m, n, &r.u, &r.s, &r.vh);
+        if rel > 1e-9 || orth > 1e-9 {
+            worst_scale = Some(exp);
+        }
+    }
+    match worst_scale {
+        None => {
+            println!("qpe2n gate: PASS -- reconstruction holds at every scale down to 1e-150");
+            true
+        }
+        Some(exp) => {
+            println!("qpe2n gate: FAIL -- reconstruction breaks at scale 1e{exp}");
+            false
+        }
+    }
+}
+
 fn main() {
     scale_probe();
     full_u_cost_probe();
+    println!();
+    if !scale_regression_gate() {
+        std::process::exit(1);
+    }
 }
