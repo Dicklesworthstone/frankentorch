@@ -108800,6 +108800,99 @@ mod tests {
     }
 
     #[test]
+    fn backward_rejects_a_borrowed_input_mutated_after_the_graph_was_built() {
+        // frankentorch-9da7i. The borrowed-input backward re-reads the live leaf
+        // rather than cloning it into the tape, so mutating that leaf between the
+        // forward and `backward` used to produce gradients computed from data the
+        // forward never saw -- silently, with no diagnostic. PyTorch raises for
+        // this off its version counter; FrankenTorch maintained the counter and
+        // never consulted it on this path.
+        // The reachable shape of this bug is narrower than it first looks.
+        // FrankenTorch ALREADY refuses in-place mutation of a leaf that requires
+        // grad ("in-place mutation on leaf tensors that require grad is
+        // forbidden"), so the exposure is not there. It is the borrowed input
+        // that does NOT require grad and is still needed to compute somebody
+        // else's gradient: `x` below feeds the weight and bias gradients,
+        // mutating it is permitted today, and the backward re-reads it.
+        let (x, w, b, batch, groups, spatial) = group_norm_f32_stats_fixture();
+        let channels = groups * 2;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = s
+            .tensor_variable_f32(x.clone(), vec![batch, channels, spatial], false)
+            .unwrap();
+        let wt = s
+            .tensor_variable_f32(w.clone(), vec![channels], true)
+            .unwrap();
+        let bt = s
+            .tensor_variable_f32(b.clone(), vec![channels], true)
+            .unwrap();
+        let out = s
+            .functional_group_norm(xt, groups, Some(wt), Some(bt), 1e-5)
+            .unwrap();
+        // After the loss node exists, so the graph that will be walked is already
+        // built and has recorded what it is entitled to see.
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_mul_scalar_(xt, 2.0)
+            .expect("mutating a non-grad leaf is permitted today; that is the exposure");
+
+        let err = s
+            .tensor_backward(loss)
+            .expect_err("backward must refuse an input mutated after the graph was built");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("modified by an in-place operation"),
+            "the error must name the cause; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn backward_accepts_mutations_that_do_not_touch_a_borrowed_input() {
+        // The other half of the guard, and the reason it is not simply "error if
+        // any version moved": a guard that cannot tell an unrelated mutation from
+        // a dangerous one would break every training loop on its second step.
+        let (x, w, b, batch, groups, spatial) = group_norm_f32_stats_fixture();
+        let channels = groups * 2;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = s
+            .tensor_variable_f32(x.clone(), vec![batch, channels, spatial], true)
+            .unwrap();
+        let wt = s
+            .tensor_variable_f32(w.clone(), vec![channels], true)
+            .unwrap();
+        let bt = s
+            .tensor_variable_f32(b.clone(), vec![channels], true)
+            .unwrap();
+        // A tensor that is not part of the graph at all.
+        let unrelated = s
+            .tensor_variable_f32(vec![1.0f32; 8], vec![8], false)
+            .unwrap();
+
+        let out = s
+            .functional_group_norm(xt, groups, Some(wt), Some(bt), 1e-5)
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_mul_scalar_(unrelated, 3.0).unwrap();
+        s.tensor_backward(loss)
+            .expect("mutating an unrelated tensor must not disturb backward");
+
+        // And the ordinary repeated-step shape: build the graph again and run it
+        // again. A guard keyed on "has any version ever moved anywhere" rather
+        // than on the versions THIS function borrowed would reject the second
+        // step, which is every training loop from iteration two onward.
+        //
+        // The parameters are not mutated in place here because FrankenTorch
+        // already forbids that on a leaf requiring grad; the point being defended
+        // is that a fresh graph over the same leaves is unaffected by the
+        // bookkeeping the first one left behind.
+        let out2 = s
+            .functional_group_norm(xt, groups, Some(wt), Some(bt), 1e-5)
+            .unwrap();
+        let loss2 = s.tensor_sum(out2).unwrap();
+        s.tensor_backward(loss2)
+            .expect("a second step over the same leaves must not inherit the first step's guard");
+    }
+
+    #[test]
     fn group_norm_f32_sum_shortcut_reuses_forward_stats_bitwise() {
         // frankentorch-qkwsy. The sum-loss shortcut now hands the backward the
         // statistics the forward computed instead of rebuilding them. The

@@ -1293,6 +1293,14 @@ pub enum AutogradError {
     },
     Dispatch(DispatchError),
     DenseTensor(DenseTensorError),
+    /// A tensor a custom function borrows for its backward was mutated in place
+    /// after the forward ran, so the gradient would be computed from data the
+    /// forward never saw (frankentorch-9da7i).
+    BorrowedInputVersionMismatch {
+        node: TensorNodeId,
+        recorded: u64,
+        observed: u64,
+    },
     ReentrantDepthExceeded {
         current: usize,
         max: usize,
@@ -1343,6 +1351,16 @@ impl fmt::Display for AutogradError {
             ),
             Self::Dispatch(error) => write!(f, "dispatch failure: {error}"),
             Self::DenseTensor(error) => write!(f, "dense tensor failure: {error}"),
+            Self::BorrowedInputVersionMismatch {
+                node,
+                recorded,
+                observed,
+            } => write!(
+                f,
+                "one of the tensors needed for gradient computation has been modified by an \
+                 in-place operation: tensor node {node:?} was at version {recorded} when the \
+                 forward ran and is at version {observed} now"
+            ),
             Self::ReentrantDepthExceeded { current, max } => write!(
                 f,
                 "reentrant backward depth exceeded: current={current} max={max}"
@@ -4258,6 +4276,15 @@ pub struct TensorTape {
     consumed_boundary: usize,
     grad_enabled: bool,
     custom_functions: BTreeMap<usize, CustomFunctionRecord>,
+    /// Version of each borrowed input at the moment its forward ran, keyed by
+    /// custom-function id (frankentorch-9da7i).
+    ///
+    /// Only the BORROWED backward variants populate this. The owned variant
+    /// clones what it needs into its `ctx`, so a later in-place mutation cannot
+    /// reach it; the borrowed variants deliberately re-read the live leaf at
+    /// backward time, which is what makes a mutation in between observable — and,
+    /// before this guard, silent.
+    custom_function_input_versions: BTreeMap<usize, Vec<(TensorNodeId, u64)>>,
     next_custom_function_id: usize,
     retains_grad: BTreeSet<usize>,
     /// Anomaly detection mode: when enabled, backward checks for NaN/Inf gradients.
@@ -4298,6 +4325,7 @@ impl Default for TensorTape {
             consumed_boundary: 0,
             grad_enabled: true,
             custom_functions: BTreeMap::new(),
+            custom_function_input_versions: BTreeMap::new(),
             next_custom_function_id: 0,
             retains_grad: BTreeSet::new(),
             detect_anomaly: false,
@@ -9097,6 +9125,11 @@ impl TensorTape {
         let function_id = self.next_custom_function_id;
         self.next_custom_function_id += 1;
 
+        // frankentorch-9da7i: this backward re-reads these leaves, so record what
+        // it is entitled to see.
+        let borrowed_versions = self.borrowed_input_versions(inputs)?;
+        self.custom_function_input_versions
+            .insert(function_id, borrowed_versions);
         self.custom_functions.insert(
             function_id,
             CustomFunctionRecord {
@@ -9365,6 +9398,10 @@ impl TensorTape {
         let function_id = self.next_custom_function_id;
         self.next_custom_function_id += 1;
 
+        // frankentorch-9da7i: see the non-create_graph variant.
+        let borrowed_versions = self.borrowed_input_versions(inputs)?;
+        self.custom_function_input_versions
+            .insert(function_id, borrowed_versions);
         self.custom_functions.insert(
             function_id,
             CustomFunctionRecord {
@@ -9459,6 +9496,10 @@ impl TensorTape {
         let function_id = self.next_custom_function_id;
         self.next_custom_function_id += 1;
 
+        // frankentorch-9da7i: see the f64 variant.
+        let borrowed_versions = self.borrowed_input_versions(inputs)?;
+        self.custom_function_input_versions
+            .insert(function_id, borrowed_versions);
         self.custom_functions.insert(
             function_id,
             CustomFunctionRecord {
@@ -9567,6 +9608,10 @@ impl TensorTape {
         let function_id = self.next_custom_function_id;
         self.next_custom_function_id += 1;
 
+        // frankentorch-9da7i: see the f64 variant.
+        let borrowed_versions = self.borrowed_input_versions(inputs)?;
+        self.custom_function_input_versions
+            .insert(function_id, borrowed_versions);
         self.custom_functions.insert(
             function_id,
             CustomFunctionRecord {
@@ -15438,6 +15483,10 @@ impl TensorTape {
                                 backward_fn(&record.ctx, &grad_outputs)?
                             }
                             CustomFunctionBackward::BorrowedInputsF64(backward_fn) => {
+                                Self::assert_borrowed_versions(
+                                    &self.nodes,
+                                    self.custom_function_input_versions.get(&function_id),
+                                )?;
                                 let mut borrowed_inputs = Vec::with_capacity(inputs.len());
                                 for &input_id in inputs {
                                     let input_node = self.node(input_id)?;
@@ -15452,6 +15501,10 @@ impl TensorTape {
                                 // f32-output custom op: re-read inputs as f32; the
                                 // incoming output grad stays f64 (tape grad-space);
                                 // the closure returns f64 input grads.
+                                Self::assert_borrowed_versions(
+                                    &self.nodes,
+                                    self.custom_function_input_versions.get(&function_id),
+                                )?;
                                 let mut borrowed_inputs = Vec::with_capacity(inputs.len());
                                 for &input_id in inputs {
                                     let input_node = self.node(input_id)?;
@@ -21037,6 +21090,52 @@ impl TensorTape {
             .ok_or(AutogradError::UnknownTensorNode(id))
     }
 
+    /// Refuse to run a borrowed-input backward whose inputs have moved since the
+    /// forward (frankentorch-9da7i).
+    ///
+    /// The borrowed variants re-read the live leaf at backward time rather than
+    /// cloning it into the tape, so an in-place mutation in between silently
+    /// changes the gradient: it is computed from data the forward never saw, with
+    /// no diagnostic anywhere. PyTorch raises for exactly this case off its own
+    /// version counter; FrankenTorch maintained the counter and never consulted
+    /// it here.
+    ///
+    /// Snapshot the versions a borrowed-input backward is entitled to see.
+    fn borrowed_input_versions(
+        &self,
+        inputs: &[TensorNodeId],
+    ) -> Result<Vec<(TensorNodeId, u64)>, AutogradError> {
+        inputs
+            .iter()
+            .map(|&id| Ok((id, self.node(id)?.tensor.version())))
+            .collect()
+    }
+
+    /// Takes `&[TensorNode]` rather than `&self` so it can be called while a
+    /// `custom_functions` borrow is live.
+    fn assert_borrowed_versions(
+        nodes: &[TensorNode],
+        recorded: Option<&Vec<(TensorNodeId, u64)>>,
+    ) -> Result<(), AutogradError> {
+        let Some(recorded) = recorded else {
+            return Ok(());
+        };
+        for &(node_id, version) in recorded {
+            let node = nodes
+                .get(node_id.0)
+                .ok_or(AutogradError::UnknownTensorNode(node_id))?;
+            let observed = node.tensor.version();
+            if observed != version {
+                return Err(AutogradError::BorrowedInputVersionMismatch {
+                    node: node_id,
+                    recorded: version,
+                    observed,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn node_mut(&mut self, id: TensorNodeId) -> Result<&mut TensorNode, AutogradError> {
         self.nodes
             .get_mut(id.0)
@@ -21705,6 +21804,16 @@ mod tests {
     /// discipline in AGENTS.md, applied to a lever rather than a bug).
     #[test]
     fn backward_gradients_are_bit_identical_with_and_without_the_buffer_pool() {
+        // `set_enabled` is a PROCESS-GLOBAL switch, so this test must hold the
+        // same lock as every other test that touches it. Without the guard it
+        // flips the pool off underneath the three guarded tests that require it
+        // on, and they fail at random: measured 1 failure in 3 full parallel runs
+        // of this binary, and green every time under `--test-threads=1`. The
+        // guarded tests were written with the lock; this one reached for the same
+        // global and did not. frankentorch-9da7i drive-by.
+        let guard = BUFFER_POOL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The pool declines anything below MIN_POOLED_LEN, so the graph has to be
         // wide enough to reach it.
         let len = ft_core::buffer_pool::MIN_POOLED_LEN;
@@ -21755,6 +21864,7 @@ mod tests {
              pass could take (hits {hits_before} -> {hits_after})"
         );
         ft_core::buffer_pool::clear();
+        drop(guard);
     }
 
     #[test]
