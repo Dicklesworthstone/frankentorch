@@ -23099,3 +23099,48 @@ It does not license reasoning about mechanisms whose *structure* is in question 
 that is what the first five hypotheses were, and reading the source supported every
 one of them convincingly before measurement killed it. The distinction is narrow
 and worth respecting: **bound magnitudes on paper, measure structure.**
+
+## 38. A DRIFTING RUN DOES NOT JUST FAIL ITS GATES — IT REPORTS A DIFFERENT NUMBER, BIASED TOWARD 1.0
+
+The drift gate has been treated as hygiene: a filter that rejects runs taken while the
+host moved. Today's rows show it is more than that. **The ratio itself moves with the
+excursion**, so a drifted row is not a good number that failed a formality — it is a
+biased number.
+
+`avg_pool1d`, same binary, same lane, min estimator:
+
+    run     load_1m start -> end      ratio
+    ap1_r2   10.40 -> 16.19           2.676
+    ap1_r3   14.12 -> 15.41           2.661
+    q7       24.44 -> 29.33           2.773
+    q9       40.22 -> 40.41           2.690
+    q3       32.89 -> 31.69           2.411
+    ap1_r5   20.83 -> 24.04           2.344
+    s1       13.75 -> 85.24           2.006   <- largest excursion
+    s2       97.60 -> 32.02           2.223   <- second largest
+
+The two runs with the largest excursions produced the two lowest ratios. It is NOT a
+function of load LEVEL — q9 sat flat at 40 and read 2.690, higher than q3 at 33 and
+ap1_r5 at 21. It tracks the excursion, which is exactly what the drift gate measures.
+
+WHY THE BIAS HAS A DIRECTION. FrankenTorch runs this lane on 64 rayon threads; the
+incumbent runs on 8. Under contention the 64-thread arm cannot realise its parallelism
+and loses proportionally more, so an FT-favourable ratio COMPRESSES toward 1.0.
+
+THE CONSEQUENCE, and it cuts both ways:
+  - On a lane where FT is FASTER, a drifted run UNDERSTATES the win. Quoting one would
+    be conservative — but conservative in a way that is luck, not discipline.
+  - On a lane where FT is SLOWER, the same mechanism INFLATES the apparent loss. A
+    drifted row there would overstate how far behind we are.
+
+So "the ratio replicated across drifted runs, so the measurement is probably fine" —
+which is a reading the earlier guardrail discussion left open — is wrong in a specific
+way: drifted runs can replicate each other precisely because they share the bias.
+Agreement among drifted runs is evidence of a stable disturbance, not of a stable
+number.
+
+THIS DOES NOT INVALIDATE ANY BANKED ROW. Every standing in this ledger was taken on runs
+whose drift gate PASSED, so none of them carries this bias. What it invalidates is the
+temptation — recorded in item 31a, where ten agreeing drifted runs sat there looking
+quotable — to treat consistency across rejected runs as a reason to relax the gate. The
+ten agreed with each other; on this evidence they would also have been biased together.
