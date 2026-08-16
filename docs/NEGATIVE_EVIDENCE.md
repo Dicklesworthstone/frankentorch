@@ -23612,3 +23612,63 @@ away would report as free and the row would mean nothing.
 **UNCOMPILED**: written under the no-cold-build rule, rustfmt-parsed, additive,
 test-only, and mirroring timing tests already passing in this module (item 41's
 constraints).
+
+## 48. ZERO OF 21 LANES CERTIFIED IN A DRIFT-CLEAN RUN — THE ALLOCATOR IS THE PRIME SUSPECT
+
+The statistic I ran but had not written down, from the same drift-clean local
+invocation as items 45-47. No new build; disk sat at 43G all turn.
+
+### 48a. The count
+
+    MIN-estimator rows                21
+    rows with PT null FAIL            16
+    rows with FT null FAIL            17
+    rows with BOTH nulls PASS          0
+
+**Not one lane certified**, in an invocation whose drift gate PASSED
+(load_1m 17.78 -> 17.72). The instrument is working — it refused everything, which
+is the correct behaviour — but two full local sweeps have now produced zero
+bankable rows.
+
+Note also that the failures are NOT one-sided across the sweep: PT fails 16 of 21
+and FT 17 of 21, at similar rates. Individual lanes are one-sided (group_norm's
+incumbent, prelu's FrankenTorch arm), but the sweep as a whole is not, which points
+at something affecting both arms rather than a per-lane defect.
+
+### 48b. The allocator is the difference that has not been controlled
+
+Both local runs used a plain `--release` build, so glibc malloc. **Every previously
+certified row in this campaign used mimalloc** (`--features fair-alloc`), and the
+harness prints the warning itself: *"allocator=system (glibc malloc) — re-run with
+`--features fair-alloc` before quoting"*.
+
+That is not merely a comparability caveat, which is how items 44-46 recorded it.
+It is a candidate CAUSE of the pervasive null failures. An A/A null compares an
+arm's first half against its own second half, so it is sensitive to any
+within-run drift in allocation cost — arena growth, free-list state, page faults on
+first touch. mimalloc was adopted here precisely because it makes that behaviour
+steadier. Running glibc malloc and then finding both arms fail their within-run
+self-comparison at ~80% is consistent with the allocator, and is not explained by
+host load, which the drift gate certified as steady.
+
+### 48c. Why this outranks the levers
+
+Two local sweeps, both instrumented correctly, both refused in full. Until a run
+certifies something, **no lever landed this session can be shown to have crossed**,
+including the 14.50x completion A/B and the 5.33x group_norm loss — the FT-vs-FT
+paired ratios survive, but nothing vs-incumbent does.
+
+The next action is a build flag, not code: `--features fair-alloc`, then re-run and
+count certified rows. If the count moves off zero, the allocator was the blocker
+and every local row taken so far should be retaken under it. If it stays at zero,
+the blocker is round count or sample count and the harness needs more of both,
+which is a larger change and worth knowing before attempting.
+
+### 48d. The honest reading of my own recent output
+
+I have banked five ledger items off two runs that certified nothing. That is
+defensible — attribution, corrections, and refuted hypotheses are real work, and
+several of them redirected levers away from terms worth ~10% — but it should be
+stated plainly: **the campaign's actual deliverable is a certified vs-incumbent
+row, and I have not produced one locally.** The measurement path is now correct
+end to end; the remaining gap is one build flag and a quiet host.
