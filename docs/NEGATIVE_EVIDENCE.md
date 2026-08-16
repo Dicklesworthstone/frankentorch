@@ -21895,3 +21895,164 @@ which is probably why the class went unnoticed" was a tidy explanation for
 something that is not true; two of the three fail identically, and the reason the
 class went unnoticed is simpler — every test in the suite runs at unit scale,
 where all three behave.
+
+## 31. SQUARE `full_matrices=true` WAS EXCLUDED FROM ITS OWN FAST PATHS — 1.52-1.60x, WITH A CONTROL
+
+Both square SVD fast paths opened with the same gate:
+
+    if full_matrices || m != n || n < 64 { return Ok(None); }
+
+so a SQUARE matrix was eligible at `full_matrices=false` and eligible for neither
+at `full_matrices=true` — even though for `m == n` the two calls are the same
+decomposition. `k = m = n`, so full's `(m x m, n x n)` and reduced's
+`(m x k, k x n)` are the same shapes, not merely compatible ones. `ft-api`'s own
+comment says the equivalence outright.
+
+### 31a. The measurement, and why the control is the important column
+
+Same process, both arms, min of 3, rch worker `vmi1227854`, harness
+`crates/ft-kernel-cpu/examples/svd_scale_probe.rs`:
+
+           n      reduced ns         full ns  full/reduced  fast paths eligible
+          48          701780          666339         0.95x  neither (control)
+          64          565868          904545         1.60x  reduced only
+          96         1431886         2234549         1.56x  reduced only
+         128         2778443         4233284         1.52x  reduced only
+
+**n = 48 is the control and it is what makes this readable.** Below the `n >= 64`
+threshold NEITHER call is eligible, and there the ratio is 0.95x — so "full is
+just inherently slower for square inputs" is excluded by measurement rather than
+by argument. The 1.5-1.6x appears exactly where the gate turns on.
+
+This is a paired within-process ratio, so it survives the worker heterogeneity
+that invalidates absolute cross-run times.
+
+### 31b. The proof is structural, and the after-timing is NOT quotable
+
+`svd_square_full_matrices_matches_reduced_bitwise_across_the_fast_path_gate`
+asserts full and reduced agree BIT-FOR-BIT at n = 48, 64, 96. **That test would
+have failed before this change** — the two ran different algorithms and produced
+different last bits. It passing is the proof the fast path is now taken; the
+timing is corroboration.
+
+The post-change probe run is deliberately NOT banked. It landed on `vmi1293453`,
+took 725s against the earlier run's 191s, and read 0.91x / 1.15x / 1.42x — which
+cannot be right, because bit-identical outputs from one code path must be 1.00x by
+construction. That row is noise on a contended worker, and quoting it either as a
+win (0.91x) or as a failure (1.42x) would be reading tea leaves. **The honest claim
+is the pre-change cost with its control, plus bit-identity afterwards.**
+
+### 31c. Why the existing test did not catch it
+
+`tensor_linalg_svd_full_square_batched_grad_matches_reduced` asserts exactly this
+equivalence — at `n = 5`, below the `n >= 64` gate, where neither call is eligible
+and both take the general path. It passed regardless of how the gate was wired.
+
+That is the reusable warning: **a test written to lock an equivalence is worthless
+if its size sits on the wrong side of the threshold that creates the difference.**
+The new test straddles the gate on purpose.
+
+---
+
+## 28. SVD ZERO-COLUMN SKIP AT 1.73x, A PROOF THE BEAD DID NOT EXPECT, AND THE BOOKKEEPING THAT ATE HALF THE LEVER
+
+### 28a. The row
+
+`complete_orthonormal_basis_f64` orthogonalizes each candidate against ALL `u_cols`
+columns of `U`, including the ones still zero. `frankentorch-tfnap` skips those.
+
+Interleaved (full, skip, full, skip...) in ONE process, per-arm min-of-5, so both
+arms are the same binary by construction:
+
+    shape              run A (hz1)              run B (vmi1149989)
+    m=96  k=8     1964946 -> 1093713  1.80x    999030 ->  568507  1.76x
+    m=128 k=8     5923593 -> 3159469  1.87x   3100401 -> 1670831  1.86x
+    m=192 k=16   19130776 ->10443710  1.83x   9932372 -> 5584424  1.78x
+    m=256 k=32   44409347 ->25488397  1.74x  32904940 ->19026567  1.73x
+
+CONSERVATIVE CLAIM: **at least 1.73x** on the headline 256x32 `full_matrices` shape,
+taking the worst of the two runs. Replicated across TWO DIFFERENT WORKERS, which is
+the first time this campaign has got cross-worker replication rather than settling
+for same-binary — the arms are same-binary by construction here, so the worker
+difference costs nothing and buys independence.
+
+NOT a vs-PyTorch row. There is no incumbent arm in this measurement; it is FT-vs-FT
+maintenance on a phase the SVD attribution put at 44-62% of a square SVD.
+
+### 28b. The bead expected an empirical justification; the proof is available
+
+`tfnap` set out the exactness question honestly and expected the answer to be "bit-exact
+in practice, gated by a randomized test". It feared this: `dot` accumulates
+`col[i] * 0.0`, each term `+0.0` or `-0.0`; if every term were `-0.0` then `dot` would
+be `-0.0`, the update would be `col[i] - (-0.0)`, and a `col[i]` of `-0.0` would flip
+to `+0.0` — a bitwise difference.
+
+**That cannot happen, because `dot` starts at `+0.0` and accumulates.** Under IEEE-754,
+`(+0.0) + (-0.0) = +0.0`, so once the accumulator is `+0.0` it stays `+0.0` for either
+sign of addend. `dot == -0.0` requires the sum to START at the first product; this loop
+starts at `0.0`. So `dot` is exactly `+0.0` for all finite `col`, the update is
+`col[i] - (+0.0)` which is the identity even for `-0.0`, and the skip is exact BY PROOF.
+
+Two guards keep the proof honest rather than nearly-true. The mask tests
+`to_bits() == 0`, not `== 0.0`, so a column of `-0.0` is never skipped — against `-0.0`
+the argument genuinely fails. And the scope is finite `col`: a `u` carrying NaN would
+make the two forms differ, but such a `u` has already failed the SVD that produced it.
+
+The test runs both forms in one process over six shapes including interleaved
+rank-deficient cases, each in a normal AND a sign-flipped variant chosen so `col` goes
+negative during the sweep — the exact configuration that would expose the flip if the
+accumulator argument were wrong. Gate 30/0 on the svd filter, worker vmi1264463.
+
+### 28c. THE BOOKKEEPING ATE HALF THE LEVER — measured, not reasoned
+
+The first working version rebuilt the zero-mask once per completion column. It gated
+clean and it measured **1.19-1.37x** against the bead's predicted ~2x.
+
+The gap was the mask itself. Rebuilt per column it costs `O(m * u_cols)` against a
+sweep of `O(2 * m * u_cols)` — **half of what it saves**. Hoisting it out of the column
+loop, valid because the mask is MONOTONE (a column only ever goes zero -> non-zero, when
+this loop fills it), takes the same lever from 1.19-1.37x to **1.73-1.87x**.
+
+    per-column mask   1.19x  1.25x  1.33x  1.26x   (and 1.29/1.33/1.37/1.35)
+    hoisted mask      1.76x  1.86x  1.78x  1.73x   (and 1.80/1.87/1.83/1.74)
+
+THE LESSON, which is the transferable part: **a skip-test is itself work, and an
+optimization whose bookkeeping is the same order as the work it removes will measure at
+a fraction of its predicted value while looking correct.** The bead's ~2x estimate was
+right about the work being skipped and silent about the cost of deciding to skip it.
+Had I banked the first version I would have recorded a real lever at half its worth and
+called the bead's estimate optimistic — the wrong conclusion, from a correct measurement.
+
+Worth checking wherever a predicate guards an inner loop: is the predicate cheaper than
+the body, and is it hoisted as far as its own invariants allow?
+
+### 28d. NAMING THE STRUCTURAL PREDICTOR FOR THE UNINIT LEVER (items 26-27)
+
+Item 27 measured the same uninit first-touch lever paying 1.27-1.49x on max_pool1d and
+NOTHING on avg_pool2d. Same lever, same binary, same invocations, opposite outcomes, so
+the mechanism is structural and worth naming rather than shrugging at.
+
+**The predictor is zeroed bytes per unit of kernel work** — how much dead
+initialization the lever deletes, divided by how much real work the kernel does around
+it:
+
+    max_pool1d   2 buffers x 8*64*4096 f64 = 32 MB zeroed   kernel: 2 comparisons per output   PAYS
+    avg_pool2d   1 buffer  x 8*64*32*32 f64 =  4 MB zeroed   kernel: 4 reads, 3 adds, 1 divide  DOES NOT
+
+Eight times less zeroing against several times more work per element, and the lever
+falls inside the noise. Two further terms, from item 26c and from 28c respectively:
+
+  - The zeroing may be FREE. `vec![0.0; n]` is a calloc, and served by a fresh `mmap`
+    the kernel supplies zero pages at no cost. Only zeroing served from recycled dirty
+    arena memory is a real memset. So the numerator is not "bytes allocated" but "bytes
+    actually memset", which depends on the process's allocation history and is invisible
+    to any ELF hash.
+  - The replacement is not free either. `build_uninit` still allocates; what it removes
+    is the write pass, not the allocation.
+
+USABLE FORM: before applying this lever anywhere, ask what fraction of the kernel's
+runtime is the output zeroing. If the output buffer is large relative to the arithmetic
+per element AND the allocation is served from a warm allocator, expect a real win; if
+the kernel does substantial work per output element, or the buffer is small, expect
+nothing. Do not apply it to the remaining ~75 sites on family resemblance — measure the
+ones where the ratio is favourable and leave the rest as they are.

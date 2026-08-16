@@ -29880,14 +29880,76 @@ fn svd_full_rank_square_deferred_left_fast_path(
 /// 255 MILLISECONDS here. Measured growth of the full-U term was steeper still
 /// (exponent 4.85 to 5.94 across 32/64/96/128), so `m^4` is a floor rather than a
 /// fit; the residual factor is not accounted for. NEGATIVE_EVIDENCE item 29.
+/// # `skip_zero_columns`
+///
+/// frankentorch-tfnap: skip the Gram-Schmidt sweep against columns of `U` that
+/// are still exactly `+0.0`. At the first completion column of a 256x32
+/// `full_matrices` SVD, 223 of 256 columns are zero, so most of that sweep is
+/// multiplying by zeros.
+///
+/// UNCONDITIONALLY BIT-EXACT for finite `col`, by the following argument — the
+/// bead filing this expected only an empirical justification, and the stronger
+/// one is available because of how `dot` accumulates.
+///
+/// Let column `prev` be all `+0.0`. The sweep computes
+/// `dot = sum_i col[i] * u[i][prev]` and then `col[i] -= dot * u[i][prev]`.
+///
+/// 1. Each product `col[i] * (+0.0)` is `+0.0` for `col[i] >= +0.0` and `-0.0`
+/// for `col[i] < 0.0` (finite `col`).
+/// 2. `dot` STARTS AT `+0.0` and accumulates. Under IEEE-754 round-to-nearest,
+/// `(+0.0) + (+0.0) = +0.0` and `(+0.0) + (-0.0) = +0.0`, and once the
+/// accumulator is `+0.0` it stays `+0.0` for either sign of addend. So `dot`
+/// is exactly `+0.0` REGARDLESS of the signs in `col`.
+///
+/// This is the step the bead thought could fail. It feared `dot == -0.0` when
+/// every term is `-0.0`, which would make the update `col[i] - (-0.0)` and
+/// flip a `-0.0` entry to `+0.0`. That requires the sum to START at the first
+/// product; starting at `+0.0`, as this loop does, makes `-0.0` unreachable.
+/// 3. The update is therefore `col[i] -= (+0.0) * (+0.0)` = `col[i] - (+0.0)`,
+/// which is the identity for every finite `col[i]` INCLUDING `-0.0`
+/// (`-0.0 - (+0.0) = -0.0`).
+///
+/// So the skipped work provably changes nothing, and the skip is exact by proof
+/// rather than by observation.
+///
+/// SCOPE, stated rather than glossed: the argument assumes `col` is finite,
+/// which holds because `col` starts as a standard basis vector and is only ever
+/// decremented by finite multiples of finite `u` entries. If `u` contained a NaN
+/// or infinity the two forms would genuinely differ — the non-skipping form
+/// would propagate NaN into `col` and the skipping form would not — but a `u`
+/// carrying NaN has already failed the SVD that produced it.
+///
+/// The mask tests `to_bits() == 0`, not `== 0.0`, so a column of `-0.0` is NOT
+/// skipped. Against `-0.0` step 1 flips and step 3 could turn `-0.0` into
+/// `+0.0`; excluding it keeps the proof intact at the cost of a sweep that in
+/// practice never occurs.
 fn complete_orthonormal_basis_f64(
     u: &mut [f64],
     m: usize,
     u_cols: usize,
     tol: f64,
     advance_cursor: bool,
+    skip_zero_columns: bool,
 ) {
     let mut cursor = 0usize;
+    // frankentorch-tfnap: the zero-column mask, built ONCE for the whole completion
+    // rather than once per column.
+    //
+    // Valid because the mask is MONOTONE: a column only ever goes zero -> non-zero,
+    // when this loop fills it, and nothing here ever zeroes a column. So one initial
+    // scan plus a single-bit update at each fill is exact.
+    //
+    // This is the difference between the lever paying and half-paying. Rebuilt per
+    // column the mask costs O(m * u_cols) against a sweep of O(2 * m * u_cols) — it
+    // eats half of what it saves, which is why the first version of this measured
+    // 1.19-1.37x against a predicted ~2x. Hoisted, it is O(m * u_cols) ONCE for the
+    // entire completion.
+    let mut zero_col = vec![false; u_cols];
+    if skip_zero_columns {
+        for (prev, slot) in zero_col.iter_mut().enumerate() {
+            *slot = (0..m).all(|i| u[i * u_cols + prev].to_bits() == 0);
+        }
+    }
     for j in 0..u_cols {
         // Check if column j is currently zero (norm < tol).
         let mut existing_norm_sq = 0.0f64;
@@ -29914,6 +29976,9 @@ fn complete_orthonormal_basis_f64(
                 if prev == j {
                     continue;
                 }
+                if skip_zero_columns && zero_col[prev] {
+                    continue;
+                }
                 let mut dot = 0.0;
                 for i in 0..m {
                     dot += col[i] * u[i * u_cols + prev];
@@ -29931,6 +29996,9 @@ fn complete_orthonormal_basis_f64(
                 for i in 0..m {
                     u[i * u_cols + j] = col[i] / norm;
                 }
+                // frankentorch-tfnap: the one transition the mask can make. `norm >
+                // tol` guarantees the column just written is not all-zero.
+                zero_col[j] = false;
                 cursor = seed + 1;
                 break;
             }
@@ -30038,7 +30106,7 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
     // under frankentorch-zs8a — previously the rank-deficient path
     // left those columns as zeros and reduced-mode SVD failed
     // U^T U = I on rank-deficient matrices.
-    complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true);
+    complete_orthonormal_basis_f64(&mut u, m, u_cols, tol, true, true);
 
     // Build Vh: V^T with reordering
     let vh_rows = if full_matrices { n } else { k };
@@ -41163,10 +41231,10 @@ mod tests {
             let mut cursored = seeded;
 
             let t0 = std::time::Instant::now();
-            complete_orthonormal_basis_f64(&mut restarting, m, u_cols, 1e-15, false);
+            complete_orthonormal_basis_f64(&mut restarting, m, u_cols, 1e-15, false, false);
             let restart_ns = t0.elapsed().as_nanos();
             let t1 = std::time::Instant::now();
-            complete_orthonormal_basis_f64(&mut cursored, m, u_cols, 1e-15, true);
+            complete_orthonormal_basis_f64(&mut cursored, m, u_cols, 1e-15, true, false);
             let cursor_ns = t1.elapsed().as_nanos();
 
             for (idx, (a, b)) in restarting.iter().zip(cursored.iter()).enumerate() {
@@ -41199,6 +41267,111 @@ mod tests {
                 "264q0 basis completion m={m} k={k} u_cols={u_cols} rank={rank}: \
                  restarting {restart_ns} ns, cursor {cursor_ns} ns ({speedup:.2}x)"
             );
+        }
+    }
+
+    /// frankentorch-tfnap: what the zero-column skip is WORTH, measured in one
+    /// process with the arms INTERLEAVED (full, skip, full, skip, ...) and reduced
+    /// by the per-arm MIN, so a load excursion has to hit both arms to bias the
+    /// ratio. This is an FT-vs-FT maintenance measurement, not a vs-PyTorch row:
+    /// there is no incumbent arm here, and it is not a certified standing.
+    ///
+    /// Shapes are `full_matrices` tall SVDs, where `u_cols = m` and only `k`
+    /// columns arrive filled — the case where most of `U` is still zero and the
+    /// sweep is mostly multiplying by zeros.
+    #[test]
+    fn svd_basis_completion_zero_skip_is_worth_measuring() {
+        use super::complete_orthonormal_basis_f64;
+
+        println!("tfnap zero-skip, interleaved min-of-5, one process:");
+        for &(m, k) in &[(96usize, 8usize), (128, 8), (192, 16), (256, 32)] {
+            let seeded = orthonormal_seed_columns(m, k, m, k);
+            let (mut full_ns, mut skip_ns) = (u128::MAX, u128::MAX);
+            for _ in 0..5 {
+                let mut a = seeded.clone();
+                let t = std::time::Instant::now();
+                complete_orthonormal_basis_f64(&mut a, m, m, 1e-15, true, false);
+                full_ns = full_ns.min(t.elapsed().as_nanos());
+                std::hint::black_box(&a);
+
+                let mut b = seeded.clone();
+                let t = std::time::Instant::now();
+                complete_orthonormal_basis_f64(&mut b, m, m, 1e-15, true, true);
+                skip_ns = skip_ns.min(t.elapsed().as_nanos());
+                std::hint::black_box(&b);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let speedup = full_ns as f64 / skip_ns.max(1) as f64;
+            println!(
+                "  m={m:4} k={k:3} u_cols={m:4}   full {full_ns:>12} ns   \
+                 skip {skip_ns:>12} ns   {speedup:.2}x"
+            );
+        }
+    }
+
+    /// frankentorch-tfnap. The zero-column skip must agree BIT-FOR-BIT with the
+    /// sweep it replaces. The proof on `skip_zero_columns` says it must; this runs
+    /// both forms in one process and checks, on the shapes where completion columns
+    /// are INTERLEAVED among real singular vectors as well as the trailing case.
+    ///
+    /// The negative-`col` shapes are the point. The failure the bead feared needs
+    /// `dot` to reach `-0.0`, which needs every term negative — so these seed
+    /// columns are built to make `col` go negative during the sweep, which is the
+    /// state that would expose it if the accumulator argument were wrong.
+    #[test]
+    fn svd_basis_completion_zero_skip_matches_the_full_sweep_bitwise() {
+        use super::complete_orthonormal_basis_f64;
+
+        for &(m, k, u_cols, rank) in &[
+            (48usize, 6usize, 48usize, 6usize),
+            (40, 12, 40, 12),
+            (36, 4, 36, 4),
+            (32, 32, 32, 20),
+            (40, 10, 40, 6),
+            (24, 3, 24, 3),
+        ] {
+            for negate in [false, true] {
+                let mut seeded = orthonormal_seed_columns(m, k, u_cols, rank);
+                if negate {
+                    // Flip the sign of the seeded columns, so the running `col`
+                    // takes negative values and every product in `dot` is `-0.0`
+                    // against a zero column — the exact configuration the bead
+                    // identified as the one that could flip a sign of zero.
+                    for value in &mut seeded {
+                        *value = -*value;
+                    }
+                }
+                let mut full = seeded.clone();
+                let mut skipped = seeded;
+
+                complete_orthonormal_basis_f64(&mut full, m, u_cols, 1e-15, true, false);
+                complete_orthonormal_basis_f64(&mut skipped, m, u_cols, 1e-15, true, true);
+
+                for (idx, (a, b)) in full.iter().zip(skipped.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "tfnap zero-skip changed a value: m={m} k={k} rank={rank} \
+                         negate={negate} idx={idx} full={a} skipped={b}"
+                    );
+                }
+
+                // Independent of the bit-identity above, so a shared bug in both
+                // forms cannot pass: the result must still be an orthonormal basis.
+                for p in 0..u_cols {
+                    for q in p..u_cols {
+                        let mut dot = 0.0f64;
+                        for i in 0..m {
+                            dot += skipped[i * u_cols + p] * skipped[i * u_cols + q];
+                        }
+                        let want = if p == q { 1.0 } else { 0.0 };
+                        assert!(
+                            (dot - want).abs() < 1e-11,
+                            "tfnap UtU off: m={m} p={p} q={q} negate={negate} dot={dot}"
+                        );
+                    }
+                }
+            }
         }
     }
 
