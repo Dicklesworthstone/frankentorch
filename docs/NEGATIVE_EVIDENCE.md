@@ -25011,3 +25011,53 @@ boost clock and later slots throttled; the incumbent's 8 threads are far less af
 which fits its much smaller and non-monotone slot structure. Falsifiable by reading
 per-slot CPU frequency, or by inserting an idle gap between slots and seeing whether the
 ramp flattens.
+
+## 65. THE BLOCKED form_p PAYS 9x — AND MY FIRST THRESHOLD SHIPPED IT AS AN 11% LOSS
+
+`frankentorch-4zjaa` landed wired at `n >= 64`, inheriting `svd_use_blocked_bidiag`'s
+gate rather than measuring one. The owed post-fix ratio says that was wrong.
+
+FT-vs-FT, one process, same packed reflectors, interleaved, min of 3. **Maintenance
+evidence under section 1, not a win.** Observed loadavg 24.71 / 24.40 / 27.85 (1m
+and 5m within 1%), disk 289G, local build via the wrapper bypass, no `[RCH]` line.
+
+    n=64    unblocked     47590 ns   blocked     50496 ns   0.94x   LOSS
+    n=128   unblocked    335175 ns   blocked    384359 ns   0.87x   LOSS
+    n=160   unblocked   5889192 ns   blocked    646525 ns   9.11x
+    n=192   unblocked   9732548 ns   blocked   1043859 ns   9.32x
+    n=224   unblocked  13140537 ns   blocked   1524469 ns   8.62x
+    n=256   unblocked  17723374 ns   blocked   1939236 ns   9.14x
+
+### 65a. The threshold was inherited, and inheriting it shipped a regression
+
+At `n >= 64` the dispatch made n=64 and n=128 **11-13% SLOWER**. Those are real
+shapes — 128 in particular is a common square SVD — so the lever as first wired was
+a regression for everything between 64 and 160 and a 9x win above it.
+
+Corrected to `n >= 160`, which is where the measurement puts the crossover. The
+threshold is now measured rather than borrowed from a neighbouring gate that
+happened to be nearby.
+
+### 65b. The unblocked path falls off a cliff at 160
+
+    n=128   335 us
+    n=160  5889 us
+
+**A 1.25x size increase costs 17.6x more time.** That is not the O(n^3) the
+algorithm implies, and it is why the crossover is so sharp rather than gradual —
+the blocked path grows smoothly (646 us -> 1939 us from 160 to 256, ~3x for 1.6x
+size) while the unblocked one steps. Something in the unblocked expansion changes
+regime between 128 and 160; a rayon gate or a cache boundary are the obvious
+candidates and neither is verified here.
+
+**That cliff is worth more than the lever.** The blocked path routes around it above
+160, but every caller below 160 still walks into it, and `bidiag_form_p_f64` is
+reached by every reduced SVD in that range. Filed as the next thing to look at.
+
+### 65c. What this says about borrowing thresholds
+
+The gate I copied (`n >= 64`) was correct for the REDUCTION, which is a different
+kernel with a different crossover. Reusing a neighbour's constant felt conservative
+and was in fact untested for the path it was applied to. **A threshold is a
+measurement, not a convention** — and the cost of not measuring it was shipping a
+regression inside a commit whose own message claimed the speedup was unmeasured.

@@ -29150,10 +29150,21 @@ fn svd_blocked_bidiag_prologue(
     // measured 31.6% of a square SVD, rising with n (NEGATIVE_EVIDENCE item 36),
     // next to a reduction that is already GEMM-bound.
     //
-    // The threshold matches `svd_use_blocked_bidiag`'s own n >= 64: below it the
-    // unblocked form is kept, so every smaller shape retains its CURRENT output
-    // bit-for-bit and the existing tests keep their meaning. Panel width is the
-    // same `svd_bidiag_block_size()` already tuned for the reduction.
+    // THRESHOLD IS 160, MEASURED, NOT INHERITED. I first wired this at n >= 64 to
+    // match `svd_use_blocked_bidiag`'s gate, and the A/B says that was wrong --
+    // blocking LOSES below the crossover:
+    //
+    //   n=64   unblocked    47590 ns   blocked    50496 ns   0.94x
+    //   n=128  unblocked   335175 ns   blocked   384359 ns   0.87x
+    //   n=160  unblocked  5889192 ns   blocked   646525 ns   9.11x
+    //   n=192  unblocked  9732548 ns   blocked  1043859 ns   9.32x
+    //   n=256  unblocked 17723374 ns   blocked  1939236 ns   9.14x
+    //
+    // Note the unblocked path's 17x jump between 128 and 160 for a 1.25x size
+    // increase -- it falls off a cliff there, which is what makes the crossover so
+    // sharp. Below 160 the unblocked form is kept, so smaller shapes retain their
+    // CURRENT output bit-for-bit. Panel width is the same `svd_bidiag_block_size()`
+    // already tuned for the reduction.
     //
     // NOT bit-identical above the threshold — blocking reassociates the same
     // arithmetic — so it is admissible only under the ratified eig/SVD tolerance
@@ -29165,7 +29176,7 @@ fn svd_blocked_bidiag_prologue(
     // Per section 1 of the standing orders this is landed, not won, until a
     // post-fix ratio is taken in a quiet window.
     let t_formp = std::time::Instant::now();
-    let v = if n >= 64 {
+    let v = if n >= 160 {
         bidiag::bidiag_form_p_blocked_f64(a, n, &taup, svd_bidiag_block_size())
     } else {
         bidiag::bidiag_form_p_f64(a, n, &taup)
@@ -58522,7 +58533,7 @@ mod tests {
     /// run in ONE process over the SAME packed reflectors, interleaved, min of 3.
     #[test]
     fn bidiag_form_p_blocked_versus_unblocked_ab() {
-        for &n in &[64usize, 128, 256] {
+        for &n in &[64usize, 128, 160, 192, 224, 256] {
             let mut packed = bidiag_test_matrix(n, n, 0xAB0007 ^ n as u64);
             let (_d, _e, _tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, n, n);
             let nb = super::svd_bidiag_block_size();
@@ -58539,7 +58550,9 @@ mod tests {
             }
             #[allow(clippy::cast_precision_loss)]
             let speedup = un_ns as f64 / bl_ns.max(1) as f64;
-            println!("4zjaa form_p n={n} nb={nb}: unblocked {un_ns} ns, blocked {bl_ns} ns ({speedup:.2}x)");
+            println!(
+                "4zjaa form_p n={n} nb={nb}: unblocked {un_ns} ns, blocked {bl_ns} ns ({speedup:.2}x)"
+            );
         }
     }
 
