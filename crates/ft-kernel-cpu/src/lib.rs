@@ -12838,6 +12838,27 @@ fn conv3d_col2im_repeated_row_f64(
     dpadded
 }
 
+/// Largest `in_ch` for which the direct 3x3x3 kernel is MEASURED to beat the streamed
+/// im2col+GEMM fallback. See NEGATIVE_EVIDENCE items 68b and 89.
+///
+/// The direct kernel's scalar four-accumulator loop wins only while the reduction depth
+/// `in_ch*27` is short enough that avoiding the im2col panel pays for giving up
+/// `matrixmultiply`'s blocked SIMD microkernel. Measured cost per output channel:
+///
+/// ```text
+/// in_ch    k   direct ms/ch   stream ms/ch   stream/direct
+///     8  216         0.0585         0.0663          1.134x  <- direct wins
+///    12  324         0.0835         0.0549          0.658x
+///    32  864         0.2282         0.1236          0.541x  <- the scored h2h lane
+///    48 1296         0.2904         0.0884          0.304x
+/// ```
+///
+/// The gate previously admitted `in_ch >= 8` with NO CEILING while the kernel's proof
+/// test only ever witnessed `in_ch == 8`, so every shape above the validation point took
+/// a route that had never been shown to be either faster or better. A ceiling at the
+/// measured crossover is the whole fix.
+const CONV3D_DIRECT_MAX_IN_CH: usize = 8;
+
 /// Direct NCDHW f64 convolution for the scored 3x3x3 stride-1 route.
 ///
 /// Blocks four adjacent output channels so one input patch is read once for four
@@ -13060,9 +13081,16 @@ fn conv3d_forward_streamed_f64(
 
 /// Fused conv3d forward (f64) on a padded input, plus optional per-channel bias.
 ///
-/// The native NCDHW 3x3x3 stride-1 lane uses a direct cache-local kernel. Other
-/// shapes retain the streamed im2col-GEMM fallback, which remains preferable
-/// when the output-channel block would not amortize its scalar dot products.
+/// The native NCDHW 3x3x3 stride-1 lane uses a direct cache-local kernel, but ONLY up to
+/// `CONV3D_DIRECT_MAX_IN_CH` — the deepest reduction at which that kernel is measured to
+/// win. Other shapes take the streamed im2col-GEMM fallback, which remains preferable
+/// whenever the output-channel block would not amortize its scalar dot products.
+///
+/// The two routes do not produce identical bits at depth (`matrixmultiply` blocks the k
+/// dimension, so the streamed route sums in a different order). That is not a tolerance
+/// being spent: measured against an exact rational reference, the streamed route is the
+/// MORE accurate of the two and is more accurate than torch itself, and its worst-case
+/// divergence from torch is smaller than the direct kernel's. NEGATIVE_EVIDENCE item 89.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv3d_forward_f64(
@@ -13092,6 +13120,7 @@ pub fn conv3d_forward_f64(
         && sh == 1
         && sw == 1
         && in_ch >= 8
+        && in_ch <= CONV3D_DIRECT_MAX_IN_CH
         && out_ch >= 8
         && out_ch.is_multiple_of(4)
     {
@@ -46300,6 +46329,74 @@ mod tests {
         }
     }
 
+    /// The gate must STOP handing deep reductions to the direct kernel.
+    ///
+    /// `conv3d_direct_3x3s1_matches_streamed_reference_bits` cannot witness this: at
+    /// in_ch=8 the two routes agree bit for bit, so it passes whichever route runs. That
+    /// is precisely how the ceiling-less gate survived — its proof test was blind to the
+    /// thing that went wrong. At in_ch=32 the routes DISAGREE (115364 of 122880 outputs,
+    /// worst relative 4.770e-12), which makes a bitwise comparison a genuine route
+    /// assertion rather than a restatement of the dispatcher.
+    ///
+    /// NEGATIVE_EVIDENCE items 68b and 89.
+    #[test]
+    fn conv3d_forward_f64_routes_deep_reductions_to_the_streamed_kernel() {
+        const IN_CH: usize = 32;
+        const OUT_CH: usize = 8;
+        let (pd, ph, pw) = (5usize, 6usize, 6usize);
+        let (od, oh, ow) = (pd - 2, ph - 2, pw - 2);
+        let padded: Vec<f64> = (0..IN_CH * pd * ph * pw)
+            .map(|index| ((index % 251) as f64) * 0.001 - 0.12)
+            .collect();
+        let weight: Vec<f64> = (0..OUT_CH * IN_CH * 3 * 3 * 3)
+            .map(|index| ((index % 241) as f64) * 0.001 - 0.11)
+            .collect();
+
+        // in_ch=32 satisfies every OTHER clause of the direct gate (k=3, stride=1,
+        // out_ch>=8 and a multiple of 4), so only the new ceiling can send it streamed.
+        let dispatched = super::conv3d_forward_f64(
+            &padded, &weight, None, 1, IN_CH, pd, ph, pw, 3, 3, 3, od, oh, ow, 1, 1, 1, OUT_CH,
+        );
+        let streamed = super::conv3d_forward_streamed_f64(
+            &padded, &weight, None, 1, IN_CH, pd, ph, pw, 3, 3, 3, od, oh, ow, 1, 1, 1, OUT_CH,
+        );
+        let direct = super::conv3d_forward_direct_3x3s1_f64(
+            &padded, &weight, None, 1, IN_CH, pd, ph, pw, od, oh, ow, OUT_CH,
+        );
+
+        // Guard the test's own premise: if these ever agreed, the assertion below would
+        // be vacuous and would silently stop testing the gate.
+        assert!(
+            direct
+                .iter()
+                .zip(streamed.iter())
+                .any(|(d, s)| d.to_bits() != s.to_bits()),
+            "premise broken: the routes agree at in_ch={IN_CH}, so this test proves nothing"
+        );
+
+        for (index, (got, want)) in dispatched.iter().zip(streamed.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "conv3d_forward_f64 took the DIRECT route at in_ch={IN_CH} (element {index})"
+            );
+        }
+    }
+
+    /// The ceiling must not evict the one shape where the direct kernel is measured to
+    /// win: in_ch=8 still takes it.
+    #[test]
+    fn conv3d_direct_gate_still_admits_the_shape_it_wins_at() {
+        assert!(
+            8 <= super::CONV3D_DIRECT_MAX_IN_CH,
+            "in_ch=8 is the measured win (1.134x) and must remain on the direct route"
+        );
+        assert!(
+            12 > super::CONV3D_DIRECT_MAX_IN_CH,
+            "in_ch=12 is a measured 0.658x LOSS and must not reach the direct route"
+        );
+    }
+
     #[test]
     fn conv3d_direct_3x3s1_matches_streamed_reference_bits() {
         let padded: Vec<f64> = (0..8 * 5 * 5 * 5)
@@ -59845,6 +59942,117 @@ mod tests {
         let p = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
         let err = bidiag_p_orthonormality_error(&p, n);
         assert!(err < 1e-9, "P P^T deviates from I by {err}");
+    }
+
+    /// `frankentorch-ga99y` step 3, the probe the bead asked for by name: **is each
+    /// individual reflector still orthogonal at rank 2 / scale 1e-20?**
+    ///
+    /// `H = I - tau*v*v^T` is orthogonal exactly when `tau * (v^T v) == 2`, and the
+    /// generator's algebra says that holds identically: with `beta = -sign(alpha)*norm`
+    /// and `d = alpha - beta`, `tau = d/norm` while `v^T v = 1 + tail_sq/d^2 = 2*norm/d`,
+    /// so the product is 2 for every input. If that identity survives in floating point,
+    /// every reflector is orthogonal to rounding, a product of them cannot drift to
+    /// 1.6e-8, and the fault is in the EXPANSION. If it does not survive, generation is
+    /// at fault and the expansion is faithfully expanding bad reflectors.
+    ///
+    /// The decisive experiment above narrowed this to "expansion or reflector
+    /// conditioning" by showing BOTH reductions are bad (unblocked 1.644e-8, blocked
+    /// 1.113e-2). This separates those two, which is the last split on this bead.
+    ///
+    /// Reads `v` exactly the way `bidiag_form_p_f64` reads it, so a packing/indexing
+    /// disagreement between generator and expansion shows up here as a broken identity
+    /// rather than hiding. Reports the worst deviation at the failing scale AND at unit
+    /// scale, because a number is only evidence next to its control.
+    #[test]
+    fn bidiag_reflector_tau_vtv_identity_holds_at_rank_deficient_tiny_scale() {
+        let n = 64usize;
+        let seed = 0xA11CE;
+        let rank = 2usize;
+
+        // Worst |tau*(v^T v) - 2| over the P (row) reflectors, read as the expansion reads
+        // them, plus the same for the Q (column) reflectors as a within-run control.
+        let worst_identity = |scale: f64| -> (f64, f64, usize, String) {
+            let mut packed = bidiag_test_matrix_rank_scaled(n, n, seed, rank, scale);
+            let (_d, _e, tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, n, n);
+
+            let mut worst_p = 0.0f64;
+            let mut live_p = 0usize;
+            let mut worst_detail = String::new();
+            for i in 0..n {
+                let tau = taup[i];
+                let row0 = i + 1;
+                if row0 >= n || tau == 0.0 {
+                    continue;
+                }
+                live_p += 1;
+                let nrows = n - row0;
+                // v[0] = 1 implicitly; v[r] = packed[i*n + row0 + r] -- byte-for-byte the
+                // read in bidiag_form_p_f64.
+                let mut vtv = 1.0f64;
+                for r in 1..nrows {
+                    let value = packed[i * n + row0 + r];
+                    vtv += value * value;
+                }
+                let deviation = (tau * vtv - 2.0).abs();
+                if deviation > worst_p {
+                    worst_p = deviation;
+                    // Recover the generator's inputs from what it left behind, so the
+                    // failing reflector can be read rather than guessed at:
+                    // packed[i*n+row0] is beta, and tau = (beta-alpha)/beta gives
+                    // alpha = beta*(1-tau). The identity predicts v^T v = 2|beta|/|alpha-beta|,
+                    // so comparing that against the summed vtv says whether the STORED v
+                    // is mis-scaled or whether tau itself is wrong.
+                    let beta = packed[i * n + row0];
+                    let alpha = beta * (1.0 - tau);
+                    let predicted = 2.0 * beta.abs() / (alpha - beta).abs();
+                    worst_detail = format!(
+                        "i={i} tau={tau:.17e} vtv={vtv:.17e} predicted_vtv={predicted:.17e} \
+                         beta={beta:.6e} alpha={alpha:.6e} tail_ratio={:.3e}",
+                        (vtv - 1.0).max(0.0).sqrt()
+                    );
+                }
+            }
+
+            let mut worst_q = 0.0f64;
+            for j in 0..n {
+                let tau = tauq[j];
+                let col0 = j + 1;
+                if col0 >= n || tau == 0.0 {
+                    continue;
+                }
+                let mut vtv = 1.0f64;
+                for r in col0..n {
+                    let value = packed[r * n + j];
+                    vtv += value * value;
+                }
+                worst_q = worst_q.max((tau * vtv - 2.0).abs());
+            }
+            (worst_p, worst_q, live_p, worst_detail)
+        };
+
+        let (tiny_p, tiny_q, tiny_live, tiny_detail) = worst_identity(1e-20);
+        let (unit_p, unit_q, unit_live, unit_detail) = worst_identity(1.0);
+
+        let verdict = if tiny_p > 1e-12 {
+            "GENERATION at fault -- individual reflectors are not orthogonal"
+        } else {
+            "reflectors are orthogonal -- the EXPANSION is at fault"
+        };
+        println!(
+            "ga99y tau*(vTv)-2  rank={rank} n={n}: scale 1e-20 P {tiny_p:.3e} Q {tiny_q:.3e} \
+             ({tiny_live} live P reflectors); scale 1e0 P {unit_p:.3e} Q {unit_q:.3e} \
+             ({unit_live} live) -- {verdict}"
+        );
+        println!("  worst P reflector @1e-20: {tiny_detail}");
+        println!("  worst P reflector @1e0  : {unit_detail}");
+
+        // The identity is exact algebra, so it must hold to rounding at BOTH scales. This
+        // is the assertion the bead is owed: it fails loudly if generation ever regresses,
+        // and it documents which half of the pipeline is exonerated.
+        assert!(
+            tiny_p < 1e-12 && tiny_q < 1e-12 && unit_p < 1e-12 && unit_q < 1e-12,
+            "tau*(v^T v) must be 2 for every reflector at every scale"
+        );
     }
 
     /// THE DECISIVE EXPERIMENT for `frankentorch-ga99y`, using only existing
