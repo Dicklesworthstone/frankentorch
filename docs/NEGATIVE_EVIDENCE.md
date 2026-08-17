@@ -30497,3 +30497,66 @@ exists.
 No vs-PyTorch row was taken this turn: neighbouring measurements were live and item 38's
 contention effect manufactures wins in exactly that condition. conv2d's standings remain item
 128's — 1.7-2.1x SLOWER summed, 7.4-8.8x SLOWER real.
+
+## 136. conv2d's BACKWARD IS SHAPE-BOUND, CONFIRMED — GEMM EFFICIENCY SCALES ALMOST LINEARLY WITH out_ch, AND THE SCORED SHAPE RUNS AT ~30% OF ITS OWN CEILING
+
+`frankentorch-hi9r6` (P0). Item 134 rejected the gate explanation by measuring it and left one
+unpriced candidate standing: the dpanel GEMM's `k`, which IS `out_ch`, and which at the scored
+shape is 32 — an eighth of one `DGEMM_KC` (256) block. This prices it.
+
+`examples/conv2d_outch_efficiency_probe.rs` sweeps `out_ch` through the PUBLIC
+`conv2d_backward_f64` with everything else fixed (`[8,32,32,32]` k=3 s=1 pad=1, flat=8192,
+patch_width=288), subtracts `im2col` and `col2im` at every point, and normalises by FLOPs.
+min-of-7, rayon_threads=8, loadavg 20.07/16.74/15.39, CPU idle 87% verified by vmstat with
+iowait 0, df 203G.
+
+    out_ch   k/KC    gemm ms (asc)   GFLOP/s (asc)   GFLOP/s (desc)
+         8   0.03           9.057             8.3             8.1
+        16   0.06           8.263            18.3            17.9
+        32   0.12           8.234            36.7            38.5   <- the scored shape
+        64   0.25          10.013            60.3            60.7
+       128   0.50          15.601            77.4            93.7
+       256   1.00          21.699           111.3           133.7
+
+### THE SWEEP IS RUN IN BOTH DIRECTIONS, AND THAT IS WHY IT IS READABLE
+
+A first attempt looked identical in shape and was THROWN AWAY: its controls drifted 3.3x
+(`im2col` 8.014 -> 2.438 -> 5.719) because the host was at loadavg 25, and sweep order
+correlates with time, so a drifting host manufactures a monotonic trend. The rerun sweeps
+ascending AND descending in one process. Ascending and descending agree at every point
+(8.3/8.1, 18.3/17.9, 36.7/38.5, 60.3/60.7), and the controls are flat (`im2col` 0.66-1.68,
+`col2im` 0.76-1.34, no systematic direction). A drift artefact reverses when the order
+reverses; this does not.
+
+### WHAT IT SAYS
+
+GEMM efficiency is very nearly PROPORTIONAL to `out_ch` in the thin regime — 8x more channels
+(8 -> 64) buys 7.3x more GFLOP/s — and then flattens as `k/KC` approaches 1. That is the
+signature of a fixed per-call cost amortised over `k`: the pack. **At the scored `out_ch=32` the
+same code runs at ~37 GFLOP/s against ~111-134 at `k = DGEMM_KC`, so conv2d's backward is
+operating at roughly 30% of the ceiling its own GEMM reaches on the same machine.**
+
+The thin-`k` hypothesis is CONFIRMED, and unlike the gate hypothesis it survived being measured.
+
+### WHAT IS STILL NOT SEPARATED, AND SHOULD BE BEFORE A LEVER
+
+`out_ch` moves the dpanel GEMM's `k` AND the dweight GEMM's `m` simultaneously, so this sweep
+cannot say which of the two thin shapes carries the loss — it says the loss is SHAPE, not that
+it is `k`. Timing the two GEMMs apart needs `mod gemm` to be reachable, which
+`#![forbid(unsafe_code)]` plus its privacy currently prevents from an example; an in-crate bench
+is the honest next instrument. Item 134 is the standing warning against skipping that step: the
+last hypothesis that looked obvious from reading bought 1.041x.
+
+### THE SHAPE OF A FIX, NOT ATTEMPTED
+
+Nothing here is a lever yet, and the two candidates pull in different directions:
+  * **Do not decompose at all for small `out_ch`.** A direct convolution has no panel to pack
+    and no thin GEMM; the entire 30%-of-ceiling problem is an artefact of choosing im2col+GEMM
+    for a shape that does not suit it. This is the one that matches the evidence.
+  * **Batch the k dimension differently** — but `k = out_ch` is set by the operator, not by us,
+    so there is nothing to lengthen. That is precisely why the gate fix could not work.
+
+PyTorch is 3.0-3.6 ms on this lane against our 11-13 ms, and it does not use a thin GEMM at
+small channel counts. That is the gap, and it is now attributed rather than guessed.
+
+Arm-internal: no incumbent in this probe, no ratio, no gate. Not a standing.
