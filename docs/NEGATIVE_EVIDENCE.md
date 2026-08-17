@@ -26665,3 +26665,50 @@ of that term to the widen this removes.
 Item 69's widen shipped with a 20.351 ms prediction the board confirmed to 0.5%. This one
 owes the same check — session-minus-kernels on the filtered group_norm family, in a settled
 window, against the 5.45 ms baseline.
+
+## 81. ITEM 80 COMPLETED — BOTH f32 GroupNorm BACKWARD ROUTES NOW EMIT f64 dx
+
+Item 80 removed the widen from the SHORTCUT route only (the one the scored lane takes when
+the loss is a plain sum). The non-shortcut route — `functional_group_norm` reached without
+the sum shortcut — still returned `Vec<f32>` and was widened in ft-api, so the fast path was
+a special case rather than the rule. Closed here.
+
+`group_norm_backward_scalar_f32_dx_f64` is the statistics-RECOMPUTING entry. It dispatches
+exactly as its f32 twin does: `cpg == 2` goes through the shared generic body and pays no
+widen at all; every other `cpg` falls through to the unchanged general kernel and is widened
+inside the entry. **So the new entry is never worse than the f32 one and is better on the
+shape the board runs.**
+
+### 81a. A third body was NOT written, deliberately
+
+Making the general (`cpg != 2`) kernel generic too would have added a second large body to
+this change for no measured caller — the board only exercises `cpg == 2`, and item 78 is the
+standing reason not to convert code no lane runs. The widen for those shapes simply moved
+from ft-api into the kernel entry, unchanged.
+
+### 81b. The stats computation is now shared, not copied
+
+The recomputing entry needs the same per-group `mean`/`rstd`/`sum0`/`sum1` its f32 twin
+builds inline. Copying that block would have put the formula in two places — precisely the
+drift the shared-body comment in this file already warns about, and the same trap item 80a
+avoided. It is extracted to `group_norm_cpg2_stats_f32` and both entries call it.
+
+### 81c. Proof extended to both dispatch branches
+
+`group_norm_cpg2_dx_f64_matches_the_f32_route_widened_bitwise` now also runs the recomputing
+entry against its f32 twin at **cpg = 2, 2, 3 and 5** — covering both the shared-body branch
+and the general-kernel fallback — comparing `dx` bit for bit against the f32 output widened,
+and asserting `dweight`/`dbias` unchanged outright. 654 ft-kernel-cpu and 2579 ft-api tests
+pass.
+
+### 81d. Still unmeasured, and the debt is now explicit
+
+`uptime` read 42.6 / 46.1 / 34.7 rising when this tick began and 21-40 while it ran, so no
+measurement was taken and **no speedup is claimed for items 80 or 81**. The owed check is
+unchanged and now covers both: session-minus-kernels on the filtered group_norm family in a
+settled window, against item 70d's 5.45 ms baseline, with the prediction that it falls
+toward ~1 ms because 84% of that term was the widen these two items remove.
+
+Two items have now shipped on this lever without a number. Item 69 set the standard —
+a 20.351 ms prediction the board confirmed to 0.5% — and that standard has not yet been met
+here.

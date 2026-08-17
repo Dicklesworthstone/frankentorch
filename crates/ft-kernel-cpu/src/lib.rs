@@ -7233,44 +7233,8 @@ pub fn group_norm_backward_scalar_f32(
     spatial: usize,
     eps: f32,
 ) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
-    let group_numel = cpg * spatial;
-    let inv_m = 1.0f32 / group_numel as f32;
     if cpg == 2 {
-        let stats: Vec<GroupNormCpg2StatsF32> = (0..batch * num_groups)
-            .into_par_iter()
-            .map(|grp| {
-                let base = grp * group_numel;
-                let (x0, x1) = x[base..base + group_numel].split_at(spatial);
-                let mut sum = 0.0f32;
-                let mut sum0 = 0.0f32;
-                for &v in x0 {
-                    sum += v;
-                    sum0 += v;
-                }
-                let mut sum1 = 0.0f32;
-                for &v in x1 {
-                    sum += v;
-                    sum1 += v;
-                }
-                let mean = sum * inv_m;
-                let mut vsum = 0.0f32;
-                for &v in x0 {
-                    let d = v - mean;
-                    vsum += d * d;
-                }
-                for &v in x1 {
-                    let d = v - mean;
-                    vsum += d * d;
-                }
-                let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
-                GroupNormCpg2StatsF32 {
-                    mean,
-                    rstd,
-                    sum0,
-                    sum1,
-                }
-            })
-            .collect();
+        let stats = group_norm_cpg2_stats_f32(x, batch, num_groups, spatial, eps);
         return group_norm_backward_scalar_f32_cpg2_from_stats(
             upstream, x, weight, &stats, batch, num_groups, spatial,
         );
@@ -7278,6 +7242,58 @@ pub fn group_norm_backward_scalar_f32(
     group_norm_backward_scalar_f32_general(
         upstream, x, weight, batch, num_groups, cpg, spatial, eps,
     )
+}
+
+/// Rebuild the `cpg == 2` per-group statistics the forward would have handed over.
+///
+/// frankentorch-68pwz: extracted from `group_norm_backward_scalar_f32` so the f32 and f64
+/// dx entry points share ONE copy. Duplicating it would have put the mean/rstd formula in
+/// two places, which is the drift the shared-body comment below already guards against.
+#[must_use]
+fn group_norm_cpg2_stats_f32(
+    x: &[f32],
+    batch: usize,
+    num_groups: usize,
+    spatial: usize,
+    eps: f32,
+) -> Vec<GroupNormCpg2StatsF32> {
+    let group_numel = 2 * spatial;
+    let inv_m = 1.0f32 / group_numel as f32;
+    (0..batch * num_groups)
+        .into_par_iter()
+        .map(|grp| {
+            let base = grp * group_numel;
+            let (x0, x1) = x[base..base + group_numel].split_at(spatial);
+            let mut sum = 0.0f32;
+            let mut sum0 = 0.0f32;
+            for &v in x0 {
+                sum += v;
+                sum0 += v;
+            }
+            let mut sum1 = 0.0f32;
+            for &v in x1 {
+                sum += v;
+                sum1 += v;
+            }
+            let mean = sum * inv_m;
+            let mut vsum = 0.0f32;
+            for &v in x0 {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            for &v in x1 {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+            GroupNormCpg2StatsF32 {
+                mean,
+                rstd,
+                sum0,
+                sum1,
+            }
+        })
+        .collect()
 }
 
 /// [`group_norm_backward_scalar_f32`] for `cpg == 2` with the per-group
@@ -7307,6 +7323,42 @@ pub fn group_norm_backward_scalar_f32_with_cpg2_stats(
     group_norm_backward_scalar_f32_cpg2_from_stats(
         upstream, x, weight, stats, batch, num_groups, spatial,
     )
+}
+
+/// [`group_norm_backward_scalar_f32`] writing `dx` straight into `f64` —
+/// `frankentorch-68pwz`, completing item 80.
+///
+/// The statistics-recomputing route, for callers that do not already hold them. `cpg == 2`
+/// goes through the same generic body as
+/// [`group_norm_backward_scalar_f32_dx_f64_with_cpg2_stats`] and pays no widen at all;
+/// every other `cpg` falls through to the unchanged general kernel and is widened here, so
+/// this entry is never worse than the f32 one and is better on the shape the board runs.
+///
+/// Splitting it this way rather than making the general kernel generic keeps a second,
+/// larger body out of the change — it has no measured caller and item 78 is the standing
+/// reason not to convert code no lane exercises.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_backward_scalar_f32_dx_f64(
+    upstream: f32,
+    x: &[f32],
+    weight: Option<&[f32]>,
+    batch: usize,
+    num_groups: usize,
+    cpg: usize,
+    spatial: usize,
+    eps: f32,
+) -> (Vec<f64>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    if cpg == 2 {
+        let stats = group_norm_cpg2_stats_f32(x, batch, num_groups, spatial, eps);
+        return group_norm_backward_scalar_f32_cpg2_from_stats(
+            upstream, x, weight, &stats, batch, num_groups, spatial,
+        );
+    }
+    let (dx, dweight, dbias) = group_norm_backward_scalar_f32_general(
+        upstream, x, weight, batch, num_groups, cpg, spatial, eps,
+    );
+    (dx.iter().map(|&v| f64::from(v)).collect(), dweight, dbias)
 }
 
 /// [`group_norm_backward_scalar_f32_with_cpg2_stats`] writing `dx` straight into `f64` —
@@ -45904,6 +45956,40 @@ mod tests {
             // dweight/dbias are untouched by the change and must be identical outright.
             assert_eq!(dw64, dw32, "dweight moved at spatial={spatial}");
             assert_eq!(db64, db32, "dbias moved at spatial={spatial}");
+        }
+
+        // The statistics-RECOMPUTING entry (item 80's completion), over both branches it
+        // dispatches on: cpg == 2 takes the shared generic body and pays no widen, every
+        // other cpg falls through to the general kernel and is widened inside the entry.
+        // Both must equal the f32 route widened.
+        for &(batch, num_groups, cpg, spatial) in
+            &[(2usize, 3usize, 2usize, 8usize), (1, 2, 2, 5), (2, 3, 3, 7), (1, 2, 5, 4)]
+        {
+            let channels = num_groups * cpg;
+            let numel = batch * num_groups * cpg * spatial;
+            let x: Vec<f32> = (0..numel)
+                .map(|index| ((index % 41) as f32) * 0.0625 - 1.75)
+                .collect();
+            let weight: Vec<f32> = (0..channels).map(|c| 0.5 + (c as f32) * 0.125).collect();
+            let upstream = -0.375f32;
+            let eps = 1e-5f32;
+
+            let (dx32, dw32, db32) = super::group_norm_backward_scalar_f32(
+                upstream, &x, Some(&weight), batch, num_groups, cpg, spatial, eps,
+            );
+            let (dx64, dw64, db64) = super::group_norm_backward_scalar_f32_dx_f64(
+                upstream, &x, Some(&weight), batch, num_groups, cpg, spatial, eps,
+            );
+            assert_eq!(dx64.len(), dx32.len(), "len mismatch at cpg={cpg}");
+            for (index, (wide, narrow)) in dx64.iter().zip(dx32.iter()).enumerate() {
+                assert_eq!(
+                    wide.to_bits(),
+                    f64::from(*narrow).to_bits(),
+                    "recomputing dx diverged at {index} (cpg={cpg} spatial={spatial})"
+                );
+            }
+            assert_eq!(dw64, dw32, "dweight moved at cpg={cpg}");
+            assert_eq!(db64, db32, "dbias moved at cpg={cpg}");
         }
     }
 

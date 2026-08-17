@@ -37756,7 +37756,11 @@ impl FrankenTorchSession {
                         move |_ctx, grad_outputs, borrowed| {
                             #[allow(clippy::cast_possible_truncation)]
                             let upstream = grad_outputs[0][0] as f32;
-                            let (dx, dw, db) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+                            // frankentorch-68pwz item 80: the non-shortcut f32 GroupNorm
+                            // backward now takes the f64-dx entry too, so cpg==2 pays no
+                            // widen here either. Other cpg values are widened inside the
+                            // kernel entry, unchanged.
+                            let (dx, dw, db) = ft_kernel_cpu::group_norm_backward_scalar_f32_dx_f64(
                                 upstream,
                                 borrowed[0].0,
                                 Some(borrowed[1].0),
@@ -37767,9 +37771,7 @@ impl FrankenTorchSession {
                                 eps_f,
                             );
                             Ok(vec![
-                                // frankentorch-68pwz: same widen on the non-shortcut
-                                // f32 GroupNorm backward. See `widen_f32_to_f64`.
-                                Some(widen_f32_to_f64(&dx)),
+                                Some(dx),
                                 Some(widen_f32_to_f64(&dw.unwrap())),
                                 Some(widen_f32_to_f64(&db.unwrap())),
                             ])
