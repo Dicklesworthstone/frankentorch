@@ -121,6 +121,29 @@ const C3_K: usize = 3;
 // the 2026-07-05 all-ones adjoint is eligible. Sized so the im2col panel (8192 x 288 f64,
 // 18.9 MB) is the same order as conv3d's, keeping the two lanes comparable.
 const C2_N: usize = 8;
+/// The `conv2d_big*` twins' batch — `frankentorch-hi9r6`, item 142.
+///
+/// Item 137 could not certify EITHER conv2d lane: our A/A null passed 5/5 and PyTorch's failed
+/// 5/5, and item 137c blamed the incumbent arm's duration (2.3-3.1 ms) rather than the host,
+/// pointing at `frankentorch-uilzh`'s group_norm precedent where a lane only nulled once the
+/// incumbent sat in the 4-7 ms band.
+///
+/// That is a HYPOTHESIS about why the null fails, and doubling the batch is what tests it. If
+/// PyTorch's null passes here at ~5-6 ms, the duration explanation holds and these twins become
+/// conv2d's certifiable lanes; if it fails here too, the explanation is refuted and the cause is
+/// something other than arm length. Either way the answer is a ledger item.
+///
+/// The twins are ADDED rather than swapped in. Item 137c proposed resizing in place and called
+/// the loss of comparability with items 128 and 137 "the price"; that price only buys something
+/// if the resize works, and it is not yet known that it does. Keeping both sizes costs two lanes
+/// of sweep time and keeps the old rows meaningful, and the small pair can be retired later on
+/// evidence rather than on the expectation of it.
+///
+/// BATCH is the dimension doubled, deliberately. It scales `flat` (8192 -> 16384) and so both
+/// GEMMs proportionally, while leaving `out_ch` and `patch_width` fixed -- item 136 measured
+/// GEMM efficiency rising with `out_ch`, so growing THAT would move the lane along the very
+/// curve the bead is trying to measure and confound the resize with a shape change.
+const C2B_N: usize = 16;
 const C2_CI: usize = 32;
 const C2_CO: usize = 32;
 const C2_H: usize = 32;
@@ -740,17 +763,21 @@ fn timed_prelu(
 /// `timed_conv3d_masked` does, so the upstream gradient is `mask` rather than all-ones and the
 /// call reaches the generic backward. It is a leaf, so its construction sits outside the timer
 /// on both arms.
-fn timed_conv2d(values: &[f64], weights: &[f64], mask: Option<&[f64]>) -> (f64, f64) {
+///
+/// `batch` is a parameter rather than `C2_N` so the item 142 `conv2d_big*` twins share this exact
+/// body: a resize whose two sizes ran through different code would test the code as much as the
+/// size.
+fn timed_conv2d(values: &[f64], weights: &[f64], mask: Option<&[f64]>, batch: usize) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
-        .tensor_variable(values.to_vec(), vec![C2_N, C2_CI, C2_H, C2_W], true)
+        .tensor_variable(values.to_vec(), vec![batch, C2_CI, C2_H, C2_W], true)
         .expect("conv2d leaf");
     let w = session
         .tensor_variable(weights.to_vec(), vec![C2_CO, C2_CI, C2_K, C2_K], false)
         .expect("conv2d weight");
     let m = mask.map(|values| {
         session
-            .tensor_variable(values.to_vec(), vec![C2_N, C2_CO, C2_H, C2_W], false)
+            .tensor_variable(values.to_vec(), vec![batch, C2_CO, C2_H, C2_W], false)
             .expect("conv2d mask")
     });
     let started = Instant::now();
@@ -967,6 +994,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c2x = seq(C2_N * C2_CI * C2_H * C2_W);
     let c2w = seq(C2_CO * C2_CI * C2_K * C2_K);
     let c2m = seq(C2_N * C2_CO * C2_H * C2_W);
+    // item 142's doubled-batch twins. Same `seq` generator, same weights -- only the batch
+    // differs, so any change in the ratio is the resize and not a different workload.
+    let c2bx = seq(C2B_N * C2_CI * C2_H * C2_W);
+    let c2bm = seq(C2B_N * C2_CO * C2_H * C2_W);
     let linx = seq(LIN_B * LIN_IN);
     let linw_wide = seq(LIN_OUT_WIDE * LIN_IN);
     let linw_narrow = seq(LIN_OUT_NARROW * LIN_IN);
@@ -1033,6 +1064,9 @@ c3m=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 c2x=seq(8*32*32*32).reshape(8,32,32,32)
 c2w=seq(32*32*3*3).reshape(32,32,3,3)
 c2m=seq(8*32*32*32).reshape(8,32,32,32)
+# item 142: the doubled-batch twins, same weights, same generator.
+c2bx=seq(16*32*32*32).reshape(16,32,32,32)
+c2bm=seq(16*32*32*32).reshape(16,32,32,32)
 linx=seq(512*1024).reshape(512,1024)
 linw_wide=seq(128*1024).reshape(128,1024).requires_grad_(True)
 linw_narrow=seq(512*1024).reshape(512,1024).requires_grad_(True)
@@ -1080,6 +1114,10 @@ LANES = {
     # gradient non-uniform, so the second lane reaches the generic backward as conv3d_masked does.
     "conv2d":        (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_masked": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
+    # item 142: the same two routes at double the batch, to test whether a ~5-6 ms incumbent
+    # arm nulls where a ~3 ms one would not.
+    "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
+    "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
@@ -1568,13 +1606,24 @@ LANES = {
             // frankentorch-58zjz item 126d: conv2d's SUMMED route, which takes the all-ones
             // fast path its 2026-07-05 adjoint provides.
             "conv2d",
-            Box::new(|| timed_conv2d(&c2x, &c2w, None)),
+            Box::new(|| timed_conv2d(&c2x, &c2w, None, C2_N)),
         ),
         (
             // The same op under a NON-UNIFORM loss, reaching the generic backward -- the route
             // real training takes, and the one item 124 found algorithmically behind for conv3d.
             "conv2d_masked",
-            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m))),
+            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N)),
+        ),
+        (
+            // item 142: both routes again at double the batch. Item 137 certified NEITHER
+            // conv2d lane because PyTorch's A/A null failed 5/5 while ours passed 5/5, and
+            // item 137c blamed the incumbent arm's ~3 ms duration. These twins test that.
+            "conv2d_big",
+            Box::new(|| timed_conv2d(&c2bx, &c2w, None, C2B_N)),
+        ),
+        (
+            "conv2d_big_masked",
+            Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N)),
         ),
         (
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate

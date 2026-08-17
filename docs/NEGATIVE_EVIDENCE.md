@@ -30862,3 +30862,122 @@ shared cache.
 
 Deletion condition for this item: when `.zshrc:51` is gone, the per-invocation guard stops being
 load-bearing and this stops being worth remembering.
+
+## 142. conv2d GETS ITS FIRST CERTIFIED STANDING — 5.73x SLOWER — AND THE RESIZE CONFIRMS ITEM 137c: THE INCUMBENT'S NULL WAS DURATION-BOUND, SO THE BLOCKER IS NOW ON OUR SIDE
+
+`frankentorch-hi9r6` (P0). Item 137 measured both conv2d lanes and could certify NEITHER: our
+A/A null passed 5/5 and PyTorch's failed 5/5. Item 137c blamed the incumbent arm's duration
+(2.3-3.1 ms) rather than the host, citing `frankentorch-uilzh`'s group_norm precedent where a
+lane only nulled once the incumbent sat in the 4-7 ms band, and proposed resizing the lane.
+
+That was a HYPOTHESIS about why a gate fails, and it had never been tested. This item tests it
+by adding `conv2d_big` / `conv2d_big_masked` — the same two routes at double the batch — and
+running all four lanes in ONE invocation so host load is common-mode and cannot explain a
+difference between them.
+
+Host `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2, governor powersave,
+`RAYON_NUM_THREADS=8` (the width every conv2d standing is taken at), online_cpus=64,
+incumbent PyTorch 2.12.1+cpu self-reported by the arm in the same invocation, torch threads=8,
+allocator mimalloc (`--features fair-alloc`), ELF sha256 `3d9b995be11945f817a14458997f4b61ed0f05cbf01e858c56d894c6d4e30ae7`
+self-reported from inside the process. loadavg 16.24-20.93 across the three runs, drift gate
+PASS on all three, CPU idle 88% verified by me with vmstat (iowait 0%), df 197-201G. Cross-core
+clock spread while sampling 2.82-2.98x, arms NOT pinned.
+
+    lane                 FT(ms)   PT(ms)   standing        PT null           FT null
+    run a / run b / run c, 16 rounds each, per-round median estimator
+    conv2d               4.925    3.002    1.64x SLOWER    FAIL  1.317       FAIL
+                         5.504    3.091    1.78x SLOWER    FAIL  1.140       OFFSET
+                         5.879    3.156    1.86x SLOWER    FAIL  1.059       FAIL
+    conv2d_masked       16.127    2.696    5.98x SLOWER    FAIL  0.907       FAIL
+                        16.697    2.913    5.73x SLOWER    PASS  1.000       PASS   <- QUOTABLE
+                        17.355    3.180    5.46x SLOWER    OFFSET 0.961      OFFSET
+    conv2d_big           8.967   11.232    1.25x FASTER    PASS  0.997       FAIL 1.151
+                         9.385   11.171    1.19x FASTER    PASS  0.994       FAIL 1.177
+                         9.686   11.182    1.15x FASTER    PASS  0.992       FAIL 1.170
+    conv2d_big_masked   40.521   11.397    3.56x SLOWER    PASS  1.017       OFFSET 0.968
+                        40.645   11.177    3.64x SLOWER    PASS  0.994       PASS   <- QUOTABLE
+                        41.868   11.622    3.60x SLOWER    PASS  1.015       FAIL 0.954
+
+### 142a. THE HYPOTHESIS IS CONFIRMED — PyTorch's NULL IS DURATION-BOUND
+
+PyTorch's A/A null passed **6/6 on the big lanes** (point estimates 0.992-1.017, every one
+inside the +/-0.02 band) and **1/6 on the small ones**. That is the cleanest result here, and it
+was measured with the small lanes running in the same invocation as their controls, so host load
+cannot account for it. Item 137c's diagnosis was right: a ~3 ms incumbent arm cannot null on
+this host, and a ~11 ms one can.
+
+This also corrects item 137's own framing. It reported PyTorch failing 5/5 and read that as a
+property of the lane; run b here shows the small masked lane nulling cleanly on both arms. The
+small arm's null is not impossible, it is unreliable — which is worse for certification, because
+it means a passing small-lane row is a coin-flip rather than a repeatable gate.
+
+### 142b. conv2d's FIRST CERTIFIED ROW, AND IT IS BETTER THAN THE UNCERTIFIED ONE
+
+Run b certified two rows on both gates with parity `match`:
+
+* **`conv2d_masked` FT 16.697 ms vs PyTorch 2.913 ms — 5.73x SLOWER.**
+* **`conv2d_big_masked` FT 40.645 ms vs PyTorch 11.177 ms — 3.64x SLOWER.**
+
+Item 128's widely-quoted **7.4-8.8x** was never certifiable and should stop being quoted; the
+certified figure for the training route at the original shape is **5.73x**. conv2d is still the
+worst standing on the board, but by less than the bead has been claiming for four items.
+
+The bigger shape stands at 3.60-3.64x across all three runs — noticeably better than the small
+shape's 5.46-5.98x, which is consistent with item 141's finding that a large fixed cost, not a
+FLOP-proportional one, dominates this kernel.
+
+### 142c. THE BLOCKER MOVED TO OUR SIDE, AND IT IS SPECIFIC
+
+`conv2d_big`'s FT null failed **3/3 at 1.151, 1.177, 1.170** — a 15-18% asymmetry between our
+own two slots, reproducing to within 2.6% across three runs. That consistency is what makes it a
+defect rather than noise: a load artefact would not land three times on the same value while the
+incumbent's null in the same rounds sits at 0.992-0.997.
+
+It is confined to the SUMMED route at the bigger batch. `conv2d_big_masked` nulls fine (0.954,
+0.968, PASS), and small `conv2d_big`'s route at the original batch does not show it. So the
+suspect is the all-ones fast-path adjoint interacting with a doubled working set, not the lane
+machinery — the summed route allocates and first-touches a 37.7 MiB output-sized buffer where
+the masked route reuses the mask leaf.
+
+This is a fresh, aimed lever and it belongs to us, which is a better position than item 137's:
+there, the gate that blocked certification was in the incumbent's arm and nothing we could write
+would have moved it.
+
+### 142d. WHAT THE RESIZE COST — THE INCUMBENT CHANGED REGIME, NOT JUST DURATION
+
+Doubling the batch did NOT simply make PyTorch's arm longer. Its time went **3.00 -> 11.23 ms
+for 2x the work, a 3.74x jump**, while ours went 4.93 -> 8.97 ms (1.82x, sublinear). Whatever
+torch does at the small shape — a cache-resident regime, a threading decision — it stops doing
+at the large one.
+
+So `conv2d_big` is not "the same lane, longer", and its 1.15-1.25x FASTER reading must NOT be
+carried back to the original shape as evidence about it. **That reading is also not a win in its
+own right**: our null fails 3/3 on exactly that lane, so it is not quotable, and the first thing
+to do with it is 142c rather than to celebrate it. A ratio whose favourable direction comes from
+the incumbent scaling badly is a claim about torch's regime change and needs its own
+verification before it is anything else.
+
+### 142e. WHY THE TWINS WERE ADDED RATHER THAN SWAPPED IN
+
+Item 137c proposed resizing in place and called losing comparability with items 128 and 137 "the
+price". That price only buys something if the resize works, and it was not known that it would.
+Keeping both sizes cost two lanes of sweep time and bought the control that produced 142a: the
+small lanes ran beside the big ones, so "PyTorch nulls at 11 ms but not at 3 ms" is a
+within-invocation comparison rather than a claim across runs. Had the small lanes been deleted,
+the resize would have had to be justified by comparing against item 137's numbers taken on a
+different day at a different load — the exact move items 123 and 139 exist to forbid.
+
+Retiring the small pair is now defensible on evidence, but it is a separate decision and this
+item does not take it.
+
+### CROSS-REFERENCE, AND WHAT THIS DOES NOT TOUCH
+
+Item 139 measured this lane as 91.3% kernel at 8 threads; item 141 then found 57% of that kernel
+belongs to no phase anyone has named. Together those put roughly half of the certified 5.73x
+inside a cost with no owner. Nothing in this item attributes that cost — it certifies the
+standing the attribution work is aimed at, and supplies the shape where the gates actually hold.
+
+The estimator caveat from item 139 applies here too, in reverse: these are per-round MEDIANS over
+16 rounds, and the min-estimator lines in the same output read 8.53x, 3.62x and so on. The
+medians are what the gates judge and what is quoted; the min figures are not interchangeable with
+them.
