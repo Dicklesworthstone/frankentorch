@@ -15186,19 +15186,67 @@ impl TensorTape {
                         pad_before[dim] = padding[i * 2];
                     }
 
+                    // The un-pad is a pure GATHER of the unpadded region — no arithmetic
+                    // on values at all — so it is bit-identical however it is ordered or
+                    // fanned out. It used to run one element at a time, and each element
+                    // paid `ndim` integer divisions plus `ndim` modulos to un-flatten its
+                    // index, all on a single thread. Measured on the conv3d lane
+                    // ([2,32,8,16,16] k=3 pad=1): 2.06-2.82 ms of an 8.81 ms backward
+                    // stage, ~1/4 of it, to move 1 MB.
+                    //
+                    // The innermost axis is contiguous in BOTH buffers (the pad only
+                    // shifts its start), so the whole thing is a row-wise memcpy: divide
+                    // once per ROW instead of once per element (8192 rows, not 131072
+                    // elements, at this shape) and let the rows fan over Rayon. Serial and
+                    // parallel run the identical row copy, so the gate changes only the
+                    // fan-out, never a value. frankentorch-l2zki.
+                    const PAD_BWD_PAR_MIN: usize = 1 << 15;
+                    let inner_len = if ndim == 0 { 0 } else { original_shape[ndim - 1] };
                     let mut contrib = vec![0.0; in_numel];
-                    let mut coords = vec![0usize; ndim];
-                    for flat_in in 0..in_numel {
-                        let mut rem = flat_in;
-                        for d in 0..ndim {
-                            coords[d] = rem / in_strides[d];
-                            rem %= in_strides[d];
+                    if inner_len == 0 {
+                        // ndim == 0 (scalar) or a zero-length innermost axis: no rows to
+                        // copy. A 0-d pad has in_numel == 1 and its single element sits at
+                        // flat_out 0, which the per-element walk below still handles.
+                        let mut coords = vec![0usize; ndim];
+                        for flat_in in 0..in_numel {
+                            let mut rem = flat_in;
+                            for d in 0..ndim {
+                                coords[d] = rem / in_strides[d];
+                                rem %= in_strides[d];
+                            }
+                            let mut flat_out = 0;
+                            for d in 0..ndim {
+                                flat_out += (coords[d] + pad_before[d]) * out_strides[d];
+                            }
+                            contrib[flat_in] = incoming[flat_out];
                         }
-                        let mut flat_out = 0;
-                        for d in 0..ndim {
-                            flat_out += (coords[d] + pad_before[d]) * out_strides[d];
+                    } else {
+                        // `in_strides[d]` is a multiple of `inner_len` for every d < ndim-1
+                        // (it is the product of all trailing extents, which includes the
+                        // innermost one), so the row-space stride below divides exactly.
+                        let row_base = pad_before[ndim - 1];
+                        let copy_row = |row: usize, dst: &mut [f64]| {
+                            let mut rem = row;
+                            let mut flat_out = row_base;
+                            for d in 0..ndim - 1 {
+                                let row_stride = in_strides[d] / inner_len;
+                                let coord = rem / row_stride;
+                                rem %= row_stride;
+                                flat_out += (coord + pad_before[d]) * out_strides[d];
+                            }
+                            dst.copy_from_slice(&incoming[flat_out..flat_out + inner_len]);
+                        };
+                        if in_numel >= PAD_BWD_PAR_MIN {
+                            use rayon::prelude::*;
+                            contrib
+                                .par_chunks_mut(inner_len)
+                                .enumerate()
+                                .for_each(|(row, dst)| copy_row(row, dst));
+                        } else {
+                            for (row, dst) in contrib.chunks_mut(inner_len).enumerate() {
+                                copy_row(row, dst);
+                            }
                         }
-                        contrib[flat_in] = incoming[flat_out];
                     }
 
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
@@ -29534,6 +29582,133 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// Independent reference for constant-pad backward: for every element of the
+    /// UNPADDED tensor, the gradient it receives is the incoming gradient at its
+    /// position inside the padded tensor. Written as an explicit 4-deep loop, with no
+    /// shared helper and no stride arithmetic borrowed from the implementation, so it
+    /// cannot agree with a wrong un-flattening by construction.
+    fn unpad_gather_reference_4d(
+        incoming: &[f64],
+        shape: [usize; 4],
+        pad_before: [usize; 4],
+        padded_shape: [usize; 4],
+    ) -> Vec<f64> {
+        let mut expected = Vec::with_capacity(shape.iter().product());
+        for i0 in 0..shape[0] {
+            for i1 in 0..shape[1] {
+                for i2 in 0..shape[2] {
+                    for i3 in 0..shape[3] {
+                        let p0 = i0 + pad_before[0];
+                        let p1 = i1 + pad_before[1];
+                        let p2 = i2 + pad_before[2];
+                        let p3 = i3 + pad_before[3];
+                        let flat = ((p0 * padded_shape[1] + p1) * padded_shape[2] + p2)
+                            * padded_shape[3]
+                            + p3;
+                        expected.push(incoming[flat]);
+                    }
+                }
+            }
+        }
+        expected
+    }
+
+    /// The pad backward's row-wise gather has to survive three things at once: a padded
+    /// INNERMOST axis (so every row's source starts at an offset), padded OUTER axes (so
+    /// the row index itself has to be un-flattened), and a leading axis that is NOT
+    /// padded at all (`padding` covers only the trailing dims). This shape is also over
+    /// the parallel gate, so it is the fanned-out path that is being checked.
+    ///
+    /// The incoming gradient is made ALL-DISTINCT by multiplying the padded tensor with a
+    /// distinct-valued constant before the sum. Reducing straight to a sum would make the
+    /// incoming gradient all-ones, and then every possible permutation of the gather —
+    /// including every wrong one — would produce the same answer. frankentorch-l2zki.
+    #[test]
+    fn pad_backward_gathers_the_unpadded_region_under_asymmetric_partial_padding() {
+        const SHAPE: [usize; 4] = [3, 5, 37, 61];
+        // Trailing-dims-first, before/after per dim: dim3 (2,1), dim2 (3,2), dim1 (1,4).
+        // Dim 0 is left unpadded so `num_pad_dims < ndim`.
+        const PADDING: [usize; 6] = [2, 1, 3, 2, 1, 4];
+        const PAD_BEFORE: [usize; 4] = [0, 1, 3, 2];
+        const PADDED_SHAPE: [usize; 4] = [3, 5 + 1 + 4, 37 + 3 + 2, 61 + 2 + 1];
+
+        let numel: usize = SHAPE.iter().product();
+        assert!(
+            numel >= 1 << 15,
+            "shape must clear the parallel gate so this exercises the fanned path"
+        );
+        let padded_numel: usize = PADDED_SHAPE.iter().product();
+
+        let values: Vec<f64> = (0..numel).map(|i| (i % 97) as f64 * 0.5 - 13.0).collect();
+        // Distinct per position, and large enough in magnitude that an off-by-one row
+        // offset cannot coincide with the right answer.
+        let mask: Vec<f64> = (0..padded_numel).map(|i| i as f64 + 0.25).collect();
+
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(values, SHAPE.to_vec(), true).expect("leaf");
+        let padded = tape.pad(x, &PADDING, 0.0).expect("pad");
+        let m = tape
+            .leaf(mask.clone(), PADDED_SHAPE.to_vec(), false)
+            .expect("mask");
+        let (scaled, _) = tape.mul(padded, m, ExecutionMode::Strict).expect("mul");
+        let (root, _) = tape.sum(scaled, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(root).expect("backward");
+        let grad = report.gradient(x).expect("grad").to_vec();
+
+        let expected = unpad_gather_reference_4d(&mask, SHAPE, PAD_BEFORE, PADDED_SHAPE);
+        assert_eq!(grad.len(), expected.len());
+        assert_eq!(grad, expected, "pad backward gathered the wrong positions");
+    }
+
+    /// The same gather below the parallel gate, plus the 1-D case, where the row loop
+    /// `for d in 0..ndim-1` is empty and the whole tensor is a single row whose source
+    /// offset is the innermost pad alone. A row-wise gather that forgot to seed the row
+    /// base with `pad_before[ndim-1]` passes every multi-row test and fails this one.
+    #[test]
+    fn pad_backward_serial_and_one_dimensional_gathers_match_the_reference() {
+        // --- 1-D: one row, offset by the leading pad only.
+        let values: Vec<f64> = (0..9).map(|i| i as f64).collect();
+        let mask: Vec<f64> = (0..(9 + 4 + 2)).map(|i| i as f64 * 3.0 + 1.0).collect();
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(values, vec![9], true).expect("leaf");
+        let padded = tape.pad(x, &[4, 2], 0.0).expect("pad");
+        let m = tape.leaf(mask.clone(), vec![15], false).expect("mask");
+        let (scaled, _) = tape.mul(padded, m, ExecutionMode::Strict).expect("mul");
+        let (root, _) = tape.sum(scaled, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(root).expect("backward");
+        assert_eq!(
+            report.gradient(x).expect("grad").to_vec(),
+            mask[4..4 + 9].to_vec(),
+            "1-D pad backward lost the leading offset"
+        );
+
+        // --- 3-D, well under the parallel gate, asymmetric on every axis.
+        const SHAPE: [usize; 4] = [1, 4, 5, 6];
+        const PADDING: [usize; 6] = [1, 3, 2, 1, 2, 2];
+        const PAD_BEFORE: [usize; 4] = [0, 2, 2, 1];
+        const PADDED_SHAPE: [usize; 4] = [1, 4 + 2 + 2, 5 + 2 + 1, 6 + 1 + 3];
+        let numel: usize = SHAPE.iter().product();
+        assert!(numel < 1 << 15, "this case must stay on the serial path");
+        let padded_numel: usize = PADDED_SHAPE.iter().product();
+        let values: Vec<f64> = (0..numel).map(|i| i as f64 * 0.125).collect();
+        let mask: Vec<f64> = (0..padded_numel).map(|i| i as f64 - 7.5).collect();
+
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(values, SHAPE[1..].to_vec(), true)
+            .expect("leaf 3d");
+        let padded = tape.pad(x, &PADDING, 0.0).expect("pad 3d");
+        let m = tape
+            .leaf(mask.clone(), PADDED_SHAPE[1..].to_vec(), false)
+            .expect("mask 3d");
+        let (scaled, _) = tape.mul(padded, m, ExecutionMode::Strict).expect("mul 3d");
+        let (root, _) = tape.sum(scaled, ExecutionMode::Strict).expect("sum 3d");
+        let report = tape.backward(root).expect("backward 3d");
+
+        let expected = unpad_gather_reference_4d(&mask, SHAPE, PAD_BEFORE, PADDED_SHAPE);
+        assert_eq!(report.gradient(x).expect("grad 3d").to_vec(), expected);
     }
 
     #[test]
