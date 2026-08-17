@@ -27250,3 +27250,93 @@ The `serialfwd` control is stable at 0.368-0.411 across six runs, as a deliberat
 arm should be. `group_norm_f32`'s three certifications and the 3.876 -> 2.017 ms engine
 result of item 83 are untouched by this correction — they were quoted on the min estimator
 throughout.
+
+## 88. conv3d IS THE LAST OF THE CONV FAMILY STILL BUILDING A 28 MB PANEL TO COLUMN-SUM IT — LOCATED BY READING, NOT MEASURED
+
+**Nothing in this entry was measured.** Builds, benches and measurements are stopped
+(loadavg 525, iowait 77%). This is a ledger preflight plus a source reading, and the sizes
+below are arithmetic from the lane's shapes, not observations. It is written now because
+item 85e closed by saying "the next lever is the kernel" without saying WHICH PART of it,
+and that question turns out to be answerable without running anything.
+
+### 88a. THE PANEL HAS EXACTLY ONE CONSUMER, AND IT IS A COLUMN SUM
+
+`conv3d_backward_ones_dout_f64` is the branch the scored lane takes (its loss is
+`out.sum()`, so `dout` is exactly all `+1.0`). It opens with:
+
+    let panel = conv3d_im2col_f64(padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw);
+
+At the lane's shape that panel is `flat x patch_width` = `(2*8*16*16) x (32*3*3*3)` =
+`4096 x 864` = 3,538,944 f64 = **28.3 MB**. Reading the whole function to its close at the
+`(dpadded, dweight, dbias)` return, `panel` is used in exactly ONE place:
+
+    gemm::dgemm(1, flat, patch_width, &ones_flat, &panel, &mut dweight_row);
+
+A `1 x flat` times `flat x patch_width` product whose left operand is all ones **is a column
+sum of the panel.** Nothing else reads `panel`; `dweight` is then that single row replicated
+across output channels, and the input-gradient half of the function never touches it.
+
+So the kernel materializes 28.3 MB, streams it back once, and keeps 864 numbers. Every entry
+of that panel is a COPY of a padded-input element, so the same 864 numbers are a strided
+reduction over `padded` itself — 207,360 elements, **1.6 MB**. The panel is dead weight
+between an input we already hold and a reduction of it.
+
+Item 74d's shape recurs: the kernels were cut 1.71x and the lane moved 1.17x. Here the
+arithmetic to be done is tiny and the traffic around it is not.
+
+### 88b. THE PRECEDENT EXISTS, TWICE, AND CONV3D IS THE ONE THAT MISSED IT
+
+This is not a new idea and that is the point — **the other two members of the family already
+have it**:
+
+    2026-07-05  conv2d  "direct no-panel adjoint" for f64 3x3 stride-1 all-ones dout.
+                        Bypasses dout_flat, the full im2col panel, the full dpanel and the
+                        ones GEMMs. 1.429x same-worker vs ORIG on ovh-a, 2.119x on hz2.
+    2026-07-09  conv1d  the same primitive for the height-1 shape. 1.37x vs ORIG.
+    conv3d              still builds the full panel.
+
+This is the asymmetric-fast-path pattern the memory notes already name for dtypes, here
+across a shape family: a fast path landed for N-1 members leaves the last one carrying the
+old cost, and nobody re-reads the family once the first two are green.
+
+### 88c. THE OBLIGATION THIS LEVER CARRIES, NAMED IN ADVANCE
+
+The reduction must reproduce `dgemm`'s accumulation order **bit for bit**, because
+`dweight` feeds a gradient the parity harness compares exactly. This is precisely where
+conv3d levers have died before: items 67, 68 and 70 all foundered on reassociation, and item
+72a shipped only because per-(batch,channel) planes are disjoint and *no* element changed its
+summation order.
+
+The reason to attempt it anyway is that **conv2d's version is already proven bit-exact**
+against the equivalent reference — `conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference`,
+recorded GREEN and "bit-exact vs im2col+dgemm_tb+dgemm+col2im reference". A recipe that
+survived this exact obligation in 2-D exists to be read before any 3-D attempt is made. If
+the 3-D order cannot be matched, the lever is a tolerance question and must be REJECTED
+rather than argued, on item 85's standard.
+
+### 88d. PREFLIGHT: WHAT IS ALREADY CLOSED ON THIS LANE
+
+Checked before naming the above, per section 4, so the next tick does not re-run a refuted
+lever:
+
+    all-ones dout special case            SHIPPED   kgs4.118 (this is the branch itself)
+    borrowed-input custom autograd        SHIPPED   kgs4.119, "do not re-chase saved-input copying"
+    API-level scalar-loss wrappers        REJECTED  "do not retry ... for Conv3d"
+    col2im repeated-row plane split       SHIPPED   item 72
+    direct f32 conv3d kernel              REFUTED   1.5-3.3x pessimization above in_ch=8
+    whole-row autograd / tape allocation  SPENT     items 82, 85 — engine is 0.859 ms floor
+
+kgs4.119's own retry condition listed five directions; four are now closed by the rows above,
+and the one it left open — "persistent conv3d workspaces ... or an exotic layout/kernel plan"
+— is where 88a lands.
+
+### 88e. ONE HELD OBSERVATION THAT POINTS THE SAME WAY
+
+The certified h2h run in item 85 printed, in the same invocation:
+
+    buffer_pool: hits=0 misses=0 parked=64 buffers / 76.8 MiB
+
+Not a miss rate — **zero consultations**. The recycling pool sat on 76.8 MiB while this lane
+allocated and freed a 28.3 MB panel per backward. That is consistent with 88a and it is the
+only datum here that came from a run rather than from reading. Whether the panel should be
+pooled or should stop existing, 88a answers second.
