@@ -29861,3 +29861,62 @@ BatchNorm (33.7-38.3 ms) is FASTER than our own f32 BatchNorm (53.3 ms measured 
 the same shape). A dtype that halves the arithmetic making the op SLOWER points at the tape's
 f32<->f64 conversion boundary costing more than the narrower arithmetic saves. Not chased
 here; it is the most concrete lead this bead has left.
+
+## 126. LINEAR HAS ITS FIRST LIVE INCUMBENT ARM — CERTIFIED 1.41x FASTER, AND ITEM 119's CONTRIBUTION IS STILL NOT ISOLATED
+
+Item 120 recorded that `dgemm_tb` — parallelized in item 119 — is the weight-gradient GEMM for
+linear, conv2d and attention, that none of them had a lane, and that **nobody should quote a
+linear speedup from item 119**. The lane now exists. The warning still stands.
+
+### 126a. THE CERTIFIED ROW
+
+    linear_narrow   MIN 1.41x FASTER   ratio 1.406 [1.269,1.487]
+                    FT 5.238 ms   PT 7.251 ms   (PyTorch 2.12.0+cpu, same invocation)
+                    PT null 1.003 PASS   FT null 1.016 PASS   parity match
+                    drift PASS (load_1m 11.39 flat)
+                    loadavg 11.37 / 17.41 / 22.23, vmstat idle 90% (iowait 0%)
+                    cpu_mhz min=1429 median=1928 max=4167 spread=2.916x
+                    CROSS-CORE SPREAD WHILE SAMPLING 2.845x / 2.946x / 3.004x
+                    RAYON_NUM_THREADS=8, 16 rounds, mimalloc, thinkstation1
+                    shape [512,1024] x [512,1024]^T, WEIGHT requires grad on both arms
+                    ELF 75df5c601d8e8f37...
+
+**This is the first vs-PyTorch row linear has ever had on this board.** Three invocations read
+1.455, 1.392 and 1.406; the certified one is the middle.
+
+### 126b. THE SECOND LANE, AND WHY BOTH EXIST
+
+    lane            shape (m x k x n for dgemm_tb)   gate      min-ratio (3 runs)
+    linear_wide     128 x 512 x 1024   n > 4m TRUE   ENGAGES   1.288 / 1.289 / 1.287
+    linear_narrow   512 x 512 x 1024   n > 4m false  no        1.455 / 1.392 / 1.406
+
+`dgemm_tb`'s column split needs `in_features > 4*out_features`. The two shapes sit either side
+of it deliberately, so the pair reports WHERE item 119's path engages instead of asserting that
+it engages everywhere. Both are faster than the incumbent; `linear_wide` never nulled across
+three runs because at ~2 ms it is the shortest lane on the board, which is the short-lane
+problem item 108b already documented in the other direction.
+
+### 126c. WHAT THIS DOES **NOT** ESTABLISH
+
+**It does not attribute anything to item 119.** These are absolute standings against PyTorch,
+not a before/after. Isolating item 119's contribution needs the same shape measured on a binary
+without the column split, and I did not do that. Note also that the lane where the gate does
+NOT engage is the FASTER of the two — which proves nothing either way, because the shapes
+differ and each is compared only against its own incumbent, but it is exactly the kind of
+coincidence that becomes a false attribution if quoted carelessly.
+
+So item 120's sentence stands unchanged: **nobody should quote a linear speedup from item 119.**
+What is now true is narrower and worth more: linear is measurably ahead of PyTorch on this box
+at these shapes, and the op is no longer invisible to the board.
+
+### 126d. COVERAGE AFTER THIS
+
+`frankentorch-58zjz` asked for linear, conv2d and attention lanes. Linear has two. conv2d and
+attention remain unmeasured, and conv2d matters most of the three because it shares conv3d's
+im2col decomposition — item 124's finding that the remaining conv3d gap is ALGORITHMIC
+(im2col + col2im are 46% of a backward PyTorch does not pay) very likely transfers to it, and
+nothing on the board would currently show that.
+
+The file reservation was taken before editing this time
+(`crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, held by me, 1h) rather than discovered
+afterwards by the guard — item 121's lesson applied in the other direction.

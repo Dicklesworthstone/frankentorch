@@ -113,6 +113,15 @@ const C3_H: usize = 16;
 const C3_W: usize = 16;
 const C3_K: usize = 3;
 
+// frankentorch-58zjz. dgemm_tb's column gate is `n > 4*m` with m = out_features and
+// n = in_features, so LIN_OUT_WIDE clears it (1024 > 512) and LIN_OUT_NARROW does not
+// (1024 > 2048 is false). Both are far past PAR_MIN_FLOPS_COLS, so the gate is the only
+// difference between the two lanes.
+const LIN_B: usize = 512;
+const LIN_IN: usize = 1024;
+const LIN_OUT_WIDE: usize = 128;
+const LIN_OUT_NARROW: usize = 512;
+
 const MP3_N: usize = 2;
 const MP3_C: usize = 32;
 const MP3_D: usize = 16;
@@ -709,6 +718,46 @@ fn timed_prelu(
     (elapsed, checksum)
 }
 
+/// Linear train step: `y = x @ W^T`, with the WEIGHT requiring grad — the only reason this lane
+/// exists (`frankentorch-58zjz`).
+///
+/// `linear_backward_f64`'s `dweight` is `gemm::dgemm_tb(out_features, batch, in_features, ..)`,
+/// and item 119 gave `dgemm_tb` its first parallel path. That entry is also conv2d's and
+/// attention's weight-gradient GEMM, but item 120 recorded that none of them had a lane — so a
+/// library-wide scheduling change shipped on the strength of a conv3d row. This lane prices it
+/// on the op that dominates its use.
+///
+/// A no-grad weight would skip `dweight` entirely and measure the wrong half, which is why
+/// `requires_grad` is true on both arms — the same reason `prelu` and `group_norm` carry
+/// grad-requiring parameters.
+fn timed_linear(
+    values: &[f64],
+    weight: &[f64],
+    batch: usize,
+    in_f: usize,
+    out_f: usize,
+) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), vec![batch, in_f], true)
+        .expect("linear leaf");
+    let w = session
+        .tensor_variable(weight.to_vec(), vec![out_f, in_f], true)
+        .expect("linear weight");
+    let started = Instant::now();
+    let out = session.functional_linear(x, w, None).expect("linear");
+    let loss = session.tensor_sum(out).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// Conv3d under a NON-UNIFORM loss — the only lane on this board that reaches conv3d's
 /// GENERIC backward.
 ///
@@ -859,6 +908,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // arms multiply by bit-identical values, which is what keeps the gradient checksum a
     // parity check rather than a coincidence.
     let c3m = seq(C3_N * C3_CO * C3_D * C3_H * C3_W);
+    // frankentorch-58zjz linear fixtures, same `seq` generator as the python arm.
+    let linx = seq(LIN_B * LIN_IN);
+    let linw_wide = seq(LIN_OUT_WIDE * LIN_IN);
+    let linw_narrow = seq(LIN_OUT_NARROW * LIN_IN);
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
     // Built by the SAME formula the python arm uses, then cast — so the two arms
     // normalize identical numbers and the gradient checksum is a real parity check
@@ -917,6 +970,11 @@ c3w=seq(32*32*3*3*3).reshape(32,32,3,3,3)
 # bit-identical values. Non-uniform on purpose -- a constant mask is still a uniform `dout`
 # and would land back on the all-ones fast path this lane exists to avoid. Output shape.
 c3m=seq(2*32*8*16*16).reshape(2,32,8,16,16)
+# frankentorch-58zjz linear fixtures. requires_grad on the WEIGHTS so this arm computes dweight
+# too, matching the FrankenTorch side; the checksum stays x.grad on both.
+linx=seq(512*1024).reshape(512,1024)
+linw_wide=seq(128*1024).reshape(128,1024).requires_grad_(True)
+linw_narrow=seq(512*1024).reshape(512,1024).requires_grad_(True)
 mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
 # frankentorch-kgs4.115 GroupNorm f32 train step, shape and groups copied verbatim
 # from the scorecard row so the two describe the same workload. f32 on BOTH sides:
@@ -954,6 +1012,11 @@ def run(base, fn):
 LANES = {
     "max_pool1d": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
     "avg_pool2d": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
+    # frankentorch-58zjz: linear with a GRAD-REQUIRING weight, which is the point -- a no-grad
+    # weight skips dweight and measures the wrong half. Two shapes straddling dgemm_tb's
+    # `in_features > 4*out_features` column gate.
+    "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
+    "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
     # frankentorch-l2zki: NON-UNIFORM loss, the only lane here that reaches conv3d's GENERIC
     # backward. The `*c3m` sits inside the lane's own fn, so `run`'s `fn(x).sum()` becomes
@@ -1435,6 +1498,19 @@ LANES = {
                 ft_kernel_cpu::set_pool_output_zeroed(previous);
                 sample
             }),
+        ),
+        (
+            // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate
+            // ENGAGES here (m=128, n=1024: n > 4m, and m*k*n = 67M > 16.8M).
+            "linear_wide",
+            Box::new(|| timed_linear(&linx, &linw_wide, LIN_B, LIN_IN, LIN_OUT_WIDE)),
+        ),
+        (
+            // The same op on the OTHER side of that gate (m=512, n=1024: n > 4m is false), so
+            // item 119's path does NOT engage. Carried so the pair says where the change acts
+            // rather than implying it acts everywhere.
+            "linear_narrow",
+            Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW)),
         ),
         (
             "conv3d",
