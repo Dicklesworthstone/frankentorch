@@ -26459,3 +26459,59 @@ what the next lever should be aimed at.
 The forward/sum/backward cuts cost one probe edit and one build. Both of the corrections
 above would have been avoided by taking them BEFORE naming a lever, which is exactly the
 order item 69 used on GroupNorm and exactly the order I skipped here twice.
+
+## 77. conv3d REPLICATED — THREE CERTIFICATIONS AT 0.324-0.352, AND THE CONSERVATIVE BOUND WIDENS TO 3.58x
+
+Item 74's standing rested on ONE certification out of six runs, where item 71's group_norm
+had four. Replication was the weakest thing I owned. Six more runs, on the **exact ELF item
+74 certified with** (`36b2c579`) rather than a fresh build — a true replication, and it also
+keeps the row clear of another agent's uncommitted `ft-autograd` un-pad work now in the
+tree, which touches precisely the backward phase under test.
+
+    run    load 1m  drift    gates        FT ms    PT ms   min-ratio             cert
+    r8_1     16.70  1.000x   PASS/PASS   21.569    7.828   0.352 [0.330,0.381]   CERT
+    r8_2     18.37  1.040x   PASS/PASS   25.607    9.005   0.330 [0.307,0.348]   FT null 0.966 F
+    r8_3     20.15  1.471x   DRIFTED     38.872   91.500   0.514 [0.284,1.137]   refused
+    r8_4     42.02  1.000x   PASS/PASS   28.040    8.740   0.324 [0.279,0.341]   CERT
+    r8_5     54.12  1.000x   PASS/PASS   21.605    7.044   0.324 [0.304,0.333]   PT null 1.030 F
+    r8_6     51.13  1.000x   PASS/PASS   22.403    7.306   0.322 [0.312,0.344]   PT null 1.029 F
+
+Parity `match` throughout, 0 MISMATCH.
+
+### 77a. THE POINT ESTIMATE REPLICATES TIGHTLY; THE CONSERVATIVE BOUND DOES NOT
+
+Three certifications now exist — item 74's 0.329, and 0.352 and 0.324 here:
+
+    point estimates   0.324  0.329  0.352      median 0.329, spread 1.086x
+    CI floors         0.279  0.315  0.330      worst 0.279
+
+The point estimate is stable to 8.6% across three certifications taken in different
+windows. **But the conservative bound WIDENS: item 74 quoted "at most 3.17x SLOWER" from
+its own CI floor of 0.315, and with three rows the worst floor is 0.279, i.e. AT MOST
+3.58x SLOWER.** More certifications made the honest bound worse, not better, because a
+conservative bound over N rows takes the worst interval rather than the best.
+
+The standing is therefore: **median 3.04x SLOWER, at most 3.58x on the conservative bound
+across three certifications.** Item 74's 3.17x is superseded.
+
+### 77b. r8_3 IS THE DRIFT GATE EARNING ITS KEEP
+
+In `r8_3` the incumbent read **91.500 ms against 7.044-9.005 in every other run** — a
+tenfold excursion — and the drift gate refused the row at 1.471x. That is the exact failure
+mode item 71's `g2` slipped through, where a 1.7x incumbent excursion passed drift and both
+nulls and had to be excluded by hand on the harness's printed incumbent rule. Here the
+instrument caught it unaided. **Both facts should be carried together: the gate catches a
+10x excursion and misses a 1.7x one.**
+
+### 77c. Per-arm host state for the certified rows
+
+    r8_1  loadavg 16.70 / 15.30 / 16.96 pre, 18.37 / 15.78 / 17.08 post
+          CPU 1429-4089 MHz idle spread 2.86x; cross-core spread WHILE SAMPLING
+          median 2.951x (min 1.464x, max 2.973x)
+    r8_4  loadavg 42.02 / 21.86 / 19.03 pre, 54.12 / 27.87 / 21.19 post
+          CPU 3883-3895 MHz idle spread 1.00x; cross-core spread WHILE SAMPLING
+          median 2.756x (min 1.007x, max 2.801x)
+
+`r8_4` certified at loadavg 42 rising to 54, with drift 1.000x — more evidence for item
+74a that a single-lane filter makes the drift gate robust to a busy host, and for item 74b
+that what refuses rows here is the null band rather than the machine.
