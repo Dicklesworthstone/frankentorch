@@ -28531,3 +28531,60 @@ standing remains item 94's certified **2.50x SLOWER** until a paired run moves i
 that this lever does NOT touch the scored lane at all, because that lane's loss is
 `out.sum()` and it takes the ones-dout branch. **This one has to be measured on a
 non-uniform-loss lane or it cannot be measured at all**, which no current h2h lane provides.
+
+### 103c. THE NARROW LEVER NEVER RUNS ON THE LANE THE BOARD SCORES — PROVEN BY SENTINEL, NOT BY READING
+
+`frankentorch-68pwz`. `examples/narrow_route_sentinel.rs`, one process, ELF built local
+(`RCH_CARGO_WRAPPER_BYPASS=1`), RAYON_NUM_THREADS=8, loadavg 14.98/17.65/16.95, cpu_mhz
+min=1429 median=2848 max=4260 spread=2.98x, df /data 115G.
+
+Items 103 and 103b both assumed, without checking, that a lever landed in the f32 GroupNorm
+backward closure was a lever on the h2h board's `group_norm_f32` lane. It is not.
+
+    ROUTE A   loss = tensor_sum(out)       narrow_f64_to_f32 calls=0  elements=0
+    ROUTE B   loss = tensor_sum(out*out)   narrow_f64_to_f32 calls=1  elements=6 422 528
+
+Route A is verbatim what `timed_group_norm_f32` does. The f32 norm ops have TWO backward
+routes and the LOSS picks between them: a plain `tensor_sum` fires the sum-shortcut, whose
+backward takes a SCALAR upstream and never materializes a per-element `dy`; any other loss
+takes the closure the narrow lever sits in. Both routes ran in one process against the same
+op and shape, so Route B is a positive control for Route A's zero — the counter works, the
+zero is a real route split.
+
+**SO THE 2.5 ms PRICE IN ITEM 103 BUYS NOTHING ON THE SCORED LANE, AND ITEM 103's FRAMING IS
+CORRECTED HERE.** The code change is right, tested and bit-exact, and it fires on every
+non-sum-loss backward of all four f32 norm ops — which is what ordinary training code does.
+But item 103 presented it beside the scored `[32,64,56,56]` GroupNorm lane and priced it on
+that shape, which reads as a claim about that lane. It is not one. Item 103b's refusal to
+attribute the 5.45 -> 2.19 ms engine-term movement to this lever now has a stronger reason
+than the one it gave: the movement is not merely SHARED with a peer's lever, it is NONE of
+this lever's doing, because this lever does not execute there.
+
+WHAT IT IS WORTH WHERE IT DOES FIRE, measured paired ON vs OFF via
+`ft_api::set_gradient_narrow_serial`, alternating within one process on one binary, fresh
+session per rep (the tape never frees nodes, so a reused session would measure degradation
+instead), min and mean of 9:
+
+    lever ON  (parallel narrow)   min 124.692 ms   mean 133.607 ms
+    lever OFF (serial narrow)     min 136.357 ms   mean 146.490 ms
+    OFF/ON = 1.094x on min, 1.096x on mean — 11.665 ms of a 136 ms backward
+
+FT-vs-FT, so maintenance and not a win, and it is reported as the attribution number item
+103b owed rather than as a ratio against the incumbent. Note the in-situ saving (11.7 ms) is
+4.7x LARGER than the 2.5 ms the standalone probe predicted; standalone ladders have
+inverted in situ before in this ledger, and here one under-predicted instead. Not explained,
+and NOT claimed as a bigger win — the honest reading is that the paired figure includes
+whatever else forcing a single-threaded first-touch of a 25 MiB buffer does to the passes
+that follow it, which is a property of the configuration, not of the one line.
+
+### THE TRANSFERABLE RULE
+
+**A lever's route is decided by the LOSS, not by the op, and a lane that ends in
+`tensor_sum` is exercising a different backward from the one your training code runs.** Two
+items in this ledger reasoned about a GroupNorm lever's value using a lane that never
+executes it. `frankentorch-372h8` already recorded this hazard from the other side — its
+dense route "needed a new lane (sum(out*out), with the incumbent twin squared to match) to
+be visible at all" — and it was filed as its own bead precisely so the rest of the lane
+surface would get checked. That check had not reached here. Before pricing any grad lever,
+run the sentinel: `narrow_counts()`-style execution evidence costs one relaxed atomic and
+settles in one run what source reading got wrong twice.
