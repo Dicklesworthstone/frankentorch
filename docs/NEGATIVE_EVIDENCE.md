@@ -26559,3 +26559,55 @@ GroupNorm engine term (~84% of 5.45 ms) lives.
 
 2579 ft-api tests pass. Observed loadavg 21.20 / 29.36 / 24.24 at the start of this tick;
 no certification attempted or claimed here. df read 161G.
+
+## 79. THE `_zeroed` LANES ARE LEVER-OFF CONTROLS, NOT STANDINGS — ITEMS 71 AND 77 QUOTED A CONTROL
+
+A labelling error in my own banked rows, found while ranking lanes for the next target.
+
+The h2h board carries `_zeroed` twins for several lanes. They are NOT independent
+workloads: the FrankenTorch side runs them with a lever DISABLED and the incumbent code is
+byte-identical under both names, so `PT(zeroed)/PT(base)` is a free ~1.0 control. The
+harness says so at each definition — `group_norm_f32_zeroed` is described as "incumbent
+twin for the group_norm uninit A/B" (frankentorch-jlcmi), and the `max_pool1d_zeroed`
+comment spells out that PT under the two names must agree or the host moved.
+
+**Item 71 certified and headlined `group_norm_f32_zeroed`.** That row is the LEVER-OFF twin,
+not the shipped configuration. The substance survives — `group_norm_f32`, the real lane,
+also certified in the same sweep at **0.573** against the twin's 0.567, so the two agree to
+1% and every conclusion in item 71 holds — but the row was labelled as the standing and it
+is not one. The product standing for that family is `group_norm_f32`.
+
+Same correction applies to how the lane table in item 66g should be read: `avg_pool1d_dense_zeroed`
+at 0.664 and `max_pool1d_zeroed` at 0.889 are not regressions to chase, they are the
+lever-off arms showing what `yc7ud` and the uninit work bought. Ranking "worst lanes" without
+excluding them points a campaign at its own controls.
+
+**Excluding controls, the real standings are:** conv3d 0.329 (certified, items 74/77),
+max_pool3d/`_nopool` 0.562-0.601, `group_norm_f32` 0.635, then everything else at parity or
+FASTER.
+
+### 79a. Also landed: the direct forward's output buffer
+
+`conv3d_forward_direct_3x3s1_f64` allocated its output with `vec![0.0f64; ..]` and then
+assigned every element — the block split covers `plane_count`, the four plane slices cover
+each block, and item 73's spatial tiles cover `patch_count`. Dead fill, same as the im2col
+panels of item 72, now `build_uninit`. Bit-exact: only the allocation's initialization
+changes, and item 73's
+`conv3d_direct_3x3s1_spatial_tiling_matches_a_serial_reference_bitwise` is precisely the
+test that fails if any element goes unwritten, since an uninit buffer returns garbage where
+a zeroed one would quietly return 0.0. 653 tests pass.
+
+**Expected to be small.** The im2col equivalent measured 0.327 ms on a 27 MiB panel; this
+buffer is 2 x 32 x 2048 f64 = 1 MiB, so roughly a thirtieth of that surface. It is landed
+because it is free and correct, not because it moves a standing, and it is NOT measured
+separately — the honest reason being that a sub-0.05 ms effect is far below anything this
+board can resolve.
+
+### 79b. Why no larger lever landed this tick
+
+Every remaining NAMED lever is either held by another agent — the conv3d backward un-pad
+(`f34ae89e`) and its attribution probe (`0110c4ed`), and the tape itself — or is
+multi-turn: eliminating the GroupNorm widen means fusing the f32->f64 store into a SIMD
+kernel that currently writes `f32x8` lanes through `copy_from_slice`, which is a new kernel
+entry point rather than an edit. Naming that honestly is better than starting it badly at
+the end of a tick.

@@ -31,7 +31,12 @@ const NUMEL: usize = 32 * 64 * 56 * 56;
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|raw| raw.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+        .map(|raw| {
+            raw.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| "unavailable".to_owned())
 }
 
@@ -65,9 +70,11 @@ fn main() {
         .collect();
 
     println!("gradient_widen_probe (frankentorch-68pwz)");
-    println!("numel={NUMEL} ({:.1} MiB as f32 -> {:.1} MiB as f64)",
+    println!(
+        "numel={NUMEL} ({:.1} MiB as f32 -> {:.1} MiB as f64)",
         (NUMEL * 4) as f64 / (1024.0 * 1024.0),
-        (NUMEL * 8) as f64 / (1024.0 * 1024.0));
+        (NUMEL * 8) as f64 / (1024.0 * 1024.0)
+    );
     println!("rayon_threads={}", rayon::current_num_threads());
     println!("pre  loadavg {}", loadavg());
     println!("pre  cpu_mhz {}", cpu_mhz());
@@ -119,7 +126,10 @@ fn main() {
         serial_best / parallel_best,
         serial_best - parallel_best
     );
-    println!("bit-identical: {} mismatches over {NUMEL} elements", mismatches);
+    println!(
+        "bit-identical: {} mismatches over {NUMEL} elements",
+        mismatches
+    );
     println!();
     println!(
         "CONTEXT: the group_norm_f32 lane's FT arm measured 30-52 ms forward+backward on \
@@ -131,7 +141,10 @@ fn main() {
     // per-channel (length 64), where rayon's fork/join would be pure loss. Measured
     // rather than guessed, so the constant that ships has a number behind it.
     println!("CROSSOVER SWEEP (min of 9; serial/parallel > 1 means parallel wins)");
-    println!("{:>10}  {:>10}  {:>10}  {:>16}", "numel", "serial ms", "par ms", "serial/parallel");
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>16}",
+        "numel", "serial ms", "par ms", "serial/parallel"
+    );
     for &n in &[
         1_024usize, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304,
     ] {

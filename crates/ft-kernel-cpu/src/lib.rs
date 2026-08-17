@@ -2552,10 +2552,10 @@ fn narrow_pool() -> Option<&'static rayon::ThreadPool> {
 /// argument trivial: the same chunks do the same writes in the same order within a chunk,
 /// and chunks were already independent.
 fn with_narrow_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if NARROW_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Some(pool) = narrow_pool() {
-            return pool.install(f);
-        }
+    if NARROW_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(pool) = narrow_pool()
+    {
+        return pool.install(f);
     }
     f()
 }
@@ -12757,7 +12757,11 @@ fn conv3d_forward_direct_3x3s1_f64(
         .div_ceil(tiles_per_block)
         .max(MIN_SPATIAL_TILE)
         .min(patch_count.max(1));
-    let mut out = vec![0.0f64; plane_count * patch_count];
+    // frankentorch-l2zki: every element is assigned below — the block split covers
+    // `plane_count`, the four plane slices cover each block, and the spatial tiles cover
+    // `patch_count` — so the zero-fill was dead, exactly as in the im2col panels of item
+    // 72. Bit-exact: only the allocation's initialization changes.
+    build_uninit(plane_count * patch_count, |out: &mut [f64]| {
     out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)
         .enumerate()
         .for_each(|(block, out_block)| {
@@ -12833,7 +12837,7 @@ fn conv3d_forward_direct_3x3s1_f64(
                     }
                 });
         });
-    out
+    })
 }
 
 /// Streamed im2col-GEMM fallback for f64 convolution on a PADDED input.

@@ -30,7 +30,12 @@ const K: usize = 3;
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|raw| raw.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+        .map(|raw| {
+            raw.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| "unavailable".to_owned())
 }
 
@@ -146,8 +151,7 @@ fn main() {
             }
         }
         let out = ft_kernel_cpu::conv3d_forward_f64(
-            &padded, &weights, None, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1,
-            OUT_CH,
+            &padded, &weights, None, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1, OUT_CH,
         );
         let loss: f64 = out.iter().sum();
         let dout = vec![1.0f64; out.len()];
@@ -179,9 +183,17 @@ fn main() {
     );
     println!();
     println!("SESSION ARM, cumulative stage cuts (min of {reps}):");
-    println!("{:>34}  {:>10}", "through functional_conv3d", format!("{fwd_only:.3}"));
+    println!(
+        "{:>34}  {:>10}",
+        "through functional_conv3d",
+        format!("{fwd_only:.3}")
+    );
     println!("{:>34}  {:>10}", "+ tensor_sum", format!("{fwd_sum:.3}"));
-    println!("{:>34}  {:>10}", "+ tensor_backward (full)", format!("{session_best:.3}"));
+    println!(
+        "{:>34}  {:>10}",
+        "+ tensor_backward (full)",
+        format!("{session_best:.3}")
+    );
     println!(
         "{:>34}  {:>10}   <- backward's share of the session arm",
         "backward stage alone",

@@ -31,7 +31,12 @@ const K: usize = 3;
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|raw| raw.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+        .map(|raw| {
+            raw.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| "unavailable".to_owned())
 }
 
@@ -61,9 +66,24 @@ fn cpu_mhz() -> String {
 /// The fill body, byte-identical between the two allocation strategies so the only
 /// variable is how the buffer was obtained.
 #[allow(clippy::too_many_arguments)]
-fn fill(panel: &mut [f64], padded: &[f64], patch_width: usize, patch_count: usize,
-        in_ch: usize, pd: usize, ph: usize, pw: usize, kd: usize, kh: usize, kw: usize,
-        oh: usize, ow: usize, sd: usize, sh: usize, sw: usize) {
+fn fill(
+    panel: &mut [f64],
+    padded: &[f64],
+    patch_width: usize,
+    patch_count: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) {
     panel
         .par_chunks_mut(patch_width)
         .enumerate()
@@ -84,8 +104,7 @@ fn fill(panel: &mut [f64], padded: &[f64], patch_width: usize, patch_count: usiz
                     for kr in 0..kh {
                         let irow = d_off + (base_h + kr) * pw + base_w;
                         let prow_off = pkd + kr * kw;
-                        prow[prow_off..(kw + prow_off)]
-                            .copy_from_slice(&padded[irow..(kw + irow)]);
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
                     }
                 }
             }
@@ -103,8 +122,12 @@ fn main() {
     let numel = BATCH * patch_count * patch_width;
 
     println!("im2col_zerofill_probe (frankentorch-l2zki)");
-    println!("panel {} x {} = {numel} f64 = {:.1} MiB", BATCH * patch_count, patch_width,
-        (numel * 8) as f64 / (1024.0 * 1024.0));
+    println!(
+        "panel {} x {} = {numel} f64 = {:.1} MiB",
+        BATCH * patch_count,
+        patch_width,
+        (numel * 8) as f64 / (1024.0 * 1024.0)
+    );
     println!("rayon_threads={}", rayon::current_num_threads());
     println!("pre  loadavg {}", loadavg());
     println!("pre  cpu_mhz {}", cpu_mhz());
@@ -120,8 +143,24 @@ fn main() {
         // (a) exactly what ships today
         let started = Instant::now();
         let mut panel = vec![0.0f64; numel];
-        fill(&mut panel, &padded, patch_width, patch_count, IN_CH, pd, ph, pw, K, K, K,
-             oh, ow, 1, 1, 1);
+        fill(
+            &mut panel,
+            &padded,
+            patch_width,
+            patch_count,
+            IN_CH,
+            pd,
+            ph,
+            pw,
+            K,
+            K,
+            K,
+            oh,
+            ow,
+            1,
+            1,
+            1,
+        );
         let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
         zeroed_best = zeroed_best.min(elapsed);
         zeroed_last = panel;
@@ -129,8 +168,24 @@ fn main() {
         // (b) same fill, uninitialized allocation
         let started = Instant::now();
         let panel = ft_kernel_cpu::build_uninit(numel, |panel: &mut [f64]| {
-            fill(panel, &padded, patch_width, patch_count, IN_CH, pd, ph, pw, K, K, K,
-                 oh, ow, 1, 1, 1);
+            fill(
+                panel,
+                &padded,
+                patch_width,
+                patch_count,
+                IN_CH,
+                pd,
+                ph,
+                pw,
+                K,
+                K,
+                K,
+                oh,
+                ow,
+                1,
+                1,
+                1,
+            );
         });
         let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
         uninit_best = uninit_best.min(elapsed);
@@ -144,7 +199,10 @@ fn main() {
         .zip(uninit_last.iter())
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
-    assert_eq!(mismatches, 0, "uninit panel diverged: some element is never written");
+    assert_eq!(
+        mismatches, 0,
+        "uninit panel diverged: some element is never written"
+    );
 
     println!("{:>30}  {:>10}", "allocation", "min ms");
     println!("{:>30}  {zeroed_best:>10.3}", "vec![0.0; n] + fill");

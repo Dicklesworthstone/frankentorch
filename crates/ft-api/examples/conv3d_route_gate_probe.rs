@@ -74,19 +74,20 @@ fn cpu_mhz() -> String {
 
 fn main() {
     let (pd, ph, pw) = (SPATIAL_D + 2, SPATIAL_H + 2, SPATIAL_W + 2);
-    let (od, oh, ow) = (
-        pd - K + 1,
-        ph - K + 1,
-        pw - K + 1,
-    );
+    let (od, oh, ow) = (pd - K + 1, ph - K + 1, pw - K + 1);
     let padded: Vec<f64> = (0..BATCH * IN_CH * pd * ph * pw)
         .map(|index| ((index % 251) as f64) * 0.001 - 0.12)
         .collect();
 
     println!("conv3d_route_gate_probe (frankentorch-l2zki)");
-    println!("host={}", std::env::var("HOSTNAME").unwrap_or_else(|_| "thinkstation1".into()));
+    println!(
+        "host={}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "thinkstation1".into())
+    );
     println!("rayon_threads={}", rayon::current_num_threads());
-    println!("shape batch={BATCH} in_ch={IN_CH} spatial={SPATIAL_D}x{SPATIAL_H}x{SPATIAL_W} k=3 stride=1 pad=1");
+    println!(
+        "shape batch={BATCH} in_ch={IN_CH} spatial={SPATIAL_D}x{SPATIAL_H}x{SPATIAL_W} k=3 stride=1 pad=1"
+    );
     println!("out={od}x{oh}x{ow}  patch_width={}", IN_CH * K * K * K);
     println!("pre  loadavg {}", loadavg());
     println!("pre  cpu_mhz {}", cpu_mhz());
@@ -125,11 +126,7 @@ fn main() {
         println!(
             "{out_ch:>7}  {:>7}  {best:>10.3}  {per_channel:>14.4}  {:>10}",
             if direct { "DIRECT" } else { "stream" },
-            cpu_mhz()
-                .split("spread=")
-                .nth(1)
-                .unwrap_or("?")
-                .to_owned()
+            cpu_mhz().split("spread=").nth(1).unwrap_or("?").to_owned()
         );
         rows.push((out_ch, direct, best, per_channel));
     }
@@ -178,8 +175,8 @@ fn in_channel_crossover(pd: usize, ph: usize, pw: usize, od: usize, oh: usize, o
             for _ in 0..5 {
                 let started = Instant::now();
                 let out = ft_kernel_cpu::conv3d_forward_f64(
-                    &padded, &weight, None, BATCH, in_ch, pd, ph, pw, K, K, K, od, oh, ow, 1, 1,
-                    1, out_ch,
+                    &padded, &weight, None, BATCH, in_ch, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1,
+                    out_ch,
                 );
                 let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
                 assert!(out.iter().sum::<f64>().is_finite());
@@ -234,7 +231,23 @@ fn cross_route_bit_exactness(
     );
 
     let streamed = ft_kernel_cpu::conv3d_forward_f64(
-        padded, &shared, None, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1,
+        padded,
+        &shared,
+        None,
+        BATCH,
+        IN_CH,
+        pd,
+        ph,
+        pw,
+        K,
+        K,
+        K,
+        od,
+        oh,
+        ow,
+        1,
+        1,
+        1,
         STREAMED_CH,
     );
     let direct = ft_kernel_cpu::conv3d_forward_f64(
@@ -277,7 +290,10 @@ fn cross_route_bit_exactness(
         }
     }
     let compared = BATCH * STREAMED_CH * patch_count;
-    println!("CROSS-ROUTE BIT-EXACTNESS at the operative k={} (in_ch={IN_CH})", per_channel);
+    println!(
+        "CROSS-ROUTE BIT-EXACTNESS at the operative k={} (in_ch={IN_CH})",
+        per_channel
+    );
     println!(
         "  compared {compared} outputs: {mismatches} differ; worst bit delta {worst_bits}, \
          worst relative {worst_relative:.3e}"

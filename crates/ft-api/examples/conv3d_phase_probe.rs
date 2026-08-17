@@ -25,7 +25,12 @@ const K: usize = 3;
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|raw| raw.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+        .map(|raw| {
+            raw.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| "unavailable".to_owned())
 }
 
@@ -70,7 +75,9 @@ fn main() {
         .collect();
 
     println!("conv3d_phase_probe (frankentorch-l2zki)");
-    println!("shape batch={BATCH} in_ch={IN_CH} out_ch={OUT_CH} spatial={SPATIAL_D}x{SPATIAL_H}x{SPATIAL_W} k=3 s=1 pad=1");
+    println!(
+        "shape batch={BATCH} in_ch={IN_CH} out_ch={OUT_CH} spatial={SPATIAL_D}x{SPATIAL_H}x{SPATIAL_W} k=3 s=1 pad=1"
+    );
     println!("padded numel={}  out numel={out_numel}", padded.len());
     println!("rayon_threads={}", rayon::current_num_threads());
     println!("pre  loadavg {}", loadavg());
@@ -85,8 +92,7 @@ fn main() {
     for _ in 0..reps {
         let started = Instant::now();
         let out = ft_kernel_cpu::conv3d_forward_f64(
-            &padded, &weight, None, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1,
-            OUT_CH,
+            &padded, &weight, None, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1, OUT_CH,
         );
         let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
         assert_eq!(out.len(), out_numel);
@@ -95,8 +101,8 @@ fn main() {
 
         let started = Instant::now();
         let (dp, dw, _) = ft_kernel_cpu::conv3d_backward_f64(
-            &dout_ones, &padded, &weight, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1,
-            1, OUT_CH, false,
+            &dout_ones, &padded, &weight, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1, 1,
+            OUT_CH, false,
         );
         let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
         std::hint::black_box((&dp, &dw));
@@ -104,8 +110,25 @@ fn main() {
 
         let started = Instant::now();
         let (dp, dw, _) = ft_kernel_cpu::conv3d_backward_f64(
-            &dout_mixed, &padded, &weight, BATCH, IN_CH, pd, ph, pw, K, K, K, od, oh, ow, 1, 1,
-            1, OUT_CH, false,
+            &dout_mixed,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            pd,
+            ph,
+            pw,
+            K,
+            K,
+            K,
+            od,
+            oh,
+            ow,
+            1,
+            1,
+            1,
+            OUT_CH,
+            false,
         );
         let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
         std::hint::black_box((&dp, &dw));
@@ -114,7 +137,11 @@ fn main() {
 
     let step = fwd + bwd_ones;
     println!("{:>34}  {:>10}  {:>8}", "phase", "min ms", "share");
-    println!("{:>34}  {fwd:>10.3}  {:>7.1}%", "forward (direct 3x3s1 route)", 100.0 * fwd / step);
+    println!(
+        "{:>34}  {fwd:>10.3}  {:>7.1}%",
+        "forward (direct 3x3s1 route)",
+        100.0 * fwd / step
+    );
     println!(
         "{:>34}  {bwd_ones:>10.3}  {:>7.1}%",
         "backward (ones-dout fast path)",
