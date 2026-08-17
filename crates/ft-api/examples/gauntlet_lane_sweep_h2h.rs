@@ -117,6 +117,16 @@ const C3_K: usize = 3;
 // n = in_features, so LIN_OUT_WIDE clears it (1024 > 512) and LIN_OUT_NARROW does not
 // (1024 > 2048 is false). Both are far past PAR_MIN_FLOPS_COLS, so the gate is the only
 // difference between the two lanes.
+// frankentorch-58zjz item 126d. 3x3 stride-1 pad-1, so the output extents equal the input's and
+// the 2026-07-05 all-ones adjoint is eligible. Sized so the im2col panel (8192 x 288 f64,
+// 18.9 MB) is the same order as conv3d's, keeping the two lanes comparable.
+const C2_N: usize = 8;
+const C2_CI: usize = 32;
+const C2_CO: usize = 32;
+const C2_H: usize = 32;
+const C2_W: usize = 32;
+const C2_K: usize = 3;
+
 const LIN_B: usize = 512;
 const LIN_IN: usize = 1024;
 const LIN_OUT_WIDE: usize = 128;
@@ -718,6 +728,51 @@ fn timed_prelu(
     (elapsed, checksum)
 }
 
+/// Conv2d, both loss routes — `frankentorch-58zjz`, item 126d.
+///
+/// conv2d shares conv3d's im2col decomposition and has the SAME all-ones fast path
+/// (`conv2d_backward_3x3_stride1_ones_dout_f64`, 2026-07-05), so it has both a summed route and
+/// a generic one and, until now, no lane for either. Item 124 found the remaining conv3d gap is
+/// ALGORITHMIC — im2col + col2im are 46% of a backward PyTorch does not pay — and if that
+/// transfers, conv2d is where it shows up next.
+///
+/// `mask` multiplies the output by a non-uniform tensor before the sum, exactly as
+/// `timed_conv3d_masked` does, so the upstream gradient is `mask` rather than all-ones and the
+/// call reaches the generic backward. It is a leaf, so its construction sits outside the timer
+/// on both arms.
+fn timed_conv2d(values: &[f64], weights: &[f64], mask: Option<&[f64]>) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), vec![C2_N, C2_CI, C2_H, C2_W], true)
+        .expect("conv2d leaf");
+    let w = session
+        .tensor_variable(weights.to_vec(), vec![C2_CO, C2_CI, C2_K, C2_K], false)
+        .expect("conv2d weight");
+    let m = mask.map(|values| {
+        session
+            .tensor_variable(values.to_vec(), vec![C2_N, C2_CO, C2_H, C2_W], false)
+            .expect("conv2d mask")
+    });
+    let started = Instant::now();
+    let out = session
+        .functional_conv2d(x, w, None, (1, 1), (1, 1))
+        .expect("conv2d");
+    let scored = match m {
+        Some(mask_leaf) => session.tensor_mul(out, mask_leaf).expect("mask multiply"),
+        None => out,
+    };
+    let loss = session.tensor_sum(scored).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// Linear train step: `y = x @ W^T`, with the WEIGHT requiring grad — the only reason this lane
 /// exists (`frankentorch-58zjz`).
 ///
@@ -909,6 +964,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parity check rather than a coincidence.
     let c3m = seq(C3_N * C3_CO * C3_D * C3_H * C3_W);
     // frankentorch-58zjz linear fixtures, same `seq` generator as the python arm.
+    let c2x = seq(C2_N * C2_CI * C2_H * C2_W);
+    let c2w = seq(C2_CO * C2_CI * C2_K * C2_K);
+    let c2m = seq(C2_N * C2_CO * C2_H * C2_W);
     let linx = seq(LIN_B * LIN_IN);
     let linw_wide = seq(LIN_OUT_WIDE * LIN_IN);
     let linw_narrow = seq(LIN_OUT_NARROW * LIN_IN);
@@ -972,6 +1030,9 @@ c3w=seq(32*32*3*3*3).reshape(32,32,3,3,3)
 c3m=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 # frankentorch-58zjz linear fixtures. requires_grad on the WEIGHTS so this arm computes dweight
 # too, matching the FrankenTorch side; the checksum stays x.grad on both.
+c2x=seq(8*32*32*32).reshape(8,32,32,32)
+c2w=seq(32*32*3*3).reshape(32,32,3,3)
+c2m=seq(8*32*32*32).reshape(8,32,32,32)
 linx=seq(512*1024).reshape(512,1024)
 linw_wide=seq(128*1024).reshape(128,1024).requires_grad_(True)
 linw_narrow=seq(512*1024).reshape(512,1024).requires_grad_(True)
@@ -1015,6 +1076,10 @@ LANES = {
     # frankentorch-58zjz: linear with a GRAD-REQUIRING weight, which is the point -- a no-grad
     # weight skips dweight and measures the wrong half. Two shapes straddling dgemm_tb's
     # `in_features > 4*out_features` column gate.
+    # frankentorch-58zjz item 126d: conv2d's two loss routes. The *c2m makes the upstream
+    # gradient non-uniform, so the second lane reaches the generic backward as conv3d_masked does.
+    "conv2d":        (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
+    "conv2d_masked": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
@@ -1498,6 +1563,18 @@ LANES = {
                 ft_kernel_cpu::set_pool_output_zeroed(previous);
                 sample
             }),
+        ),
+        (
+            // frankentorch-58zjz item 126d: conv2d's SUMMED route, which takes the all-ones
+            // fast path its 2026-07-05 adjoint provides.
+            "conv2d",
+            Box::new(|| timed_conv2d(&c2x, &c2w, None)),
+        ),
+        (
+            // The same op under a NON-UNIFORM loss, reaching the generic backward -- the route
+            // real training takes, and the one item 124 found algorithmically behind for conv3d.
+            "conv2d_masked",
+            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m))),
         ),
         (
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate

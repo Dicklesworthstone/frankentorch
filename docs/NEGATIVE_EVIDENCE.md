@@ -29988,3 +29988,61 @@ be taken: warm the harness once, discard that run, then measure.
 
 GroupNorm dense replicated at 2.65x and 2.67x SLOWER across these two runs, matching item 116's
 banked 2.66x, but neither cleared its nulls and neither is quoted. Nothing here re-banks it.
+
+## 128. conv2d IS FAR WORSE THAN conv3d ON BOTH ROUTES — 1.7-2.1x SLOWER SUMMED, 7.4-8.8x SLOWER REAL, AND IT HAD NO LANE AT ALL
+
+Item 126d predicted conv2d would inherit conv3d's algorithmic gap and said nothing on the board
+would show it. Both halves were right, and the magnitude is worse than the prediction.
+
+    lane            FT ms     PT ms   min-ratio                    standing
+    conv2d           6.075     3.374  0.587 [0.514,0.713]          1.70x SLOWER
+    conv2d           5.335     3.088  0.481 [0.399,0.564]          2.08x SLOWER
+    conv2d_masked   21.908     3.643  0.136 [0.120,0.160]          7.38x SLOWER
+    conv2d_masked   20.307     3.039  0.114 [0.104,0.128]          8.78x SLOWER
+    conv2d_masked   20.112     3.200  0.131 [0.107,0.137]          7.65x SLOWER
+
+    ELF ef086938aa899a23, RAYON_NUM_THREADS=8, 16 rounds, mimalloc, thinkstation1
+    shape [8,32,32,32] k=3 s=1 pad=1 out_ch=32, im2col panel 8192 x 288 f64 = 18.9 MB
+    row 3: loadavg 20.31/15.78/18.78, vmstat idle 86%, load_1m 19.16 -> 18.50 drift PASS,
+           cpu_mhz 1429/2595/4167 spread 2.916x, cross-core 2.882x/2.920x/2.986x
+    parity match on every row, 0 MISMATCH
+
+**NOT CERTIFIED.** The first invocation was LOAD-DRIFTED (14.01 -> 19.69) and the harness refused
+it on its face; the other two are drift-clean but the PT null failed at 1.051 and 1.085. That
+failure has an obvious cause — torch's arm is ~3 ms here, the shortest incumbent on the board,
+and a short arm nulls badly (items 108b, 126b). **Replicated 3/3 with a 7-8x effect against arms
+stable to a few percent; the gate is not what decides this one.**
+
+### 128a. THE COMPARISON THAT MATTERS
+
+    op       summed route        real-loss route
+    conv3d   1.61x FASTER        1.65-1.80x SLOWER    (items 119, 124)
+    conv2d   1.70-2.08x SLOWER   7.4-8.8x SLOWER
+
+**conv2d is worse than conv3d on BOTH routes, and its training route is roughly 4x worse than
+conv3d's.** That is the opposite of where this campaign has spent its attention: conv3d has had
+items 82, 88, 89, 95, 98, 104, 110, 114, 117, 119, 123 and 124 — twelve ledger items and two
+reverts — while conv2d, which is far more common in real models, had no lane and no measurement
+of any kind.
+
+The reason it went unseen is exactly item 110's mechanism one level up: conv3d got a lane
+because a scorecard row named it, and nothing generalised from "this op is slow" to "its
+siblings share the decomposition".
+
+### 128b. WHAT IS LIKELY WRONG, STATED AS A HYPOTHESIS
+
+Unmeasured, and named so the next agent probes rather than assumes: conv2d's generic backward
+uses the same im2col + two GEMMs + col2im decomposition conv3d does, and item 124 measured that
+as 46% pure decomposition overhead PyTorch does not pay. At conv2d's aspect ratio the panel is
+18.9 MB for a 3 ms incumbent — a far worse ratio of scaffolding to arithmetic than conv3d's,
+which is consistent with 7-8x rather than 1.7x. **The probe to run is
+`conv3d_generic_phase_probe`'s conv2d twin**, which does not exist yet; do that before touching
+the kernel, because on this route two of my three attempts to fix conv3d without one were
+regressions (items 114, 117, 119).
+
+### 128c. WHY THE SUMMED ROUTE IS ALSO BEHIND
+
+conv2d's all-ones adjoint (2026-07-05, and repaired in item 105/ikw6q) exists precisely to make
+the summed route cheap, and it is still 1.7-2.1x slower than PyTorch. So the fast path is not
+merely un-tuned — it is losing to an incumbent that has no such specialisation at all. That is a
+second, independent target, and the cheaper of the two to investigate.
