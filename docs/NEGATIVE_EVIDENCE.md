@@ -26403,3 +26403,59 @@ on a 64-core box; its value is unmeasured.
 That is the honest state: item 69's widen was landed with a 20.351 ms prediction that the
 board then confirmed to within 0.5%, and this one has no such number. Re-measuring it in a
 settled window, against the 6.533 ms engine baseline recorded above, is owed.
+
+## 76. CORRECTING ITEM 75: THE PAD I PARALLELIZED IS NOT ON THE SCORED LANE — AND THE ENGINE IS IN THE BACKWARD
+
+Two corrections and one located target. Both corrections are against my own items from the
+last two ticks, and both are scope errors of the same kind: naming a lever without checking
+which path the scored lane actually executes.
+
+### 76a. THE `pad_ncdhw_zero_*` CHANGE DOES NOT TOUCH THE conv3d LANE
+
+Item 75 landed a parallel plane-copy in `pad_ncdhw_zero_f64`/`_f32` and described it as
+serial "on every forward". **It is not on every forward.** Both call sites sit under
+
+    if is_depthwise && nograd { ... }
+
+so the helper serves the DEPTHWISE NO-GRAD path only. The scored conv3d lane is groups=1
+WITH grad and never reaches it — it pads through `tensor_pad`, whose f64 body already uses
+`par_chunks_mut` and was already parallel.
+
+The change remains correct, bit-exact and tested, and depthwise no-grad conv3d is a real
+path that genuinely was serial over `n*c` planes. But item 75's framing overstated its
+reach, and its "no speedup demonstrated" caveat now has a second and better reason: the
+measurement it was compared against could not have moved, because the lane under
+measurement does not call the function.
+
+**This is the same error as item 74's ">50% engine", one tick earlier** — a number asserted
+about the lane from a fact established off the lane. NEGATIVE_EVIDENCE item 37 already
+names the rule ("check which route the lane selects before measuring"); I have now broken
+it twice in three ticks, in the same lane.
+
+### 76b. THE ENGINE IS IN THE BACKWARD, and it is 78% of the lane
+
+Staged cuts of the session arm (`conv3d_engine_probe.rs`, min of 7, 64 threads). Observed
+loadavg 22.41 / 27.69 / 25.57; CPU 1429-4072 MHz, spread 2.85x.
+
+    stage (cumulative)                 min ms
+    through functional_conv3d           3.936
+    + tensor_sum                        4.040
+    + tensor_backward (full)           18.508
+    backward stage alone               14.468   <- 78% of the session arm
+
+Item 73 measured the conv3d KERNEL backward at 5.539 ms. So of the 14.468 ms backward
+stage, **roughly 9 ms is tape traversal rather than convolution** — gradient accumulation,
+`tensor_pad`'s backward narrow over 207,360 elements, `tensor_sum`'s backward expand over
+131,072, and the custom-op wrapper.
+
+The forward stage, by contrast, is nearly free of engine cost: 3.936 ms against item 73's
+3.652 ms kernel forward, so ~0.28 ms of tape. **Every remaining engine lever on this lane is
+in `tensor_backward`, and none is in the forward.** That is the first time this lane's
+overhead has been attributed to a phase rather than inferred from a subtraction, and it is
+what the next lever should be aimed at.
+
+### 76c. Method note
+
+The forward/sum/backward cuts cost one probe edit and one build. Both of the corrections
+above would have been avoided by taking them BEFORE naming a lever, which is exactly the
+order item 69 used on GroupNorm and exactly the order I skipped here twice.

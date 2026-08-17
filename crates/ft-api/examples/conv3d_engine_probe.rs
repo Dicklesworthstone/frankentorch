@@ -75,6 +75,11 @@ fn main() {
     let reps = 7;
     let mut session_best = f64::INFINITY;
     let mut kernels_best = f64::INFINITY;
+    // Stage split of the session arm, so the 6.5 ms engine term can be attributed to a
+    // phase instead of guessed at. Item 75's mistake was naming a lever (the NCDHW pad)
+    // that the scored lane never reaches; these three cuts say where the time is.
+    let mut fwd_only = f64::INFINITY;
+    let mut fwd_sum = f64::INFINITY;
 
     for _ in 0..reps {
         // ---- session arm: exactly the h2h conv3d lane's timed region ----
@@ -100,6 +105,27 @@ fn main() {
             .sum();
         assert!(checksum.is_finite());
         session_best = session_best.min(elapsed);
+
+        // Same three calls, timed cumulatively on a fresh session so the tape state
+        // matches the arm above at each cut.
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x2 = s2
+            .tensor_variable(values.clone(), vec![BATCH, IN_CH, SD, SH, SW], true)
+            .expect("leaf");
+        let w2 = s2
+            .tensor_variable(weights.clone(), vec![OUT_CH, IN_CH, K, K, K], false)
+            .expect("weight");
+        let t0 = Instant::now();
+        let o2 = s2
+            .functional_conv3d(x2, w2, None, (1, 1, 1), (1, 1, 1))
+            .expect("conv3d");
+        let after_forward = t0.elapsed().as_secs_f64() * 1_000.0;
+        let l2 = s2.tensor_sum(o2).expect("sum");
+        let after_sum = t0.elapsed().as_secs_f64() * 1_000.0;
+        let r2 = s2.tensor_backward(l2).expect("backward");
+        assert!(r2.gradient(x2).is_some());
+        fwd_only = fwd_only.min(after_forward);
+        fwd_sum = fwd_sum.min(after_sum);
 
         // ---- kernels arm: the same work, no session, no tape ----
         let (pd, ph, pw) = (SD + 2, SH + 2, SW + 2);
@@ -150,6 +176,16 @@ fn main() {
         "{:>34}  {engine:>10.3}  {:>7.1}%",
         "ENGINE (session - kernels)",
         100.0 * engine / session_best
+    );
+    println!();
+    println!("SESSION ARM, cumulative stage cuts (min of {reps}):");
+    println!("{:>34}  {:>10}", "through functional_conv3d", format!("{fwd_only:.3}"));
+    println!("{:>34}  {:>10}", "+ tensor_sum", format!("{fwd_sum:.3}"));
+    println!("{:>34}  {:>10}", "+ tensor_backward (full)", format!("{session_best:.3}"));
+    println!(
+        "{:>34}  {:>10}   <- backward's share of the session arm",
+        "backward stage alone",
+        format!("{:.3}", session_best - fwd_sum)
     );
     println!();
     println!(
