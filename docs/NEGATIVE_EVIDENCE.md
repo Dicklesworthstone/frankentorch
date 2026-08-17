@@ -27407,3 +27407,86 @@ timings, not answers.
 
 Observed loadavg 29.35 / 45.51 / 60.67 falling to 26.34 / 42.01 / 58.60; CPU 1429-4143 MHz,
 idle spread 2.78x; iowait 0%. df read 161G, checked before each build.
+
+## 89. THE conv3d NO-PANEL LEVER IS REJECTED ON BIT-EXACTNESS — AND THE conv2d PROOF IT WAS BUILT ON DOES NOT HOLD AT REAL SHAPES EITHER
+
+Item 88 located the lever, named the obligation in advance, and pre-committed to the
+outcome: *"If the 3-D order cannot be matched, the lever is a tolerance question and must be
+REJECTED rather than argued."* It cannot be matched. It is rejected. The more valuable half
+of this item is what the same test found in code that shipped a year ago.
+
+### 89a. THE LEVER, AND THE MEASUREMENT THAT KILLED IT
+
+Implemented exactly as item 88a described: drop the 28.3 MB im2col panel and compute
+`dweight_row` as a direct strided reduction over `padded`, walking the elements in the
+panel's own row order (ascending `b, d, h, w`) so each column accumulates in one f64 chain.
+Structurally identical to conv2d's shipped no-panel adjoint, with the depth axis added.
+
+Pinned against the panel + `dgemm(1, flat, patch_width, ones, panel, ..)` it replaces:
+
+    shape                                        flat    verdict
+    [2,3,7,9,11] k=(2,3,2) s=(2,1,3)              168    BIT-IDENTICAL, passes
+    [2,32,10,18,18] k=3 s=1  (THE SCORED LANE)   4096    FAILS
+                             no-panel  -1.3543944432142094e0
+                             panel+GEMM -1.3543944432142112e0   (~6 ULP)
+
+**The small shape passes and the real one fails, and that is the whole story.** `gemm::dgemm`
+delegates to `matrixmultiply`, which packs and BLOCKS the k dimension: a column's sum is
+`((0 + block1) + block2) + ...` where each block is its own ascending chain, not one chain
+over all of k. Below one k block the two are the same expression; above it they are not.
+
+Reverted. The panel stays, with a comment at the call site so the next reader does not
+re-derive this.
+
+### 89b. THE PART THAT MATTERS MORE: conv2d's SHIPPED CLAIM IS SHAPE-LIMITED
+
+Item 88b justified attempting this by pointing at conv2d's precedent, recorded 2026-07-05 as
+*"bit-exact vs im2col+dgemm_tb+dgemm+col2im reference"*. That proof,
+`conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference`, runs at **`flat = 60`** —
+inside one k block, i.e. precisely the case that cannot tell a single chain from a blocked
+one. So it was never evidence for the claim it was recorded as proving.
+
+Probed directly, on the SHIPPED `conv2d_backward_3x3_stride1_ones_dout_f64`, at
+`batch=2, in_ch=3, out_ch=4, oh=ow=64`, `flat = 8192`:
+
+    conv2d no-panel dweight vs panel+GEMM:  104 of 108 entries DIFFER
+    first divergence: -2.65639706510564e0  vs  -2.656397065105646e0
+
+**conv2d's scalar-loss `dweight` is a TOLERANCE path that shipped recorded as an exact one**,
+and conv1d's (2026-07-09) is the same primitive with the same shape-limited proof. This is
+not a demonstrated wrong answer against PyTorch — torch's own conv backward has its own
+summation order, so that comparison was always tolerance-shaped — but the ledger entry
+asserting bit-exactness is false outside its test shape, and item 88b reasoned from it.
+
+The probe test is NOT committed: it fails against shipped code, and landing a red gate to
+make a point is not a contribution. Everything needed to re-derive it in five minutes is
+above.
+
+### 89c. THE RULE THIS PAYS FOR
+
+**A bit-exactness proof against a BLOCKED kernel is only valid at shapes that exceed the
+block.** Every one of these paths — conv1d, conv2d, conv3d — compares a hand-written
+reduction to a GEMM, and every one of their proofs picked a comfortable little shape. The
+test that decides the question is the one run at the shape the lane actually uses, which is
+the same lesson as [[project_conv3d_direct_gate_misset]]: *a fast path validated at ONE shape
+is only known right at that shape.* It cost one test to find, and it invalidates a family
+claim.
+
+### 89d. WHAT WOULD HAVE TO CHANGE FIRST
+
+The 28.3 MB panel is still dead weight and item 88a's arithmetic still stands — 56.6 MB of
+traffic to keep 864 numbers. Three routes remain, in the order I would take them:
+
+1. **Ratify a tolerance for conv scalar-loss `dweight`**, the way
+   [[project_eig_tolerance_policy_ratified]] did for eigenvector outputs. This is a POLICY
+   call, not mine to make unilaterally, and it should be decided knowing that conv2d and
+   conv1d have already been on the far side of it since July.
+2. **Match the blocking instead of fighting it** — reduce in `kc`-sized blocks with the same
+   partial-sum structure matrixmultiply uses. Reproducible in principle, fragile against a
+   dependency bump, and it would need its own real-shape proof.
+3. **Leave `dweight` on the GEMM and remove the panel only for the INPUT-gradient half.**
+   The `dpadded` path already avoids the panel (it goes through `dpanel_row` and
+   `conv3d_col2im_repeated_row_f64`), so this route buys nothing. Recorded so nobody re-checks.
+
+Route 1 is the only one that makes the 28 MB go away, and it is a question for the campaign
+rather than a lever.

@@ -13542,10 +13542,18 @@ fn conv3d_backward_ones_dout_f64(
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let flat = batch * patch_count;
+
     let panel = conv3d_im2col_f64(
         padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
 
+    // frankentorch-l2zki / NEGATIVE_EVIDENCE item 89: the panel below is materialized
+    // (4096 x 864 f64 = 28.3 MB on the scored lane) purely so this all-ones GEMM can
+    // COLUMN-SUM it, and it is never read again. Replacing it with a direct strided
+    // reduction over `padded` was tried and REJECTED: at the lane's `flat = 4096` the
+    // result moved by ~6 ULP, because `dgemm` delegates to matrixmultiply, which BLOCKS
+    // the k dimension and so does not accumulate a column as one ascending chain. Do not
+    // retry it as a bit-exact lever; see item 89 for what would have to change first.
     let ones_flat = vec![1.0f64; flat];
     let mut dweight_row = vec![0.0f64; patch_width];
     gemm::dgemm(1, flat, patch_width, &ones_flat, &panel, &mut dweight_row);
@@ -45965,9 +45973,12 @@ mod tests {
         // dispatches on: cpg == 2 takes the shared generic body and pays no widen, every
         // other cpg falls through to the general kernel and is widened inside the entry.
         // Both must equal the f32 route widened.
-        for &(batch, num_groups, cpg, spatial) in
-            &[(2usize, 3usize, 2usize, 8usize), (1, 2, 2, 5), (2, 3, 3, 7), (1, 2, 5, 4)]
-        {
+        for &(batch, num_groups, cpg, spatial) in &[
+            (2usize, 3usize, 2usize, 8usize),
+            (1, 2, 2, 5),
+            (2, 3, 3, 7),
+            (1, 2, 5, 4),
+        ] {
             let channels = num_groups * cpg;
             let numel = batch * num_groups * cpg * spatial;
             let x: Vec<f32> = (0..numel)
@@ -45978,10 +45989,24 @@ mod tests {
             let eps = 1e-5f32;
 
             let (dx32, dw32, db32) = super::group_norm_backward_scalar_f32(
-                upstream, &x, Some(&weight), batch, num_groups, cpg, spatial, eps,
+                upstream,
+                &x,
+                Some(&weight),
+                batch,
+                num_groups,
+                cpg,
+                spatial,
+                eps,
             );
             let (dx64, dw64, db64) = super::group_norm_backward_scalar_f32_dx_f64(
-                upstream, &x, Some(&weight), batch, num_groups, cpg, spatial, eps,
+                upstream,
+                &x,
+                Some(&weight),
+                batch,
+                num_groups,
+                cpg,
+                spatial,
+                eps,
             );
             assert_eq!(dx64.len(), dx32.len(), "len mismatch at cpg={cpg}");
             for (index, (wide, narrow)) in dx64.iter().zip(dx32.iter()).enumerate() {
