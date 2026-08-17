@@ -30616,3 +30616,64 @@ So the owed probe named in item 135c — conv2d's twin of `conv3d_masked_engine_
 arm against kernels arm, at both pool widths — is now the ONLY sensible next step on this bead.
 Item 133 was a real 1.3-1.5x on the kernel and bought nothing at the lane, which is exactly what
 attacking the wrong half looks like when the wrong half is genuinely improvable.
+
+## 139. THE conv2d ENGINE PROBE REFUTES MY OWN ITEMS 135d AND 137d — AT THE CERTIFIED WIDTH THE LANE IS 91% KERNEL
+
+Items 135 and 137 concluded that roughly half of conv2d's lane is not the backward, and item
+137d went further: "nobody should touch the conv2d backward" until this probe existed. The
+probe exists. **Both conclusions are wrong, and they are wrong by the mechanism I wrote down
+myself in item 123.**
+
+### 139a. THE SPLIT, ONE INVOCATION PER WIDTH, SAME ELF
+
+    arm                                  8 threads        64 threads
+    session (the lane's timed region)    11.460 ms        20.961 ms
+    kernels only (pad+fwd+loss+bwd)      10.458 (91.3%)   11.440 (54.6%)
+    ENGINE (session - kernels)            1.002 ( 8.7%)    9.522 (45.4%)
+    session, through the forward only     2.685            5.403
+
+    loadavg 36.04 / 25.48 / 18.14, vmstat idle 83%, iowait 0%
+    cpu_mhz 1429-4192 spread 2.93x, min of 9, arm-internal
+
+**At `RAYON_NUM_THREADS=8` — the width every conv2d standing is taken at — the lane is 91.3%
+kernel and 8.7% engine.** The backward is the right target after all.
+
+### 139b. HOW I GOT IT WRONG, TWICE
+
+Item 135b subtracted a 64-thread kernel figure (1.766 ms) from an 8-thread lane figure
+(5.335-6.075 ms) and called the remainder "forward plus tape plus session". Item 137d repeated
+the move on the masked route (15.7-16.4 ms lane against a ~7.5 ms kernel) and reached "about
+half the lane is not the backward".
+
+**Item 123 says, in its own subheading, that an engine-vs-kernel attribution taken at a
+different pool width than the certified row is not evidence about that row.** I wrote that after
+measuring the conv3d engine term move 3.8x between the two widths. Here it moves 9.5x, and I
+made the exact error the item exists to prevent — in the two turns immediately after writing it.
+
+Item 135c did hedge the first one ("an UPPER BOUND ... not a measurement of it"), which is why
+this costs a correction rather than a lever. Item 137d did not hedge, and its instruction not
+to touch the backward should be disregarded.
+
+### 139c. WHAT IS ACTUALLY TRUE NOW
+
+    conv2d_masked at 8 threads:  91.3% kernel, of which the backward is the large part
+    conv2d_masked at 64 threads: 45.4% engine — real, but not the configuration we certify in
+
+Item 136 already measured the backward as shape-bound and running at ~30% of its own ceiling,
+and item 133's 2-D tile bought a genuine 1.3-1.5x there. Those remain the live leads. Item 137's
+finding that the tile win did not move the standing still stands on its own evidence — both arms
+moved in a quieter window — and does not require the engine story that has just been refuted.
+
+**The estimator caveat, so this item does not repeat the error it corrects:** this probe is
+min-of-9 and the h2h lane figures are per-round medians, so 11.460 ms here and 15.7-16.4 ms
+there are not the same quantity. The SHARE is internal to one invocation under one estimator and
+is what this item claims; the absolute is not comparable to a lane row.
+
+### 139d. THE PATTERN WORTH NAMING
+
+Three items in a row on this bead (135, 137, and now this correction) turned on the same thing:
+a number measured at one pool width being reasoned about at another. It is not that the lesson
+was unlearned — item 123 is four items back and I cited it while making the mistake. **The
+defect is that pool width is invisible in a figure once it is written down.** Every phase number
+in this ledger should carry its `RAYON_NUM_THREADS` in the same line as its milliseconds, and
+the ones that do not should be treated as unattributed until re-measured.
