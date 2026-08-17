@@ -7184,22 +7184,12 @@ pub fn group_norm_backward_f32(
             1.0f32, x, weight, batch, num_groups, cpg, spatial, eps,
         );
     }
-    let ngrp = batch * num_groups;
-    let parallel = group_norm_parallel_pays(ngrp, ngrp * group_numel);
-
-    // PER-GROUP STATISTICS, COMPUTED ONCE — frankentorch-68pwz.
-    //
-    // The dx pass and the affine (dweight/dbias) pass each used to recompute `mean` and
-    // `rstd` from scratch, so the kernel made TWO extra full passes over `x` for statistics
-    // it had already produced. On the scored `[32,64,56,56]` dense lane that is 6,422,528
-    // elements walked twice for nothing. Hoisted here and read by both passes.
-    //
-    // BIT-EXACT: the per-group reduction below is the same ascending chain over the same
-    // `xb` slice that both call sites ran, so every `mean` and `rstd` is identical to the
-    // value each pass computed for itself.
-    let stat_of = |grp: usize| -> (f32, f32) {
+    let mut dx = vec![0.0f32; batch * num_groups * group_numel];
+    let dx_grp = |grp: usize, dxrow: &mut [f32]| {
+        let g = grp % num_groups;
         let base = grp * group_numel;
         let xb = &x[base..base + group_numel];
+        let dyb = &dy[base..base + group_numel];
         let mut sum = 0.0f32;
         for &v in xb {
             sum += v;
@@ -7210,27 +7200,7 @@ pub fn group_norm_backward_f32(
             let d = v - mean;
             vsum += d * d;
         }
-        (mean, 1.0f32 / (vsum * inv_m + eps).sqrt())
-    };
-    let mut stats = vec![(0.0f32, 0.0f32); ngrp];
-    if parallel {
-        stats
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(grp, slot)| *slot = stat_of(grp));
-    } else {
-        for (grp, slot) in stats.iter_mut().enumerate() {
-            *slot = stat_of(grp);
-        }
-    }
-
-    let mut dx = vec![0.0f32; ngrp * group_numel];
-    let dx_grp = |grp: usize, dxrow: &mut [f32]| {
-        let g = grp % num_groups;
-        let base = grp * group_numel;
-        let xb = &x[base..base + group_numel];
-        let dyb = &dy[base..base + group_numel];
-        let (mean, rstd) = stats[grp];
+        let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
         let mut c1 = 0.0f32;
         let mut c2 = 0.0f32;
         for i in 0..group_numel {
@@ -7250,7 +7220,7 @@ pub fn group_norm_backward_f32(
     // Reduce-then-scale over groups. Gated on the number of GROUPS as well as the
     // element count (`group_norm_parallel_pays`); see the forward for why a
     // numel-only gate is the wrong unit for this op.
-    if parallel {
+    if group_norm_parallel_pays(batch * num_groups, batch * num_groups * group_numel) {
         dx.par_chunks_mut(group_numel)
             .enumerate()
             .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
@@ -7261,54 +7231,28 @@ pub fn group_norm_backward_f32(
     }
     let need_affine = weight.is_some();
     let (dweight, dbias) = if need_affine {
-        // AFFINE GRADS, PARALLEL OVER CHANNELS AND BIT-EXACT — frankentorch-68pwz.
-        //
-        // This was a SERIAL loop over every group, and on the dense route it was the
-        // largest phase in the whole lane: ~1024 groups x 6272 elements walked in one
-        // thread, plus the two statistics passes now hoisted above.
-        //
-        // WHY CHANNELS AND NOT GROUPS. `dw[c]`/`db[c]` accumulate ACROSS groups, so a
-        // per-group fan-out would need a cross-thread combine and would reassociate the
-        // sum. Fanning over CHANNELS instead gives each output slot its own private chain,
-        // and that chain visits exactly the terms the serial loop did, in exactly its
-        // order: for a fixed `c` the group index is `g = c / cpg`, the contributing groups
-        // are `grp = n * num_groups + g` for ascending `n` (because `g = grp % num_groups`
-        // fixes `g` and `grp` ascending means `n` ascending), and within each the `i` range
-        // is the contiguous run `[(c % cpg) * spatial, ((c % cpg) + 1) * spatial)` in
-        // ascending order. Same terms, same order, so not one bit moves — asserted in
-        // `group_norm_backward_f32_affine_grads_match_serial_reference_bits` rather than
-        // argued.
         let mut dw = vec![0.0f32; channels];
         let mut db = vec![0.0f32; channels];
-        let chan = |c: usize, dwc: &mut f32, dbc: &mut f32| {
-            let g = c / cpg;
-            let local = c % cpg;
-            let lo = local * spatial;
-            let hi = lo + spatial;
-            let mut aw = 0.0f32;
-            let mut ab = 0.0f32;
-            for n in 0..batch {
-                let grp = n * num_groups + g;
-                let (mean, rstd) = stats[grp];
-                let base = grp * group_numel;
-                let xb = &x[base..base + group_numel];
-                let dyb = &dy[base..base + group_numel];
-                for i in lo..hi {
-                    aw += dyb[i] * (xb[i] - mean) * rstd;
-                    ab += dyb[i];
-                }
+        for grp in 0..batch * num_groups {
+            let g = grp % num_groups;
+            let base = grp * group_numel;
+            let xb = &x[base..base + group_numel];
+            let dyb = &dy[base..base + group_numel];
+            let mut sum = 0.0f32;
+            for &v in xb {
+                sum += v;
             }
-            *dwc = aw;
-            *dbc = ab;
-        };
-        if parallel {
-            dw.par_iter_mut()
-                .zip(db.par_iter_mut())
-                .enumerate()
-                .for_each(|(c, (dwc, dbc))| chan(c, dwc, dbc));
-        } else {
-            for (c, (dwc, dbc)) in dw.iter_mut().zip(db.iter_mut()).enumerate() {
-                chan(c, dwc, dbc);
+            let mean = sum * inv_m;
+            let mut vsum = 0.0f32;
+            for &v in xb {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+            for i in 0..group_numel {
+                let c = g * cpg + i / spatial;
+                dw[c] += dyb[i] * (xb[i] - mean) * rstd;
+                db[c] += dyb[i];
             }
         }
         (Some(dw), Some(db))
@@ -12956,106 +12900,6 @@ pub fn conv3d_col2im_f64(
     dpadded
 }
 
-/// conv3d input-gradient WITHOUT materializing `dpanel`: fuse the `dout_flat @ weight`
-/// product into the col2im scatter, one row block at a time.
-///
-/// The generic backward used to build the whole `dpanel` — `flat x patch_width`, **28.3 MB**
-/// on the scored lane, the second panel-sized buffer on that route after item 104 removed the
-/// first — write every row, then read every row once in `conv3d_col2im_f64` and drop it.
-///
-/// **Why this split is exact, and it is NOT item 97's reason.** Item 104 split a GEMM's `k`,
-/// which changes the summation order and only worked because matrixmultiply's partition was
-/// reproducible. Here the split is on `m`: `C[i][:]` depends solely on `A[i][:]`, so computing
-/// rows `[t, t+B)` in their own call gives the same arithmetic no matter how the rows are
-/// grouped. Nothing about the reduction order changes, because the reduction is over `out_ch`
-/// and is untouched.
-///
-/// The SCATTER order is the part that needs an argument. `conv3d_col2im_f64` accumulates into
-/// each output element in ascending `pc` — both of its paths do, the small-batch one with `c`
-/// outside `pc` and the large-batch one with `pc` outside `c`, which is why those two already
-/// agree. Blocking `pc` ascending inside each batch preserves exactly that sequence, and the
-/// `(kdd, kr, kc)` order inside a patch is copied unchanged. So every output element receives
-/// the same contributions in the same order.
-///
-/// Peak buffer falls from `flat * patch_width` to `DPANEL_BLOCK_ROWS * patch_width` — 1.77 MB
-/// at the scored lane's shape, cache-resident instead of a DRAM round trip.
-/// frankentorch-l2zki, NEGATIVE_EVIDENCE items 104c and 113.
-#[allow(clippy::too_many_arguments)]
-#[must_use]
-fn conv3d_col2im_from_dout_blocked_f64(
-    dout_flat: &[f64],
-    weight_flat: &[f64],
-    batch: usize,
-    in_ch: usize,
-    pd: usize,
-    ph: usize,
-    pw: usize,
-    kd: usize,
-    kh: usize,
-    kw: usize,
-    od: usize,
-    oh: usize,
-    ow: usize,
-    sd: usize,
-    sh: usize,
-    sw: usize,
-    out_ch: usize,
-) -> Vec<f64> {
-    let patch_width = in_ch * kd * kh * kw;
-    let patch_count = od * oh * ow;
-    let plane = pd * ph * pw;
-    let mut dpadded = vec![0.0f64; batch * in_ch * plane];
-    if patch_width == 0 || patch_count == 0 || plane == 0 {
-        return dpadded;
-    }
-    let rows_per_block = DPANEL_BLOCK_ROWS.min(patch_count);
-    let mut block = vec![0.0f64; rows_per_block * patch_width];
-    for b in 0..batch {
-        let mut pc0 = 0usize;
-        while pc0 < patch_count {
-            let rows = rows_per_block.min(patch_count - pc0);
-            let a_row = (b * patch_count + pc0) * out_ch;
-            gemm::dgemm(
-                rows,
-                out_ch,
-                patch_width,
-                &dout_flat[a_row..a_row + rows * out_ch],
-                weight_flat,
-                &mut block[..rows * patch_width],
-            );
-            let filled: &[f64] = &block[..rows * patch_width];
-            let base = b * in_ch * plane;
-            dpadded[base..base + in_ch * plane]
-                .par_chunks_mut(plane)
-                .enumerate()
-                .for_each(|(c, dpc)| {
-                    let pch = c * kd * kh * kw;
-                    for r in 0..rows {
-                        let pc = pc0 + r;
-                        let base_d = (pc / (oh * ow)) * sd;
-                        let rem = pc % (oh * ow);
-                        let base_h = (rem / ow) * sh;
-                        let base_w = (rem % ow) * sw;
-                        let prow = r * patch_width + pch;
-                        for kdd in 0..kd {
-                            let d_off = (base_d + kdd) * ph * pw;
-                            let pkd = kdd * kh * kw;
-                            for kr in 0..kh {
-                                let irow = d_off + (base_h + kr) * pw + base_w;
-                                let prow_off = prow + pkd + kr * kw;
-                                for kc in 0..kw {
-                                    dpc[irow + kc] += filled[prow_off + kc];
-                                }
-                            }
-                        }
-                    }
-                });
-            pc0 += rows;
-        }
-    }
-    dpadded
-}
-
 /// Scatter-add one repeated `dpanel` row into every conv3d output patch. This is
 /// the exact col2im specialization for `dout == 1`: every patch receives the same
 /// summed weight row, so materializing `flat * patch_width` identical rows is pure
@@ -13916,13 +13760,6 @@ pub fn conv3d_backward_f64(
 /// and fails loudly if they ever diverge. NEGATIVE_EVIDENCE item 97.
 const DGEMM_KC: usize = 256;
 
-/// Patch rows per block in [`conv3d_col2im_from_dout_blocked_f64`].
-///
-/// Unlike [`DGEMM_KC`] this number is FREE: the fused path splits the GEMM on `m`, not `k`, so
-/// the result is bit-identical for any block width and this is purely a
-/// working-set choice. 256 rows x `patch_width` is 1.77 MB at the scored lane's shape.
-const DPANEL_BLOCK_ROWS: usize = 256;
-
 #[allow(clippy::too_many_arguments)]
 fn conv3d_backward_ones_dout_f64(
     padded: &[f64],
@@ -14173,29 +14010,11 @@ fn conv3d_backward_generic_f64(
             start += rows;
         }
     });
-    // The 28.3 MB `dpanel` is gone: the product is fused into the col2im scatter one row
-    // block at a time, so the panel-shaped buffer never exists. Exact because the split is on
-    // `m` (each output row depends only on its own row of `dout_flat`) and because the scatter
-    // keeps `pc` ascending, which is the order `conv3d_col2im_f64` accumulates in.
-    // frankentorch-l2zki, NEGATIVE_EVIDENCE item 113.
-    let dpadded = conv3d_col2im_from_dout_blocked_f64(
-        &dout_flat,
-        weight_flat,
-        batch,
-        in_ch,
-        pd,
-        ph,
-        pw,
-        kd,
-        kh,
-        kw,
-        od,
-        oh,
-        ow,
-        sd,
-        sh,
-        sw,
-        out_ch,
+    let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f64]| {
+        gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+    });
+    let dpadded = conv3d_col2im_f64(
+        &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
     let dbias = if has_bias {
         // Parallel over out_ch: each channel's bias gradient is an independent
@@ -41400,102 +41219,6 @@ mod tests {
     /// conv1d's primitive is covered by measurement rather than by the bead's presumption.
     /// A sub-block case is kept as the control that the blocking did not change the
     /// single-block answer.
-    /// frankentorch-68pwz: `group_norm_backward_f32`'s affine grads went from a SERIAL loop
-    /// over groups to a per-CHANNEL parallel fan-out, and its per-group statistics are now
-    /// hoisted and shared with the dx pass instead of recomputed.
-    ///
-    /// Both changes claim BIT-EXACTNESS, so both are checked against a reference written
-    /// independently here in the shape the ORIGINAL had: serial over groups, statistics
-    /// recomputed inline, `dw[c] += ...` accumulating across groups. If the channel fan-out
-    /// visited the terms in any other order, or if hoisting the statistics changed a single
-    /// `mean`/`rstd`, these bit comparisons fail.
-    ///
-    /// `batch > 1` in every case is the point: with `batch == 1` each channel's chain has
-    /// only one group in it and the ordering claim is vacuous. Both sides of the parallel
-    /// gate are exercised, and a `cpg > 1` case is included so `c % cpg` addressing is
-    /// actually stressed.
-    #[test]
-    fn group_norm_backward_f32_affine_grads_match_serial_reference_bits() {
-        // batch, num_groups, cpg, spatial
-        let cases: &[(usize, usize, usize, usize)] = &[
-            (3, 2, 2, 5),  // tiny -> serial side of the gate, cpg > 1
-            (2, 4, 1, 7),  // cpg == 1
-            (4, 8, 4, 64), // large enough to cross the gate
-        ];
-        for &(batch, num_groups, cpg, spatial) in cases {
-            let channels = num_groups * cpg;
-            let group_numel = cpg * spatial;
-            let numel = batch * num_groups * group_numel;
-            let x: Vec<f32> = (0..numel)
-                .map(|i| ((i as f32 * 0.037).sin() * 0.7 + (i % 13) as f32 * 0.011 - 0.4))
-                .collect();
-            // Deliberately NOT all-ones: an all-ones dy takes the scalar shortcut instead.
-            let dy: Vec<f32> = (0..numel)
-                .map(|i| ((i as f32 * 0.041).cos() * 0.5) + 0.25)
-                .collect();
-            let weight: Vec<f32> = (0..channels).map(|c| 0.7 + (c % 5) as f32 * 0.1).collect();
-            let eps = 1e-5f32;
-
-            // Reference: the original nesting, serial, statistics recomputed inline.
-            let inv_m = 1.0f32 / group_numel as f32;
-            let mut want_dw = vec![0.0f32; channels];
-            let mut want_db = vec![0.0f32; channels];
-            for grp in 0..batch * num_groups {
-                let g = grp % num_groups;
-                let base = grp * group_numel;
-                let xb = &x[base..base + group_numel];
-                let dyb = &dy[base..base + group_numel];
-                let mut sum = 0.0f32;
-                for &v in xb {
-                    sum += v;
-                }
-                let mean = sum * inv_m;
-                let mut vsum = 0.0f32;
-                for &v in xb {
-                    let d = v - mean;
-                    vsum += d * d;
-                }
-                let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
-                for i in 0..group_numel {
-                    let c = g * cpg + i / spatial;
-                    want_dw[c] += dyb[i] * (xb[i] - mean) * rstd;
-                    want_db[c] += dyb[i];
-                }
-            }
-
-            let (_, got_dw, got_db) = super::group_norm_backward_f32(
-                &dy,
-                &x,
-                Some(&weight),
-                batch,
-                num_groups,
-                cpg,
-                spatial,
-                eps,
-            );
-            let got_dw = got_dw.expect("dweight");
-            let got_db = got_db.expect("dbias");
-            for c in 0..channels {
-                assert_eq!(
-                    got_dw[c].to_bits(),
-                    want_dw[c].to_bits(),
-                    "dweight[{c}] moved at batch={batch} groups={num_groups} cpg={cpg} \
-                     spatial={spatial}: {} vs {}",
-                    got_dw[c],
-                    want_dw[c]
-                );
-                assert_eq!(
-                    got_db[c].to_bits(),
-                    want_db[c].to_bits(),
-                    "dbias[{c}] moved at batch={batch} groups={num_groups} cpg={cpg} \
-                     spatial={spatial}: {} vs {}",
-                    got_db[c],
-                    want_db[c]
-                );
-            }
-        }
-    }
-
     #[test]
     fn conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise() {
         // batch, in_ch, ph, pw, kh, kw, sh, sw
@@ -47742,103 +47465,6 @@ mod tests {
     /// The reference is the exact code this replaced: build the whole im2col panel, then one
     /// `dgemm_tb` over the full `flat`. Shapes straddle the block width in both directions so
     /// a mishandled final partial block cannot hide.
-    /// The fused GEMM+scatter input gradient must be BIT-IDENTICAL to the
-    /// `dgemm` -> full `dpanel` -> `conv3d_col2im_f64` pair it replaced.
-    ///
-    /// Two independent things have to hold and the test checks their product: the `m`-split of
-    /// the product (each `dpanel` row depends only on its own `dout_flat` row) and the scatter
-    /// keeping `pc` ascending, which is the order col2im accumulates into an output element.
-    ///
-    /// Shapes straddle `DPANEL_BLOCK_ROWS` in both directions AND straddle
-    /// `COL2IM_PLANE_MAX_BATCH`, because `conv3d_col2im_f64` has two loop nests either side of
-    /// that gate and the fused path has to match both. A `patch_count` below one block and one
-    /// with a ragged tail are included, since a dropped final partial block is the failure this
-    /// most plausibly has. `dout` is non-uniform so the generic route is the one running.
-    #[test]
-    fn conv3d_generic_dpadded_fused_scatter_matches_panel_col2im_bitwise() {
-        let cases: &[(
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        )] = &[
-            // batch, in_ch, pd, ph, pw, kd, kh, kw, sd, sh, sw
-            (2, 32, 10, 18, 18, 3, 3, 3, 1, 1, 1), // scored lane: patch_count 2048 = 8 blocks
-            (2, 3, 7, 9, 11, 2, 3, 2, 1, 1, 1),    // patch_count 420, ragged tail
-            (1, 2, 5, 6, 6, 2, 2, 2, 2, 1, 3),     // patch_count 20, BELOW one block; strided
-            (9, 2, 5, 5, 5, 2, 2, 2, 1, 1, 1),     // batch 9 -> the OTHER col2im loop nest
-        ];
-
-        for &(batch, in_ch, pd, ph, pw, kd, kh, kw, sd, sh, sw) in cases {
-            let out_ch = 4usize;
-            let od = (pd - kd) / sd + 1;
-            let oh = (ph - kh) / sh + 1;
-            let ow = (pw - kw) / sw + 1;
-            let patch_width = in_ch * kd * kh * kw;
-            let patch_count = od * oh * ow;
-            let flat = batch * patch_count;
-
-            let weight_flat: Vec<f64> = (0..out_ch * patch_width)
-                .map(|i| ((i as f64 * 0.041).cos() * 0.5) / 1024.0)
-                .collect();
-            let dout_flat: Vec<f64> = (0..flat * out_ch)
-                .map(|i| ((i as f64 * 0.019).sin() * 0.5 + 0.25) / 512.0)
-                .collect();
-
-            // Reference: exactly the two steps this replaced.
-            let mut dpanel = vec![0.0f64; flat * patch_width];
-            super::gemm::dgemm(
-                flat,
-                out_ch,
-                patch_width,
-                &dout_flat,
-                &weight_flat,
-                &mut dpanel,
-            );
-            let want = super::conv3d_col2im_f64(
-                &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-            );
-
-            let got = super::conv3d_col2im_from_dout_blocked_f64(
-                &dout_flat,
-                &weight_flat,
-                batch,
-                in_ch,
-                pd,
-                ph,
-                pw,
-                kd,
-                kh,
-                kw,
-                od,
-                oh,
-                ow,
-                sd,
-                sh,
-                sw,
-                out_ch,
-            );
-
-            assert_eq!(got.len(), want.len());
-            for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
-                assert_eq!(
-                    g.to_bits(),
-                    w.to_bits(),
-                    "dpadded[{i}] moved at batch={batch} in_ch={in_ch} patch_count={patch_count} \
-                     (DPANEL_BLOCK_ROWS={}): fused {g:e} vs panel+col2im {w:e}",
-                    super::DPANEL_BLOCK_ROWS
-                );
-            }
-        }
-    }
-
     #[test]
     fn conv3d_generic_dweight_blocked_panel_matches_full_panel_gemm_bitwise() {
         let cases: &[(
