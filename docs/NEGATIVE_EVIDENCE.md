@@ -30981,3 +30981,65 @@ The estimator caveat from item 139 applies here too, in reverse: these are per-r
 16 rounds, and the min-estimator lines in the same output read 8.53x, 3.62x and so on. The
 medians are what the gates judge and what is quoted; the min figures are not interchangeable with
 them.
+
+## 143. THE conv2d GAP IS NOT A MISSING PHASE — ENUMERATION IS EXHAUSTIVE, SO IT IS THE SAME PHASES COSTING MORE IN SEQUENCE. PEAK FOOTPRINT (36 MB) JUST EXCEEDS ONE 32 MiB L3 INSTANCE
+
+`frankentorch-hi9r6` (P0). Item 141 found 57% of `conv2d_backward_f64` unaccounted and named
+the next step as bisecting the kernel. Before spending a build on that — the box is carrying 12
+rustc processes and ~100k blocks/s of write traffic — the cheaper question was whether anything
+is un-enumerated at all. Nothing is.
+
+### THE GENERIC PATH IS EXACTLY NINE OPERATIONS, AND ALL NINE ARE TIMED
+
+    2x dout.iter().all(..) fast-path checks   short-circuit on non-uniform dout
+    dout_flat alloc (2 MB) + gather           0.289 ms
+    conv2d_im2col_f64 -> panel (18 MB)        0.990 ms
+    dweight alloc + gemm::dgemm_tb            2.036 ms
+    dpanel alloc (18 MB)                      1.072 ms
+    gemm::dgemm                               1.557 ms
+    conv2d_col2im_f64 -> dpadded              1.129 ms
+    dbias                                     not taken (has_bias = false)
+                                       sum    7.072 ms   against a 16.595 ms whole
+
+Read the function end to end: there is no tenth operation. **So the 9.5 ms is not a phase anyone
+forgot to time — it is the same phases costing roughly 2.3x more when run once each in sequence
+than when run repeatedly in isolation.** That is a different kind of finding from "we have not
+found it yet", and it closes item 141's open question about whether something was un-enumerated.
+
+### THE MECHANISM, WITH THE NUMBERS THAT MAKE IT SPECIFIC
+
+`lscpu`: **L3 128 MiB in 4 instances — 32 MiB each**, 32 cores/socket, 1 NUMA node.
+
+The kernel holds `panel` (18.0 MB) and `dpanel` (18.0 MB) LIVE SIMULTANEOUSLY — `dpanel` is
+allocated while `panel` is still borrowed by the dweight GEMM's result and still needed as
+`dgemm`'s operand source. Add `dout_flat` (2 MB) and `dpadded` (2.4 MB) and the peak working set
+is **~40 MB against a 32 MiB L3 instance**. Each phase measured standalone touches ~18-20 MB and
+fits; the sequence does not.
+
+Stated as the hypothesis it is: this is arithmetic that fits, not a measurement. Eight rayon
+threads may span one or two CCDs, which would put 32-64 MiB in reach, so 36 MB sits right at the
+boundary rather than far past it. What makes it the leading candidate is that enumeration has
+excluded every alternative of the form "some phase we did not time".
+
+### THE TEST, AND IT IS CHEAP
+
+Run the phases ONCE EACH IN SEQUENCE on freshly allocated buffers — replicating the kernel's
+allocation pattern — instead of repeatedly on reused ones. If that reproduces ~16 ms from parts
+that sum to 7 ms in isolation, footprint is confirmed and no further attribution is needed. If it
+does not, the footprint story dies like the previous four and the bisection item 141 called for
+is the remaining option. One build, and it should wait for a window with iowait near zero.
+
+### WHY THIS POINTS AT A LEVER THAT ALREADY HAS A PRIMITIVE
+
+If peak footprint is the cost, the fix is not to make any phase faster — it is to stop having two
+18 MB panels alive at once. `gemm::dgemm_tb_add_into` exists for exactly this: item 97 established
+the `DGEMM_KC` partition that lets a transpose-GEMM's k be split from OUTSIDE bit-exactly, and
+item 100 banked the design of consuming an im2col panel one 256-row block at a time instead of
+materialising it. It has had no caller since item 117's revert, and item 140 marked it
+`#[allow(dead_code)]` rather than letting it be deleted. conv3d took this route (items 98, 119)
+and is the op that ended up 4x better on this route than conv2d.
+
+Five hypotheses have now been tested on this kernel — scaffolding, the column gate, GEMM shape,
+the GEMM attribution, and "something un-enumerated". Four were refuted by measurement and the
+fifth by reading. The footprint hypothesis is the first that nothing has yet contradicted, which
+is a reason to test it, not to believe it.
