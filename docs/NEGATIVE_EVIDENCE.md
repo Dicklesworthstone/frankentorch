@@ -28157,3 +28157,99 @@ It cannot by item 98's route. It would need a different decomposition of
 `dout_flat^T @ panel` — the panel's entries are gathers from `padded`, so the product is a
 strided GEMM over the input rather than over a materialized matrix, which is a real
 algorithmic change and not a loop rewrite.
+
+## 100. ITEM 99's REMAINING PANEL IS REMOVABLE BY ITEM 97's PARTITION TOO — DESIGN BANKED, DELIBERATELY NOT SHIPPED BLIND
+
+Item 98 removed the 28.3 MB im2col panel from the ones-dout backward. Item 99 correctly
+scoped that: the GENERIC backward — the branch every non-`sum()` loss takes — still builds
+it. This item states the fix precisely, and states why the code is not in this commit.
+
+### 100a. THE SAME PARTITION APPLIES, AND THE OPERAND LAYOUT COOPERATES
+
+`conv3d_backward_generic_f64` builds the full panel and consumes it once:
+
+    let panel = conv3d_im2col_f64(...);                                   // 28.3 MB
+    gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+
+`dgemm_tb` computes `C = A^T·B` with `A` of shape `k x m` and `B` of shape `k x n`, and here
+**k is `flat` — the panel's ROW count**. So the panel is consumed along exactly the axis
+item 97 showed is partitionable: `matrixmultiply`'s LOOP 4 already walks k in ascending
+`kc = D_KC = 256` chunks, accumulating into C between them.
+
+Both operands cooperate with a k-split, which is the part that is not automatic:
+
+    dout_flat   flat x out_ch        row-major -> a k-block is CONTIGUOUS rows
+    panel       flat x patch_width   row-major -> a k-block is CONTIGUOUS rows
+
+So block `t` needs only panel rows `[256t, min(256(t+1), flat))` — **1.7 MB at
+`patch_width=864`, cache-resident** — instead of all 28.3 MB. That is the whole lever: the
+panel never reaches DRAM, and by item 97 the result is bit-identical, not merely close.
+
+### 100b. WHAT IT NEEDS THAT DOES NOT EXIST YET
+
+An accumulating transpose-GEMM. `gemm::dgemm_tb` hardcodes `beta = 0.0` (via
+`dgemm_tb_scaled`, which exposes `alpha` only), so it cannot add into `C` across blocks.
+
+The precedent is already in the file: `dgemm_sub_into` passes `alpha = -1.0, beta = 1.0`
+with its own comment "beta=1 accumulates". A `dgemm_tb_add_into` is that same shape with
+`alpha = 1.0`, splitting the same way so writes never race.
+
+Then the loop is: `dgemm_tb` (beta=0) on block 0, `dgemm_tb_add_into` on blocks 1..n,
+ascending, with the block size **exactly** `DGEMM_KC`.
+
+### 100c. WHY THE CODE IS NOT IN THIS COMMIT
+
+Builds were withdrawn twice mid-turn (loadavg 465 then 651, iowait 78-82%), and my one
+verification attempt was killed at ten minutes. I already have ONE unverified change on
+main (item 101 below). Adding a NEW gemm entry point — raw pointers, `alpha`/`beta`
+semantics, a hand-managed block loop — while unable to compile or run it is a different
+class of risk from the mechanical `build_uninit` swaps: **a mistake there does not fail to
+compile, it silently returns wrong gradients.** The design above is complete enough to
+implement in one sitting once a build is available, and that is where it should be written.
+
+Recording the design rather than the code is the deliberate choice, not an omission.
+
+### 100d. TWO VERIFICATIONS I OWE
+
+1. `cargo test --release -p frankentorch-kernel-cpu conv` against the generic-backward
+   `build_uninit` change (item 101). It is parse-checked only.
+2. The full `frankentorch-kernel-cpu` and `ft-api` suites against the MERGED state, which
+   now contains item 98's panel removal and item 101's change together — neither has been
+   run against the other. Item 98's own commit says as much.
+
+Both are blocked on the fleet, not on doubt about the changes.
+
+## 101. THE conv3d GENERIC BACKWARD ZERO-FILLED ~29.5 MB PER CALL THAT IT THEN FULLY OVERWROTE
+
+Item 96 did the streamed forward; this is the same vein in `conv3d_backward_generic_f64`,
+the path every non-`sum()` loss takes. Four buffers were `vec![0.0; _]` and then written in
+full:
+
+    dout_flat   1 MB     fully written by the par_chunks_mut transpose, every (row, oc)
+    dweight     221 KB   written by dgemm_tb
+    dpanel      28.3 MB  written by dgemm            <- the one that matters
+    dbias       out_ch   fully written by par_iter_mut
+
+**WHAT HAD TO BE CHECKED RATHER THAN ASSUMED.** Dropping a zero-fill in front of a GEMM is
+sound only if the GEMM OVERWRITES `C` rather than accumulating into it, and the names do not
+say which. Read in the source: `dgemm_block` (via `dgemm_block_scaled`),
+`dgemm_col_parallel`, `dgemm_2d_parallel` and `dgemm_tb` (via `dgemm_tb_scaled`) all pass
+**beta = 0.0**. Those are all the paths plain `dgemm` dispatches to, so `C` is always
+overwritten. Had one of them accumulated, this would have been a silent wrong-answer bug and
+not a compile error — which is precisely why the new test scores VALUES, not just finiteness.
+
+Test: `conv3d_generic_backward_writes_every_uninitialized_slot`, three shapes, strides 1 and
+2, an `out_ch` that is not a multiple of 4, and a `dout` deliberately NOT all ones so the
+fast path cannot fire.
+
+**STATUS: UNVERIFIED.** Parse-checked only (`rustfmt --edition 2024 --check` parses the
+whole file and reports 0 diffs, which rules out syntax errors and nothing else). The
+verification run was killed at ten minutes when the host hit loadavg 465. Owed command in
+100d. If it breaks the build, revert it alone — nothing depends on it.
+
+It reached main inside `2ff1fd9c`, another agent's commit, as the FIFTH sweep of my
+uncommitted work this session. Two consequences worth separating: the change is now mixed
+into a commit whose message does not describe it, and its author's gate line ("14 conv3d
+tests green") was measured BEFORE my hunks arrived, so that number does not cover this code.
+**A gate is only evidence for the tree it actually ran on** — the same lesson as item 92,
+arriving from the other direction.
