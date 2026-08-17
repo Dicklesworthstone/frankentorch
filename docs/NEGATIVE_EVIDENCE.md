@@ -27193,3 +27193,60 @@ is explicit about. It is recorded because a term moving against the direction of
 run is the one kind of cross-window comparison that carries information.
 
 The certified statement about this lever remains item 85's row and nothing more.
+
+## 86. CORRECTING ITEM 83d's KERNEL FIGURE — A MIXED-ESTIMATOR SLIP, AND THE FULL SIX-RUN LANE TABLE
+
+Build-free re-reading of data already held. No run was made for this item; the host sat at
+loadavg 178-525 with 69-77% iowait throughout.
+
+### 86a. THE SLIP
+
+Item 83d concluded the group_norm kernels "already run 1.14x SLOWER than the incumbent on
+their own lane (`group_norm_f32_kernels`, 0.881 in run `n`)", and used that to argue the
+campaign's next lever should move from engine work to kernel work.
+
+**0.881 is the MEDIAN-estimator ratio. This ledger quotes the MIN estimator.** The
+min-estimator value for that same lane in that same run is **0.960**. Item 12 named exactly
+this — quoting a ratio under one estimator behind a gate adjudicated under another — and
+item 13's `rled4` machinery exists so the harness prints both side by side. I read the wrong
+column off a line that contains both.
+
+Across all six runs on the min estimator:
+
+    lane                                    certs   min-estimator ratios              median
+    group_norm_f32                           3/6    0.678 0.754 0.724 0.741 0.703 0.736  0.730
+    group_norm_f32_kernels                   0/6    0.960 1.074 0.964 1.033 0.929 0.965  0.965
+    group_norm_f32_statskernels              0/6    1.205 1.098 1.185 1.151 1.019 1.142  1.147
+    group_norm_f32_statskernels_recompute    1/6    1.174 1.395 1.220 1.129 1.195 1.210   1.203
+    group_norm_f32_kernels_serialfwd         0/6    0.411 0.405 0.368 0.406 0.380 0.402  0.403
+
+**The kernels lane is at PARITY, not 1.14x slower** — median 0.965, straddling 1.0 in 2 of
+6 runs. Item 83d's conclusion that "the kernels are now the majority phase" stands on the
+timings and is unaffected; its second claim, that they are meaningfully slower than the
+incumbent, does not. The next lever is still plausibly kernel work, but the gap it would
+close is ~3%, not ~14%.
+
+### 86b. WHAT THE TABLE SHOWS THAT WAS NEVER BANKED
+
+Both statistics-route lanes are FASTER than the incumbent in **6 of 6 runs** —
+`statskernels` 1.019-1.205 and `statskernels_recompute` 1.129-1.395, never once below 1.0.
+That is a consistent direction across every run taken.
+
+**And exactly one of those twelve rows certified** (`statskernels_recompute` at 1.220),
+whose CI is `[0.786, 1.306]` — an interval that spans both directions, so even the
+certified row cannot support "faster". A direction visible in 6/6 runs that the instrument
+will not certify in 11 of 12 attempts is items 60 and 63 again: the +/-0.02 null band, not
+the machine.
+
+This is worth stating plainly because it cuts against the campaign's own framing. The
+`group_norm_f32_kernels` route ft-api actually calls sits at parity while two neighbouring
+routes computing the same gradient sit 15-20% FASTER in every run — which is the same
+observation item 84 made from the FT-only side, arrived at independently from the
+vs-incumbent side, and still not isolated to a cause.
+
+### 86c. Unchanged
+
+The `serialfwd` control is stable at 0.368-0.411 across six runs, as a deliberately-serial
+arm should be. `group_norm_f32`'s three certifications and the 3.876 -> 2.017 ms engine
+result of item 83 are untouched by this correction — they were quoted on the min estimator
+throughout.
