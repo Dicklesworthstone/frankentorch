@@ -28127,3 +28127,33 @@ does not move until a paired run says so.
 
 The full kernel-cpu suite and ft-api are also unrun against this change; only the 14-test
 conv3d family is green. Both are owed before this is quoted as anything but landed.
+
+## 99. SCOPE LIMIT ON ITEM 98: THE PANEL IS ONLY GONE FROM THE SUM-LOSS BRANCH, AND THE GENERIC ONE STILL PAYS IT
+
+Item 98 removed the 28.3 MB im2col panel from `conv3d_backward_ones_dout_f64`. Recorded
+here, unprompted, because the win reads broader than it is and the scored lane is exactly
+the shape that benefits.
+
+`conv3d_backward_f64` branches on `dout` being exactly all `+1.0`. Only that branch lost its
+panel. `conv3d_backward_generic_f64` still calls `conv3d_im2col_f64` (lib.rs:13805) and still
+materializes the full panel, because its `dweight` is a genuine GEMM —
+`dout_flat^T @ panel` via `dgemm_tb` — not a column sum. There is no all-ones structure to
+collapse, so item 98's technique does not transfer and no cheap removal is available there.
+
+**Which route does real work take?** The all-ones branch fires when the loss is a plain
+`out.sum()`. That is what `ops_bench` and the h2h conv3d lane do, and it is a legitimate
+common case (`loss.backward()` on a summed output). Training against a real objective —
+cross-entropy, MSE against targets — reaches the GENERIC branch and still pays 28.3 MB.
+
+This is worth stating in the ledger rather than left implicit, because section 2 bans
+bench-path hardcoding and a reader is entitled to ask whether item 98 is that. It is not:
+the all-ones branch predates this work by two months (kgs4.118, 2026-06-20) and the lever
+changed how an EXISTING route computes, adding no shape test and no bench-specific
+condition. But it does mean **item 98's benefit is concentrated on the measured lane**, and
+any claim that conv3d training got faster would be overreach.
+
+The honest next question for this lane is whether the generic branch's panel can go at all.
+It cannot by item 98's route. It would need a different decomposition of
+`dout_flat^T @ panel` — the panel's entries are gathers from `padded`, so the product is a
+strided GEMM over the input rather than over a materialized matrix, which is a real
+algorithmic change and not a loop rewrite.
