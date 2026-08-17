@@ -26349,3 +26349,57 @@ engine. The conv3d engine term is now the majority phase and has never been pric
 next lever on this lane is the engine, not another kernel** — and on the GroupNorm
 precedent the first thing to look for is a numel-scaled serial materialization in the
 backward closure, not a fusion.
+
+## 75. THE conv3d ENGINE IS 36.8%, NOT ">50%" — CORRECTING ITEM 74, AND THE PAD WAS SERIAL
+
+Item 74 closed by asserting "more than half the lane is engine". **That was wrong, and
+this corrects it.** The claim compared the certified lane's FT arm (19.4-22.9 ms) against
+item 73's kernel figure of 9.582 ms — but that figure EXCLUDED the input padding, which
+the session must also do. Comparing a whole against a part inflated the remainder.
+
+Measured properly with a twin-lane split (`crates/ft-api/examples/conv3d_engine_probe.rs`),
+the same technique the board already carries for GroupNorm and which found item 69:
+
+    arm                                  min ms   share
+    session (functional_conv3d + tape)   17.755   100.0%
+    kernels only (pad+fwd+sum+bwd)       11.222    63.2%
+    ENGINE (session - kernels)            6.533    36.8%
+
+Observed loadavg 21.55 / 20.14 / 21.38; CPU 1429-4044 MHz, spread 2.83x. 64 threads.
+
+**36.8%, not >50%.** Still the largest single un-attacked block on the lane, and still the
+right next target — but a third smaller than I claimed, and the claim should not have been
+made from a mismatched pair of numbers.
+
+### 75a. The pad was fully serial, and is now parallel
+
+`FrankenTorchSession::pad_ncdhw_zero_f64` looped `for plane in 0..n*c` with no rayon — 64
+planes for the scored lane, on a 64-core box, on every forward. Its f32 counterpart was
+identical. Both now split planes through a shared `pad_ncdhw_copy_planes`, gated at
+`PAD_PLANE_PARALLEL_MIN` because item 69 measured a 64-way join at 0.1-0.9 ms, larger than
+a small pad entire.
+
+BIT-EXACT: planes are disjoint and this is a pure copy — no arithmetic, no accumulation,
+no order to change. **The `vec![0.0; ..]` STAYS.** Unlike the im2col panels of item 72, the
+zeros here are LOAD-BEARING — only the interior is written and the border zeros ARE the
+padding — so `build_uninit` would be unsound. That distinction is the whole reason the
+im2col change was safe and this one would not have been.
+
+`pad_ncdhw_zero_parallel_matches_serial_and_keeps_borders` compares both dtypes against an
+independently written reference on both sides of the gate (a small shape that stays serial
+and the lane's own shape that goes parallel), and separately asserts every border element
+is exactly `+0.0`, so a wrong plane stride surfaces as a misplaced value instead of passing
+silently. 2579 ft-api tests pass; ft-api clippy is clean.
+
+### 75b. NO SPEEDUP IS DEMONSTRATED, and the reason is the host
+
+The only post-change measurement available ran at **loadavg 36.93 against 21.55** for the
+pre-change one — a 1.7x change in host occupancy. Every arm moved with it (session
+17.755 -> 20.146, kernels 11.222 -> 12.375, engine 6.533 -> 7.771), so the comparison is
+confounded and **no improvement is claimed from it**. The change is landed on correctness
+and on the structural argument that a serial loop over 64 disjoint planes cannot be right
+on a 64-core box; its value is unmeasured.
+
+That is the honest state: item 69's widen was landed with a 20.351 ms prediction that the
+board then confirmed to within 0.5%, and this one has no such number. Re-measuring it in a
+settled window, against the 6.533 ms engine baseline recorded above, is owed.

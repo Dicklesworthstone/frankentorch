@@ -30229,18 +30229,60 @@ impl FrankenTorchSession {
         let out_h = in_h + 2 * pad_h;
         let out_w = in_w + 2 * pad_w;
         let mut dst = vec![0.0; n * c * out_d * out_h * out_w];
-        for plane in 0..n * c {
+        // frankentorch-l2zki: this ran SERIALLY over n*c planes — 64 of them for the
+        // scored conv3d lane, on a 64-core box — on every forward. Planes are disjoint
+        // and this is a pure copy, so splitting them is BIT-EXACT: no arithmetic, no
+        // accumulation, no order to change.
+        //
+        // The `vec![0.0; ..]` STAYS. Unlike the im2col panels of item 72, the zeros here
+        // are LOAD-BEARING — only the interior is written and the border zeros are the
+        // padding itself — so `build_uninit` would be unsound.
+        let plane_out = out_d * out_h * out_w;
+        Self::pad_ncdhw_copy_planes(&mut dst, src, n * c, in_d, in_h, in_w, plane_out, pad_d,
+            pad_h, pad_w, out_h, out_w);
+        dst
+    }
+
+    /// Shared plane-copy for [`Self::pad_ncdhw_zero_f64`] and its f32 counterpart.
+    ///
+    /// Below `PAD_PLANE_PARALLEL_MIN` output elements the rayon fork/join costs more than
+    /// the copy saves — this box measured a 64-way join at 0.1-0.9 ms in item 69, which is
+    /// larger than a small pad in its entirety.
+    fn pad_ncdhw_copy_planes<T: Copy + Send + Sync>(
+        dst: &mut [T],
+        src: &[T],
+        planes: usize,
+        in_d: usize,
+        in_h: usize,
+        in_w: usize,
+        plane_out: usize,
+        pad_d: usize,
+        pad_h: usize,
+        pad_w: usize,
+        out_h: usize,
+        out_w: usize,
+    ) {
+        const PAD_PLANE_PARALLEL_MIN: usize = 1 << 16;
+        let copy_plane = |plane: usize, dpl: &mut [T]| {
             let src_base = plane * in_d * in_h * in_w;
-            let dst_base = plane * out_d * out_h * out_w;
             for d in 0..in_d {
                 for h in 0..in_h {
                     let src_row = src_base + (d * in_h + h) * in_w;
-                    let dst_row = dst_base + ((d + pad_d) * out_h + (h + pad_h)) * out_w + pad_w;
-                    dst[dst_row..dst_row + in_w].copy_from_slice(&src[src_row..src_row + in_w]);
+                    let dst_row = ((d + pad_d) * out_h + (h + pad_h)) * out_w + pad_w;
+                    dpl[dst_row..dst_row + in_w].copy_from_slice(&src[src_row..src_row + in_w]);
                 }
             }
+        };
+        if planes * plane_out >= PAD_PLANE_PARALLEL_MIN {
+            use rayon::prelude::*;
+            dst.par_chunks_mut(plane_out)
+                .enumerate()
+                .for_each(|(plane, dpl)| copy_plane(plane, dpl));
+        } else {
+            for (plane, dpl) in dst.chunks_mut(plane_out).enumerate() {
+                copy_plane(plane, dpl);
+            }
         }
-        dst
     }
 
     /// f32 counterpart of [`Self::pad_ncdhw_zero_f64`].
@@ -30259,17 +30301,11 @@ impl FrankenTorchSession {
         let out_h = in_h + 2 * pad_h;
         let out_w = in_w + 2 * pad_w;
         let mut dst = vec![0.0f32; n * c * out_d * out_h * out_w];
-        for plane in 0..n * c {
-            let src_base = plane * in_d * in_h * in_w;
-            let dst_base = plane * out_d * out_h * out_w;
-            for d in 0..in_d {
-                for h in 0..in_h {
-                    let src_row = src_base + (d * in_h + h) * in_w;
-                    let dst_row = dst_base + ((d + pad_d) * out_h + (h + pad_h)) * out_w + pad_w;
-                    dst[dst_row..dst_row + in_w].copy_from_slice(&src[src_row..src_row + in_w]);
-                }
-            }
-        }
+        // frankentorch-l2zki: same serial plane loop as the f64 form; see
+        // `pad_ncdhw_copy_planes`. Zeros stay — they are the padding.
+        let plane_out = out_d * out_h * out_w;
+        Self::pad_ncdhw_copy_planes(&mut dst, src, n * c, in_d, in_h, in_w, plane_out, pad_d,
+            pad_h, pad_w, out_h, out_w);
         dst
     }
 
@@ -144480,6 +144516,84 @@ mod tests {
     /// accumulation order — but the whole point of the helper is that it takes a
     /// DIFFERENT code path above the gate, so both sides of the gate are exercised and
     /// compared against the serial form the change replaced.
+    /// frankentorch-l2zki: `pad_ncdhw_zero_{f64,f32}` now copy their planes in parallel
+    /// above `PAD_PLANE_PARALLEL_MIN`. Planes are disjoint and this is a pure copy, so it
+    /// must be bit-identical to the serial form — and, unlike the im2col panels of item
+    /// 72, the surrounding zeros are LOAD-BEARING and must survive.
+    ///
+    /// Both sides of the gate are exercised: a small pad stays serial, a lane-sized one
+    /// goes parallel. The reference is written independently, and every border element is
+    /// checked to be exactly +0.0 so a wrong plane stride shows up as a misplaced value
+    /// rather than passing silently.
+    #[test]
+    fn pad_ncdhw_zero_parallel_matches_serial_and_keeps_borders() {
+        for &(n, c, in_d, in_h, in_w, pad_d, pad_h, pad_w) in &[
+            (1usize, 2usize, 3usize, 4usize, 5usize, 1usize, 1usize, 1usize), // small -> serial
+            (2, 32, 8, 16, 16, 1, 1, 1), // the scored conv3d lane -> parallel
+        ] {
+            let (out_d, out_h, out_w) = (in_d + 2 * pad_d, in_h + 2 * pad_h, in_w + 2 * pad_w);
+            let src: Vec<f64> = (0..n * c * in_d * in_h * in_w)
+                .map(|index| (index % 251) as f64 * 0.125 - 7.0)
+                .collect();
+            let src32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+
+            let got = super::FrankenTorchSession::pad_ncdhw_zero_f64(
+                &src, n, c, in_d, in_h, in_w, pad_d, pad_h, pad_w,
+            );
+            let got32 = super::FrankenTorchSession::pad_ncdhw_zero_f32(
+                &src32, n, c, in_d, in_h, in_w, pad_d, pad_h, pad_w,
+            );
+
+            let mut want = vec![0.0f64; n * c * out_d * out_h * out_w];
+            for plane in 0..n * c {
+                for d in 0..in_d {
+                    for h in 0..in_h {
+                        for w in 0..in_w {
+                            let s = ((plane * in_d + d) * in_h + h) * in_w + w;
+                            let t = ((plane * out_d + d + pad_d) * out_h + h + pad_h) * out_w
+                                + w
+                                + pad_w;
+                            want[t] = src[s];
+                        }
+                    }
+                }
+            }
+            assert_eq!(got.len(), want.len());
+            for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "f64 pad diverged at {index} (n={n} c={c})");
+            }
+            for (index, (g, w)) in got32.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    (*w as f32).to_bits(),
+                    "f32 pad diverged at {index} (n={n} c={c})"
+                );
+            }
+            // Borders must be exactly +0.0, not merely equal to the reference.
+            let mut borders = 0usize;
+            for plane in 0..n * c {
+                for d in 0..out_d {
+                    for h in 0..out_h {
+                        for w in 0..out_w {
+                            let interior = d >= pad_d
+                                && d < pad_d + in_d
+                                && h >= pad_h
+                                && h < pad_h + in_h
+                                && w >= pad_w
+                                && w < pad_w + in_w;
+                            if !interior {
+                                let t = ((plane * out_d + d) * out_h + h) * out_w + w;
+                                assert_eq!(got[t].to_bits(), 0.0f64.to_bits(), "border at {t}");
+                                borders += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(borders > 0, "test shape must actually have a border");
+        }
+    }
+
     #[test]
     fn widen_f32_gradient_matches_serial_bitwise() {
         fn serial(values: &[f32]) -> Vec<f64> {
