@@ -28893,3 +28893,83 @@ surface gets checked"). It is now confirmed on a second op, with a certified rat
 
 NOT A REGRESSION AND NOT NEW: nothing got slower. This is a loss that was always there and
 was never in view.
+
+## 110. conv3d's CERTIFIED WIN COVERS ONLY `sum()` LOSSES — THE ROUTE TRAINING TAKES IS 2.8x SLOWER, AND NOTHING ON THE BOARD WAS MEASURING IT
+
+Item 108 certified conv3d at 1.25-1.31x FASTER and item 108d named the gap in that claim: the
+lane's loss is `out.sum()`, so its output gradient is exactly all `+1.0` and it takes
+`conv3d_backward_f64`'s fast path. A real objective does not. I built the lane that measures
+the other route, and the result reframes the win.
+
+`conv3d_masked` is the existing conv3d lane with ONE difference — the loss is
+`(out * mask).sum()` instead of `out.sum()`, so the output gradient is `mask` and the call
+lands in `conv3d_backward_generic_f64`. Same shape, same weight, same incumbent op, mask
+built from the same `seq` generator on both arms.
+
+### 110a. THE TWO ROUTES, MEASURED SIDE BY SIDE IN ONE INVOCATION
+
+    lane             FT ms    PT ms   standing
+    conv3d            4.299    7.058  1.62x FASTER    <- all-ones fast path
+    conv3d_masked    18.958    7.131  2.74x SLOWER    <- generic path
+
+**PyTorch is flat across the two — 7.058 against 7.131, a 1.010x difference — and we are
+4.4x apart.** That ratio of ratios is the finding: the incumbent does not care what shape the
+loss is, and we care enormously.
+
+`PT(conv3d_masked) / PT(conv3d) = 1.010` is also the built-in control for this lane: it prices
+the mask multiply itself on an arm that has no fast path to lose, and 1% is far too small to
+explain the FT difference. The multiply is charged to both arms and is not the story.
+
+### 110b. FIVE ROWS, REPLICATED 5/5, CERTIFIED 0/5
+
+ELF `65f2efcb...`, `RAYON_NUM_THREADS=8`, 16 rounds, mimalloc, thinkstation1, live PyTorch
+2.12.0+cpu in every invocation:
+
+    run  load_1m   FT ms     PT ms    min-ratio             nulls
+    m1     14.27   18.958    7.131    0.365 [0.339,0.382]   PT 1.040 F   FT 1.009 P
+    m2     17.20   18.839    7.449    0.354 [0.340,0.395]   PT 0.979 F   FT 1.036 F
+    m3     20.62   17.887    6.820    0.371 [0.356,0.384]   PT 1.025 F   FT 0.991 P
+    m4     19.32   19.807    6.897    0.342 [0.321,0.359]   PT 1.053 F   FT 0.991 P
+    m5     22.66   18.029    6.498    0.340 [0.326,0.349]   PT 1.043 F   FT 0.987 P
+
+m5 provenance: cpu_mhz min=1429 median=2514 max=4156 spread=2.909x; cross-core spread while
+sampling 2.861x / 2.938x / 2.960x; load_series n=18 worst_drift 1.047x, both gates PASS.
+
+FT 17.887-19.807 ms (spread 1.107x), PT 6.498-7.449 (1.146x), min-ratio **0.340-0.371 =
+2.7-2.9x SLOWER**. Our arm's null passed in four of five; the INCUMBENT's failed in all five
+at 1.025-1.053, so no row is quotable. Replicated, not certified, and recorded as such.
+
+**Parity reads `match` on every row.** That is worth more than usual here: it is the check
+that the lane itself is built right, because the two arms only agree on the gradient checksum
+if the mask values are bit-identical on both sides, which is what the shared `seq` formula was
+for.
+
+### 110c. WHAT THIS DOES TO ITEM 108's WIN
+
+It narrows it, and does not retract it. Item 108's rows are real, certified and reproducible
+— for a `sum()` loss. What was wrong was the implicit scope: the lane was treated as "the
+conv3d standing" when it is the standing of one branch. **conv3d's honest position is now two
+numbers**: 1.25-1.60x FASTER under a summed loss, 2.7-2.9x SLOWER under a real one, and the
+second is the one a user training a 3-D CNN meets.
+
+This also finally prices item 104. Its 28.3 MB panel removal lives on the generic route and
+was unmeasurable until now; 18.0-19.8 ms is the number AFTER it landed. I have no paired
+before, so item 104's own contribution is still unattributed — but the route is now
+instrumented and the next lever on it can be measured properly, which was the point.
+
+### 110d. A CONVERGENCE, NOT A COINCIDENCE
+
+Item 109 reports the identical defect class for GroupNorm, found independently and in the same
+window: the benchmark's loss shape was hiding the real gap, and the dense route certifies at
+**6.51x SLOWER**. Two lanes, two agents, same mechanism.
+
+**The pattern is now general enough to state: a board whose every lane ends in `.sum()` is
+measuring the sum-loss specialisations, not the library.** Any op with an all-ones fast path
+— and this codebase has deliberately built several, kgs4.118 for conv3d, 2026-07-05 for
+conv2d, 2026-07-09 for conv1d, and whatever GroupNorm's is — has been scored on the branch
+real training never reaches. The other lanes should be audited for the same blind spot before
+any more of their standings are quoted, and `prelu`, `max_pool*` and `avg_pool*` all end in
+`sum()` today.
+
+That audit is the highest-value measurement work left on this board, and it is bigger than
+any single lever either of us has landed this campaign.

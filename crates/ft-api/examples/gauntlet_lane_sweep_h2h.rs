@@ -588,6 +588,63 @@ fn timed_prelu(values: &[f64], weight: &[f64], defeat_shortcut: bool) -> (f64, f
     (elapsed, checksum)
 }
 
+/// Conv3d under a NON-UNIFORM loss — the only lane on this board that reaches conv3d's
+/// GENERIC backward.
+///
+/// Every other conv3d lane ends in `tensor_sum(out)`, so the output gradient is exactly all
+/// `+1.0` and `conv3d_backward_f64` takes its all-ones fast path. That is a legitimate case
+/// (`loss.backward()` on a summed output) but it is NOT what training does, and it means the
+/// generic route — the one a real objective reaches — has never had a live incumbent arm.
+/// NEGATIVE_EVIDENCE item 104 removed a 28.3 MB im2col panel from precisely that route and
+/// could not be measured at all for this reason; item 108d named this lane as the fix.
+///
+/// The loss is `(out * mask).sum()`, which makes the incoming gradient `mask` rather than
+/// ones. The mask is built from the same `seq` generator both arms use, so the two sides
+/// multiply by bit-identical values, and it is deliberately non-uniform: a constant mask
+/// would still be a uniform `dout` and would land back on the fast path.
+///
+/// The extra elementwise multiply is real work and is charged to BOTH arms — 131,072
+/// elements against a lane in the millisecond range — so it shifts both sides together and
+/// does not favour either. It is inside the timed region on both arms because it is part of
+/// the loss, which is what `loss_sum` in the declared region covers. frankentorch-l2zki.
+fn timed_conv3d_masked(
+    values: &[f64],
+    input_shape: Vec<usize>,
+    weights: &[f64],
+    weight_shape: Vec<usize>,
+    mask: &[f64],
+    out_shape: Vec<usize>,
+) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), input_shape, true)
+        .expect("conv3d leaf");
+    let weight = session
+        .tensor_variable(weights.to_vec(), weight_shape, false)
+        .expect("conv3d weight");
+    // The mask is a leaf too, and it is built here for the same reason the weight is: the
+    // PyTorch arm makes it once during setup, so constructing it inside the timer would
+    // charge tensor construction to one arm only.
+    let mask_leaf = session
+        .tensor_variable(mask.to_vec(), out_shape, false)
+        .expect("conv3d mask");
+    let started = Instant::now();
+    let out = session
+        .functional_conv3d(x, weight, None, (1, 1, 1), (1, 1, 1))
+        .expect("conv3d");
+    let scaled = session.tensor_mul(out, mask_leaf).expect("mask multiply");
+    let loss = session.tensor_sum(scaled).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// Time Conv3d with both tensor leaves built before the declared timed region.
 ///
 /// The PyTorch arm constructs `c3w` during setup and reuses it for every sample.
@@ -675,6 +732,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ap2 = seq(AP2_N * AP2_C * AP2_H * AP2_W);
     let c3x = seq(C3_N * C3_CI * C3_D * C3_H * C3_W);
     let c3w = seq(C3_CO * C3_CI * C3_K * C3_K * C3_K);
+    // frankentorch-l2zki: the conv3d_masked lane's loss weights, over the OUTPUT shape.
+    // stride 1 / pad 1 / k 3 makes the output extents equal the input's, so this is the same
+    // element count as `c3x` and the same `seq` call the python arm makes for `c3m` — the two
+    // arms multiply by bit-identical values, which is what keeps the gradient checksum a
+    // parity check rather than a coincidence.
+    let c3m = seq(C3_N * C3_CO * C3_D * C3_H * C3_W);
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
     // Built by the SAME formula the python arm uses, then cast — so the two arms
     // normalize identical numbers and the gradient checksum is a real parity check
@@ -720,6 +783,11 @@ mp1=seq(8*64*8192).reshape(8,64,8192)
 ap2=seq(8*64*64*64).reshape(8,64,64,64)
 c3x=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 c3w=seq(32*32*3*3*3).reshape(32,32,3,3,3)
+# frankentorch-l2zki: the conv3d_masked lane's loss weights. Same `seq` generator as every
+# other tensor here and the same one the Rust arm uses, so both sides multiply by
+# bit-identical values. Non-uniform on purpose -- a constant mask is still a uniform `dout`
+# and would land back on the all-ones fast path this lane exists to avoid. Output shape.
+c3m=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
 # frankentorch-kgs4.115 GroupNorm f32 train step, shape and groups copied verbatim
 # from the scorecard row so the two describe the same workload. f32 on BOTH sides:
@@ -747,10 +815,17 @@ def run(base, fn):
     elapsed=(time.perf_counter()-s)*1e3
     # teardown, deliberately AFTER the clock stops on BOTH arms
     return elapsed, x.grad.abs().sum().item()
+
 LANES = {
     "max_pool1d": (mp1, lambda x: Fn.max_pool1d(x,2,2)),
     "avg_pool2d": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
+    # frankentorch-l2zki: NON-UNIFORM loss, the only lane here that reaches conv3d's GENERIC
+    # backward. The `*c3m` sits inside the lane's own fn, so `run`'s `fn(x).sum()` becomes
+    # `(conv3d(x)*c3m).sum()` and the output gradient is `c3m` instead of all-ones -- no
+    # change to the shared serve loop, which unpacks a 2-tuple for every lane. The multiply
+    # is charged to both arms alike and the mask is built in setup, outside the timer.
+    "conv3d_masked": (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))*c3m),
     "max_pool3d": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
     # frankentorch-9pafs: the same torch op under a second name. The FrankenTorch
     # side runs this lane with its buffer pool DISABLED, so the pair isolates the
@@ -1143,6 +1218,26 @@ LANES = {
                     vec![C3_N, C3_CI, C3_D, C3_H, C3_W],
                     &c3w,
                     vec![C3_CO, C3_CI, C3_K, C3_K, C3_K],
+                )
+            }),
+        ),
+        (
+            // frankentorch-l2zki, NEGATIVE_EVIDENCE item 108d. The board's conv3d lane ends
+            // in `sum()`, so its output gradient is all-ones and it takes conv3d's fast
+            // path. This twin ends in `(out * mask).sum()`, which is the only way from here
+            // to the GENERIC backward — the route a real objective reaches, and the one item
+            // 104's 28.3 MB panel removal lives on. Same shape, same weight, same incumbent
+            // op; the ONLY difference between the two lanes is the loss, so PT(conv3d_masked)
+            // / PT(conv3d) also prices what the mask multiply itself costs.
+            "conv3d_masked",
+            Box::new(|| {
+                timed_conv3d_masked(
+                    &c3x,
+                    vec![C3_N, C3_CI, C3_D, C3_H, C3_W],
+                    &c3w,
+                    vec![C3_CO, C3_CI, C3_K, C3_K, C3_K],
+                    &c3m,
+                    vec![C3_N, C3_CO, C3_D, C3_H, C3_W],
                 )
             }),
         ),
