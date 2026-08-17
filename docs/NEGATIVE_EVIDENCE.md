@@ -27490,3 +27490,123 @@ traffic to keep 864 numbers. Three routes remain, in the order I would take them
 
 Route 1 is the only one that makes the 28 MB go away, and it is a question for the campaign
 rather than a lever.
+
+## 90. THE conv3d "TOLERANCE RATIFICATION" WAS A PHANTOM — THE ROUTE WE ALREADY SHIP IS THE LESS ACCURATE ONE
+
+`frankentorch-conv3d-direct-gate-misset-w3pol`, owed since item 68d and closed here.
+
+Item 68d sized the re-gate at 1.5-3.3x and then blocked it: switching conv3d's deep
+reductions from the direct kernel to the streamed im2col+GEMM route changes the produced
+bits by 4.770e-12 relative, so it "requires a tolerance ratification" — a policy call
+someone had to make.
+
+**There was never anything to ratify, and the reason is a mistake in the framing rather
+than in the number.** Item 68d compared FrankenTorch's direct kernel against
+FrankenTorch's streamed kernel. That comparison can establish that two of our kernels
+disagree. It cannot establish which one is right, because **neither of them is a
+reference.** Ratifying a tolerance on that basis would have been ratifying our own drift
+against itself.
+
+### 90a. TWO REAL REFERENCES, AND BOTH WERE AVAILABLE ALL ALONG
+
+1. **Torch**, because parity-with-torch is this campaign's actual rule.
+2. **The exact answer.** Every input here is an f64 and therefore an exact rational, so
+   the true value of the convolution is exactly computable with `fractions.Fraction` and
+   correctly rounded to f64. Against that, "which route is more accurate" is a fact. This
+   reference also scores TORCH, which is what makes it the stronger of the two.
+
+Probe `crates/ft-api/examples/conv3d_route_torch_arbiter.rs` + arbiter
+`scripts/conv3d_route_torch_arbiter.py`. Both routes are reached with NO source edit, via
+item 68d's own trick: `out_ch % 4 == 0` gates the direct kernel, so out_ch=30 runs
+streamed while the same 30 channels inside a 32-channel weight run direct. ELF
+`38c44f3e...`, host thinkstation1, worker vmi1227854 for the build. torch 2.12.1+cpu.
+
+The probe first reproduced item 68d exactly, from an independently built binary:
+**115364 of 122880 outputs differ, worst relative 4.770e-12.** So the disagreement is
+real and this is the same phenomenon, not a different one.
+
+### 90b. THE RESULT INVERTS THE BLOCK
+
+Shape [2,32,10,18,18] pre-padded, weight [30,32,3,3,3], reduction depth k=864.
+
+    AGAINST TORCH (all 122880 elements)
+      route      bit-exact      max_rel     max_ulp   mean_ulp
+      streamed   7445/122880   4.770e-12     28160     14.016
+      direct    27774/122880   8.313e-12     49072     11.578   <- what ships today
+
+    AGAINST THE EXACT ANSWER (Fraction, 1267 sampled outputs, stride 97)
+      route      bit-exact      max_rel     max_ulp   mean_ulp
+      streamed    151/1267     3.401e-14       284      5.809   <- most accurate
+      direct       79/1267     7.977e-14       685      9.223
+      torch        65/1267     9.375e-14       805      9.779
+
+Two things fall out, and the first one ends the debate:
+
+1. **The direct route we ship is ALREADY 8.313e-12 from torch — 1.74x FURTHER than the
+   4.770e-12 that item 68d treated as the cost of switching.** Any tolerance wide enough
+   to admit the code that ships today necessarily admits the replacement. The "cost" was
+   never a cost; it was a figure smaller than the drift already in the binary.
+
+2. **The streamed route is the most accurate of all three, torch included** (5.809 vs
+   9.223 vs 9.779 mean ulp from the exact answer). We are not spending accuracy to buy
+   speed here. We are gaining both.
+
+### 90c. THE ONE METRIC THAT FAVOURS THE INCUMBENT, RECORDED RATHER THAN OMITTED
+
+On MEAN ulp distance from torch, the direct route is nominally closer: 11.578 against
+14.016. That is reported because it is real, and it does not change the conclusion:
+
+- It measures agreement with torch's PARTICULAR ROUNDING, not correctness. The exact
+  reference shows torch is itself 9.779 mean ulp from the true value — the direct kernel
+  looks closer to torch partly by being wrong in a similar direction.
+- On worst-case relative error — the metric a tolerance gate would actually be written
+  against, and the one item 68d quoted — the streamed route wins, 4.770e-12 to 8.313e-12.
+
+### 90d. MECHANISM, and it agrees with a peer's independent finding
+
+`gemm::dgemm` delegates to `matrixmultiply`, which packs and BLOCKS the k dimension, so
+the streamed route sums an 864-deep reduction in blocked order. The direct kernel walks
+the same 864 terms flat through four scalar accumulators. Blocked summation has lower
+error growth than flat accumulation, which is exactly why the streamed route beats both
+the direct kernel and torch. `frankentorch-l2zki` reached the same mechanism from the
+opposite direction in their item 89, where `matrixmultiply`'s k-blocking is exactly what
+defeated their attempt to reproduce a GEMM column sum by direct strided reduction. Two
+agents, two unrelated levers, same underlying fact about the summation order — which is
+the strongest form this ledger has for believing a mechanism.
+
+### 90e. WHAT SHIPPED
+
+`CONV3D_DIRECT_MAX_IN_CH = 8` — a ceiling on the previously open-ended `in_ch >= 8`,
+placed at the measured crossover from item 68b (direct wins 1.134x at in_ch=8, loses
+0.658x at 12 and 0.541x at the scored lane's 32).
+
+Gate: `cargo test --release -p frankentorch-kernel-cpu conv` on remote worker vmi1227854,
+**17 passed / 0 failed / 1 ignored**, including both new tests.
+
+Landed in commit `8ec58070`, which is ANOTHER AGENT'S — `frankentorch-l2zki` picked my
+uncommitted working-tree edit up in a `git add -A` and committed it with their own kernel
+change, crediting "NEGATIVE_EVIDENCE 68b / 89". That is the FOURTH time this session my
+uncommitted work has been swept into a peer's commit, and this time it also mis-cited the
+evidence, because 89 is their item and the arbiter result is this one. The code comments
+have been corrected to point at 90. **The operational lesson is not about credit: an
+uncommitted working tree in a shared checkout is not a private workspace, and anything
+left there will be committed by someone who cannot describe it.**
+
+**The old proof test could not have caught this.**
+`conv3d_direct_3x3s1_matches_streamed_reference_bits` uses in_ch=8, where the two routes
+agree bit for bit — so it passes whichever route runs. It was blind to the dispatcher it
+appeared to be testing, which is how a ceiling-less gate survived review. The new test
+asserts the route at in_ch=32, where the routes genuinely disagree, and carries an
+explicit premise guard that fails if they ever start agreeing (which would make the
+assertion vacuous without making it fail).
+
+### 90f. THE GENERAL LESSON
+
+Item 68b named one trap: a fast path validated at ONE shape and gated on an open-ended
+inequality is only known to be right at that shape. This item names its companion:
+
+**When two of your own implementations disagree, "which tolerance do we accept" is the
+wrong question. Ask which one is CORRECT. If the inputs are floats they are exact
+rationals, so the true answer is computable and the question has a fact for an answer —
+and the incumbent may turn out to be the worse one, in which case there was no trade-off
+to adjudicate at all.**

@@ -12839,7 +12839,7 @@ fn conv3d_col2im_repeated_row_f64(
 }
 
 /// Largest `in_ch` for which the direct 3x3x3 kernel is MEASURED to beat the streamed
-/// im2col+GEMM fallback. See NEGATIVE_EVIDENCE items 68b and 89.
+/// im2col+GEMM fallback. See NEGATIVE_EVIDENCE items 68b and 90.
 ///
 /// The direct kernel's scalar four-accumulator loop wins only while the reduction depth
 /// `in_ch*27` is short enough that avoiding the im2col panel pays for giving up
@@ -13090,7 +13090,7 @@ fn conv3d_forward_streamed_f64(
 /// dimension, so the streamed route sums in a different order). That is not a tolerance
 /// being spent: measured against an exact rational reference, the streamed route is the
 /// MORE accurate of the two and is more accurate than torch itself, and its worst-case
-/// divergence from torch is smaller than the direct kernel's. NEGATIVE_EVIDENCE item 89.
+/// divergence from torch is smaller than the direct kernel's. NEGATIVE_EVIDENCE item 90.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv3d_forward_f64(
@@ -46338,7 +46338,7 @@ mod tests {
     /// worst relative 4.770e-12), which makes a bitwise comparison a genuine route
     /// assertion rather than a restatement of the dispatcher.
     ///
-    /// NEGATIVE_EVIDENCE items 68b and 89.
+    /// NEGATIVE_EVIDENCE items 68b and 90.
     #[test]
     fn conv3d_forward_f64_routes_deep_reductions_to_the_streamed_kernel() {
         const IN_CH: usize = 32;
