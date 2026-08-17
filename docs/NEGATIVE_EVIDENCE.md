@@ -27092,11 +27092,11 @@ same-harness rows in the same configuration. The owed follow-up is a fully-captu
 replication; the host went to loadavg 171 immediately after h5, which is why it is not in
 this entry.
 
-## 85. ITEM 84's ISOLATION EXPERIMENT IS WRITTEN AND UNRUN — PLUS A HOST STATE NO MEASUREMENT SURVIVES
+## 86. ITEM 84's ISOLATION EXPERIMENT IS WRITTEN AND UNRUN — PLUS A HOST STATE NO MEASUREMENT SURVIVES
 
 Two things, one of which is a non-result recorded on purpose.
 
-### 85a. The three-cell probe item 84b asked for
+### 86a. The three-cell probe item 84b asked for
 
 `crates/ft-api/examples/group_norm_route_isolation_probe.rs` splits item 84's confounded
 1.19x by changing ONE variable at a time:
@@ -27115,7 +27115,7 @@ gradient, and a divergence would mean the comparison is between two different an
 **It has not been run.** Writing the experiment and running it are separate acts, and this
 item records only the first.
 
-### 85b. The host state, recorded because "record the host" cuts both ways
+### 86b. The host state, recorded because "record the host" cuts both ways
 
 The standing rule is that every row names its machine. The corollary is that a machine this
 bad should produce no rows at all, and saying so is itself the measurement:
@@ -27135,3 +27135,61 @@ that rate the floor is roughly an hour away, and most of the consumers are exter
 project (smartedgar, mcp_agent_mail_rust, coding_agent_session_search). Recorded here
 because a measurement campaign that loses its disk stops being able to build at all, and
 the ledger should show when that risk was visible rather than only when it landed.
+
+## 87. THE ENGINE IS 5x MORE LOAD-SENSITIVE THAN THE KERNEL — A SECOND SPLIT-PROBE RUN I HELD AND HAD NOT BANKED
+
+Item 82b banked ONE `conv3d_backward_split_probe` run. I took a second, after the pad lever
+landed, and never wrote it down. It is banked here because the comparison between the two
+says something the single run could not, and because it is evidence about MEASURING on this
+host — which is the binding constraint right now.
+
+Same probe, same shape `[2,32,8,16,16]` k=3 s=1 pad=1, same 64 threads, min of 9, arm-internal
+(no incumbent, no ratio, no drift gate).
+
+    lane                                     run 1        run 2      inflation
+                                        load 17.54   load 28.17
+    A  leaf -> conv3d(pad=1) -> sum         8.808       13.789        1.57x
+    B  leaf(padded) -> conv3d(pad=0) -> sum 5.984       11.962        2.00x
+    C  leaf -> pad -> sum                   2.916        5.524        1.89x
+    D  leaf(padded) -> sum   [the FLOOR]    0.859        4.434        5.16x
+    K  conv3d_backward_f64, no tape         6.037        7.102        1.18x
+
+    run 1: ELF a0722c635eb5a9ef, loadavg 17.54 / 16.13 / 18.75, CPU 1429-4168 MHz spread 2.92x
+    run 2: ELF 454e24d34b889ac7, loadavg 28.17 / 32.14 / 24.74, CPU 1429-4043 MHz spread 2.83x
+
+### 87a. THE FINDING: LOAD FALLS ON THE ENGINE, NOT ON THE KERNEL
+
+Loadavg rose 1.6x between the runs. The convolution KERNEL absorbed that at **1.18x**. The
+FLOOR lane — a leaf, a sum, and its backward, i.e. one broadcast over 207,360 elements plus
+the report build, with no convolution anywhere in it — absorbed it at **5.16x**.
+
+**A phase made of fork/join and allocation degrades several times faster under contention
+than a phase made of arithmetic.** The kernel keeps its cores busy and is scheduled once;
+the engine's cost is per-region rayon entry, buffer traffic and page faults, all of which
+are exactly what a loaded host makes expensive.
+
+Two consequences worth carrying:
+
+- **It explains item 82e directly.** Our arm degraded 1.98x while PyTorch's held at 1.06x
+  over the same load rise. That is not our kernels being fragile; it is that a much larger
+  share of our lane is engine, and the engine is the load-sensitive part. It is the same
+  finding as `frankentorch-rayon-pool-width-qq8as` arriving from a second direction.
+- **Engine phases are the ones you cannot measure on a busy host.** A kernel figure taken at
+  load 28 is worth something (1.18x off); a tape or allocation figure taken at load 28 is
+  worth almost nothing (5.16x off). Any future `session - kernels` attribution needs a quiet
+  window far more than a kernel A/B does.
+
+### 87b. AND A LOWER BOUND ON THE PAD LEVER, FOR FREE
+
+Run 2 is post-fix and was taken in the WORSE window, so its pad subtractions are a lower
+bound on what the lever did rather than a measurement of it:
+
+    pad node backward   (C - D)     2.057  ->  1.090
+    pad node backward   (A - B)     2.823  ->  1.828
+
+The pad term FELL while every other lane in the same probe INFLATED by 1.18-5.16x. That is
+not a certified delta and it is not quoted as one — it is a cross-window pair, which item 82
+is explicit about. It is recorded because a term moving against the direction of the whole
+run is the one kind of cross-window comparison that carries information.
+
+The certified statement about this lever remains item 85's row and nothing more.
