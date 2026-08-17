@@ -8783,20 +8783,27 @@ fn conv2d_backward_height1_ones_dout_f64(
         .par_chunks_mut(patch_width)
         .for_each(|row| row.copy_from_slice(&dweight_row));
 
+    // frankentorch-ikw6q, SECOND defect. This replaces the generic route's
+    // `dgemm(flat, out_ch, patch_width, dout_flat, weight_flat, dpanel)`, whose k is
+    // `out_ch` — a different k from the dweight GEMM's `flat`, and blocked at `DGEMM_KC`
+    // just the same. A hand-rolled chain over `oc` diverged from it above 256 channels
+    // (measured: dpadded moved at out_ch=300).
+    //
+    // Rather than reproduce the blocking a second time, call the GEMM: every dpanel row is
+    // identical when dout is all ones, so ONE row computed by `dgemm` is bit-identical to
+    // every row the generic route produces, by construction rather than by argument. This
+    // is what `conv3d_backward_ones_dout_f64` already does, and it is why conv3d never had
+    // this defect.
+    let ones_out = vec![1.0f64; out_ch];
     let mut dpanel_row = vec![0.0f64; patch_width];
-    dpanel_row
-        .par_chunks_mut(kw)
-        .enumerate()
-        .for_each(|(c, dp)| {
-            let pch = c * kw;
-            for (kc, slot) in dp.iter_mut().enumerate() {
-                let mut acc = 0.0f64;
-                for oc in 0..out_ch {
-                    acc += weight_flat[oc * patch_width + pch + kc];
-                }
-                *slot = acc;
-            }
-        });
+    gemm::dgemm(
+        1,
+        out_ch,
+        patch_width,
+        &ones_out,
+        weight_flat,
+        &mut dpanel_row,
+    );
 
     let mut dpadded = vec![0.0f64; batch * in_ch * pw];
     dpadded
@@ -8899,23 +8906,20 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
         .par_chunks_mut(patch_width)
         .for_each(|row| row.copy_from_slice(&dweight_row));
 
+    // frankentorch-ikw6q, SECOND defect — see the height-1 path for the full reasoning.
+    // The dpanel GEMM's k is `out_ch`, not `flat`, and a hand-rolled chain over `oc`
+    // diverged from it above 256 channels. One `dgemm` row is bit-identical to every row
+    // the generic route produces when dout is all ones.
+    let ones_out = vec![1.0f64; out_ch];
     let mut dpanel_row = vec![0.0f64; patch_width];
-    dpanel_row
-        .par_chunks_mut(kh * kw)
-        .enumerate()
-        .for_each(|(c, dpc)| {
-            let pch = c * kh * kw;
-            for kr in 0..kh {
-                for kc in 0..kw {
-                    let kidx = pch + kr * kw + kc;
-                    let mut acc = 0.0f64;
-                    for oc in 0..out_ch {
-                        acc += weight_flat[oc * patch_width + kidx];
-                    }
-                    dpc[kr * kw + kc] = acc;
-                }
-            }
-        });
+    gemm::dgemm(
+        1,
+        out_ch,
+        patch_width,
+        &ones_out,
+        weight_flat,
+        &mut dpanel_row,
+    );
 
     let patch_count = oh * ow;
     let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
@@ -41229,8 +41233,38 @@ mod tests {
             (2, 3, 7, 8, 3, 3, 1, 1),
         ];
 
-        for &(batch, in_ch, ph, pw, kh, kw, sh, sw) in cases {
-            let out_ch = 4usize;
+        // `out_ch` is the k dimension of the dpanel GEMM, so it needs its own case above
+        // `DGEMM_KC` — the dweight cases above all run at out_ch=4, which is inside one
+        // block and therefore blind to a chained-vs-blocked difference in exactly the way
+        // the ORIGINAL proofs were blind for `flat`. Repeating that mistake one function
+        // over is the specific failure this case exists to prevent.
+        let all: Vec<(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        )> = cases
+            .iter()
+            .map(|&(b, ic, ph, pw, kh, kw, sh, sw)| (b, ic, ph, pw, kh, kw, sh, sw, 4usize))
+            .chain([
+                // out_ch = 300 > DGEMM_KC: a ragged tail in the dpanel GEMM's k
+                (
+                    1usize, 2usize, 9usize, 9usize, 3usize, 3usize, 1usize, 1usize, 300usize,
+                ),
+                // out_ch = 512 = 2 * DGEMM_KC exactly
+                (
+                    1usize, 2usize, 7usize, 7usize, 3usize, 3usize, 1usize, 1usize, 512usize,
+                ),
+            ])
+            .collect();
+        let mut saw_flat_above_block = false;
+        let mut saw_out_ch_above_block = false;
+        for &(batch, in_ch, ph, pw, kh, kw, sh, sw, out_ch) in &all {
             let oh = (ph - kh) / sh + 1;
             let ow = (pw - kw) / sw + 1;
             let patch_width = in_ch * kh * kw;
@@ -41269,10 +41303,70 @@ mod tests {
                 false,
             );
 
-            assert!(
-                flat > super::DGEMM_KC || ph == 7,
-                "every case but the control must exceed one k block (flat={flat})"
+            saw_flat_above_block |= flat > super::DGEMM_KC;
+            saw_out_ch_above_block |= out_ch > super::DGEMM_KC;
+
+            // The OTHER GEMM in this route, whose k is `out_ch` rather than `flat`
+            // (frankentorch-ikw6q, second defect). The generic path computes
+            // `dpanel = dout_flat @ weight_flat` with `dgemm(flat, out_ch, patch_width,
+            // ..)`, so `out_ch` is the blocked dimension there. Checked here at every
+            // case's `out_ch`, and separately below at an `out_ch` that exceeds a block.
+            let mut dout_flat = vec![0.0f64; flat * out_ch];
+            for row in 0..flat {
+                for oc in 0..out_ch {
+                    dout_flat[row * out_ch + oc] = 1.0;
+                }
+            }
+            let mut want_dpanel = vec![0.0f64; flat * patch_width];
+            super::gemm::dgemm(
+                flat,
+                out_ch,
+                patch_width,
+                &dout_flat,
+                &weight_flat,
+                &mut want_dpanel,
             );
+            let want_dpadded = super::conv2d_col2im_f64(
+                &want_dpanel,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+            );
+            let (got_dp, _, _) = super::conv2d_backward_f64(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
+            );
+            assert_eq!(got_dp.len(), want_dpadded.len());
+            for (j, (&g, &w)) in got_dp.iter().zip(want_dpadded.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "dpadded[{j}] moved at batch={batch} in_ch={in_ch} out_ch={out_ch} \
+                     ph={ph} pw={pw} flat={flat} (DGEMM_KC={}): no-panel {g:e} vs \
+                     panel+GEMM {w:e}",
+                    super::DGEMM_KC
+                );
+            }
             assert_eq!(got_dw.len(), out_ch * patch_width);
             for oc in 0..out_ch {
                 let row = &got_dw[oc * patch_width..(oc + 1) * patch_width];
@@ -41288,6 +41382,22 @@ mod tests {
                 }
             }
         }
+
+        // THE META-GUARD, and the whole reason this test exists in this shape. This route
+        // has TWO GEMMs with two DIFFERENT k dimensions — `flat` for dweight and `out_ch`
+        // for dpanel — and a case set that stays inside one block in either of them is
+        // blind to a chained-vs-blocked difference there. That is exactly how the original
+        // 2026-07-05/07-09 proofs passed while the claim was false. Asserting the coverage
+        // rather than trusting the case list means a later edit that drops the large
+        // shapes fails loudly instead of silently reverting to the blind regime.
+        assert!(
+            saw_flat_above_block,
+            "case set must exercise flat > DGEMM_KC or it cannot see the dweight defect"
+        );
+        assert!(
+            saw_out_ch_above_block,
+            "case set must exercise out_ch > DGEMM_KC or it cannot see the dpanel defect"
+        );
     }
 
     #[test]

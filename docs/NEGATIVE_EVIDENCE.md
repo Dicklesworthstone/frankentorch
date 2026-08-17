@@ -28710,3 +28710,57 @@ The banked certified standing remains **item 94's 0.400 = 2.50x SLOWER**, becaus
 last row that passed its gates. The live measurement is ~1.2x FASTER, replicated 4/4, and
 uncertified. Both statements are true and the second does not replace the first until a row
 certifies on a resized lane.
+
+## 105. ITEM 104's FIX WAS HALF THE DEFECT — THE SAME ROUTE HAS A SECOND GEMM WITH A DIFFERENT k, AND MY OWN NEW TEST WAS BLIND TO IT
+
+`frankentorch-ikw6q`, reopened against myself one commit later.
+
+Item 104 fixed the conv2d/conv1d dweight reduction to fold on `DGEMM_KC` boundaries and
+closed the bead. It also wrote down the lesson: *a test that pins a blocking-sensitive claim
+has to run at a shape larger than the block, or it is testing the degenerate case.* Then the
+test I shipped with it ran every case at `out_ch = 4`.
+
+**THE ROUTE HAS TWO GEMMs WITH TWO DIFFERENT k DIMENSIONS.** The generic conv2d backward is:
+
+    dweight = dgemm_tb(out_ch, flat,   patch_width, dout_flat, panel)        k = flat
+    dpanel  = dgemm   (flat,   out_ch, patch_width, dout_flat, weight_flat)  k = out_ch
+
+Item 104 blocked the first. The fast paths ALSO hand-roll the second, as a single ascending
+chain over `oc`, and it diverges above 256 channels exactly as the first did over 256 patches.
+Measured, at the shape my own test could not reach:
+
+    dpadded[1] at batch=1 in_ch=2 out_ch=300 ph=pw=9, flat=49
+      no-panel     1.6920282888907312e-3
+      panel+GEMM   1.6920282888907314e-3
+
+`flat = 49` here — well inside one block — so item 104's cases could never have surfaced it,
+and `out_ch = 4` in all of them meant the second k never left its first block either. **The
+blindness I documented and the blindness I shipped were the same blindness, one dimension
+over.** Writing the lesson down did not transfer it; only enumerating the k dimensions did.
+
+THE FIX IS NOT MORE BLOCKING. Rather than reproduce matrixmultiply's partition a second time,
+both conv2d paths now CALL the GEMM for that row: when `dout` is all ones every dpanel row is
+identical, so one `dgemm(1, out_ch, patch_width, ones, weight_flat)` row is bit-identical to
+every row the generic route builds — by construction, not by argument. This is what
+`conv3d_backward_ones_dout_f64` already did, which is precisely why conv3d never had this
+defect and needed no change here. The hand-rolled reduction is deleted rather than corrected.
+
+THE TEST NOW ASSERTS ITS OWN COVERAGE. Two booleans accumulate across the case set and are
+checked after the loop: one case must exceed a block in `flat`, another in `out_ch`. A later
+edit that drops the large shapes now fails loudly instead of silently returning the suite to
+the blind regime that let this ship twice. Cases: `flat` 8192 / 1800 / 1200 / 30, `out_ch` 300
+(ragged tail) / 512 (exact multiple) / 4 (control).
+
+665 ft-kernel-cpu, 2580 ft-api and the full ft-conformance suite pass. clippy/fmt clean.
+
+### THE TRANSFERABLE RULE, CORRECTED
+
+Item 104 said to test above the block size. That is not enough and this item is the proof.
+**Enumerate every GEMM the fast path replaces, and every k dimension among them, and require
+a case above the block in EACH.** A route with two GEMMs has two ways to be wrong, and fixing
+the one you found first makes the second harder to see, because the bead is now closed and
+the test is now green.
+
+NOT MEASURED: no-certify turn. Replacing a hand-rolled parallel reduction with a `dgemm` call
+on a 1 x out_ch x patch_width problem is a small shape change in an already-tiny phase; no
+ratio is claimed and none was taken.
