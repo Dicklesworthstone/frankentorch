@@ -13069,53 +13069,66 @@ fn conv3d_forward_streamed_f64(
     let nthreads = rayon::current_num_threads().max(1);
     let cap = (1usize << 16).div_ceil(patch_width.max(1)).max(1);
     let tile = flat.div_ceil(nthreads * 4).clamp(1, cap);
-    let mut out_flat = vec![0.0f64; flat * out_ch];
-    out_flat
-        .par_chunks_mut(tile * out_ch)
-        .enumerate()
-        .for_each(|(ti, oflat_tile)| {
-            let m0 = ti * tile;
-            let rows = oflat_tile.len() / out_ch;
-            let mut ptile = vec![0.0f64; rows * patch_width];
-            for r in 0..rows {
-                let row = m0 + r;
-                let b = row / patch_count;
-                let pc = row % patch_count;
-                let base_d = (pc / (oh * ow)) * sd;
-                let rem = pc % (oh * ow);
-                let base_h = (rem / ow) * sh;
-                let base_w = (rem % ow) * sw;
-                let batch_off = b * in_ch * pd * ph * pw;
-                let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                for c in 0..in_ch {
-                    let ch_off = batch_off + c * pd * ph * pw;
-                    let pch = c * kd * kh * kw;
-                    for kdd in 0..kd {
-                        let d_off = ch_off + (base_d + kdd) * ph * pw;
-                        let pkd = pch + kdd * kh * kw;
-                        for kr in 0..kh {
-                            let irow = d_off + (base_h + kr) * pw + base_w;
-                            let prow_off = pkd + kr * kw;
-                            prow[prow_off..(kw + prow_off)]
-                                .copy_from_slice(&padded[irow..(kw + irow)]);
+    // Three FULL-OVERWRITE buffers, so none of them is zero-filled first. `ptile` is the
+    // one that matters: it is allocated once PER TILE (~4 per thread), each ~110 KB on the
+    // scored lane, and every byte is overwritten by the `copy_from_slice` walk below — so
+    // the `vec![0.0; _]` it used to be was ~28 MB of dead memset per forward, repaid
+    // nowhere. Same vein and same buffer size as the im2col panel measured at 1.29x in
+    // item 70; a zero-fill only costs when the allocator RECYCLES a dirty block, which is
+    // exactly what a per-tile allocation in a hot loop makes it do.
+    //
+    // `out_flat` is safe for the same reason at one remove: `dgemm_bt` passes beta=0.0, so
+    // it OVERWRITES C rather than accumulating into it. `out` is written at every (idx, p).
+    // NEGATIVE_EVIDENCE item 94; vein [[project_expand_uninit_firsttouch]].
+    let out_flat = build_uninit(flat * out_ch, |out_flat: &mut [f64]| {
+        out_flat
+            .par_chunks_mut(tile * out_ch)
+            .enumerate()
+            .for_each(|(ti, oflat_tile)| {
+                let m0 = ti * tile;
+                let rows = oflat_tile.len() / out_ch;
+                let ptile = build_uninit(rows * patch_width, |ptile: &mut [f64]| {
+                    for r in 0..rows {
+                        let row = m0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_d = (pc / (oh * ow)) * sd;
+                        let rem = pc % (oh * ow);
+                        let base_h = (rem / ow) * sh;
+                        let base_w = (rem % ow) * sw;
+                        let batch_off = b * in_ch * pd * ph * pw;
+                        let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                        for c in 0..in_ch {
+                            let ch_off = batch_off + c * pd * ph * pw;
+                            let pch = c * kd * kh * kw;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * ph * pw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = pkd + kr * kw;
+                                    prow[prow_off..(kw + prow_off)]
+                                        .copy_from_slice(&padded[irow..(kw + irow)]);
+                                }
+                            }
                         }
                     }
+                });
+                gemm::dgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
+            });
+    });
+    build_uninit(batch * out_ch * patch_count, |out: &mut [f64]| {
+        out.par_chunks_mut(patch_count)
+            .enumerate()
+            .for_each(|(idx, orow)| {
+                let n = idx / out_ch;
+                let oc = idx % out_ch;
+                let bo = bias.map_or(0.0, |bb| bb[oc]);
+                for (p, slot) in orow.iter_mut().enumerate() {
+                    *slot = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
                 }
-            }
-            gemm::dgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
-        });
-    let mut out = vec![0.0f64; batch * out_ch * patch_count];
-    out.par_chunks_mut(patch_count)
-        .enumerate()
-        .for_each(|(idx, orow)| {
-            let n = idx / out_ch;
-            let oc = idx % out_ch;
-            let bo = bias.map_or(0.0, |bb| bb[oc]);
-            for p in 0..patch_count {
-                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
-            }
-        });
-    out
+            });
+    })
 }
 
 /// Fused conv3d forward (f64) on a padded input, plus optional per-channel bias.
@@ -46513,6 +46526,106 @@ mod tests {
                 (*w as f32).to_bits(),
                 "conv2d_im2col_f32 at {index}"
             );
+        }
+    }
+
+    /// Every element of the streamed forward's three uninitialized buffers must be written.
+    ///
+    /// `conv3d_forward_streamed_f64` now takes `ptile`, `out_flat` and `out` from
+    /// `build_uninit` instead of `vec![0.0; _]` (NEGATIVE_EVIDENCE item 94). That is only
+    /// sound if the code writes every slot; a missed slot yields whatever the allocator
+    /// last left there. A numeric comparison against an independent naive convolution is
+    /// what catches that — leftover heap bytes do not land within 1e-11 of a convolution,
+    /// and would usually be NaN, inf, or wildly scaled.
+    ///
+    /// The shapes deliberately include `flat` values that do NOT divide evenly by the
+    /// adaptive tile, so the SHORT FINAL TILE — the slot most likely to be skipped — is
+    /// exercised rather than assumed.
+    #[test]
+    fn conv3d_streamed_forward_writes_every_uninitialized_slot() {
+        for &(batch, in_ch, out_ch, sd, sh, sw) in &[
+            (1usize, 3usize, 5usize, 1usize, 1usize, 1usize),
+            (2, 4, 7, 1, 1, 1),
+            (3, 2, 3, 2, 1, 2),
+            (1, 5, 11, 1, 2, 1),
+        ] {
+            let (pd, ph, pw) = (6usize, 7usize, 8usize);
+            let (kd, kh, kw) = (2usize, 3usize, 3usize);
+            let (od, oh, ow) = ((pd - kd) / sd + 1, (ph - kh) / sh + 1, (pw - kw) / sw + 1);
+            let padded: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
+                .map(|index| ((index % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..out_ch * in_ch * kd * kh * kw)
+                .map(|index| ((index % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            let bias: Vec<f64> = (0..out_ch).map(|oc| oc as f64 * 0.125 - 0.25).collect();
+
+            let got = super::conv3d_forward_streamed_f64(
+                &padded,
+                &weight,
+                Some(&bias),
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+            );
+            assert_eq!(got.len(), batch * out_ch * od * oh * ow);
+
+            for (index, value) in got.iter().enumerate() {
+                assert!(
+                    value.is_finite(),
+                    "streamed forward left {index} uninitialized (got {value}) \
+                     at batch={batch} in_ch={in_ch} out_ch={out_ch}"
+                );
+            }
+
+            for b in 0..batch {
+                for oc in 0..out_ch {
+                    for z in 0..od {
+                        for y in 0..oh {
+                            for x in 0..ow {
+                                let mut want = bias[oc];
+                                for c in 0..in_ch {
+                                    for kdd in 0..kd {
+                                        for kr in 0..kh {
+                                            for kc in 0..kw {
+                                                let at =
+                                                    ((b * in_ch + c) * pd + z * sd + kdd) * ph * pw
+                                                        + (y * sh + kr) * pw
+                                                        + x * sw
+                                                        + kc;
+                                                let wat = ((oc * in_ch + c) * kd + kdd) * kh * kw
+                                                    + kr * kw
+                                                    + kc;
+                                                want += padded[at] * weight[wat];
+                                            }
+                                        }
+                                    }
+                                }
+                                let at = ((b * out_ch + oc) * od + z) * oh * ow + y * ow + x;
+                                let scale = want.abs().max(got[at].abs()).max(1.0);
+                                assert!(
+                                    (got[at] - want).abs() / scale < 1e-11,
+                                    "streamed forward wrong at {at}: got {} want {want} \
+                                     (batch={batch} in_ch={in_ch} out_ch={out_ch})",
+                                    got[at]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
