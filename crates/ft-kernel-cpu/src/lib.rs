@@ -12735,6 +12735,28 @@ fn conv3d_forward_direct_3x3s1_f64(
     let patch_width = in_ch * KERNEL_WIDTH;
     let patch_count = od * oh * ow;
     let plane_count = batch * out_ch;
+    // frankentorch-l2zki: the outer split alone yields `plane_count / 4` tasks —
+    // SIXTEEN for the scored lane (batch 2, out_ch 32) on a 64-core box, so three
+    // quarters of the machine sat idle through the forward. Item 70 measured that
+    // forward at 52.4% of the lane once the backward was fixed, which makes this the
+    // binding phase.
+    //
+    // Each output element is computed by ONE thread with its own sequential sweep over
+    // (c, kd, kh, kw), and no element is shared between tasks, so splitting the SPATIAL
+    // range inside a block changes who computes an element but not the order in which
+    // that element accumulates. BIT-IDENTICAL, and it keeps the four-accumulator
+    // register reuse that motivated `OUT_CHANNEL_BLOCK` in the first place — the
+    // alternative of chunking per plane would have thrown that away.
+    let blocks = plane_count / OUT_CHANNEL_BLOCK;
+    let threads = rayon::current_num_threads().max(1);
+    // Aim at ~4 tasks per thread so rayon can balance; never below one tile, and never
+    // so fine that a tile stops amortising its own setup.
+    const MIN_SPATIAL_TILE: usize = 64;
+    let tiles_per_block = (threads * 4).div_ceil(blocks.max(1)).max(1);
+    let spatial_tile = patch_count
+        .div_ceil(tiles_per_block)
+        .max(MIN_SPATIAL_TILE)
+        .min(patch_count.max(1));
     let mut out = vec![0.0f64; plane_count * patch_count];
     out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)
         .enumerate()
@@ -12760,9 +12782,25 @@ fn conv3d_forward_direct_3x3s1_f64(
                     values[first_channel + 3],
                 ]
             });
-            for oz in 0..od {
-                for oy in 0..oh {
-                    for ox in 0..ow {
+            // The four planes of this block are contiguous and equal-length, so they
+            // split cleanly into four disjoint slices that can be tiled in lockstep.
+            let (plane0, rest) = out_block.split_at_mut(patch_count);
+            let (plane1, rest) = rest.split_at_mut(patch_count);
+            let (plane2, plane3) = rest.split_at_mut(patch_count);
+            plane0
+                .par_chunks_mut(spatial_tile)
+                .zip(plane1.par_chunks_mut(spatial_tile))
+                .zip(plane2.par_chunks_mut(spatial_tile))
+                .zip(plane3.par_chunks_mut(spatial_tile))
+                .enumerate()
+                .for_each(|(tile, (((tile0, tile1), tile2), tile3))| {
+                    let start = tile * spatial_tile;
+                    for offset in 0..tile0.len() {
+                        let position = start + offset;
+                        let oz = position / (oh * ow);
+                        let rem = position % (oh * ow);
+                        let oy = rem / ow;
+                        let ox = rem % ow;
                         let mut sums = [0.0f64; OUT_CHANNEL_BLOCK];
                         for c in 0..in_ch {
                             let input_channel = batch_offset + c * pd * ph * pw;
@@ -12788,14 +12826,12 @@ fn conv3d_forward_direct_3x3s1_f64(
                                 }
                             }
                         }
-                        let output_offset = (oz * oh + oy) * ow + ox;
-                        out_block[output_offset] = sums[0] + biases[0];
-                        out_block[patch_count + output_offset] = sums[1] + biases[1];
-                        out_block[2 * patch_count + output_offset] = sums[2] + biases[2];
-                        out_block[3 * patch_count + output_offset] = sums[3] + biases[3];
+                        tile0[offset] = sums[0] + biases[0];
+                        tile1[offset] = sums[1] + biases[1];
+                        tile2[offset] = sums[2] + biases[2];
+                        tile3[offset] = sums[3] + biases[3];
                     }
-                }
-            }
+                });
         });
     out
 }
@@ -45719,6 +45755,89 @@ mod tests {
                         maybe_bias.is_some()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn conv3d_direct_3x3s1_spatial_tiling_matches_a_serial_reference_bitwise() {
+        // frankentorch-l2zki: the direct 3x3x3 forward now tiles the SPATIAL range
+        // inside each 4-plane block, because the outer split alone gave plane_count/4
+        // tasks — 16 for the scored lane on a 64-core box.
+        //
+        // The claim is BIT-IDENTICAL: each output element is still computed by one
+        // thread with the same sequential (c, kd, kh, kw) sweep, and no element is
+        // shared. The reference below reproduces that exact order serially, so it pins
+        // the ORDER and not merely the value.
+        //
+        // The pre-existing direct-vs-streamed test runs patch_count = 27, which is BELOW
+        // MIN_SPATIAL_TILE and would therefore only ever exercise a single tile. These
+        // shapes straddle it: 120 positions (multi-tile) and 27 (single tile).
+        for &(batch, in_ch, out_ch, pd, ph, pw) in &[
+            (2usize, 8usize, 8usize, 6usize, 7usize, 8usize), // patch_count 120 -> tiled
+            (1, 8, 12, 5, 5, 5),                              // patch_count 27  -> one tile
+        ] {
+            let (od, oh, ow) = (pd - 2, ph - 2, pw - 2);
+            let patch_width = in_ch * 27;
+            let padded: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
+                .map(|index| 1.0 / ((index % 13) as f64 + 2.0))
+                .collect();
+            let weight: Vec<f64> = (0..out_ch * patch_width)
+                .map(|index| 1.0 / ((index % 11) as f64 + 3.0))
+                .collect();
+            let bias: Vec<f64> = (0..out_ch).map(|c| (c as f64) * 0.25).collect();
+
+            let got = super::conv3d_forward_f64(
+                &padded, &weight, Some(&bias), batch, in_ch, pd, ph, pw, 3, 3, 3, od, oh,
+                ow, 1, 1, 1, out_ch,
+            );
+
+            let patch_count = od * oh * ow;
+            let mut want = vec![0.0f64; batch * out_ch * patch_count];
+            for n in 0..batch {
+                let batch_offset = n * in_ch * pd * ph * pw;
+                for oc in 0..out_ch {
+                    let weight_offset = oc * patch_width;
+                    for oz in 0..od {
+                        for oy in 0..oh {
+                            for ox in 0..ow {
+                                let mut sum = 0.0f64;
+                                for c in 0..in_ch {
+                                    let input_channel = batch_offset + c * pd * ph * pw;
+                                    let weight_channel = c * 27;
+                                    for kdd in 0..3 {
+                                        let input_depth =
+                                            input_channel + (oz + kdd) * ph * pw;
+                                        let weight_depth = weight_channel + kdd * 9;
+                                        for kr in 0..3 {
+                                            let input_row =
+                                                input_depth + (oy + kr) * pw + ox;
+                                            let weight_row = weight_depth + kr * 3;
+                                            for kc in 0..3 {
+                                                sum += padded[input_row + kc]
+                                                    * weight[weight_offset
+                                                        + weight_row
+                                                        + kc];
+                                            }
+                                        }
+                                    }
+                                }
+                                let offset = (oz * oh + oy) * ow + ox;
+                                want[(n * out_ch + oc) * patch_count + offset] =
+                                    sum + bias[oc];
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(got.len(), want.len(), "len mismatch at in_ch={in_ch}");
+            for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "conv3d direct spatial tiling diverged at {index} \
+                     (batch={batch} in_ch={in_ch} out_ch={out_ch} patch_count={patch_count})"
+                );
             }
         }
     }

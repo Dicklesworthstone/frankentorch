@@ -26166,3 +26166,67 @@ forward's remaining lever is the mis-set direct gate (item 68), which is toleran
 and worth 1.20x on the lane (item 70), and is filed as
 `frankentorch-conv3d-direct-gate-misset-w3pol` awaiting a policy call. The two `dgemm`
 column-sums inside the backward remain unpriced.
+
+## 73. THE conv3d DIRECT FORWARD RAN ON SIXTEEN TASKS — SPATIAL TILING IS 1.67x, BIT-EXACT
+
+Item 72 fixed the backward and left the FORWARD as the majority phase at 52.4%. Its only
+previously-named lever was the mis-set direct gate, which is tolerance-blocked (item 68)
+and worth just 1.20x on the lane (item 70). This one needs no policy call.
+
+`conv3d_forward_direct_3x3s1_f64` parallelized as
+`out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)` — `plane_count / 4` tasks, which for
+the scored lane (batch 2, out_ch 32) is **SIXTEEN on a 64-core box**. Three quarters of the
+machine sat idle through the forward.
+
+That also retires a loose end from item 68c. There I refuted under-parallelization as the
+reason DIRECT loses to STREAMED, because the direct/streamed ratio held at 0.217/0.217/0.289
+across 8/16/64 threads. That refutation stands and is untouched — direct is slower per FLOP
+than a blocked SIMD GEMM. But it was never the same question as whether the direct kernel
+scales, and it does not: 16 tasks caps it regardless of who it is being compared against.
+
+### 73a. Bit-exact, and structurally so
+
+Each output element is computed by ONE thread with its own sequential sweep over
+`(c, kd, kh, kw)`, and no element is shared between tasks. Splitting the SPATIAL range
+inside a 4-plane block changes which thread computes an element, never the order in which
+that element accumulates. The four planes of a block are contiguous and equal-length, so
+`split_at_mut` gives four disjoint slices that tile in lockstep — which keeps the
+four-accumulator register reuse that motivated `OUT_CHANNEL_BLOCK`. Chunking per plane
+instead would have thrown that away.
+
+Tiles target ~4 per thread with a `MIN_SPATIAL_TILE` floor of 64 positions, so a small
+shape collapses back to one tile and the old behaviour.
+
+`conv3d_direct_3x3s1_spatial_tiling_matches_a_serial_reference_bitwise` reproduces the
+inner order serially and compares bitwise — it pins the ORDER, not just the value — at
+patch_count 120 (multi-tile) and 27 (single tile). **The pre-existing direct-vs-streamed
+test runs patch_count = 27, below the floor, so it would only ever have exercised one
+tile**; that gap is why the new test carries its own shape. 653 tests pass.
+
+### 73b. The measurement, with two controls
+
+`crates/ft-api/examples/conv3d_phase_probe.rs`, arm-internal, 64 threads. Observed loadavg
+20.55 / 27.13 / 27.93; CPU 1429-4226 MHz, cross-core spread 2.96x.
+
+    phase                            item 72      now    change
+    forward (direct 3x3s1 route)       6.091    3.652    1.67x FASTER
+    backward (ones-dout)               5.539    5.930    +7%   (unchanged code)
+    forward + backward                11.630    9.582    1.21x FASTER
+    backward (non-ones, generic)      18.771   18.779    +0.04%  <- HOST CONTROL
+
+**The generic backward is the control that matters**: it is a code path this change does
+not touch, and it came back within 0.04% across the two runs, so the host was effectively
+identical and the forward's 1.67x is a property of the change. The ones-dout backward's
++7% is run-to-run variance in that phase, not a regression — its code did not change
+between these two runs.
+
+Cumulative on this lane across items 72 and 73 plus the im2col uninit of `abd6a122`:
+**16.367 -> 9.582 ms, 1.71x**, every step bit-exact.
+
+### 73c. Not certified
+
+`uptime` read 45.6 rising when this was requested and 20-29 while it ran. No certified
+vs-incumbent row was attempted or is claimed. These are ARM-INTERNAL phase timings — our
+arm against itself, no incumbent, no ratio, no drift gate. The conv3d lane's vs-incumbent
+standing (0.269, 3.72x SLOWER) is NOT updated and needs a board run in a real window; on
+these phase numbers it should improve substantially, and that is a prediction, not a result.
