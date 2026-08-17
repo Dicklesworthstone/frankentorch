@@ -26942,9 +26942,9 @@ lane** (`group_norm_f32_kernels`, 0.881 in run `n`), so the next lever here is k
 not engine work — the opposite of where items 69-81 have been aimed. That inversion is the
 result, and it should be checked before anyone spends another tick on the tape.
 
-## 83. A 1.19x GAP BETWEEN TWO GroupNorm KERNEL ROUTES — REPLICATED 5/5, CAUSE NOT ISOLATED
+## 84. A 1.19x GAP BETWEEN TWO GroupNorm KERNEL ROUTES — REPLICATED 5/5, CAUSE NOT ISOLATED
 
-Item 82d said the kernels are now the majority of the group_norm lane and the next lever is
+Item 83d said the kernels are now the majority of the group_norm lane and the next lever is
 kernel work. Looking there immediately turned up a gap, and then a reason not to act on it
 yet.
 
@@ -26959,7 +26959,7 @@ completely. ELF `9c4d0d70...`, 8 threads, five runs:
 9.029 ms and the kernel route it actually calls (`group_norm_f32_kernels`) at 6.870 — so if
 this gap were harvestable it would be worth roughly 1.1-1.3 ms of a 9 ms arm.
 
-### 83a. WHY I AM NOT ACTING ON IT, AND THE HARNESS COMMENT THAT NEARLY MADE ME
+### 84a. WHY I AM NOT ACTING ON IT, AND THE HARNESS COMMENT THAT NEARLY MADE ME
 
 The lane is named `_recompute` and the harness introduces it as *"Lever OFF: identical work,
 statistics rebuilt in the backward."* Read at face value that says the ONLY difference is
@@ -26982,7 +26982,7 @@ The harness comment is the proximate cause and should be corrected by whoever ow
 — it currently carries another agent's uncommitted work, so it is reported here rather than
 edited.
 
-### 83b. The isolation experiment this needs
+### 84b. The isolation experiment this needs
 
 One variable at a time, all four combinations, arm-internal:
 
@@ -26996,7 +26996,7 @@ lands near 6.67 the forward is the cost; near 5.61 the stats path is, and `qkwsy
 refuted. **Until that row exists, "stats reuse is a regression" is not a claim this ledger
 should carry**, however suggestive 5/5 looks.
 
-### 83c. What is certain from this
+### 84c. What is certain from this
 
 Two routes computing the same gradient differ by 1.19x, replicated, on the lane whose
 kernels are now the majority phase. That is worth someone's tick. It is the size of the
