@@ -7309,10 +7309,23 @@ pub fn group_norm_backward_scalar_f32_with_cpg2_stats(
     )
 }
 
-/// The `cpg == 2` gradient write, shared by the route that recomputes statistics
-/// and the route that is handed them, so the two cannot drift.
+/// [`group_norm_backward_scalar_f32_with_cpg2_stats`] writing `dx` straight into `f64` —
+/// `frankentorch-68pwz`.
+///
+/// The tape stores gradients as `f64`, so the f32 route's caller had to widen the whole
+/// `dx` buffer in a second pass. Item 69 measured that widen at 4.566 ms parallel on the
+/// scored `[32,64,56,56]` lane and item 70d found it was ~84% of the remaining GroupNorm
+/// engine term; this removes a 25.7 MiB write and a 25.7 MiB read-back by having the
+/// kernel emit the wider type directly.
+///
+/// `dweight`/`dbias` stay f32: they are per-channel (64 on the scored lane), so widening
+/// them costs nothing and they fall through the caller's serial gate anyway.
+///
+/// Bit-identical to widening the f32 route's output — the arithmetic is unchanged and only
+/// the store converts. See `GroupNormDxStore`.
 #[allow(clippy::too_many_arguments)]
-fn group_norm_backward_scalar_f32_cpg2_from_stats(
+#[must_use]
+pub fn group_norm_backward_scalar_f32_dx_f64_with_cpg2_stats(
     upstream: f32,
     x: &[f32],
     weight: Option<&[f32]>,
@@ -7320,7 +7333,71 @@ fn group_norm_backward_scalar_f32_cpg2_from_stats(
     batch: usize,
     num_groups: usize,
     spatial: usize,
-) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
+) -> (Vec<f64>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    group_norm_backward_scalar_f32_cpg2_from_stats(
+        upstream, x, weight, stats, batch, num_groups, spatial,
+    )
+}
+
+/// How a computed f32 gradient lane reaches the `dx` buffer — `frankentorch-68pwz`.
+///
+/// WHY THIS EXISTS. The tape stores gradients as `f64`, so ft-api used to take this
+/// kernel's `Vec<f32>` and widen it in a second pass: item 69 measured that widen at
+/// 4.566 ms parallel (24.9 ms serial) on the scored `[32,64,56,56]` lane, and item 70d
+/// found it was ~84% of what remained of the GroupNorm engine term. Writing `f64`
+/// straight out of the kernel removes a 25.7 MiB buffer write and a 25.7 MiB read-back.
+///
+/// BIT-EXACT: the arithmetic stays entirely in f32 and only the STORE converts, using the
+/// same `f64::from` ft-api applied. Every f32 is exactly representable in f64, so the
+/// bits are identical — asserted in
+/// `group_norm_cpg2_dx_f64_matches_the_f32_route_widened_bitwise`.
+///
+/// The f32 impl keeps `copy_from_slice` so the existing route's vector store is not
+/// disturbed; only the f64 impl pays a per-element conversion, which it must anyway.
+trait GroupNormDxStore: Copy + Send + Sync {
+    fn store_lane8(dst: &mut [Self], src: [f32; 8]);
+    fn from_f32(value: f32) -> Self;
+}
+
+impl GroupNormDxStore for f32 {
+    #[inline]
+    fn store_lane8(dst: &mut [Self], src: [f32; 8]) {
+        dst.copy_from_slice(&src);
+    }
+    #[inline]
+    fn from_f32(value: f32) -> Self {
+        value
+    }
+}
+
+impl GroupNormDxStore for f64 {
+    #[inline]
+    fn store_lane8(dst: &mut [Self], src: [f32; 8]) {
+        for (slot, value) in dst.iter_mut().zip(src) {
+            *slot = f64::from(value);
+        }
+    }
+    #[inline]
+    fn from_f32(value: f32) -> Self {
+        f64::from(value)
+    }
+}
+
+/// The `cpg == 2` gradient write, shared by the route that recomputes statistics
+/// and the route that is handed them, so the two cannot drift.
+///
+/// Generic in the `dx` element type rather than duplicated, for the same reason: an f64
+/// copy of this body would be a second place for the formula to drift.
+#[allow(clippy::too_many_arguments)]
+fn group_norm_backward_scalar_f32_cpg2_from_stats<T: GroupNormDxStore>(
+    upstream: f32,
+    x: &[f32],
+    weight: Option<&[f32]>,
+    stats: &[GroupNormCpg2StatsF32],
+    batch: usize,
+    num_groups: usize,
+    spatial: usize,
+) -> (Vec<T>, Option<Vec<f32>>, Option<Vec<f32>>) {
     let cpg = 2usize;
     let group_numel = cpg * spatial;
     let inv_m = 1.0f32 / group_numel as f32;
@@ -7364,26 +7441,28 @@ fn group_norm_backward_scalar_f32_cpg2_from_stats(
                     let mut lane = 0;
                     while lane + 8 <= spatial {
                         let xhat = (f32x8::from(&x0[lane..lane + 8]) - vmean) * vrstd;
-                        dx0[lane..lane + 8].copy_from_slice(
-                            &(vrstd * (vdxhat0 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
+                        T::store_lane8(
+                            &mut dx0[lane..lane + 8],
+                            (vrstd * (vdxhat0 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
                         );
                         lane += 8;
                     }
                     for i in lane..spatial {
                         let xhat = (x0[i] - mean) * rstd;
-                        dx0[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
+                        dx0[i] = T::from_f32(rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m));
                     }
                     let mut lane = 0;
                     while lane + 8 <= spatial {
                         let xhat = (f32x8::from(&x1[lane..lane + 8]) - vmean) * vrstd;
-                        dx1[lane..lane + 8].copy_from_slice(
-                            &(vrstd * (vdxhat1 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
+                        T::store_lane8(
+                            &mut dx1[lane..lane + 8],
+                            (vrstd * (vdxhat1 - (vc1_sum + xhat * vc2_sum) * vinv_m)).to_array(),
                         );
                         lane += 8;
                     }
                     for i in lane..spatial {
                         let xhat = (x1[i] - mean) * rstd;
-                        dx1[i] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
+                        dx1[i] = T::from_f32(rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m));
                     }
                 });
         });
@@ -45760,6 +45839,71 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn group_norm_cpg2_dx_f64_matches_the_f32_route_widened_bitwise() {
+        // frankentorch-68pwz: the cpg==2 backward now emits dx as f64 directly so ft-api
+        // no longer widens it in a second pass. The claim is that this is BIT-IDENTICAL to
+        // the old route's output widened — the arithmetic stays in f32 and only the STORE
+        // converts.
+        //
+        // The two routes share one generic body, so this also guards the store impls
+        // against drift: an f64 impl that rounded, or an f32 impl that stopped using
+        // copy_from_slice correctly, shows up here.
+        //
+        // `spatial` values straddle the 8-wide vector loop deliberately: 8 is exact, 5 is
+        // all tail, 19 is two vectors plus a 3-element tail.
+        for &(batch, num_groups, spatial) in &[(2usize, 3usize, 8usize), (1, 2, 5), (3, 4, 19)] {
+            let cpg = 2usize;
+            let channels = num_groups * cpg;
+            let numel = batch * num_groups * cpg * spatial;
+            let x: Vec<f32> = (0..numel)
+                .map(|index| ((index % 37) as f32) * 0.125 - 2.25)
+                .collect();
+            let weight: Vec<f32> = (0..channels).map(|c| 1.0 + (c as f32) * 0.0625).collect();
+            // Statistics that are not round numbers, so a changed rounding would show.
+            let stats: Vec<super::GroupNormCpg2StatsF32> = (0..batch * num_groups)
+                .map(|g| super::GroupNormCpg2StatsF32 {
+                    mean: 0.1 + (g as f32) / 7.0,
+                    rstd: 1.0 / (1.3 + (g as f32) / 11.0),
+                    sum0: 3.5 + (g as f32) / 3.0,
+                    sum1: -2.25 + (g as f32) / 5.0,
+                })
+                .collect();
+            let upstream = 0.75f32;
+
+            let (dx32, dw32, db32) = super::group_norm_backward_scalar_f32_with_cpg2_stats(
+                upstream,
+                &x,
+                Some(&weight),
+                &stats,
+                batch,
+                num_groups,
+                spatial,
+            );
+            let (dx64, dw64, db64) = super::group_norm_backward_scalar_f32_dx_f64_with_cpg2_stats(
+                upstream,
+                &x,
+                Some(&weight),
+                &stats,
+                batch,
+                num_groups,
+                spatial,
+            );
+
+            assert_eq!(dx64.len(), dx32.len(), "len mismatch at spatial={spatial}");
+            for (index, (wide, narrow)) in dx64.iter().zip(dx32.iter()).enumerate() {
+                assert_eq!(
+                    wide.to_bits(),
+                    f64::from(*narrow).to_bits(),
+                    "dx diverged at {index} (batch={batch} groups={num_groups} spatial={spatial})"
+                );
+            }
+            // dweight/dbias are untouched by the change and must be identical outright.
+            assert_eq!(dw64, dw32, "dweight moved at spatial={spatial}");
+            assert_eq!(db64, db32, "dbias moved at spatial={spatial}");
         }
     }
 

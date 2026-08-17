@@ -26270,33 +26270,41 @@ impl FrankenTorchSession {
             move |_ctx, grad_outputs, borrowed| {
                 #[allow(clippy::cast_possible_truncation)]
                 let upstream = grad_outputs[0][0] as f32;
+                // frankentorch-68pwz: `dx` is one element per input — the 49 MiB buffer
+                // that dominated the engine term. The cpg==2 route now emits f64
+                // DIRECTLY, so the separate widen pass (4.566 ms parallel, item 69) is
+                // gone from the path this lane takes. The generic fallback still returns
+                // f32 and is widened here, unchanged.
                 let (dx, dw, db) = match stats.as_deref() {
                     // frankentorch-qkwsy: the forward already computed these.
-                    Some(stats) => ft_kernel_cpu::group_norm_backward_scalar_f32_with_cpg2_stats(
-                        upstream,
-                        borrowed[0].0,
-                        Some(borrowed[1].0),
-                        stats,
-                        batch_size,
-                        num_groups,
-                        spatial,
-                    ),
-                    None => ft_kernel_cpu::group_norm_backward_scalar_f32(
-                        upstream,
-                        borrowed[0].0,
-                        Some(borrowed[1].0),
-                        batch_size,
-                        num_groups,
-                        channels_per_group,
-                        spatial,
-                        eps,
-                    ),
+                    Some(stats) => {
+                        ft_kernel_cpu::group_norm_backward_scalar_f32_dx_f64_with_cpg2_stats(
+                            upstream,
+                            borrowed[0].0,
+                            Some(borrowed[1].0),
+                            stats,
+                            batch_size,
+                            num_groups,
+                            spatial,
+                        )
+                    }
+                    None => {
+                        let (dx, dw, db) = ft_kernel_cpu::group_norm_backward_scalar_f32(
+                            upstream,
+                            borrowed[0].0,
+                            Some(borrowed[1].0),
+                            batch_size,
+                            num_groups,
+                            channels_per_group,
+                            spatial,
+                            eps,
+                        );
+                        (widen_f32_to_f64(&dx), dw, db)
+                    }
                 };
                 Ok(vec![
-                    // frankentorch-68pwz: one element per input, so this is the 49 MiB
-                    // widen that dominated the engine term. dw/db are per-channel (64
-                    // here) and stay serial by the helper's own gate.
-                    Some(widen_f32_to_f64(&dx)),
+                    // dw/db are per-channel (64 here) and stay serial by the gate.
+                    Some(dx),
                     Some(widen_f32_to_f64(&dw.unwrap())),
                     Some(widen_f32_to_f64(&db.unwrap())),
                 ])

@@ -26611,3 +26611,57 @@ multi-turn: eliminating the GroupNorm widen means fusing the f32->f64 store into
 kernel that currently writes `f32x8` lanes through `copy_from_slice`, which is a new kernel
 entry point rather than an edit. Naming that honestly is better than starting it badly at
 the end of a tick.
+
+## 80. THE GroupNorm WIDEN IS GONE FROM THE KERNEL SIDE — dx IS EMITTED AS f64 DIRECTLY
+
+Item 70d named this as the next GroupNorm lever and called it architectural; item 79b
+deferred it as multi-turn. It is neither: the tape's storage does not have to change, only
+the kernel's store.
+
+Item 69 cut the f32 GroupNorm engine term 25.69 -> 5.45 ms by parallelizing the
+`f32 -> f64` gradient widen. Item 70d then measured that **~84% of what remained WAS the
+widen itself** (4.566 ms of 5.45), so the only way further was to stop widening.
+
+`group_norm_backward_scalar_f32_dx_f64_with_cpg2_stats` emits `dx` as `f64` from inside the
+kernel. That removes a 25.7 MiB buffer write and a 25.7 MiB read-back on the scored
+`[32,64,56,56]` lane — the arithmetic never leaves f32, only the STORE converts.
+
+### 80a. One body, not two
+
+The existing inner function carries the comment that it is "shared by the route that
+recomputes statistics and the route that is handed them, so the two cannot drift". A
+duplicated f64 copy would have created exactly the drift that comment exists to prevent, so
+the body is now generic over a `GroupNormDxStore` trait with two impls:
+
+- **f32** keeps `copy_from_slice` on the 8-wide lane, so the existing route's vector store
+  is untouched and the harness's `group_norm_f32_kernels` twin lane measures what it did
+  before;
+- **f64** converts per element, which it must anyway.
+
+`dweight`/`dbias` stay f32 — per-channel (64 on the lane), so they cost nothing and fall
+through the caller's serial gate.
+
+Only ft-api's backward switches. The harness twin lane and the kernel's own test keep
+calling the f32 entry point deliberately, so the diagnostic split in item 69a still
+measures the same thing.
+
+### 80b. Bit-exactness is proved against the old route, not asserted
+
+`group_norm_cpg2_dx_f64_matches_the_f32_route_widened_bitwise` runs BOTH entry points on the
+same inputs and compares `dx` bit for bit against the f32 output widened with `f64::from`,
+at `spatial` values chosen to straddle the 8-wide loop: 8 (exact), 5 (all tail), 19 (two
+vectors plus a 3-element tail). It also asserts `dweight`/`dbias` are unchanged outright.
+Because the two routes share one body, this doubles as the anti-drift guard the original
+comment asked for. 654 ft-kernel-cpu and 2579 ft-api tests pass.
+
+### 80c. NOT MEASURED YET, and that is the honest state
+
+`uptime` read 19.02 / 23.95 / 25.30 falling when this began but climbed to 51-56 while it
+built, so no before/after was taken and **no speedup is claimed**. The prediction is
+explicit and falsifiable: the engine term should fall from ~5.45 ms toward ~1 ms, and
+`group_norm_f32`'s certified 0.635 should improve, because item 70d already attributed 84%
+of that term to the widen this removes.
+
+Item 69's widen shipped with a 20.351 ms prediction the board confirmed to 0.5%. This one
+owes the same check — session-minus-kernels on the filtered group_norm family, in a settled
+window, against the 5.45 ms baseline.
