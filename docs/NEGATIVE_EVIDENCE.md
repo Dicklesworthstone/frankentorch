@@ -29747,3 +29747,61 @@ certified row is not evidence about that row.** Item 82's split for the sum lane
 64-thread configuration and the standings it is cited near are 8-thread ones. Any phase
 attribution should record its `RAYON_NUM_THREADS` beside its loadavg, and this ledger's earlier
 phase items mostly do not.
+
+## 124. BOTH conv3d LOSS ROUTES CERTIFIED IN ONE INVOCATION — 1.61x FASTER SUMMED, 1.80x SLOWER REAL
+
+Item 110 established that conv3d's standing depends on the loss shape and had to say so with a
+certified sum-loss row next to an uncertified masked one. Here both certify in the **same
+invocation**, which removes the last thing separating them: host state, incumbent warmth and
+clock are shared, so the pair is a controlled comparison rather than two rows placed side by
+side.
+
+    lane            MIN ratio                     FT ms    PT ms   nulls                    verdict
+    conv3d          1.611 [1.419,1.720]  1.61x F   4.849    7.338  PT 1.018 P  FT 1.002 P   CERT
+    conv3d_masked   0.557 [0.523,0.593]  1.80x S  12.819    7.463  PT 1.007 P  FT 0.980 P   CERT
+
+    common provenance, one invocation
+      ELF a01302d87d9d74b9..., HEAD fb42f855, tree CLEAN (no uncommitted peer work)
+      RAYON_NUM_THREADS=8, 16 rounds, balanced-square ABBAABBA, mimalloc, OP WORK ONLY
+      thinkstation1, AMD Ryzen Threadripper PRO 5975WX, governor powersave
+      loadavg 21.51 / 21.86 / 25.12, vmstat idle 81% (user 23%, sys 9%, iowait 0%)
+      load_1m 24.71 -> 24.82, drift_gate PASS
+      cpu_mhz min=1429 median=3177 max=4025 spread=2.816x
+      CROSS-CORE SPREAD WHILE SAMPLING min 1.087x median 2.768x max 2.916x
+      parity match on both rows, 0 MISMATCH
+
+**PyTorch is the same on both — 7.338 and 7.463 ms, 1.7% apart — and we are 2.6x apart.** The
+incumbent does not care which loss it is differentiating; we still do, by a factor that decides
+the sign of the standing.
+
+### 124a. THE SPREAD, WHICH THE CERTIFIED ROW UNDERSTATES
+
+Three invocations in this window, all drift-clean:
+
+    run   idle    conv3d          conv3d_masked
+    c1    64%     1.656x FASTER   1.65x SLOWER
+    c2    76%     1.607x FASTER   1.66x SLOWER
+    c3    81%     1.611x FASTER   1.80x SLOWER   <- the one that nulled
+
+The certified masked row (1.80x) is the WORST of the three, and item 119's certified row was
+1.67x. **A single certified row is a sample, not a bound**, and quoting 1.80x as "the standing"
+would be as wrong as quoting 1.65x. The honest statement is 1.65-1.80x SLOWER across four
+certified-or-clean rows, with the certified pair above as the citable one.
+
+That the certifying run is the outlier is worth noticing on its own: the A/A null passes when
+the two halves of a run agree, which is not the same as the run agreeing with its neighbours.
+
+### 124b. WHERE THIS LEAVES THE LANE
+
+Item 123 measured the 8-thread split at 78% kernel / 22% engine, so the kernel is the binding
+constraint at the configuration these rows were taken in. Within it,
+`conv3d_generic_phase_probe` says GEMMs 54%, col2im 25%, im2col 21%, and both GEMMs now clear
+their parallel gates (`should_parallelize` passes at 113M flops for the dpanel product;
+`dgemm_tb` gained its column split in item 119). At ~146 GFLOP/s for the two f64 products the
+GEMM phase is no longer obviously mis-scheduled.
+
+**So the remaining gap on the real-loss route is algorithmic, not scheduling.** im2col + col2im
+together are 46% of the backward and exist only to turn a convolution into a matmul; PyTorch
+does not pay them. That is the shape of the next lever, and it is a different class of work
+from everything items 98-123 did — which were all scheduling, memory or gate fixes on the
+existing decomposition.
