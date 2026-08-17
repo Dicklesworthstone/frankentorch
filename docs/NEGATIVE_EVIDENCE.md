@@ -30750,3 +30750,62 @@ means timing the GEMM immediately after an im2col of the same panel versus on a 
 which is one more probe and should come before any lever. Three hypotheses on this P0 have now
 been killed by measurement (scaffolding, gate, shape); the discipline that killed them is the
 only reason to trust the fourth.
+
+## 141. 57% OF conv2d's GENERIC BACKWARD IS NOT ANY PHASE ANYONE HAS NAMED — THE "79-82% GEMM" ATTRIBUTION IN ITEMS 130, 131 AND 136 IS AN ARTEFACT OF SUBTRACTION
+
+`frankentorch-hi9r6` (P0). Item 140 found the two GEMMs run at 99-138 GFLOP/s standalone and
+guessed the missing time was panel temperature. That guess is now unnecessary and the finding
+underneath it is bigger: measured in ONE process, with every named phase timed directly, most of
+this kernel's time belongs to nothing anyone has identified.
+
+`conv2d_which_gemm_is_thin` (`#[ignore]`d), RAYON_NUM_THREADS=8, min-of-7, `out_ch=32`,
+loadavg 24.41/21.34/19.60, CPU idle 82% verified by vmstat with iowait 0, df 200G:
+
+    conv2d_backward_f64 whole     16.595 ms   100%
+      im2col                       0.990
+      col2im                       1.129
+      dweight GEMM (dgemm_tb)      2.036
+      dpanel  GEMM (dgemm)         1.557
+      dout_flat gather             0.289
+      dpanel alloc+zero            1.072
+      ---- sum of parts            7.072 ms    43%
+      ---- UNACCOUNTED             9.522 ms    57%
+
+### WHY THE EARLIER NUMBER WAS WRONG, MECHANICALLY
+
+Items 130, 131 and 136 all computed the GEMM share as a RESIDUAL: `total - im2col - col2im`,
+then labelled the remainder "the two GEMMs + dout_flat". Every one of them was arithmetically
+correct and all three agreed with each other (79%, 81.9%, and the sweep built on them), which is
+exactly why it went unchallenged — two independent agents cross-checked the subtraction and
+neither checked the LABEL. Timed directly, the two GEMMs are **3.593 ms of 16.595, or 22%**, not
+80%. **A residual is not a measurement of whatever you name it.**
+
+This also explains item 136's `out_ch` curve without any appeal to GEMM shape: a large cost that
+does not scale with `out_ch`, divided by out_ch-proportional FLOPs, produces a near-linear rise
+in apparent GFLOP/s. Item 136 measured that rise carefully — bidirectional sweep, flat controls
+— and attributed it to the one thing it had not timed.
+
+### WHAT IS EXCLUDED, WHICH IS THE USEFUL PART
+
+The 9.522 ms is NOT im2col, NOT col2im, NOT either GEMM, NOT the dout_flat gather, and NOT the
+dpanel allocation. Those are every phase named in items 128, 130, 131, 132, 134, 136 and 140.
+Four hypotheses about this kernel have now been killed by measurement — scaffolding (item 130),
+the column gate (item 134), GEMM shape (item 140), and now the GEMM attribution itself.
+
+### WHAT I DO NOT KNOW
+
+Where the 9.5 ms is. Item 140's warm-L3 story was a guess about a gap that has since more than
+doubled under better measurement, and it is not being carried forward as a claim. The honest
+candidates, none tested:
+  * the kernel holds panel, dpanel, dpadded, dout_flat and dweight LIVE SIMULTANEOUSLY — about
+    40 MB — while each standalone timing above allocates one buffer that the allocator can hand
+    back from the same slot every rep. Peak footprint, not any single phase, may be the cost;
+  * something between the phases that no one has enumerated, which is what "unaccounted" means
+    and why it should be found by bisection of the kernel rather than by another hypothesis.
+
+THE NEXT INSTRUMENT, and it should come before any lever: bisect `conv2d_backward_f64` itself —
+time it with each phase progressively removed, in situ, rather than timing phases in isolation
+and subtracting. Isolation is precisely what produced three wrong attributions in a row here.
+
+Arm-internal, no incumbent, no gate: not a standing. What it revises is our own attribution, and
+the vs-PyTorch standing (7.4-8.8x SLOWER on this route) is untouched by it.

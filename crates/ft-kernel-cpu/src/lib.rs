@@ -41582,6 +41582,129 @@ mod tests {
              dimension costs; whichever is already flat is not the target."
         );
 
+        // RECONCILE THE BUDGET IN ONE PROCESS — item 140's ~5 ms gap was measured across TWO
+        // binaries (the example for the phases, this test for the GEMMs), and "the two numbers
+        // came from different processes" is a cheaper explanation than any cache story. Every
+        // term is timed here, same shape, same reps, same rayon pool, so the gap either survives
+        // or it was an artefact of comparing across binaries.
+        {
+            const BATCH: usize = 8;
+            const IN_CH: usize = 32;
+            const OUT_CH: usize = 32;
+            const PH: usize = 34;
+            const PW: usize = 34;
+            const KK: usize = 3;
+            const OH: usize = 32;
+            const OW: usize = 32;
+
+            let padded: Vec<f64> = (0..BATCH * IN_CH * PH * PW)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..OUT_CH * PATCH)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            let dout: Vec<f64> = (0..BATCH * OUT_CH * OH * OW)
+                .map(|i| ((i % 197) as f64) * 0.0007 + 0.25)
+                .collect();
+            let panel_ref: Vec<f64> = (0..FLAT * PATCH)
+                .map(|i| ((i % 173) as f64) * 0.0011 - 0.09)
+                .collect();
+            let wsmall: Vec<f64> = (0..OUT_CH * PATCH)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            let mut c_tb = vec![0.0f64; OUT_CH * PATCH];
+            let mut c_mm = vec![0.0f64; FLAT * PATCH];
+            let a_flat: Vec<f64> = (0..FLAT * OUT_CH)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+
+            let (mut whole, mut ic, mut ci, mut g_tb, mut g_mm) = (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+            );
+            for _ in 0..REPS {
+                let t = Instant::now();
+                let (dp, dw, _) = super::conv2d_backward_f64(
+                    &dout, &padded, &weight, BATCH, IN_CH, PH, PW, KK, KK, OH, OW, 1, 1, OUT_CH,
+                    false,
+                );
+                whole = whole.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box((&dp, &dw));
+
+                let t = Instant::now();
+                let panel =
+                    super::conv2d_im2col_f64(&padded, BATCH, IN_CH, PH, PW, KK, KK, OH, OW, 1, 1);
+                ic = ic.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&panel);
+
+                let t = Instant::now();
+                let sc = super::conv2d_col2im_f64(
+                    &panel_ref, BATCH, IN_CH, PH, PW, KK, KK, OH, OW, 1, 1,
+                );
+                ci = ci.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&sc);
+
+                let t = Instant::now();
+                super::gemm::dgemm_tb(OUT_CH, FLAT, PATCH, &a_flat, &panel_ref, &mut c_tb);
+                g_tb = g_tb.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&c_tb);
+
+                let t = Instant::now();
+                super::gemm::dgemm(FLAT, OUT_CH, PATCH, &a_flat, &wsmall, &mut c_mm);
+                g_mm = g_mm.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&c_mm);
+            }
+            // The last named term: the dout_flat gather and the dpanel allocation, both
+            // reproduced here so "unaccounted" means unaccounted by EVERY phase anyone has
+            // named, not merely by the four big ones.
+            let mut gather = f64::INFINITY;
+            let mut alloc = f64::INFINITY;
+            for _ in 0..REPS {
+                let t = Instant::now();
+                let mut dout_flat = vec![0.0f64; FLAT * OUT_CH];
+                {
+                    use rayon::prelude::*;
+                    dout_flat
+                        .par_chunks_mut(OUT_CH)
+                        .enumerate()
+                        .for_each(|(row, dr)| {
+                            let n = row / (OH * OW);
+                            let p = row % (OH * OW);
+                            for (oc, d) in dr.iter_mut().enumerate() {
+                                *d = dout[(n * OUT_CH + oc) * (OH * OW) + p];
+                            }
+                        });
+                }
+                gather = gather.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&dout_flat);
+
+                let t = Instant::now();
+                let buf = vec![0.0f64; FLAT * PATCH];
+                alloc = alloc.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&buf);
+            }
+            let parts = ic + ci + g_tb + g_mm + gather + alloc;
+            println!();
+            println!("  dout_flat gather            {gather:>8.3} ms");
+            println!("  dpanel alloc+zero           {alloc:>8.3} ms");
+            println!();
+            println!("BUDGET RECONCILED IN ONE PROCESS (min of {REPS}), out_ch={OUT_CH}:");
+            println!("  conv2d_backward_f64 whole   {whole:>8.3} ms");
+            println!("  im2col                      {ic:>8.3} ms");
+            println!("  col2im                      {ci:>8.3} ms");
+            println!("  dweight GEMM (dgemm_tb)     {g_tb:>8.3} ms");
+            println!("  dpanel  GEMM (dgemm)        {g_mm:>8.3} ms");
+            println!("  ---- sum of parts           {parts:>8.3} ms");
+            println!(
+                "  ---- UNACCOUNTED            {:>8.3} ms   ({:.0}% of the whole)",
+                whole - parts,
+                100.0 * (whole - parts) / whole
+            );
+        }
+
         // THE FIXED COSTS the phase probe could not see. `conv2d_backward_f64` allocates two
         // zeroed buffers before it does any arithmetic, and only ONE of them scales with
         // `out_ch`. A cost independent of `out_ch` is invisible to an `out_ch` sweep that
