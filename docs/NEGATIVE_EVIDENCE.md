@@ -26515,3 +26515,47 @@ instrument caught it unaided. **Both facts should be carried together: the gate 
 `r8_4` certified at loadavg 42 rising to 54, with drift 1.000x — more evidence for item
 74a that a single-lane filter makes the drift gate robust to a busy host, and for item 74b
 that what refuses rows here is the null band rather than the machine.
+
+## 78. ITEM 69f's OWED SWEEP IS CLOSED: THE WIDENING VEIN IS HARVESTED — ONE SITE LEFT, AND IT IS OFF-BOARD
+
+Item 69 found a serial `f32 -> f64` widen worth 20.2 ms and recorded that
+`map(|&v| f64::from(v))` appears at 14 sites in `ft-api`, with "a sweep for other
+numel-scaled widenings owed". I asserted at the time that the rest were per-channel, index
+or grid buffers. **That was an assertion, not a sweep.** Done properly now, site by site:
+
+    site                       what it widens              scale
+    stft signal                the whole input signal      NUMEL   <- the only one
+    cross-entropy target       [batch]                     batch
+    stft window                [win_length]                window
+    grid_sample grid           the sampling grid           grid
+    two index conversions      gathered indices            small
+    remaining                  tests and the helper itself -
+
+**Exactly one more numel-scaled site existed, and the assertion was right about the other
+five.** The vein is harvested.
+
+### 78a. What was landed, and what it is NOT
+
+`stft`'s F32 branch now widens through the same helper, which is renamed
+`widen_f32_to_f64` since it no longer serves gradients alone. Bit-exact by the same
+argument as item 69 — every f32 is exactly representable in f64 and an elementwise map has
+no accumulation order — and it inherits item 69's MEASURED gate of `1 << 20`, below which
+it stays serial.
+
+**NO SPEEDUP IS CLAIMED. `stft` has no h2h lane**, so this change cannot be measured with
+the trusted instrument at all, and its benefit depends entirely on signal length: a short
+signal falls through the gate and nothing changes. It is landed because it is free,
+bit-exact, and closes the sweep — not because it moves a standing. Anyone wanting a number
+must first build an stft lane, and item 11's divergence risk applies to adding a second
+instrument.
+
+### 78b. Why this closes rather than continues the vein
+
+The GroupNorm widen was worth 20.2 ms because it sat inside a TIMED BACKWARD on a scored
+lane at 6,422,528 elements. Nothing else in `ft-api` combines those three properties. The
+next f32-surface lever is not another widen — it is the tape storing f32 gradients as f64
+at all, which item 70d already named as architectural and which is where the remaining
+GroupNorm engine term (~84% of 5.45 ms) lives.
+
+2579 ft-api tests pass. Observed loadavg 21.20 / 29.36 / 24.24 at the start of this tick;
+no certification attempted or claimed here. df read 161G.

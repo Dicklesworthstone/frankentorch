@@ -101,7 +101,12 @@ const NAN_TO_NUM_FLOAT_REASON: &str = "nan_to_num only supported for float32/flo
 /// the first size measured to win, not extrapolated below it.
 const GRADIENT_WIDEN_PARALLEL_MIN: usize = 1 << 20;
 
-/// Widen an f32 gradient buffer into the tape's f64 storage.
+/// Widen an f32 buffer to f64, in parallel once it is large enough to pay for the join.
+///
+/// Named for gradients because that is where it was measured, but it now also serves the
+/// one other numel-scaled widening site the item 69f sweep found (`stft`'s signal). Every
+/// remaining `f32 -> f64` conversion in this file is batch-, window-, index- or
+/// grid-sized and falls through the gate to the serial path.
 ///
 /// WHY THIS EXISTS. The f32 GroupNorm backward hands its gradient to the tape as a
 /// `Vec<f64>`, and did so with a serial `.iter().map(f64::from).collect()`. For the
@@ -114,8 +119,8 @@ const GRADIENT_WIDEN_PARALLEL_MIN: usize = 1 << 20;
 /// BIT-EXACT BY CONSTRUCTION, not by tolerance: every `f32` is exactly representable in
 /// `f64`, and an elementwise map has no accumulation order to change. Splitting the range
 /// therefore cannot alter a single bit, which is asserted in
-/// `widen_f32_gradient_matches_serial_bitwise` rather than assumed.
-fn widen_f32_gradient(values: &[f32]) -> Vec<f64> {
+/// `widen_f32_to_f64_matches_serial_bitwise` rather than assumed.
+fn widen_f32_to_f64(values: &[f32]) -> Vec<f64> {
     if values.len() < GRADIENT_WIDEN_PARALLEL_MIN {
         return values.iter().map(|&v| f64::from(v)).collect();
     }
@@ -2659,10 +2664,11 @@ impl FrankenTorchSession {
         }
 
         let (signal, base_dtype) = match input_tensor.typed_storage() {
-            TensorStorage::F32(values) => (
-                values.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
-                DType::F32,
-            ),
+            // frankentorch-68pwz item 69f: the sweep for other numel-scaled f32->f64
+            // widenings found exactly one more, and this is it — a whole signal, which
+            // for stft is the largest buffer in the call. Every other remaining site is
+            // batch-, window-, index- or grid-sized and stays serial through the gate.
+            TensorStorage::F32(values) => (widen_f32_to_f64(values), DType::F32),
             TensorStorage::F64(values) => (values.as_ref().clone(), DType::F64),
             TensorStorage::F64Inline4(values) => (values.to_vec(), DType::F64),
             _ => {
@@ -26290,9 +26296,9 @@ impl FrankenTorchSession {
                     // frankentorch-68pwz: one element per input, so this is the 49 MiB
                     // widen that dominated the engine term. dw/db are per-channel (64
                     // here) and stay serial by the helper's own gate.
-                    Some(widen_f32_gradient(&dx)),
-                    Some(widen_f32_gradient(&dw.unwrap())),
-                    Some(widen_f32_gradient(&db.unwrap())),
+                    Some(widen_f32_to_f64(&dx)),
+                    Some(widen_f32_to_f64(&dw.unwrap())),
+                    Some(widen_f32_to_f64(&db.unwrap())),
                 ])
             },
         )?;
@@ -37754,10 +37760,10 @@ impl FrankenTorchSession {
                             );
                             Ok(vec![
                                 // frankentorch-68pwz: same widen on the non-shortcut
-                                // f32 GroupNorm backward. See `widen_f32_gradient`.
-                                Some(widen_f32_gradient(&dx)),
-                                Some(widen_f32_gradient(&dw.unwrap())),
-                                Some(widen_f32_gradient(&db.unwrap())),
+                                // f32 GroupNorm backward. See `widen_f32_to_f64`.
+                                Some(widen_f32_to_f64(&dx)),
+                                Some(widen_f32_to_f64(&dw.unwrap())),
+                                Some(widen_f32_to_f64(&db.unwrap())),
                             ])
                         },
                         move |ctx, grad_outs, fn_inputs, tape| {
@@ -144520,7 +144526,7 @@ mod tests {
         }
     }
 
-    /// frankentorch-68pwz: `widen_f32_gradient` parallelises the f32->f64 gradient
+    /// frankentorch-68pwz: `widen_f32_to_f64` parallelises the f32->f64 gradient
     /// materialization above `GRADIENT_WIDEN_PARALLEL_MIN`. Splitting an elementwise map
     /// cannot change a bit — every f32 is exactly representable in f64 and there is no
     /// accumulation order — but the whole point of the helper is that it takes a
@@ -144605,7 +144611,7 @@ mod tests {
     }
 
     #[test]
-    fn widen_f32_gradient_matches_serial_bitwise() {
+    fn widen_f32_to_f64_matches_serial_bitwise() {
         fn serial(values: &[f32]) -> Vec<f64> {
             values.iter().map(|&v| f64::from(v)).collect()
         }
@@ -144634,7 +144640,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let got = super::widen_f32_gradient(&values);
+            let got = super::widen_f32_to_f64(&values);
             let want = serial(&values);
             assert_eq!(got.len(), want.len(), "len mismatch at {len}");
             for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
