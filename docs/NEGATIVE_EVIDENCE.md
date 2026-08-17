@@ -27610,3 +27610,41 @@ wrong question. Ask which one is CORRECT. If the inputs are floats they are exac
 rationals, so the true answer is computable and the question has a fact for an answer —
 and the incumbent may turn out to be the worse one, in which case there was no trade-off
 to adjudicate at all.**
+
+## 91. `bidiag_reflector_tau_vtv_identity_holds_at_rank_deficient_tiny_scale` IS FLAKY IN-SUITE — main IS INTERMITTENTLY RED
+
+Not my test and not my lever; recorded because it makes the whole crate's gate unreliable
+for everyone, and because the way it fails is the interesting part.
+
+Landed in `8ec58070` (`frankentorch-l2zki` / probe `ga99y`), alongside the conv3d ceiling.
+
+    FULL SUITE   cargo test --release -p frankentorch-kernel-cpu
+                 656 passed, 1 FAILED, 2 ignored
+                 panicked at crates/ft-kernel-cpu/src/lib.rs:60052
+
+    ISOLATED     cargo test --release -p frankentorch-kernel-cpu bidiag_reflector_tau_vtv
+                 1 passed, 0 failed
+
+**Same worker (vmi1227854), same source, opposite results.** So this is not a broken
+assertion — it is order- or scheduling-dependent. The suspicion worth handing to the owner
+is that the identity `tau*(v^T v) == 2` is being checked on a reduction whose ORDER varies
+with rayon's pool state, which differs between running 659 tests concurrently and running
+one. A numeric identity that depends on thread scheduling is non-deterministic by
+construction, and at "rank_deficient_tiny_scale" there is the least headroom to absorb it.
+
+I could not re-run the full suite to see whether it is deterministic in-suite or genuinely
+random: rch refused three consecutive times with `no admissible workers`. That question is
+open and is the first thing the owner should settle.
+
+### 91a. AND THE REFUSAL EXITS 0
+
+    [RCH] remote required; refusing local fallback (no admissible workers:
+          insufficient_slots=2, insufficient_total_slots=7, active_project_exclusion=1)
+    [exited with code 0]
+
+**A refusal that ran nothing reports success.** So does a test-suite FAILURE when the
+invocation pipes through `grep` — the earlier full-suite run above also exited 0 while
+reporting `1 failed`. Two independent ways for this harness to say "fine" when it is not,
+which is why every run in this session is read from its OUTPUT and never from `$?`. This
+is the same family as the four traps in [[feedback_exit_code_and_shell_traps]], and it is
+also why a wait-loop around a build never terminates: the refusal writes nothing to wait for.
