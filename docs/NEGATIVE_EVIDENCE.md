@@ -28711,11 +28711,11 @@ last row that passed its gates. The live measurement is ~1.2x FASTER, replicated
 uncertified. Both statements are true and the second does not replace the first until a row
 certifies on a resized lane.
 
-## 107. ITEM 104's FIX WAS HALF THE DEFECT — THE SAME ROUTE HAS A SECOND GEMM WITH A DIFFERENT k, AND MY OWN NEW TEST WAS BLIND TO IT
+## 107. ITEM 105's FIX WAS HALF THE DEFECT — THE SAME ROUTE HAS A SECOND GEMM WITH A DIFFERENT k, AND MY OWN NEW TEST WAS BLIND TO IT
 
 `frankentorch-ikw6q`, reopened against myself one commit later.
 
-Item 104 fixed the conv2d/conv1d dweight reduction to fold on `DGEMM_KC` boundaries and
+Item 105 fixed the conv2d/conv1d dweight reduction to fold on `DGEMM_KC` boundaries and
 closed the bead. It also wrote down the lesson: *a test that pins a blocking-sensitive claim
 has to run at a shape larger than the block, or it is testing the degenerate case.* Then the
 test I shipped with it ran every case at `out_ch = 4`.
@@ -28725,7 +28725,7 @@ test I shipped with it ran every case at `out_ch = 4`.
     dweight = dgemm_tb(out_ch, flat,   patch_width, dout_flat, panel)        k = flat
     dpanel  = dgemm   (flat,   out_ch, patch_width, dout_flat, weight_flat)  k = out_ch
 
-Item 104 blocked the first. The fast paths ALSO hand-roll the second, as a single ascending
+Item 105 blocked the first. The fast paths ALSO hand-roll the second, as a single ascending
 chain over `oc`, and it diverges above 256 channels exactly as the first did over 256 patches.
 Measured, at the shape my own test could not reach:
 
@@ -28733,7 +28733,7 @@ Measured, at the shape my own test could not reach:
       no-panel     1.6920282888907312e-3
       panel+GEMM   1.6920282888907314e-3
 
-`flat = 49` here — well inside one block — so item 104's cases could never have surfaced it,
+`flat = 49` here — well inside one block — so item 105's cases could never have surfaced it,
 and `out_ch = 4` in all of them meant the second k never left its first block either. **The
 blindness I documented and the blindness I shipped were the same blindness, one dimension
 over.** Writing the lesson down did not transfer it; only enumerating the k dimensions did.
@@ -28755,7 +28755,7 @@ the blind regime that let this ship twice. Cases: `flat` 8192 / 1800 / 1200 / 30
 
 ### THE TRANSFERABLE RULE, CORRECTED
 
-Item 104 said to test above the block size. That is not enough and this item is the proof.
+Item 105 said to test above the block size. That is not enough and this item is the proof.
 **Enumerate every GEMM the fast path replaces, and every k dimension among them, and require
 a case above the block in EACH.** A route with two GEMMs has two ways to be wrong, and fixing
 the one you found first makes the second harder to see, because the bead is now closed and
@@ -28840,7 +28840,7 @@ conv3d with a non-uniform loss. Real training does. A `conv3d_mse` lane — same
 against a target instead of `sum()` — is the measurement that would price it, and unlike the
 resize withdrawn above, that one is worth building.
 
-## 106. THE GroupNorm GAP WAS HIDING BEHIND THE BENCHMARK'S LOSS SHAPE — THE DENSE ROUTE CERTIFIES AT 6.51x SLOWER
+## 109. THE GroupNorm GAP WAS HIDING BEHIND THE BENCHMARK'S LOSS SHAPE — THE DENSE ROUTE CERTIFIES AT 6.51x SLOWER
 
 `frankentorch-68pwz`. The board's scored `group_norm_f32` lane reads 1.11-1.13x SLOWER. The
 same op under a loss that is not a bare sum reads **6.51x SLOWER against the same incumbent
