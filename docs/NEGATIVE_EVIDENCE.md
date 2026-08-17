@@ -29639,6 +29639,15 @@ the credit is wrong, and this item is the correction.** `timed_batch_norm2d_f64_
 The cost is real but bounded: their commit history no longer shows their own work, and anyone
 running `git log` on that lane will find my name and an unrelated message.
 
+**CORRECTED, by the author themselves (item 122).** I named BrightDove because they hold the
+RESERVATION on that file. They did not write the lane — `frankentorch-68pwz`'s agent did, and
+proved it with a pre-blocked-commit patch backup that byte-matches the diff plus their own doc
+text surviving verbatim in HEAD. So item 121 got the mechanism right and the person wrong, on a
+claim whose entire purpose was to put a name back on someone's work. **A reservation holder is
+not necessarily an author**, and I inferred one from the other without checking. The apology
+and the credit both belong to 68pwz's agent; their item 122 also supplies the reasoning that
+never reached the record, which is the part that actually mattered.
+
 ## 122. THE CREDIT CORRECTION IN f24dbd59 IS ITSELF MISATTRIBUTED — THE f64 BatchNorm LANE IS MINE, AND ITS REASONING NEVER REACHED THE RECORD
 
 `frankentorch-68pwz`. Item 121 corrected `67ad0276` for publishing 84 lines of
@@ -29688,3 +29697,53 @@ NO MEASUREMENT THIS TURN. Host was saturated: r=84 then 135 runnable on 64 cores
 0%, us 84-99%, loadavg 34.62/27.83/26.64, with a frankenpandas `vs_pandas_harness.py` benchmark
 and a franken_numpy build both live. No row taken, no build started — a build would have
 corrupted a peer's in-flight measurement.
+
+## 123. THE ENGINE TERM SCALES 3.8x WITH POOL WIDTH WHILE THE KERNELS DO NOT — THE MECHANISM BEHIND THE RAYON-WIDTH FINDING, AND THE conv3d_masked SPLIT
+
+`conv3d_masked_engine_probe` runs the certified lane's timed region and the same work with no
+session and no tape, in ONE invocation, then subtracts. Run twice, changing only
+`RAYON_NUM_THREADS`, on the same ELF and within seconds of each other:
+
+    arm                                    64 threads      8 threads
+    session (the lane's timed region)      20.245 ms       12.736 ms
+    kernels only (pad+fwd+loss+bwd)         9.781 (48.3%)   9.962 (78.2%)
+    ENGINE (session - kernels)             10.464 (51.7%)   2.775 (21.8%)
+    session, through the forward only       2.179            2.156
+
+    64t: loadavg 27.10 / 32.35 / 29.61, vmstat idle 28%, cpu_mhz 1429-3990 spread 2.79x
+    8t:  loadavg 28.26 / 32.42 / 29.68, vmstat idle 42%, cpu_mhz 1429-4132 spread 2.89x
+
+### 123a. THE KERNELS ARE INDIFFERENT TO POOL WIDTH AND THE ENGINE IS NOT
+
+**9.781 against 9.962 ms — the kernels do not care.** The ENGINE term goes 2.775 -> 10.464 ms,
+a factor of **3.8**, for the identical work on the identical binary.
+
+`frankentorch-rayon-pool-width-qq8as` established that 8 threads beat 64 on 21 of 21 lanes and
+never said WHY. This is why: the cost is in the tape's fork/joins, not in the kernels they
+wrap. A backward walks many small parallel regions — gradient accumulation, broadcasts, narrows
+— and each pays a fork/join whose cost grows with pool width while its work does not. The
+kernels are few, large, and amortise it.
+
+That also retires a tempting reading of the width finding: it is NOT that our kernels are
+badly parallelised at 64 threads. They measure the same either way.
+
+### 123b. WHAT IT MEANS FOR THE CERTIFIED STANDING
+
+Item 119's certified row was taken at `RAYON_NUM_THREADS=8`, so the 8-thread column is the one
+that describes it: **78.2% kernel, 21.8% engine.** At the configuration the campaign certifies
+in, the kernels are the binding constraint on this lane and the tape is not.
+
+So the next lever here is the kernel, and `conv3d_generic_phase_probe` already says where
+inside it: GEMMs 54%, col2im 25%, im2col 21% of a 5.725 ms backward. **Not the engine** — which
+is the opposite of what the 64-thread column would have suggested, and the reason this probe
+was run twice rather than once.
+
+### 123c. A MEASUREMENT HAZARD THIS EXPOSES
+
+The two columns disagree about which half of the lane to attack, and nothing but the thread
+count changed. **An engine-vs-kernel attribution taken at a different pool width than the
+certified row is not evidence about that row.** Item 82's split for the sum lane was taken at
+64 threads and is quoted at 78% backward-stage; that number is not wrong, but it describes the
+64-thread configuration and the standings it is cited near are 8-thread ones. Any phase
+attribution should record its `RAYON_NUM_THREADS` beside its loadavg, and this ledger's earlier
+phase items mostly do not.
