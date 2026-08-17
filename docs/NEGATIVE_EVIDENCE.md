@@ -30110,3 +30110,134 @@ optimised: three levers have now been spent on the conversion tax, and this is t
 underneath them.
 
 NO ROW CLAIMED HERE. Arm-internal FT-vs-FT phase attribution; no incumbent, no gate.
+
+## 130. ITEM 128's HYPOTHESIS IS REFUTED BY ITS OWN PROBE — conv2d's BACKWARD IS 79% GEMM, AND ITS dweight PRODUCT IS STILL SINGLE-THREADED
+
+Item 128 measured conv2d at 7.4-8.8x SLOWER and guessed why: "conv2d's scaffolding-to-arithmetic
+ratio is far worse than conv3d's". It also insisted the probe be written before any kernel work.
+The probe was written, and it refutes the guess.
+
+### 130a. BOTH PROBES, SAME WINDOW, SAME BOX
+
+    phase                              conv2d            conv3d
+    TOTAL (non-uniform dout)          11.513 ms         5.651 ms
+    im2col                             1.005 ( 8.7%)    1.217 (21.5%)
+    col2im                             1.373 (11.9%)    1.404 (24.9%)
+    RESIDUAL = the two GEMMs           9.135 (79.3%)    3.029 (53.6%)
+    scaffolding (im2col + col2im)      2.378 ms         2.621 ms
+
+    loadavg 13.60 / 15.24 / 16.84, vmstat idle 85%, iowait 1%
+    cpu_mhz 1429-4294 spread 3.01x; rayon_threads 64; min of 9
+
+**The scaffolding is the same in absolute terms — 2.378 against 2.621 ms — and it is a SMALLER
+share of conv2d than of conv3d.** The entire difference is the GEMMs. Item 128's hypothesis was
+exactly backwards, and it was written with a caveat that it was unmeasured, which is the only
+reason it cost nothing.
+
+### 130b. THE ACTUAL CAUSE, AND IT IS ITEM 119 AGAIN
+
+conv2d does FEWER MACs in MORE time:
+
+    conv2d   2 * 32 * 8192 * 288 = 151.0 MMAC in 9.135 ms  ->  16.5 GMAC/s
+    conv3d   2 * 32 * 4096 * 864 = 226.5 MMAC in 3.029 ms  ->  74.8 GMAC/s
+
+4.5x apart in throughput. The gate arithmetic says why. `dgemm_tb`'s column split, added in item
+119, requires `n >= 4*MIN_BLOCK_COLS` (512), `n > 4*m`, and `m*k*n >= 16.8M`:
+
+    conv2d dweight  m=32 k=8192 n=288   (False, True, True)   -> DOES NOT FIRE
+    conv3d dweight  m=32 k=4096 n=864   (True,  True, True)   -> fires
+
+**conv2d's `dweight` GEMM fails on ONE condition — its `patch_width` of 288 is below the
+512-column floor — so it is still running on a single core.** Item 119 did not fix `dgemm_tb`
+for every shape; it fixed it for shapes wide enough to column-split, and conv2d is not one.
+Item 120 warned that "the benefit is shape-dependent and each of these has a different aspect
+ratio"; this is that warning coming true, measured.
+
+### 130c. WHY THE OBVIOUS FIXES DO NOT APPLY, WRITTEN DOWN SO NOBODY BURNS A TICK
+
+* **Lower the column floor.** `block_cols` would give 288/8 = 36-column blocks. Possible, but
+  it changes a constant shared by `dgemm`, `dgemm_bt` and `dgemm_tb` for every caller in the
+  crate, on the strength of one shape.
+* **Split k.** This is the axis with the work (8192), and it is the ONLY axis that is not
+  bit-exact: partials summed per-thread give `(b0+b1)+(b2+b3)` where sequential gives
+  `((b0+b1)+b2)+b3`. Item 97's kc-block trick reproduces matrixmultiply's ORDER but not a
+  threaded reduction over it. A k-split here is a tolerance change, not a scheduling change.
+* **Split m.** `m = 32` with `MIN_BLOCK_ROWS = 8` yields four blocks — bit-exact and real, but
+  capped at 4x on a 64-core box.
+
+**The one that fits is 2-D tiling**, which `dgemm` already has as `dgemm_2d_parallel` and
+`dgemm_tb` does not: tiles of the `m x n` output keep every element's k-reduction whole, so it
+is bit-exact for the same reason the column split is, and 32 x 288 has room for far more than
+four tiles. That is the lever, it is not written, and it should be measured on both conv2d and
+conv3d shapes because it would replace the column path's coverage rather than sit beside it.
+
+### 130d. THE METHOD POINT, WHICH IS THE REASON THIS ITEM IS CHEAP
+
+Item 128 named a cause and immediately said: probe before touching the kernel. Doing so cost one
+build and refuted the cause. Had the "obvious" scaffolding lever been built instead — a
+no-im2col conv2d backward — it would have attacked 8.7% of the runtime, which is precisely the
+shape of items 104 and 114, both of which were regressions aimed at conv3d's 13%.
+
+**Three times now on this bead the memory-shaped intuition has been wrong and the probe has been
+right.** The intuition is not getting better; the probes are just cheap.
+
+## 130. hi9r6's SCAFFOLDING HYPOTHESIS IS REFUTED — conv2d's BACKWARD IS 82% TWO THIN GEMMs RUNNING AT ~28 GFLOP/s
+
+`frankentorch-hi9r6` (P0). The bead states the rule its own history earned: attribute the
+phases BEFORE touching the kernel, because on the conv3d route two of three unprobed attempts
+were regressions (items 114, 117) and the one that worked came straight after the probe (119).
+This is that probe for conv2d, and it refutes the bead's stated hypothesis.
+
+`examples/conv2d_generic_phase_probe.rs`, the sibling of `conv3d_generic_phase_probe`, at
+hi9r6's own shape `[8,32,32,32]` k=3 s=1 pad=1 out_ch=32 (flat=8192, patch_width=288, dpanel
+18.0 MiB). Non-uniform `dout`, asserted, so it measures the generic route and not the all-ones
+fast path. min-of-9, rayon_threads=8, loadavg 13.20/14.64/16.50, CPU idle 86-87% verified by
+vmstat with iowait 0, cpu_mhz min 1429 median 3132 max 4267 spread 2.99x, df 204G.
+
+    phase                                        min ms   share
+    TOTAL conv2d_backward_f64 (non-uniform)      13.380   100.0%
+      im2col (dweight's panel)                    0.932     7.0%
+      col2im (dpanel -> dpadded scatter)          1.215     9.1%
+      RESIDUAL                                   11.233    84.0%
+        of which dout_flat gather                 0.271     2.0%   (reimplemented; a BOUND)
+        of which the two GEMMs                   10.962    81.9%
+
+### THE HYPOTHESIS AND WHY IT IS WRONG
+
+hi9r6 predicted conv2d's scaffolding-to-arithmetic ratio would be FAR WORSE than conv3d's —
+"an 18.9 MB panel against a 3 ms incumbent" — and that this explained 7-8x rather than 1.7x.
+
+conv2d's scaffolding is **16.0%**. conv3d's, measured by item 124, is **46%**. conv2d's
+scaffolding ratio is nearly 3x BETTER, and conv2d is the op that is 4x worse overall. The
+prediction is refuted in the direction that matters: **attacking the panel here would have
+been the conv3d playbook applied to a problem that does not have conv3d's shape**, which is
+exactly the mistake items 114 and 117 made in the other direction.
+
+### WHAT THE TARGET ACTUALLY IS
+
+The two GEMMs, at 81.9% of the backward and ~302 MFLOP between them, are running at
+**~28 GFLOP/s** — a small fraction of what 8 threads of this part should reach on f64. Their
+shapes say why, and both are deformed by the same parameter:
+
+    dweight   dgemm_tb(m=32,   k=8192, n=288)    m is THIN
+    dpanel    dgemm   (m=8192, k=32,   n=288)    k is THIN
+
+`out_ch = 32` is the thin dimension in both. A generic GEMM blocks for register and cache
+reuse along dimensions it assumes are large; at m=32 the dweight GEMM has almost no row reuse
+to amortise a panel pack, and at k=32 the dpanel GEMM's inner reduction is shorter than a
+single k-block (`DGEMM_KC = 256`, established in item 97), so it pays full packing overhead
+for an eighth of a block's work.
+
+That is a concrete, falsifiable target: the conv2d backward is not scaffolding-bound and not
+arithmetic-bound, it is **GEMM-SHAPE-bound**, and the shape is set by out_ch.
+
+### WHAT THIS PROBE DOES NOT SAY
+
+It does not measure the two GEMMs separately — `mod gemm` is private, so they cannot be called
+from an example, and the 10.962 ms is their SUM by subtraction. Splitting them needs either a
+visibility change or an in-crate bench, and which of the two thin shapes dominates should be
+established before a lever is aimed at either. The `dout_flat` figure is a faithful
+REIMPLEMENTATION of the gather, not the shipping call, and is stated as a bound.
+
+No incumbent, no ratio, no gate: arm-internal attribution. It says which phase to attack and
+is not a standing.
