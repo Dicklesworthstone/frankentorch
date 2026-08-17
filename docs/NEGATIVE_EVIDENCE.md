@@ -29394,3 +29394,152 @@ small levers means the wrong thing is being optimised.
 CODE LANDED, BUT NOT BY ME: a peer's `git add -A` swept this kernel change into `a6e4b580`
 ("perf(conv3d): fuse the dpanel GEMM into col2im"), whose message describes none of it. Second
 time this session; recorded so the provenance is findable.
+
+## 117. ITEM 114 WAS A 1.7x REGRESSION ON THE LANE IT TARGETED — REVERTED, MEASURED BOTH WAYS
+
+Item 114 fused conv3d's `dpanel` GEMM into the col2im scatter, removing 28.3 MB and proving
+bit-exactness at four shapes. It was correct and it was **slower**. Reverted.
+
+### 117a. THE MEASUREMENT, BOTH DIRECTIONS, LIVE INCUMBENT IN EVERY ROW
+
+`conv3d_masked` — the lane built in item 110 precisely so this route could be priced —
+`RAYON_NUM_THREADS=8`, 16 rounds, mimalloc, thinkstation1, live PyTorch 2.12.0+cpu in the same
+invocation, in the quietest window of the campaign (loadavg 6.0-13.6):
+
+    build                       FT ms     PT ms   min-ratio   standing
+    with item 114 (44da2efe)   32.500     6.929   0.213       4.69x SLOWER
+    with item 114 (44da2efe)   30.233     6.676   0.216       4.62x SLOWER
+    item 114 REVERTED (e7fe847b) 19.194   7.083   0.382       2.62x SLOWER
+
+    banked before item 114 (item 110, ELF 65f2efcb, five rows)
+                             17.887-19.807  6.498-7.449  0.340-0.371   2.7-2.9x SLOWER
+
+r1 provenance: cpu_mhz min=1429 median=1429 max=4293 spread=3.004x, cross-core while sampling
+2.933x/2.994x/3.006x, load_1m 8.16 flat. Reverted-build provenance: cpu_mhz min=1429 median=3389
+max=4242 spread=2.969x, cross-core 2.875x/2.920x/2.966x, load_1m 14.64 flat. Parity `match`
+throughout. None certified — the PT null failed on all three — but the effect is 1.6x and the
+arms are stable to a few percent, so the gates are not what decides this.
+
+**The revert lands exactly back in item 110's banked band, on a different day and a different
+ELF.** That is what makes the attribution a measurement rather than an elimination argument.
+
+### 117b. WHY IT LOST, AND THE THING I DID NOT PRICE
+
+One `dgemm(flat=4096, out_ch, patch_width)` is a single wide parallel region. Sixteen sequential
+`dgemm(256, ..)` calls are sixteen narrow ones, and between them the scatter runs with only
+`in_ch = 32` tasks instead of col2im's `batch * in_ch = 64` planes. **I traded parallel width
+for working-set size on a machine with 64 cores and no memory pressure.**
+
+Item 114's own text predicted "bandwidth: 28.3 MB of write-then-read replaced by 1.77 MB
+resident". The prediction was about the right quantity and the wrong constraint: this route is
+not bandwidth-bound at this size, it is parallelism-bound, and shrinking the working set does
+nothing for the first while the blocking costs the second.
+
+This is [[feedback_insitu_over_standalone]] again — a lever that is obviously good in isolation
+inverting in situ — and it is the second time on this bead that a memory-shaped argument has
+failed to predict a time. Item 88a's "56.6 MB of traffic to keep 864 numbers" was right and
+paid; this one used the same reasoning and did not. **The difference is that item 98/104
+removed work, while item 114 only moved it, and moving it cost a fork/join.**
+
+### 117c. WHAT IS LEFT IN THE TREE, AND WHAT IS NOT
+
+The fused kernel, its constant and its bit-exactness test are all removed — a kernel nothing
+calls, kept alive only by its own test, decays. The design and the reason it lost are here
+instead, which is the durable form. **Do not re-fuse this without a design that keeps ONE wide
+parallel region** — for instance scattering all blocks' output in a single parallel pass after
+the GEMMs, which keeps the memory saving without fragmenting the fork/join. That is a different
+lever and it needs its own measurement.
+
+`DPANEL_BLOCK_ROWS` is gone with it. Note for anyone reading item 114's claim that the constant
+was "FREE": that was true numerically — any block width gives bit-identical results — and false
+in every other sense. A constant that changes only performance is not free, it is untested.
+
+### 117d. HOW THIS WAS COMMITTED, BECAUSE IT MATTERS
+
+A peer had uncommitted BatchNorm work in the same file with two failing tests
+(`batch_norm_f32_scalar_backward_matches_unit_dy_bits`,
+`batch_norm_f32_unit_dy_matches_general_reference_bits`). Staging `crates/` would have landed
+their in-flight breakage under my message. The revert was staged instead with
+`git show a6e4b580 -- <file> | git apply -R --cached -`, which writes the reverse patch to the
+INDEX ONLY and leaves the working tree untouched, then verified with
+`git diff --cached | rg batch_norm` returning nothing. Their work is still theirs and still
+uncommitted.
+
+## 119. THE GENERIC conv3d BACKWARD IS 86.8% GEMM, ITS dweight GEMM WAS SINGLE-THREADED, AND MY OWN ITEM 104 WAS HIDING IT — CERTIFIED 2.7x -> 1.67x SLOWER
+
+Item 117 reverted a lever aimed at this route that was guessed rather than aimed. This one was
+aimed, and it found that two of the three things I had already done to this route were wrong.
+
+### 119a. THE PROBE, WHICH SHOULD HAVE COME FIRST
+
+`conv3d_generic_phase_probe` times the phases of `conv3d_backward_f64` under a NON-UNIFORM
+`dout`, using only public kernel entries. Min of 9, arm-internal:
+
+    phase                                       ms      share
+    TOTAL conv3d_backward_f64 (non-uniform)   17.005    100.0%
+    im2col (dweight's panel)                   1.000      5.9%
+    col2im (dpanel -> dpadded scatter)         1.252      7.4%
+    RESIDUAL (two GEMMs + dout_flat)          14.753     86.8%
+
+**86.8% is the GEMMs.** Every lever I aimed at this route before this probe was aimed at the
+13% — item 104 removed the im2col panel, item 114 removed the dpanel. Item 114 cost 1.7x and
+item 104, it turns out, cost more than that.
+
+### 119b. TWO DEFECTS, AND BOTH WERE MINE
+
+**`dgemm_tb` had no parallel path at all.** `dgemm` dispatches three ways and `dgemm_bt`'s own
+doc says it "uses the same column/row/serial split as `dgemm`" — but `dgemm_tb`, the entry that
+computes `dweight`, called `dgemm_mm` bare at every shape. 113M MACs on one core inside a
+kernel that is 87% GEMM.
+
+**And item 104's k-blocking made that unfixable.** Blocking the dweight GEMM into
+`DGEMM_KC = 256` row chunks dropped each call to `m*k*n = 32*256*864 = 7.1M` MACs — **below
+`PAR_MIN_FLOPS_COLS = 16.8M`**, so even after `dgemm_tb` gained a column split, all sixteen
+calls still ran single-threaded. Item 104 was landed as a memory win with "not measured, and
+not claimed"; it was in fact a large loss, and it also locked the door on the real fix.
+
+Fixed together: `dgemm_tb` gets the same column-parallel path its siblings have, and the
+dweight GEMM goes back to ONE wide call over the full panel.
+
+    conv3d_backward_f64 (non-uniform), same probe
+        before                       17.005 ms   (loadavg 13.32)
+        dgemm_tb parallel only       20.152 ms   (loadavg 15.65)  <- gate never fires
+        + one wide GEMM               5.725 ms   (loadavg 41.85)  <- 3.0x, at 3x the load
+
+### 119c. THE CERTIFIED ROW
+
+    conv3d_masked  MIN 1.67x SLOWER  ratio 0.598 [0.578,0.626]
+                   FT 10.780 ms   PT 6.841 ms   (PyTorch 2.12.0+cpu, same invocation)
+                   PT null 1.004 PASS   FT null 1.004 PASS   parity match
+                   drift PASS (load_1m 22.30 -> 22.52), loadavg 24.02 / 30.22 / 27.62
+                   cpu_mhz min=1429 median=3185 max=3996 spread=2.797x
+                   CROSS-CORE SPREAD WHILE SAMPLING 2.795x / 2.821x / 3.004x
+                   RAYON_NUM_THREADS=8, 16 rounds, mimalloc, thinkstation1
+                   ELF 37e8c0d86aef2c7f...
+
+Against item 110's banked **2.7-2.9x SLOWER** and item 117's 2.62x, on the route a real
+objective takes. The incumbent did not move: 6.841 ms sits inside the 6.498-7.449 band this
+lane has always read.
+
+### 119d. WHY THE COLUMN SPLIT IS BIT-EXACT, AND WHY THAT MATTERS HERE
+
+Splitting N partitions the OUTPUT columns, so every element's k-reduction stays whole and in
+one piece. Nothing is reassociated. That is a categorically different argument from item 104's
+k-split, which had to reproduce matrixmultiply's private `D_KC` — and it is the third time on
+this bead that the m/n-split has been safe and the k-split has been the one needing care.
+666 ft-kernel-cpu tests pass.
+
+Item 104's bit-exactness test is deleted: with the dweight back to one full-panel `dgemm_tb`,
+it compared that call against itself.
+
+### 119e. THE LESSON, WHICH IS EXPENSIVE AND SPECIFIC
+
+**Three levers on this route, two regressions, and the probe that settled it cost one build.**
+Items 104 and 114 were both memory-shaped arguments landed with "not measured"; both moved work
+rather than removing it, and both fragmented a parallel region to do it. The probe that would
+have caught either of them was twenty lines of public API.
+
+And the second-order damage is the part worth remembering: **item 104 did not merely fail, it
+concealed the real defect.** A single-threaded `dgemm_tb` is obvious in a profile of one wide
+call and invisible in sixteen narrow ones, because each narrow call is individually too small
+to look wrong. An unmeasured lever is not neutral; it can move the evidence.

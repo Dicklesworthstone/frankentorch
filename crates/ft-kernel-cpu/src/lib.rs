@@ -316,6 +316,52 @@ mod gemm {
         let a = &a[..k * m];
         let b = &b[..k * n];
         let c = &mut c[..m * n];
+        // COLUMN-PARALLEL, on the same gate and block width `dgemm` and `dgemm_bt` use.
+        //
+        // This entry was the only transpose variant still calling `dgemm_mm` bare: `dgemm_bt`
+        // documents that it "uses the same column/row/serial split as `dgemm`", and `dgemm`
+        // itself dispatches three ways, but `dgemm_tb` ran single-threaded at every shape. On
+        // conv3d's generic backward that is the `dweight` product at m=32, k=4096, n=864 —
+        // 113M MACs on ONE core, inside a kernel measured at 86.8% GEMM
+        // (`conv3d_generic_phase_probe`, NEGATIVE_EVIDENCE item 118).
+        //
+        // BIT-EXACT for the same reason `dgemm_col_parallel` is: splitting N partitions the
+        // OUTPUT columns, so every element's k-reduction is untouched and runs in one piece.
+        // Nothing is reassociated — unlike a k-split, which is why item 104 needed a private
+        // constant and this needs nothing. Column windows are disjoint, so writes never race.
+        if should_parallelize_cols(m, k, n) {
+            let nb = block_cols(n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                // SAFETY: identical operand model to the serial call below — A is [k,m] read
+                // as A^T via strides (rsa=1, csa=m), B is the contiguous [k,n] matrix whose
+                // column window is b.add(n0) with rsb=n, csb=1. The output window
+                // cp.0.add(n0) (rsc=n, csc=1) is the m x bw tile whose last element
+                // (m-1)*n + n0 + bw - 1 <= m*n - 1, and windows are disjoint across blocks.
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        alpha,
+                        a.as_ptr(),
+                        1,
+                        m as isize,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        0.0,
+                        cp.0.add(n0),
+                        n as isize,
+                        1,
+                    );
+                }
+            });
+            return;
+        }
         // SAFETY: A is [k,m] and read as A^T via strides; B and C are contiguous
         // row-major matrices with the exact dimensions passed to matrixmultiply.
         unsafe {
@@ -14034,37 +14080,15 @@ fn conv3d_backward_generic_f64(
             dweight.fill(0.0);
             return;
         }
-        let mut block = vec![0.0f64; DGEMM_KC.min(flat) * patch_width];
-        let mut start = 0usize;
-        while start < flat {
-            let rows = DGEMM_KC.min(flat - start);
-            let block = &mut block[..rows * patch_width];
-            conv3d_im2col_fill_rows_f64(
-                block,
-                padded,
-                start,
-                in_ch,
-                pd,
-                ph,
-                pw,
-                kd,
-                kh,
-                kw,
-                patch_count,
-                oh,
-                ow,
-                sd,
-                sh,
-                sw,
-            );
-            let a_block = &dout_flat[start * out_ch..(start + rows) * out_ch];
-            if start == 0 {
-                gemm::dgemm_tb(out_ch, rows, patch_width, a_block, block, dweight);
-            } else {
-                gemm::dgemm_tb_add_into(out_ch, rows, patch_width, a_block, block, dweight);
-            }
-            start += rows;
-        }
+        // ONE WIDE GEMM, not sixteen narrow ones. Item 104 blocked this on `k` to keep the
+        // im2col panel out of DRAM, and that blocking dropped each call to
+        // m*k*n = 32*256*864 = 7.1M MACs -- BELOW `PAR_MIN_FLOPS_COLS` (16.8M), so every one
+        // of the sixteen ran single-threaded even after `dgemm_tb` gained a column split. The
+        // full-panel call is 113M MACs and clears the gate. NEGATIVE_EVIDENCE item 118.
+        let panel = conv3d_im2col_f64(
+            padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
     });
     // frankentorch-l2zki / NEGATIVE_EVIDENCE item 116: the fused block-at-a-time form of the
     // two steps below was tried and REVERTED. It removed the 28.3 MB `dpanel` and it was
@@ -47652,113 +47676,6 @@ mod tests {
             "ga99y REGRESSED: Vh rows at rank 2 / scale 1e-20 deviate by {deficient:.3e}; \
              the bead reported 1.839e-2 before the house_gen_strided_f64 safmin rescale"
         );
-    }
-
-    /// The GENERIC conv3d backward's `dweight` must be BIT-IDENTICAL after the panel was
-    /// replaced by a `DGEMM_KC`-blocked consumer — this is the branch real training takes,
-    /// and the risk item 100 named is that a mistake here does not fail to compile, it
-    /// silently returns wrong gradients.
-    ///
-    /// `dout` is deliberately NOT all `+1.0`, so `conv3d_backward_f64` routes to
-    /// `conv3d_backward_generic_f64` rather than the sum-loss fast path. A test that let it
-    /// fall through to the ones-dout branch would pass while exercising nothing.
-    ///
-    /// The reference is the exact code this replaced: build the whole im2col panel, then one
-    /// `dgemm_tb` over the full `flat`. Shapes straddle the block width in both directions so
-    /// a mishandled final partial block cannot hide.
-    #[test]
-    fn conv3d_generic_dweight_blocked_panel_matches_full_panel_gemm_bitwise() {
-        let cases: &[(
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        )] = &[
-            // batch, in_ch, pd, ph, pw, kd, kh, kw, sd, sh, sw
-            (2, 32, 10, 18, 18, 3, 3, 3, 1, 1, 1), // the scored lane: flat = 4096 = 16 * 256
-            (2, 3, 7, 9, 11, 2, 3, 2, 1, 1, 1),    // flat = 840, NOT a multiple of 256
-            (1, 2, 5, 6, 6, 2, 2, 2, 2, 1, 3),     // flat = 20, BELOW one block; strided
-        ];
-
-        for &(batch, in_ch, pd, ph, pw, kd, kh, kw, sd, sh, sw) in cases {
-            let out_ch = 4usize;
-            let od = (pd - kd) / sd + 1;
-            let oh = (ph - kh) / sh + 1;
-            let ow = (pw - kw) / sw + 1;
-            let patch_width = in_ch * kd * kh * kw;
-            let patch_count = od * oh * ow;
-            let flat = batch * patch_count;
-
-            let padded: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
-                .map(|i| ((i as f64 * 0.037).sin() * 0.7 + (i % 13) as f64 * 0.011 - 0.4) / 1024.0)
-                .collect();
-            let weight_flat: Vec<f64> = (0..out_ch * patch_width)
-                .map(|i| ((i as f64 * 0.041).cos() * 0.5) / 1024.0)
-                .collect();
-            // Non-uniform, and never exactly +1.0 anywhere.
-            let dout: Vec<f64> = (0..batch * out_ch * patch_count)
-                .map(|i| ((i as f64 * 0.019).sin() * 0.5) + 0.25)
-                .collect();
-            assert!(
-                dout.iter().any(|v| v.to_bits() != 1.0f64.to_bits()),
-                "dout must not be all-ones or this exercises the wrong branch"
-            );
-
-            // Reference: the whole panel, then ONE dgemm_tb over all of `flat`.
-            let mut dout_flat = vec![0.0f64; flat * out_ch];
-            for row in 0..flat {
-                let n = row / patch_count;
-                let p = row % patch_count;
-                for oc in 0..out_ch {
-                    dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * patch_count + p];
-                }
-            }
-            let panel = super::conv3d_im2col_f64(
-                &padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-            );
-            let mut want_dw = vec![0.0f64; out_ch * patch_width];
-            super::gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut want_dw);
-
-            let (_, got_dw, _) = super::conv3d_backward_f64(
-                &dout,
-                &padded,
-                &weight_flat,
-                batch,
-                in_ch,
-                pd,
-                ph,
-                pw,
-                kd,
-                kh,
-                kw,
-                od,
-                oh,
-                ow,
-                sd,
-                sh,
-                sw,
-                out_ch,
-                false,
-            );
-
-            assert_eq!(got_dw.len(), want_dw.len());
-            for (j, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
-                assert_eq!(
-                    g.to_bits(),
-                    w.to_bits(),
-                    "generic dweight[{j}] moved at batch={batch} in_ch={in_ch} flat={flat} \
-                     (DGEMM_KC={}): blocked {g:e} vs full-panel {w:e}",
-                    super::DGEMM_KC
-                );
-            }
-        }
     }
 
     #[test]
