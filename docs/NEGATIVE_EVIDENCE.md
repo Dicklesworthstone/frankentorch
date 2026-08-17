@@ -31143,3 +31143,55 @@ per-call cost does not by itself explain a one-sided SLOT bias, which is what 14
 found. It is written down so the next quiet window has something aimed to test, and per
 `feedback_cycle_profile_hides_serial` a serial region like this would be invisible in a cycle
 profile at pool width 8.
+
+## 146. THE FOOTPRINT HYPOTHESIS HELD — ONE `drop(panel)` TAKES conv2d's GENERIC BACKWARD 1.6-2.0x, AND THE 63% RESIDUAL FALLS TO 19%
+
+`frankentorch-hi9r6` (P0). Item 143 argued from exhaustive enumeration that the gap could not be
+a missing phase and had to be peak footprint. It was, and the fix is one line.
+
+`panel` is 18.0 MB at the scored shape and its LAST use is the dweight GEMM, but without an
+explicit drop it lives to the end of the function — so it and the 18.0 MB `dpanel` allocated on
+the very next line are both resident through the second GEMM and through `col2im`. Peak ~40 MB
+against a 32 MiB L3 instance (`lscpu`: 128 MiB in 4 instances). `drop(panel)` at its last use
+halves it.
+
+### SELF-CONTROLLED, IN ONE PROCESS
+
+The same probe times the phases standalone alongside the whole call, so the phases are the
+control:
+
+                 whole      parts    unaccounted
+    before     14.868 ms    5.456    9.412 (63%)
+    after       9.225 ms    6.778    2.446 (27%)
+    after (2)   7.436 ms    6.030    1.406 (19%)
+
+**1.61x then 2.00x.** The controls got SLOWER across the change (parts 5.456 -> 6.778), so the
+effect is understated rather than flattered by drift. RAYON_NUM_THREADS=8, min-of-7, CPU idle
+85% verified by vmstat with iowait 0, loadavg 11.03/20.36/21.60 and 17.44/18.29/20.34, df 190G.
+
+BIT-EXACT WITHOUT AN ARGUMENT: a LIFETIME changed, not an operation. Nothing is reordered,
+recomputed, or read after the drop. 665 ft-kernel-cpu + 2580 ft-api + full ft-conformance pass.
+
+### THE vs-PyTorch ROW IS A CANDIDATE, NOT BANKED
+
+Board run on the same ELF `c6bc3e70...`, PyTorch 2.12.0+cpu co-process, threads=8:
+
+    conv2d_masked   FT 15.937 ms   PT 3.588 ms   4.44x SLOWER (min estimator 5.02x)
+    conv2d          FT  6.149 ms   PT 3.568 ms   1.72x SLOWER (min estimator 2.10x)
+
+**NOT QUOTABLE.** The invocation was LOAD-DRIFTED (load_1m 23.04 -> 34.58, series_gate DRIFTED)
+and both A/A nulls failed on both lanes. Parity `match` on both. Recorded only because the
+direction is worth knowing: item 128 banked conv2d_masked at 7.38-8.78x SLOWER with the FT arm
+at 20.1-21.9 ms, and this reads 4.44x with the arm at 15.9 ms. That is consistent with the
+arm-internal 1.6-2.0x, and it is **owed a quiet-window certification before any of it is
+banked**. A failure to certify under load is not a loss.
+
+### WHAT IT TOOK, WHICH IS THE POINT
+
+Five hypotheses were tested on this kernel: scaffolding (item 130, refuted), the column gate
+(item 134, refuted at 1.041x), GEMM shape (item 136, refuted), the GEMM attribution itself (item
+141 — the "79-82% GEMM" figure was a subtraction artefact; the GEMMs are 22%), and "something
+un-enumerated" (item 143, refuted by reading). **The fix is one line, and it was reachable only
+after four wrong answers were cleared away.** Every one of those four was arrived at by
+subtracting rather than measuring, or by reading rather than executing; the one that worked came
+from enumerating the function and finding that nothing was missing.
