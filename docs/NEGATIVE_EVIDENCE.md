@@ -28423,3 +28423,45 @@ commit message does not cover code that arrived by sweep.
 The in-situ engine-term measurement (`session − kernels` within one sweep, both arms in the
 same window) before any vs-PyTorch ratio is quoted for this. The arm-internal price above
 is not that number, and item 69's history is exactly why the distinction is worth keeping.
+
+### 103b. THE IN-SITU ENGINE TERM, MEASURED — AND WHY IT IS A CANDIDATE, NOT A ROW
+
+Paid the debt item 103 recorded as owed. `gauntlet_lane_sweep_h2h`, `--features fair-alloc`,
+`RAYON_NUM_THREADS=8`, incumbent PyTorch 2.12.0+cpu driven as a co-process in the SAME
+invocation, host thinkstation1 (Threadripper PRO 5975WX, x86_64+avx2, governor powersave,
+64 online CPUs), ELF sha256 `c76154f57e31973fd368c10ac8787a2ed73143d163442240271fda17181ed41b`.
+
+Engine term = the `group_norm_f32` session lane MINUS the `group_norm_f32_kernels` lane,
+taken WITHIN each sweep, which is item 69's estimator and subtracts the kernels on both sides:
+
+    run 1   session 6.904   kernels 4.717   engine 2.187 ms   load 14.31 -> 17.01,
+            cpu_mhz min 1429 median 2460 max 4114 spread 2.879x, drift PASS, series PASS
+    run 2   session 7.042   kernels 4.776   engine 2.266 ms   load 20.43 -> 23.74,
+            cpu_mhz min 1429 median 3229 max 4043 spread 2.829x, drift DRIFTED, series DRIFTED
+
+The engine term reproduces to 1.04x across two runs in two different load regimes, which is
+the useful part: item 69 left it at 5.45 ms (its w1/w2/w3 read 5.496/5.534/5.323), and it now
+reads 2.19-2.27 ms.
+
+**I AM NOT CLAIMING THAT 3.2 ms DROP.** The narrow was priced at 2.5 ms (8 threads, min-of-9),
+which would account for most of it — but a peer's uninit-output lever landed in the SAME
+session path between item 69 and this measurement, and this very board reports it as
+1.321x faster ON vs OFF on the `group_norm_f32` lane. Two levers landed in one term across
+two ELFs and two windows, so the term's movement is SHARED and cannot be split by
+subtraction after the fact. Attributing it to mine would be the cross-ELF before/after that
+item 69 explicitly refused to rest on. Splitting it needs a lever-off toggle for the narrow,
+measured paired in one binary; that is now the owed measurement, and it is a smaller debt
+than the one this item just paid.
+
+NEITHER RUN CERTIFIES, and neither is quoted as a vs-PyTorch row. Run 1 failed both A/A
+nulls on both group_norm lanes (incumbent 0.964/1.001, ours 0.967/0.977). Run 2 tripped the
+drift gate outright (`LOAD-DRIFTED — no row from this invocation is quotable, whatever its
+nulls say`). Per the standing rule, a failure to certify under load is not a loss; the
+window was busy with peer builds throughout and the standing group_norm row is unchanged
+until it is re-run quiet.
+
+What the two runs DO agree on, directionally and under a failing gate, is that the
+`group_norm_f32` session lane now reads 1.11-1.13x SLOWER than the incumbent (min estimator
+1.18x), against the 5.41x SLOWER item 69 started from and the ~1.7x it left. That is the
+campaign-level movement on 68pwz's GroupNorm half; it is NOT certified and must not be
+quoted as a banked row until it clears both nulls and drift in one quiet invocation.
