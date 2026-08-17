@@ -29260,3 +29260,68 @@ prediction is bandwidth — 28.3 MB of write-then-read replaced by 1.77 MB resid
 route item 110 measured at **2.7-2.9x SLOWER** than PyTorch, which is my worst standing and the
 reason this lever was chosen over adding more lanes. `conv3d_masked` is now the lane that can
 price it, and the paired before/after is owed in a quiet window.
+
+## 115. prelu IS CLEARED — ITS DENSE ROUTE CERTIFIES AT 1.73x FASTER, AND IT IS THE FIRST OP WHOSE REAL-LOSS ROUTE BEATS ITS SUM-LOSS ONE
+
+Item 111 left three sum-shortcuts with no dense measurement: `try_batch_norm1d`,
+`try_batch_norm2d_f32`, `try_prelu`. This clears prelu, and the result runs the opposite way to
+conv3d and the pools.
+
+### 115a. THE CERTIFIED ROW
+
+    prelu_dense   MIN 1.73x FASTER   ratio 1.733 [1.674,1.783]
+                  FT 24.341 ms   PT 42.939 ms   (PyTorch 2.12.0+cpu, same invocation)
+                  PT null 0.998 PASS   FT null 0.993 PASS   parity match
+                  drift PASS (load_1m 18.13 -> 17.53)
+                  loadavg 17.21 / 18.59 / 20.09 entering the run
+                  cpu_mhz min=1429 median=3208 max=4025 spread=2.817x
+                  CROSS-CORE SPREAD WHILE SAMPLING 2.805x / 2.829x / 2.890x
+                  RAYON_NUM_THREADS=8, 16 rounds, mimalloc, thinkstation1
+                  ELF 450a9cfd5fa07b7c...
+
+Replicated across three invocations at 1.753, 1.724 and 1.733 (spread 1.017x) before the one
+that nulled. The plain `prelu` lane also certified in the same window — **1.43x FASTER**, ratio
+1.432 [1.397,1.484], PT null 1.006 PASS, FT null 0.999 PASS.
+
+    lane               FT ms     PT ms    min-ratio   parity
+    prelu             11.444    17.387    1.43x F     match   CERTIFIED
+    prelu_dense       24.003    42.939    1.73x F     match   CERTIFIED
+    prelu_noshortcut  15.590    17.776    1.12x F     match   -
+
+### 115b. THE DIRECTION IS THE FINDING
+
+Every other op audited got WORSE on the real-loss route: conv3d 1.62x faster -> 2.74x slower,
+max_pool1d 1.11x faster -> 1.28x slower, max_pool3d 1.43x -> 2.01x slower. **prelu gets
+BETTER** — 1.43x faster -> 1.73x faster.
+
+The reason is visible in the incumbent's own arm. Squaring the loss cost PyTorch 17.387 ->
+42.939 ms, a factor of **2.47**, while it cost us 11.444 -> 24.341, a factor of **2.13**. Both
+arms pay for the extra elementwise multiply and its backward over 4.2M elements; we pay less.
+prelu's dense backward is elementwise and already parallel, so a non-uniform upstream costs it
+almost nothing beyond the multiply itself — whereas conv3d's generic route swaps an all-ones
+specialisation for two GEMMs and a scatter.
+
+**So "the dense route is worse" is not a law, it is a property of ops whose fast path removes
+real work.** An elementwise op has no such specialisation to lose. That is worth knowing before
+the remaining lanes are audited: expect the gap to appear where the shortcut collapses a
+reduction, not where it merely skips a buffer.
+
+### 115c. AND prelu's SHORTCUT PREDICATE IS CORRECT
+
+Parity reads `match` on all three prelu lanes, including the dense one. `try_prelu_sum_shortcut`
+declines when the upstream gradient is non-uniform, which is exactly what item 112's retraction
+established for `avg_pool2d` after I wrongly accused it — these shortcuts are keyed on the id of
+the node being summed, so `sum(mul(out, out))` cannot reach them. Two ops have now been checked
+against that reasoning by measurement rather than by argument.
+
+### 115d. SHORTCUT STATUS AFTER THIS ITEM
+
+    cleared by measurement    max_pool1d, max_pool3d, avg_pool2d, prelu, conv3d
+    covered by earlier twins  avg_pool1d (yc7ud), group_norm_f32 (103c/109/113)
+    STILL UNMEASURED          try_batch_norm1d, try_batch_norm2d_f32
+
+The last two are unmeasured for a different reason than the rest: **the board has no batch_norm
+lane at all**, so auditing them is not a registration but a new lane on both arms — input
+tensors, torch call, and a decision about which of BatchNorm's several f32/f64 entries the
+scorecard cares about. That is the remaining work on `frankentorch-mdsmm` and it is bigger than
+the five registrations that preceded it.

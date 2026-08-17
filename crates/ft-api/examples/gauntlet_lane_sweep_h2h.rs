@@ -561,7 +561,22 @@ fn timed_group_norm_f32_kernels_recomputing(
 /// usable for this — `backward` persists a retained gradient via
 /// `contiguous_values_as_f64()`, charging the control arm a 33 MiB copy that has
 /// nothing to do with the lever and would inflate the paired ratio.
-fn timed_prelu(values: &[f64], weight: &[f64], defeat_shortcut: bool) -> (f64, f64) {
+///
+/// `square_loss` selects the DENSE-route arm (frankentorch-mdsmm). `defeat_shortcut` disables
+/// the FUSION while leaving the upstream gradient uniform; `square_loss` instead makes the
+/// upstream gradient `2*out`, so `try_prelu_sum_shortcut`'s own predicate has to decline. Those
+/// are different questions and item 111 left the second one unmeasured for prelu.
+///
+/// Squaring is valid here because `tensor_prelu` returns the ELEMENTWISE output — the shortcut
+/// is applied later, inside `tensor_sum`. The `functional_*_sum` entries return an
+/// already-reduced scalar and must never be squared; confusing the two cost a retracted P0
+/// (NEGATIVE_EVIDENCE item 112).
+fn timed_prelu(
+    values: &[f64],
+    weight: &[f64],
+    defeat_shortcut: bool,
+    square_loss: bool,
+) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(values.to_vec(), vec![PR_N, PR_C, PR_W], true)
@@ -576,7 +591,12 @@ fn timed_prelu(values: &[f64], weight: &[f64], defeat_shortcut: bool) -> (f64, f
             .tensor_register_hook(out, |_grad| Ok(None))
             .expect("observation-only hook");
     }
-    let loss = session.tensor_sum(out).expect("sum");
+    let reduced = if square_loss {
+        session.tensor_mul(out, out).expect("square")
+    } else {
+        out
+    };
+    let loss = session.tensor_sum(reduced).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     let checksum = report
@@ -897,6 +917,9 @@ LANES = {
     # decline and restores the materialising path. PT(noshortcut)/PT(prelu) is
     # therefore a free control that must land near 1.0.
     "prelu_noshortcut": (prx, lambda x: Fn.prelu(x,prw)),
+    # frankentorch-mdsmm: prelu's DENSE-route incumbent twin. SQUARED here so this arm's loss is
+    # sum(out*out) and matches what the FT arm times, exactly as avg_pool1d_dense does it.
+    "prelu_dense": (prx, lambda x: Fn.prelu(x,prw)**2),
 }
 "#;
     let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
@@ -1232,14 +1255,22 @@ LANES = {
             "group_norm_f32_statskernels_recompute",
             Box::new(|| timed_group_norm_f32_kernels_inner(&gnx, &gnw, &gnb, true, false)),
         ),
-        ("prelu", Box::new(|| timed_prelu(&prx, &prw, false))),
+        ("prelu", Box::new(|| timed_prelu(&prx, &prw, false, false))),
+        (
+            // frankentorch-mdsmm: prelu's DENSE route. `prelu_noshortcut` defeats the fusion
+            // with a hook but keeps the upstream gradient uniform; this makes it `2*out`, so
+            // the shortcut's predicate must decline on its own. One of the three shortcuts
+            // item 111 left with no dense measurement.
+            "prelu_dense",
+            Box::new(|| timed_prelu(&prx, &prw, false, true)),
+        ),
         (
             // frankentorch-k1hto: the SAME lane with the PReLU+sum shortcut
             // declined. One binary, two arms against one live incumbent inside one
             // invocation, so the ratio-of-ratios against `prelu` is immune to the
             // host drift that makes cross-run ratios unquotable here.
             "prelu_noshortcut",
-            Box::new(|| timed_prelu(&prx, &prw, true)),
+            Box::new(|| timed_prelu(&prx, &prw, true, false)),
         ),
         (
             // frankentorch-lu3ht: the avg_pool2d forward is the ONE member of the
