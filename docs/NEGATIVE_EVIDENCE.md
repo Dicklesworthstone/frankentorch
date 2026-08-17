@@ -29051,3 +29051,77 @@ have twins from yc7ud and 103c. **Three remain with no dense lane and no evidenc
 guarded by a predicate, and this is the first demonstration on this codebase that one of those
 predicates is too loose. The remaining three should be assumed guilty until a dense lane says
 otherwise.
+
+## 112. I FILED A P0 WRONG-GRADIENT BUG THAT WAS MY OWN BROKEN LANE — RETRACTED WITHIN THE TURN
+
+Item 111 reported `avg_pool2d_dense` as the only parity MISMATCH on the board, established
+that torch matched an analytic derivation to `0.000e+00`, and filed `frankentorch-1mwwe` as a
+**P0 silently-wrong gradient in a shipped op**. That was wrong. The defect was in the lane I
+had just written. The bead is closed as invalid and the lane is fixed.
+
+### 112a. WHAT THE LANE ACTUALLY DID
+
+Its FT side called `functional_avg_pool2d_sum`, whose doc comment says, in the line directly
+above the signature: *"Fused scalar loss for `sum(avg_pool2d(input))`"*. **It returns the
+SCALAR.** `timed_op_sq` then squares whatever the closure returns, so:
+
+    FT computed      (sum(avg_pool2d(x)))^2
+    torch computed   sum(avg_pool2d(x)^2)
+
+Two different losses. Their gradients differ for the same reason `(a+b)^2 != a^2+b^2`, and
+nothing about FrankenTorch's pooling backward was involved. `max_pool1d_dense` and
+`max_pool3d_dense` were never affected — they call `functional_max_pool1d`/`max_pool3d`, which
+return tensors, which is exactly why those two read `match` while this one did not.
+
+Fixed by pointing the dense lane at `functional_avg_pool2d`, the tensor-returning entry. It now
+reads **`match`**, and behaves like its siblings: FT 1.451 -> 3.068 ms, 2.11x slower on the
+dense route, where before it was implausibly unchanged.
+
+### 112b. THE TWO ERRORS OF REASONING, NAMED
+
+**I asserted a mechanism I had not checked.** The bead claimed
+`try_avg_pool2d_sum_shortcut` fires on `sum(mul(out, out))`. It cannot: it is keyed on
+`avg_pool2d_sum_shortcuts.get(&input.0)` where `input` is the node being summed, and for
+`sum(mul(...))` that is the Mul node, which is never in the registry. Reading those four lines
+would have killed the bead before it was filed. I had even written down the rule — item 92's
+"prove which path executes" — one turn earlier.
+
+**I read my strongest corroboration backwards.** I called it a smoking gun that FT's dense
+lane did not slow down while torch's rose 1.70x. That observation was correct and its meaning
+was the opposite of what I claimed: *our arm did not slow down because it never left the fused
+scalar path*, i.e. the lane was not measuring what it said. A cross-arm disagreement plus "our
+arm is suspiciously fast" is the signature of a broken harness at least as often as a broken
+kernel, and I had that exact lesson banked from item 87's "audit your own instrument".
+
+### 112c. THE SEQUENCE ERROR, WHICH IS THE REAL LESSON
+
+The order was: see a MISMATCH, verify the INCUMBENT against an analytic truth, conclude our
+side is wrong, file P0. **Verifying the incumbent is not the same as verifying the
+comparison.** The analytic check proved torch computed `sum(pool(x)^2)` correctly; it said
+nothing about whether OUR arm was asked for the same quantity, and that is the question a
+MISMATCH actually raises first.
+
+**Before filing a parity defect against our own code, prove both arms were asked for the same
+thing.** For this board that means reading what the FT closure returns — a tensor or an
+already-reduced scalar — because `timed_op` and `timed_op_sq` accept either without complaint
+and only one of them is a valid loss to square.
+
+Cost: one P0 bead that would have pulled an agent onto a phantom, live for roughly twenty
+minutes. It was retracted by me, in the same turn, before anyone picked it up — which is the
+only part of this worth keeping.
+
+### 112d. THE AUDIT'S CORRECTED RESULT
+
+With the lane fixed, all three new dense lanes agree with torch and the finding is purely
+about speed:
+
+    op            plain (sum loss)    dense (real loss)
+    avg_pool2d    1.63x FASTER        1.26x FASTER
+    max_pool1d    1.11x FASTER        1.28x SLOWER      <- sign flip
+    max_pool3d    1.43x SLOWER        2.01x SLOWER
+
+None certified; the host sat at loadavg 16-30 and no row passed both nulls. **No wrong
+gradient was found anywhere.** Item 111's perf conclusions stand, its correctness claim does
+not, and its status table for the eight shortcuts should now read: `max_pool1d`, `max_pool3d`
+and `avg_pool2d` cleared by measurement, `avg_pool1d` and `group_norm_f32` covered by earlier
+twins, and `try_batch_norm1d`, `try_batch_norm2d_f32`, `try_prelu` still unmeasured.

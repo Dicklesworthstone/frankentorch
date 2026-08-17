@@ -1109,10 +1109,17 @@ LANES = {
         // already existed for exactly this — yc7ud built it for avg_pool1d and item 103c
         // used the same idea for group_norm — so these are registrations, not new machinery.
         (
+            // NOT `functional_avg_pool2d_sum` — that one is documented as the "fused scalar
+            // loss for sum(avg_pool2d(input))" and RETURNS THE SCALAR, so squaring it would
+            // time `(sum(pool(x)))^2` against torch's `sum(pool(x)^2)`: two different losses,
+            // disagreeing gradients, and a lane that never leaves the fused path it is
+            // supposed to avoid. That is exactly the mistake this lane shipped with for one
+            // commit; see NEGATIVE_EVIDENCE item 112. The plain lane above deliberately keeps
+            // the fused entry, because measuring it IS that lane's purpose.
             "avg_pool2d_dense",
             Box::new(|| {
                 timed_op_sq(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
-                    s.functional_avg_pool2d_sum(x, (2, 2), (2, 2), (0, 0), false, true)
+                    s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
                         .expect("avg_pool2d")
                 })
             }),
