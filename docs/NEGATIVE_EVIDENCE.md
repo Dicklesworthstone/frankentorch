@@ -27920,3 +27920,71 @@ exact arbiter, and both times the SHIPPING route was the one that turned out to 
 (w3pol in item 90, this in 95). A disagreement between two approximations says nothing about
 which is right, and reaching for a policy call at that moment ratifies whichever one happened
 to ship first.
+
+## 95. THE conv3d STREAMED FORWARD ZERO-FILLED ~30 MB PER CALL THAT IT THEN FULLY OVERWROTE
+
+Shipped in `42eb634a`. Small, certain, and bit-exact — banked mainly because the largest of
+the three buffers is invisible at a glance, and because of what item 90's re-gate did to
+this function's importance.
+
+### 95a. THE RE-GATE MADE THIS CODE HOT
+
+Before item 90, the scored lane's forward ran the DIRECT kernel and never touched
+`conv3d_forward_streamed_f64`. Capping the gate at `in_ch=8` moved the lane onto the
+streamed route — so a dead memset that had been costing the lane nothing was, from that
+commit onward, on its critical path. **Closing one gap can promote code that was previously
+unreachable into the hot path, and the new hot path has not been reviewed for the thing you
+just fixed elsewhere.** Worth doing deliberately after every re-route.
+
+### 95b. THE THREE BUFFERS
+
+    ptile     ~110 KB, allocated once PER TILE (~4 per thread), fully overwritten by the
+              copy_from_slice walk  ->  ~28 MB of dead memset per forward on the lane
+    out_flat  1 MB, overwritten by dgemm_bt
+    out       1 MB, written at every (idx, p) by the NHWCO->NCDHW transpose
+
+`ptile` is the one that matters and the one that looks harmless: it is only 110 KB *per
+allocation*, and the 28 MB only appears once you multiply by the tile count. This is the
+same buffer and the same size as the im2col panel measured at **1.29x** in item 70, and the
+mechanism is the one that probe established: `vec![0.0; n]` is nearly free from cold,
+because `alloc_zeroed` hands back lazily-mapped zero pages, and costs real time only when
+the allocator RECYCLES a dirty block and must memset it. **A per-tile allocation inside a
+hot parallel loop is precisely the recycling regime**, so this is the case where the
+zero-fill is real rather than notional.
+
+`out_flat` is safe for a reason that had to be CHECKED rather than inferred from the name:
+`dgemm_bt` passes `beta = 0.0` to the microkernel, so it overwrites C instead of
+accumulating into it. Had it accumulated, dropping the zero-fill would have been a silent
+correctness bug that no shape-independent test would reliably catch.
+
+### 95c. THE TEST, and why it is not bitwise
+
+`conv3d_streamed_forward_writes_every_uninitialized_slot` scores the forward against an
+independent naive convolution at four shapes.
+
+A bitwise reference is not available here and pretending otherwise would be the trap item 90
+named: a naive triple loop does NOT reproduce `matrixmultiply`'s blocked k-order, so
+demanding bit equality against one would fail for a reason unrelated to the change. The
+claim being tested is not "the bits are unchanged" — it is **"every slot is written"**, and
+for that a numeric comparison is the right instrument: leftover heap bytes do not land
+within 1e-11 of a convolution, and are usually NaN, inf, or wildly scaled. Finiteness is
+asserted first and separately because it is the symptom that localizes fastest.
+
+The shapes include `flat` values that do NOT divide evenly by the adaptive tile, so the
+SHORT FINAL TILE — the slot most likely to be skipped — is exercised rather than assumed.
+Strides 1 and 2 are both covered.
+
+Gate: `cargo test --release -p frankentorch-kernel-cpu conv`, worker vmi1153651, HEAD
+`65c65333` plus this change, **19 passed / 0 failed / 1 ignored** (18 before, +1 new).
+The FULL crate suite also ran green earlier in the same turn at `bb21691f`: **658 passed /
+0 failed / 2 ignored**, worker vmi1153651 — which clears the owed run item 93 recorded, and
+confirms the col2im rewrite and the peer's bidiag fix are green together.
+
+NO SPEED FIGURE IS CLAIMED. The dead-write volume is counted, not measured.
+
+Landed by filtered-hunk staging; a peer's new dweight test was in the same file and was
+dropped from the index rather than swept in. Notably that test —
+`conv3d_dweight_no_panel_vs_panel_gemm_scored_against_the_exact_sum` — is item 90's
+exact-reference technique being applied by its owner to the lever item 89 rejected. The
+technique transferred without being handed over, which is the point of banking a method and
+not just a result.

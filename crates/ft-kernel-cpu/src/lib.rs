@@ -13079,7 +13079,7 @@ fn conv3d_forward_streamed_f64(
     //
     // `out_flat` is safe for the same reason at one remove: `dgemm_bt` passes beta=0.0, so
     // it OVERWRITES C rather than accumulating into it. `out` is written at every (idx, p).
-    // NEGATIVE_EVIDENCE item 94; vein [[project_expand_uninit_firsttouch]].
+    // NEGATIVE_EVIDENCE item 95; vein [[project_expand_uninit_firsttouch]].
     let out_flat = build_uninit(flat * out_ch, |out_flat: &mut [f64]| {
         out_flat
             .par_chunks_mut(tile * out_ch)
@@ -46532,7 +46532,7 @@ mod tests {
     /// Every element of the streamed forward's three uninitialized buffers must be written.
     ///
     /// `conv3d_forward_streamed_f64` now takes `ptile`, `out_flat` and `out` from
-    /// `build_uninit` instead of `vec![0.0; _]` (NEGATIVE_EVIDENCE item 94). That is only
+    /// `build_uninit` instead of `vec![0.0; _]` (NEGATIVE_EVIDENCE item 95). That is only
     /// sound if the code writes every slot; a missed slot yields whatever the allocator
     /// last left there. A numeric comparison against an independent naive convolution is
     /// what catches that — leftover heap bytes do not land within 1e-11 of a convolution,
