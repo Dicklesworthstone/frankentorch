@@ -8740,14 +8740,41 @@ fn conv2d_backward_height1_ones_dout_f64(
         .enumerate()
         .for_each(|(c, dw)| {
             for (kc, slot) in dw.iter_mut().enumerate() {
-                let mut acc = 0.0f64;
+                // Same k-blocking as the 3x3 path and for the same reason
+                // (frankentorch-ikw6q): this replaces `dgemm(1, flat, patch_width, ones,
+                // panel)`, whose k is folded on `DGEMM_KC` boundaries. conv1d's height-1
+                // primitive was filed as "presumed to share the defect"; it does, and the
+                // test now covers it at a shape with `flat > DGEMM_KC` rather than
+                // presuming either way.
+                let mut total = 0.0f64;
+                let mut block = 0.0f64;
+                let mut in_block = 0usize;
+                let mut folded = false;
                 for n in 0..batch {
                     let base = (n * in_ch + c) * pw + kc;
                     for ox in 0..ow {
-                        acc += padded[base + ox * sw];
+                        block += padded[base + ox * sw];
+                        in_block += 1;
+                        if in_block == DGEMM_KC {
+                            if folded {
+                                total += block;
+                            } else {
+                                total = block;
+                                folded = true;
+                            }
+                            block = 0.0;
+                            in_block = 0;
+                        }
                     }
                 }
-                *slot = acc;
+                if in_block > 0 {
+                    if folded {
+                        total += block;
+                    } else {
+                        total = block;
+                    }
+                }
+                *slot = total;
             }
         });
 
@@ -8820,17 +8847,49 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
         .for_each(|(c, dwc)| {
             for kr in 0..kh {
                 for kc in 0..kw {
-                    let mut acc = 0.0f64;
+                    // FOLD ON THE GEMM's OWN BOUNDARIES (frankentorch-ikw6q). This
+                    // reduction replaces `dgemm(1, flat, patch_width, ones, panel)`, and
+                    // `dgemm` delegates to matrixmultiply, which BLOCKS k at `DGEMM_KC`.
+                    // A single ascending chain over `flat` is a DIFFERENT summation order
+                    // and diverges from the panel route once `flat > DGEMM_KC` — 104 of
+                    // 108 dweight entries differed at oh=ow=64. Blocking here reproduces
+                    // the GEMM's order exactly, so the "bit-exact vs panel+GEMM" claim
+                    // this path shipped with in 2026-07-05 becomes true rather than being
+                    // downgraded to a tolerance. `folded` keeps the FIRST block assigned
+                    // rather than added into 0.0, so a `-0.0` first block is not
+                    // canonicalised to `+0.0` (frankentorch-dtyiz).
+                    let mut total = 0.0f64;
+                    let mut block = 0.0f64;
+                    let mut in_block = 0usize;
+                    let mut folded = false;
                     for n in 0..batch {
                         let ch_off = (n * in_ch + c) * ph * pw;
                         for oy in 0..oh {
                             let irow = ch_off + (oy + kr) * pw + kc;
                             for ox in 0..ow {
-                                acc += padded[irow + ox];
+                                block += padded[irow + ox];
+                                in_block += 1;
+                                if in_block == DGEMM_KC {
+                                    if folded {
+                                        total += block;
+                                    } else {
+                                        total = block;
+                                        folded = true;
+                                    }
+                                    block = 0.0;
+                                    in_block = 0;
+                                }
                             }
                         }
                     }
-                    dwc[kr * kw + kc] = acc;
+                    if in_block > 0 {
+                        if folded {
+                            total += block;
+                        } else {
+                            total = block;
+                        }
+                    }
+                    dwc[kr * kw + kc] = total;
                 }
             }
         });
@@ -41138,6 +41197,97 @@ mod tests {
             );
         }
         assert_eq!(got_db.unwrap(), want_db);
+    }
+
+    /// frankentorch-ikw6q: the no-panel conv2d/conv1d dweight must be BIT-EXACT to the
+    /// panel+GEMM route it replaced, at shapes that can actually tell them apart.
+    ///
+    /// WHY THE OLD PROOFS COULD NOT SEE THE BUG. Both existing fast-path tests run at
+    /// `flat = 30` and `flat = 60` — inside ONE `DGEMM_KC` block, which is exactly the case
+    /// where a single ascending accumulation chain and a k-blocked one CANNOT differ. The
+    /// paths shipped 2026-07-05 and 2026-07-09 recorded as "bit-exact vs im2col+dgemm", and
+    /// at the real shape `[2,3,4] oh=ow=64` (flat = 8192 = 32 blocks) 104 of 108 dweight
+    /// entries actually differed. The claim was false, not the code — and the fix is to make
+    /// the claim true rather than to widen the old tests' shapes until they pass.
+    ///
+    /// So every case here has `flat > DGEMM_KC`, and the set straddles the block boundary:
+    /// an exact multiple, a non-multiple with a ragged tail, and a strided height-1 shape so
+    /// conv1d's primitive is covered by measurement rather than by the bead's presumption.
+    /// A sub-block case is kept as the control that the blocking did not change the
+    /// single-block answer.
+    #[test]
+    fn conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise() {
+        // batch, in_ch, ph, pw, kh, kw, sh, sw
+        let cases: &[(usize, usize, usize, usize, usize, usize, usize, usize)] = &[
+            // the bead's repro: oh = ow = 64, flat = 2*64*64 = 8192 = 32 * DGEMM_KC
+            (2, 3, 66, 66, 3, 3, 1, 1),
+            // flat = 2*30*30 = 1800, NOT a multiple of 256 (ragged tail)
+            (2, 3, 32, 32, 3, 3, 1, 1),
+            // height-1 (conv1d's primitive), strided, flat = 4*300 = 1200
+            (4, 2, 1, 605, 1, 5, 1, 2),
+            // control: flat = 30, inside ONE block — the regime the old proofs used
+            (2, 3, 7, 8, 3, 3, 1, 1),
+        ];
+
+        for &(batch, in_ch, ph, pw, kh, kw, sh, sw) in cases {
+            let out_ch = 4usize;
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_width = in_ch * kh * kw;
+            let flat = batch * oh * ow;
+
+            let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i as f64 * 0.037).sin() * 0.7 + (i % 13) as f64 * 0.011 - 0.4) / 1024.0)
+                .collect();
+            let weight_flat: Vec<f64> = (0..out_ch * patch_width)
+                .map(|i| ((i as f64 * 0.041).cos() * 0.5) / 1024.0)
+                .collect();
+
+            // The reference: exactly what the kernel used to do before the fast paths.
+            let panel =
+                super::conv2d_im2col_f64(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+            let ones_flat = vec![1.0f64; flat];
+            let mut want_row = vec![0.0f64; patch_width];
+            super::gemm::dgemm(1, flat, patch_width, &ones_flat, &panel, &mut want_row);
+
+            let dout = vec![1.0f64; batch * out_ch * oh * ow];
+            let (_, got_dw, _) = super::conv2d_backward_f64(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
+            );
+
+            assert!(
+                flat > super::DGEMM_KC || ph == 7,
+                "every case but the control must exceed one k block (flat={flat})"
+            );
+            assert_eq!(got_dw.len(), out_ch * patch_width);
+            for oc in 0..out_ch {
+                let row = &got_dw[oc * patch_width..(oc + 1) * patch_width];
+                for (j, (&g, &w)) in row.iter().zip(want_row.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "dweight[oc={oc}][{j}] moved at batch={batch} in_ch={in_ch} \
+                         ph={ph} pw={pw} kh={kh} kw={kw} flat={flat} (DGEMM_KC={}): \
+                         no-panel {g:e} vs panel+GEMM {w:e}",
+                        super::DGEMM_KC
+                    );
+                }
+            }
+        }
     }
 
     #[test]

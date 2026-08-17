@@ -28588,3 +28588,53 @@ be visible at all" — and it was filed as its own bead precisely so the rest of
 surface would get checked. That check had not reached here. Before pricing any grad lever,
 run the sentinel: `narrow_counts()`-style execution evidence costs one relaxed atomic and
 settles in one run what source reading got wrong twice.
+
+## 104. ikw6q's FALSE BIT-EXACT CLAIM IS NOW TRUE — conv2d/conv1d FOLD ON THE GEMM's k BOUNDARIES, AND THE OLD PROOFS COULD NOT HAVE SEEN THE BUG
+
+`frankentorch-ikw6q`, closed by making the claim true rather than by conceding a tolerance.
+
+THE BUG, AS FILED. `conv2d_backward_3x3_stride1_ones_dout_f64` (2026-07-05) and
+`conv2d_backward_height1_ones_dout_f64` (2026-07-09, conv1d's primitive) each shipped
+recorded as "bit-exact vs im2col+dgemm_tb+dgemm+col2im reference". Both compute dweight as a
+SINGLE ascending accumulation chain over `flat`. `dgemm` delegates to matrixmultiply, which
+BLOCKS k at `DGEMM_KC = 256`. Two different summation orders, so they cannot agree once
+`flat > 256`.
+
+WHY BOTH PROOFS PASSED ANYWAY, which is the part worth carrying. The 3x3 proof runs at
+`flat = 60` and the height-1 proof at `flat = 30` — both inside ONE k block, the one regime
+in which a single chain and a blocked chain are IDENTICAL. The tests were not weak in
+general; they were blind to exactly the property they were named for. **A test that pins a
+blocking-sensitive claim has to run at a shape larger than the block, or it is testing the
+degenerate case.**
+
+REPRODUCED EXACTLY BEFORE FIXING. Reverting the reduction to its shipped form reproduces the
+bead's reported divergence to the last digit, at the bead's own shape:
+
+    dweight[oc=0][0] at batch=2 in_ch=3 ph=pw=66 kh=kw=3, flat=8192 (=32*DGEMM_KC)
+      no-panel      -2.65639706510564e0
+      panel+GEMM    -2.656397065105646e0
+
+That is the value `frankentorch-ikw6q` cited from an independent probe, recovered here from
+the opposite direction, so the defect this fixes is the defect that was filed.
+
+THE FIX is item 97's partition applied unchanged: accumulate into a block, fold into the
+total every `DGEMM_KC` elements, with a `folded` flag so the FIRST block is assigned rather
+than added into `0.0` (otherwise a `-0.0` first block is canonicalised to `+0.0`,
+frankentorch-dtyiz). Identical in both conv2d paths to the conv3d one item 98 landed. This is
+the (b) branch of the bead's two options; the (a) branch — ratify a tolerance and correct the
+two ledger entries — is not needed, because the exact order is reproducible from outside.
+
+CONV1D WAS PRESUMED, AND THE PRESUMPTION WAS RIGHT. The bead recorded the height-1 primitive
+as "presumed to share the defect; not yet probed". It does. It is now covered by measurement
+at a strided shape with `flat = 1200`, not by presumption in either direction.
+
+THE NEW PROOF straddles the boundary deliberately: `flat = 8192` (an exact multiple of the
+block), `flat = 1800` (a ragged tail), `flat = 1200` (height-1, strided), and `flat = 30`
+retained as the control that blocking did not change the single-block answer. Verified
+load-bearing by reverting the reduction and watching it fail; passes on restore. 665
+ft-kernel-cpu tests, 2580 ft-api tests and the full ft-conformance suite all pass, so no
+golden had pinned the wrong values.
+
+NOT MEASURED: this turn is under a no-certify instruction, and the change is a summation
+ORDER change with no expected perf effect in either direction — the same element count, the
+same single pass, one extra add per 256. No ratio is claimed and none was taken.
