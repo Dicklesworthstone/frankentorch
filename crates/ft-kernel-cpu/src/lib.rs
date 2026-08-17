@@ -13598,8 +13598,6 @@ pub fn conv3d_backward_f64(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 /// `matrixmultiply`'s f64 k-block width (`archparam::D_KC`), which `gemm::dgemm` inherits.
 ///
 /// It is a PRIVATE constant of a dependency — `conf_env_or_default!("MATMUL_DGEMM_KC", 256)`
@@ -13610,6 +13608,7 @@ pub fn conv3d_backward_f64(
 /// and fails loudly if they ever diverge. NEGATIVE_EVIDENCE item 97.
 const DGEMM_KC: usize = 256;
 
+#[allow(clippy::too_many_arguments)]
 fn conv3d_backward_ones_dout_f64(
     padded: &[f64],
     weight_flat: &[f64],
@@ -29051,7 +29050,7 @@ mod bidiag {
             return 0.0;
         }
 
-        if tmax >= SAFE_LO && tmax <= SAFE_HI {
+        if (SAFE_LO..=SAFE_HI).contains(&tmax) {
             let mut tail_sq = 0.0f64;
             for k in 1..len {
                 let value = a[start + k * stride];
@@ -46985,6 +46984,77 @@ mod tests {
     /// This test is also the guard on `DGEMM_KC`: it compares against the REAL GEMM, so if a
     /// `cargo update` changes matrixmultiply's private `MATMUL_DGEMM_KC` the comparison
     /// fails here rather than silently shifting gradients. frankentorch-l2zki.
+    /// `frankentorch-ga99y`'s HEADLINE cell, at the public API rather than inside the
+    /// reduction: **Vh's rows must be orthonormal for a rank-deficient matrix at tiny scale.**
+    ///
+    /// The bead is titled "Vh rows lose orthonormality (1.8e-2) on a rank-deficient matrix at
+    /// tiny scale, while U stays clean", and its failing cell is rank 2 of 64 at scale 1e-20,
+    /// measured through `svd_contiguous_f64`. Everything I proved while fixing it —
+    /// `tau*(v^T v) == 2`, and P's orthonormality leaving both reductions — is one level down.
+    /// A bead closes on its own named probe, not on a proxy for it, so this pins the cell the
+    /// bead actually names.
+    ///
+    /// Full rank at the same scale is carried as an in-test CONTROL: the bead established that
+    /// the defect needs BOTH rank deficiency and tiny scale (full-rank at 1e-20 was already
+    /// clean at 9.5e-15), so a run where the control also moved would mean something else
+    /// broke and this assertion is not measuring what it claims.
+    ///
+    /// Fixture copied from `svd_scale_probe`'s sweep so the cell is the same one the bead
+    /// reported: `rank` independent columns, the rest repeating them cyclically, then scaled.
+    #[test]
+    fn svd_vh_rows_stay_orthonormal_for_a_rank_deficient_matrix_at_tiny_scale() {
+        let n = 64usize;
+        let build = |rank: usize, scale: f64| -> Vec<f64> {
+            let mut z = 0x51ca_7e51_ca7e_u64;
+            let mut base = vec![0.0f64; n * n];
+            for row in 0..n {
+                for col in 0..n {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    #[allow(clippy::cast_precision_loss)]
+                    let v = ((z >> 11) as f64) / ((1u64 << 53) as f64) - 0.5;
+                    base[row * n + col] = if col < rank {
+                        v
+                    } else {
+                        base[row * n + (col % rank)]
+                    };
+                }
+            }
+            base.iter().map(|v| v * scale).collect()
+        };
+
+        let ortho_of = |a: &[f64]| -> f64 {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let r = super::svd_contiguous_f64(a, &meta, false).expect("svd");
+            super::svd_rows_orthogonality_error(&r.vh, r.k, r.n)
+        };
+
+        let deficient = ortho_of(&build(2, 1e-20));
+        let full_rank = ortho_of(&build(64, 1e-20));
+        let deficient_unit = ortho_of(&build(2, 1.0));
+
+        println!(
+            "ga99y headline: rank2@1e-20 orthoV {deficient:.3e} (bead reported 1.839e-2), \
+             rank64@1e-20 {full_rank:.3e}, rank2@1e0 {deficient_unit:.3e}"
+        );
+
+        assert!(
+            full_rank < 1e-9,
+            "the full-rank control moved to {full_rank:.3e} -- something other than ga99y \
+             is wrong and the assertion below is not measuring what it claims"
+        );
+        assert!(
+            deficient_unit < 1e-9,
+            "rank-deficient at UNIT scale moved to {deficient_unit:.3e}"
+        );
+        assert!(
+            deficient < 1e-9,
+            "ga99y REGRESSED: Vh rows at rank 2 / scale 1e-20 deviate by {deficient:.3e}; \
+             the bead reported 1.839e-2 before the house_gen_strided_f64 safmin rescale"
+        );
+    }
+
     #[test]
     fn conv3d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise() {
         let cases: &[(

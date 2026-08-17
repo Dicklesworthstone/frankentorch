@@ -213,9 +213,7 @@ fn main() {
     dump(&dir, "weight.f64", &weight_stream);
     dump(&dir, "out_stream.f64", &out_stream);
     dump(&dir, "out_direct.f64", &out_direct);
-    let shape = format!(
-        "{BATCH} {IN_CH} {pd} {ph} {pw} {OUT_CH_STREAM} {K} {od} {oh} {ow}\n"
-    );
+    let shape = format!("{BATCH} {IN_CH} {pd} {ph} {pw} {OUT_CH_STREAM} {K} {od} {oh} {ow}\n");
     std::fs::write(format!("{dir}/shape.txt"), shape).expect("write shape");
 
     println!();

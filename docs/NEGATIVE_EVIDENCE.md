@@ -28253,3 +28253,52 @@ into a commit whose message does not describe it, and its author's gate line ("1
 tests green") was measured BEFORE my hunks arrived, so that number does not cover this code.
 **A gate is only evidence for the tree it actually ran on** — the same lesson as item 92,
 arriving from the other direction.
+
+## 102. ga99y IS CLOSED ON ITS OWN HEADLINE CELL — Vh ORTHONORMALITY 1.839e-2 -> 2.665e-15, WITH BOTH CONTROLS HELD
+
+The safmin rescale landed in `2683f7fb` and everything proved about it since has been one
+level below the bug as filed: `tau*(v^T v) == 2` for the reflectors, and P's orthonormality
+leaving both reductions. **A bead closes on the probe it names, not on a proxy for it**, and
+`frankentorch-ga99y` names Vh, measured through `svd_contiguous_f64`. Pinned here:
+
+    ga99y headline (rank 2 of 64, n=64, scale 1e-20, via the public SVD):
+        Vh row orthogonality   2.665e-15    (the bead reported 1.839e-2)
+        full-rank @ 1e-20      5.773e-15    CONTROL
+        rank 2 @ unit scale    4.441e-16    CONTROL
+
+Both controls are asserted, not just printed. The bead established that the defect needed
+BOTH rank deficiency and tiny scale — full rank at 1e-20 was already clean at 9.5e-15 — so a
+run where a control also moved would mean something else broke and the headline assertion
+would not be measuring what it claims. That is the difference between a regression test and
+a number that happens to be small.
+
+### 102a. THE FULL EVIDENCE THIS CLOSES ON
+
+    named probe   tau*(v^T v) == 2 at rank 2 / scale 1e-20    1.422e-8 -> 5.329e-15, asserted
+    reduction     unblocked |P P^T - I|                       1.644e-8 -> 2.554e-15, asserted
+                  blocked   |P P^T - I|                       1.113e-2 -> 1.887e-15, asserted
+    headline      Vh rows, public API, the bead's own cell    1.839e-2 -> 2.665e-15, asserted
+    suites        ft-kernel-cpu 662 / ft-api lib 2580 / ft-conformance 203
+                  3445 tests, 0 failures
+
+### 102b. AND THE SIXTH HYPOTHESIS WAS THE RIGHT ONE ALL ALONG
+
+The bead retired six mechanisms. The sixth — `house_gen_strided_f64` omitting `dlarfg`'s
+safmin rescaling — was retired "by arithmetic, no build spent", on the grounds that ga99y
+works at 1e-20 while the guard needs 1e-292 and squares only underflow below 1.49e-154.
+**That arithmetic was right about the constants and wrong about the operand.** It used the
+INPUT scale; the reduction does not stay at the input scale. By P reflector i=18 the
+generator sees alpha = -1.1196e-158 and beta = 5.4006e-158, whose squares are ~1e-316 —
+subnormal — and the tail norm loses half its mantissa before `sqrt` halves the error
+exponent again, which is the sqrt(eps) signature the bead had already spotted and called a
+lead.
+
+So `frankentorch-i3nqm`, filed as a separate latent divergence "below ~1e-154", was never
+separate and was never latent: it is this bug, and fixing it fixed this. Commented there
+rather than closed, since it is not mine to close.
+
+**The transferable rule: an exclusion argument that reasons about magnitudes must use the
+magnitudes the code will actually SEE, not the ones the caller passed in.** An iterative
+reduction, a normalization, a deflation — any of them can move an operand hundreds of orders
+of magnitude away from the input, and every "cannot be reached at this scale" argument about
+such a routine is invalid unless it names where in the iteration it is evaluating.

@@ -128,6 +128,71 @@ fn widen_f32_to_f64(values: &[f32]) -> Vec<f64> {
     values.par_iter().map(|&v| f64::from(v)).collect()
 }
 
+/// Element count at or above which narrowing the tape's f64 gradient to an f32 kernel's
+/// input is worth a rayon fork/join — `frankentorch-68pwz`.
+///
+/// FOUR TIMES the widen's gate, and measured separately rather than inherited from it
+/// (`examples/gradient_narrow_probe.rs`, min-of-9). The crossover is WIDTH-DEPENDENT, so
+/// the constant is the first size measured to win at BOTH the 64-thread default pool and
+/// the 8-thread budget the h2h board certifies at:
+///
+///     numel        8 threads   64 threads
+///     1 048 576        1.28x        0.23x   <- the widen's gate; a 4.3x LOSS at 64
+///     2 097 152        2.28x        0.70x   <- still a loss at 64
+///     4 194 304        3.49x        1.44x   <- first size winning at both
+///     6 422 528        2.84x        1.68x   (the scored [32,64,56,56] lane)
+///
+/// WHY IT IS NOT THE WIDEN'S 1<<20. A widen reads 4 bytes and writes 8; a narrow reads 8
+/// and writes 4. First-touching the fresh output allocation is the expensive half, so at
+/// equal element counts the widen does ~6.5x more serial work (26.3 ms vs 3.9 ms at
+/// 6.4M) and amortizes the same fork/join over far more of it. Re-using the widen's
+/// constant here would have shipped a measured 4.3x pessimization on the default pool.
+const GRADIENT_NARROW_PARALLEL_MIN: usize = 1 << 22;
+
+/// The narrow's gate must stay ABOVE the widen's — enforced at COMPILE time.
+///
+/// A gate guard, not a style assertion. The two constants look redundant and are exactly
+/// what a later cleanup folds into one; the table above is the measured reason they
+/// differ, and running the narrow at the widen's `1 << 20` was observed at **0.23x on the
+/// 64-thread default pool** — a 4.3x pessimization — while the widen is 1.89x there.
+///
+/// Deletion condition: when no numel-scaled `narrow_f64_to_f32` call site remains.
+const _: () = assert!(
+    GRADIENT_NARROW_PARALLEL_MIN > GRADIENT_WIDEN_PARALLEL_MIN,
+    "a narrow reads 8 bytes and writes 4, so it amortizes a fork/join over ~6.5x less \
+     serial work than a widen and needs a HIGHER gate; folding the two constants together \
+     ships a measured 4.3x pessimization at 64 threads"
+);
+
+/// Narrow the tape's f64 gradient to f32 for an f32 kernel, in parallel once it is large
+/// enough to pay for the join.
+///
+/// WHY THIS EXISTS. Item 69 priced and removed the serial f32 -> f64 widen on the way OUT
+/// of the f32 norm backward closures. Each of those closures opens with the MIRROR of that
+/// line on the way IN — `grad_outputs[0].iter().map(|&v| v as f32).collect()` — over the
+/// same one-element-per-input buffer, so there were always TWO serial numel-scaled
+/// materializations and item 69 removed one. For the scored `[32,64,56,56]` lane the
+/// narrow is 6,422,528 values costing **3.9 ms** serially, against an engine term that
+/// item 69 had already cut to 5.45 ms.
+///
+/// Item 69's follow-up sweep missed this because it grepped `f64::from`, and every
+/// conversion in these closures is spelled `v as f32` / `v as f64`.
+///
+/// BIT-EXACT UNDER SPLITTING, which is a weaker claim than the widen's and the right one:
+/// f64 -> f32 does round, so it is not value-preserving. But each output depends on
+/// exactly one input and on nothing else, so partitioning the range cannot change a
+/// single bit of the result. That is asserted in `narrow_f64_to_f32_matches_serial_bitwise`
+/// over subnormals, both infinities, NaN, f32-overflow and round-to-nearest-even ties,
+/// rather than assumed.
+#[allow(clippy::cast_possible_truncation)]
+fn narrow_f64_to_f32(values: &[f64]) -> Vec<f32> {
+    if values.len() < GRADIENT_NARROW_PARALLEL_MIN {
+        return values.iter().map(|&v| v as f32).collect();
+    }
+    use rayon::prelude::*;
+    values.par_iter().map(|&v| v as f32).collect()
+}
+
 #[derive(Clone, Copy)]
 struct ConvTransposeOutputDimSpec {
     input: usize,
@@ -37121,7 +37186,7 @@ impl FrankenTorchSession {
                             Ok((out, ishape.clone()))
                         },
                         move |_ctx, grad_outputs, borrowed| {
-                            let dy: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            let dy = narrow_f64_to_f32(grad_outputs[0]);
                             let (dx, dw, db) = ft_kernel_cpu::layer_norm_backward_f32(
                                 &dy,
                                 borrowed[0].0,
@@ -37131,9 +37196,11 @@ impl FrankenTorchSession {
                                 eps_f,
                             );
                             Ok(vec![
-                                Some(dx.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dw.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(db.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                                // dx is numel-scaled and crosses both gates; dw/db are
+                                // normalized-shape-sized and stay serial through them.
+                                Some(widen_f32_to_f64(&dx)),
+                                Some(widen_f32_to_f64(&dw)),
+                                Some(widen_f32_to_f64(&db)),
                             ])
                         },
                         // create_graph backward: cast F32 inputs to the F64
@@ -37504,16 +37571,16 @@ impl FrankenTorchSession {
                         Ok((out, ishape.clone()))
                     },
                     move |_ctx, grad_outputs, borrowed| {
-                        let dy: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                        let dy = narrow_f64_to_f32(grad_outputs[0]);
                         let xv = borrowed[0].0;
                         let wv = if has_w { Some(borrowed[1].0) } else { None };
                         let (dx, dw) =
                             ft_kernel_cpu::rms_norm_backward_f32(&dy, xv, wv, bn, nn, eps_f);
-                        let mut g = vec![Some(dx.iter().map(|&v| v as f64).collect::<Vec<f64>>())];
+                        // dx is numel-scaled and crosses both gates; dw is
+                        // normalized-shape-sized and stays serial through them.
+                        let mut g = vec![Some(widen_f32_to_f64(&dx))];
                         if has_w {
-                            g.push(Some(
-                                dw.unwrap().iter().map(|&v| v as f64).collect::<Vec<f64>>(),
-                            ));
+                            g.push(Some(widen_f32_to_f64(&dw.unwrap())));
                         }
                         Ok(g)
                     },
@@ -38516,7 +38583,7 @@ impl FrankenTorchSession {
                             Ok((out, ishape.clone()))
                         },
                         move |_ctx, grad_outputs, borrowed| {
-                            let dy: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            let dy = narrow_f64_to_f32(grad_outputs[0]);
                             let (dx, dw, db) = ft_kernel_cpu::group_norm_backward_f32(
                                 &dy,
                                 borrowed[0].0,
@@ -38528,9 +38595,11 @@ impl FrankenTorchSession {
                                 eps_f,
                             );
                             Ok(vec![
-                                Some(dx.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dw.unwrap().iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(db.unwrap().iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                                // dx is numel-scaled and crosses both gates; dw/db are
+                                // per-channel and stay serial through them.
+                                Some(widen_f32_to_f64(&dx)),
+                                Some(widen_f32_to_f64(&dw.unwrap())),
+                                Some(widen_f32_to_f64(&db.unwrap())),
                             ])
                         },
                         move |ctx, grad_outs, fn_inputs, tape| {
@@ -39195,7 +39264,7 @@ impl FrankenTorchSession {
                             Ok((out, ishape.clone()))
                         },
                         move |_ctx, grad_outputs, borrowed| {
-                            let dy: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            let dy = narrow_f64_to_f32(grad_outputs[0]);
                             let (dx, dw, db) = ft_kernel_cpu::batch_norm_backward_f32(
                                 &dy,
                                 borrowed[0].0,
@@ -39208,9 +39277,11 @@ impl FrankenTorchSession {
                                 eps32,
                             );
                             Ok(vec![
-                                Some(dx.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dw.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(db.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                                // dx is numel-scaled and crosses both gates; dw/db are
+                                // per-channel and stay serial through them.
+                                Some(widen_f32_to_f64(&dx)),
+                                Some(widen_f32_to_f64(&dw)),
+                                Some(widen_f32_to_f64(&db)),
                             ])
                         },
                     )?;
@@ -144701,6 +144772,93 @@ mod tests {
                     g.to_bits(),
                     w.to_bits(),
                     "widen diverged at index {index} of {len}"
+                );
+            }
+        }
+    }
+
+    /// frankentorch-68pwz: `narrow_f64_to_f32` parallelises the f64->f32 gradient
+    /// materialization on the way INTO the f32 norm kernels, above
+    /// `GRADIENT_NARROW_PARALLEL_MIN`.
+    ///
+    /// TWO SEPARATE OBLIGATIONS, because passing only the first is the trap here.
+    ///
+    /// 1. SPLITTING IS BIT-EXACT. Unlike the widen, this direction ROUNDS, so it is not
+    ///    value-preserving; what makes it safe to parallelise is only that each output
+    ///    depends on exactly one input. Both sides of the gate are exercised and compared
+    ///    against the serial form the change replaced.
+    ///
+    /// 2. THE CAST SEMANTICS ARE THE ONES `v as f32` HAD. Obligation 1 alone is satisfied
+    ///    by ANY elementwise function — a saturating cast, a truncating one, or one that
+    ///    flushes subnormals would all keep serial and parallel agreeing with each other
+    ///    while silently changing every gradient that reaches an f32 norm kernel. So the
+    ///    overflow, underflow, tie-breaking and NaN cases are pinned against the IEEE
+    ///    behaviour directly, not just against each other.
+    #[test]
+    fn narrow_f64_to_f32_matches_serial_bitwise() {
+        #[allow(clippy::cast_possible_truncation)]
+        fn serial(values: &[f64]) -> Vec<f32> {
+            values.iter().map(|&v| v as f32).collect()
+        }
+
+        // (2) Semantics first: these are the cases a plausible-but-wrong replacement gets
+        // wrong, and they are checked against the required answer, not against a twin.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            // Overflow saturates to infinity, NOT to f32::MAX.
+            assert_eq!((f64::MAX as f32).to_bits(), f32::INFINITY.to_bits());
+            assert_eq!((-f64::MAX as f32).to_bits(), f32::NEG_INFINITY.to_bits());
+            // Underflow below the smallest subnormal goes to +0.0, keeping the sign.
+            assert_eq!((f64::MIN_POSITIVE as f32).to_bits(), 0.0f32.to_bits());
+            assert_eq!((-f64::MIN_POSITIVE as f32).to_bits(), (-0.0f32).to_bits());
+            // Subnormal f32s survive rather than being flushed to zero.
+            let sub = f64::from(f32::MIN_POSITIVE) / 2.0;
+            assert_eq!((sub as f32).to_bits(), (f32::MIN_POSITIVE * 0.5).to_bits());
+            assert!(sub as f32 != 0.0, "subnormals must not be flushed");
+            // Round-to-nearest-EVEN on an exact tie, not round-half-away-from-zero:
+            // 1 + eps/2 is exactly between 1.0 and 1.0+eps, so it must land on 1.0.
+            let tie = 1.0f64 + f64::from(f32::EPSILON) / 2.0;
+            assert_eq!((tie as f32).to_bits(), 1.0f32.to_bits());
+            // -0.0 keeps its sign bit.
+            assert_eq!((-0.0f64 as f32).to_bits(), (-0.0f32).to_bits());
+        }
+
+        // (1) Straddle the gate deliberately: below, exactly at, and above.
+        for &len in &[
+            0usize,
+            1,
+            1_023,
+            super::GRADIENT_NARROW_PARALLEL_MIN - 1,
+            super::GRADIENT_NARROW_PARALLEL_MIN,
+            super::GRADIENT_NARROW_PARALLEL_MIN + 12_345,
+        ] {
+            let values: Vec<f64> = (0..len)
+                .map(|index| {
+                    // Every class the narrow has to get right, cycled so that each one
+                    // lands on both sides of every rayon split boundary.
+                    match index % 11 {
+                        0 => f64::from(f32::MIN_POSITIVE) / 2.0, // f32 subnormal
+                        1 => -0.0,
+                        2 => f64::INFINITY,
+                        3 => f64::NEG_INFINITY,
+                        4 => f64::NAN,
+                        5 => f64::MAX,          // overflows f32 -> +inf
+                        6 => -f64::MAX,         // overflows f32 -> -inf
+                        7 => f64::MIN_POSITIVE, // underflows f32 -> +0.0
+                        8 => 1.0 + f64::from(f32::EPSILON) / 2.0, // exact tie
+                        9 => f64::from(f32::MAX),
+                        _ => ((index % 9973) as f64) * 0.000_37 - 1.5,
+                    }
+                })
+                .collect();
+            let got = super::narrow_f64_to_f32(&values);
+            let want = serial(&values);
+            assert_eq!(got.len(), want.len(), "len mismatch at {len}");
+            for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "narrow diverged at index {index} of {len}"
                 );
             }
         }

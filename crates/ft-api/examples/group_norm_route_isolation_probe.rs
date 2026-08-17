@@ -42,7 +42,12 @@ const EPS: f32 = 1e-5;
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|raw| raw.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+        .map(|raw| {
+            raw.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| "unavailable".to_owned())
 }
 
@@ -107,17 +112,44 @@ fn main() {
     // that component reads the same in both, and this one now does.
     {
         let (out, stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
-            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, spatial, EPS,
+            &x,
+            Some(&weight),
+            Some(&bias),
+            GN_N,
+            GN_GROUPS,
+            spatial,
+            EPS,
         );
         std::hint::black_box(&out);
         let _ = ft_kernel_cpu::group_norm_backward_scalar_f32_with_cpg2_stats(
-            1.0f32, &x, Some(&weight), &stats, GN_N, GN_GROUPS, spatial,
+            1.0f32,
+            &x,
+            Some(&weight),
+            &stats,
+            GN_N,
+            GN_GROUPS,
+            spatial,
         );
         let _ = ft_kernel_cpu::group_norm_backward_scalar_f32(
-            1.0f32, &x, Some(&weight), GN_N, GN_GROUPS, cpg, spatial, EPS,
+            1.0f32,
+            &x,
+            Some(&weight),
+            GN_N,
+            GN_GROUPS,
+            cpg,
+            spatial,
+            EPS,
         );
         let out = ft_kernel_cpu::group_norm_forward_f32_scheduled(
-            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, cpg, spatial, EPS, true,
+            &x,
+            Some(&weight),
+            Some(&bias),
+            GN_N,
+            GN_GROUPS,
+            cpg,
+            spatial,
+            EPS,
+            true,
         );
         std::hint::black_box(&out);
     }
@@ -135,14 +167,26 @@ fn main() {
         // ---- cell A: stats-forward + stats-backward (what ft-api ships) ----
         let t0 = Instant::now();
         let (out, stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
-            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, spatial, EPS,
+            &x,
+            Some(&weight),
+            Some(&bias),
+            GN_N,
+            GN_GROUPS,
+            spatial,
+            EPS,
         );
         let fwd = t0.elapsed().as_secs_f64() * 1_000.0;
         let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&out, &out_meta).expect("sum");
         assert!(loss.is_finite());
         let t1 = Instant::now();
         let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32_with_cpg2_stats(
-            1.0f32, &x, Some(&weight), &stats, GN_N, GN_GROUPS, spatial,
+            1.0f32,
+            &x,
+            Some(&weight),
+            &stats,
+            GN_N,
+            GN_GROUPS,
+            spatial,
         );
         let bwd = t1.elapsed().as_secs_f64() * 1_000.0;
         sums[0] = dx.iter().map(|&v| f64::from(v.abs())).sum();
@@ -153,14 +197,27 @@ fn main() {
         // ---- cell M: SAME forward, recomputing backward (the decisive cell) ----
         let t0 = Instant::now();
         let (out, _stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
-            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, spatial, EPS,
+            &x,
+            Some(&weight),
+            Some(&bias),
+            GN_N,
+            GN_GROUPS,
+            spatial,
+            EPS,
         );
         let fwd = t0.elapsed().as_secs_f64() * 1_000.0;
         let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&out, &out_meta).expect("sum");
         assert!(loss.is_finite());
         let t1 = Instant::now();
         let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32(
-            1.0f32, &x, Some(&weight), GN_N, GN_GROUPS, cpg, spatial, EPS,
+            1.0f32,
+            &x,
+            Some(&weight),
+            GN_N,
+            GN_GROUPS,
+            cpg,
+            spatial,
+            EPS,
         );
         let bwd = t1.elapsed().as_secs_f64() * 1_000.0;
         sums[1] = dx.iter().map(|&v| f64::from(v.abs())).sum();
@@ -171,14 +228,29 @@ fn main() {
         // ---- cell B: scheduled forward + recomputing backward ----
         let t0 = Instant::now();
         let out = ft_kernel_cpu::group_norm_forward_f32_scheduled(
-            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, cpg, spatial, EPS, true,
+            &x,
+            Some(&weight),
+            Some(&bias),
+            GN_N,
+            GN_GROUPS,
+            cpg,
+            spatial,
+            EPS,
+            true,
         );
         let fwd = t0.elapsed().as_secs_f64() * 1_000.0;
         let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&out, &out_meta).expect("sum");
         assert!(loss.is_finite());
         let t1 = Instant::now();
         let (dx, _, _) = ft_kernel_cpu::group_norm_backward_scalar_f32(
-            1.0f32, &x, Some(&weight), GN_N, GN_GROUPS, cpg, spatial, EPS,
+            1.0f32,
+            &x,
+            Some(&weight),
+            GN_N,
+            GN_GROUPS,
+            cpg,
+            spatial,
+            EPS,
         );
         let bwd = t1.elapsed().as_secs_f64() * 1_000.0;
         sums[2] = dx.iter().map(|&v| f64::from(v.abs())).sum();
@@ -187,7 +259,10 @@ fn main() {
         b[2] = b[2].min(fwd + bwd);
     }
 
-    println!("{:>46}{:>10}{:>10}{:>10}", "cell", "fwd ms", "bwd ms", "total");
+    println!(
+        "{:>46}{:>10}{:>10}{:>10}",
+        "cell", "fwd ms", "bwd ms", "total"
+    );
     println!(
         "{:>46}{:>10.3}{:>10.3}{:>10.3}",
         "A  stats-fwd + stats-bwd   (ships)", a[0], a[1], a[2]
@@ -201,9 +276,21 @@ fn main() {
         "B  scheduled-fwd + recomputing-bwd", b[0], b[1], b[2]
     );
     println!();
-    println!("A -> M  (forward held fixed, backward switched): {:.3} ms, {:.2}x", a[2] - m[2], a[2] / m[2]);
-    println!("M -> B  (backward held fixed, forward switched): {:.3} ms, {:.2}x", m[2] - b[2], m[2] / b[2]);
-    println!("A -> B  (both, i.e. item 84's confounded gap):   {:.3} ms, {:.2}x", a[2] - b[2], a[2] / b[2]);
+    println!(
+        "A -> M  (forward held fixed, backward switched): {:.3} ms, {:.2}x",
+        a[2] - m[2],
+        a[2] / m[2]
+    );
+    println!(
+        "M -> B  (backward held fixed, forward switched): {:.3} ms, {:.2}x",
+        m[2] - b[2],
+        m[2] / b[2]
+    );
+    println!(
+        "A -> B  (both, i.e. item 84's confounded gap):   {:.3} ms, {:.2}x",
+        a[2] - b[2],
+        a[2] / b[2]
+    );
     println!();
     // THE CONTROL. A and M call the same forward, so their forward timings must agree; if
     // they do not, cell order is still contaminating the comparison and A -> M means
@@ -215,7 +302,11 @@ fn main() {
         "CONTROL  A.fwd {:.3} vs M.fwd {:.3} (same function) -> {fwd_control:.3}x{}",
         a[0],
         m[0],
-        if fwd_control > 1.10 { "   *** CONTAMINATED — A->M IS NOT READABLE ***" } else { "   ok" }
+        if fwd_control > 1.10 {
+            "   *** CONTAMINATED — A->M IS NOT READABLE ***"
+        } else {
+            "   ok"
+        }
     );
     println!();
     println!("VERDICT: whichever single-variable step carries the gap is the lever. If A->M is");
@@ -228,7 +319,10 @@ fn main() {
     let spread = sums.iter().cloned().fold(f64::MIN, f64::max)
         - sums.iter().cloned().fold(f64::MAX, f64::min);
     let rel = spread / sums[0].abs().max(f64::MIN_POSITIVE);
-    println!("|dx| checksums  A {:.6e}  M {:.6e}  B {:.6e}   relative spread {rel:.3e}", sums[0], sums[1], sums[2]);
+    println!(
+        "|dx| checksums  A {:.6e}  M {:.6e}  B {:.6e}   relative spread {rel:.3e}",
+        sums[0], sums[1], sums[2]
+    );
     assert!(
         rel < 1e-5,
         "the three routes must compute the same gradient; relative spread {rel:.3e} says they do not"
