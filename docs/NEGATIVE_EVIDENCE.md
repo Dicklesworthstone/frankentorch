@@ -28465,3 +28465,69 @@ What the two runs DO agree on, directionally and under a failing gate, is that t
 1.18x), against the 5.41x SLOWER item 69 started from and the ~1.7x it left. That is the
 campaign-level movement on 68pwz's GroupNorm half; it is NOT certified and must not be
 quoted as a banked row until it clears both nulls and drift in one quiet invocation.
+
+## 104. ITEM 100's BANKED DESIGN IS IMPLEMENTED — THE GENERIC conv3d BACKWARD'S 28.3 MB PANEL IS GONE, BIT-EXACT
+
+Item 100 worked out how to remove the panel from `conv3d_backward_generic_f64` — the branch
+every non-`sum()` loss takes, which item 99 flagged as the half item 98 did NOT fix — and
+deliberately recorded the design instead of the code, because builds were unavailable and
+the failure mode is a silent wrong gradient rather than a compile error. Builds were
+available this turn. It is implemented, and it is bit-identical.
+
+### 104a. WHAT SHIPPED, AND WHY IT IS EXACT
+
+`dgemm_tb` computes `C = A^T·B` with **k = `flat`**, i.e. it consumes the panel along its ROW
+axis — the axis item 97 showed matrixmultiply already partitions in ascending `D_KC = 256`
+chunks, accumulating into C between them. Both operands are row-major in k, so a k-block is
+a contiguous row window of each.
+
+So the panel is built one 256-row block at a time into a reused **1.7 MB** buffer and folded
+into `dweight` with `beta = 0` on the first block and `beta = 1` after. **28.3 MB of DRAM
+traffic becomes 1.7 MB that stays in cache**, and the arithmetic is the same sum in the same
+order.
+
+Two supporting pieces, both minimal:
+
+    gemm::dgemm_tb_add_into        C += A^T·B. `dgemm_tb` hardcodes beta=0 and so cannot be
+                                   called twice on one C. Same alpha=1/beta=1 shape as the
+                                   existing `dgemm_sub_into`, no column split.
+    conv3d_im2col_fill_rows_f64    the per-row index algebra, EXTRACTED rather than copied.
+                                   `conv3d_im2col_f64` now calls it too, so the whole-panel
+                                   builder and the blocked consumer cannot drift.
+
+### 104b. THE PROOF, AND THE BRANCH IT HAD TO REACH
+
+`conv3d_generic_dweight_blocked_panel_matches_full_panel_gemm_bitwise` compares every
+`dweight` entry with `to_bits()` against the exact code it replaced — full panel, one
+`dgemm_tb` over all of `flat`:
+
+    the scored lane   [2,32,10,18,18] k=3 s=1     flat = 4096 = 16 * 256   PASS
+    remainder         [2,3,7,9,11] k=(2,3,2)      flat =  840              PASS
+    below one block   [1,2,5,6,6] k=2 s=(2,1,3)   flat =   20, strided     PASS
+
+**`dout` is deliberately not all-`+1.0`**, and the test asserts that before proceeding. A
+uniform `dout` would route to the sum-loss fast path and the test would pass while
+exercising nothing — the same blind spot item 37 documents.
+
+Gates: 664 ft-kernel-cpu tests pass (0 failed), clippy `-D warnings` clean on the crate.
+
+### 104c. SCOPE, AGAIN — `dpanel` IS STILL 28.3 MB
+
+The generic backward allocates TWO panel-sized buffers, and only one is gone. `dpanel`
+(`flat x patch_width`, built by `dgemm(flat, out_ch, patch_width, dout_flat, weight_flat)`
+and consumed by `conv3d_col2im_f64`) is untouched and still materializes in full.
+
+It does NOT yield to this technique. Here the panel-shaped buffer is the GEMM's OUTPUT, not
+an operand: blocking its k would not shrink it, because every one of its `flat`
+rows is written and then read again by col2im. Removing it means fusing the col2im INTO the
+GEMM's output loop — a real algorithmic change, not a k-split, and a separate lever.
+
+### 104d. NOT MEASURED
+
+Seven local builds were in flight, so no timing was taken and none is claimed. The
+prediction is bandwidth: 28.3 MB of write-then-read replaced by 1.7 MB resident, on a path
+item 87 measured as far more load-sensitive than the arithmetic around it. The conv3d lane's
+standing remains item 94's certified **2.50x SLOWER** until a paired run moves it — and note
+that this lever does NOT touch the scored lane at all, because that lane's loss is
+`out.sum()` and it takes the ones-dout branch. **This one has to be measured on a
+non-uniform-loss lane or it cannot be measured at all**, which no current h2h lane provides.

@@ -186,11 +186,57 @@ const _: () = assert!(
 /// rather than assumed.
 #[allow(clippy::cast_possible_truncation)]
 fn narrow_f64_to_f32(values: &[f64]) -> Vec<f32> {
-    if values.len() < GRADIENT_NARROW_PARALLEL_MIN {
+    NARROW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    NARROW_ELEMS.fetch_add(values.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    if values.len() < GRADIENT_NARROW_PARALLEL_MIN
+        || NARROW_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return values.iter().map(|&v| v as f32).collect();
     }
     use rayon::prelude::*;
     values.par_iter().map(|&v| v as f32).collect()
+}
+
+/// Execution sentinel for [`narrow_f64_to_f32`] — `frankentorch-68pwz`.
+///
+/// WHY A SENTINEL RATHER THAN READING THE SOURCE. The f32 norm ops have TWO backward
+/// routes, and which one runs is decided by the shape of the LOSS, not by the op: a plain
+/// `tensor_sum` fires a scalar sum-shortcut that never materializes a per-element `dy`,
+/// while any other loss takes the closure that does. The h2h board's `group_norm_f32` lane
+/// ends in `tensor_sum`, so reading the op's code cannot tell you whether this helper is on
+/// that lane's path at all. This counter answers it by execution.
+///
+/// One relaxed increment per CALL (not per element), against a function that materializes
+/// millions of values, so it is not measurable in the lane it instruments.
+static NARROW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NARROW_ELEMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NARROW_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `(calls, elements)` seen by [`narrow_f64_to_f32`] since the last [`reset_narrow_counts`].
+#[must_use]
+pub fn narrow_counts() -> (u64, u64) {
+    (
+        NARROW_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        NARROW_ELEMS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Zero the [`narrow_counts`] sentinel so one process can probe several routes.
+pub fn reset_narrow_counts() {
+    NARROW_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    NARROW_ELEMS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Force [`narrow_f64_to_f32`] down its serial path — the LEVER-OFF twin.
+///
+/// Returns the previous setting so a lane can restore it, matching
+/// `ft_kernel_cpu::set_pool_output_zeroed`. This exists so the narrow's contribution can be
+/// measured PAIRED in one binary and one invocation, instead of by subtracting two engine
+/// terms taken on different ELFs in different windows — which is what item 103b had to
+/// decline to do, because a peer's lever had landed in the same term.
+pub fn set_gradient_narrow_serial(force_serial: bool) -> bool {
+    NARROW_FORCE_SERIAL.swap(force_serial, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy)]
