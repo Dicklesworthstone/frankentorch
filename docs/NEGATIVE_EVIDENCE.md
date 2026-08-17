@@ -27091,3 +27091,47 @@ not safely comparable across windows on frequency grounds. It is compared here o
 same-harness rows in the same configuration. The owed follow-up is a fully-captured
 replication; the host went to loadavg 171 immediately after h5, which is why it is not in
 this entry.
+
+## 85. ITEM 84's ISOLATION EXPERIMENT IS WRITTEN AND UNRUN — PLUS A HOST STATE NO MEASUREMENT SURVIVES
+
+Two things, one of which is a non-result recorded on purpose.
+
+### 85a. The three-cell probe item 84b asked for
+
+`crates/ft-api/examples/group_norm_route_isolation_probe.rs` splits item 84's confounded
+1.19x by changing ONE variable at a time:
+
+    A  stats-forward + stats-backward        what ft-api ships for cpg == 2
+    M  stats-forward + recomputing-backward  the decisive middle cell
+    B  scheduled-forward + recomputing-backward
+
+`A -> M` holds the forward fixed and switches the backward, pricing the stats path.
+`M -> B` holds the backward fixed and switches the forward, pricing the forward. Whichever
+single-variable step carries the gap is the lever; the other is not. Each cell also times
+its forward and backward separately, so the verdict does not rest on a subtraction between
+cells, and all three `|dx|` checksums are asserted to agree — three routes to the same
+gradient, and a divergence would mean the comparison is between two different answers.
+
+**It has not been run.** Writing the experiment and running it are separate acts, and this
+item records only the first.
+
+### 85b. The host state, recorded because "record the host" cuts both ways
+
+The standing rule is that every row names its machine. The corollary is that a machine this
+bad should produce no rows at all, and saying so is itself the measurement:
+
+    loadavg 441.88 / 208.17 / 96.75      (reported to me as 158 — it was worse)
+    CPU     us=25 sy=3 id=4 wa=67        two thirds of the machine waiting on I/O
+    disk    154G -> 137G -> 122G within this tick (~15G per minute)
+
+No build and no measurement was attempted. Under 67% iowait a timing is not noisy, it is
+meaningless: the min-of-N estimator this ledger quotes assumes the fastest sample is
+uncontended, and with 387 blocked processes there is no uncontended sample to find. Item
+66's whole apparatus — drift gates, A/A nulls, per-arm clocks — exists to detect a host
+moving by a few percent. It has nothing to say about one moving by 4x.
+
+**The disk rate is the operational finding.** 17G in a single tick, against a 42G floor: at
+that rate the floor is roughly an hour away, and most of the consumers are external to this
+project (smartedgar, mcp_agent_mail_rust, coding_agent_session_search). Recorded here
+because a measurement campaign that loses its disk stops being able to build at all, and
+the ledger should show when that risk was visible rather than only when it landed.
