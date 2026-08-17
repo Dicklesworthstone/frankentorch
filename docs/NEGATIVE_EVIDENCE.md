@@ -27704,3 +27704,89 @@ next to it, exactly as every measured row records its ELF sha.
 Item 91a stands untouched and is worth more than the flake claim it accompanied: an rch
 refusal exits 0, and a `grep`-piped failing suite exits 0. Both are real, both are why this
 item's verdicts come from output rather than `$?`.
+
+## 93. THE conv3d REPEATED-ROW col2im SCATTER IS REDUNDANT — 3.5M ACCUMULATIONS BECOME 207K STORES, BIT-EXACT
+
+Shipped in `5989aedd`. Also: **item 92 is right and my item 91 was wrong** — see 93d.
+
+### 93a. THE OBSERVATION
+
+In `conv3d_backward_ones_dout_f64` — the branch the scored conv3d lane takes, and 63% of
+that lane per item 70 — `dpanel_row` is ONE row that every patch scatters with. So a padded
+voxel's gradient depends only on WHICH kernel offsets reach it, never on which patch
+delivered them.
+
+Offset validity factorizes per axis: coordinate `z` is reached by offset `off` exactly when
+`z == base*stride + off` for some `base < out_extent`. Each axis therefore has only a
+handful of distinct reachable-offset sets — five for k=3 stride 1 (two near edges, the
+interior, two far edges) — and every voxel sharing a triple of those sets shares one value.
+
+The col2im collapses to a table of `in_ch * nd * nh * nw` sums plus a flat parallel WRITE:
+
+    before   batch*in_ch*patch_count*kd*kh*kw  read-modify-writes  = 3,538,944
+    after    batch*in_ch*pd*ph*pw              stores              =   207,360
+
+~17x less memory traffic for the same answer, and the zero-fill goes too: every element is
+now fully determined rather than accumulated into, so the buffer comes from `build_uninit`
+and takes the dead serial first-touch with it ([[project_expand_uninit_firsttouch]]).
+
+### 93b. WHY IT IS BIT-IDENTICAL, and why that argument had to be structural
+
+A voxel accumulated its contributions in ascending PATCH order. For a FIXED voxel, ascending
+patch index means DESCENDING kernel offset, because `base = (z - off)/stride`. The table
+sums each offset set in that same descending order starting from the same `0.0`. Identical
+operands in an identical order give identical bits, **and the argument does not depend on
+the values** — which is the whole point, because the neighbouring lever in item 89 was
+rejected for failing exactly this test: `matrixmultiply` blocks the k dimension, and no
+ascending chain reproduces it.
+
+Note the asymmetry worth keeping: item 90 established that bit-exactness against our own
+kernel is the WRONG bar when a reference exists. That does not license reassociation here.
+Item 90's streamed route was independently shown MORE accurate; this lever has no such
+warrant, so it earns its way in by changing nothing at all.
+
+### 93c. TESTS
+
+`conv3d_col2im_repeated_row_matches_a_serial_scatter_at_the_scored_lane_shape` is new and
+pins the PRODUCTION shape (batch 2, in_ch 32, 3x3x3 stride 1, pad 1) against an independent
+serial scatter, bitwise. That shape choice is item 68b's lesson turned into a test instead
+of repeated as an incident.
+
+The existing repeated-row test is retained and re-aimed rather than deleted with the code it
+described. Its stride triple (1,2,3) is what makes it valuable now: some padded coordinates
+are reached by NO patch and others by a proper subset of offsets, so the class decomposition
+is exercised at every kind of coordinate and not only the interior. Its values are
+reciprocals that do not sum exactly, so a reassociation shows up as a bit difference, and
+its batch sweep 1/2/4/8/9 straddles the `COL2IM_PLANE_MAX_BATCH` gate this rewrite deletes
+from the function — kept so the shapes that used to route differently are still proven to
+agree.
+
+Gate: `cargo test --release -p frankentorch-kernel-cpu conv`, remote worker ovh-a,
+**18 passed / 0 failed / 1 ignored** (17 before, +1 new), including
+`conv3d_backward_ones_dout_fast_path_matches_generic_reference`. Working tree was
+`2683f7fb` plus this change, now `5989aedd`. **The full-crate run is still owed**: rch
+refused twice with `no admissible workers`.
+
+NO SPEED FIGURE IS CLAIMED. loadavg was 48.84/35.99/28.33 at the time, which is no state to
+quote a ratio from. The work reduction above is counted, not measured, and is labelled as
+such until the host is quiet enough to certify.
+
+Landed by FILTERED-HUNK STAGING: `ft-kernel-cpu/src/lib.rs` concurrently carried another
+agent's uncommitted work in `build_uninit`, `with_narrow_pool` and the bidiag test; those
+four hunks were dropped from the index rather than swept in. That is the technique the same
+file's history keeps demanding, and it is the counter-move to the sweep recorded in 90e.
+
+### 93d. ITEM 91 WAS WRONG, AND ITEM 92's CORRECTION IS ACCEPTED IN FULL
+
+I reported that bidiag test as flaky on "same worker, same source, opposite results". The
+source was not the same: the fix landed in `2683f7fb` between my two runs, so the failing
+run was on a tree where the bug was still present and the test was correctly reporting it.
+Had my reading been believed, the response would have been to loosen a bound that was doing
+its job.
+
+The failure is mine and it is specific: **I recorded the worker for both runs and the commit
+for neither.** [[feedback_snapshot_binary_before_measuring]] says to snapshot the ELF
+because peers rebuild the shared target underneath you; I have been applying that to
+timings only. It applies to CORRECTNESS runs identically — on a checkout a dozen agents
+write to, "same source" between two runs minutes apart is not an assumption anyone is
+entitled to make. Every gate line in item 93 above names the commit it ran at.
