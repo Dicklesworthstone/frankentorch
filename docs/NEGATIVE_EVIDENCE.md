@@ -28058,3 +28058,72 @@ ascending chain cannot, because the GEMM's is partitioned — but the partition 
 documented, readable, reproducible 256.** The wall was never the opacity of the reduction;
 it was the shape of it, and the shape is public. Worth keeping straight, because "opaque
 dependency internals" invites giving up and "a partition I can read" does not.
+
+## 98. THE 28.3 MB conv3d PANEL IS GONE, BIT-EXACT — ITEM 97's PARTITION CLOSED A LEVER ITEMS 89 AND 95 COULD NOT
+
+Item 88 located it, item 89 rejected it, item 95 unblocked it on accuracy grounds, and item
+97 supplied the fact that made it land with nothing conceded at all. Recording the chain
+because the lever changed shape three times and only the last shape was admissible.
+
+### 98a. WHAT SHIPPED
+
+`conv3d_backward_ones_dout_f64` no longer builds the im2col panel. It used to materialize
+`flat x patch_width` = **4096 x 864 f64 = 28.3 MB** on the scored lane, hand it to
+`dgemm(1, flat, patch_width, ones, panel, ..)` — an all-ones left operand, i.e. a COLUMN SUM
+— and never read it again. Those 864 numbers are now reduced straight off `padded`
+(207,360 elements, 1.6 MB), parallel over input channels.
+
+**Bit-identical, not close.** `conv3d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise`
+compares every `dweight` entry against the panel+GEMM it replaced, `to_bits()`, at three
+shapes chosen to straddle the block width:
+
+    the scored lane   [2,32,10,18,18] k=3 s=1     flat = 4096 = 16 * 256   PASS
+    remainder         [2,3,7,9,11] k=(2,3,2)      flat =  840, not a multiple   PASS
+    below one block   [1,2,5,6,6] k=2 s=(2,1,3)   flat =   20, strided     PASS
+
+14 conv3d tests green, including the pre-existing generic-reference and col2im proofs.
+
+### 98b. WHY IT IS BIT-EXACT NOW AND WAS NOT IN ITEM 89
+
+Item 89 replaced the GEMM with ONE ascending chain per column and moved the result ~6 ULP.
+Item 97 established that matrixmultiply's k-partition is not opaque: it walks k in ascending
+`kc`-sized chunks and accumulates into C between them, `beta` being 0 on the first chunk and
+1 after, with `kc = archparam::D_KC = 256` for f64.
+
+So the kernel folds its partials on the same 256-row boundaries — and assigns rather than
+adds on the first fold, because `0.0 + (-0.0)` is `+0.0` and a `-0.0` first block would
+otherwise be canonicalised (frankentorch-dtyiz, the same trap the gradient accumulators hit).
+
+**The wall was never the GEMM's opacity, it was its SHAPE, and the shape is public.**
+
+### 98c. THE ACCURACY IMPROVEMENT WAS DELIBERATELY NOT TAKEN
+
+Item 95's arbiter showed a loop-nest-blocked reduction is MORE accurate than the GEMM —
+1.51 vs 2.26 ULP worst against an exact sum. This lever does not take that. Matching the
+shipping order exactly means no gradient moves by one ULP, no golden is touched, and no
+tolerance is conceded, which is what makes a 28.3 MB removal safe to land in one commit. The
+accuracy gain remains available as its own decision with its own evidence, and item 95 is
+where it is written down.
+
+Two levers were available and they are not the same lever. Taking the accuracy one would
+have made this a parity change; taking the exact one made it invisible.
+
+### 98d. THE HAZARD THIS INTRODUCES, AND HOW IT FAILS
+
+`DGEMM_KC = 256` reproduces a dependency's PRIVATE constant
+(`conf_env_or_default!("MATMUL_DGEMM_KC")`). A `cargo update` can change it with no compile
+error and would silently shift gradients. The test does not compare against the constant —
+it compares against the REAL GEMM at three shapes, so a changed `kc` fails loudly there
+rather than escaping into a golden. That is the only reason hardcoding it is acceptable.
+
+### 98e. NOT MEASURED
+
+No timing was taken: the fleet was throttled mid-lever (loadavg 465, 78% iowait, 677 blocked
+processes) and starting a measurement build would have been the wrong thing regardless of
+what it showed. Item 88a's arithmetic — 56.6 MB of traffic removed to keep 864 numbers, out
+of a `conv3d_backward_f64` measured at 6.037 ms and 68.5% of an 8.808 ms backward stage — is
+the PREDICTION, not a result. The lane's standing is item 94's certified 2.50x SLOWER and
+does not move until a paired run says so.
+
+The full kernel-cpu suite and ft-api are also unrun against this change; only the 14-test
+conv3d family is green. Both are owed before this is quoted as anything but landed.
