@@ -349,6 +349,49 @@ fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f
     (elapsed, checksum)
 }
 
+/// GroupNorm f32 on the DENSE route — `frankentorch-68pwz`, NEGATIVE_EVIDENCE item 103c.
+///
+/// WHY THIS LANE HAD TO EXIST. `timed_group_norm_f32` ends in a plain `tensor_sum`, which
+/// fires the GroupNorm sum-shortcut: its backward takes a SCALAR upstream and never
+/// materializes a per-element `dy`. An execution sentinel put a number on that — the scored
+/// lane calls `narrow_f64_to_f32` **zero** times, while the same op under a non-sum loss
+/// calls it once over all 6,422,528 elements. So every f32-norm engine lever that lives in
+/// the dy/dx conversion boundary was invisible to the board: there was no lane on the route
+/// that executes it, and an FT-only paired toggle is maintenance, not a win.
+///
+/// This lane is that route with a live incumbent beside it. The loss is `sum(out*out)`, and
+/// the PyTorch twin returns `Fn.group_norm(...)**2` so the sample loop's `fn(x).sum()`
+/// gives the incumbent the SAME loss — the convention `avg_pool1d_dense` established for
+/// exactly this reason (`frankentorch-yc7ud`). Without the square the two arms would time
+/// different work and parity would mismatch.
+fn timed_group_norm_f32_dense(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable_f32(values.to_vec(), vec![GN_N, GN_C, GN_H, GN_W], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable_f32(weight.to_vec(), vec![GN_C], true)
+        .expect("weight");
+    let b = session
+        .tensor_variable_f32(bias.to_vec(), vec![GN_C], true)
+        .expect("bias");
+    let started = Instant::now();
+    let out = session
+        .functional_group_norm(x, GN_GROUPS, Some(w), Some(b), 1e-5)
+        .expect("group_norm");
+    let squared = session.tensor_mul(out, out).expect("square");
+    let loss = session.tensor_sum(squared).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// The same GroupNorm f32 work with NO session and NO tape: the kernels the
 /// session lane actually calls, invoked directly, on f32 throughout.
 ///
@@ -737,6 +780,16 @@ LANES = {
     # frankentorch-lu3ht: incumbent twin for the avg_pool2d uninit A/B.
     "avg_pool2d_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # frankentorch-68pwz item 103c: the DENSE-route twin. The board's other group_norm
+    # lanes all end in a plain sum, which fires the sum-shortcut whose backward never
+    # materializes a per-element dy -- a sentinel measured the narrow lever executing
+    # ZERO times on those lanes. This name is the same op under a non-sum loss, which is
+    # the route the f32 engine's dy/dx conversions actually run on.
+    # SQUARED on this side too, the avg_pool1d_dense convention: the loop does
+    # fn(x).sum().backward(), so returning the square makes the incumbent's loss
+    # sum(out*out) and matches what the FT arm times. Without it the two arms would
+    # measure different work and parity would mismatch.
+    "group_norm_f32_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     # frankentorch-jlcmi: incumbent twin for the group_norm uninit A/B.
     "group_norm_f32_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # The FrankenTorch side of this second name calls the two f32 kernels
@@ -1022,6 +1075,14 @@ LANES = {
                 ft_kernel_cpu::set_pool_output_zeroed(previous);
                 sample
             }),
+        ),
+        (
+            // frankentorch-68pwz item 103c: the dense route, where the f32 engine's
+            // per-element dy/dx conversions actually execute. Not a twin of
+            // `group_norm_f32` — it is a DIFFERENT backward, so it carries its own
+            // incumbent rather than being read as a lever-off pair.
+            "group_norm_f32_dense",
+            Box::new(|| timed_group_norm_f32_dense(&gnx, &gnw, &gnb)),
         ),
         (
             "group_norm_f32_kernels",
