@@ -29125,3 +29125,81 @@ gradient was found anywhere.** Item 111's perf conclusions stand, its correctnes
 not, and its status table for the eight shortcuts should now read: `max_pool1d`, `max_pool3d`
 and `avg_pool2d` cleared by measurement, `avg_pool1d` and `group_norm_f32` covered by earlier
 twins, and `try_batch_norm1d`, `try_batch_norm2d_f32`, `try_prelu` still unmeasured.
+
+## 113. THE DENSE-ROUTE LOSS IS MORE THAN HALVED, CERTIFIED — AND THE LEVER WAS NOT IN GroupNorm AT ALL
+
+`frankentorch-68pwz`. Item 109 certified the dense-route GroupNorm lane at 6.17-6.51x SLOWER
+than PyTorch. It now certifies at **2.78x SLOWER**, against a live incumbent in the same
+invocation, and the lever was in the autograd tape rather than in the op the lane is named for.
+
+### AIMED BY LANE SUBTRACTION, NOT BY REACHING FOR THE PIECE I HAD ALREADY TOUCHED
+
+Splitting the lane's timed region first was the whole of the value here:
+
+    forward group_norm      3.495 ms    2.8%
+    square  tensor_mul      2.785 ms    2.2%
+    loss    tensor_sum      0.549 ms    0.4%
+    backward              118.559 ms   94.6%
+
+Then the backward, removing exactly one node at a time:
+
+    backward WITH group_norm      118.301 ms
+    backward WITHOUT (sum(x*x))    72.298 ms   <- the tape's OWN mul+sum backward
+    backward of sum(x) alone        4.253 ms   <- ones-broadcast, cheap
+    => tensor_mul's backward       68.044 ms   against a 2.785 ms forward: 24x its own forward
+
+**The majority of a lane named `group_norm_f32_dense` was not GroupNorm.** The narrow lever
+from item 103 lives on this route and is worth ~11 ms of it; had I widened that instead of
+splitting the lane, I would have polished 9% of the problem and reported it as progress.
+
+### THE CAUSE: AN ASYMMETRIC-DTYPE BORROW
+
+`operand_values_cow` borrowed f64 operands ZERO-COPY and materialized everything else, and
+`DenseTensor::contiguous_values_as_f64` widens F32 with a serial
+`.iter().map(f64::from).collect()`. `TensorNodeOp::Mul`'s backward calls it TWICE per node.
+Item 103's probe had independently priced one serial widen of this shape at 26.3 ms; two of
+them are most of the 68 ms. A fast path gated on one dtype stranding the other, on the dtype
+that the norm and conv lanes actually use.
+
+Fixed at the caller in `ft-autograd`, which already depends on rayon — deliberately NOT in
+`ft-core`, which has no rayon at all and is a foundational crate a dozen agents share.
+Non-contiguous operands and every other dtype fall through unchanged.
+
+### THE ROWS
+
+BEFORE (ELF 341a6faa...54c6, item 109) and AFTER (ELF 1a35b62a...10be), host thinkstation1
+(AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2, powersave, rayon_threads=8, online_cpus=64),
+incumbent PyTorch 2.12.0+cpu self-reported in each invocation at threads=8:
+
+    when     FT ms    PT ms   sq-median  MIN    nulls(PT/FT)     drift    load_1m         typical core MHz
+    before   127.740  19.632  6.51x      6.86x  PASS/PASS        PASS     18.29 -> 15.71   min 1429 med 3284 max 4214
+    before   125.632  19.496  6.44x      6.63x  PASS/0.978 FAIL  PASS     12.94 -> 11.74   min 1429 med 3288 max 4289
+    before   129.874  21.049  6.17x      6.49x  0.960 FAIL/PASS  DRIFTED  12.74 -> 20.58   min 2190 med 3431 max 4289
+    after     56.862  20.425  2.78x      2.91x  PASS/PASS        PASS     18.30 -> 17.44   min 1429 med 3373 max 4289
+    after     57.117  20.668  2.76x      2.89x  OFFSET/PASS      DRIFTED  15.38 -> 20.27   min 1429 med 3332 max 4292
+    after     58.843  22.186  2.65x      2.69x  OFFSET/OFFSET    DRIFTED  24.94 -> 29.78   min 1429 med 3288 max 4292
+
+One certifying row on each side under the square-median estimator: 6.51x -> **2.78x SLOWER**,
+both nulls PASS, drift and series gates PASS, parity match on both. FT arm 125.6-129.9 ms
+before, 56.9-58.8 ms after — spans of 1.034x and 1.035x, so both sides are reproducible.
+**CONSERVATIVE BOUND: from at least 6.17x SLOWER to at most 2.78x SLOWER.**
+
+THE INCUMBENT IS THE CONTROL THAT MAKES THIS READABLE. PT read 19.632 / 19.496 / 21.049 before
+and 20.425 / 20.668 / 22.186 after — overlapping ranges, no material movement. The two sides
+are separate ELFs in separate windows, which is weaker than a within-invocation pair; what
+licenses reading them together is that each carries its own live incumbent and the incumbent
+did not move between them.
+
+The MIN estimator agrees in direction on every row (6.86/6.63/6.49 -> 2.91/2.89/2.69) but the
+after rows fail its nulls, so the banked figure is the square-median one.
+
+### WHAT IS NOT CLAIMED
+
+The remaining 2.65-2.78x is not attributed. GroupNorm's own backward contribution was ~47.9 ms
+before the fix and ~47.9 ms after — unchanged, as expected since nothing touched it, which is
+also the check that the attribution above was clean. It is now the largest single phase and
+the obvious next target.
+
+Nothing here says the tape's f64 grad space is right; it says one serial widen inside it was
+not. Every gradient buffer on an f32 lane is still twice the bytes PyTorch moves, and that is
+an architectural question this item does not open.
