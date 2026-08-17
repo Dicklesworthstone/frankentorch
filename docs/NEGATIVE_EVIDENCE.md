@@ -30809,3 +30809,56 @@ and subtracting. Isolation is precisely what produced three wrong attributions i
 
 Arm-internal, no incumbent, no gate: not a standing. What it revises is our own attribution, and
 the vs-PyTorch standing (7.4-8.8x SLOWER on this route) is untouched by it.
+
+## 142. THE SHARED-CARGO-TARGET VIOLATION HAS A ROOT CAUSE AND IT IS `.zshrc:51` — A REPO-LOCAL FIX IS IMPOSSIBLE, SO `env -u` PER INVOCATION IS THE ONLY GUARD
+
+Process hazard, recorded because it recurs and because the obvious fix does not work.
+
+A frankentorch `cargo` was caught writing to the SHARED `/data/tmp/cargo-target` — the volume
+that once went 48G to 336G in two hours. The directory is currently **47G** and holds
+frankentorch build artifacts (`release/build/frankentorch-{core,kernel-cpu,api,dispatch,
+autograd}`) alongside another project's (`frankensqlite_pragma_conformance_report.json`), so it
+is shared across projects as well as agents.
+
+### THE ROOT CAUSE
+
+    /home/ubuntu/.zshrc:51:  export CARGO_TARGET_DIR=/data/tmp/cargo-target
+
+Every shell spawned for a tool call sources `.zshrc`, and agent shell state does NOT persist
+between calls — so the banned value is re-exported before EVERY command, in every project, for
+every agent, forever. `unset CARGO_TARGET_DIR` in one call protects nothing in the next.
+
+### WHY THE REPO CANNOT DEFEND ITSELF, WHICH IS THE PART WORTH KNOWING
+
+The natural fix — pin `[build] target-dir` in `/data/projects/frankentorch/.cargo/config.toml`
+— **does not work**. Cargo gives the `CARGO_TARGET_DIR` environment variable precedence over
+`build.target-dir` from config. The repo already has a `.cargo/config.toml` (it sets
+`rustflags`), so the file exists and the setting would look effective while being silently
+overridden. There is no repo-local defence against this; the guard has to be at each call site.
+
+**That is why the rule is "always `env -u CARGO_TARGET_DIR`" and why it keeps being violated:
+it is a per-invocation discipline defending against a global default, and it fails open.** One
+forgotten prefix in one command writes to the shared volume, and nothing warns.
+
+### MY OWN INVOCATIONS, AUDITED RATHER THAN ASSERTED
+
+Checked rather than claimed, because "I always use the flag" is exactly the belief that produces
+these violations. Every example binary this session built —
+`conv2d_generic_phase_probe`, `conv2d_outch_efficiency_probe`, `narrow_route_sentinel`,
+`bn_parity_arbiter`, `gradient_narrow_probe` — is present in
+`/data/projects/frankentorch/target/release/examples/` and **none of them appears anywhere in
+`/data/tmp/cargo-target`**. The artifacts that are there are not mine. That is evidence, not a
+recollection.
+
+### WHAT IS NOT DONE HERE, AND WHY
+
+`.zshrc` is NOT edited. It is the user's global shell configuration, it governs nine projects
+and every agent on this box, and the shared directory currently holds another project's
+artifacts — so removing the export could send several projects' caches into their own repos at
+once, which is a disk event of its own. That is a decision for the human, not an opportunistic
+edit from inside one project. Recommended fix, for whoever owns that call: delete line 51 and
+let each repo default to its own `target/`, after checking which projects were relying on the
+shared cache.
+
+Deletion condition for this item: when `.zshrc:51` is gone, the per-invocation guard stops being
+load-bearing and this stops being worth remembering.
