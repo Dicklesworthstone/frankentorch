@@ -29543,3 +29543,55 @@ And the second-order damage is the part worth remembering: **item 104 did not me
 concealed the real defect.** A single-threaded `dgemm_tb` is obvious in a profile of one wide
 call and invisible in sixteen narrow ones, because each narrow call is individually too small
 to look wrong. An unmeasured lever is not neutral; it can move the evidence.
+
+## 120. THE SERIAL `dgemm_tb` WAS NOT A conv3d BUG — IT IS THE WEIGHT-GRADIENT GEMM FOR LINEAR, conv2d AND ATTENTION, AND NONE OF THEM IS ON THE BOARD
+
+Item 119 fixed `dgemm_tb` while chasing conv3d and certified that lane 2.7x -> 1.67x. The fix is
+not conv3d's. Recording the breadth immediately, because the natural failure here is to bank a
+conv3d number and let a library-wide change go uninspected.
+
+### 120a. WHO WAS RUNNING SINGLE-THREADED
+
+Every `gemm::dgemm_tb` call site in `ft-kernel-cpu`, all of them serial at every shape until
+item 119:
+
+    lib.rs:15154  linear backward   dgemm_tb(out_features, batch, in_features, dy, x, dweight)
+    lib.rs:8788   conv2d backward   dgemm_tb(out_ch, flat, patch_width, dout_flat, panel, ..)
+    lib.rs:14091  conv3d backward   dgemm_tb(out_ch, flat, patch_width, dout_flat, panel, ..)
+    lib.rs:5214   attention dV      dgemm_tb(seq_k, seq_q, d_v, p, doh, dv_bh)
+    lib.rs:5298   attention dV      (second entry)
+    lib.rs:25759  gram              dgemm_tb(n, m, n, data, data, gram)
+    lib.rs:25797  atu               dgemm_tb(n, m, m, data, u, atu)
+
+**`dweight` for a Linear layer is the most-executed of these by a wide margin** — every MLP and
+every transformer projection reaches it on every backward. Its own comment records that a
+previous lever there was worth 327 ms at `[8192,4096]`, so the shape is known to matter, and
+it has been running on one core ever since.
+
+### 120b. WHAT IS AND IS NOT ESTABLISHED
+
+**Established:** the entry had no parallel path (read from source), all seven sites used it, and
+on the one lane that measures it the fix is worth 3.0x at the kernel and a certified 2.7x ->
+1.67x at the lane (item 119).
+
+**NOT established:** any number for linear, conv2d or attention. The gate is
+`should_parallelize_cols`, which requires `n > 4*m` and `m*k*n >= 16.8M`, so the benefit is
+shape-dependent and each of these has a different aspect ratio. Linear's call is
+`m = out_features, k = batch, n = in_features` — wide-output layers clear `n > 4*m` easily and
+narrow ones do not. **Nobody should quote a linear speedup from item 119.**
+
+### 120c. WHY IT CANNOT BE MEASURED HERE YET
+
+The board has 29 lanes and not one of them is `linear`, `conv2d`, `matmul` or attention. Its
+coverage is pooling, normalisation, prelu and conv3d — so the single most common backward in
+the library has never had a live incumbent arm, and a change to it just shipped on the strength
+of a conv3d row.
+
+I did not add the lanes: `gauntlet_lane_sweep_h2h.rs` is under an MCP file reservation held by
+another agent, and the pre-commit guard correctly refused my earlier attempt to stage it. That
+is the reservation system working, not an obstacle to route around.
+
+Filed as its own bead. The lane is straightforward — `functional_linear` with a
+`requires_grad` weight on both arms, following the `prelu` pattern which already carries a
+grad-requiring parameter — and both a `sum()` and a dense twin are wanted, since item 115
+showed the two routes can disagree in direction.

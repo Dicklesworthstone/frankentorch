@@ -413,6 +413,54 @@ fn timed_group_norm_f32_dense(values: &[f32], weight: &[f32], bias: &[f32]) -> (
 /// `true` is `sum(out*out)`, the route ordinary training takes. Item 109 showed those are
 /// different backwards for GroupNorm, and the point of carrying both here is to find out
 /// whether BatchNorm splits the same way.
+/// BatchNorm2d on the DENSE route in f64 — the lane that can actually CERTIFY.
+///
+/// WHY AN f64 LANE EXISTS BESIDE THE f32 ONE. The f32 BatchNorm lanes cannot clear this
+/// harness's parity gate at ANY shape, and that is arithmetic rather than a defect in either
+/// implementation. The gate is `1e-6` relative on a gradient checksum; two different f32
+/// batch-norm implementations differ by ~`2e-5` relative on these gradients, because the
+/// gradient VALUES are f32 and the two libraries round their intermediates differently.
+/// Measured, with an f64 arbiter placing both arms on the same axis
+/// (`examples/bn_parity_arbiter.rs`): after fixing our accumulators, ours sits `1.966e-5`
+/// from the f64 truth and PyTorch's sits `2.501e-5`, and the two differ from EACH OTHER by
+/// 0.616 absolute against a tolerance of 0.0138. The gate is 20x below the noise floor of
+/// the quantity it is gating.
+///
+/// f64 removes that floor: both arms carry the same values to ~1e-16, so the checksum
+/// comparison means what it claims to. This is the convention the board's `max_pool`,
+/// `avg_pool` and `conv3d` lanes already use, and it is why THEY certify.
+///
+/// It measures the f64 BatchNorm path, not the f32 one — stated plainly rather than papered
+/// over. The f32 dense lane is kept alongside precisely so the f32 engine's timing stays
+/// visible; it simply reports MISMATCH and is not quotable, which is the honest label for it.
+fn timed_batch_norm2d_f64_dense(values: &[f64], weight: &[f64], bias: &[f64]) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), vec![GN_N, GN_C, GN_H, GN_W], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable(weight.to_vec(), vec![GN_C], true)
+        .expect("weight");
+    let b = session
+        .tensor_variable(bias.to_vec(), vec![GN_C], true)
+        .expect("bias");
+    let started = Instant::now();
+    let (out, _, _) = session
+        .functional_batch_norm2d(x, None, None, Some(w), Some(b), true, 0.1, 1e-5)
+        .expect("batch_norm2d");
+    let squared = session.tensor_mul(out, out).expect("square");
+    let loss = session.tensor_sum(squared).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 fn timed_batch_norm2d_f32(values: &[f32], weight: &[f32], bias: &[f32], dense: bool) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
@@ -815,6 +863,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Built by the SAME formula the python arm uses, then cast — so the two arms
     // normalize identical numbers and the gradient checksum is a real parity check
     // rather than a coincidence of shapes.
+    // frankentorch-68pwz: the f64 BatchNorm lane's fixtures. Same generator and same shape
+    // as the f32 ones, so the two BatchNorm rows describe the same workload in two dtypes.
+    let bnx: Vec<f64> = seq(GN_N * GN_C * GN_H * GN_W);
+    let bnw: Vec<f64> = seq(GN_C)
+        .into_iter()
+        .map(|value| value * 10.0 + 1.0)
+        .collect();
+    let bnb: Vec<f64> = seq(GN_C).into_iter().map(|value| value * 3.0).collect();
     #[allow(clippy::cast_possible_truncation)]
     let gnx: Vec<f32> = seq(GN_N * GN_C * GN_H * GN_W)
         .into_iter()
@@ -870,6 +926,12 @@ mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
 gnx=seq(32*64*56*56).reshape(32,64,56,56).float()   # frankentorch-uilzh: keep in lockstep with GN_N/GN_C/GN_H/GN_W
 gnw=(seq(64)*10.0+1.0).float().requires_grad_(True)
 gnb=(seq(64)*3.0).float().requires_grad_(True)
+# frankentorch-68pwz: f64 BatchNorm fixtures — same generator and shape as the f32 ones, no
+# `.float()`, so the f64 lane's two arms carry identical values to ~1e-16 and its parity
+# checksum means what it claims. The f32 BatchNorm lane cannot say that at any shape.
+bnx=seq(32*64*56*56).reshape(32,64,56,56)
+bnw=(seq(64)*10.0+1.0).requires_grad_(True)
+bnb=(seq(64)*3.0).requires_grad_(True)
 # frankentorch-k1hto PReLU f64 train step. The weight requires grad on both arms:
 # the lever reconstructs BOTH gradients from the scalar upstream, so a no-grad
 # weight would skip the half of the backward it changes most.
@@ -953,8 +1015,15 @@ LANES = {
     # so passing them would mutate the fixture between samples and neither arm would time
     # the same work twice. Both loss shapes are carried, to find out whether BatchNorm
     # splits into shortcut and dense routes the way group_norm does (item 109).
-    "batch_norm2d_f32": (gnx, lambda x: Fn.batch_norm(x,None,None,gnw,gnb,True,0.1,1e-5)),
+    # The f32 SUM-loss lane was REMOVED after one invocation, not merely left failing: under a
+    # bare sum loss batch-norm's dx is ANALYTICALLY ZERO (f64 arbiter: ours 4.49e-9, torch
+    # 3.84e-9), so its gradient checksum compared two computations of nothing and could never
+    # mean anything. Deleting a lane that cannot carry information beats leaving it red on a
+    # board a dozen agents run.
     "batch_norm2d_f32_dense": (gnx, lambda x: Fn.batch_norm(x,None,None,gnw,gnb,True,0.1,1e-5)**2),
+    # The f64 twin, which is the one that can CERTIFY — see timed_batch_norm2d_f64_dense for
+    # why an f32 BatchNorm lane cannot clear a 1e-6 parity gate at any shape.
+    "batch_norm2d_f64_dense": (bnx, lambda x: Fn.batch_norm(x,None,None,bnw,bnb,True,0.1,1e-5)**2),
     # frankentorch-jlcmi: incumbent twin for the group_norm uninit A/B.
     "group_norm_f32_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # The FrankenTorch side of this second name calls the two f32 kernels
@@ -1296,12 +1365,17 @@ LANES = {
             // frankentorch-68pwz: BatchNorm2d's first live incumbent arm. Both loss shapes,
             // so the sum-shortcut/dense split item 109 found on group_norm is measured here
             // rather than assumed to repeat.
-            "batch_norm2d_f32",
-            Box::new(|| timed_batch_norm2d_f32(&gnx, &gnw, &gnb, false)),
-        ),
-        (
+            // f32: NOT quotable and expected to report MISMATCH — kept so the f32 engine's
+            // timing stays visible, with the honest label attached. The sum-loss sibling was
+            // removed: its dx is analytically zero, so its checksum compared two
+            // computations of nothing.
             "batch_norm2d_f32_dense",
             Box::new(|| timed_batch_norm2d_f32(&gnx, &gnw, &gnb, true)),
+        ),
+        (
+            // f64: the lane that can certify, on the board's dominant convention.
+            "batch_norm2d_f64_dense",
+            Box::new(|| timed_batch_norm2d_f64_dense(&bnx, &bnw, &bnb)),
         ),
         (
             "group_norm_f32_kernels",
