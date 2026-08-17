@@ -26102,3 +26102,67 @@ It is a **matched-thread-budget** row: `RAYON_NUM_THREADS=8` against torch's har
 8, with the family filter. It is not a shipped-default (64-thread) row, and the two are
 not interchangeable — item 66 records why. A 64-thread certification of this family has
 never succeeded and is not claimed here.
+
+## 72. THE conv3d BACKWARD WAS RUNNING ON TWO RAYON TASKS — PER-PLANE SPLIT MAKES IT 1.86x, AND THE FORWARD IS THE CONTROL
+
+Item 70 established the conv3d backward as 63% of my worst lane and untargeted. This is
+the lever, and it was sitting ten lines from its own fix.
+
+`conv3d_backward_ones_dout_f64` — the branch the scored lane takes, because its loss is
+`out.sum()` — ends in `conv3d_col2im_repeated_row_f64`, which parallelized over BATCH
+ONLY:
+
+    dpadded.par_chunks_mut(in_ch * pd * ph * pw)   // batch chunks
+
+At the lane's batch=2 that is **two rayon tasks on a 64-core box**. Its sibling
+`conv3d_col2im_f64` has had the per-(batch,channel)-plane split since kgs4-col2im-plane,
+gated at `COL2IM_PLANE_MAX_BATCH = 8`; the repeated-row variant was the one path left
+without it. Applying the same gate gives `batch * in_ch = 64` tasks instead of 2.
+
+### 72a. BIT-IDENTICAL, for a reason that is checkable rather than hopeful
+
+Channel `c` writes only `[c*pd*ph*pw, (c+1)*pd*ph*pw)`, so per-(batch,channel) planes are
+DISJOINT and splitting races nothing. And exactly one channel contributes to any given
+output element, so that element still accumulates in the same `pc -> kdd -> kr -> kc`
+order it did before — no reassociation, unlike every conv3d lever in items 67, 68 and 70,
+which all foundered on rounding.
+
+`conv3d_col2im_repeated_row_plane_split_matches_per_batch_bitwise` pins it against an
+independent serial scatter at batch 1, 2, 4, 8 and 9 — straddling the gate in both
+directions — with non-unit strides (1,2,3) and values chosen NOT to sum exactly
+(`1/(i%7+3)`), so a reassociation would show. 652 tests pass.
+
+### 72b. THE MEASUREMENT, WITH AN IN-RUN CONTROL
+
+`crates/ft-api/examples/conv3d_phase_probe.rs`, arm-internal, 64 threads. Observed
+loadavg 16.24 / 23.64 / 27.17; CPU 1429-4238 MHz, cross-core spread 2.97x.
+
+    phase                            item 70      now     change
+    forward (direct 3x3s1 route)       6.077    6.091     +0.2%  <- CONTROL
+    backward (ones-dout fast path)    10.290    5.539     1.86x FASTER
+    forward + backward                16.367   11.630     1.41x FASTER
+
+**The forward is the control and it is measured in the same run.** It touches none of the
+changed code and moved 0.2%, which is what makes the backward's 4.75 ms a property of the
+change rather than of the host — the two runs sat at comparable load (18.42/19.62/21.14
+then, 16.24/23.64/27.17 now) but that alone would not have been enough.
+
+Of the 4.75 ms, ~0.33 ms is the im2col uninit landed in `abd6a122` and separately
+measured; the remaining ~4.4 ms is the plane split.
+
+### 72c. NOT CERTIFIED, and deliberately not attempted
+
+`uptime` read 47.1 rising when this work was requested and 19.49-24.83 while it ran. No
+certified vs-incumbent row was attempted and none is claimed. The numbers above are
+ARM-INTERNAL phase timings — our own arm against itself, no incumbent, no ratio, no drift
+gate — which is exactly the kind of measurement that does not need a quiet host to be
+honest. The conv3d lane's vs-incumbent standing (0.269, 3.72x SLOWER) is NOT updated here
+and needs a board run in a genuine window.
+
+### 72d. What is left in the backward
+
+At 5.539 ms the backward is no longer the majority — the forward is, at 52.4%. The
+forward's remaining lever is the mis-set direct gate (item 68), which is tolerance-blocked
+and worth 1.20x on the lane (item 70), and is filed as
+`frankentorch-conv3d-direct-gate-misset-w3pol` awaiting a policy call. The two `dgemm`
+column-sums inside the backward remain unpriced.

@@ -12639,6 +12639,47 @@ fn conv3d_col2im_repeated_row_f64(
 ) -> Vec<f64> {
     let patch_count = od * oh * ow;
     let mut dpadded = vec![0.0f64; batch * in_ch * pd * ph * pw];
+    // frankentorch-l2zki: this variant parallelized over BATCH ONLY, so the scored
+    // conv3d lane (batch=2) got TWO rayon tasks on a 64-core box while its sibling
+    // `conv3d_col2im_f64` has had the per-(batch,channel)-plane split since
+    // kgs4-col2im-plane. The ones-dout backward — the branch the scored lane takes,
+    // and 63% of that lane per item 70 — was the one path left without it.
+    //
+    // BIT-IDENTICAL, and for a checkable reason: channel `c` writes only
+    // `[c*pd*ph*pw, (c+1)*pd*ph*pw)`, so the planes are disjoint and splitting races
+    // nothing; and exactly one channel contributes to any given element, so that
+    // element still accumulates in the same `pc -> kdd -> kr -> kc` order it did
+    // before. Same argument the sibling's comment makes.
+    //
+    // Gated identically at `COL2IM_PLANE_MAX_BATCH`: per-plane loses dpanel cache
+    // locality and the sibling measured it regressing at batch>=16.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded
+            .par_chunks_mut(pd * ph * pw)
+            .enumerate()
+            .for_each(|(bc, dpc)| {
+                let c = bc % in_ch;
+                let pch = c * kd * kh * kw;
+                for pc in 0..patch_count {
+                    let base_d = (pc / (oh * ow)) * sd;
+                    let rem = pc % (oh * ow);
+                    let base_h = (rem / ow) * sh;
+                    let base_w = (rem % ow) * sw;
+                    for kdd in 0..kd {
+                        let d_off = (base_d + kdd) * ph * pw;
+                        let pkd = pch + kdd * kh * kw;
+                        for kr in 0..kh {
+                            let irow = d_off + (base_h + kr) * pw + base_w;
+                            let prow_off = pkd + kr * kw;
+                            for kc in 0..kw {
+                                dpc[irow + kc] += dpanel_row[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * pd * ph * pw)
         .for_each(|dpb| {
@@ -45678,6 +45719,69 @@ mod tests {
                         maybe_bias.is_some()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn conv3d_col2im_repeated_row_plane_split_matches_per_batch_bitwise() {
+        // frankentorch-l2zki: `conv3d_col2im_repeated_row_f64` now splits per
+        // (batch,channel) plane below COL2IM_PLANE_MAX_BATCH so batch=2 does not run on
+        // two rayon tasks. The claim is BIT-IDENTICAL output, which is only true because
+        // channels own disjoint output regions and each element keeps its
+        // pc -> kdd -> kr -> kc accumulation order.
+        //
+        // Both sides of the gate are exercised: batch 1/2/4 take the new plane split,
+        // batch 8/9 fall through to the original per-batch path. The reference is an
+        // independent serial scatter, so it pins the ORDER, not just the value.
+        let (in_ch, pd, ph, pw) = (3usize, 5usize, 6usize, 7usize);
+        let (kd, kh, kw) = (2usize, 3usize, 2usize);
+        let (sd, sh, sw) = (1usize, 2usize, 3usize);
+        let (od, oh, ow) = ((pd - kd) / sd + 1, (ph - kh) / sh + 1, (pw - kw) / sw + 1);
+        let patch_width = in_ch * kd * kh * kw;
+        let patch_count = od * oh * ow;
+        // Values that do NOT sum exactly, so a reassociation would show up.
+        let dpanel_row: Vec<f64> = (0..patch_width)
+            .map(|index| 1.0 / ((index % 7) as f64 + 3.0))
+            .collect();
+
+        for &batch in &[1usize, 2, 4, super::COL2IM_PLANE_MAX_BATCH, 9] {
+            let got = super::conv3d_col2im_repeated_row_f64(
+                &dpanel_row, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            );
+            let mut want = vec![0.0f64; batch * in_ch * pd * ph * pw];
+            for b in 0..batch {
+                for c in 0..in_ch {
+                    let plane = (b * in_ch + c) * pd * ph * pw;
+                    let pch = c * kd * kh * kw;
+                    for pc in 0..patch_count {
+                        let base_d = (pc / (oh * ow)) * sd;
+                        let rem = pc % (oh * ow);
+                        let base_h = (rem / ow) * sh;
+                        let base_w = (rem % ow) * sw;
+                        for kdd in 0..kd {
+                            let d_off = (base_d + kdd) * ph * pw;
+                            let pkd = pch + kdd * kh * kw;
+                            for kr in 0..kh {
+                                let irow = d_off + (base_h + kr) * pw + base_w;
+                                let prow_off = pkd + kr * kw;
+                                for kc in 0..kw {
+                                    want[plane + irow + kc] += dpanel_row[prow_off + kc];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(got.len(), want.len(), "len mismatch at batch={batch}");
+            for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "conv3d_col2im_repeated_row_f64 diverged at {index}, batch={batch} \
+                     (gate is batch < {})",
+                    super::COL2IM_PLANE_MAX_BATCH
+                );
             }
         }
     }
