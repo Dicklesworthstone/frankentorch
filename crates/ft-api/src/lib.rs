@@ -491,7 +491,6 @@ struct MaxPool1dSumShortcut {
     channels: usize,
     length: usize,
     output_len: usize,
-    sum: f64,
     /// frankentorch-md74s: a HANDLE to the argmax buffer the forward already built,
     /// not a copy of it. The grad-path forward, its backward closure and this
     /// registry all read the same allocation.
@@ -26076,6 +26075,17 @@ impl FrankenTorchSession {
             return Ok(None);
         }
 
+        // frankentorch-md74s: computed HERE rather than at registration. This is the same
+        // reduction `tensor_sum` would have performed on this tensor, so the shortcut path
+        // pays exactly what the ordinary path pays -- and a grad-mode forward that is never
+        // summed now pays nothing.
+        let sum = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
+                .map_err(|error| {
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
+                })?
+        };
         let shortcut = self
             .max_pool1d_sum_shortcuts
             .remove(&input.0)
@@ -26086,7 +26096,6 @@ impl FrankenTorchSession {
             channels,
             length,
             output_len,
-            sum,
             arg_offsets,
         } = shortcut;
         // frankentorch-md74s: the shortcut's backward reads the SAME argmax allocation
@@ -33730,13 +33739,15 @@ impl FrankenTorchSession {
                 ));
             }
             let arg_offsets = std::sync::Arc::clone(&shortcut_sidecar);
-            let sum = {
-                let tensor = self.tensor_tape.tensor(pooled)?;
-                ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
-                    .map_err(|error| {
-                        AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
-                    })?
-            };
+            // frankentorch-md74s: the sum is NOT computed here. Registering a shortcut is
+            // speculative -- it pays off only if the caller goes on to write
+            // `tensor_sum(pooled)` -- and a full numel reduction on every grad-mode
+            // forward is real work charged to callers who never ask for it.
+            //
+            // Deferring costs nothing when the shortcut IS taken, because the sum is then
+            // computed at consumption instead, which is the same reduction the ordinary
+            // `tensor_sum` path would have run anyway. `try_prelu_sum_shortcut` already
+            // works this way; max_pool1d was the outlier.
             self.max_pool1d_sum_shortcuts.insert(
                 pooled.0,
                 MaxPool1dSumShortcut {
@@ -33745,7 +33756,6 @@ impl FrankenTorchSession {
                     channels: ch,
                     length: l,
                     output_len,
-                    sum,
                     arg_offsets,
                 },
             );
