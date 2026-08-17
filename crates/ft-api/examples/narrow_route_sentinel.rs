@@ -161,6 +161,114 @@ fn main() {
     );
     println!("  loadavg {}", loadavg());
     println!("  cpu_mhz {}", cpu_mhz());
+
+    // WHERE THE DENSE ROUTE'S TIME ACTUALLY GOES — NEGATIVE_EVIDENCE item 109.
+    //
+    // The board now certifies this route at 6.17-6.51x SLOWER than PyTorch, against the
+    // sum-loss lane's 1.11-1.13x. Before anyone reaches for a lever, split the timed region
+    // the lane measures (forward + square + sum + backward) into its four phases. This is
+    // arm-internal attribution — no incumbent, no ratio, no gate — and it exists so the
+    // next lever is aimed by measurement instead of by the fact that the narrow happens to
+    // be the piece I already touched.
+    println!();
+    println!("PHASE SPLIT of the dense route's timed region (min of 9, arm-internal)");
+    let mut fwd = f64::INFINITY;
+    let mut sq = f64::INFINITY;
+    let mut sum = f64::INFINITY;
+    let mut bwd = f64::INFINITY;
+    for _ in 0..9 {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (x, w, b) = build!(session);
+        let t0 = std::time::Instant::now();
+        let out = session
+            .functional_group_norm(x, GN_GROUPS, Some(w), Some(b), 1e-5)
+            .expect("group_norm");
+        let t1 = std::time::Instant::now();
+        let squared = session.tensor_mul(out, out).expect("mul");
+        let t2 = std::time::Instant::now();
+        let loss = session.tensor_sum(squared).expect("sum");
+        let t3 = std::time::Instant::now();
+        let report = session.tensor_backward(loss).expect("backward");
+        let t4 = std::time::Instant::now();
+        std::hint::black_box(report.gradient(x).expect("grad").len());
+        fwd = fwd.min((t1 - t0).as_secs_f64() * 1e3);
+        sq = sq.min((t2 - t1).as_secs_f64() * 1e3);
+        sum = sum.min((t3 - t2).as_secs_f64() * 1e3);
+        bwd = bwd.min((t4 - t3).as_secs_f64() * 1e3);
+    }
+    let total = fwd + sq + sum + bwd;
+    println!(
+        "  forward  group_norm   {fwd:>9.3} ms  {:>5.1}%",
+        100.0 * fwd / total
+    );
+    println!(
+        "  square   tensor_mul   {sq:>9.3} ms  {:>5.1}%",
+        100.0 * sq / total
+    );
+    println!(
+        "  loss     tensor_sum   {sum:>9.3} ms  {:>5.1}%",
+        100.0 * sum / total
+    );
+    println!(
+        "  backward              {bwd:>9.3} ms  {:>5.1}%",
+        100.0 * bwd / total
+    );
+    println!("  total                 {total:>9.3} ms");
+    println!("  loadavg {}", loadavg());
+    println!("  cpu_mhz {}", cpu_mhz());
+
+    // SPLIT THE BACKWARD BY LANE SUBTRACTION, not by a profiler. The same graph with
+    // exactly ONE node removed: `sum(x*x)` on the same f32 leaf, no group_norm. Whatever
+    // that costs is the tape's own mul+sum backward over this many elements; the remainder
+    // is what the GroupNorm backward closure adds. A cycle profile would divide a serial
+    // region by the pool width and rank it near zero, which is why this campaign subtracts
+    // lanes instead.
+    println!();
+    println!("BACKWARD SPLIT by lane subtraction (min of 9, arm-internal)");
+    let mut nogn = f64::INFINITY;
+    for _ in 0..9 {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (x, _w, _b) = build!(session);
+        let squared = session.tensor_mul(x, x).expect("mul");
+        let loss = session.tensor_sum(squared).expect("sum");
+        let t0 = std::time::Instant::now();
+        let report = session.tensor_backward(loss).expect("backward");
+        let elapsed = t0.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(report.gradient(x).expect("grad").len());
+        nogn = nogn.min(elapsed);
+    }
+    println!("  backward WITH group_norm     {bwd:>9.3} ms");
+    println!("  backward WITHOUT (sum(x*x))  {nogn:>9.3} ms   <- tape's own mul+sum backward");
+    println!(
+        "  difference                   {:>9.3} ms   <- what the GroupNorm backward adds",
+        bwd - nogn
+    );
+    println!(
+        "  tape mul+sum share of the whole timed region: {:.1}%",
+        100.0 * nogn / total
+    );
+
+    // One more node removed: `sum(x)` alone. Its backward is a pure broadcast of 1.0 into a
+    // numel-sized f64 gradient — no products at all. Separating it from the mul says whether
+    // the lever is the ones-materialization or the elementwise product.
+    let mut sumonly = f64::INFINITY;
+    for _ in 0..9 {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (x, _w, _b) = build!(session);
+        let loss = session.tensor_sum(x).expect("sum");
+        let t0 = std::time::Instant::now();
+        let report = session.tensor_backward(loss).expect("backward");
+        let elapsed = t0.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(report.gradient(x).expect("grad").len());
+        sumonly = sumonly.min(elapsed);
+    }
+    println!("  backward of sum(x) alone     {sumonly:>9.3} ms   <- pure ones-broadcast");
+    println!(
+        "  so tensor_mul's backward adds {:>9.3} ms on top of it",
+        nogn - sumonly
+    );
+    println!("  loadavg {}", loadavg());
+    println!("  cpu_mhz {}", cpu_mhz());
 }
 
 fn loadavg() -> String {

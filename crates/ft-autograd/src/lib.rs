@@ -21024,14 +21024,51 @@ impl TensorTape {
     /// values it would have cloned, non-f64 still converts, and any non-contiguous
     /// tensor returns the identical `UnsupportedLayout` error (both accessors
     /// reject non-contiguous layouts).
+    /// Element count at or above which widening an F32 operand into the tape's f64 grad
+    /// space is worth a rayon fork/join — `frankentorch-68pwz`.
+    ///
+    /// Same constant and same measurement as `ft_api`'s gradient widen gate: min-of-9 over
+    /// the scored `[32,64,56,56]` shape, the crossover is the first size measured to win
+    /// (1<<20 -> 1.31x at 64 threads, 4.03x at 8), and it is far above the 8192 that older
+    /// gates in this workspace use because a 64-way join costs 0.1-0.9 ms here.
+    const OPERAND_WIDEN_PARALLEL_MIN: usize = 1 << 20;
+
+    /// Borrow a backward operand as `f64`, widening only when the dtype forces it.
+    ///
+    /// THE F64 PATH WAS ZERO-COPY AND THE F32 PATH WAS A SERIAL FULL MATERIALIZATION, which
+    /// is the asymmetric-dtype shape this workspace has hit repeatedly: a fast path gated on
+    /// one dtype strands the other, and F32 is the common case for the norm/conv lanes.
+    /// `DenseTensor::contiguous_values_as_f64` widens F32 with a serial
+    /// `.iter().map(f64::from).collect()`, and `TensorNodeOp::Mul`'s backward calls this
+    /// helper TWICE per node.
+    ///
+    /// MEASURED, on the dense-route GroupNorm lane (`examples/narrow_route_sentinel.rs`,
+    /// lane subtraction, min-of-9): `tensor_mul`'s backward costs **68.0 ms** against a
+    /// forward of 2.8 ms for the same elementwise op — 24x its own forward. One serial widen
+    /// of that shape was independently priced at 26.3 ms, and this path does two of them.
+    ///
+    /// BIT-EXACT BY CONSTRUCTION: every f32 is exactly representable in f64 and an
+    /// elementwise map has no accumulation order, so splitting the range cannot change a
+    /// bit. Asserted in `operand_values_cow_f32_matches_serial_bitwise` rather than assumed.
+    /// Non-contiguous and non-F32 dtypes fall through to the original path unchanged.
     fn operand_values_cow(
         tensor: &DenseTensor,
     ) -> Result<std::borrow::Cow<'_, [f64]>, AutogradError> {
         if tensor.meta().dtype() == DType::F64 {
-            Ok(std::borrow::Cow::Borrowed(tensor.contiguous_values()?))
-        } else {
-            Ok(std::borrow::Cow::Owned(tensor.contiguous_values_as_f64()?))
+            return Ok(std::borrow::Cow::Borrowed(tensor.contiguous_values()?));
         }
+        if tensor.meta().dtype() == DType::F32
+            && tensor.meta().is_contiguous()
+            && tensor.meta().numel() >= Self::OPERAND_WIDEN_PARALLEL_MIN
+        {
+            if let Ok(values) = tensor.contiguous_values_f32() {
+                use rayon::prelude::*;
+                return Ok(std::borrow::Cow::Owned(
+                    values.par_iter().map(|&v| f64::from(v)).collect(),
+                ));
+            }
+        }
+        Ok(std::borrow::Cow::Owned(tensor.contiguous_values_as_f64()?))
     }
 
     fn check_gradient_anomaly(
@@ -22007,6 +22044,56 @@ mod tests {
         // y was created with grad disabled, so backward from y fails
         let err = tape.backward(y);
         assert!(err.is_err());
+    }
+
+    /// frankentorch-68pwz: `operand_values_cow` now widens large contiguous F32 operands in
+    /// parallel instead of serially. Splitting an elementwise map cannot change a bit —
+    /// every f32 is exactly representable in f64 and there is no accumulation order — but
+    /// the whole point of the change is that it takes a DIFFERENT code path above the gate,
+    /// so both sides are exercised and compared against the serial form it replaced.
+    ///
+    /// The values deliberately include the classes a widen must carry through unchanged:
+    /// subnormals, -0.0, both infinities, NaN and f32::MAX are all valid gradient operand
+    /// bits.
+    #[test]
+    fn operand_values_cow_f32_matches_serial_bitwise() {
+        for &len in &[
+            1usize,
+            1_023,
+            TensorTape::OPERAND_WIDEN_PARALLEL_MIN - 1,
+            TensorTape::OPERAND_WIDEN_PARALLEL_MIN,
+            TensorTape::OPERAND_WIDEN_PARALLEL_MIN + 12_345,
+        ] {
+            let values: Vec<f32> = (0..len)
+                .map(|index| match index % 7 {
+                    0 => f32::MIN_POSITIVE * 0.5, // subnormal
+                    1 => -0.0,
+                    2 => f32::INFINITY,
+                    3 => f32::NEG_INFINITY,
+                    4 => f32::NAN,
+                    5 => f32::MAX,
+                    _ => ((index % 9973) as f32) * 0.000_37 - 1.5,
+                })
+                .collect();
+            let tensor = DenseTensor::from_typed_storage(
+                TensorMeta::from_shape(vec![len], DType::F32, Device::Cpu),
+                TensorStorage::F32(Arc::new(values.clone())),
+            )
+            .expect("tensor");
+
+            // The serial form this replaced, taken straight from `DenseTensor`.
+            let want = tensor.contiguous_values_as_f64().expect("serial widen");
+            let got = TensorTape::operand_values_cow(&tensor).expect("cow widen");
+
+            assert_eq!(got.len(), want.len(), "len mismatch at {len}");
+            for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "operand widen diverged at index {index} of {len}"
+                );
+            }
+        }
     }
 
     #[test]

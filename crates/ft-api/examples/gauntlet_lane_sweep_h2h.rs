@@ -854,6 +854,15 @@ LANES = {
     "avg_pool1d_dense_zeroed": (mp1, lambda x: Fn.avg_pool1d(x,2,2)**2),
     # frankentorch-lu3ht: incumbent twin for the avg_pool2d uninit A/B.
     "avg_pool2d_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
+    # frankentorch-mdsmm: incumbent twins for the three DENSE-route lanes. SQUARED here too,
+    # for the same reason avg_pool1d_dense is: the loop does fn(x).sum().backward(), so
+    # returning the square makes this arm's loss sum(out*out) and matches the work the FT arm
+    # times. Without it the arms measure different things and parity mismatches. torch is
+    # byte-identical code under the plain and dense names, so PT(dense)/PT(plain) is a free
+    # control that prices the squaring itself.
+    "avg_pool2d_dense": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))**2),
+    "max_pool3d_dense": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))**2),
+    "max_pool1d_dense": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # frankentorch-68pwz item 103c: the DENSE-route twin. The board's other group_norm
     # lanes all end in a plain sum, which fires the sum-shortcut whose backward never
@@ -1089,6 +1098,39 @@ LANES = {
                 timed_op(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
                     s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
                         .expect("max_pool3d")
+                })
+            }),
+        ),
+        // frankentorch-mdsmm, NEGATIVE_EVIDENCE item 110/111: DENSE-route twins for the
+        // three lanes that still had none. Each op below owns a scalar sum-shortcut
+        // (`try_avg_pool2d_sum_shortcut`, `try_max_pool3d_sum_shortcut`,
+        // `try_max_pool1d_sum_shortcut`), so the plain-sum lane above it scores the
+        // shortcut and never runs the dense backward a real objective reaches. `timed_op_sq`
+        // already existed for exactly this — yc7ud built it for avg_pool1d and item 103c
+        // used the same idea for group_norm — so these are registrations, not new machinery.
+        (
+            "avg_pool2d_dense",
+            Box::new(|| {
+                timed_op_sq(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
+                    s.functional_avg_pool2d_sum(x, (2, 2), (2, 2), (0, 0), false, true)
+                        .expect("avg_pool2d")
+                })
+            }),
+        ),
+        (
+            "max_pool3d_dense",
+            Box::new(|| {
+                timed_op_sq(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
+                    s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+                        .expect("max_pool3d")
+                })
+            }),
+        ),
+        (
+            "max_pool1d_dense",
+            Box::new(|| {
+                timed_op_sq(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
                 })
             }),
         ),

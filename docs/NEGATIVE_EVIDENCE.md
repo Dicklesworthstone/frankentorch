@@ -28973,3 +28973,81 @@ any more of their standings are quoted, and `prelu`, `max_pool*` and `avg_pool*`
 
 That audit is the highest-value measurement work left on this board, and it is bigger than
 any single lever either of us has landed this campaign.
+
+## 111. THE sum()-LOSS AUDIT FOUND A WRONG GRADIENT ON ITS FIRST PASS — avg_pool2d's SHORTCUT FIRES UNDER A NON-UNIFORM LOSS
+
+Item 110 filed `frankentorch-mdsmm` to audit the board's lanes for the `.sum()`-loss blind
+spot. The first three lanes audited turned up a **silently wrong gradient in a shipped op**,
+which is worth more than the three perf numbers that came with it.
+
+### 111a. FIRST, A CORRECTION TO ITEM 110
+
+Item 110 presented "a board whose every lane ends in `.sum()` is measuring the sum-loss
+specialisations" as a general finding and called the audit the highest-value work left.
+**The mechanism was already known and already partly instrumented, and I should have read the
+file before claiming it.** `timed_op_sq` has been in `gauntlet_lane_sweep_h2h.rs` since
+`frankentorch-yc7ud`, and its doc comment states the point exactly: a plain `tensor_sum`
+"fires the pooling ops' scalar sum-shortcut", while `sum(out*out)` makes the upstream
+gradient `2*out` so "the DENSE backward runs — which no existing lane exercised". Item 103c
+did the same for group_norm and item 109 measured it. My contribution is the conv3d lane and
+the three below, not the insight.
+
+### 111b. WHAT WAS ACTUALLY UNAUDITED, VERIFIED BY READING
+
+Eight scalar sum-shortcuts exist: `try_avg_pool1d`, `try_avg_pool2d`, `try_batch_norm1d`,
+`try_batch_norm2d_f32`, `try_group_norm_f32`, `try_max_pool1d`, `try_max_pool3d`,
+`try_prelu`. `timed_op_sq` was wired to exactly one lane (`avg_pool1d_dense`), and
+group_norm had item 103c's twin. So **avg_pool2d, max_pool3d and max_pool1d had no dense
+twin at all** despite each owning a shortcut. Those three are added here — registrations
+against the existing `timed_op_sq`, plus their incumbent twins squared on the torch side, no
+new machinery.
+
+### 111c. THE THREE NEW LANES, AND THE ONE THAT MISMATCHED
+
+    lane                 FT ms    PT ms   standing        parity
+    max_pool1d            8.274   10.324  1.11x FASTER    match
+    max_pool1d_dense     15.287   12.180  1.59x SLOWER    match
+    max_pool3d            1.605    1.036  1.43x SLOWER    match
+    max_pool3d_dense      2.266    1.197  1.93x SLOWER    match
+    avg_pool2d            1.175    2.472  1.89x FASTER    match
+    avg_pool2d_dense      1.159    4.204  2.61x FASTER    MISMATCH
+
+None certified (nulls). **max_pool1d flips sign on the dense route — 1.11x FASTER becomes
+1.59x SLOWER — and max_pool3d worsens from 1.43x to 1.93x SLOWER.** Both are honest new
+standings on the route training takes.
+
+### 111d. THE WRONG GRADIENT, AND THE TIMING THAT NAMES ITS CAUSE
+
+`avg_pool2d_dense` is the only MISMATCH on the board, in two consecutive invocations, and
+parity here is a comparison of deterministic gradient checksums, so load cannot cause it.
+
+**torch is right, and that was established independently rather than assumed.** For 2x2
+stride-2 avg_pool2d exactly tiling 64x64: `out[t]` is the mean of its four inputs, so with
+`L = sum out^2`, `dL/dx[i] = 2*out[t]/4 = out[t]/2` and `sum|grad| = 2*sum_t|out[t]|`. On the
+lane's own input:
+
+    squared loss   torch 40747.656   analytic 40747.656   rel_diff 0.000e+00
+    plain sum      torch 524288      analytic 524288      rel_diff 0.000e+00
+
+**The cause is visible in the TIMES, not only the values.** FT's dense lane costs the same as
+its sum lane — 1.159 and 1.334 ms against 1.175 and 1.504 ms — while torch's rose 1.70x for
+the harder loss, 2.472 to 4.204 ms. We are not doing the dense work at all. The other two new
+dense lanes both slowed as expected and both agree with torch: max_pool1d 1.85x, max_pool3d
+1.41x. So the shortcut `try_avg_pool2d_sum_shortcut` appears to be firing on
+`sum(mul(out, out))` when it may only fire for a plain `sum(out)`, returning the uniform-
+upstream gradient for a non-uniform one.
+
+Predicted FT checksum if that is the mechanism: **524288**, the plain-sum answer, against
+torch's 40747.656 — a 12.9x error, not a rounding difference. The harness compares the two
+checksums but does not print them, so confirming it is one print away. Filed as
+`frankentorch-1mwwe` (P0) with the arbiter script and the repro.
+
+### 111e. WHAT THIS SAYS ABOUT THE OTHER SHORTCUTS
+
+Two of the eight are now cleared by measurement (`max_pool1d`, `max_pool3d` — dense lanes
+read `match`), one is confirmed broken (`avg_pool2d`), and `avg_pool1d` and `group_norm_f32`
+have twins from yc7ud and 103c. **Three remain with no dense lane and no evidence:
+`try_batch_norm1d`, `try_batch_norm2d_f32`, `try_prelu`.** A shortcut is a specialisation
+guarded by a predicate, and this is the first demonstration on this codebase that one of those
+predicates is too loose. The remaining three should be assumed guilty until a dense lane says
+otherwise.
