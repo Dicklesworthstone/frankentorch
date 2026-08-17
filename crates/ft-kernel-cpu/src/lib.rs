@@ -12767,75 +12767,110 @@ fn conv3d_col2im_repeated_row_f64(
     sh: usize,
     sw: usize,
 ) -> Vec<f64> {
-    let patch_count = od * oh * ow;
-    let mut dpadded = vec![0.0f64; batch * in_ch * pd * ph * pw];
-    // frankentorch-l2zki: this variant parallelized over BATCH ONLY, so the scored
-    // conv3d lane (batch=2) got TWO rayon tasks on a 64-core box while its sibling
-    // `conv3d_col2im_f64` has had the per-(batch,channel)-plane split since
-    // kgs4-col2im-plane. The ones-dout backward — the branch the scored lane takes,
-    // and 63% of that lane per item 70 — was the one path left without it.
+    // THE SCATTER IS REDUNDANT. `dpanel_row` is ONE row reused by every patch, so a
+    // padded voxel's gradient depends only on WHICH kernel offsets reach it — never on
+    // which patch delivered them. Offset validity factorizes per axis, so each axis has
+    // only a handful of distinct "reachable offset" sets (5 for k=3 stride 1: the two
+    // near edges, the interior, the two far edges). Every voxel sharing a triple of
+    // those sets shares one value.
     //
-    // BIT-IDENTICAL, and for a checkable reason: channel `c` writes only
-    // `[c*pd*ph*pw, (c+1)*pd*ph*pw)`, so the planes are disjoint and splitting races
-    // nothing; and exactly one channel contributes to any given element, so that
-    // element still accumulates in the same `pc -> kdd -> kr -> kc` order it did
-    // before. Same argument the sibling's comment makes.
+    // So the whole col2im collapses to a tiny table plus a flat parallel WRITE, instead
+    // of `batch*in_ch*patch_count*kd*kh*kw` read-modify-writes. On the scored lane that
+    // is 3,538,944 accumulations replaced by 207,360 stores — the same answer for ~17x
+    // less memory traffic — and it removes the zero-fill too, since every element is now
+    // fully determined rather than accumulated into.
     //
-    // Gated identically at `COL2IM_PLANE_MAX_BATCH`: per-plane loses dpanel cache
-    // locality and the sibling measured it regressing at batch>=16.
-    if batch < COL2IM_PLANE_MAX_BATCH {
+    // BIT-IDENTICAL BY CONSTRUCTION, which is the only reason this is allowed to ship
+    // (see NEGATIVE_EVIDENCE item 89 for a neighbouring lever that was rejected for
+    // failing exactly this): a voxel accumulated contributions in ascending patch order,
+    // and for a fixed voxel ascending patch index means DESCENDING kernel offset. The
+    // table sums each offset set in that same descending order, starting from the same
+    // 0.0. Identical operands in an identical order give identical bits — the argument
+    // does not depend on the values.
+    let (classes_d, class_of_d) = col2im_offset_classes(pd, od, kd, sd);
+    let (classes_h, class_of_h) = col2im_offset_classes(ph, oh, kh, sh);
+    let (classes_w, class_of_w) = col2im_offset_classes(pw, ow, kw, sw);
+    let (nd, nh, nw) = (classes_d.len(), classes_h.len(), classes_w.len());
+
+    let mut table = vec![0.0f64; in_ch * nd * nh * nw];
+    for c in 0..in_ch {
+        let pch = c * kd * kh * kw;
+        for (id, offs_d) in classes_d.iter().enumerate() {
+            for (ih, offs_h) in classes_h.iter().enumerate() {
+                for (iw, offs_w) in classes_w.iter().enumerate() {
+                    // Same nesting as the scatter's patch order: d slowest, w fastest,
+                    // each descending. An empty set sums to 0.0, which is what the
+                    // zero-initialized buffer used to leave for unreachable padding.
+                    let mut sum = 0.0f64;
+                    for &kdd in offs_d {
+                        for &kr in offs_h {
+                            for &kc in offs_w {
+                                sum += dpanel_row[pch + kdd * kh * kw + kr * kw + kc];
+                            }
+                        }
+                    }
+                    table[((c * nd + id) * nh + ih) * nw + iw] = sum;
+                }
+            }
+        }
+    }
+
+    build_uninit(batch * in_ch * pd * ph * pw, |dpadded: &mut [f64]| {
         dpadded
             .par_chunks_mut(pd * ph * pw)
             .enumerate()
-            .for_each(|(bc, dpc)| {
-                let c = bc % in_ch;
-                let pch = c * kd * kh * kw;
-                for pc in 0..patch_count {
-                    let base_d = (pc / (oh * ow)) * sd;
-                    let rem = pc % (oh * ow);
-                    let base_h = (rem / ow) * sh;
-                    let base_w = (rem % ow) * sw;
-                    for kdd in 0..kd {
-                        let d_off = (base_d + kdd) * ph * pw;
-                        let pkd = pch + kdd * kh * kw;
-                        for kr in 0..kh {
-                            let irow = d_off + (base_h + kr) * pw + base_w;
-                            let prow_off = pkd + kr * kw;
-                            for kc in 0..kw {
-                                dpc[irow + kc] += dpanel_row[prow_off + kc];
-                            }
+            .for_each(|(bc, plane)| {
+                let tc = (bc % in_ch) * nd * nh * nw;
+                for z in 0..pd {
+                    let td = tc + class_of_d[z] * nh * nw;
+                    for y in 0..ph {
+                        let th = td + class_of_h[y] * nw;
+                        let row = &mut plane[(z * ph + y) * pw..(z * ph + y) * pw + pw];
+                        for (x, slot) in row.iter_mut().enumerate() {
+                            *slot = table[th + class_of_w[x]];
                         }
                     }
                 }
             });
-        return dpadded;
-    }
-    dpadded
-        .par_chunks_mut(in_ch * pd * ph * pw)
-        .for_each(|dpb| {
-            for pc in 0..patch_count {
-                let base_d = (pc / (oh * ow)) * sd;
-                let rem = pc % (oh * ow);
-                let base_h = (rem / ow) * sh;
-                let base_w = (rem % ow) * sw;
-                for c in 0..in_ch {
-                    let ch_off = c * pd * ph * pw;
-                    let pch = c * kd * kh * kw;
-                    for kdd in 0..kd {
-                        let d_off = ch_off + (base_d + kdd) * ph * pw;
-                        let pkd = pch + kdd * kh * kw;
-                        for kr in 0..kh {
-                            let irow = d_off + (base_h + kr) * pw + base_w;
-                            let prow_off = pkd + kr * kw;
-                            for kc in 0..kw {
-                                dpb[irow + kc] += dpanel_row[prow_off + kc];
-                            }
-                        }
-                    }
-                }
+    })
+}
+
+/// For one spatial axis, which kernel offsets reach each padded coordinate, listed in the
+/// order a scatter would have delivered them, plus a class index per coordinate.
+///
+/// A padded coordinate `z` is reached by kernel offset `off` exactly when some output
+/// index `base` satisfies `z == base*stride + off` with `base < out_extent`. The scatter
+/// visited patches in ascending `base`, so the offsets are returned in DESCENDING order —
+/// that is what makes the summed table bit-identical to the accumulation it replaces.
+///
+/// Coordinates with the same offset set share a class, so the caller's table has one entry
+/// per distinct set rather than one per coordinate. For `k=3, stride=1` there are five.
+fn col2im_offset_classes(
+    padded_extent: usize,
+    out_extent: usize,
+    k: usize,
+    stride: usize,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let mut classes: Vec<Vec<usize>> = Vec::new();
+    let mut class_of = Vec::with_capacity(padded_extent);
+    for z in 0..padded_extent {
+        let mut offsets = Vec::new();
+        for off in (0..k).rev() {
+            if off > z {
+                continue;
             }
-        });
-    dpadded
+            let rem = z - off;
+            if rem % stride == 0 && rem / stride < out_extent {
+                offsets.push(off);
+            }
+        }
+        let index = classes.iter().position(|known| *known == offsets);
+        class_of.push(index.unwrap_or_else(|| {
+            classes.push(offsets);
+            classes.len() - 1
+        }));
+    }
+    (classes, class_of)
 }
 
 /// Largest `in_ch` for which the direct 3x3x3 kernel is MEASURED to beat the streamed
@@ -46213,17 +46248,96 @@ mod tests {
         }
     }
 
+    /// The table rewrite must hold at the SCORED LANE's own shape, not only at the small
+    /// odd-stride shape the sibling test uses.
+    ///
+    /// This is the shape lesson from NEGATIVE_EVIDENCE 68b turned into a test rather than
+    /// repeated as an incident: conv3d's direct kernel shipped a gate validated at one
+    /// shape and was wrong at the shape production ran. So the shape production runs —
+    /// batch 2, in_ch 32, 3x3x3 stride 1, pad 1 — gets its own bit-exact check.
+    #[test]
+    fn conv3d_col2im_repeated_row_matches_a_serial_scatter_at_the_scored_lane_shape() {
+        let (batch, in_ch) = (2usize, 32usize);
+        let (pd, ph, pw) = (10usize, 18usize, 18usize);
+        let (kd, kh, kw) = (3usize, 3usize, 3usize);
+        let (od, oh, ow) = (pd - 2, ph - 2, pw - 2);
+        let patch_width = in_ch * kd * kh * kw;
+        let dpanel_row: Vec<f64> = (0..patch_width)
+            .map(|index| 1.0 / ((index % 11) as f64 + 3.0))
+            .collect();
+
+        let got = super::conv3d_col2im_repeated_row_f64(
+            &dpanel_row,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            1,
+            1,
+            1,
+        );
+
+        // Independent serial scatter, in the exact order the old implementation used.
+        let mut want = vec![0.0f64; batch * in_ch * pd * ph * pw];
+        for b in 0..batch {
+            for c in 0..in_ch {
+                let plane = (b * in_ch + c) * pd * ph * pw;
+                let pch = c * kd * kh * kw;
+                for pc in 0..(od * oh * ow) {
+                    let base_d = pc / (oh * ow);
+                    let rem = pc % (oh * ow);
+                    let base_h = rem / ow;
+                    let base_w = rem % ow;
+                    for kdd in 0..kd {
+                        for kr in 0..kh {
+                            for kc in 0..kw {
+                                let at = plane
+                                    + (base_d + kdd) * ph * pw
+                                    + (base_h + kr) * pw
+                                    + base_w
+                                    + kc;
+                                want[at] += dpanel_row[pch + kdd * kh * kw + kr * kw + kc];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(got.len(), want.len());
+        for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "col2im table diverged from the serial scatter at {index}"
+            );
+        }
+    }
+
     #[test]
     fn conv3d_col2im_repeated_row_plane_split_matches_per_batch_bitwise() {
-        // frankentorch-l2zki: `conv3d_col2im_repeated_row_f64` now splits per
-        // (batch,channel) plane below COL2IM_PLANE_MAX_BATCH so batch=2 does not run on
-        // two rayon tasks. The claim is BIT-IDENTICAL output, which is only true because
-        // channels own disjoint output regions and each element keeps its
-        // pc -> kdd -> kr -> kc accumulation order.
+        // `conv3d_col2im_repeated_row_f64` no longer scatters at all: it sums a small
+        // per-offset-class table and writes each voxel once (NEGATIVE_EVIDENCE item 92).
+        // The claim is still BIT-IDENTICAL output, and this test is what pins it, because
+        // the reference below is an independent SERIAL SCATTER — it reproduces the
+        // accumulation the table replaced, so it checks the ORDER and not merely the value.
         //
-        // Both sides of the gate are exercised: batch 1/2/4 take the new plane split,
-        // batch 8/9 fall through to the original per-batch path. The reference is an
-        // independent serial scatter, so it pins the ORDER, not just the value.
+        // The stride triple (1,2,3) is deliberate: with stride > 1 some padded coordinates
+        // are reached by NO patch and others by a proper subset of the kernel offsets, so
+        // the offset-class decomposition is exercised at every kind of coordinate rather
+        // than only at the interior. Values are reciprocals that do not sum exactly, so
+        // any reassociation shows up as a bit difference.
+        //
+        // Batches 1/2/4/8/9 straddle the old COL2IM_PLANE_MAX_BATCH gate. That gate is
+        // gone from this function, and the sweep is kept precisely so the shapes it used
+        // to route differently are still proven to agree.
         let (in_ch, pd, ph, pw) = (3usize, 5usize, 6usize, 7usize);
         let (kd, kh, kw) = (2usize, 3usize, 2usize);
         let (sd, sh, sw) = (1usize, 2usize, 3usize);
