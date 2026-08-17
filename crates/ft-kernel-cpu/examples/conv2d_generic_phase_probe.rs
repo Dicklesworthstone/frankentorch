@@ -124,6 +124,13 @@ fn main() {
     let mut total = f64::INFINITY;
     let mut im2col = f64::INFINITY;
     let mut col2im = f64::INFINITY;
+    // frankentorch-hi9r6's SECOND target, which item 128 called the cheaper of the two and
+    // nothing has probed: the summed route is 1.7-2.1x slower than PyTorch DESPITE having a
+    // dedicated all-ones adjoint (2026-07-05, repaired under ikw6q). A fast path that loses to
+    // an incumbent with no such specialisation is its own question, and pricing it beside the
+    // generic route in ONE invocation is the only way to say how much the specialisation buys.
+    let mut ones_total = f64::INFINITY;
+    let ones_dout = vec![1.0f64; BATCH * OUT_CH * patch_count];
 
     for _ in 0..REPS {
         let started = Instant::now();
@@ -144,6 +151,16 @@ fn main() {
             ft_kernel_cpu::conv2d_col2im_f64(&dpanel, BATCH, IN_CH, PH, PW, K, K, OH, OW, 1, 1);
         col2im = col2im.min(started.elapsed().as_secs_f64() * 1_000.0);
         std::hint::black_box(&scattered);
+
+        // The SAME kernel entry under an all-ones dout, which routes to the 3x3 stride-1
+        // adjoint instead. Same shape, same buffers, same invocation -- so the difference is
+        // the specialisation and nothing else.
+        let started = Instant::now();
+        let (odp, odw, _) = ft_kernel_cpu::conv2d_backward_f64(
+            &ones_dout, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, OH, OW, 1, 1, OUT_CH, false,
+        );
+        ones_total = ones_total.min(started.elapsed().as_secs_f64() * 1_000.0);
+        std::hint::black_box((&odp, &odw));
     }
 
     let residual = total - im2col - col2im;
@@ -223,6 +240,16 @@ fn main() {
         "SCAFFOLDING (im2col + col2im) = {:.3} ms, {:.1}% of the backward",
         im2col + col2im,
         100.0 * (im2col + col2im) / total
+    );
+    println!();
+    println!(
+        "{:>44}  {ones_total:>9.3}",
+        "ALL-ONES route (the 3x3 fast path)"
+    );
+    println!(
+        "{:>44}  {:>9.2}x",
+        "what the specialisation buys (generic/ones)",
+        total / ones_total
     );
     println!(
         "READING IT: hi9r6 predicts scaffolding DOMINATES here, worse than conv3d's 46%. If \

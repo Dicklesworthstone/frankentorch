@@ -30445,3 +30445,55 @@ measured:
 REVERTED, code and sentinel both; tree restored from HEAD, 665 ft-kernel-cpu tests green. The
 rejected diff is kept at `scratchpad/tb_gate_rejected.patch` so the next agent can see exactly
 what was tried rather than trying it again.
+
+## 135. conv2d's SUMMED-ROUTE LOSS IS NOT IN ITS BACKWARD — THE FAST PATH IS 1.766 ms AGAINST PyTorch'S WHOLE 3.1 ms LANE
+
+Item 128 flagged a second target: conv2d's summed route is 1.7-2.1x SLOWER than PyTorch *despite*
+a dedicated all-ones adjoint, and called it "the cheaper of the two to investigate". Probed. The
+adjoint is not the problem, and the number says so unambiguously.
+
+### 135a. THE MEASUREMENT, BOTH ROUTES IN ONE INVOCATION
+
+`conv2d_generic_phase_probe` now times the same kernel entry under both dout shapes — same
+buffers, same shape, same process, so the difference is the specialisation and nothing else:
+
+    TOTAL conv2d_backward_f64, non-uniform dout      7.543 ms
+      im2col                                         1.343 (17.8%)
+      col2im                                         1.511 (20.0%)
+      RESIDUAL, the two GEMMs                        4.689 (62.2%)
+    ALL-ONES route (the 3x3 stride-1 adjoint)        1.766 ms
+    what the specialisation buys                     4.27x
+
+    loadavg 17.72 / 14.18 / 14.51, vmstat idle 78%, iowait 1%
+    cpu_mhz 1429-4054 spread 2.84x, rayon_threads 64, min of 9
+    neighbouring benches LIVE throughout (frankenscipy eigh, frankenlibc)
+
+**The 2026-07-05 adjoint is doing its job — 4.27x — and it is not what is losing.**
+
+### 135b. THE ARITHMETIC THAT REFRAMES THE TARGET
+
+    conv2d SUMMED lane (item 128, h2h)   FT 5.335-6.075 ms   PT 3.088-3.374 ms
+    conv2d ones-dout BACKWARD KERNEL     1.766 ms
+
+**Our backward kernel for that route is faster than PyTorch's entire lane** — forward, loss and
+backward together. Yet the lane is 1.7-2.1x behind. So roughly 3.5-4.3 ms of the summed lane is
+forward plus tape plus session, and that, not the backward, is where the summed route loses.
+
+Every lever anyone would reach for on this route — a better adjoint, a cheaper scatter, removing
+the panel — attacks a phase that is already ahead of the whole incumbent. **That is the same
+mistake items 104, 114 and 128 made on conv3d, and it is the fourth time on this bead that the
+obvious target has been the wrong one.**
+
+### 135c. WHAT THIS DOES NOT ESTABLISH
+
+The kernel figure is at 64 threads and the lane figures are at `RAYON_NUM_THREADS=8`, and item
+123 showed the ENGINE term moves 3.8x with pool width while kernels do not. So the 3.5-4.3 ms
+remainder is an upper bound on the engine's share at 8 threads, not a measurement of it. **The
+owed probe is conv2d's `conv3d_masked_engine_probe` twin** — session arm against kernels arm, one
+invocation, at BOTH pool widths — which would split that remainder into forward and tape. It is
+about twenty lines from the conv3d one and nobody should touch the conv2d backward before it
+exists.
+
+No vs-PyTorch row was taken this turn: neighbouring measurements were live and item 38's
+contention effect manufactures wins in exactly that condition. conv2d's standings remain item
+128's — 1.7-2.1x SLOWER summed, 7.4-8.8x SLOWER real.
