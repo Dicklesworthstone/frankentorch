@@ -27648,3 +27648,59 @@ reporting `1 failed`. Two independent ways for this harness to say "fine" when i
 which is why every run in this session is read from its OUTPUT and never from `$?`. This
 is the same family as the four traps in [[feedback_exit_code_and_shell_traps]], and it is
 also why a wait-loop around a build never terminates: the refusal writes nothing to wait for.
+
+## 92. ITEM 91's FLAKE IS NOT A FLAKE — THE TWO RUNS WERE AGAINST DIFFERENT TREES, AND THE TEST WAS REPORTING THE REAL BUG
+
+Item 91 reported `bidiag_reflector_tau_vtv_identity_holds_at_rank_deficient_tiny_scale` as
+FLAKY — "same worker, same source, opposite results" — and concluded main was intermittently
+red from a numeric identity that depends on thread scheduling. **The premise is wrong: the
+two runs were not the same source.** This is my test, so the correction is mine to make.
+
+### 92a. THE TEST AND ITS FIX LANDED IN DIFFERENT COMMITS
+
+    8ec58070  "fix(conv3d): cap the direct kernel at in_ch=8; probe ga99y reflector identity"
+              contains the TEST          (bidiag_reflector_tau_vtv_identity: present)
+              does NOT contain the FIX   (SAFE_LO: absent)
+
+    3dbe5a0c  item 91, the flake report          <- written HERE
+    2683f7fb  "fix(bidiag): LAPACK-style safmin rescale"
+              contains the FIX           (SAFE_LO: present)
+
+Checked by extracting each commit's `ft-kernel-cpu/src/lib.rs` and grepping, not by reading
+the messages. The full-suite run in item 91 was taken at `8ec58070`, where the test was
+present and the fix was not, so the assertion failed **because the bug was still there** —
+`tau*(v^T v) - 2` reads 1.422e-8 against a 1e-12 bound. It was doing its job. The isolated
+run that "passed" was taken later, after `2683f7fb` had landed the fix into the shared
+checkout underneath it.
+
+Two runs minutes apart, two different trees, and nothing in either invocation recorded which
+commit it was on.
+
+### 92b. THE STANDING EVIDENCE, ON THE FIXED TREE
+
+    cargo test -p frankentorch-kernel-cpu   657 passed, 0 failed, 2 ignored
+
+with the identity test among them, in-suite, alongside all 656 others. That run also
+surfaced two DOCTEST failures — `NARROW_POOL_ENABLED` and `PARALLEL_TARGET_WORKERS`, both
+mine, where an indented measurement table in a doc comment is parsed as a Rust example.
+Those are fixed here by fencing the tables as ```text. **That fix is not yet verified by a
+run: rch refused with `no admissible workers` on four consecutive attempts.** It is a
+doc-comment-only change, but it is unverified and is written down as such rather than
+assumed.
+
+### 92c. THE RULE
+
+**On a checkout a dozen agents are writing to, "same source" is not an assumption you are
+entitled to make between two runs minutes apart.** [[feedback_snapshot_binary_before_measuring]]
+already says this for measurement binaries — snapshot the ELF, because peers rebuild the
+shared target underneath you. It applies identically to CORRECTNESS runs, and item 91 is the
+first time it has cost this campaign a wrong diagnosis rather than a wrong ratio: it
+attributed a real, reproducible bug to thread non-determinism, and had it been believed, the
+response would have been to loosen a bound that was correctly failing.
+
+Every test run that is going to be written down needs the commit it ran against recorded
+next to it, exactly as every measured row records its ELF sha.
+
+Item 91a stands untouched and is worth more than the flake claim it accompanied: an rch
+refusal exits 0, and a `grep`-piped failing suite exits 0. Both are real, both are why this
+item's verdicts come from output rather than `$?`.

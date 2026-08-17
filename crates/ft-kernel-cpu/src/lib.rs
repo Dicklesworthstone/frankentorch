@@ -2481,9 +2481,11 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
 /// MEASURED, not chosen: on this box our arm is monotonically faster as the width drops
 /// from 64, and the curve TURNS at 8 (NEGATIVE_EVIDENCE item 51, load-controlled):
 ///
+/// ```text
 ///     width 64  1.904 ms      width 16  1.291 ms (1.475x)
 ///     width 32  1.623 (1.173x) width  8  1.145 ms (1.663x)  <- optimum
 ///                              width  4  1.195 ms (1.593x)
+/// ```
 ///
 /// The mechanism is clock spread, not join count alone: cores on this machine run
 /// 2.86-3.00x apart AT ONE INSTANT, so a 64-wide join waits on whichever core is parked
@@ -2564,9 +2566,11 @@ fn with_narrow_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// capping the POOL does, and shipping it on was a regression. Measured ABBA, one ELF,
 /// arm-internal, loadavg 15.65-18.68 throughout, cross-core spread 2.7-2.9x:
 ///
+/// ```text
 ///     chunk-width off (one chunk per plane)   min 1.715 ms   median 2.384
 ///     chunk-width on  (target 8 chunks)       min 1.861 ms   median 2.639
 ///                                             0.922x min, 0.903x median -- SLOWER
+/// ```
 ///
 /// The width sweep that motivated this changed `RAYON_NUM_THREADS`, which shrinks the
 /// POOL. This changes only how the work is partitioned while leaving 64 threads spun up,
@@ -46324,7 +46328,7 @@ mod tests {
     #[test]
     fn conv3d_col2im_repeated_row_plane_split_matches_per_batch_bitwise() {
         // `conv3d_col2im_repeated_row_f64` no longer scatters at all: it sums a small
-        // per-offset-class table and writes each voxel once (NEGATIVE_EVIDENCE item 92).
+        // per-offset-class table and writes each voxel once (NEGATIVE_EVIDENCE item 93).
         // The claim is still BIT-IDENTICAL output, and this test is what pins it, because
         // the reference below is an independent SERIAL SCATTER — it reproduces the
         // accumulation the table replaced, so it checks the ORDER and not merely the value.
@@ -60217,9 +60221,9 @@ mod tests {
         let (unit_p, unit_q, unit_live, unit_detail) = worst_identity(1.0);
 
         let verdict = if tiny_p > 1e-12 {
-            "GENERATION at fault -- individual reflectors are not orthogonal"
+            "REGRESSED -- reflector generation has lost the identity again (see ga99y)"
         } else {
-            "reflectors are orthogonal -- the EXPANSION is at fault"
+            "identity holds at both scales"
         };
         println!(
             "ga99y tau*(vTv)-2  rank={rank} n={n}: scale 1e-20 P {tiny_p:.3e} Q {tiny_q:.3e} \
@@ -60274,18 +60278,28 @@ mod tests {
         let p_blocked = super::bidiag::bidiag_form_p_f64(&packed_blocked, n, &taup_b);
         let err_blocked = bidiag_p_orthonormality_error(&p_blocked, n);
 
-        let verdict = if err_unblocked < 1e-9 && err_blocked >= 1e-9 {
-            "BLOCKED REDUCTION at fault (unblocked clean)"
-        } else if err_unblocked >= 1e-9 && err_blocked >= 1e-9 {
-            "BOTH bad -> the EXPANSION or reflector conditioning, not blocking"
-        } else if err_unblocked >= 1e-9 {
-            "UNBLOCKED bad, blocked clean -- unexpected, re-read the fixture"
+        let verdict = if err_unblocked < 1e-9 && err_blocked < 1e-9 {
+            "both clean -- ga99y stays fixed"
+        } else if err_unblocked < 1e-9 {
+            "BLOCKED REDUCTION regressed (unblocked still clean)"
+        } else if err_blocked < 1e-9 {
+            "UNBLOCKED regressed (blocked still clean)"
         } else {
-            "neither reproduces -- fixture does not hit the configuration"
+            "BOTH regressed -> reflector generation or the expansion, as in ga99y"
         };
         println!(
             "ga99y oracle rank={rank} scale={scale:e} n={n}: unblocked |PP^T-I| \
              {err_unblocked:.3e}, blocked {err_blocked:.3e} -- {verdict}"
+        );
+
+        // This began as a print-only probe because the bug was live and there was nothing
+        // to assert. The safmin rescale in `house_gen_strided_f64` fixed BOTH arms
+        // (unblocked 1.644e-8 -> 2.554e-15, blocked 1.113e-2 -> 1.887e-15), so the probe
+        // is now a gate: this exact configuration is the one that regressed, and it is the
+        // one that has to stay clean. frankentorch-ga99y.
+        assert!(
+            err_unblocked < 1e-9 && err_blocked < 1e-9,
+            "P must stay orthonormal at rank {rank} / scale {scale:e}: {verdict}"
         );
     }
 
