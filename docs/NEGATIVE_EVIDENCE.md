@@ -26230,3 +26230,63 @@ vs-incumbent row was attempted or is claimed. These are ARM-INTERNAL phase timin
 arm against itself, no incumbent, no ratio, no drift gate. The conv3d lane's vs-incumbent
 standing (0.269, 3.72x SLOWER) is NOT updated and needs a board run in a real window; on
 these phase numbers it should improve substantially, and that is a prediction, not a result.
+
+## 53. THE PER-OP NARROW POOL IS WORTH ~5%, NOT 66% — AND UNDER WORST-BOUND IT IS NOT A WIN
+
+Item 51 measured `RAYON_NUM_THREADS=8` at 1.663x against 64 on `max_pool3d_nopool`. Item 52
+refuted the chunk-size shape (0.922x). This measures the third shape: a per-op narrow pool
+that kernels `install()` onto, leaving the process-wide pool alone.
+
+ELF `b7cdaee76ff59033`, arm-internal via `FT_H2H_NO_INCUMBENT` so there is no incumbent, no
+ratio and no drift gate. **Per-arm provenance:** observed loadavg 16.24-24.15 across twelve
+passes; CPU during sampling cross-core spread min 1.297x median 2.019x max 2.975x.
+
+### 53a. Adjacent-pair design, because the host was falling
+
+Item 51 recorded that a palindrome cancels a trend that REVERSES but not one that only
+moves one way, and that reading a monotone ramp gave a number 50% too large. The host was
+falling monotonically here (1-min 22.4 -> 18.0 while 5-min sat at 26), so the twelve passes
+alternate tightly and each ON is compared against the OFF **immediately beside it**. A
+monotone drift moves both members of a pair by nearly the same amount, so it cancels within
+the pair rather than across halves.
+
+    adjacent ON/OFF pairs, ratio off/on, >1 means the narrow pool is faster
+      min-reduced      1.056  1.006  1.046  0.967  1.176  1.179
+      median-reduced   1.041  0.979  1.001  1.047  1.153  1.135
+      median across pairs   1.051 (min)   1.044 (median)
+      pairs favouring narrow   5 of 6
+
+### 53b. Real but small, and NOT a win by this campaign's own convention
+
+Five of six pairs favour the narrow pool and the central estimate is ~5%. But **one pair
+reads 0.967** — a loss — so the worst bound any pair produced is below 1.0, and the
+worst-bound convention this ledger quotes everything under does not license calling this a
+win. Recorded as: a probable ~5% effect that does not clear the bar.
+
+**And ~5% is not 66%.** Shrinking the actual pool with `RAYON_NUM_THREADS=8` gives 1.663x;
+routing two kernels onto a narrow pool gives 1.05x. The gap is the answer to the question
+the bead posed:
+
+  - the lane's session is much more than these two kernels — tape, allocation, the fused
+    sum's serial parts — and all of it still runs 64-wide on the ambient pool;
+  - `install()` costs something on every call, and these kernels are 0.6-0.9 ms, so the
+    fixed cost is not negligible against the win.
+
+So the per-op shape captures only a small fraction of what the global shape does. **The
+bead's three candidate shapes now read: global pool cap 1.663x, per-op pool ~1.05x and not
+gate-clean, chunk size 0.922x.** That is the search space resolved by measurement rather
+than argument, which is what the bead asked for.
+
+### 53c. Default stays OFF
+
+Two levers this session were shipped or nearly shipped on thin evidence — the chunk-width
+default (an 8-10% regression) and item 48's contention figure (3x overstated). A 5% central
+estimate with one adverse pair is exactly the evidence that should not flip a default. The
+code stays, switchable and tested (19 passed / 0 failed, bit-exact including the fused
+sum), so a future turn can re-measure it in a stable window or behind a global cap without
+re-deriving anything.
+
+WHAT TO DO INSTEAD, on this evidence: the global pool cap is where the 1.663x lives, and
+the open question there is not whether it works on this lane but what it costs the lanes
+that measured only 1.01x. That is a campaign decision about a process-wide default, and it
+is now the only shape left unmeasured.
