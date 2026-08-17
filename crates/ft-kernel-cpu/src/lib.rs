@@ -362,6 +362,58 @@ mod gemm {
             });
             return;
         }
+        // 2-D TILE PATH, for the shapes the column split cannot reach.
+        //
+        // The column gate needs `n >= 4*MIN_BLOCK_COLS` (512). conv2d's dweight product is
+        // m=32, k=8192, n=288 -- its `patch_width` of 288 is below that floor, so it failed the
+        // gate and kept running single-threaded even after item 119. Measured consequence:
+        // 16.5 GMAC/s against conv3d's 74.8 on the same box, and 79.3% of conv2d's backward
+        // sitting in the two GEMMs (NEGATIVE_EVIDENCE item 130).
+        //
+        // Tiling BOTH output axes reaches it: `tile_shape(32, 288)` is 6 tiles at 8 threads and
+        // 12 at 64, against one today. **Bit-exact for the same reason the column split is** --
+        // K is never tiled, so every output element's reduction stays whole and in one piece.
+        // That is what separates this from a k-split, which would reassociate (item 130c).
+        //
+        // Ordered AFTER the column check so no shape that already parallelised changes path.
+        if should_parallelize(m, k, n) {
+            let (mb, nb) = tile_shape(m, n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
+                let cp = &cp;
+                let j0 = j_blk * nb;
+                let bj = (j0 + nb).min(n) - j0;
+                (0..m.div_ceil(mb)).into_par_iter().for_each(|i_blk| {
+                    let i0 = i_blk * mb;
+                    let bi = (i0 + mb).min(m) - i0;
+                    // SAFETY: same operand model as the serial call below. A is [k,m] read as
+                    // A^T (rsa=1, csa=m), so its row window [i0,i0+bi) is the column window
+                    // a.add(i0) under those strides. B's column window is b.add(j0) with
+                    // rsb=n, csb=1. The output tile cp.0.add(i0*n+j0) is disjoint across
+                    // blocks -- rows and columns both partition -- and its last element
+                    // (i0+bi-1)*n + j0+bj-1 <= m*n-1. K is NOT tiled.
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            bj,
+                            alpha,
+                            a.as_ptr().add(i0),
+                            1,
+                            m as isize,
+                            b.as_ptr().add(j0),
+                            n as isize,
+                            1,
+                            0.0,
+                            cp.0.add(i0 * n + j0),
+                            n as isize,
+                            1,
+                        );
+                    }
+                });
+            });
+            return;
+        }
         // SAFETY: A is [k,m] and read as A^T via strides; B and C are contiguous
         // row-major matrices with the exact dimensions passed to matrixmultiply.
         unsafe {

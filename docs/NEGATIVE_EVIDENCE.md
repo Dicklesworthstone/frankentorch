@@ -30325,3 +30325,62 @@ which callers fall on the wrong side of it, and were they measured or merely not
 
 NOT MEASURED, NOT FIXED. Reading only, with a neighbouring frankenfs mounted-kernel benchmark
 running throughout, which is also why no row was taken.
+
+## 133. dgemm_tb GETS A 2-D TILE PATH — conv2d's BACKWARD 1.3-1.5x, BIT-EXACT, AND conv3d UNTOUCHED
+
+Item 130 named the lever precisely: `dgemm_tb` had a column split and no 2-D path, so conv2d's
+`dweight` product (m=32, k=8192, n=288) failed the `n >= 512` column floor and stayed
+single-threaded. Implemented.
+
+### 133a. WHAT SHIPPED, AND WHY IT IS BIT-EXACT
+
+A tile path that partitions BOTH output axes, ordered AFTER the column check so no shape that
+already parallelised changes route. `tile_shape(32, 288)` yields 6 tiles at 8 threads and 12 at
+64, against one before.
+
+**K is never tiled**, so every output element's reduction stays whole and in one piece — the
+same argument that makes the column split exact, and the one a k-split cannot make (item 130c).
+
+### 133b. MEASURED, ARM-INTERNAL
+
+    conv2d_backward_f64 (non-uniform dout), min of 9
+        before          TOTAL 11.513 ms   residual 9.135   (loadavg 13.60, idle 85%)
+        after, run 1    TOTAL  8.849 ms   residual 6.536   (loadavg 11.60, idle 82%)
+        after, run 2    TOTAL  7.744 ms   residual 5.117   (loadavg 11.77, idle 82%)
+
+    conv3d_backward_f64, REGRESSION CHECK
+        before          TOTAL  5.651 ms   residual 3.029
+        after           TOTAL  5.830 ms   residual 2.826
+
+**1.30-1.49x on the conv2d backward, 1.40-1.79x on the GEMM phase it targets, and conv3d
+unchanged** — which is the check that matters for an edit to a shared GEMM entry: conv3d's
+n=864 still takes the column path, so its numbers move only with the window.
+
+The two post-fix runs sit at a slightly quieter loadavg than the baseline (11.6-11.8 against
+13.6), so the low end of that range is the safe reading. Neighbouring benchmarks were live
+throughout (frankenscipy `perf_eigh_vs_scipy`, frankenlibc `incumbent_coverage_ab`,
+frankenredis) — recorded because it is exactly the contention that inflates a local baseline.
+
+### 133c. THE PROOF IS SOMEONE ELSE'S TEST
+
+`conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise` — 68pwz's agent's, from ikw6q —
+compares a hand-written direct reduction against `panel + dgemm_tb`. It is the one test on the
+board that pins `dgemm_tb`'s OUTPUT against something that is not itself a GEMM, so it would
+break on any reassociation this change introduced. It passes, along with 664 others.
+
+Worth stating because I nearly deleted its sibling as tautological in item 119: a test that
+compares two INDEPENDENT implementations keeps its value when one of them is re-scheduled, and
+a test that compares a route to itself does not.
+
+### 133d. NOT A STANDING, AND WHAT IS OWED
+
+No vs-PyTorch row was taken: neighbouring measurements were in flight and certifying into
+another project's benchmark is how item 38's contention effect manufactures wins. **conv2d's
+standing remains item 128's 7.4-8.8x SLOWER** until a paired run says otherwise, and a 1.3-1.5x
+kernel improvement cannot close that on its own — the lane is ~20 ms against a ~3 ms incumbent.
+
+The shape is the reason the win is modest and the reason it is nearly exhausted: m=32, n=288,
+k=8192 has only 9,216 output elements and a reduction 8,192 deep. Tiling the output can use at
+most a few dozen threads' worth of parallelism no matter how it is cut; the work is in k, and
+k is the axis that cannot be split bit-exactly. **Further gains on this product need either a
+ratified tolerance or a different decomposition, not another scheduling pass.**
