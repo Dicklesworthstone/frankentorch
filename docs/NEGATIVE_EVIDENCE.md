@@ -30560,3 +30560,59 @@ PyTorch is 3.0-3.6 ms on this lane against our 11-13 ms, and it does not use a t
 small channel counts. That is the gap, and it is now attributed rather than guessed.
 
 Arm-internal: no incumbent in this probe, no ratio, no gate. Not a standing.
+
+## 137. ITEM 133's KERNEL WIN DID NOT MOVE conv2d's STANDING — AND THE conv2d LANES MAY NOT BE CERTIFIABLE AT THIS SHAPE
+
+Item 133 landed a bit-exact 1.3-1.5x on conv2d's backward kernel and said explicitly that the
+standing remains item 128's until a paired run says otherwise. Paired runs taken. It does not
+move, and the reason is worth more than the number.
+
+### 137a. THE ROWS
+
+    run  load_1m  idle   conv2d FT/PT        min-ratio   conv2d_masked FT/PT   min-ratio
+    z1   10.82    87%    4.635 / 2.297       0.400       15.660 / 2.721        0.122  (8.20x S)
+    z2   15.21    87%    4.660 / 2.813       0.441       16.442 / 3.097        0.142  (7.02x S)
+    z3   12.36    89%    --                  --          16.040 / 3.076        0.159  (6.31x S)
+
+    ELF bb7700fc4f4b8003, HEAD 2f929b61, RAYON_NUM_THREADS=8, 16 rounds, mimalloc
+    z3: cpu_mhz 1429/2508/4218 spread 2.952x, cross-core 2.864x/2.978x/3.005x, drift PASS
+    parity match on every row
+    NEIGHBOURING MEASUREMENT LIVE: frankenfs `ffs-mounted-ker` at ~34% CPU throughout, plus
+    unrelated `smartedgar`/`am` processes. The frankenscipy eigh bench was `rch exec`, i.e.
+    running REMOTELY, so it did not contend locally — checked, not assumed.
+
+### 137b. THE FT ARM IMPROVED AND THE RATIO DID NOT
+
+    conv2d_masked FT   before item 133   20.112 - 21.908 ms
+                       after             15.660 - 16.442 ms     (1.28-1.34x)
+    conv2d_masked PT   before             3.039 -  3.643 ms
+                       after              2.721 -  3.097 ms     (also faster)
+
+**Both arms moved, because the window was quieter, so the ratio is roughly where item 128 left
+it.** That is the whole argument for paired same-invocation ratios in one line: the FT-only
+improvement is real and matches the kernel probe's direction, and it would have read as a win if
+quoted against the older PT numbers instead of the ones measured beside it.
+
+### 137c. NOT CERTIFIED, AND THIS TIME THE INCUMBENT IS THE PROBLEM
+
+**Our A/A null passed on all five conv2d rows taken today (0.995-1.019). PyTorch's failed on
+every one (0.949-1.223).** Torch's arm here is 2.3-3.1 ms — the shortest incumbent on the board
+— and a short arm nulls badly, which items 108b and 126b already recorded from the other side.
+
+Five rows, one stable arm, one unstable arm, no certification. **The conv2d lanes as sized may
+not be certifiable at all**, and the fix is the one `frankentorch-uilzh` used for group_norm:
+resize the lane until the incumbent sits in the 4-7 ms band where lanes null cleanly. That
+breaks comparability with items 128 and 137, which is the price, and it should be paid
+deliberately rather than by accumulating uncertified rows.
+
+### 137d. WHERE THE conv2d GAP ACTUALLY IS
+
+Masked lane 15.7-16.4 ms against a backward kernel of ~7.5 ms (item 135's probe, 64 threads):
+**roughly half the lane is not the backward at all.** Item 135 found the same for the summed
+route, where the kernel (1.766 ms) is faster than PyTorch's entire lane. Two routes, same
+conclusion.
+
+So the owed probe named in item 135c — conv2d's twin of `conv3d_masked_engine_probe`, session
+arm against kernels arm, at both pool widths — is now the ONLY sensible next step on this bead.
+Item 133 was a real 1.3-1.5x on the kernel and bought nothing at the lane, which is exactly what
+attacking the wrong half looks like when the wrong half is genuinely improvable.
