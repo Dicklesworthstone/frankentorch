@@ -7664,8 +7664,7 @@ pub fn conv2d_im2col_f64(
                     for kr in 0..kh {
                         let irow = ch_off + (base_h + kr) * pw + base_w;
                         let prow_off = pch + kr * kw;
-                        prow[prow_off..(kw + prow_off)]
-                            .copy_from_slice(&padded[irow..(kw + irow)]);
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
                     }
                 }
             });
@@ -8033,25 +8032,25 @@ pub fn conv2d_im2col_f32(
     let patch_count = oh * ow;
     // frankentorch-l2zki: see `conv3d_im2col_f64`. Padded input, every element written.
     build_uninit(batch * patch_count * patch_width, |panel: &mut [f32]| {
-    panel
-        .par_chunks_mut(patch_width)
-        .enumerate()
-        .for_each(|(row, prow)| {
-            let b = row / patch_count;
-            let pc = row % patch_count;
-            let base_h = (pc / ow) * sh;
-            let base_w = (pc % ow) * sw;
-            let batch_off = b * in_ch * ph * pw;
-            for c in 0..in_ch {
-                let ch_off = batch_off + c * ph * pw;
-                let pch = c * kh * kw;
-                for kr in 0..kh {
-                    let irow = ch_off + (base_h + kr) * pw + base_w;
-                    let prow_off = pch + kr * kw;
-                    prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+        panel
+            .par_chunks_mut(patch_width)
+            .enumerate()
+            .for_each(|(row, prow)| {
+                let b = row / patch_count;
+                let pc = row % patch_count;
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let batch_off = b * in_ch * ph * pw;
+                for c in 0..in_ch {
+                    let ch_off = batch_off + c * ph * pw;
+                    let pch = c * kh * kw;
+                    for kr in 0..kh {
+                        let irow = ch_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pch + kr * kw;
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
                 }
-            }
-        });
+            });
     })
 }
 
@@ -12893,81 +12892,81 @@ fn conv3d_forward_direct_3x3s1_f64(
     // `patch_count` — so the zero-fill was dead, exactly as in the im2col panels of item
     // 72. Bit-exact: only the allocation's initialization changes.
     build_uninit(plane_count * patch_count, |out: &mut [f64]| {
-    out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)
-        .enumerate()
-        .for_each(|(block, out_block)| {
-            let first_plane = block * OUT_CHANNEL_BLOCK;
-            let n = first_plane / out_ch;
-            let first_channel = first_plane % out_ch;
-            let batch_offset = n * in_ch * pd * ph * pw;
-            // The dispatch guard requires `out_ch` to be divisible by four, so
-            // every block is full and cannot cross an NCDHW batch boundary.
-            // Keeping the four accumulators explicit lets LLVM keep them in
-            // registers instead of reloading the dynamic channel loop state at
-            // every input tap.
-            let weight_offset0 = first_channel * patch_width;
-            let weight_offset1 = weight_offset0 + patch_width;
-            let weight_offset2 = weight_offset1 + patch_width;
-            let weight_offset3 = weight_offset2 + patch_width;
-            let biases = bias.map_or([0.0; OUT_CHANNEL_BLOCK], |values| {
-                [
-                    values[first_channel],
-                    values[first_channel + 1],
-                    values[first_channel + 2],
-                    values[first_channel + 3],
-                ]
-            });
-            // The four planes of this block are contiguous and equal-length, so they
-            // split cleanly into four disjoint slices that can be tiled in lockstep.
-            let (plane0, rest) = out_block.split_at_mut(patch_count);
-            let (plane1, rest) = rest.split_at_mut(patch_count);
-            let (plane2, plane3) = rest.split_at_mut(patch_count);
-            plane0
-                .par_chunks_mut(spatial_tile)
-                .zip(plane1.par_chunks_mut(spatial_tile))
-                .zip(plane2.par_chunks_mut(spatial_tile))
-                .zip(plane3.par_chunks_mut(spatial_tile))
-                .enumerate()
-                .for_each(|(tile, (((tile0, tile1), tile2), tile3))| {
-                    let start = tile * spatial_tile;
-                    for offset in 0..tile0.len() {
-                        let position = start + offset;
-                        let oz = position / (oh * ow);
-                        let rem = position % (oh * ow);
-                        let oy = rem / ow;
-                        let ox = rem % ow;
-                        let mut sums = [0.0f64; OUT_CHANNEL_BLOCK];
-                        for c in 0..in_ch {
-                            let input_channel = batch_offset + c * pd * ph * pw;
-                            let weight_channel = c * KERNEL_WIDTH;
-                            for kdd in 0..3 {
-                                let input_depth = input_channel + (oz + kdd) * ph * pw;
-                                let weight_depth = weight_channel + kdd * 3 * 3;
-                                for kr in 0..3 {
-                                    let input_row = input_depth + (oy + kr) * pw + ox;
-                                    let weight_row = weight_depth + kr * 3;
-                                    for kc in 0..3 {
-                                        let value = padded[input_row + kc];
-                                        let weight_index = weight_row + kc;
-                                        sums[0] +=
-                                            value * weight_flat[weight_offset0 + weight_index];
-                                        sums[1] +=
-                                            value * weight_flat[weight_offset1 + weight_index];
-                                        sums[2] +=
-                                            value * weight_flat[weight_offset2 + weight_index];
-                                        sums[3] +=
-                                            value * weight_flat[weight_offset3 + weight_index];
+        out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)
+            .enumerate()
+            .for_each(|(block, out_block)| {
+                let first_plane = block * OUT_CHANNEL_BLOCK;
+                let n = first_plane / out_ch;
+                let first_channel = first_plane % out_ch;
+                let batch_offset = n * in_ch * pd * ph * pw;
+                // The dispatch guard requires `out_ch` to be divisible by four, so
+                // every block is full and cannot cross an NCDHW batch boundary.
+                // Keeping the four accumulators explicit lets LLVM keep them in
+                // registers instead of reloading the dynamic channel loop state at
+                // every input tap.
+                let weight_offset0 = first_channel * patch_width;
+                let weight_offset1 = weight_offset0 + patch_width;
+                let weight_offset2 = weight_offset1 + patch_width;
+                let weight_offset3 = weight_offset2 + patch_width;
+                let biases = bias.map_or([0.0; OUT_CHANNEL_BLOCK], |values| {
+                    [
+                        values[first_channel],
+                        values[first_channel + 1],
+                        values[first_channel + 2],
+                        values[first_channel + 3],
+                    ]
+                });
+                // The four planes of this block are contiguous and equal-length, so they
+                // split cleanly into four disjoint slices that can be tiled in lockstep.
+                let (plane0, rest) = out_block.split_at_mut(patch_count);
+                let (plane1, rest) = rest.split_at_mut(patch_count);
+                let (plane2, plane3) = rest.split_at_mut(patch_count);
+                plane0
+                    .par_chunks_mut(spatial_tile)
+                    .zip(plane1.par_chunks_mut(spatial_tile))
+                    .zip(plane2.par_chunks_mut(spatial_tile))
+                    .zip(plane3.par_chunks_mut(spatial_tile))
+                    .enumerate()
+                    .for_each(|(tile, (((tile0, tile1), tile2), tile3))| {
+                        let start = tile * spatial_tile;
+                        for offset in 0..tile0.len() {
+                            let position = start + offset;
+                            let oz = position / (oh * ow);
+                            let rem = position % (oh * ow);
+                            let oy = rem / ow;
+                            let ox = rem % ow;
+                            let mut sums = [0.0f64; OUT_CHANNEL_BLOCK];
+                            for c in 0..in_ch {
+                                let input_channel = batch_offset + c * pd * ph * pw;
+                                let weight_channel = c * KERNEL_WIDTH;
+                                for kdd in 0..3 {
+                                    let input_depth = input_channel + (oz + kdd) * ph * pw;
+                                    let weight_depth = weight_channel + kdd * 3 * 3;
+                                    for kr in 0..3 {
+                                        let input_row = input_depth + (oy + kr) * pw + ox;
+                                        let weight_row = weight_depth + kr * 3;
+                                        for kc in 0..3 {
+                                            let value = padded[input_row + kc];
+                                            let weight_index = weight_row + kc;
+                                            sums[0] +=
+                                                value * weight_flat[weight_offset0 + weight_index];
+                                            sums[1] +=
+                                                value * weight_flat[weight_offset1 + weight_index];
+                                            sums[2] +=
+                                                value * weight_flat[weight_offset2 + weight_index];
+                                            sums[3] +=
+                                                value * weight_flat[weight_offset3 + weight_index];
+                                        }
                                     }
                                 }
                             }
+                            tile0[offset] = sums[0] + biases[0];
+                            tile1[offset] = sums[1] + biases[1];
+                            tile2[offset] = sums[2] + biases[2];
+                            tile3[offset] = sums[3] + biases[3];
                         }
-                        tile0[offset] = sums[0] + biases[0];
-                        tile1[offset] = sums[1] + biases[1];
-                        tile2[offset] = sums[2] + biases[2];
-                        tile3[offset] = sums[3] + biases[3];
-                    }
-                });
-        });
+                    });
+            });
     })
 }
 
@@ -13158,31 +13157,32 @@ pub fn conv3d_im2col_f32(
     let patch_count = od * oh * ow;
     // frankentorch-l2zki: see `conv3d_im2col_f64`. Padded input, every element written.
     build_uninit(batch * patch_count * patch_width, |panel: &mut [f32]| {
-    panel
-        .par_chunks_mut(patch_width)
-        .enumerate()
-        .for_each(|(row, prow)| {
-            let b = row / patch_count;
-            let pc = row % patch_count;
-            let base_d = (pc / (oh * ow)) * sd;
-            let rem = pc % (oh * ow);
-            let base_h = (rem / ow) * sh;
-            let base_w = (rem % ow) * sw;
-            let batch_off = b * in_ch * pd * ph * pw;
-            for c in 0..in_ch {
-                let ch_off = batch_off + c * pd * ph * pw;
-                let pch = c * kd * kh * kw;
-                for kdd in 0..kd {
-                    let d_off = ch_off + (base_d + kdd) * ph * pw;
-                    let pkd = pch + kdd * kh * kw;
-                    for kr in 0..kh {
-                        let irow = d_off + (base_h + kr) * pw + base_w;
-                        let prow_off = pkd + kr * kw;
-                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+        panel
+            .par_chunks_mut(patch_width)
+            .enumerate()
+            .for_each(|(row, prow)| {
+                let b = row / patch_count;
+                let pc = row % patch_count;
+                let base_d = (pc / (oh * ow)) * sd;
+                let rem = pc % (oh * ow);
+                let base_h = (rem / ow) * sh;
+                let base_w = (rem % ow) * sw;
+                let batch_off = b * in_ch * pd * ph * pw;
+                for c in 0..in_ch {
+                    let ch_off = batch_off + c * pd * ph * pw;
+                    let pch = c * kd * kh * kw;
+                    for kdd in 0..kd {
+                        let d_off = ch_off + (base_d + kdd) * ph * pw;
+                        let pkd = pch + kdd * kh * kw;
+                        for kr in 0..kh {
+                            let irow = d_off + (base_h + kr) * pw + base_w;
+                            let prow_off = pkd + kr * kw;
+                            prow[prow_off..(kw + prow_off)]
+                                .copy_from_slice(&padded[irow..(kw + irow)]);
+                        }
                     }
                 }
-            }
-        });
+            });
     })
 }
 
@@ -42872,7 +42872,11 @@ mod tests {
             assert_eq!(a.to_bits(), b.to_bits(), "narrow pool moved a value at {i}");
         }
         for (i, (a, b)) in arg_a.iter().zip(arg_b.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(), "narrow pool moved an argmax at {i}");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "narrow pool moved an argmax at {i}"
+            );
         }
     }
 
@@ -42885,10 +42889,9 @@ mod tests {
     /// pool has more workers than chunks.
     #[test]
     fn max_pool3d_backward_narrow_pool_is_bit_identical() {
-        for &(batch, ch, id, ih, iw) in &[
-            (2usize, 32usize, 8usize, 8usize, 8usize),
-            (1, 4, 8, 8, 8),
-        ] {
+        for &(batch, ch, id, ih, iw) in
+            &[(2usize, 32usize, 8usize, 8usize, 8usize), (1, 4, 8, 8, 8)]
+        {
             let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
             let in_numel = batch * ch * id * ih * iw;
             let out_numel = batch * ch * od * oh * ow;
@@ -46022,8 +46025,24 @@ mod tests {
             let bias: Vec<f64> = (0..out_ch).map(|c| (c as f64) * 0.25).collect();
 
             let got = super::conv3d_forward_f64(
-                &padded, &weight, Some(&bias), batch, in_ch, pd, ph, pw, 3, 3, 3, od, oh,
-                ow, 1, 1, 1, out_ch,
+                &padded,
+                &weight,
+                Some(&bias),
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                3,
+                3,
+                3,
+                od,
+                oh,
+                ow,
+                1,
+                1,
+                1,
+                out_ch,
             );
 
             let patch_count = od * oh * ow;
@@ -46040,25 +46059,20 @@ mod tests {
                                     let input_channel = batch_offset + c * pd * ph * pw;
                                     let weight_channel = c * 27;
                                     for kdd in 0..3 {
-                                        let input_depth =
-                                            input_channel + (oz + kdd) * ph * pw;
+                                        let input_depth = input_channel + (oz + kdd) * ph * pw;
                                         let weight_depth = weight_channel + kdd * 9;
                                         for kr in 0..3 {
-                                            let input_row =
-                                                input_depth + (oy + kr) * pw + ox;
+                                            let input_row = input_depth + (oy + kr) * pw + ox;
                                             let weight_row = weight_depth + kr * 3;
                                             for kc in 0..3 {
                                                 sum += padded[input_row + kc]
-                                                    * weight[weight_offset
-                                                        + weight_row
-                                                        + kc];
+                                                    * weight[weight_offset + weight_row + kc];
                                             }
                                         }
                                     }
                                 }
                                 let offset = (oz * oh + oy) * ow + ox;
-                                want[(n * out_ch + oc) * patch_count + offset] =
-                                    sum + bias[oc];
+                                want[(n * out_ch + oc) * patch_count + offset] = sum + bias[oc];
                             }
                         }
                     }
@@ -46100,7 +46114,21 @@ mod tests {
 
         for &batch in &[1usize, 2, 4, super::COL2IM_PLANE_MAX_BATCH, 9] {
             let got = super::conv3d_col2im_repeated_row_f64(
-                &dpanel_row, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+                &dpanel_row,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
             );
             let mut want = vec![0.0f64; batch * in_ch * pd * ph * pw];
             for b in 0..batch {
@@ -46154,11 +46182,7 @@ mod tests {
         let (pd, ph, pw) = (5usize, 6usize, 7usize);
         let (kd, kh, kw) = (2usize, 3usize, 2usize);
         let (sd, sh, sw) = (1usize, 2usize, 3usize); // non-unit strides on purpose
-        let (od, oh, ow) = (
-            (pd - kd) / sd + 1,
-            (ph - kh) / sh + 1,
-            (pw - kw) / sw + 1,
-        );
+        let (od, oh, ow) = ((pd - kd) / sd + 1, (ph - kh) / sh + 1, (pw - kw) / sw + 1);
         let padded64: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
             .map(|index| (index % 97) as f64 * 0.125 - 6.0)
             .collect();
@@ -46215,12 +46239,10 @@ mod tests {
         }
 
         // 2-D, f64 and f32, over the same padded plane.
-        let got2_64 = super::conv2d_im2col_f64(
-            &padded64, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-        );
-        let got2_32 = super::conv2d_im2col_f32(
-            &padded32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-        );
+        let got2_64 =
+            super::conv2d_im2col_f64(&padded64, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        let got2_32 =
+            super::conv2d_im2col_f32(&padded32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         let patch_width2 = in_ch * kh * kw;
         let patch_count2 = oh * ow;
         let mut want2 = vec![0.0f64; batch * patch_count2 * patch_width2];
@@ -46232,11 +46254,8 @@ mod tests {
             for c in 0..in_ch {
                 for kr in 0..kh {
                     for kc in 0..kw {
-                        let src = b * in_ch * ph * pw
-                            + c * ph * pw
-                            + (base_h + kr) * pw
-                            + base_w
-                            + kc;
+                        let src =
+                            b * in_ch * ph * pw + c * ph * pw + (base_h + kr) * pw + base_w + kc;
                         let dst = row * patch_width2 + c * kh * kw + kr * kw + kc;
                         want2[dst] = padded64[src];
                     }
