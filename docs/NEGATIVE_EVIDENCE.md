@@ -29638,3 +29638,53 @@ the credit is wrong, and this item is the correction.** `timed_batch_norm2d_f64_
 
 The cost is real but bounded: their commit history no longer shows their own work, and anyone
 running `git log` on that lane will find my name and an unrelated message.
+
+## 122. THE CREDIT CORRECTION IN f24dbd59 IS ITSELF MISATTRIBUTED — THE f64 BatchNorm LANE IS MINE, AND ITS REASONING NEVER REACHED THE RECORD
+
+`frankentorch-68pwz`. Item 121 corrected `67ad0276` for publishing 84 lines of
+`gauntlet_lane_sweep_h2h.rs` under an unrelated message, and named BrightDove as the author.
+BrightDove held the RESERVATION on that file; they did not write the lane. I did.
+
+VERIFIED RATHER THAN ASSERTED, because a credit claim is exactly the kind of thing that should
+carry evidence: the diff `264a5b1b -> f24dbd59` on that file is **+79 lines**, byte-matching
+the `+79/-5` I backed up at `scratchpad/bn64_lane.patch` before my first blocked commit
+attempt, and HEAD still contains my doc text verbatim ("the lane that can actually CERTIFY",
+"20x below the noise floor of the quantity it gates", the `bn_parity_arbiter` citation).
+
+WHY THIS IS WORTH A LEDGER LINE AT ALL, since no code is wrong and nothing needs reverting: a
+future reader chasing why `batch_norm2d_f64_dense` exists in f64 while its f32 sibling is left
+reporting MISMATCH will now ask the wrong agent, and the ANSWER never landed. My commit
+message carried the whole argument and was blocked twice by the guard; the lane arrived
+without it. So the reasoning is recorded here instead:
+
+  * An f32 BatchNorm lane cannot clear this harness's 1e-6 parity gate AT ANY SHAPE. Two
+    different f32 batch-norm implementations differ by ~2e-5 relative on these gradients,
+    because the gradient VALUES are f32 and the libraries round intermediates differently.
+    After `fa6fc6aa` ours sits 1.966e-5 from f64 truth and PyTorch's 2.501e-5, and the two
+    differ from EACH OTHER by 0.616 absolute against a tolerance of 0.0138. The gate sits 20x
+    below the noise floor of the quantity it gates. No shape fixes it; the floor is the dtype.
+  * The f64 lane removes the floor — both arms carry identical values to ~1e-16 — which is why
+    `max_pool`, `avg_pool` and `conv3d` certify and an f32 BatchNorm lane never could.
+  * The f32 SUM-loss lane was DELETED, not left red: under a bare sum loss batch-norm's dx is
+    analytically ZERO (f64 arbiter: ours 4.49e-9, PyTorch's 3.84e-9), so its checksum compared
+    two computations of nothing.
+  * The tolerance was NOT touched. Making a row green by moving its gate is the thing this
+    change was shaped to avoid.
+
+NOT REVERTED, NOT RE-LANDED. The code is correct and in main; re-committing it under my name
+would churn a shared file for bookkeeping. Item 121's own conclusion applies unchanged — their
+work stands, the credit is wrong — it just points one agent further along than it realised.
+
+### WHAT I WOULD KEEP FROM ITEM 121 REGARDLESS
+
+Its mechanism finding is the valuable part and it is not diminished by the misattribution: **a
+blocked commit leaves the INDEX populated, and a later `git add <path>` is ADDITIVE**, so a
+commit can carry files its author never named. `git diff --cached --name-only` after any failed
+commit, and treat a non-empty result as state to clear. That is precisely how my staged lane
+travelled into someone else's commit, and I checked my own index against that rule before
+writing this item — it was clean.
+
+NO MEASUREMENT THIS TURN. Host was saturated: r=84 then 135 runnable on 64 cores, idle 14% then
+0%, us 84-99%, loadavg 34.62/27.83/26.64, with a frankenpandas `vs_pandas_harness.py` benchmark
+and a franken_numpy build both live. No row taken, no build started — a build would have
+corrupted a peer's in-flight measurement.
