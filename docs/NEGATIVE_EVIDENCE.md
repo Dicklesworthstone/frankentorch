@@ -28839,3 +28839,57 @@ removal is still unmeasured and unmeasurable on this board**, because no h2h lan
 conv3d with a non-uniform loss. Real training does. A `conv3d_mse` lane — same shape, loss
 against a target instead of `sum()` — is the measurement that would price it, and unlike the
 resize withdrawn above, that one is worth building.
+
+## 106. THE GroupNorm GAP WAS HIDING BEHIND THE BENCHMARK'S LOSS SHAPE — THE DENSE ROUTE CERTIFIES AT 6.51x SLOWER
+
+`frankentorch-68pwz`. The board's scored `group_norm_f32` lane reads 1.11-1.13x SLOWER. The
+same op under a loss that is not a bare sum reads **6.51x SLOWER against the same incumbent
+in the same invocation**. Both statements are true; only one of them describes what ordinary
+training code runs.
+
+WHY THE LANE DID NOT EXIST UNTIL NOW. Item 103c's sentinel measured the scored lane calling
+the f32 engine's per-element conversion path ZERO times: `tensor_sum` fires the GroupNorm
+sum-shortcut, whose backward takes a SCALAR upstream. So the board had no lane on the route
+where the f32 engine's dy/dx conversions execute, and the only instrument left for levers
+there was an FT-only toggle — maintenance, not a win. This lane is that route with a live
+PyTorch arm beside it, the twin returning `Fn.group_norm(...)**2` so the sample loop's
+`fn(x).sum()` gives the incumbent the same loss (the `avg_pool1d_dense` convention,
+frankentorch-yc7ud). Parity confirms the match rather than assuming it.
+
+THREE INVOCATIONS, same ELF `341a6faa...54c6`, host thinkstation1 (AMD Ryzen Threadripper PRO
+5975WX, x86_64+avx2, governor powersave, rayon_threads=8, online_cpus=64), incumbent PyTorch
+2.12.0+cpu self-reported in the same invocation at threads=8, df /data 100G:
+
+    run  FT ms    PT ms   sq-median   MIN     nulls (PT/FT)      drift    load_1m        typical core MHz
+     1   127.740  19.632  6.51x       6.86x   PASS/PASS          PASS     18.29 -> 15.71  min 1429 med 3284 max 4214
+     2   125.632  19.496  6.44x       6.63x   PASS/0.978 FAIL    PASS     12.94 -> 11.74  min 1429 med 3288 max 4289
+     3   129.874  21.049  6.17x       6.49x   0.960 FAIL/PASS    DRIFTED  12.74 -> 20.58  min 2190 med 3431 max 4289
+
+RUN 1 CERTIFIES: both A/A nulls PASS (min estimator PT 0.996, FT 0.993), drift_gate PASS,
+series_gate PASS (worst_drift 1.232x), parity match, and the harness itself labels it
+QUOTABLE under the min estimator. Runs 2 and 3 do not certify — 2's FT null lands at 0.978,
+two thousandths outside the +/-0.02 band, and 3 was drift-gated by a load spike from 12.74 to
+20.58 mid-run — but both replicate the magnitude: FT arm spans 125.6-129.9 ms (1.034x), PT
+arm 19.50-21.05 ms (1.079x).
+
+**CONSERVATIVE BOUND: at least 6.17x SLOWER**, the weakest of the three readings, with one
+certified row at 6.51x. Cross-core spread ran 2.9-3.0x median throughout and the arms are NOT
+pinned, so the caveat every row on this host carries applies here too.
+
+### WHAT THIS CHANGES
+
+This bead has spent its life chasing a number that the instrument was measuring on the wrong
+route. Item 69's widen, item 103's narrow, the peer's uninit-output lever and the stats-reuse
+lever were all evaluated against a lane whose backward is a scalar shortcut. The real f32
+GroupNorm gap vs PyTorch is on the dense route and it is 6.17-6.51x, not 1.1x.
+
+**The transferable rule, third form.** Item 103c said a lever's route is decided by the LOSS.
+This says the same thing about the MEASUREMENT: a benchmark whose loss is a bare `sum(op(x))`
+is not measuring the op as applications use it, because a bare sum is the one loss shape that
+lets a framework collapse the backward. Every lane on this board that ends in `tensor_sum`
+should be assumed to be scoring a shortcut until a dense twin says otherwise — and
+`frankentorch-372h8` filed exactly that concern as its own bead ("the rest of the lane
+surface gets checked"). It is now confirmed on a second op, with a certified ratio attached.
+
+NOT A REGRESSION AND NOT NEW: nothing got slower. This is a loss that was always there and
+was never in view.
