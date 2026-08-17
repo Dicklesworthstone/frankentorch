@@ -30181,7 +30181,28 @@ shape of items 104 and 114, both of which were regressions aimed at conv3d's 13%
 **Three times now on this bead the memory-shaped intuition has been wrong and the probe has been
 right.** The intuition is not getting better; the probes are just cheap.
 
-## 130. hi9r6's SCAFFOLDING HYPOTHESIS IS REFUTED — conv2d's BACKWARD IS 82% TWO THIN GEMMs RUNNING AT ~28 GFLOP/s
+## 131. INDEPENDENT SECOND PROBE OF conv2d's BACKWARD — SAME REFUTATION, AND THE TWO AGREE TO 3 POINTS
+
+**READ THIS ALONGSIDE ITEM 130, WHICH IS THE SAME FINDING BY A DIFFERENT AGENT AND A DIFFERENT
+PROBE, ARRIVED AT IN THE SAME WINDOW.** We both wrote a `conv2d_generic_phase_probe`, neither
+knew of the other's, and my staged work was swept into their commit `5a38617d` — so the ledger
+briefly carried two `## 130`s. Mine is renumbered rather than deleted, because two independent
+instruments agreeing is stronger evidence than either alone:
+
+    quantity                   item 130 (theirs)   item 131 (mine)
+    GEMM share of backward           79%                81.9%
+    scaffolding share                ~17%               16.0%
+    verdict on 128's hypothesis      REFUTED            REFUTED
+
+Three points apart on the headline, from separately written probes at the same shape. **What
+each adds that the other lacks:** theirs found the **dweight product is still single-threaded**,
+a concrete lever I did not find. Mine prices the GEMMs in **GFLOP/s (~28)** and names the
+mechanism — both are THIN in a dimension set by `out_ch=32`, and the dpanel GEMM's `k=32` is
+shorter than one `DGEMM_KC=256` block. The two explanations are compatible and are probably one
+story seen from two sides: a single-threaded product would also read as terrible GFLOP/s.
+Whoever takes the lever should reconcile them first — "parallelise it" and "reshape it" are
+different fixes, and the first is far cheaper if it suffices.
+
 
 `frankentorch-hi9r6` (P0). The bead states the rule its own history earned: attribute the
 phases BEFORE touching the kernel, because on the conv3d route two of three unprobed attempts
