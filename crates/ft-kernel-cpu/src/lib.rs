@@ -28883,21 +28883,90 @@ mod bidiag {
             return 0.0;
         }
         let alpha = a[start];
+
+        // `tail_sq` is a raw sum of squares, so it silently loses precision once the
+        // squares stop being NORMAL f64 — and that is a reachable regime, not a
+        // theoretical one. On `frankentorch-ga99y`'s fixture (rank 2, scale 1e-20, n=64)
+        // the reduction drives the trailing submatrix down as it sweeps: by reflector
+        // i=18 the generator sees alpha = -1.1196e-158 and beta = 5.4006e-158, whose
+        // squares are ~1e-316 — SUBNORMAL, below f64::MIN_POSITIVE = 2.2251e-308. Half
+        // the mantissa is gone before `sqrt` is even called, and `sqrt` then halves the
+        // remaining error exponent, which is why the damage surfaces at ~sqrt(eps).
+        //
+        // Measured consequence: `tau * (v^T v)`, which must be exactly 2 for
+        // `I - tau*v*v^T` to be orthogonal, came out 1.422e-8 away from 2 at that scale
+        // against 5.773e-15 at unit scale — and P's orthonormality error, 1.644e-8, is
+        // that same number. This is LAPACK `dlarfg`'s safmin rescaling, which this
+        // routine omitted. The bead had retired the mechanism by arguing the entries sit
+        // at ~1e-35 and so cannot underflow; that argument used the INPUT scale, and the
+        // reduction does not stay there.
+        //
+        // The rescale is by a POWER OF TWO taken from the largest magnitude present, so
+        // it is lossless and cannot overflow, and it is entered ONLY when the squares
+        // would leave the normal range — every input at ordinary scales keeps the exact
+        // arithmetic, and its exact bits, that it had before. frankentorch-ga99y /
+        // frankentorch-i3nqm.
+        const SAFE_LO: f64 = 1.4916681462400413e-154; // sqrt(f64::MIN_POSITIVE)
+        const SAFE_HI: f64 = 1.3407807929942596e154; // sqrt(f64::MAX)
+
+        let mut tmax = 0.0f64;
+        for k in 1..len {
+            tmax = tmax.max(a[start + k * stride].abs());
+        }
+        if tmax == 0.0 {
+            return 0.0;
+        }
+
+        if tmax >= SAFE_LO && tmax <= SAFE_HI {
+            let mut tail_sq = 0.0f64;
+            for k in 1..len {
+                let value = a[start + k * stride];
+                tail_sq += value * value;
+            }
+            if tail_sq == 0.0 {
+                return 0.0;
+            }
+            let beta = -house_sign_f64(alpha) * alpha.hypot(tail_sq.sqrt());
+            let tau = (beta - alpha) / beta;
+            let inv = 1.0 / (alpha - beta);
+            for k in 1..len {
+                a[start + k * stride] *= inv;
+            }
+            a[start] = beta;
+            return tau;
+        }
+
+        // Scaled path. `pivot` is the largest magnitude in play, so scaling maps it into
+        // [1,2) and every other value stays below it — nothing can overflow.
+        let pivot = tmax.max(alpha.abs());
+        let pivot_exp = if pivot >= f64::MIN_POSITIVE {
+            ((pivot.to_bits() >> 52) & 0x7ff) as i32 - 1023
+        } else {
+            // Subnormal pivot: its bits are already degraded, but lifting it as far as
+            // the exponent field allows still recovers the sum of squares.
+            -1022
+        };
+        let scale = f64::from_bits((((1023 - pivot_exp).clamp(1, 2046)) as u64) << 52);
+
+        let alpha_s = alpha * scale;
         let mut tail_sq = 0.0f64;
         for k in 1..len {
-            let value = a[start + k * stride];
+            let value = a[start + k * stride] * scale;
             tail_sq += value * value;
         }
         if tail_sq == 0.0 {
             return 0.0;
         }
-        let beta = -house_sign_f64(alpha) * alpha.hypot(tail_sq.sqrt());
-        let tau = (beta - alpha) / beta;
-        let inv = 1.0 / (alpha - beta);
+        let beta_s = -house_sign_f64(alpha_s) * alpha_s.hypot(tail_sq.sqrt());
+        // `tau` and `v` are both scale-INVARIANT — tau is a ratio of two scaled
+        // quantities and v is the tail divided by a scaled quantity — so only `beta` has
+        // to come back down, and dividing by a power of two is exact.
+        let tau = (beta_s - alpha_s) / beta_s;
+        let inv = 1.0 / (alpha_s - beta_s);
         for k in 1..len {
-            a[start + k * stride] *= inv;
+            a[start + k * stride] = (a[start + k * stride] * scale) * inv;
         }
-        a[start] = beta;
+        a[start] = beta_s / scale;
         tau
     }
 
