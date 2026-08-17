@@ -28711,7 +28711,7 @@ last row that passed its gates. The live measurement is ~1.2x FASTER, replicated
 uncertified. Both statements are true and the second does not replace the first until a row
 certifies on a resized lane.
 
-## 105. ITEM 104's FIX WAS HALF THE DEFECT — THE SAME ROUTE HAS A SECOND GEMM WITH A DIFFERENT k, AND MY OWN NEW TEST WAS BLIND TO IT
+## 107. ITEM 104's FIX WAS HALF THE DEFECT — THE SAME ROUTE HAS A SECOND GEMM WITH A DIFFERENT k, AND MY OWN NEW TEST WAS BLIND TO IT
 
 `frankentorch-ikw6q`, reopened against myself one commit later.
 
@@ -28764,3 +28764,78 @@ the test is now green.
 NOT MEASURED: no-certify turn. Replacing a hand-rolled parallel reduction with a `dgemm` call
 on a 1 x out_ch x patch_width problem is a small shape change in an already-tiny phase; no
 ratio is claimed and none was taken.
+
+## 108. conv3d IS CERTIFIED FASTER THAN PyTorch — 2.50x SLOWER TO 1.25-1.31x FASTER, AND ITEM 106a's RESIZE TASK IS WITHDRAWN
+
+The bead's worst standing all campaign is now a certified win. Two certifications in one
+quiet window, on the same ELF, with live PyTorch 2.12.0+cpu in each invocation.
+
+### 108a. THE CERTIFIED ROWS
+
+    q2   conv3d   MIN 1.25x FASTER   ratio 1.246 [1.169,1.306]
+                  FT 5.017 ms   PT 6.302 ms
+                  PT null 0.989 PASS   FT null 1.006 PASS   parity match
+                  drift PASS (load_1m 13.93 -> 13.94), load_series n=18 worst_drift 1.001x
+                  loadavg 12.66 / 17.41 / 18.78 entering the run
+                  cpu_mhz min=1429 median=2516 max=4114 spread=2.879x
+                  typical core 3214 / 3308 / 4114 MHz
+                  CROSS-CORE SPREAD WHILE SAMPLING 2.812x / 2.881x / 2.908x
+
+    q3   conv3d   MIN 1.31x FASTER   ratio 1.310 [1.190,1.357]
+                  FT 6.171 ms   PT 7.071 ms
+                  PT null 0.989 PASS   FT null 1.003 PASS   parity match
+                  drift PASS (load_1m 14.63 -> 16.51)
+                  loadavg 13.00 / 17.02 / 18.60 entering the run
+                  cpu_mhz min=1429 median=3276 max=4109 spread=2.875x
+                  CROSS-CORE SPREAD WHILE SAMPLING 1.010x / 2.823x / 2.969x
+
+    common        RAYON_NUM_THREADS=8, 16 rounds, balanced-square ABBAABBA, mimalloc,
+                  OP WORK ONLY, thinkstation1 (Threadripper PRO 5975WX, powersave)
+                  ELF 9bb8a0d7dc655b0175613051ae47eb4ccb94c0ca5d3284a1933ba2ef9de65de4
+
+The two CIs overlap on [1.190, 1.306]. All four rows taken in the window agree — 1.246,
+1.279, 1.310, 1.323 — and the two that failed their nulls failed them at 1.032-1.060, not on
+the ratio.
+
+**Against the banked certified 0.400 = 2.50x SLOWER (item 94), this is a 3.1-3.3x swing in
+the ratio, and the sign has changed.** The incumbent did not move: PT 6.302 and 7.071 ms sit
+inside the 6.485-9.005 ms band every banked conv3d row has used.
+
+ELF PROVENANCE: built at `ab3713f3`, measured while HEAD had moved to `dd982871`. That
+commit's only appearance of the string `conv3d` in the diff is inside a COMMENT in conv2d
+code — the conv3d path is byte-identical between the two — so the row describes the current
+kernel. Checked, not assumed.
+
+### 108b. ITEM 106a WAS WRONG, AND ITS TASK IS WITHDRAWN
+
+Item 106a explained yesterday's 0-of-6 by saying the lane had "optimised its way out of its
+own measurement window": at ~5.4 ms it was supposedly too short for the A/A null, by analogy
+with `group_norm_f32`, and it filed a lane RESIZE as the next measurement task.
+
+**That was a hypothesis stated with more confidence than it had earned, and it is refuted.**
+The lane certified twice at 5.017 and 6.171 ms without any change to it. The 0-of-6 was the
+HOST — those runs sat at load_1m 18-38 while these sit at 12-16. The harness's own comment
+already said as much and I did not weigh it: 16x was chosen for group_norm to put the
+incumbent "near 4-5 ms, in the band where max_pool3d_nopool, conv3d and prelu all null
+cleanly". Our incumbent arm is 6.3-7.1 ms — inside the band the harness calls clean.
+
+No resize is needed. **Do not spend a tick widening the conv3d lane.** The lesson is the one
+this ledger keeps paying for: a failure to certify under load is not a property of the lane,
+and the fix is a quiet window, not a redesign.
+
+### 108c. ATTRIBUTION IS UNCHANGED AND STILL MOSTLY NOT MINE
+
+As item 106b set out. On this lane: my item 82 (pad un-gather) and item 98 (ones-dout panel,
+28.3 MB -> 1.6 MB); my item 104 does NOT execute here, because the lane's loss is `out.sum()`
+and it takes the ones-dout branch. The peers' levers on the same lane — item 93's col2im
+scatter, items 96 and 101's dead ~30 MB memsets, item 103's serial numel pass, w3pol's gate
+cap — are collectively larger than mine and were not measured individually. The certified
+number belongs to the lane, not to any one agent, and least of all to me.
+
+### 108d. WHAT IS NOW OWED
+
+The lane is a win, so the interesting question moves on: **item 104's generic-path panel
+removal is still unmeasured and unmeasurable on this board**, because no h2h lane drives
+conv3d with a non-uniform loss. Real training does. A `conv3d_mse` lane — same shape, loss
+against a target instead of `sum()` — is the measurement that would price it, and unlike the
+resize withdrawn above, that one is worth building.
