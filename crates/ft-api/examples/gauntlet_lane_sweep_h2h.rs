@@ -392,6 +392,59 @@ fn timed_group_norm_f32_dense(values: &[f32], weight: &[f32], bias: &[f32]) -> (
     (elapsed, checksum)
 }
 
+/// BatchNorm2d f32 — the half of `frankentorch-68pwz` that has never had a lane at all.
+///
+/// The bead has carried "BatchNorm2d is about 5.7x slower" as an UNVERIFIED figure since it
+/// was filed, explicitly because there was no h2h lane and therefore no way to check it with
+/// the trusted instrument. Every number this bead has produced so far is GroupNorm's. These
+/// two lanes are the first live incumbent arm BatchNorm2d has had.
+///
+/// SHAPE AND PARAMETERS ARE THE GroupNorm FIXTURES, deliberately: same `[32,64,56,56]` input
+/// and the same 64-channel affine pair, so a BatchNorm row can be read directly against the
+/// GroupNorm rows beside it without a second shape to control for.
+///
+/// `running_mean`/`running_var` are None on BOTH arms. Torch's `F.batch_norm` UPDATES running
+/// statistics in place when they are passed under `training=True`, so a lane that supplied
+/// them would mutate its own fixture between samples and neither arm would be timing the same
+/// work twice. None keeps both arms pure and still exercises the training path, which is the
+/// one with the backward.
+///
+/// `dense` selects the loss: `false` is `sum(out)`, which fires whatever sum-shortcut exists;
+/// `true` is `sum(out*out)`, the route ordinary training takes. Item 109 showed those are
+/// different backwards for GroupNorm, and the point of carrying both here is to find out
+/// whether BatchNorm splits the same way.
+fn timed_batch_norm2d_f32(values: &[f32], weight: &[f32], bias: &[f32], dense: bool) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable_f32(values.to_vec(), vec![GN_N, GN_C, GN_H, GN_W], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable_f32(weight.to_vec(), vec![GN_C], true)
+        .expect("weight");
+    let b = session
+        .tensor_variable_f32(bias.to_vec(), vec![GN_C], true)
+        .expect("bias");
+    let started = Instant::now();
+    let (out, _, _) = session
+        .functional_batch_norm2d(x, None, None, Some(w), Some(b), true, 0.1, 1e-5)
+        .expect("batch_norm2d");
+    let scored = if dense {
+        session.tensor_mul(out, out).expect("square")
+    } else {
+        out
+    };
+    let loss = session.tensor_sum(scored).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// The same GroupNorm f32 work with NO session and NO tape: the kernels the
 /// session lane actually calls, invoked directly, on f32 throughout.
 ///
@@ -894,6 +947,14 @@ LANES = {
     # sum(out*out) and matches what the FT arm times. Without it the two arms would
     # measure different work and parity would mismatch.
     "group_norm_f32_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
+    # frankentorch-68pwz: BatchNorm2d, the half of the bead that never had a lane. Same
+    # fixtures as the group_norm rows so the two are directly comparable. running_mean and
+    # running_var are None on BOTH arms — torch UPDATES them in place under training=True,
+    # so passing them would mutate the fixture between samples and neither arm would time
+    # the same work twice. Both loss shapes are carried, to find out whether BatchNorm
+    # splits into shortcut and dense routes the way group_norm does (item 109).
+    "batch_norm2d_f32": (gnx, lambda x: Fn.batch_norm(x,None,None,gnw,gnb,True,0.1,1e-5)),
+    "batch_norm2d_f32_dense": (gnx, lambda x: Fn.batch_norm(x,None,None,gnw,gnb,True,0.1,1e-5)**2),
     # frankentorch-jlcmi: incumbent twin for the group_norm uninit A/B.
     "group_norm_f32_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # The FrankenTorch side of this second name calls the two f32 kernels
@@ -1230,6 +1291,17 @@ LANES = {
             // incumbent rather than being read as a lever-off pair.
             "group_norm_f32_dense",
             Box::new(|| timed_group_norm_f32_dense(&gnx, &gnw, &gnb)),
+        ),
+        (
+            // frankentorch-68pwz: BatchNorm2d's first live incumbent arm. Both loss shapes,
+            // so the sum-shortcut/dense split item 109 found on group_norm is measured here
+            // rather than assumed to repeat.
+            "batch_norm2d_f32",
+            Box::new(|| timed_batch_norm2d_f32(&gnx, &gnw, &gnb, false)),
+        ),
+        (
+            "batch_norm2d_f32_dense",
+            Box::new(|| timed_batch_norm2d_f32(&gnx, &gnw, &gnb, true)),
         ),
         (
             "group_norm_f32_kernels",
