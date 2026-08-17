@@ -30384,3 +30384,64 @@ k=8192 has only 9,216 output elements and a reduction 8,192 deep. Tiling the out
 most a few dozen threads' worth of parallelism no matter how it is cut; the work is in k, and
 k is the axis that cannot be split bit-exactly. **Further gains on this product need either a
 ratified tolerance or a different decomposition, not another scheduling pass.**
+
+## 134. REJECTED LEVER — RELAXING THE dgemm_tb COLUMN GATE BUYS 1.04x, NOT THE 2-3x ITEM 132 PREDICTED. MY OWN RECOMMENDATION, REFUTED BY MEASURING IT
+
+`frankentorch-hi9r6` (P0). Item 132 read the gate, found conv2d's dweight product failing it on
+one condition of four, and recommended relaxing it — while insisting the new threshold be
+MEASURED at conv2d's shape rather than lowered until the branch is taken. I took my own advice
+and the answer is no.
+
+### THE LEVER, AS BUILT
+
+A separate `should_parallelize_cols_tb` for `dgemm_tb_scaled` alone, relaxing only the column
+threshold from `n >= 4 * MIN_BLOCK_COLS` (512) to `n >= 2 * MIN_BLOCK_COLS` (256), which admits
+conv2d's `n=288`. Scoped to the transpose GEMM deliberately, on the argument that `dgemm`
+dispatches three ways and can afford a strict gate while `dgemm_tb` has ONE parallel path and
+so is choosing between parallel and SERIAL. That argument still looks right. It just does not
+buy anything.
+
+### THE MEASUREMENT, AND THE SENTINEL THAT MADE IT READABLE
+
+First pass looked like nothing happened (GEMMs 8.972 -> 9.377 ms across two builds), but the
+controls moved too (`im2col` 0.828 -> 0.704), so the window had shifted and the comparison was
+worthless. Rather than report "no effect" — which would have been the mistake this ledger's
+sentinel rule exists to prevent, since "no effect" and "never executed" look identical — the
+gate was given a temporary `FT_TB_COLS_OFF` env override so both states could be measured from
+ONE binary, minutes apart, on one shape:
+
+    tb column split ON    GEMMs 7.613 ms   TOTAL  9.669 ms   im2col 0.686
+    tb column split OFF   GEMMs 7.927 ms   TOTAL 10.330 ms   im2col 0.849
+
+**1.041x on the GEMM phase.** The branch DOES fire — the two states differ — but the `im2col`
+control moved by more between the same two runs (0.686 vs 0.849, 1.24x) than the effect being
+measured. An effect smaller than its own control's noise is not a lever.
+
+### WHY IT DOES NOT PAY, WHICH IS THE PART WORTH KEEPING
+
+`block_cols(288)` with 8 threads is `max(288/8, 128) = 128`, so the split is three UNEVEN blocks
+of 128/128/32 — at most ~2.25x of theoretical parallelism, already far from 8. And each block is
+a separate `dgemm_mm` call that **re-packs the same A panel** (32 x 8192, 262,144 elements).
+Three column blocks means three packs of an A that the serial call packs once. The split trades
+parallelism for redundant packing, and at this shape the trade is roughly even.
+
+**The gate is not mis-set. It is doing its job**, and item 132's "conv2d misses conv3d's fix by
+a threshold" was the right reading of the code and the wrong conclusion about the fix. conv3d's
+n=864 gets 7 blocks from the same `block_cols`, which is why the same branch pays there and not
+here — the difference between the two ops is not that one was overlooked, it is that only one of
+them has enough columns to split.
+
+### WHAT THIS LEAVES
+
+The two GEMMs are still 78-82% of conv2d's generic backward at ~32-40 GFLOP/s, and that is
+still the target. What is now excluded is the cheap explanation. Remaining candidates, none
+measured:
+  * the dpanel GEMM's `k=32`, an inner reduction an eighth of one `DGEMM_KC` block, so it pays
+    full packing overhead for very little arithmetic — this is the shape nobody has priced;
+  * a k-split of dweight, which parallelises the fat dimension but REASSOCIATES and needs item
+    97's machinery;
+  * not doing im2col at all for small kernels — a direct convolution has no panel to pack.
+
+REVERTED, code and sentinel both; tree restored from HEAD, 665 ft-kernel-cpu tests green. The
+rejected diff is kept at `scratchpad/tb_gate_rejected.patch` so the next agent can see exactly
+what was tried rather than trying it again.
