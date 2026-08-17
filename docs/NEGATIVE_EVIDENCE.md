@@ -30262,3 +30262,66 @@ REIMPLEMENTATION of the gather, not the shipping call, and is stated as a bound.
 
 No incumbent, no ratio, no gate: arm-internal attribution. It says which phase to attack and
 is not a standing.
+
+## 132. ITEMS 130 AND 131 RECONCILED BY READING, NOT MEASURING — conv2d's dweight GEMM MISSES conv3d's OWN FIX BY ONE GATE CONDITION
+
+`frankentorch-hi9r6` (P0). Item 131 said the two explanations — "dweight is single-threaded"
+(item 130) and "~28 GFLOP/s, both GEMMs thin" (item 131) — were probably one story from two
+sides, and that they must be reconciled BEFORE a lever is chosen, because *parallelise it* and
+*reshape it* are different fixes. They are one story, and this settles which fix it is. No
+measurement was taken: a frankenfs mounted-kernel bench was in flight, and this needed none.
+
+### THE MECHANISM, EXACTLY
+
+`dgemm_tb_scaled` has exactly ONE parallel path — column-parallel, gated on
+`should_parallelize_cols` — and falls through to a bare serial `dgemm_mm`. conv2d's dweight
+product is `dgemm_tb(m=32, k=8192, n=288)`, and against that gate:
+
+    rayon::current_num_threads() > 1                    ok
+    n > 4 * m                     288 > 128             ok
+    m*k*n >= PAR_MIN_FLOPS_COLS   75.5M >= 16.8M        ok
+    n >= 4 * MIN_BLOCK_COLS       288 >= 512            ** FAILS **
+
+**One condition out of four.** 75,497,472 MACs run on a single core because `n` is 288 and the
+gate wants 512.
+
+### AND conv3d ALREADY HAS THE FIX
+
+`dgemm_tb_scaled`'s own comment records it: "`dgemm_tb` ran single-threaded at every shape. On
+conv3d's generic backward that is the `dweight` product at m=32, k=4096, n=864 — 113M MACs on
+ONE core" (item 118). conv3d's `n=864` clears 512; conv2d's `n=288` does not. **The two ops
+call the same routine, the fix landed for one of them, and the other misses it by a
+threshold** — which is the same gate-mis-set class as `conv3d-direct-gate-misset-w3pol`, where
+a path validated at one shape was gated open-endedly and pessimised every other.
+
+This also explains the ratio the probes measured without either of them naming it: conv2d's
+backward is 79-82% GEMM, and roughly half of that GEMM is a serial product on one of 64 cores.
+~28 GFLOP/s is not a mystery once one of the two products is single-threaded.
+
+### WHAT THE LEVER IS, AND WHAT IT IS NOT
+
+It is NOT "reshape the GEMM". It is the column gate, and the cheap question is what
+`block_cols(288)` yields: with `MIN_BLOCK_COLS = 128` the split is ~2-3 blocks, so relaxing the
+gate buys ~2-3x on this product, not 8x. That is still ~2-3x on half of 80% of the backward, on
+the worst standing on the board.
+
+Two cautions for whoever takes it, both from this ledger's own history:
+  * the gate is not arbitrary — a column split with too few blocks pays a fork/join for little
+    parallelism, which is exactly what `GRADIENT_NARROW_PARALLEL_MIN` was measured to avoid
+    (item 103, where the widen's gate lost 4.3x at the wrong width). The new threshold has to
+    be MEASURED at conv2d's shape, not lowered until the branch is taken;
+  * a k-split would parallelise better (k=8192 is the fat dimension) but REASSOCIATES the
+    reduction, and item 97 is the precedent for what that costs: it needs `DGEMM_KC` and a
+    bit-exactness argument. The column split needs neither, which is why `dgemm_tb_scaled`
+    documents it as bit-exact by construction.
+
+### THE TRANSFERABLE PART
+
+**A shared routine fixed for one caller is not fixed for its siblings, and a gate is how the
+fix fails to travel.** Item 118 fixed `dgemm_tb` for conv3d and the comment names conv3d's
+shape specifically; nothing checked which other callers sat below the threshold. conv2d had no
+h2h lane at the time, so nothing could have noticed. Worth asking of every gate in `mod gemm`:
+which callers fall on the wrong side of it, and were they measured or merely not present?
+
+NOT MEASURED, NOT FIXED. Reading only, with a neighbouring frankenfs mounted-kernel benchmark
+running throughout, which is also why no row was taken.
