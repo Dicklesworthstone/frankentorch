@@ -27340,3 +27340,70 @@ Not a miss rate — **zero consultations**. The recycling pool sat on 76.8 MiB w
 allocated and freed a 28.3 MB panel per backward. That is consistent with 88a and it is the
 only datum here that came from a run rather than from reading. Whether the panel should be
 pooled or should stop existing, 88a answers second.
+
+## 87. qkwsy IS EXONERATED — STATS REUSE IS 1.78x FASTER, AND THE PROBE'S OWN CONTROL CAUGHT MY FIRST ANSWER
+
+Item 85a's three-cell probe, run at last. It produced a wrong answer first, caught it
+itself, and then answered the question.
+
+### 87a. THE FIRST RUN WAS INVALID AND THE PROBE SAID SO
+
+Cells A and M call the IDENTICAL forward, so their forward timings must agree. On the first
+run they did not:
+
+    A.fwd 2.745 ms      M.fwd 1.521 ms      1.80x apart, same function
+
+A ran first in every rep and paid cold allocator and page state; M never did. The `A -> M`
+figure that fell out — a clean-looking **2.15x** that would have condemned
+`frankentorch-qkwsy` — was that artifact and nothing else.
+
+Fixed with an untimed warmup of all four kernels before the timed loop, and the shared-
+forward agreement is now an explicit printed CONTROL rather than a coincidence in a column
+someone has to notice. It reads **1.003x** on the corrected run.
+
+**This is the discipline items 74, 75, 80c and 86 kept failing, finally caught before the
+claim rather than after.** The probe was designed with a component shared between two cells;
+that made a self-check possible; the self-check fired.
+
+### 87b. THE ANSWER, on the corrected run
+
+    cell                                   fwd ms   bwd ms
+    A  stats-fwd + stats-bwd   (ships)      3.015    1.173
+    M  stats-fwd + recomputing-bwd          3.024    2.090
+    B  scheduled-fwd + recomputing-bwd      2.625    1.960
+
+Forward held fixed, backward switched: **1.173 -> 2.090 ms. Reusing the forward's
+statistics is 1.78x FASTER than recomputing them.**
+
+`frankentorch-qkwsy` is EXONERATED. Its premise — that rebuilding the statistics costs two
+extra full passes over the input — is correct, and item 84's suggestion that stats reuse
+might be a regression is refuted. **The session's backward already calls the faster route
+and must not be changed.** Had item 84 acted on its 5/5 replication, it would have made this
+lane 1.78x slower on the backward.
+
+Backward held fixed, forward switched: the stats-EMITTING forward costs 3.015 against the
+scheduled forward's 2.625, so emitting statistics is worth about 0.39 ms — real, and far
+smaller than the 0.92 ms the backward saves by consuming them. The lever nets positive.
+
+### 87c. AN UNRESOLVED CONTRADICTION, recorded rather than smoothed
+
+This probe totals A at 4.189 ms and B at 4.585 — **A, what ships, is 1.09x FASTER**. The
+harness lanes in items 84 and 86 put B ahead of A by 1.19x, in 6 of 6 runs and from both the
+FT-only and the vs-incumbent side. **These disagree in DIRECTION**, so my reconstruction of
+the two routes is not equivalent to what those lanes execute — the lanes also run a `sum`,
+build tensors differently, and interleave with a live incumbent co-process.
+
+Item 84's gap therefore remains unexplained. What is now settled is only the sub-question it
+was blocking: the stats path is not the cost, and it is a win.
+
+One further caution from this run: cell M's best combined rep (8.174 ms) is far above the
+sum of its own phase minima (3.024 + 2.090 = 5.114), meaning M's fast forward and fast
+backward never coincided. A and B are self-consistent to three decimals. M is the noisy
+cell, and its TOTAL should not be quoted.
+
+All three cells' `|dx|` checksums are identical to the digit (4.425998e5, relative spread
+0.000e0), so the three routes compute the same gradient and the comparison is between
+timings, not answers.
+
+Observed loadavg 29.35 / 45.51 / 60.67 falling to 26.34 / 42.01 / 58.60; CPU 1429-4143 MHz,
+idle spread 2.78x; iowait 0%. df read 161G, checked before each build.

@@ -84,8 +84,7 @@ fn main() {
         vec![GN_N, GN_C, GN_H, GN_W],
         DType::F32,
         ft_core::Device::Cpu,
-    )
-    .expect("meta");
+    );
 
     println!("group_norm_route_isolation_probe (frankentorch-68pwz, item 84b)");
     println!("shape [{GN_N},{GN_C},{GN_H},{GN_W}] groups={GN_GROUPS} cpg={cpg} spatial={spatial}");
@@ -93,6 +92,35 @@ fn main() {
     println!("pre  loadavg {}", loadavg());
     println!("pre  cpu_mhz {}", cpu_mhz());
     println!();
+
+    // ORDERING CONTAMINATION, found by this probe's own control on its first run.
+    //
+    // Cells A and M call the IDENTICAL forward. On the first version of this probe — which
+    // ran A, then M, then B inside each rep with no warmup — that shared forward reported
+    // 2.745 ms in A and 1.521 ms in M: a 1.80x gap for the same function, because A paid
+    // the cold allocator and page state every rep and M never did. The "2.15x" that fell
+    // out of A -> M was that artifact, not the stats path.
+    //
+    // Two fixes, both needed. An untimed warmup pass runs every cell once so no cell is
+    // measured cold, and the A/M forward agreement is asserted at the end instead of being
+    // left as a coincidence to notice. A probe whose cells share a component should CHECK
+    // that component reads the same in both, and this one now does.
+    {
+        let (out, stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
+            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, spatial, EPS,
+        );
+        std::hint::black_box(&out);
+        let _ = ft_kernel_cpu::group_norm_backward_scalar_f32_with_cpg2_stats(
+            1.0f32, &x, Some(&weight), &stats, GN_N, GN_GROUPS, spatial,
+        );
+        let _ = ft_kernel_cpu::group_norm_backward_scalar_f32(
+            1.0f32, &x, Some(&weight), GN_N, GN_GROUPS, cpg, spatial, EPS,
+        );
+        let out = ft_kernel_cpu::group_norm_forward_f32_scheduled(
+            &x, Some(&weight), Some(&bias), GN_N, GN_GROUPS, cpg, spatial, EPS, true,
+        );
+        std::hint::black_box(&out);
+    }
 
     let reps = 7;
     // [forward, backward, total] minima per cell.
@@ -176,6 +204,19 @@ fn main() {
     println!("A -> M  (forward held fixed, backward switched): {:.3} ms, {:.2}x", a[2] - m[2], a[2] / m[2]);
     println!("M -> B  (backward held fixed, forward switched): {:.3} ms, {:.2}x", m[2] - b[2], m[2] / b[2]);
     println!("A -> B  (both, i.e. item 84's confounded gap):   {:.3} ms, {:.2}x", a[2] - b[2], a[2] / b[2]);
+    println!();
+    // THE CONTROL. A and M call the same forward, so their forward timings must agree; if
+    // they do not, cell order is still contaminating the comparison and A -> M means
+    // nothing. Stated as a hard check rather than a note, because the first run of this
+    // probe failed it at 1.80x and the failure was only visible to someone reading the
+    // per-phase columns.
+    let fwd_control = a[0].max(m[0]) / a[0].min(m[0]);
+    println!(
+        "CONTROL  A.fwd {:.3} vs M.fwd {:.3} (same function) -> {fwd_control:.3}x{}",
+        a[0],
+        m[0],
+        if fwd_control > 1.10 { "   *** CONTAMINATED — A->M IS NOT READABLE ***" } else { "   ok" }
+    );
     println!();
     println!("VERDICT: whichever single-variable step carries the gap is the lever. If A->M is");
     println!("  flat then the stats path is NOT the cost and frankentorch-qkwsy is exonerated;");
