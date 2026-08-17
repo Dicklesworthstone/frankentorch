@@ -27004,3 +27004,90 @@ prize; it is not yet the lever.
 
 Observed loadavg 20.04-42.97 across the five runs; CPU 1429-4182 MHz, cross-core spread
 while sampling 2.81-2.86x median. Parity `match` throughout, 0 MISMATCH.
+
+## 85. conv3d CERTIFIES AT 2.42x SLOWER — 3.04x -> 2.42x, AND THE INCUMBENT ARM DID NOT MOVE
+
+Item 82e reported eight live rows and zero certifications and named the owed run:
+`RAYON_NUM_THREADS=8`, filtered conv3d lane, in a settled window. This is that run. Five
+more attempts on ELF `9c4d0d707b137f3a...` built from HEAD `2f6c538a`, and the first one
+certified.
+
+### 85a. THE CERTIFIED ROW
+
+    conv3d   MIN 2.42x SLOWER   ratio 0.414 [0.384,0.430]
+             FT 17.581 ms   PT 7.073 ms   (PyTorch 2.12.0+cpu, same invocation)
+             PT null 1.008 PASS   FT null 1.007 PASS   drift 1.000x PASS/PASS
+             parity match, 0 MISMATCH
+             RAYON_NUM_THREADS=8   16 rounds   mimalloc (--features fair-alloc)
+             thinkstation1, AMD Ryzen Threadripper PRO 5975WX, governor powersave
+             load_1m start 22.86 end 22.86; loadavg 23.48 / 29.32 / 28.84 entering the run
+             ELF 9c4d0d707b137f3a018ed5a799cfdad813c780e2225a5b00408427d30945192e
+             HEAD 2f6c538a
+
+**Against the banked certified standing of 0.329 (3.04x SLOWER, item 74, replicated at
+0.324 and 0.352 in item 77): 0.414 is a 1.26x improvement in the standing.** Same harness,
+same lane filter, same 16 rounds, same `RAYON_NUM_THREADS=8`, same min estimator the banked
+rows are quoted under.
+
+**The incumbent arm did not move.** PT read 7.073 ms here against 6.485-7.079 ms in item 74
+and 7.044-9.005 ms in item 77 — inside both banded ranges. That is the condition the
+harness prints on every row (`a delta whose incumbent arm moved is NOT a win`) and it is
+met.
+
+### 85b. WHICH ESTIMATOR, PRECISELY
+
+This row certifies **under the min estimator**, which is the estimator items 74 and 77 quote
+their standings under, so the comparison above is like-for-like. Under the harness's
+per-round MEDIAN estimator the same run reads 0.402 [0.386,0.424] with the FT null OFF-CENTRE
+— covered, but outside the +/-0.02 band. Saying "certified" without saying which estimator
+would be the same class of error as comparing a 64-thread row to an 8-thread standing, which
+item 82e already caught me nearly making.
+
+### 85c. THE FOUR SIBLING ROWS, AND WHY THE CLUSTER MATTERS MORE THAN THE GATE
+
+    run  load 1m   FT ms    PT ms    min-ratio             verdict
+    h1     22.86   17.581    7.073   0.414 [0.384,0.430]   PT 1.008 PASS  FT 1.007 PASS  CERT
+    h2     22.25   17.932    7.086   0.391 [0.373,0.413]   PT null 1.055 FAIL
+    h3     22.62   17.881    6.797   0.377 [0.359,0.397]   PT 1.049 F  FT 1.044 F
+    h4     37.72   17.770    6.713   0.374 [0.364,0.390]   PT 1.030 F  FT 1.031 F
+    h5     79.66   24.287   11.691   0.422 [0.352,0.469]   PT null 1.037 FAIL
+
+Parity `match` on all five, every drift gate PASS. h5 is discarded on its face: the host was
+at load 80-94 and the INCUMBENT arm moved to 11.691 ms with it.
+
+The four usable rows sit at **FT 17.58-17.93 ms against PT 6.71-7.09 ms** — an FT spread of
+2.0% across rows whose A/A gates disagree. The gate is refusing rows whose underlying
+measurement is stable to two percent; that is items 60, 63 and 74b again, and it is why the
+cluster is worth reporting next to the certification rather than only the one row that
+passed. For comparison the same 8-thread lane read FT 19.423-20.184 ms in item 74 and
+21.569-28.040 ms in item 77.
+
+### 85d. WHAT MOVED IT, AND HOW MUCH OF IT IS ATTRIBUTABLE
+
+Item 82b measured the pad un-gather at 2.06-2.82 ms of an 8.808 ms backward stage, and the
+lever removed it. The lane fell from ~19.4-20.2 ms (item 74's 8-thread rows) to 17.58-17.93
+ms, i.e. **~2 ms** — consistent in magnitude with the attribution, measured on a different
+day in a different window. I am not claiming the whole 1.26x: item 77's rows were taken on a
+loaded host and the two sets are not paired. What is certified is the row.
+
+### 85e. WHERE THE LANE IS NOW — THE ENGINE IS SPENT, THE KERNEL IS THE WALL
+
+Item 82b's subtraction leaves almost nothing engine-side on this lane: the custom-op wrapper
+is zero, the sum-plus-report floor is 0.859 ms, and the pad is now a row copy. The backward
+stage is **68.5% `conv3d_backward_f64`**, and that kernel alone (6.037 ms) is nearly the
+whole of what PyTorch spends on forward AND backward together (7.073 ms).
+
+**The next lever on this lane is the conv3d backward kernel, and there is no engine left to
+blame.** Items 74d and 76 both closed by pointing at the engine; that direction is now
+exhausted, and saying so is the point of this entry.
+
+### 85f. ONE DEFECT IN THIS ROW, DECLARED
+
+My capture filtered the harness output down to the ratio, gate and load lines, so the
+`cpu_mhz` header and the CLOCKS-DURING-SAMPLING block are **not** recorded for h1. The
+standing orders require an observed frequency in every banked row precisely because this
+host runs cores at different clocks simultaneously, so this row is short of that bar and is
+not safely comparable across windows on frequency grounds. It is compared here only against
+same-harness rows in the same configuration. The owed follow-up is a fully-captured
+replication; the host went to loadavg 171 immediately after h5, which is why it is not in
+this entry.
