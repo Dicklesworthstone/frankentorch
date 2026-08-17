@@ -27921,13 +27921,13 @@ exact arbiter, and both times the SHIPPING route was the one that turned out to 
 which is right, and reaching for a policy call at that moment ratifies whichever one happened
 to ship first.
 
-## 95. THE conv3d STREAMED FORWARD ZERO-FILLED ~30 MB PER CALL THAT IT THEN FULLY OVERWROTE
+## 96. THE conv3d STREAMED FORWARD ZERO-FILLED ~30 MB PER CALL THAT IT THEN FULLY OVERWROTE
 
 Shipped in `42eb634a`. Small, certain, and bit-exact — banked mainly because the largest of
 the three buffers is invisible at a glance, and because of what item 90's re-gate did to
 this function's importance.
 
-### 95a. THE RE-GATE MADE THIS CODE HOT
+### 96a. THE RE-GATE MADE THIS CODE HOT
 
 Before item 90, the scored lane's forward ran the DIRECT kernel and never touched
 `conv3d_forward_streamed_f64`. Capping the gate at `in_ch=8` moved the lane onto the
@@ -27936,7 +27936,7 @@ commit onward, on its critical path. **Closing one gap can promote code that was
 unreachable into the hot path, and the new hot path has not been reviewed for the thing you
 just fixed elsewhere.** Worth doing deliberately after every re-route.
 
-### 95b. THE THREE BUFFERS
+### 96b. THE THREE BUFFERS
 
     ptile     ~110 KB, allocated once PER TILE (~4 per thread), fully overwritten by the
               copy_from_slice walk  ->  ~28 MB of dead memset per forward on the lane
@@ -27957,7 +27957,7 @@ zero-fill is real rather than notional.
 accumulating into it. Had it accumulated, dropping the zero-fill would have been a silent
 correctness bug that no shape-independent test would reliably catch.
 
-### 95c. THE TEST, and why it is not bitwise
+### 96c. THE TEST, and why it is not bitwise
 
 `conv3d_streamed_forward_writes_every_uninitialized_slot` scores the forward against an
 independent naive convolution at four shapes.
@@ -27988,3 +27988,73 @@ dropped from the index rather than swept in. Notably that test —
 exact-reference technique being applied by its owner to the lever item 89 rejected. The
 technique transferred without being handed over, which is the point of banking a method and
 not just a result.
+
+## 97. A GEMM's k DIMENSION *CAN* BE SPLIT FROM OUTSIDE BIT-EXACTLY — matrixmultiply ALREADY PARTITIONS IT, AND THE PARTITION IS 256
+
+Found by READING, during a disk hard-stop with no builds available. No measurement is
+claimed here and none was possible; this is a mechanism and a caveat.
+
+### 97a. THE STANDING BELIEF THIS QUALIFIES
+
+Items 89, 90 and 95 all rest on the same fact: `gemm::dgemm` delegates to `matrixmultiply`,
+which BLOCKS the k dimension, so a reduction over k does not accumulate as one ascending
+chain and no hand-written chain reproduces it. That has been treated — by me in item 90d,
+and as the ground for item 89's rejection — as meaning **the GEMM's k order is opaque and
+can only be matched by calling the same GEMM on the same whole k**.
+
+It is not opaque. `matrixmultiply-0.3.11/src/gemm.rs`, LOOP 4:
+
+    // LOOP 4: split k in kc parts (A, B)
+    for (l4, kc) in range_chunk(k, kkc) {
+        ...
+        // First time writing to C, use user's `beta`, else accumulate
+        let betap = if l4 == 0 { beta } else { <_>::one() };
+
+**The k partition is an ascending chunk walk with accumulation into C between chunks**, and
+the chunk size is `K::kc()`, which for the f64 kernel is `archparam::D_KC`:
+
+    archparam_defaults.rs:50    pub const D_KC: usize = 256;
+    archparam.rs:31             conf_env_or_default!("MATMUL_DGEMM_KC", ...D_KC)
+
+So splitting a GEMM's k into ascending 256-row blocks OUTSIDE the call, with `beta=0` on the
+first block and `beta=1` after, performs the identical sequence of floating-point operations
+in the identical order — bit-for-bit — because each outer block then contains exactly one
+internal LOOP 4 chunk. The short final chunk matches too, since `range_chunk` yields it the
+same way. The column-parallel path does not disturb this: it splits N and each column block
+runs its own full LOOP 4, so the per-column k sequence is unchanged.
+
+### 97b. WHAT THIS WOULD BUY, AND WHY IT IS STILL NOT THE RECOMMENDATION
+
+The conv3d ones-dout backward materializes a 28.3 MB im2col panel purely so one
+`dgemm(1, flat, patch_width, ones, panel, ...)` can column-sum it. k there IS the panel's
+row count, so the panel could be generated 256 rows at a time into a cache-resident buffer
+and accumulated — the DRAM round-trip gone, and **bit-exactness preserved with no accuracy
+argument required at all**, which is what item 89 could not offer.
+
+**I am nonetheless not recommending it as the conv3d fix, for two reasons.**
+
+1. **It couples us to a dependency's internal tuning constant.** `D_KC` is private, is
+   `conf_env_or_default!` on `MATMUL_DGEMM_KC`, and is exactly the kind of number a
+   dependency retunes in a patch release. Hardcoding 256 buys bit-exactness that breaks
+   SILENTLY — the code still computes a convolution, just not the same bits — on a
+   `cargo update` or a stray env var. A test would catch it only if it pinned bits at a
+   shape with `k > 256`, which is a subtle thing to remember to keep.
+2. **Item 95 found a strictly better answer.** Scored against an exact sum, the no-panel
+   route with a BLOCKED reduction beats the shipping panel+GEMM route outright (1.51 vs
+   2.26 worst ULP). That removes the panel with no dependency coupling whatsoever, and it
+   wins on accuracy rather than merely tying. A route that is more accurate and less
+   fragile dominates one that is exactly as accurate and more fragile.
+
+So this is banked as a TOOL, not as a plan: **when bit-exactness against an existing GEMM is
+genuinely mandatory — locking a golden, or proving a refactor inert — you may split k at
+exactly `kc` instead of being forced to keep the whole operand live.** Assert the constant
+in the test that depends on it rather than trusting it.
+
+### 97c. THE CORRECTION TO MY OWN EARLIER WORDING
+
+Item 90d and [[project_exact_rational_arbiter]] both say a strided reduction "cannot
+reproduce a GEMM column sum bit-for-bit". The accurate statement is narrower: **a FLAT
+ascending chain cannot, because the GEMM's is partitioned — but the partition is a
+documented, readable, reproducible 256.** The wall was never the opacity of the reduction;
+it was the shape of it, and the shape is public. Worth keeping straight, because "opaque
+dependency internals" invites giving up and "a partition I can read" does not.
