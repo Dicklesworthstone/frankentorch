@@ -31195,3 +31195,91 @@ un-enumerated" (item 143, refuted by reading). **The fix is one line, and it was
 after four wrong answers were cleared away.** Every one of those four was arrived at by
 subtracting rather than measuring, or by reading rather than executing; the one that worked came
 from enumerating the function and finding that nothing was missing.
+
+## 147. THE SUMMED ROUTE's FT NULL FAILS BECAUSE SLOT 0 IS COLD — A PER-ROUND WARMUP ARTEFACT OF THE SWEEP, NOT A KERNEL DEFECT
+
+`frankentorch-hi9r6` (P0). Items 144c and 145a established that the summed conv2d route's FT A/A
+null is biased one-sided high (six of six rows, 1.065-1.199) while the masked route's scatters
+around 1.0, and item 145c refuted the arm-ratio explanation. `FT_H2H_DUMP_SLOTS` — which prints
+the raw four slots per arm per round and which item 145 did not know existed — settles it.
+
+Host `thinkstation1`, `RAYON_NUM_THREADS=8`, ELF `3d9b995b`, torch 2.12.1+cpu, 16 rounds. Run A
+at loadavg 16.4-17.4, CPU idle 30% user 57% iowait 0% verified by vmstat, df 188G. Run B at
+loadavg 22-28. Both drift gates PASS. **A third run was DISCARDED, not read: its own gate said
+`load_1m start=34.05 end=54.02 drift_gate=LOAD-DRIFTED`.** No number below comes from it.
+
+    FT slot medians, ms                slot0     slot1     slot2     slot3   slots1-3 vs slot0
+    run A  conv2d                      6.533     5.374     5.269     5.450   0.82 0.81 0.83
+    run A  conv2d_big                 11.848     9.182     8.531     8.901   0.78 0.72 0.75
+    run A  conv2d_masked              17.186    16.444    16.785    16.469   0.96 0.98 0.96
+    run A  conv2d_big_masked          39.705    42.035    41.020    41.672   1.06 1.03 1.05
+    run B  conv2d                      8.118     6.327     7.037     5.739   0.78 0.87 0.71
+    run B  conv2d_big                 12.105    10.066     8.794     9.328   0.83 0.73 0.77
+    run B  conv2d_masked              20.080    19.406    19.125    18.654   0.97 0.95 0.93
+    run B  conv2d_big_masked          43.889    45.809    45.165    44.842   1.04 1.03 1.02
+
+**The whole bias is slot 0.** On the summed route the round's FIRST sample costs 20-30% more
+than the other three, which agree with each other to within a few percent. On the masked route
+there is no such step — at the bigger batch slot 0 is the FASTEST of the four. These are medians
+over 16 rounds, so it is a per-round effect, not a single cold start at the top of the run.
+
+### 147a. THE MECHANISM, READ OUT OF THE HARNESS
+
+`gauntlet_lane_sweep_h2h.rs:1766` sets `FT_H2H_WARMUP` to 32 iterations and runs them **once for
+each lane before any round begins** — never again. Between one round's samples of a lane and the
+next round's, the other three lanes run. The null is `first_half / second_half`, and slot 0 sits
+in the first half, so a cold slot 0 pushes the null up. Measured directly: run A's
+`firsthalf/secondhalf` for `conv2d_big` is 1.231 against the harness's reported null of 1.152 —
+the same effect, arrived at from the raw slots.
+
+Why the masked route is immune is the interesting half. Its backward allocates an 18.9 MiB
+(37.7 MiB at the big batch) im2col panel on EVERY call, so every sample pays the same cold cost
+and no slot is privileged. The summed route takes the all-ones fast path, allocates far less, and
+can therefore stay warm across samples 2-4 — which is exactly why only IT shows a step. Peer
+item 146 has since taken that same panel allocation as the generic backward's dominant cost, so
+the two findings are the same fact seen from opposite ends: the panel is expensive enough to
+flatten the masked route's slot profile.
+
+### 147b. WHAT IT COSTS — DECISIVE FOR THE GATE, MODEST FOR THE RATIO
+
+The lane estimator is a per-round MEDIAN of four samples, so one cold sample lifts it only a
+little; the null is a ratio of two 2-sample groups, so the same cold sample moves it a lot.
+
+    conv2d      reported 5.780   warm (slots 1-3) ~5.36   estimator inflated ~7.8%   null 1.120
+    conv2d_big  reported 9.274   warm (slots 1-3) ~8.87   estimator inflated ~4.6%   null 1.152
+
+So every summed-route conv2d standing on record — items 128, 135 and 144 — is roughly 5-8%
+**pessimistic in our favour's direction**, i.e. it makes us look slower than steady state, while
+the gate failure it causes is 15-20%. A defect that barely moves the number it is measuring can
+still be the reason the number cannot be quoted.
+
+### 147c. WHAT THIS DOES NOT TOUCH
+
+The certified rows in item 144b are the MASKED lanes, and the masked lanes show no slot-0 step in
+either run. `conv2d_masked` at 5.73x SLOWER and `conv2d_big_masked` at 3.64x SLOWER stand. This
+item explains why the SUMMED lanes could not be certified; it does not revise anything that was.
+
+Nor is this a licence to quote `conv2d_big`'s 1.15-1.25x FASTER. Item 144d's caveat is unaffected
+— PyTorch changed regime between the two batch sizes — and a warm-only estimate of our own arm is
+not a certified row.
+
+### 147d. THE OBVIOUS FIX IS NOT MINE TO MAKE UNILATERALLY
+
+A discarded warm-up sample per lane per round would put every arm in steady state and let the
+gate do its job. It would also change EVERY lane's numbers on a board that a dozen agents quote
+from, which is a coordination decision rather than a code one. Recorded here, raised on the bead,
+and deliberately not implemented in this session.
+
+### 147e. AN UNTESTED PREDICTION, STATED SO IT CAN FAIL
+
+If this mechanism is general, the other lanes whose FT nulls fail in item 145d — `avg_pool2d_nopool`
+at 1.317, `max_pool3d` at 0.861, and the rest of the sum-shortcut cluster — should show the same
+slot-0 step, and lanes that null cleanly (`linear_narrow`) should not. **I attempted exactly that
+run and the host drifted 34 -> 54 under it, so it is unmeasured.** It is written down as owed
+work rather than folded in as support, and a `max_pool3d` slot profile that comes back FLAT would
+confine this item to conv2d.
+
+One observation from the discarded run is deliberately NOT carried forward: PyTorch's
+`conv2d_big` arm read 6.456 ms there against 11.20 ms in runs A and B, which would suggest the
+incumbent's time depends on which other lanes share the sweep. That would matter a great deal if
+true, and a load-drifted run is not evidence for it.
