@@ -30677,3 +30677,76 @@ was unlearned — item 123 is four items back and I cited it while making the mi
 defect is that pool width is invisible in a figure once it is written down.** Every phase number
 in this ledger should carry its `RAYON_NUM_THREADS` in the same line as its milliseconds, and
 the ones that do not should be treated as unattributed until re-measured.
+
+## 140. ITEM 136 IS WRONG — THE GEMMs ARE NOT SHAPE-LIMITED. THEY RUN AT 99-138 GFLOP/s STANDALONE AND THE MISSING ~5 ms IS THE PANEL, NOT THE SHAPE
+
+`frankentorch-hi9r6` (P0). Item 136 concluded conv2d's backward was SHAPE-bound, from a sweep
+showing GFLOP/s scaling almost linearly with `out_ch`, and named the thin `k` as the cause. It
+also said the two GEMMs had never been timed apart and that doing so was the next instrument.
+They have now been timed apart, and item 136's conclusion does not survive it.
+
+`mod gemm` is crate-private, which blocked this from an example — but not from the crate's own
+test module. `conv2d_which_gemm_is_thin` (`#[ignore]`d; it is a measurement, not an assertion)
+times each product at its real shape. RAYON_NUM_THREADS=8 to match every phase number quoted so
+far, min-of-7, loadavg 11.97/11.27/12.89, CPU idle 90-91% verified by vmstat with iowait 0:
+
+    out_ch   dweight ms   GFLOP/s     dpanel ms   GFLOP/s
+        32        1.363     110.8         1.091      138.3
+        64        2.380     126.9         1.647      183.4
+       128        4.520     133.6         3.919      154.1
+       256        7.275     166.0         7.443      162.3
+
+### TWO THINGS THIS KILLS
+
+**1. The GEMMs are not slow.** At the scored `out_ch=32` they run at 110.8 and 138.3 GFLOP/s.
+Item 136 reported the whole backward at ~37 GFLOP/s and called that "30% of its own GEMM
+ceiling" — but the GEMMs themselves were never at 37; they were at ~120.
+
+**2. The scaling item 136 measured is not GEMM shape.** Standalone, GFLOP/s rises only
+110.8 -> 166.0 (1.5x) across 8x `out_ch`. Measured THROUGH the kernel it rose 8.3 -> 111
+(13x). A GEMM whose own efficiency moves 1.5x cannot produce a 13x curve. What produces that
+curve is a cost INDEPENDENT of `out_ch` sitting inside the timed region: normalise a
+constant by out_ch-proportional FLOPs and you get exactly the near-linear rise item 136 saw
+and mistook for shape efficiency.
+
+**Item 136's number was real and its interpretation was wrong.** The sweep was bidirectional
+and its controls were flat, so the curve is not an artefact — it just does not mean what it
+was read to mean.
+
+### WHERE THE TIME ACTUALLY IS
+
+At `out_ch=32`, 8 threads, adding up everything now measured directly:
+
+    dweight GEMM      1.363          im2col            ~0.8
+    dpanel  GEMM      1.091          col2im            ~1.0
+    dpanel  alloc     0.290          dout_flat gather  ~0.27
+    dout_flat alloc   0.027
+    ------------------------------------------------------------
+    accounted                        ~4.9 ms
+    conv2d_backward_f64 measured     9.5-13.4 ms
+
+**~5 ms is unaccounted for, and the allocations are not it** — the 18.0 MiB dpanel buffer costs
+0.290 ms to allocate and zero, not milliseconds.
+
+The likely mechanism, stated as the hypothesis it is: the standalone GEMMs reuse one 18 MiB
+panel across all seven reps, and this part has 128 MiB of L3, so the panel is WARM. Inside the
+kernel that panel has just been written by im2col and is being streamed cold. That is the
+in-situ-versus-standalone trap this ledger already records (a standalone ladder that INVERTED
+in situ on allocator warmth), and it means my standalone figures are an upper bound on GEMM
+efficiency, not a measurement of what the kernel gets.
+
+### WHAT THIS DOES TO THE LEVER
+
+Item 136 pointed at "do not decompose for small out_ch, the GEMM shape is wrong". That is now
+unsupported. If the cost is streaming an 18 MiB panel rather than the GEMM's shape, the lever is
+**panel traffic** — which is what conv3d's items 98 and 119 attacked, and conv3d is the op that
+ended up 4x better on this route. `dgemm_tb_add_into` still exists in `mod gemm`, uncalled since
+item 117's revert, and it is precisely the primitive for consuming a panel in `DGEMM_KC` blocks
+instead of materialising it. It has been marked `#[allow(dead_code)]` with that history rather
+than deleted.
+
+NOT PROVEN: the warm-L3 explanation is inferred from the 5 ms gap, not isolated. Isolating it
+means timing the GEMM immediately after an im2col of the same panel versus on a re-used one,
+which is one more probe and should come before any lever. Three hypotheses on this P0 have now
+been killed by measurement (scaffolding, gate, shape); the discipline that killed them is the
+only reason to trust the fourth.

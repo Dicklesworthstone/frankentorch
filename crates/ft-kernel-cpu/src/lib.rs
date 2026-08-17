@@ -270,6 +270,15 @@ mod gemm {
     /// `alpha=1, beta=1` shape as `dgemm_sub_into`'s "beta=1 accumulates", without the
     /// column split: the caller drives k, and every output element still accumulates over
     /// the whole of k in ascending order. NEGATIVE_EVIDENCE items 97 and 100.
+    // RETAINED THOUGH CURRENTLY UNCALLED. Its only caller was the streamed-panel conv3d
+    // backward, which item 117 measured as a 1.7x REGRESSION and `c1ac85d2` reverted — so this
+    // is dead code by revert, not by oversight. Kept rather than deleted because item 100
+    // banked the DESIGN it implements (a k dimension split from outside, accumulating into one
+    // C) and item 97 established the `DGEMM_KC` partition that makes that split bit-exact;
+    // deleting it would discard a documented, measured design that a future panel-elimination
+    // lever is the obvious consumer of. `#[allow(dead_code)]` rather than a stray `pub` so the
+    // reason is recorded where the compiler would otherwise just complain.
+    #[allow(dead_code)]
     pub fn dgemm_tb_add_into(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
         if m == 0 || n == 0 || k == 0 {
             return;
@@ -41427,7 +41436,7 @@ mod tests {
             let group_numel = cpg * spatial;
             let numel = batch * num_groups * group_numel;
             let x: Vec<f32> = (0..numel)
-                .map(|i| ((i as f32 * 0.037).sin() * 0.7 + (i % 13) as f32 * 0.011 - 0.4))
+                .map(|i| (i as f32 * 0.037).sin() * 0.7 + (i % 13) as f32 * 0.011 - 0.4)
                 .collect();
             // Deliberately NOT all-ones: an all-ones dy takes the scalar shortcut instead.
             let dy: Vec<f32> = (0..numel)
@@ -41496,10 +41505,142 @@ mod tests {
         }
     }
 
+    /// Which of conv2d's TWO GEMMs carries the shape loss? — `frankentorch-hi9r6`, item 136.
+    ///
+    /// Item 136 measured conv2d's backward at ~30% of its own GEMM ceiling and showed
+    /// efficiency scaling almost linearly with `out_ch`. But `out_ch` moves BOTH thin shapes at
+    /// once — the dpanel GEMM's `k` and the dweight GEMM's `m` — so that sweep could say the
+    /// loss is SHAPE without saying WHICH shape. Item 136 named separating them as the next
+    /// instrument and noted `mod gemm`'s privacy blocks it from an example. It does not block it
+    /// from here: this module is inside the crate.
+    ///
+    /// `#[ignore]` on purpose. It is a measurement, not an assertion — it would add seconds to a
+    /// suite a dozen agents run, and it can only fail by panicking. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test --release -p frankentorch-kernel-cpu --lib \
+    ///     conv2d_which_gemm_is_thin -- --ignored --nocapture
+    /// ```
+    ///
+    /// Both products carry the SAME MAC count at every point, so ms and GFLOP/s are directly
+    /// comparable between them; the only difference is which dimension is thin.
+    #[test]
+    #[ignore = "timing probe, not an assertion — see the doc comment for how to run it"]
+    fn conv2d_which_gemm_is_thin() {
+        use std::time::Instant;
+        const FLAT: usize = 8192; // batch * oh * ow at hi9r6's shape
+        const PATCH: usize = 288; // in_ch * k * k
+        const REPS: usize = 7;
+
+        println!();
+        println!("conv2d_which_gemm_is_thin (frankentorch-hi9r6, item 136 follow-up)");
+        println!("flat={FLAT} patch_width={PATCH}; both products are out_ch*flat*patch_width MACs");
+        println!(
+            "{:>7}  {:>12}  {:>10}  {:>12}  {:>10}",
+            "out_ch", "dweight ms", "GFLOP/s", "dpanel ms", "GFLOP/s"
+        );
+
+        for out_ch in [32usize, 64, 128, 256] {
+            // dweight = dout_flat^T @ panel : dgemm_tb(m=out_ch, k=flat, n=patch_width). m THIN.
+            let a_tb: Vec<f64> = (0..FLAT * out_ch)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let b_tb: Vec<f64> = (0..FLAT * PATCH)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            let mut c_tb = vec![0.0f64; out_ch * PATCH];
+
+            // dpanel = dout_flat @ weight : dgemm(m=flat, k=out_ch, n=patch_width). k THIN.
+            let b_mm: Vec<f64> = (0..out_ch * PATCH)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            let mut c_mm = vec![0.0f64; FLAT * PATCH];
+
+            let mut tb_best = f64::INFINITY;
+            let mut mm_best = f64::INFINITY;
+            for _ in 0..REPS {
+                let started = Instant::now();
+                super::gemm::dgemm_tb(out_ch, FLAT, PATCH, &a_tb, &b_tb, &mut c_tb);
+                tb_best = tb_best.min(started.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&c_tb);
+
+                let started = Instant::now();
+                super::gemm::dgemm(FLAT, out_ch, PATCH, &a_tb, &b_mm, &mut c_mm);
+                mm_best = mm_best.min(started.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&c_mm);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let flops = 2.0 * (out_ch * FLAT * PATCH) as f64;
+            println!(
+                "{out_ch:>7}  {tb_best:>12.3}  {:>10.1}  {mm_best:>12.3}  {:>10.1}",
+                flops / (tb_best * 1e6),
+                flops / (mm_best * 1e6)
+            );
+        }
+        println!(
+            "READING IT: whichever product's GFLOP/s climbs with out_ch is the one whose thin \
+             dimension costs; whichever is already flat is not the target."
+        );
+
+        // THE FIXED COSTS the phase probe could not see. `conv2d_backward_f64` allocates two
+        // zeroed buffers before it does any arithmetic, and only ONE of them scales with
+        // `out_ch`. A cost independent of `out_ch` is invisible to an `out_ch` sweep that
+        // normalises by out_ch-proportional FLOPs — it would masquerade as efficiency RISING
+        // with out_ch, which is exactly the curve item 136 reported.
+        println!();
+        println!("FIXED-COST BUFFERS (min of {REPS}), the part an out_ch sweep cannot see:");
+        let mut dpanel_alloc = f64::INFINITY;
+        for _ in 0..REPS {
+            let started = Instant::now();
+            let buf = vec![0.0f64; FLAT * PATCH];
+            dpanel_alloc = dpanel_alloc.min(started.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(&buf);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let mib = (FLAT * PATCH * 8) as f64 / (1024.0 * 1024.0);
+        println!(
+            "  dpanel  vec![0.0; {}] = {mib:.1} MiB   {dpanel_alloc:>8.3} ms   INDEPENDENT of out_ch",
+            FLAT * PATCH
+        );
+        for out_ch in [32usize, 256] {
+            let mut df = f64::INFINITY;
+            for _ in 0..REPS {
+                let started = Instant::now();
+                let buf = vec![0.0f64; FLAT * out_ch];
+                df = df.min(started.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&buf);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let m = (FLAT * out_ch * 8) as f64 / (1024.0 * 1024.0);
+            println!(
+                "  dout_flat vec![0.0; {}] = {m:.1} MiB  {df:>8.3} ms   (out_ch={out_ch})",
+                FLAT * out_ch
+            );
+        }
+    }
+
     #[test]
     fn conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise() {
         // batch, in_ch, ph, pw, kh, kw, sh, sw
-        let cases: &[(usize, usize, usize, usize, usize, usize, usize, usize)] = &[
+        // Named rather than spelled inline: clippy flags the bare 8- and 9-tuples as complex
+        // types, and the names also say what the positions MEAN, which a tuple of eight
+        // `usize` cannot.
+        /// `(batch, in_ch, ph, pw, kh, kw, sh, sw)`
+        type ConvCase = (usize, usize, usize, usize, usize, usize, usize, usize);
+        /// `ConvCase` plus `out_ch`, which is the dpanel GEMM's k and needs its own coverage.
+        type ConvCaseWithOutCh = (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        );
+
+        let cases: &[ConvCase] = &[
             // the bead's repro: oh = ow = 64, flat = 2*64*64 = 8192 = 32 * DGEMM_KC
             (2, 3, 66, 66, 3, 3, 1, 1),
             // flat = 2*30*30 = 1800, NOT a multiple of 256 (ragged tail)
@@ -41515,17 +41656,7 @@ mod tests {
         // block and therefore blind to a chained-vs-blocked difference in exactly the way
         // the ORIGINAL proofs were blind for `flat`. Repeating that mistake one function
         // over is the specific failure this case exists to prevent.
-        let all: Vec<(
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        )> = cases
+        let all: Vec<ConvCaseWithOutCh> = cases
             .iter()
             .map(|&(b, ic, ph, pw, kh, kw, sh, sw)| (b, ic, ph, pw, kh, kw, sh, sw, 4usize))
             .chain([
