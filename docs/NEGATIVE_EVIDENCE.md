@@ -28589,7 +28589,7 @@ surface would get checked. That check had not reached here. Before pricing any g
 run the sentinel: `narrow_counts()`-style execution evidence costs one relaxed atomic and
 settles in one run what source reading got wrong twice.
 
-## 104. ikw6q's FALSE BIT-EXACT CLAIM IS NOW TRUE — conv2d/conv1d FOLD ON THE GEMM's k BOUNDARIES, AND THE OLD PROOFS COULD NOT HAVE SEEN THE BUG
+## 105. ikw6q's FALSE BIT-EXACT CLAIM IS NOW TRUE — conv2d/conv1d FOLD ON THE GEMM's k BOUNDARIES, AND THE OLD PROOFS COULD NOT HAVE SEEN THE BUG
 
 `frankentorch-ikw6q`, closed by making the claim true rather than by conceding a tolerance.
 
@@ -28638,3 +28638,75 @@ golden had pinned the wrong values.
 NOT MEASURED: this turn is under a no-certify instruction, and the change is a summation
 ORDER change with no expected perf effect in either direction — the same element count, the
 same single pass, one extra add per 256. No ratio is claimed and none was taken.
+
+## 106. THE conv3d LANE HAS FLIPPED — 2.50x SLOWER TO ~1.2x FASTER, REPLICATED 4/4 AND CERTIFIED 0/6
+
+The lane that has been this bead's worst standing all campaign is now on the winning side of
+PyTorch. Six invocations on ELF `9bb8a0d7...` at HEAD `ab3713f3`, `RAYON_NUM_THREADS=8`,
+16 rounds, mimalloc, thinkstation1, live PyTorch 2.12.0+cpu in the same invocation:
+
+    run  load_1m   FT ms     PT ms     min-ratio             nulls                    verdict
+    r1     18.01    5.449     6.574    1.188 [1.152,1.246]   PT 1.022 F  FT 0.969 F   -
+    r2   18.4->30.4 33.307  102.574    --                    --                       VOID, drifted
+    r3     37.55    5.217     6.756    1.295 [1.237,1.324]   PT 1.028 F  FT 0.984 P   -
+    r4     35.00    8.270     7.442    1.148 [0.992,1.208]   PT 1.033 F  FT 1.254 F   -, WIDE
+    r5     34.39    5.492     6.773    1.274 [1.188,1.307]   PT 1.069 F  FT 0.974 F   -
+    r6     30.07    5.471     6.533    1.203 [1.164,1.274]   PT 1.038 F  FT 1.019 P   -
+
+Parity `match` on every row, 0 MISMATCH. r2 is void on its face — the harness's own drift
+gate caught it and the INCUMBENT arm read 102.574 ms, so nothing in it is about our code.
+r4's FT null is 1.254 and WIDE; it is reported, not used.
+
+The four usable rows: **FT 5.217-5.492 ms (spread 1.053x), PT 6.533-6.773 ms (1.037x),
+min-ratio 1.188-1.295.** Against item 94's certified **0.400 (2.50x SLOWER) at FT 15.203 ms**
+on the same harness, same thread count, same estimator. The incumbent did not move: PT
+6.533-6.773 sits inside the 6.485-9.005 ms band every banked row has used.
+
+**The FT arm is 2.8x faster than the last certified row and the lane's sign has changed.**
+
+### 106a. NOT CERTIFIED, AND THE REASON IS NEW
+
+Zero of six passed both A/A nulls, and the failure has moved: **it is now the INCUMBENT's
+null that fails**, 1.022-1.069 in five of five usable rows, while our arm passed twice.
+
+That is a predictable consequence of the win, not a separate problem. The lane is now ~5.4 ms
+instead of ~15-20 ms, and a shorter lane nulls worse — the A/A null is a ratio of two
+four-sample medians and its variance grows as the measured interval shrinks. This is exactly
+what forced `group_norm_f32` to be RESIZED 16x (frankentorch-uilzh): at 0.199-0.310 ms its
+null failed one-sided in 11 of 11 runs and no ratio from it was ever gate-quotable.
+
+**So conv3d has optimised its way out of its own measurement window.** The board will need
+the conv3d lane resized — larger batch or spatial extent — to keep it certifiable, and until
+that happens this flip cannot be banked as a certified standing however many times it
+replicates. Filing that as the next measurement task rather than pretending six failed gates
+average into a pass.
+
+### 106b. ATTRIBUTION — MOST OF THIS IS NOT MINE
+
+The flip is CUMULATIVE across a lot of work by several agents in the last few ticks, and the
+honest split matters more than the headline:
+
+    mine     item 82   pad un-gather, 2.06-2.82 ms of an 8.81 ms backward stage
+             item 98   ones-dout panel removed, 28.3 MB -> 1.6 MB   <- ON this lane
+             item 104  generic-path panel removed                   <- NOT on this lane
+    peers'   item 93   col2im repeated-row scatter, 3.5M accumulations -> 207K stores
+             item 96   streamed forward's dead ~30 MB memset
+             item 101  generic backward's dead ~29.5 MB memset
+             item 103  the surviving serial numel pass on the way in
+             w3pol     direct-kernel gate capped at in_ch=8
+
+Item 104 is explicitly NOT part of this number — the scored lane's loss is `out.sum()`, so it
+takes the ones-dout branch and never executes the generic path. Of my three, only item 98
+touches this lane. **I am not claiming the 2.8x**; several of the levers above are larger than
+mine and I did not measure them individually.
+
+What item 98 predicted for itself was bandwidth: 56.6 MB of traffic removed from a kernel
+measured at 6.037 ms. The lane arriving at 5.4 ms total is consistent with that plus the
+peers' memset and scatter removals, which were the same shape of lever on the same lane.
+
+### 106c. WHAT THE STANDING IS
+
+The banked certified standing remains **item 94's 0.400 = 2.50x SLOWER**, because that is the
+last row that passed its gates. The live measurement is ~1.2x FASTER, replicated 4/4, and
+uncertified. Both statements are true and the second does not replace the first until a row
+certifies on a resized lane.
