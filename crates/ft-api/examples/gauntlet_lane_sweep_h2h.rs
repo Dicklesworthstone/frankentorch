@@ -121,7 +121,7 @@ const C3_K: usize = 3;
 // the 2026-07-05 all-ones adjoint is eligible. Sized so the im2col panel (8192 x 288 f64,
 // 18.9 MB) is the same order as conv3d's, keeping the two lanes comparable.
 const C2_N: usize = 8;
-/// The `conv2d_big*` twins' batch — `frankentorch-hi9r6`, item 142.
+/// The `conv2d_big*` twins' batch — `frankentorch-hi9r6`, item 144.
 ///
 /// Item 137 could not certify EITHER conv2d lane: our A/A null passed 5/5 and PyTorch's failed
 /// 5/5, and item 137c blamed the incumbent arm's duration (2.3-3.1 ms) rather than the host,
@@ -764,7 +764,7 @@ fn timed_prelu(
 /// call reaches the generic backward. It is a leaf, so its construction sits outside the timer
 /// on both arms.
 ///
-/// `batch` is a parameter rather than `C2_N` so the item 142 `conv2d_big*` twins share this exact
+/// `batch` is a parameter rather than `C2_N` so the item 144 `conv2d_big*` twins share this exact
 /// body: a resize whose two sizes ran through different code would test the code as much as the
 /// size.
 fn timed_conv2d(values: &[f64], weights: &[f64], mask: Option<&[f64]>, batch: usize) -> (f64, f64) {
@@ -994,7 +994,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c2x = seq(C2_N * C2_CI * C2_H * C2_W);
     let c2w = seq(C2_CO * C2_CI * C2_K * C2_K);
     let c2m = seq(C2_N * C2_CO * C2_H * C2_W);
-    // item 142's doubled-batch twins. Same `seq` generator, same weights -- only the batch
+    // item 144's doubled-batch twins. Same `seq` generator, same weights -- only the batch
     // differs, so any change in the ratio is the resize and not a different workload.
     let c2bx = seq(C2B_N * C2_CI * C2_H * C2_W);
     let c2bm = seq(C2B_N * C2_CO * C2_H * C2_W);
@@ -1064,7 +1064,7 @@ c3m=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 c2x=seq(8*32*32*32).reshape(8,32,32,32)
 c2w=seq(32*32*3*3).reshape(32,32,3,3)
 c2m=seq(8*32*32*32).reshape(8,32,32,32)
-# item 142: the doubled-batch twins, same weights, same generator.
+# item 144: the doubled-batch twins, same weights, same generator.
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
 linx=seq(512*1024).reshape(512,1024)
@@ -1114,7 +1114,7 @@ LANES = {
     # gradient non-uniform, so the second lane reaches the generic backward as conv3d_masked does.
     "conv2d":        (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_masked": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
-    # item 142: the same two routes at double the batch, to test whether a ~5-6 ms incumbent
+    # item 144: the same two routes at double the batch, to test whether a ~5-6 ms incumbent
     # arm nulls where a ~3 ms one would not.
     "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
@@ -1615,7 +1615,7 @@ LANES = {
             Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N)),
         ),
         (
-            // item 142: both routes again at double the batch. Item 137 certified NEITHER
+            // item 144: both routes again at double the batch. Item 137 certified NEITHER
             // conv2d lane because PyTorch's A/A null failed 5/5 while ours passed 5/5, and
             // item 137c blamed the incumbent arm's ~3 ms duration. These twins test that.
             "conv2d_big",

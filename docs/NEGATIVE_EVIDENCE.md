@@ -30863,7 +30863,7 @@ shared cache.
 Deletion condition for this item: when `.zshrc:51` is gone, the per-invocation guard stops being
 load-bearing and this stops being worth remembering.
 
-## 142. conv2d GETS ITS FIRST CERTIFIED STANDING — 5.73x SLOWER — AND THE RESIZE CONFIRMS ITEM 137c: THE INCUMBENT'S NULL WAS DURATION-BOUND, SO THE BLOCKER IS NOW ON OUR SIDE
+## 144. conv2d GETS ITS FIRST CERTIFIED STANDING — 5.73x SLOWER — AND THE RESIZE CONFIRMS ITEM 137c: THE INCUMBENT'S NULL WAS DURATION-BOUND, SO THE BLOCKER IS NOW ON OUR SIDE
 
 `frankentorch-hi9r6` (P0). Item 137 measured both conv2d lanes and could certify NEITHER: our
 A/A null passed 5/5 and PyTorch's failed 5/5. Item 137c blamed the incumbent arm's duration
@@ -30898,7 +30898,7 @@ clock spread while sampling 2.82-2.98x, arms NOT pinned.
                         40.645   11.177    3.64x SLOWER    PASS  0.994       PASS   <- QUOTABLE
                         41.868   11.622    3.60x SLOWER    PASS  1.015       FAIL 0.954
 
-### 142a. THE HYPOTHESIS IS CONFIRMED — PyTorch's NULL IS DURATION-BOUND
+### 144a. THE HYPOTHESIS IS CONFIRMED — PyTorch's NULL IS DURATION-BOUND
 
 PyTorch's A/A null passed **6/6 on the big lanes** (point estimates 0.992-1.017, every one
 inside the +/-0.02 band) and **1/6 on the small ones**. That is the cleanest result here, and it
@@ -30911,7 +30911,7 @@ property of the lane; run b here shows the small masked lane nulling cleanly on 
 small arm's null is not impossible, it is unreliable — which is worse for certification, because
 it means a passing small-lane row is a coin-flip rather than a repeatable gate.
 
-### 142b. conv2d's FIRST CERTIFIED ROW, AND IT IS BETTER THAN THE UNCERTIFIED ONE
+### 144b. conv2d's FIRST CERTIFIED ROW, AND IT IS BETTER THAN THE UNCERTIFIED ONE
 
 Run b certified two rows on both gates with parity `match`:
 
@@ -30926,24 +30926,33 @@ The bigger shape stands at 3.60-3.64x across all three runs — noticeably bette
 shape's 5.46-5.98x, which is consistent with item 141's finding that a large fixed cost, not a
 FLOP-proportional one, dominates this kernel.
 
-### 142c. THE BLOCKER MOVED TO OUR SIDE, AND IT IS SPECIFIC
+### 144c. THE BLOCKER MOVED TO OUR SIDE, AND IT IS SPECIFIC
+
+**CORRECTED by item 145 — see the strikethrough reasoning below.** The claim "confined to the
+bigger batch" was wrong, and the table in this very item refutes it. Corrected statement:
 
 `conv2d_big`'s FT null failed **3/3 at 1.151, 1.177, 1.170** — a 15-18% asymmetry between our
 own two slots, reproducing to within 2.6% across three runs. That consistency is what makes it a
 defect rather than noise: a load artefact would not land three times on the same value while the
 incumbent's null in the same rounds sits at 0.992-0.997.
 
-It is confined to the SUMMED route at the bigger batch. `conv2d_big_masked` nulls fine (0.954,
-0.968, PASS), and small `conv2d_big`'s route at the original batch does not show it. So the
-suspect is the all-ones fast-path adjoint interacting with a doubled working set, not the lane
-machinery — the summed route allocates and first-touches a 37.7 MiB output-sized buffer where
-the masked route reuses the mask leaf.
+It is the SUMMED route that carries it, **at BOTH sizes**: small `conv2d`'s FT null reads 1.161,
+1.065, 1.199 in the same three runs. Across all six summed-route rows the null is biased
+**one-sided high**, while the masked route's six rows scatter around 1.0 in both directions
+(0.954, 0.968, 1.030, and three PASSes). A one-sided 6/6 result is a systematic effect, not
+variance.
+
+~~It is confined to the SUMMED route at the bigger batch, so the suspect is the all-ones
+fast-path adjoint interacting with a DOUBLED working set.~~ That was written from the big-lane
+rows alone without re-reading the small-lane column of the same table, which was already sitting
+in this item. Whatever the cause is, it is not specific to the doubled batch, so "a 37.7 MiB
+first touch" cannot be it — the small lane's buffer is half that and shows the same bias.
 
 This is a fresh, aimed lever and it belongs to us, which is a better position than item 137's:
 there, the gate that blocked certification was in the incumbent's arm and nothing we could write
 would have moved it.
 
-### 142d. WHAT THE RESIZE COST — THE INCUMBENT CHANGED REGIME, NOT JUST DURATION
+### 144d. WHAT THE RESIZE COST — THE INCUMBENT CHANGED REGIME, NOT JUST DURATION
 
 Doubling the batch did NOT simply make PyTorch's arm longer. Its time went **3.00 -> 11.23 ms
 for 2x the work, a 3.74x jump**, while ours went 4.93 -> 8.97 ms (1.82x, sublinear). Whatever
@@ -30953,15 +30962,15 @@ at the large one.
 So `conv2d_big` is not "the same lane, longer", and its 1.15-1.25x FASTER reading must NOT be
 carried back to the original shape as evidence about it. **That reading is also not a win in its
 own right**: our null fails 3/3 on exactly that lane, so it is not quotable, and the first thing
-to do with it is 142c rather than to celebrate it. A ratio whose favourable direction comes from
+to do with it is 144c rather than to celebrate it. A ratio whose favourable direction comes from
 the incumbent scaling badly is a claim about torch's regime change and needs its own
 verification before it is anything else.
 
-### 142e. WHY THE TWINS WERE ADDED RATHER THAN SWAPPED IN
+### 144e. WHY THE TWINS WERE ADDED RATHER THAN SWAPPED IN
 
 Item 137c proposed resizing in place and called losing comparability with items 128 and 137 "the
 price". That price only buys something if the resize works, and it was not known that it would.
-Keeping both sizes cost two lanes of sweep time and bought the control that produced 142a: the
+Keeping both sizes cost two lanes of sweep time and bought the control that produced 144a: the
 small lanes ran beside the big ones, so "PyTorch nulls at 11 ms but not at 3 ms" is a
 within-invocation comparison rather than a claim across runs. Had the small lanes been deleted,
 the resize would have had to be justified by comparing against item 137's numbers taken on a
@@ -31043,3 +31052,94 @@ Five hypotheses have now been tested on this kernel — scaffolding, the column 
 the GEMM attribution, and "something un-enumerated". Four were refuted by measurement and the
 fifth by reading. The footprint hypothesis is the first that nothing has yet contradicted, which
 is a reason to test it, not to believe it.
+
+## 145. MY ARM-RATIO EXPLANATION FOR THE FAILING FT NULL IS REFUTED BY 87 BANKED ROWS — AND ITEM 144c's "BIGGER BATCH" WAS WRONG ON DATA ITEM 144 ALREADY PRINTED
+
+`frankentorch-hi9r6` (P0). No host time was spent on this item: the host was at loadavg 30.49
+with **CPU idle 1%, user 94%** (iowait 0%, three peer builds), which is no window to measure in.
+Everything below is a re-reading of data already banked, plus source reading. Nothing here is a
+standing and nothing here is quotable.
+
+### 145a. THE CORRECTION FIRST
+
+Item 144c stated the failing FT null was "confined to the SUMMED route at the bigger batch" and
+inferred the suspect was a doubled 37.7 MiB first touch. **The table printed in item 144 itself
+refutes that**, and I did not read my own column: small `conv2d`'s FT null reads **1.161, 1.065,
+1.199** across the same three runs. The summed route carries the bias at BOTH sizes.
+
+What survives is stronger, not weaker: across all six summed-route rows the FT null is biased
+**one-sided high** (1.065-1.199), while the masked route's six rows scatter around 1.0 in both
+directions (0.954, 0.968, 1.030 plus three PASSes). Six of six on one side is systematic. Item
+144c is corrected in place with the wrong sentence struck through rather than deleted.
+
+### 145b. THE HYPOTHESIS, AND WHY IT WAS WORTH TESTING
+
+Reading item 144's table, the failures looked keyed to how close the two arms were in duration:
+biased where FT/PT was near 1 (4.9 vs 3.0; 9.0 vs 11.2) and clean where our arm was many times
+longer (16 vs 2.9; 40 vs 11). If true that would be a board-wide measurement defect, not a conv2d
+one — the ±0.02 null gate would systematically fail in exactly the regime where a lane is close
+to winning, which is the regime that matters most.
+
+### 145c. REFUTED — THE DIRECTION DOES NOT MOVE WITH THE ARM RATIO
+
+Parsed every lane row from 46 banked sweep logs, 87 rows, bucketed by `FT_ms / PT_ms`:
+
+    FT/PT arm ratio    n    FT-null PASS    n w/ point    median null    frac >1
+          0.0-0.7     22            41%            21          0.989        43%
+          0.7-1.5     25            32%            23          0.999        48%
+          1.5-3.0     26            54%            17          0.998        47%
+          3.0-6.0     11            55%             6          0.989        50%
+               >6      3            67%             2          0.979        50%
+
+The median null is 0.98-1.00 in every bucket and the sign splits 43-50% either way in every
+bucket. There is no directional bias keyed to arm ratio, so the hypothesis is dead.
+
+**On the legitimacy of pooling.** These 87 rows come from different sessions, loads and hosts,
+and items 123, 126 and 139 all forbid comparing across such runs. That prohibition applies to
+extracting a RATIO, and nothing here quotes one. Refuting a claim that was supposed to hold
+universally is the one thing pooled data does honestly: if arm ratio drove the null's direction,
+it would have to show up across 87 rows, and it does not.
+
+One weaker signal does survive and is recorded as suggestive only: the PASS RATE rises with arm
+ratio (41%, 32%, 54%, 55%, 67%). That is consistent with item 144a's finding — short arms null
+badly — applied to our side of the board rather than the incumbent's. It is pooled, the top
+bucket is n=3, and it is not evidence for anything until measured in one invocation.
+
+### 145d. WHAT THE DATA SAYS INSTEAD — IT CLUSTERS BY LANE
+
+Restricting to rows whose arms are within 2x of each other, the failures are lane-specific and
+they point in BOTH directions:
+
+    lane                  n    FT-null PASS    median null (failing rows)
+    avg_pool2d_nopool     3              0%                        1.317
+    conv2d_big            3              0%                        1.170
+    conv2d                6             33%                        1.038
+    linear_wide           3              0%                        0.970
+    max_pool3d_dense      1              0%                        0.928
+    max_pool3d            1              0%                        0.861
+    linear_narrow         3            100%                        0.999
+
+`conv2d_big` at 1.170 is not an outlier in a noisy field — `linear_narrow` nulls perfectly on
+the same board. Several of the badly-behaved lanes (`avg_pool2d_*`, `max_pool3d*`, summed
+`conv2d`) are SUM-LOSS SHORTCUT routes, which is a suggestive cluster and no more than that: the
+per-lane counts are 1-3 rows drawn from different runs, so this names a place to look rather
+than a finding.
+
+### 145e. ONE ASYMMETRY FOUND BY READING, NOT MEASURED
+
+`ft-kernel-cpu/src/lib.rs:8814` gates the 3x3 stride-1 all-ones adjoint on
+
+    dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+
+which is SERIAL and, on the summed route, scans the whole `dout` — 524,288 f64 (4.2 MB) at the
+big batch, 262,144 at the small one. On the masked route `mask[0]` is -0.12, so `all()`
+short-circuits at element zero and the scan is free. **The two routes this bead compares are
+therefore asymmetric by construction, and the asymmetry falls on the summed one.**
+
+Parallelising the predicate would be bit-exact — it decides a branch, it does not compute a
+value. But this is a candidate, NOT a result: no probe has timed it, the arithmetic that makes
+it sound worth ~0.2-0.4 ms is a bandwidth assumption rather than a measurement, and a constant
+per-call cost does not by itself explain a one-sided SLOT bias, which is what 145a actually
+found. It is written down so the next quiet window has something aimed to test, and per
+`feedback_cycle_profile_hides_serial` a serial region like this would be invisible in a cycle
+profile at pool width 8.
