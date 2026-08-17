@@ -27790,3 +27790,72 @@ because peers rebuild the shared target underneath you; I have been applying tha
 timings only. It applies to CORRECTNESS runs identically — on a checkout a dozen agents
 write to, "same source" between two runs minutes apart is not an assumption anyone is
 entitled to make. Every gate line in item 93 above names the commit it ran at.
+
+## 94. THE OWED REPLICATION IS PAID — conv3d CERTIFIES AGAIN AT 2.50x SLOWER WITH FULL PROVENANCE, AND SIX QUIET-WINDOW ROWS SHOW THE GATE IS THE NOISY PART
+
+Item 85f declared a defect in its own certified row: my capture had filtered the harness
+output down to the ratio and gate lines, so that row carried no CPU frequency and was not
+safely comparable across windows. This is the fully-captured replication it owed, taken on
+**the same ELF** (`9c4d0d70...`) that produced it — item 77's technique, and a stronger
+replication than a fresh build would have been.
+
+### 94a. THE CERTIFIED ROW, NOTHING WITHHELD
+
+    conv3d   MIN 2.50x SLOWER   ratio 0.400 [0.384,0.416]
+             FT 15.203 ms   PT 6.040 ms   (PyTorch 2.12.0+cpu, same invocation)
+             PT null 0.995 PASS   FT null 1.006 PASS   parity match, 0 MISMATCH
+             drift_gate PASS (load_1m 15.21 -> 15.35), load_series n=18 worst_drift 1.009x,
+               endpoint_gate PASS, series_gate PASS
+             loadavg entering the run 14.68 / 16.51 / 19.26
+             cpu_mhz min=1429 median=3331 max=4167 spread=2.916x
+             typical core   min 3274 median 3333 max 3434 MHz
+             CROSS-CORE SPREAD WHILE SAMPLING  min 2.865x median 2.930x max 3.005x
+             RAYON_NUM_THREADS=8, 16 rounds, balanced-square ABBAABBA
+             mimalloc (--features fair-alloc), OP WORK ONLY
+             thinkstation1, AMD Ryzen Threadripper PRO 5975WX, governor powersave
+             ELF 9c4d0d707b137f3a018ed5a799cfdad813c780e2225a5b00408427d30945192e
+
+**0.400 lands inside item 85a's certified 0.414 [0.384,0.430].** Two certifications, same
+ELF, different windows, overlapping intervals — the standing is replicated, and it is now
+recorded with the frequency figures the orders require. The incumbent did not move: PT
+6.040 ms against 6.485-9.005 ms across every banked row.
+
+### 94b. SIX ROWS IN THE QUIETEST WINDOW OF THE SESSION, AND ONLY ONE CERTIFIED
+
+All six taken back to back on one ELF, loadavg 13.8-17.2 throughout, every drift gate PASS:
+
+    run  load_1m      FT ms    PT ms   min-ratio             nulls              cert
+    r1   14.44        15.707   6.364   0.389 [0.378,0.402]   PT 0.992  FT 0.977   -
+    r2   15.73        16.395   6.691   0.403 [0.365,0.421]   PT 0.998  FT 1.034   -
+    r3   16.51        15.628   6.490   0.399 [0.378,0.413]   PT 1.028  FT 0.991   -
+    r4   16.45        16.250   6.757   0.408 [0.397,0.420]   PT 1.025  FT 0.971   -
+    r5   16.25        15.566   6.197   0.392 [0.369,0.414]   PT 0.985  FT 1.020   -
+    r6   15.21        15.203   6.040   0.400 [0.384,0.416]   PT 0.995  FT 1.006   CERT
+
+**The arms are stable and the NULL is not.** FT spans 15.203-16.395 ms (1.078x), PT spans
+6.040-6.757 ms (1.119x), and the min-ratio spans 0.389-0.408 — a 1.049x spread across six
+independent invocations. Yet five of six were refused, and in three of them the refusing
+null was the arm whose absolute timings barely moved.
+
+This is item 74b's observation with the sampling to back it: when the host is quiet, the
+drift gate is clean, and the underlying arms replicate to five percent, **a refusal is a
+statement about the estimator, not about the machine.** The A/A null is a ratio of two
+four-sample medians drawn from the same arm inside one 16-round run; at this lane's duration
+its own variance is wider than the +/-0.02 band it is judged against. Nothing in six runs
+suggests the measurement was wrong; the gate simply cannot resolve at this sample size.
+
+Today's certification rate is 2 of 19 attempts. Items 74 and 77 got 1 of 6 and 2 of 6. The
+rate is a property of the gate, and anyone budgeting a certification run should plan on six
+invocations to bank one row, in a quiet window, or raise `FT_H2H_REPS` and accept the
+wall-clock.
+
+### 94c. WHAT THE STANDING IS NOW
+
+    banked before today   0.329  (3.04x SLOWER, item 74, replicated 0.324 / 0.352 in item 77)
+    certified today       0.414  (2.42x, item 85 — no frequency figures)
+                          0.400  (2.50x, this item — fully provenanced)
+    quiet-window median   0.399  over six rows
+
+**conv3d stands at 2.50x SLOWER, replicated, against a banked 3.04x.** The lever behind the
+move is item 82's pad un-gather; item 85d's caution still applies — the two sets are not
+paired and the full 1.25x is not attributed to it.
