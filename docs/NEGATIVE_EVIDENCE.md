@@ -29920,3 +29920,71 @@ nothing on the board would currently show that.
 The file reservation was taken before editing this time
 (`crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, held by me, 1h) rather than discovered
 afterwards by the guard — item 121's lesson applied in the other direction.
+
+## 127. THE BatchNorm WIN REPLICATES, THE DTYPE INVERSION IS REAL AND SAME-INVOCATION, AND vyaia's FIRST-RUN RULE IS CONFIRMED IN ONE PAIR
+
+`frankentorch-68pwz`. Three results from the cleanest window since the fleet returned, all on
+ELF `a01302d87d9d...9908` — the SAME binary the item 125 rows were taken on, deliberately, so
+replication carries no rebuild as a variable. Host thinkstation1 (Threadripper PRO 5975WX,
+x86_64+avx2, powersave, rayon_threads=8, online_cpus=64), incumbent PyTorch 2.12.0+cpu in the
+same invocation at threads=8, df 205G, CPU idle verified by vmstat at 88-90% with iowait 0.
+
+### 1. THE BatchNorm WIN REPLICATES — A SECOND CERTIFIED ROW
+
+    run  FT ms   PT ms   sq-median        MIN              drift  load_1m         core MHz
+     2   38.318  63.047  1.65x CERT       1.669x CERT      PASS   18.60 -> 21.41  2424/3849/4214
+     5   33.118  58.746  1.77x CERT       1.682x CERT      PASS   11.46 -> 11.40  1429/3144/4224
+
+Run 5 clears both estimators exactly as run 2 did: square-median nulls PT PASS / FT PASS with
+no NULL-FAILED line, and the min estimator printing QUOTABLE at PT 0.985 / FT 1.005. Parity
+`match`. The min estimator across the two certified rows reads 1.669 and 1.682 — a 1.008x
+span, on two different days' load regimes.
+
+**CONSERVATIVE BOUND, now replicated: at least 1.65x FASTER.**
+
+### 2. THE DTYPE INVERSION IS REAL, AND IT IS NOT A CROSS-RUN ARTEFACT
+
+Item 122 filed "our f64 BatchNorm looks faster than our f32" as an observation from one
+drift-gated invocation, explicitly not a claim. Both dtypes are lanes on the same board, so
+they can be read from ONE invocation, which removes every cross-window confound:
+
+    run 4   BN f32 FT 50.006 ms   BN f64 FT 33.067 ms   ours: f32 is 1.513x SLOWER than our f64
+    run 5   BN f32 FT 50.297 ms   BN f64 FT 33.118 ms   ours: f32 is 1.518x SLOWER than our f64
+
+Replicated to 1.003x. The incumbent in the SAME invocations behaves the ordinary way:
+
+    run 4   PT f32 14.714 ms   PT f64 58.397 ms   torch: f32 is 3.97x FASTER than its f64
+    run 5   PT f32 14.695 ms   PT f64 58.746 ms   torch: f32 is 4.00x FASTER than its f64
+
+So halving the arithmetic width makes PyTorch ~4x faster and makes US ~1.5x slower. That is a
+**6x swing in relative position purely from dtype**, and it is exactly the size of the gap
+between our two standings: 1.77x FASTER on f64, 3.40-3.42x SLOWER on f32, same op, same shape,
+same invocation. The tape's f32<->f64 conversion boundary costs more than narrower arithmetic
+saves, and this is the number that says so.
+
+The f32 rows are MISMATCH and NOT quotable as standings (item 122's reasoning), but the
+FT-f32-vs-FT-f64 comparison above does not depend on the incumbent at all — it is our own two
+paths in one process, which is maintenance-grade evidence and sufficient for aiming a lever.
+
+### 3. vyaia IS RIGHT, DEMONSTRATED IN A CONSECUTIVE PAIR
+
+`frankentorch-vyaia` proposes discarding the first run after idle, because the harness
+self-loads and a quiet host therefore FAILS the drift gate. Runs 4 and 5 are that experiment
+by accident, back to back on one ELF in one window:
+
+    run 4  first after idle   load_1m 10.42 -> 13.53   worst_drift 1.298x   series_gate DRIFTED
+    run 5  immediately after  load_1m 11.46 -> 11.40   worst_drift 1.143x   series_gate PASS
+
+Identical work; the only difference is that run 5 started on a host already carrying the
+harness's own load. **The quietest start produced the largest proportional drift and was the
+one that gated.** This also explains why item 125's certifying row (run 2) started at 18.60
+while its two failures started at 15.53 and 24.29 — the gate is not measuring host quality,
+it is measuring how far the host moved, and starting from idle guarantees movement.
+
+Recorded here rather than on vyaia alone because it changes how every row on this board should
+be taken: warm the harness once, discard that run, then measure.
+
+### WHAT IS STILL NOT CLAIMED
+
+GroupNorm dense replicated at 2.65x and 2.67x SLOWER across these two runs, matching item 116's
+banked 2.66x, but neither cleared its nulls and neither is quoted. Nothing here re-banks it.
