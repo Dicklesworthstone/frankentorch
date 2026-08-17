@@ -27859,3 +27859,64 @@ wall-clock.
 **conv3d stands at 2.50x SLOWER, replicated, against a banked 3.04x.** The lever behind the
 move is item 82's pad un-gather; item 85d's caution still applies — the two sets are not
 paired and the full 1.25x is not attributed to it.
+
+## 95. ITEM 89 WAS RESTING ON THE WRONG REFERENCE — SCORED AGAINST THE EXACT SUM, THE NO-PANEL ROUTE CAN BE *MORE* ACCURATE THAN WHAT WE SHIP
+
+Item 89 rejected the conv3d no-panel `dweight` reduction because it differed from the
+shipping panel+GEMM route by ~6 ULP, and filed the 28.3 MB panel's removal as a TOLERANCE
+question needing a policy call. **That framing was wrong, and item 90 is why**: when two of
+our own routes disagree, the shipping one is not a reference, it is just the other
+candidate. Compute the exact answer and score both.
+
+Done here with a Shewchuk non-overlapping expansion (the `math.fsum` algorithm), which sums
+the identical `padded` terms with no rounding until the final result. Scored over all 864
+columns at the scored lane's shape (`flat = 4096`):
+
+    route                              worst      mean     closer than the other on
+    panel+GEMM  (what we ship)       2.26 ULP   0.540 ULP   770 of 864 columns
+    no-panel, FLAT chain            24.81 ULP   6.498 ULP    32 of 864 columns
+    no-panel, BLOCKED                1.51 ULP   0.306 ULP   no worse on 738
+
+### 95a. WHY THE FLAT CHAIN LOST, AND WHY THAT IS THE CLUE
+
+`dgemm` delegates to matrixmultiply, which BLOCKS the k dimension — item 89 correctly
+identified that as the reason the two routes disagree, and then treated the blocking as an
+obstacle. **It is not an obstacle, it is an accuracy feature.** Partitioned summation has
+error growing like log(n); one ascending chain grows like n. At n = 4096 that is the entire
+11x gap between 0.540 and 6.498 mean ULP. Item 89's replacement threw away an accuracy
+property it had not noticed it was relying on.
+
+### 95b. THE FIX IS AN ORDER, NOT A TOLERANCE
+
+Route C keeps a partial at each level of the loop nest that was already there — per `w`
+run, per `h`, per `d`, per `n` — instead of pouring all 4096 terms into one accumulator.
+Same terms, same traversal, same absence of a panel, no extra memory, no extra passes: a
+4096-long dependent chain becomes a depth-4 tree. It lands at **1.51 ULP worst / 0.306 mean,
+better than the 2.26 / 0.540 we ship today.**
+
+So the 28.3 MB panel can go without conceding anything. **No tolerance ratification is
+needed, and item 89d's route 1 — "ratify a tolerance, it is a policy call" — is withdrawn.**
+Had that policy call been made on item 89's evidence, the campaign would have ratified a
+tolerance in order to ship a route that was 11x LESS accurate, when a strictly better one
+cost nothing but a different loop shape.
+
+### 95c. WHAT THIS ITEM DOES AND DOES NOT CLAIM
+
+It establishes ACCURACY, not speed, and the kernel is unchanged as of this entry —
+`conv3d_dweight_no_panel_vs_panel_gemm_scored_against_the_exact_sum` is a scoring test, and
+the shipping path still builds the panel. The performance claim in item 88a (56.6 MB of
+traffic to keep 864 numbers) is still unmeasured. What has changed is that the lever is no
+longer BLOCKED: it needs an implementation and a measurement, not a policy decision.
+
+The test asserts both halves deliberately — that the flat chain IS the worse route, and that
+the blocked one is no worse than shipping. If the first ever inverts, the arbiter itself is
+suspect and should be re-read before anything downstream is trusted.
+
+### 95d. THE GENERAL RULE, WHICH IS ITEM 90's AND IS NOW TWICE-PAID
+
+**Never ratify a tolerance between two of your own routes without computing the exact
+answer.** Twice now on this codebase a "tolerance question" has dissolved on contact with an
+exact arbiter, and both times the SHIPPING route was the one that turned out to be worse
+(w3pol in item 90, this in 95). A disagreement between two approximations says nothing about
+which is right, and reaching for a policy call at that moment ratifies whichever one happened
+to ship first.

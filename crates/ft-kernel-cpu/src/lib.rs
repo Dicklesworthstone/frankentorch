@@ -46770,6 +46770,217 @@ mod tests {
         );
     }
 
+    /// EXACT ARBITER for the conv3d `dweight` column sum — item 89's open question, settled
+    /// the way item 90 settled w3pol: **when two of our own routes disagree, do not ratify a
+    /// tolerance, compute the exact answer and score both against it.**
+    ///
+    /// Item 89 rejected the no-panel `dweight` reduction because it differed from the shipping
+    /// panel+GEMM route by ~6 ULP at the scored lane's shape, and treated that as a tolerance
+    /// question needing a policy call. That framing assumed the SHIPPING route is the reference.
+    /// It is not a reference — it is just the other candidate. `dgemm` blocks the k dimension,
+    /// which reassociates the sum; the direct reduction is one ascending chain. Both are
+    /// approximations of the same exact quantity, and which is closer is a measurable fact.
+    ///
+    /// The exact value is computed with a Shewchuk non-overlapping expansion (the algorithm
+    /// behind `math.fsum`), which sums f64 values with no rounding until the final result, so it
+    /// is the correctly-rounded truth to compare against. All three routes consume the identical
+    /// `padded` buffer, so the only difference is summation order.
+    ///
+    /// Reports ULP distance from exact for both routes over every column. If the no-panel route
+    /// is no worse, item 89's rejection was resting on the wrong reference and the 28.3 MB panel
+    /// can go without any tolerance being conceded. frankentorch-l2zki.
+    #[test]
+    fn conv3d_dweight_no_panel_vs_panel_gemm_scored_against_the_exact_sum() {
+        let (batch, in_ch) = (2usize, 32usize);
+        let (pd, ph, pw) = (10usize, 18usize, 18usize);
+        let (kd, kh, kw) = (3usize, 3usize, 3usize);
+        let (sd, sh, sw) = (1usize, 1usize, 1usize);
+        let od = (pd - kd) / sd + 1;
+        let oh = (ph - kh) / sh + 1;
+        let ow = (pw - kw) / sw + 1;
+        let patch_width = in_ch * kd * kh * kw;
+        let flat = batch * od * oh * ow;
+        assert_eq!((flat, patch_width), (4096, 864), "the scored lane's shape");
+
+        let padded: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
+            .map(|i| ((i as f64 * 0.037).sin() * 0.7 + (i % 13) as f64 * 0.011 - 0.4) / 1024.0)
+            .collect();
+
+        // --- route A: what we ship. Materialize the 28.3 MB panel, column-sum it with an
+        // all-ones GEMM.
+        let panel = super::conv3d_im2col_f64(
+            &padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        let ones_flat = vec![1.0f64; flat];
+        let mut panel_row = vec![0.0f64; patch_width];
+        super::gemm::dgemm(1, flat, patch_width, &ones_flat, &panel, &mut panel_row);
+
+        // --- route B: no panel. One ascending chain per column, straight off `padded`.
+        let mut direct_row = vec![0.0f64; patch_width];
+        for c in 0..in_ch {
+            for kdd in 0..kd {
+                for kr in 0..kh {
+                    for kc in 0..kw {
+                        let mut acc = 0.0f64;
+                        for n in 0..batch {
+                            let ch_off = (n * in_ch + c) * pd * ph * pw;
+                            for d in 0..od {
+                                let d_off = ch_off + (d * sd + kdd) * ph * pw;
+                                for h in 0..oh {
+                                    let irow = d_off + (h * sh + kr) * pw + kc;
+                                    for w in 0..ow {
+                                        acc += padded[irow + w * sw];
+                                    }
+                                }
+                            }
+                        }
+                        direct_row[((c * kd + kdd) * kh + kr) * kw + kc] = acc;
+                    }
+                }
+            }
+        }
+
+        // --- route C: no panel, but BLOCKED. Same terms, same traversal, same absence of a
+        // panel; the only change is that each level of the existing loop nest keeps its own
+        // partial instead of pouring every term into one accumulator. That turns a
+        // 4096-long dependent chain into a depth-4 tree for free.
+        let mut blocked_row = vec![0.0f64; patch_width];
+        for c in 0..in_ch {
+            for kdd in 0..kd {
+                for kr in 0..kh {
+                    for kc in 0..kw {
+                        let mut total = 0.0f64;
+                        for n in 0..batch {
+                            let ch_off = (n * in_ch + c) * pd * ph * pw;
+                            let mut batch_acc = 0.0f64;
+                            for d in 0..od {
+                                let d_off = ch_off + (d * sd + kdd) * ph * pw;
+                                let mut depth_acc = 0.0f64;
+                                for h in 0..oh {
+                                    let irow = d_off + (h * sh + kr) * pw + kc;
+                                    let mut row_acc = 0.0f64;
+                                    for w in 0..ow {
+                                        row_acc += padded[irow + w * sw];
+                                    }
+                                    depth_acc += row_acc;
+                                }
+                                batch_acc += depth_acc;
+                            }
+                            total += batch_acc;
+                        }
+                        blocked_row[((c * kd + kdd) * kh + kr) * kw + kc] = total;
+                    }
+                }
+            }
+        }
+
+        // --- the truth: exact summation of the same terms, order-independent.
+        fn two_sum(a: f64, b: f64) -> (f64, f64) {
+            let s = a + b;
+            let bb = s - a;
+            ((s), ((a - (s - bb)) + (b - bb)))
+        }
+        fn exact_sum(values: &[f64]) -> f64 {
+            let mut partials: Vec<f64> = Vec::new();
+            for &value in values {
+                let mut x = value;
+                let mut kept = 0usize;
+                for j in 0..partials.len() {
+                    let (hi, lo) = two_sum(x, partials[j]);
+                    if lo != 0.0 {
+                        partials[kept] = lo;
+                        kept += 1;
+                    }
+                    x = hi;
+                }
+                partials.truncate(kept);
+                partials.push(x);
+            }
+            partials.iter().fold(0.0f64, |acc, &v| acc + v)
+        }
+
+        let ulps_from = |got: f64, want: f64| -> f64 {
+            if got == want {
+                return 0.0;
+            }
+            let ulp = (want.abs()).max(f64::MIN_POSITIVE) * f64::EPSILON;
+            (got - want).abs() / ulp
+        };
+
+        let mut terms = Vec::with_capacity(flat);
+        let (mut panel_worst, mut direct_worst, mut blocked_worst) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut panel_total, mut direct_total, mut blocked_total) = (0.0f64, 0.0f64, 0.0f64);
+        let mut blocked_wins = 0usize;
+        let mut direct_wins = 0usize;
+        let mut panel_wins = 0usize;
+        for c in 0..in_ch {
+            for kdd in 0..kd {
+                for kr in 0..kh {
+                    for kc in 0..kw {
+                        terms.clear();
+                        for n in 0..batch {
+                            let ch_off = (n * in_ch + c) * pd * ph * pw;
+                            for d in 0..od {
+                                let d_off = ch_off + (d * sd + kdd) * ph * pw;
+                                for h in 0..oh {
+                                    let irow = d_off + (h * sh + kr) * pw + kc;
+                                    for w in 0..ow {
+                                        terms.push(padded[irow + w * sw]);
+                                    }
+                                }
+                            }
+                        }
+                        let exact = exact_sum(&terms);
+                        let j = ((c * kd + kdd) * kh + kr) * kw + kc;
+                        let pe = ulps_from(panel_row[j], exact);
+                        let de = ulps_from(direct_row[j], exact);
+                        let be = ulps_from(blocked_row[j], exact);
+                        panel_worst = panel_worst.max(pe);
+                        direct_worst = direct_worst.max(de);
+                        blocked_worst = blocked_worst.max(be);
+                        panel_total += pe;
+                        direct_total += de;
+                        blocked_total += be;
+                        if be <= pe {
+                            blocked_wins += 1;
+                        }
+                        if de < pe {
+                            direct_wins += 1;
+                        } else if pe < de {
+                            panel_wins += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let n_cols = patch_width as f64;
+        println!(
+            "ga99y/l2zki conv3d dweight vs EXACT ({patch_width} columns, flat={flat}):\n               panel+GEMM (shipping)  worst {panel_worst:.2} ULP  mean {:.3} ULP  closer on {panel_wins}\n               no-panel FLAT          worst {direct_worst:.2} ULP  mean {:.3} ULP  closer on {direct_wins}\n  \
+             no-panel BLOCKED       worst {blocked_worst:.2} ULP  mean {:.3} ULP  no worse on {blocked_wins}",
+            panel_total / n_cols,
+            direct_total / n_cols,
+            blocked_total / n_cols
+        );
+
+        // The flat chain is MUCH worse, and that is the finding: `dgemm`'s k-blocking is
+        // partitioned summation, whose error grows like log(n), while one ascending chain
+        // grows like n. Blocking is an ACCURACY feature and the naive no-panel route was
+        // throwing it away. So the answer is not a tolerance, it is a better summation ORDER
+        // — block the direct reduction on the loop nest's own levels, which costs nothing and
+        // still never materializes a panel.
+        assert!(
+            direct_worst > panel_worst,
+            "the flat chain is expected to be the worse route; if this ever inverts, re-read \
+             the arbiter before trusting it"
+        );
+        assert!(
+            blocked_worst <= panel_worst,
+            "BLOCKED no-panel worst {blocked_worst:.2} ULP exceeds shipping panel+GEMM \
+             {panel_worst:.2} ULP -- the panel cannot be removed without conceding accuracy"
+        );
+    }
+
     #[test]
     fn conv3d_backward_ones_dout_fast_path_matches_generic_reference() {
         let (batch, in_ch, pd, ph, pw) = (2usize, 3usize, 5usize, 4usize, 6usize);
