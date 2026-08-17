@@ -26290,3 +26290,62 @@ WHAT TO DO INSTEAD, on this evidence: the global pool cap is where the 1.663x li
 the open question there is not whether it works on this lane but what it costs the lanes
 that measured only 1.01x. That is a campaign decision about a process-wide default, and it
 is now the only shape left unmeasured.
+
+## 74. conv3d RE-CERTIFIED: 3.72x SLOWER -> 3.04x, AND THE LANE IS NOW MAJORITY ENGINE
+
+Items 72 and 73 cut the conv3d KERNELS from 16.367 to 9.582 ms (1.71x), all bit-exact.
+This is the owed vs-incumbent row, taken in the first settled window since.
+
+Host was checked before certifying, not assumed: `uptime` read 19.09 / 21.18 / 24.59
+falling and converging, and continued to fall through the runs. ELF `36b2c579...` at HEAD
+`f2db331c`, private snapshot. Single-lane filter (`FT_H2H_LANES=conv3d`, 16 rounds), which
+is item 58's technique taken to its limit.
+
+### 74a. THE DRIFT GATE HAS NEVER BEEN THIS CLEAN — six of six
+
+    run     threads  drift    gates      FT ms   PT ms   ratio                 cert
+    c64_1   64       1.000x   PASS/PASS  22.937   7.079  0.310 [0.293,0.328]   -
+    c64_2   64       1.000x   PASS/PASS  20.120   6.592  0.344 [0.316,0.368]   -
+    c64_3   64       1.029x   PASS/PASS  17.656   6.727  0.383 [0.362,0.404]   -
+    c64_4   64       1.005x   PASS/PASS  19.109   6.485  0.344 [0.332,0.367]   -
+    c8_1     8       1.005x   PASS/PASS  19.423   6.677  0.338 [0.330,0.353]   -
+    c8_2     8       1.033x   PASS/PASS  20.184   6.622  0.329 [0.315,0.349]   CERT
+
+**Six of six drift-clean, four of them at 1.000-1.005x.** A single lane at 16 rounds is
+the shortest admissible run the harness can produce, and the drift gate rewards it — this
+is the best drift performance on record, against 1.06-1.9x for filtered families and
+1.19-2.45x for the full board. Parity `match` throughout, 0 MISMATCH.
+
+### 74b. FIVE OF SIX WERE STILL REFUSED, AND NOT BY THE HOST
+
+Only `c8_2` certified. The other five failed the A/A nulls — PT 0.957-1.038, FT
+0.957-1.102 — on a host whose drift gate read 1.000x. **When drift is 1.000x and the row
+is still refused, the refusal is the +/-0.02 band, not the machine.** That is items 60 and
+63 exactly, now demonstrated at the cleanest host state this campaign has recorded.
+
+### 74c. THE CERTIFIED ROW
+
+    conv3d   MIN 3.04x SLOWER   ratio 0.329 [0.315,0.349]
+             PT null 0.999 PASS   FT null 0.997 PASS   drift 1.033x PASS/PASS
+             parity match   RAYON_NUM_THREADS=8   ELF 36b2c579   HEAD f2db331c
+             loadavg 17.10 / 19.50 / 23.54 pre, 15.93 / 19.13 / 23.35 post
+             CPU 1429-4068 MHz, idle spread 2.85x; cross-core spread WHILE SAMPLING
+             median 2.859x (min 2.829x, max 3.004x)
+
+Against the previously banked certified **0.269 = 3.72x SLOWER**. On the conservative
+bound (CI floor 0.315) the lane is **at most 3.17x SLOWER**, a 1.17x improvement on the
+standing.
+
+### 74d. THE HONEST DISAPPOINTMENT: 1.71x on the kernels bought 1.17x on the lane
+
+Item 73 measured forward+backward at 9.582 ms. The certified lane reads FT 19.4-22.9 ms.
+**More than half the lane is engine — tape, session, padding — and none of it was
+touched.** That is why three bit-exact kernel wins totalling 1.71x moved the certified
+standing only 1.17x.
+
+This is the same shape as GroupNorm before item 69, where the kernels were already FASTER
+than the incumbent while the session path was 5.41x SLOWER and the whole gap was the
+engine. The conv3d engine term is now the majority phase and has never been priced. **The
+next lever on this lane is the engine, not another kernel** — and on the GroupNorm
+precedent the first thing to look for is a numel-scaled serial materialization in the
+backward closure, not a fusion.
