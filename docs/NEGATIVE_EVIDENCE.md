@@ -29805,3 +29805,59 @@ together are 46% of the backward and exist only to turn a convolution into a mat
 does not pay them. That is the shape of the next lever, and it is a different class of work
 from everything items 98-123 did — which were all scheduling, memory or gate fixes on the
 existing decomposition.
+
+## 125. BatchNorm2d's FIRST CERTIFIED ROW IN THE HISTORY OF THIS BEAD, AND IT IS A WIN — 1.65x FASTER THAN PyTorch ON THE DENSE ROUTE
+
+`frankentorch-68pwz`. The bead has carried "BatchNorm2d is about 5.7x slower" as an
+UNVERIFIED figure since it was filed, explicitly because there was no h2h lane and therefore
+no way to check it. There is now a lane, and BatchNorm2d is **FASTER**.
+
+### THE ROWS
+
+`batch_norm2d_f64_dense`, loss `sum(out*out)`, incumbent PyTorch 2.12.0+cpu driven as a
+co-process in the SAME invocation at threads=8. Host thinkstation1, AMD Ryzen Threadripper
+PRO 5975WX, x86_64+avx2, governor powersave, rayon_threads=8, online_cpus=64. ELF sha256
+`a01302d87d9d74b91793f200b1e0ecd847b50fcb35b2444c2e842f93077c9908`. df /data 212G.
+
+    run  FT ms   PT ms   sq-median          MIN                 drift    load_1m         idle%  typical core MHz
+     1   33.699  57.807  1.72x (PT 0.975)   1.665x              PASS     15.53 -> 16.48  ~86    min 1429 med 3273 max 4289
+     2   38.318  63.047  1.65x CERTIFIED    1.669x CERTIFIED    PASS     18.60 -> 21.41  ~86    min 2424 med 3849 max 4214
+     3   36.986  64.462  1.74x              1.709x              DRIFTED  24.29 -> 27.70  ~86    min 2445 med 3896 max 4134
+
+**RUN 2 CERTIFIES ON BOTH ESTIMATORS** — square-median nulls PT PASS / FT PASS with no
+NULL-FAILED line, and the min estimator prints QUOTABLE with PT null 0.990 and FT null 0.997.
+Parity `match` on all three. Runs 1 and 3 miss for the usual reasons and neither is quoted:
+1's incumbent null lands at 0.975, five thousandths outside the band; 3 was drift-gated by
+load climbing 24.29 -> 27.70 mid-run.
+
+The MIN estimator is the striking part: 1.665 / 1.669 / 1.709 across three invocations, a
+1.026x span. FT arm 33.7-38.3 ms (1.137x), PT arm 57.8-64.5 ms (1.115x). Cross-core spread
+ran 2.8-3.0x median with arms NOT pinned, the caveat every row on this host carries.
+
+**CONSERVATIVE BOUND: at least 1.65x FASTER**, one certified row at 1.65x (square-median) /
+1.669x (min).
+
+### WHY THIS ROW EXISTS AT ALL
+
+Three things had to happen first, and two of them were corrections to my own work:
+
+1. The lane had to be on the DENSE route. A `sum(out)` lane fires the sum-shortcut, and for
+   batch-norm under a bare sum `dx` is analytically ZERO — that lane's parity checksum
+   compared two computations of nothing (item 122).
+2. The lane had to be f64. An f32 BatchNorm lane cannot clear a 1e-6 parity gate at any
+   shape: two f32 implementations differ by ~2e-5 relative on these gradients, 20x the gate.
+3. Our f32 accumulators had to be fixed first (`fa6fc6aa`) or the arbiter could not have told
+   an accuracy bug from a precision floor. That fix stands on its own — 150x, and our f32 is
+   now closer to f64 truth than PyTorch's is.
+
+### WHAT IS NOT CLAIMED
+
+This is the **f64** BatchNorm path. The f32 path remains unquotable by construction and its
+own lane still reports MISMATCH; the "5.7x slower" figure the bead was filed on has been
+neither confirmed nor refuted, because it was never attached to a route or a dtype.
+
+And the open observation from item 122 now has a third data point behind it: our f64
+BatchNorm (33.7-38.3 ms) is FASTER than our own f32 BatchNorm (53.3 ms measured earlier on
+the same shape). A dtype that halves the arithmetic making the op SLOWER points at the tape's
+f32<->f64 conversion boundary costing more than the narrower arithmetic saves. Not chased
+here; it is the most concrete lead this bead has left.
