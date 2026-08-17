@@ -29325,3 +29325,72 @@ lane at all**, so auditing them is not a registration but a new lane on both arm
 tensors, torch call, and a decision about which of BatchNorm's several f32/f64 entries the
 scorecard cares about. That is the remaining work on `frankentorch-mdsmm` and it is bigger than
 the five registrations that preceded it.
+
+## 116. THE GroupNorm BACKWARD PHASE FALLS 2.64x — AND THE LANE RATIO BARELY MOVES, BECAUSE THE BINDING CONSTRAINT WENT BACK TO THE TAPE
+
+`frankentorch-68pwz`. Item 113 named GroupNorm's own backward contribution (~47.9 ms) as the
+largest single phase left on the dense route. It is now 18.1 ms. The lane's vs-PyTorch
+standing improved from 2.78x to 2.66x SLOWER — and the gap between those two facts is the
+finding.
+
+### THE LEVER
+
+`group_norm_backward_f32` had two defects. Its per-group `mean`/`rstd` were computed TWICE —
+once in the dx pass, once in the affine pass — so the kernel walked all of `x` two extra
+times for values it had already produced. And its affine grads ran SERIALLY over ~1024 groups
+while the dx pass beside them was already fanned over rayon.
+
+Statistics hoisted into one pass and shared. Affine grads fanned over CHANNELS rather than
+groups, because `dw[c]`/`db[c]` accumulate ACROSS groups and a per-group fan-out would need a
+cross-thread combine that reassociates the sum; per channel, each output slot keeps a private
+chain visiting exactly the serial loop's terms in exactly its order. Bit-exact, and asserted
+against an independently written reference in the ORIGINAL shape rather than argued — with
+the test itself verified order-sensitive by injecting a reversed-`n` accumulation (fails on
+`dweight[0]`, -4.8816724 vs -4.881671; passes on restore).
+
+### THE ROWS
+
+Host thinkstation1 (AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2, powersave,
+rayon_threads=8, online_cpus=64), incumbent PyTorch 2.12.0+cpu self-reported in each
+invocation at threads=8, ELF `6cf11092...869d`, df /data 90G:
+
+    run  FT ms   PT ms   sq-median            MIN                  drift  load_1m        typical core MHz
+     1   51.305  20.332  2.52x (PT null FAIL) 2.55x CERTIFIED      PASS   16.37 -> 18.89  min 1429 med 3325 max 4289
+     2   52.308  17.816  2.94x (nulls FAIL)   3.99x (PT null FAIL) PASS   17.46 -> 18.05  min 1429 med 3389 max 4239
+     3   50.799  19.106  2.66x CERTIFIED      3.29x (PT null FAIL) PASS   17.29 -> 15.16  min 1429 med 3212 max 3980
+
+Compared like-for-like against item 113's rows, per estimator and never across them:
+square-median 2.78x -> **2.66x**, both certified; MIN estimator 2.91x -> **2.55x**, the after
+row certified. Parity match on all three.
+
+**THE FT ARM IS THE STABLE PART AND THE INCUMBENT IS NOT.** FT read 50.799-52.308 ms, a 1.030x
+span; PT read 17.816-20.332 ms, a 1.14x span. The ratio spread across these three runs is
+almost entirely the incumbent moving, not us. That is why run 2's 2.94x is not evidence of a
+regression and is not read as one.
+
+### WHY THE PHASE FELL 2.64x AND THE LANE ONLY 1.05x
+
+Arm-internal lane subtraction, same shape, before and after:
+
+    GroupNorm backward contribution   47.917 -> 18.117 ms   2.64x
+    tape's own mul+sum backward       29.300 -> 32.055 ms   unchanged (this run at loadavg 31)
+    whole timed region                84.006 -> 57.099 ms
+
+The lever did what it was aimed at. But the tape's generic elementwise backward is now 56.1%
+of the region again, and `tensor_mul`'s backward alone is 27.7 ms — still the single largest
+item, even after item 113 took it from 68.0 to 24.8 ms. **Halving a phase that is a third of
+the lane cannot move the lane by more than ~1.2x, and this is the arithmetic of that.**
+
+### WHAT IS LEFT, AND IT IS NOT A ONE-LINER
+
+`tensor_mul`'s backward writes TWO f64 gradient buffers of 6,422,528 elements each — 102 MB of
+stores — for an op whose forward moves a quarter of that in f32. PyTorch's gradients for this
+lane are f32. Every gradient buffer on an f32 lane is twice the bytes the incumbent moves, and
+no amount of parallelising the widen changes that; the remaining ~2.6x is substantially the
+tape's f64 grad space, which is an architectural question, not a kernel one. Naming it here
+rather than grinding further micro-levers against it, per the standing rule that a streak of
+small levers means the wrong thing is being optimised.
+
+CODE LANDED, BUT NOT BY ME: a peer's `git add -A` swept this kernel change into `a6e4b580`
+("perf(conv3d): fuse the dpanel GEMM into col2im"), whose message describes none of it. Second
+time this session; recorded so the provenance is findable.
