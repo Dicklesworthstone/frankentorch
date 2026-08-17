@@ -269,6 +269,109 @@ fn main() {
     );
     println!("  loadavg {}", loadavg());
     println!("  cpu_mhz {}", cpu_mhz());
+
+    batch_norm_dtype_phase_split(9);
+}
+
+/// WHERE THE f32 NORM PATH LOSES TO ITS OWN f64 SIBLING — `frankentorch-68pwz`, item 127.
+///
+/// The board measured, in ONE invocation and replicated: our f32 BatchNorm is **1.51x SLOWER
+/// than our own f64 BatchNorm** on the same shape, while PyTorch's f32 is ~4x FASTER than its
+/// own f64. Halving the arithmetic width moves the incumbent one way and us the other. That
+/// is a 6x swing in relative position from dtype alone, and it is the whole distance between
+/// our two BatchNorm standings (1.77x FASTER on f64, 3.40x SLOWER on f32).
+///
+/// The board can say THAT it happens but not WHERE. This splits the same graph, both dtypes,
+/// in one process: if the gap is in the backward it is the tape's f64 grad space and the
+/// conversions at its boundary; if it were in the forward it would be the kernels, which the
+/// board already reports at 1.28x FASTER and so is the less likely story.
+///
+/// Arm-internal. No incumbent, no ratio, no gate — this aims a lever, it does not score one.
+fn batch_norm_dtype_phase_split(reps: usize) {
+    let numel = GN_N * GN_C * GN_H * GN_W;
+    let xv: Vec<f64> = (0..numel)
+        .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+        .collect();
+    let wv: Vec<f64> = (0..GN_C).map(|c| 0.7 + (c % 5) as f64 * 0.1).collect();
+    let bv: Vec<f64> = (0..GN_C).map(|c| (c % 3) as f64 * 0.05 - 0.05).collect();
+
+    println!();
+    println!("BATCHNORM f32 vs f64 PHASE SPLIT (min of {reps}, arm-internal, one process)");
+    println!(
+        "{:<6} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "dtype", "fwd ms", "square", "sum", "backward", "total"
+    );
+
+    let mut rows: Vec<(&str, f64, f64, f64, f64)> = Vec::new();
+    for dtype in ["f32", "f64"] {
+        let (mut fwd, mut sq, mut sm, mut bwd) =
+            (f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        for _ in 0..reps {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, w, b) = if dtype == "f32" {
+                (
+                    s.tensor_variable_f32(
+                        xv.iter().map(|&v| v as f32).collect(),
+                        vec![GN_N, GN_C, GN_H, GN_W],
+                        true,
+                    )
+                    .expect("x"),
+                    s.tensor_variable_f32(wv.iter().map(|&v| v as f32).collect(), vec![GN_C], true)
+                        .expect("w"),
+                    s.tensor_variable_f32(bv.iter().map(|&v| v as f32).collect(), vec![GN_C], true)
+                        .expect("b"),
+                )
+            } else {
+                (
+                    s.tensor_variable(xv.clone(), vec![GN_N, GN_C, GN_H, GN_W], true)
+                        .expect("x"),
+                    s.tensor_variable(wv.clone(), vec![GN_C], true).expect("w"),
+                    s.tensor_variable(bv.clone(), vec![GN_C], true).expect("b"),
+                )
+            };
+            let t0 = std::time::Instant::now();
+            let (out, _, _) = s
+                .functional_batch_norm2d(x, None, None, Some(w), Some(b), true, 0.1, 1e-5)
+                .expect("bn");
+            let t1 = std::time::Instant::now();
+            let squared = s.tensor_mul(out, out).expect("sq");
+            let t2 = std::time::Instant::now();
+            let loss = s.tensor_sum(squared).expect("sum");
+            let t3 = std::time::Instant::now();
+            let r = s.tensor_backward(loss).expect("bwd");
+            let t4 = std::time::Instant::now();
+            std::hint::black_box(r.gradient(x).expect("dx").len());
+            fwd = fwd.min((t1 - t0).as_secs_f64() * 1e3);
+            sq = sq.min((t2 - t1).as_secs_f64() * 1e3);
+            sm = sm.min((t3 - t2).as_secs_f64() * 1e3);
+            bwd = bwd.min((t4 - t3).as_secs_f64() * 1e3);
+        }
+        println!(
+            "{dtype:<6} {fwd:>10.3} {sq:>10.3} {sm:>10.3} {bwd:>10.3} {:>10.3}",
+            fwd + sq + sm + bwd
+        );
+        rows.push((dtype, fwd, sq, sm, bwd));
+    }
+
+    let (_, f32_fwd, f32_sq, f32_sm, f32_bwd) = rows[0];
+    let (_, f64_fwd, f64_sq, f64_sm, f64_bwd) = rows[1];
+    println!();
+    println!("  f32 MINUS f64, per phase (positive = f32 is slower here):");
+    println!("    forward  {:>9.3} ms", f32_fwd - f64_fwd);
+    println!("    square   {:>9.3} ms", f32_sq - f64_sq);
+    println!("    sum      {:>9.3} ms", f32_sm - f64_sm);
+    println!(
+        "    backward {:>9.3} ms   <- the tape's f64 grad space + its conversions",
+        f32_bwd - f64_bwd
+    );
+    println!(
+        "    TOTAL    {:>9.3} ms   ({:.3}x)",
+        (f32_fwd + f32_sq + f32_sm + f32_bwd) - (f64_fwd + f64_sq + f64_sm + f64_bwd),
+        (f32_fwd + f32_sq + f32_sm + f32_bwd) / (f64_fwd + f64_sq + f64_sm + f64_bwd)
+    );
+    println!("  loadavg {}", loadavg());
+    println!("  cpu_mhz {}", cpu_mhz());
 }
 
 fn loadavg() -> String {

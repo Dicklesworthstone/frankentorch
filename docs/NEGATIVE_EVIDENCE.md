@@ -30046,3 +30046,67 @@ conv2d's all-ones adjoint (2026-07-05, and repaired in item 105/ikw6q) exists pr
 the summed route cheap, and it is still 1.7-2.1x slower than PyTorch. So the fast path is not
 merely un-tuned — it is losing to an incumbent that has no such specialisation at all. That is a
 second, independent target, and the cheaper of the two to investigate.
+
+## 129. THE DTYPE INVERSION IS ENTIRELY IN THE BACKWARD — THE f32 FORWARD IS PROPERLY FASTER, AND THE TAPE'S f64 GRAD SPACE EATS 27 ms
+
+`frankentorch-68pwz`. Item 127 established that our f32 BatchNorm is 1.51x SLOWER than our own
+f64 on the same shape while PyTorch's f32 is ~4x FASTER than its f64. It could say THAT but not
+WHERE. This locates it, arm-internal, both dtypes in one process, min-of-9, on the same graph:
+
+    dtype      fwd ms     square        sum   backward      total
+    f32         4.267      2.566      0.505     46.272     53.610
+    f64         6.739      5.138      0.918     19.035     31.830
+
+    f32 MINUS f64, per phase (positive = f32 slower):
+      forward    -2.472 ms      square  -2.572 ms      sum  -0.413 ms
+      backward  +27.238 ms
+      TOTAL     +21.780 ms   (1.684x)
+
+Host thinkstation1, rayon_threads=8, loadavg 11.00/12.83/16.62, CPU idle 77-82% verified by
+vmstat with iowait 0, cpu_mhz min 1429 median 2390 max 4258 spread 2.98x, df 204G.
+
+### THE FORWARD IS FINE, AND THAT IS THE INFORMATIVE HALF
+
+Every forward phase is faster in f32 by roughly the width ratio: forward 1.58x, square **2.00x**
+(exactly the byte ratio), sum 1.82x. The f32 kernels and the f32 elementwise path do precisely
+what halving the operand width should do. This kills the alternative explanation — it is not
+that our f32 kernels are bad. The board already hinted at it (`group_norm_f32_kernels` reads
+1.28x FASTER); this settles it.
+
+### THE BACKWARD IS 2.43x SLOWER IN f32, WHICH IS THE WHOLE INVERSION
+
+`46.272` vs `19.035` ms. The f32 backward pays what the f64 backward does not:
+
+  * gradient buffers are f64 REGARDLESS of tensor dtype, so an f32 graph moves the SAME
+    gradient bytes as an f64 one — the halving simply does not reach the grad space;
+  * on top of that, every op boundary converts: `dy` narrowed f64 -> f32 on the way in, `dx`
+    widened f32 -> f64 on the way out, and `operand_values_cow` widening f32 operands for each
+    elementwise VJP.
+
+So f32 gets none of the bandwidth win in the backward and pays a conversion tax for the
+privilege. The forward saves 5.5 ms; the backward gives back 27.2 ms.
+
+### WHAT THIS MEANS FOR THE LEVERS ALREADY LANDED
+
+They were real and they were small against this. Item 103's parallel narrow was worth 11.7 ms
+on a GroupNorm dense backward; item 113's parallel operand widen took `tensor_mul`'s backward
+from 68.0 to 24.8 ms. Both attacked the CONVERSION TAX. Neither touched the first cause, which
+is that the tape has no f32 gradient representation at all — so every remaining conversion is
+mandatory, not incidental, and no further parallelising removes one.
+
+### THE NAMED LEVER, AND WHY IT IS NOT ATTEMPTED HERE
+
+**Give the tape an f32 gradient representation for f32 tensors.** That is what would let the
+f32 backward move half the bytes and skip every boundary conversion, and the phase split above
+prices it: up to ~27 ms of a 53.6 ms lane, which would take our f32 BatchNorm from 3.40x SLOWER
+toward the f64 path's 1.77x FASTER.
+
+Not attempted in this turn, deliberately. It changes gradient storage in `ft-autograd`, a crate
+a dozen agents share, and it is a dtype-semantics change with parity consequences across every
+op — exactly the kind of change that wants a plan and a reserved surface, not an opportunistic
+edit at the end of a window. Recorded with its price so the decision is informed rather than
+guessed, per the standing rule that a streak of micro-levers means the wrong thing is being
+optimised: three levers have now been spent on the conversion tax, and this is the thing
+underneath them.
+
+NO ROW CLAIMED HERE. Arm-internal FT-vs-FT phase attribution; no incumbent, no gate.
