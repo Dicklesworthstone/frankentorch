@@ -29203,3 +29203,60 @@ the obvious next target.
 Nothing here says the tape's f64 grad space is right; it says one serial widen inside it was
 not. Every gradient buffer on an f32 lane is still twice the bytes PyTorch moves, and that is
 an architectural question this item does not open.
+
+## 114. THE SECOND 28.3 MB PANEL IS GONE FROM THE GENERIC conv3d BACKWARD — FUSED GEMM+SCATTER, BIT-EXACT
+
+Item 104c said the generic backward's other panel-sized buffer "does NOT yield to this
+technique" and would need "a real algorithmic change, not a k-split". That was right about the
+k-split and wrong about the difficulty: the split this one wants is on `m`, and it is easier
+to justify than item 104's, not harder.
+
+### 114a. WHAT SHIPPED
+
+`conv3d_backward_generic_f64` built `dpanel` — `flat x patch_width`, **28.3 MB** on the scored
+lane — with `dgemm(flat, out_ch, patch_width, dout_flat, weight)`, then read every row once in
+`conv3d_col2im_f64` and dropped it. Now `conv3d_col2im_from_dout_blocked_f64` fuses the two:
+for each batch, take `DPANEL_BLOCK_ROWS = 256` patch rows, compute just those rows, scatter
+them, move on. Peak buffer **28.3 MB -> 1.77 MB**, cache-resident instead of a DRAM round trip.
+
+Combined with item 104, the generic route no longer allocates ANY panel-shaped buffer. That
+route is the one a real objective reaches — items 110 and 111's `_masked`/`_dense` lanes exist
+because nothing on the board was measuring it.
+
+### 114b. TWO INDEPENDENT REASONS IT IS EXACT, AND THEY ARE NOT ITEM 97's
+
+**The product splits on `m`.** `C[i][:]` depends solely on `A[i][:]`, so computing rows
+`[t, t+B)` in their own call is the same arithmetic however the rows are grouped. The reduction
+is over `out_ch` and is never divided. This is a categorically weaker requirement than item
+104's `k`-split, which needed matrixmultiply's internal partition to be reproducible and
+pinned to a private constant. **`DPANEL_BLOCK_ROWS` is therefore FREE** — any value gives
+identical results, which is worth stating because `DGEMM_KC` next to it is the opposite.
+
+**The scatter keeps `pc` ascending.** `conv3d_col2im_f64` accumulates into each output element
+in ascending `pc`; both of its loop nests do, which is why the small-batch and large-batch
+paths already agree with each other. Blocking `pc` ascending inside each batch preserves that
+sequence exactly, and `(kdd, kr, kc)` inside a patch is copied unchanged.
+
+### 114c. THE PROOF, AND THE GATE IT HAD TO STRADDLE
+
+`conv3d_generic_dpadded_fused_scatter_matches_panel_col2im_bitwise` compares every `dpadded`
+element with `to_bits()` against `dgemm` -> full `dpanel` -> `conv3d_col2im_f64`:
+
+    scored lane      [2,32,10,18,18] k=3 s=1   patch_count 2048 = 8 blocks      PASS
+    ragged tail      [2,3,7,9,11] k=(2,3,2)    patch_count  420                 PASS
+    below one block  [1,2,5,6,6] k=2 strided   patch_count   20                 PASS
+    batch 9          [9,2,5,5,5] k=2 s=1       crosses COL2IM_PLANE_MAX_BATCH   PASS
+
+The batch-9 case is deliberate: `conv3d_col2im_f64` has two different loop nests either side
+of that gate and the fused path has to match BOTH. A dropped final partial block is the most
+plausible failure here, so two shapes have ragged tails and one is smaller than a single block.
+
+Gates: 666 ft-kernel-cpu tests pass (0 failed), clippy `-D warnings` clean on the crate.
+
+### 114d. NOT MEASURED
+
+Loadavg 19-28 and rising through this work, so no timing was taken and none is claimed. The
+prediction is bandwidth — 28.3 MB of write-then-read replaced by 1.77 MB resident — on the
+route item 110 measured at **2.7-2.9x SLOWER** than PyTorch, which is my worst standing and the
+reason this lever was chosen over adding more lanes. `conv3d_masked` is now the lane that can
+price it, and the paired before/after is owed in a quiet window.
