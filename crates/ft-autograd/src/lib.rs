@@ -21060,13 +21060,12 @@ impl TensorTape {
         if tensor.meta().dtype() == DType::F32
             && tensor.meta().is_contiguous()
             && tensor.meta().numel() >= Self::OPERAND_WIDEN_PARALLEL_MIN
+            && let Ok(values) = tensor.contiguous_values_f32()
         {
-            if let Ok(values) = tensor.contiguous_values_f32() {
-                use rayon::prelude::*;
-                return Ok(std::borrow::Cow::Owned(
-                    values.par_iter().map(|&v| f64::from(v)).collect(),
-                ));
-            }
+            use rayon::prelude::*;
+            return Ok(std::borrow::Cow::Owned(
+                values.par_iter().map(|&v| f64::from(v)).collect(),
+            ));
         }
         Ok(std::borrow::Cow::Owned(tensor.contiguous_values_as_f64()?))
     }
