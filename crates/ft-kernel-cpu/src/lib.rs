@@ -8847,6 +8847,24 @@ pub fn conv2d_backward_f64(
     // fix parallelized; now eliminated). frankentorch-convbwd / kgs4-convtb.
     let mut dweight = vec![0.0f64; out_ch * patch_width];
     gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
+    // FREE THE PANEL HERE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE item 143.
+    //
+    // `panel` is 18.0 MB at the scored shape and its LAST use is the line above. Without this
+    // it stays alive to the end of the function, so it and the 18.0 MB `dpanel` allocated on
+    // the next line are both resident through the second GEMM and through `col2im` — a peak
+    // working set of ~40 MB (panel + dpanel + dout_flat + dpadded) against an L3 instance of
+    // 32 MiB on this part (`lscpu`: 128 MiB in 4 instances).
+    //
+    // WHY THIS IS THE SHAPE OF THE FIX. Item 143 enumerated the whole generic path — nine
+    // operations, every one timed — and found the parts summing to 7.1 ms against a 16.6 ms
+    // whole. Nothing is missing, so the gap is the phases costing more IN SEQUENCE, and peak
+    // footprint is the only remaining candidate. This is that hypothesis's cheapest possible
+    // test and, if it holds, its fix.
+    //
+    // BIT-EXACT WITHOUT AN ARGUMENT: this changes a LIFETIME, not an operation. No arithmetic
+    // is reordered, no value is recomputed, nothing reads `panel` after this point. It is the
+    // rare change where parity needs no reasoning at all.
+    drop(panel);
     // dpanel [flat, patch_width] = dout_flat @ weight_flat.
     let mut dpanel = vec![0.0f64; flat * patch_width];
     gemm::dgemm(
