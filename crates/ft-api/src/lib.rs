@@ -144801,26 +144801,48 @@ mod tests {
             values.iter().map(|&v| v as f32).collect()
         }
 
-        // (2) Semantics first: these are the cases a plausible-but-wrong replacement gets
-        // wrong, and they are checked against the required answer, not against a twin.
-        #[allow(clippy::cast_possible_truncation)]
+        // (2) Semantics first, asserted THROUGH the shipped helper against the required
+        // answer — not against the `serial` twin below, which would agree with a wrong
+        // helper if someone "fixed" both together, and not against a bare `as` expression,
+        // which would only be testing the language.
         {
-            // Overflow saturates to infinity, NOT to f32::MAX.
-            assert_eq!((f64::MAX as f32).to_bits(), f32::INFINITY.to_bits());
-            assert_eq!((-f64::MAX as f32).to_bits(), f32::NEG_INFINITY.to_bits());
-            // Underflow below the smallest subnormal goes to +0.0, keeping the sign.
-            assert_eq!((f64::MIN_POSITIVE as f32).to_bits(), 0.0f32.to_bits());
-            assert_eq!((-f64::MIN_POSITIVE as f32).to_bits(), (-0.0f32).to_bits());
+            let sub_in = f64::from(f32::MIN_POSITIVE) / 2.0;
+            let tie_in = 1.0f64 + f64::from(f32::EPSILON) / 2.0;
+            let got = super::narrow_f64_to_f32(&[
+                f64::MAX,
+                -f64::MAX,
+                f64::MIN_POSITIVE,
+                -f64::MIN_POSITIVE,
+                sub_in,
+                tie_in,
+                -0.0,
+            ]);
+            // Overflow goes to infinity, NOT saturated to f32::MAX.
+            assert_eq!(
+                got[0].to_bits(),
+                f32::INFINITY.to_bits(),
+                "overflow -> +inf"
+            );
+            assert_eq!(
+                got[1].to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                "overflow -> -inf"
+            );
+            // Underflow below the smallest subnormal goes to zero, keeping the sign.
+            assert_eq!(got[2].to_bits(), 0.0f32.to_bits(), "underflow -> +0.0");
+            assert_eq!(got[3].to_bits(), (-0.0f32).to_bits(), "underflow -> -0.0");
             // Subnormal f32s survive rather than being flushed to zero.
-            let sub = f64::from(f32::MIN_POSITIVE) / 2.0;
-            assert_eq!((sub as f32).to_bits(), (f32::MIN_POSITIVE * 0.5).to_bits());
-            assert!(sub as f32 != 0.0, "subnormals must not be flushed");
+            assert_eq!(
+                got[4].to_bits(),
+                (f32::MIN_POSITIVE * 0.5).to_bits(),
+                "subnormals must not be flushed"
+            );
+            assert!(got[4] != 0.0, "subnormals must not be flushed");
             // Round-to-nearest-EVEN on an exact tie, not round-half-away-from-zero:
-            // 1 + eps/2 is exactly between 1.0 and 1.0+eps, so it must land on 1.0.
-            let tie = 1.0f64 + f64::from(f32::EPSILON) / 2.0;
-            assert_eq!((tie as f32).to_bits(), 1.0f32.to_bits());
-            // -0.0 keeps its sign bit.
-            assert_eq!((-0.0f64 as f32).to_bits(), (-0.0f32).to_bits());
+            // 1 + eps/2 sits exactly between 1.0 and 1.0+eps, so it must land on 1.0.
+            assert_eq!(got[5].to_bits(), 1.0f32.to_bits(), "tie -> nearest even");
+            // -0.0 keeps its sign bit rather than collapsing to +0.0.
+            assert_eq!(got[6].to_bits(), (-0.0f32).to_bits(), "-0.0 keeps its sign");
         }
 
         // (1) Straddle the gate deliberately: below, exactly at, and above.

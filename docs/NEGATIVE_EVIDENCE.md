@@ -28302,3 +28302,124 @@ magnitudes the code will actually SEE, not the ones the caller passed in.** An i
 reduction, a normalization, a deflation — any of them can move an operand hundreds of orders
 of magnitude away from the input, and every "cannot be reached at this scale" argument about
 such a routine is invalid unless it names where in the iteration it is evaluating.
+
+## 103. ITEM 69 REMOVED ONE OF TWO SERIAL numel PASSES — THE MIRROR ON THE WAY *IN* SURVIVED, AND THE SWEEP THAT SHOULD HAVE FOUND IT GREPPED THE WRONG SPELLING
+
+`frankentorch-68pwz`. Measured 2026-08-17, `examples/gradient_narrow_probe.rs`, min-of-9,
+local measurement build (`RCH_CARGO_WRAPPER_BYPASS=1`, no `[RCH]` line in the output),
+ELF sha256 `984481d1d64842446bc007b6df6214fbea02cccbf1a573de70895f43fdff4d4a`.
+Observed loadavg 12.01/10.80/16.14 (8t arm) and 10.83/10.60/15.99 (64t arm); CPU per arm
+min=1429 mean=3086 max=4192 spread=2.93x, and min=1429 mean=2471 max=4267 spread=2.99x.
+df /data 127G.
+
+### WHAT ITEM 69 LEFT BEHIND
+
+Item 69 found that the f32 GroupNorm backward closure handed its gradient to the tape as a
+serial `.iter().map(f64::from).collect()` — 6,422,528 values for the scored
+`[32,64,56,56]` lane, 24.9 ms — and parallelised it. It stopped at the output.
+
+Every one of the FOUR f32 norm backward closures in `ft-api/src/lib.rs` opens with the
+exact mirror of that line, on the way IN:
+
+    let dy: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+
+`grad_outputs[0]` is the tape's f64 gradient — the SAME one-element-per-input buffer. So
+these closures always had TWO serial numel-scaled materializations and item 69 removed
+one. The four: `layer_norm_backward_f32`, `rms_norm_backward_f32`,
+`group_norm_backward_f32`, `batch_norm_backward_f32`.
+
+### WHY THE FOLLOW-UP SWEEP MISSED IT — THE PART WORTH KEEPING
+
+Item 69 closed with "map(|&v| f64::from(v)) appears at 14 sites in ft-api; a sweep for
+other numel-scaled widenings is owed", and item 69f ran that sweep and reported every
+remaining conversion was "batch-, window-, index- or grid-sized".
+
+That sweep grepped `f64::from`. Every conversion in these four closures is spelled
+`v as f64` / `v as f32`. The sweep's conclusion was true of its grep and false of the
+file, and it was written down as a property of the file. **A negative sweep is only as
+wide as its pattern, and the pattern belongs in the claim.** The `as`-spelled sites were
+never hidden; nothing had ever looked for them.
+
+This also means item 69f's "every remaining conversion is small" is RETRACTED as a
+statement about `ft-api`, and stands only as a statement about `f64::from` call sites.
+
+### THE NUMBERS, AND A GATE THAT IS NOT THE WIDEN'S
+
+Narrow, 6,422,528 elements, min-of-9:
+
+    8 threads (the certifying budget)   serial 3.883 ms   parallel 1.367 ms   2.84x
+    64 threads (the default pool)       serial 3.829 ms   parallel 2.285 ms   1.68x
+
+The crossover is WIDTH-DEPENDENT, which is the finding that changes what ships:
+
+    numel        8 threads   64 threads
+    1 048 576        1.28x        0.23x   <- the widen's gate: a 4.3x LOSS at 64 threads
+    2 097 152        2.28x        0.70x   <- still a loss at 64
+    4 194 304        3.49x        1.44x   <- first size winning at BOTH
+    6 422 528        2.84x        1.68x   (the scored lane)
+
+So `GRADIENT_NARROW_PARALLEL_MIN = 1 << 22`, four times the widen's gate and the first
+size measured to win at both widths. Inheriting the widen's `1 << 20` — the obvious,
+tidy-looking choice — would have shipped a measured 4.3x pessimization on the default
+pool. A compile-time `const _: () = assert!(narrow > widen)` now fails the BUILD if a
+later cleanup folds the two constants together.
+
+WHY THEY DIFFER, mechanistically rather than as a fudge: a widen reads 4 bytes and writes
+8, a narrow reads 8 and writes 4. First-touching the fresh output allocation is the
+expensive half, so at equal element counts the widen does ~6.5x more serial work
+(26.3 ms vs 3.9 ms at 6.4M) and amortizes the same fork/join over far more of it.
+
+### ITEM 69's OWN GATE REPLICATES — A CONFIRMATION, NOT A DEFECT
+
+Re-ran `gradient_widen_probe` on the same ELF and window, because a width-dependent
+crossover in one direction is a reason to doubt the other. `GRADIENT_WIDEN_PARALLEL_MIN =
+1 << 20` reads 4.03x at 8 threads and 1.89x at 64 — a win at both. Item 69's constant is
+correct and stays.
+
+### WHAT THIS IS NOT
+
+It is NOT a certified vs-PyTorch row. It is an arm-internal price for one line, taken in
+the same window on the same binary, and the in-situ engine-term measurement is owed
+before any ratio is quoted. Item 69's own history is the reason for that caution: its
+predicted 20.351 ms and its in-situ 20.24 ms agreed to within 0.5%, but only because the
+claim was made on the within-sweep `session − kernels` term rather than on a cross-ELF
+before/after.
+
+BIT-EXACTNESS IS A WEAKER CLAIM HERE THAN FOR THE WIDEN, AND THE RIGHT ONE. f32 -> f64 is
+exact; f64 -> f32 ROUNDS. What makes the narrow safe to split is only that each output
+depends on exactly one input, so partitioning cannot change a bit — not that the values
+are preserved. `narrow_f64_to_f32_matches_serial_bitwise` therefore carries two separate
+obligations, because passing the first alone is the trap: (1) serial and parallel agree
+bitwise across the gate, and (2) the cast SEMANTICS are still `as f32` — overflow to
+infinity rather than saturation to `f32::MAX`, subnormals not flushed, round-to-nearest-
+EVEN on exact ties, `-0.0` keeping its sign. Obligation (1) alone is satisfied by any
+elementwise function, including a saturating or truncating cast that would silently
+change every gradient reaching an f32 norm kernel while keeping both routes agreeing with
+each other.
+
+### A RED SHARED GATE, FOUND ON THE WAY AND FIXED
+
+`cargo clippy --all-targets -- -D warnings` was already failing at HEAD before this
+lever touched anything. In `ft-kernel-cpu`, commit `2ff1fd9c` (mine, item 98) inserted the
+`DGEMM_KC` const and its doc comment BETWEEN `#[allow(clippy::too_many_arguments)]
+#[must_use]` and the `conv3d_backward_ones_dout_f64` they belonged to, so the attributes
+silently rebound to the const — where `must_use` is meaningless — and the function lost
+its allow. Landed because item 98's gate was run before that const was added. Attributes
+moved back onto the function.
+
+### WHERE THE CODE ACTUALLY LANDED
+
+Not in a commit of mine. While this lever sat uncommitted in the shared checkout, a peer's
+`git add -A` swept the helper, all four call sites, the probe, the test and the clippy
+repair into `e797fa6d` ("test(svd): close ga99y on its own headline cell"), whose message
+describes none of them. The code is on main and correct; the commit that carries it is not
+about it. Recorded so the next reader looking for this lever's provenance finds it, and as
+the sixth instance of a hazard this ledger has now logged repeatedly: on a checkout shared
+by a dozen agents, work is not yours until it is committed, and a gate line in a peer's
+commit message does not cover code that arrived by sweep.
+
+### WHAT IS STILL OWED
+
+The in-situ engine-term measurement (`session − kernels` within one sweep, both arms in the
+same window) before any vs-PyTorch ratio is quoted for this. The arm-internal price above
+is not that number, and item 69's history is exactly why the distinction is worth keeping.
