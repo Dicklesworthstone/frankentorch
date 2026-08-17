@@ -26712,3 +26712,232 @@ toward ~1 ms because 84% of that term was the widen these two items remove.
 Two items have now shipped on this lever without a number. Item 69 set the standard —
 a 20.351 ms prediction the board confirmed to 0.5% — and that standard has not yet been met
 here.
+
+## 82. THE conv3d BACKWARD IS ATTRIBUTED AT LAST — THE PAD UN-GATHER WAS 1/4 OF IT, AND CYCLE SHARE IS THE WRONG INSTRUMENT FOR FINDING SERIAL CODE
+
+Item 76 put 78% of the conv3d lane in `tensor_backward` and named four suspects for the
+~9 ms the conv3d kernel does not explain: `tensor_pad`'s backward, `tensor_sum`'s backward,
+gradient accumulation, and the custom-op wrapper. **A list of suspects is not an
+attribution.** This item closes it, refutes two of the four suspects, and records eight
+live rows that certified nothing.
+
+### 82a. THE NEAR-MISS: A `perf record` SAID THE ANSWER WAS 0.34%, AND IT WAS WRONG TO BELIEVE IT
+
+The first instrument was `perf record -F 999 --call-graph=dwarf` over `conv3d_engine_probe`.
+It reported:
+
+    19.93%  conv3d_forward_direct_3x3s1_f64      <- kernel forward
+     8.69%  crossbeam_epoch::with_handle          }
+     7.43%  WorkerThread::steal (try_fold)        }  ~32% of all cycles is
+     5.55%  crossbeam_epoch::Global::try_advance  }  RAYON SCHEDULING
+     5.38%  crossbeam_deque::Stealer::steal       }
+     0.34%  TensorTape::backward_with_options     <- everything the tape does
+
+`backward_with_options` is where the serial per-element un-pad lives, and at 0.34% I nearly
+struck it off the list. **That reading was an artefact of the instrument.** A serial region
+running on a 64-thread pool holds ONE core while 63 spin, so its share of total CYCLES is
+divided by the thread count while its share of WALL CLOCK is not. Working it back: 0.34% of
+33.9 Gcycles is 115 Mcycles, over the 14 executions in the probe, at ~3 GHz, is **2.7 ms
+each** — which is precisely what the wall-clock subtraction below independently measured.
+
+**A cycle profile ranks parallel code above serial code by exactly the pool width.** On a
+64-thread pool it will bury a 2.7 ms serial stall under a 0.3% label. This campaign's whole
+remaining vein is serial regions inside a parallel engine (items 69, 75, 78), so this is the
+one instrument that cannot find them. Use wall-clock lane subtraction; use `perf` only after
+a phase is already located, and read its thread-count denominator.
+
+### 82b. THE ATTRIBUTION, BY LANE SUBTRACTION
+
+`conv3d_backward_split_probe` builds the scored lane and then the same lane with exactly one
+node removed, timing ONLY the backward stage (the timer starts after `tensor_sum` returns).
+Public session API throughout; no incumbent, no ratio, no drift gate, so it is honest under
+load. Shape `[2,32,8,16,16]` k=3 s=1 pad=1, 64 threads, min of 9, loadavg 17.54 / 16.13 /
+18.75, CPU 1429-4168 MHz (idle spread 2.92x), ELF `a0722c635eb5a9ef`:
+
+    lane                                          min ms
+    A  leaf -> conv3d(pad=1) -> sum   [the lane]    8.808
+    B  leaf(padded) -> conv3d(pad=0) -> sum         5.984
+    C  leaf -> pad -> sum                           2.916
+    D  leaf(padded) -> sum                          0.859
+    K  conv3d_backward_f64 kernel, no tape          6.037
+
+    pad node backward           (C - D)             2.057
+    pad node backward, in-lane  (A - B)             2.823
+    conv custom-op wrapper      (B - D - K)        -0.912
+    kernel share of the lane    (K / A)             68.5%
+
+**Two of item 76's four suspects are refuted.** The custom-op wrapper subtracts to -0.912 ms
+— i.e. zero within noise; `apply_function_with_create_graph_borrowed_inputs` borrows its
+inputs and its version check is an integer compare, so there was never a copy to find. And
+the backward stage is **68.5% kernel**, not the mostly-engine phase item 76 implied.
+
+What is real is the pad: **2.06-2.82 ms, roughly a quarter of the backward stage, to move
+1 MB.** The old body walked one element at a time, each paying `ndim` integer divisions and
+`ndim` modulos to un-flatten its index, on one thread.
+
+### 82c. THE LEVER: DIVIDE PER ROW, NOT PER ELEMENT
+
+The innermost axis is contiguous in both buffers — a constant pad only shifts where the run
+starts — so the un-pad is a row-wise `copy_from_slice`: 8192 row-base computations instead of
+131072 element-index computations at this shape, fanned over Rayon above the same 1<<15 gate
+the gradient accumulators use. Serial and parallel run the identical row copy, so the gate
+changes the fan-out and never a value. It is a pure gather with no arithmetic on the data,
+so bit-identity is structural rather than measured.
+
+### 82d. CORRECTING THE COMMIT MESSAGE THIS LANDED UNDER — IT IS NOT A BUG FIX
+
+This change reached main as `f34ae89e`, "fix(autograd): gather the unpadded region under
+asymmetric / partial pad", whose body states that the previous code "only handled the
+symmetric full-pad case" and that "asymmetric or partial padding gathered the wrong region".
+**That is false, and it should not stand in the history unchallenged.** The pre-existing
+per-element walk was a fully general gather: it un-flattened with the input strides, shifted
+each coordinate by its own leading pad, and re-flattened with the output strides, which is
+correct for asymmetric padding and for `padding` shorter than the rank.
+
+This is asserted by an executed test, not by reading the diff.
+`pad_backward_pre_row_copy_formula_was_already_correct` reimplements the pre-`f34ae89e`
+formula as arithmetic (so it keeps proving this after the old code is gone) and shows it
+produces the reference answer for asymmetric, partially-specified padding. **There is no
+pad-backward defect in any released build.** The change is a performance lever.
+
+The two accompanying tests are anti-tautology guards for the NEW row copy, and they exist
+because the obvious test does not test anything: reduce `pad(x)` straight to a sum and the
+incoming gradient is all ones, so every possible permutation of the gather — including every
+wrong one — returns the same answer. Both multiply by a distinct-valued constant first.
+
+### 82e. EIGHT LIVE ROWS, ZERO CERTIFICATIONS — AND THE FT ARM IS THE LOAD-SENSITIVE ONE
+
+`gauntlet_lane_sweep_h2h`, `FT_H2H_LANES=conv3d`, 16 rounds, live PyTorch 2.12.0+cpu in the
+same invocation, thinkstation1, ELF `29137ef9f6433810`, mimalloc (`--features fair-alloc`):
+
+    run    threads  load 1m  FT ms    PT ms    min-ratio             verdict
+    c64_1    64       20.5   16.292    6.596   0.440 [0.419,0.459]   PT null 1.031 F  FT 1.063 F
+    c64_2    64       25.6   18.615    6.591   0.384 [0.348,0.409]   FT null 1.077 F
+    c64_3    64       28.0   20.519    6.395   0.314 [0.293,0.338]   PT 1.020 F  FT 0.944 F
+    c64_4    64       31.9   32.242    6.995   0.230 [0.208,0.250]   PT 1.068 F  FT 1.039 F
+    r8_1      8       19.1   16.503    6.920   0.412 [0.396,0.430]   PT 1.072 F  FT 1.031 F
+    r8_2      8       23.5   18.747    8.105   0.393 [0.374,0.416]   PT 1.102 F  FT 0.933 F
+    r8_3      8       31.6   35.587   20.278   0.342 [0.268,0.443]   PT 0.848 F
+    r8_4      8       47.3   33.531   10.620   0.303 [0.273,0.335]   PT 0.977 F  FT 1.022 F
+
+Parity `match` on all eight, 0 MISMATCH; every drift gate PASS. **None is quotable** — all
+eight are refused by the +/-0.02 A/A band, which is items 60, 63 and 74b again. Item 74 got
+one certification in six attempts and item 77 two in six; today's rate is zero in eight, and
+the difference is the host, not the code.
+
+Two things in this table are worth more than the ratios:
+
+**The comparison I nearly made was invalid.** The certified standing (0.324-0.352, items 74
+and 77) is a `RAYON_NUM_THREADS=8` standing. The first four runs above are 64-thread, and
+comparing them to it would have been the thread-count confound wearing a lever's costume.
+The `r8_*` rows exist only because I noticed this after taking the `c64_*` ones.
+
+**Our arm degrades with host load and the incumbent's does not.** Across `c64_1 -> c64_4`,
+load 20.5 -> 31.9, the FT arm went 16.292 -> 32.242 ms (1.98x) while PT held 6.4-7.0 ms
+(1.06x). That is item 38's compression effect measured cleanly on one lane in one binary,
+and it is the strongest argument yet for `frankentorch-rayon-pool-width-qq8as`: a 64-wide
+pool on a box carrying a dozen agents is not measuring our kernels, it is measuring our
+neighbours. Only when the host saturated outright (r8_3, r8_4, load 32-47) did the PT arm
+finally move too, and those two rows are worthless for that reason.
+
+In the least-loaded windows (`r8_1`, `r8_2`, `c64_1`) the min-ratio reads 0.393-0.440
+against a certified band of 0.324-0.352, with the PT arm at 6.6-8.1 ms inside its banked
+6.485-9.005 range — i.e. the incumbent did not move. That is *suggestive* of a real
+improvement and it is **not a win**, because not one of the eight rows passed its A/A gate.
+The owed measurement is unchanged: `RAYON_NUM_THREADS=8`, filtered conv3d lane, in a settled
+window, until a row certifies.
+
+### 82f. THE CLIPPY GATE IS RED AT HEAD, AND THE TOOLCHAIN IS A FLOATING NIGHTLY
+
+Step 3f (`cargo clippy --all-targets -- -D warnings`) cannot pass at HEAD, in files nobody
+in this session touched. `rust-toolchain.toml` pins `channel = "nightly"` with no date, so a
+nightly bump turns on new lints across nine projects at once; every lint below is one of the
+recent ones (`collapsible_if` with let-chains, `chunks_exact_to_as_chunks`,
+`needless_range_loop`):
+
+    crates/ft-kernel-cpu/src/lib.rs:2555        collapsible_if           FIXED (mine, 94adb089)
+    examples/gauntlet_lane_sweep_h2h.rs         4 lints                  FIXED (harness I measure with)
+    crates/ft-kernel-cpu/examples/svd_scale_probe.rs   7x empty format   LEFT — peer's active SVD lane
+    crates/ft-kernel-cpu lib tests              3x chunks_exact          LEFT
+    crates/ft-api/benches/pytorch_gauntlet_bench.rs:1130  unused import  LEFT — see below
+
+One of the four harness fixes is deliberately an `#[allow]` with a reason rather than the
+rewrite clippy asks for: that `chunks_exact(8)` sits INSIDE the timed region of the
+8-accumulator reduction probe, and silently editing measured code to satisfy a style lint
+would invalidate the comparison the probe banks.
+
+The bench one should not be "fixed" by anyone in a hurry: clippy calls
+`use super::gauntlet_provenance` unused and its help suggests adding `#[cfg(test)]` to the
+containing module — **which is already there, on the line above the one it prints.** The
+import is used by the test in that module. Either the lint is wrong or the target is being
+compiled in a configuration nobody intended; deleting the import to get green would be
+guessing at a gate. Pinning the nightly to a date is the fix that addresses the cause.
+
+## 82. THE ITEM 80/81 DEBT IS PAID — ENGINE 3.876 -> 2.017 ms, AND MY PREDICTION WAS 2.5x TOO OPTIMISTIC
+
+Items 80 and 81 shipped the f64-dx GroupNorm backward without a number, and item 81d said
+so explicitly. Measured here, on ELF `9c4d0d70...` at HEAD `1282e290`, private snapshot,
+`FT_H2H_LANES=group_norm_f32`, `FT_H2H_REPS=16`, `RAYON_NUM_THREADS=8`. Six runs, all
+drift-clean, parity `match` throughout, 0 MISMATCH.
+
+    run  load 1m  drift    gates      session  kernels  ENGINE   ratio                 cert
+    n      20.04  1.048x   PASS/PASS    8.958    7.058   1.900   0.678 [0.652,0.821]  CERT
+    m1     34.79  1.085x   PASS/PASS    9.160    7.143   2.017   0.754 [0.723,0.914]  -
+    m2     42.97  1.215x   PASS/PASS    9.038    7.119   1.919   0.724 [0.664,0.851]  -
+    m3     32.39  1.183x   PASS/PASS    8.986    6.641   2.345   0.741 [0.691,0.882]  -
+    m4     37.19  1.053x   PASS/PASS    8.730    6.870   1.860   0.703 [0.668,0.865]  CERT
+    m5     32.64  1.038x   PASS/PASS    9.029    6.451   2.578   0.736 [0.696,0.903]  CERT
+
+### 82a. THE ENGINE TERM, which is the claim these items actually make
+
+Measured as session minus kernels WITHIN each run, so host state cancels:
+
+    before (item 71, same lane)   10.912 - 7.036 = 3.876 ms
+    after  (median of six)         9.029 - 6.870 = 2.017 ms
+
+**3.876 -> 2.017 ms, a 1.92x reduction and 1.86 ms saved.**
+
+### 82b. AND THE PREDICTION WAS WRONG BY 2.5x
+
+Item 80c predicted the term would fall "toward ~1 ms", reasoning from item 70d that 84% of
+it (4.566 ms) WAS the widen these items remove. **Observed saving is 1.86 ms, not 4.57.**
+
+The reasoning error is identifiable and worth keeping: removing the widen does not remove
+its whole cost, because **the kernel now writes twice the bytes it used to.** Before, the
+kernel wrote 25.7 MiB of f32 and the widen then read 25.7 MiB and wrote 51 MiB. After, the
+kernel writes 51 MiB directly. What is saved is the intermediate's write and read-back
+(~51 MiB of traffic), not the widen's full 4.57 ms — the f64 store was always going to be
+paid by somebody.
+
+That is the third time this campaign a phase measured in ISOLATION over-predicted its
+in-situ value (items 72's zero-fill and 79a's output buffer are the others), and the
+mechanism is the same each time: the isolated number counts work that does not disappear,
+it moves.
+
+### 82c. The certified standing
+
+Three certifications: **0.678, 0.703, 0.736** — median **0.703 = 1.42x SLOWER**, worst CI
+floor 0.652, so **at most 1.53x SLOWER**. Against item 71's certified `group_norm_f32` of
+**0.573 = 1.75x SLOWER** (item 79 corrects item 71's headline, which quoted the `_zeroed`
+control; 0.573 is the real lane's row from the same sweep).
+
+Per-arm host state for the certified rows:
+
+    n   loadavg 20.04 / 22.28 / 26.87; CPU 1429-4017 MHz idle spread 2.81x;
+        cross-core spread WHILE SAMPLING median 2.864x (2.777-3.005x)
+    m4  loadavg 37.19 / 30.95 / 29.29 -> 32.64 / 30.47 / 29.19; CPU 1429-4182 MHz idle
+        spread 2.93x; cross-core WHILE SAMPLING median 2.810x (2.693-2.897x)
+    m5  loadavg 32.64 / 30.47 / 29.19 -> 31.67 / 30.50 / 29.25; CPU 1429-4045 MHz idle
+        spread 2.83x; cross-core WHILE SAMPLING median 2.827x (1.001-2.958x)
+
+Three of six certified at loadavg 20-37 with drift 1.038-1.215x — consistent with item 74a
+that the family filter makes the drift gate robust, and item 74b that the null band is what
+refuses the rest.
+
+### 82d. What is left on this lane
+
+The engine is now 2.017 ms of a 9.0 ms arm, and the kernels are 6.5-7.1 ms. **The kernels
+are now the majority and they already run 1.14x SLOWER than the incumbent on their own
+lane** (`group_norm_f32_kernels`, 0.881 in run `n`), so the next lever here is kernel work,
+not engine work — the opposite of where items 69-81 have been aimed. That inversion is the
+result, and it should be checked before anyone spends another tick on the tape.
