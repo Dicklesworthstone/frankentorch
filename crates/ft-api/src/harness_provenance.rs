@@ -326,7 +326,12 @@ pub fn cpu_mhz_stats() -> Option<(f64, f64, f64, f64)> {
     let min = mhz[0];
     let max = mhz[mhz.len() - 1];
     let median = mhz[mhz.len() / 2];
-    Some((min, median, max, if min > 0.0 { max / min } else { f64::NAN }))
+    Some((
+        min,
+        median,
+        max,
+        if min > 0.0 { max / min } else { f64::NAN },
+    ))
 }
 
 /// One line of clock provenance for a banked row.

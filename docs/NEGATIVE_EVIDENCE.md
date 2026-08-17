@@ -26873,7 +26873,7 @@ import is used by the test in that module. Either the lint is wrong or the targe
 compiled in a configuration nobody intended; deleting the import to get green would be
 guessing at a gate. Pinning the nightly to a date is the fix that addresses the cause.
 
-## 82. THE ITEM 80/81 DEBT IS PAID — ENGINE 3.876 -> 2.017 ms, AND MY PREDICTION WAS 2.5x TOO OPTIMISTIC
+## 83. THE ITEM 80/81 DEBT IS PAID — ENGINE 3.876 -> 2.017 ms, AND MY PREDICTION WAS 2.5x TOO OPTIMISTIC
 
 Items 80 and 81 shipped the f64-dx GroupNorm backward without a number, and item 81d said
 so explicitly. Measured here, on ELF `9c4d0d70...` at HEAD `1282e290`, private snapshot,
@@ -26888,7 +26888,7 @@ drift-clean, parity `match` throughout, 0 MISMATCH.
     m4     37.19  1.053x   PASS/PASS    8.730    6.870   1.860   0.703 [0.668,0.865]  CERT
     m5     32.64  1.038x   PASS/PASS    9.029    6.451   2.578   0.736 [0.696,0.903]  CERT
 
-### 82a. THE ENGINE TERM, which is the claim these items actually make
+### 83a. THE ENGINE TERM, which is the claim these items actually make
 
 Measured as session minus kernels WITHIN each run, so host state cancels:
 
@@ -26897,7 +26897,7 @@ Measured as session minus kernels WITHIN each run, so host state cancels:
 
 **3.876 -> 2.017 ms, a 1.92x reduction and 1.86 ms saved.**
 
-### 82b. AND THE PREDICTION WAS WRONG BY 2.5x
+### 83b. AND THE PREDICTION WAS WRONG BY 2.5x
 
 Item 80c predicted the term would fall "toward ~1 ms", reasoning from item 70d that 84% of
 it (4.566 ms) WAS the widen these items remove. **Observed saving is 1.86 ms, not 4.57.**
@@ -26914,7 +26914,7 @@ in-situ value (items 72's zero-fill and 79a's output buffer are the others), and
 mechanism is the same each time: the isolated number counts work that does not disappear,
 it moves.
 
-### 82c. The certified standing
+### 83c. The certified standing
 
 Three certifications: **0.678, 0.703, 0.736** — median **0.703 = 1.42x SLOWER**, worst CI
 floor 0.652, so **at most 1.53x SLOWER**. Against item 71's certified `group_norm_f32` of
@@ -26934,10 +26934,73 @@ Three of six certified at loadavg 20-37 with drift 1.038-1.215x — consistent w
 that the family filter makes the drift gate robust, and item 74b that the null band is what
 refuses the rest.
 
-### 82d. What is left on this lane
+### 83d. What is left on this lane
 
 The engine is now 2.017 ms of a 9.0 ms arm, and the kernels are 6.5-7.1 ms. **The kernels
 are now the majority and they already run 1.14x SLOWER than the incumbent on their own
 lane** (`group_norm_f32_kernels`, 0.881 in run `n`), so the next lever here is kernel work,
 not engine work — the opposite of where items 69-81 have been aimed. That inversion is the
 result, and it should be checked before anyone spends another tick on the tape.
+
+## 83. A 1.19x GAP BETWEEN TWO GroupNorm KERNEL ROUTES — REPLICATED 5/5, CAUSE NOT ISOLATED
+
+Item 82d said the kernels are now the majority of the group_norm lane and the next lever is
+kernel work. Looking there immediately turned up a gap, and then a reason not to act on it
+yet.
+
+Arm-internal, FT against FT inside the SAME run and binary, so host state cancels
+completely. ELF `9c4d0d70...`, 8 threads, five runs:
+
+    route                                   FT ms per run                    median
+    group_norm_f32_statskernels             7.00 6.65 6.70 6.53 6.67         6.672
+    group_norm_f32_statskernels_recompute   5.61 5.39 6.21 5.64 5.26         5.609
+
+**1.19x, and the ordering holds in 5 of 5 pairs.** For context the session lane sits at
+9.029 ms and the kernel route it actually calls (`group_norm_f32_kernels`) at 6.870 — so if
+this gap were harvestable it would be worth roughly 1.1-1.3 ms of a 9 ms arm.
+
+### 83a. WHY I AM NOT ACTING ON IT, AND THE HARNESS COMMENT THAT NEARLY MADE ME
+
+The lane is named `_recompute` and the harness introduces it as *"Lever OFF: identical work,
+statistics rebuilt in the backward."* Read at face value that says the ONLY difference is
+whether the backward reuses the forward's statistics — which would make this a clean
+refutation of `frankentorch-qkwsy`'s stats-reuse lever, and a one-line change to the session
+backward.
+
+**It is not what the two lanes do.** Reading the bodies rather than the label:
+
+    reuse_stats = true   group_norm_forward_f32_with_cpg2_stats  +  ..._backward_..._with_cpg2_stats
+    reuse_stats = false  group_norm_forward_f32_scheduled        +  ..._backward_scalar_f32
+
+The FORWARD FUNCTION DIFFERS TOO. So the 1.19x is a difference between two ROUTES, and it
+is not established whether it comes from the stats path, the forward, or both. Switching the
+session's backward on this number would be acting on a confounded measurement — the exact
+error behind items 74 (">50% engine" from a mismatched pair), 75 (a lever on a path the lane
+never reaches) and 80c (a prediction 2.5x too optimistic).
+
+The harness comment is the proximate cause and should be corrected by whoever owns that file
+— it currently carries another agent's uncommitted work, so it is reported here rather than
+edited.
+
+### 83b. The isolation experiment this needs
+
+One variable at a time, all four combinations, arm-internal:
+
+    forward_with_cpg2_stats + backward_with_stats     (route A, what ships)
+    forward_with_cpg2_stats + backward_recomputing
+    forward_scheduled       + backward_with_stats     (needs stats from somewhere)
+    forward_scheduled       + backward_recomputing    (route B)
+
+The second row is the decisive one and is cheap: same forward, backward switched. If it
+lands near 6.67 the forward is the cost; near 5.61 the stats path is, and `qkwsy` is
+refuted. **Until that row exists, "stats reuse is a regression" is not a claim this ledger
+should carry**, however suggestive 5/5 looks.
+
+### 83c. What is certain from this
+
+Two routes computing the same gradient differ by 1.19x, replicated, on the lane whose
+kernels are now the majority phase. That is worth someone's tick. It is the size of the
+prize; it is not yet the lever.
+
+Observed loadavg 20.04-42.97 across the five runs; CPU 1429-4182 MHz, cross-core spread
+while sampling 2.81-2.86x median. Parity `match` throughout, 0 MISMATCH.

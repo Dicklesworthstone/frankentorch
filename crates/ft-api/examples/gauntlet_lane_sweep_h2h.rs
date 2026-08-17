@@ -1352,20 +1352,20 @@ LANES = {
             // Set FT_H2H_DUMP_SLOTS to a lane name (or `*`) to print the raw four
             // slots per arm per round. Nothing else in the harness shows them, and
             // three hypotheses died before anyone looked.
-            if let Ok(target) = std::env::var("FT_H2H_DUMP_SLOTS") {
-                if target == "*" || target.as_str() == *name {
-                    println!(
-                        "SLOTS lane={name} ft=[{:.4} {:.4} {:.4} {:.4}] pt=[{:.4} {:.4} {:.4} {:.4}]",
-                        ft_slots[0],
-                        ft_slots[1],
-                        ft_slots[2],
-                        ft_slots[3],
-                        incumbent_slots[0],
-                        incumbent_slots[1],
-                        incumbent_slots[2],
-                        incumbent_slots[3]
-                    );
-                }
+            if let Ok(target) = std::env::var("FT_H2H_DUMP_SLOTS")
+                && (target == "*" || target.as_str() == *name)
+            {
+                println!(
+                    "SLOTS lane={name} ft=[{:.4} {:.4} {:.4} {:.4}] pt=[{:.4} {:.4} {:.4} {:.4}]",
+                    ft_slots[0],
+                    ft_slots[1],
+                    ft_slots[2],
+                    ft_slots[3],
+                    incumbent_slots[0],
+                    incumbent_slots[1],
+                    incumbent_slots[2],
+                    incumbent_slots[3]
+                );
             }
             if let Some((min_mhz, median_mhz, _, spread)) =
                 ft_api::harness_provenance::cpu_mhz_stats()
@@ -1643,9 +1643,13 @@ LANES = {
         let rounds = ft_times[index].len().min(ft_times[base_index].len());
         let mut treated = Vec::with_capacity(rounds);
         let mut control = Vec::with_capacity(rounds);
-        for round in 0..rounds {
-            control.push(ft_times[index][round]);
-            treated.push(ft_times[base_index][round]);
+        for (control_time, treated_time) in ft_times[index]
+            .iter()
+            .zip(ft_times[base_index].iter())
+            .take(rounds)
+        {
+            control.push(*control_time);
+            treated.push(*treated_time);
         }
         let paired: Vec<f64> = control
             .iter()
@@ -1968,6 +1972,12 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
 
         let started = Instant::now();
         let mut acc = [0.0f32; 8];
+        // NOT rewritten to `as_chunks::<8>()` as clippy asks: this loop is INSIDE the
+        // timed region it exists to measure (the 8-accumulator reduction against the
+        // sequential one), and swapping the iterator changes the code being timed. The
+        // lint is a style preference; silently editing a measured region to satisfy it
+        // would invalidate the comparison this probe banks. frankentorch-l2zki.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let mut chunks = probe_group.chunks_exact(8);
         for chunk in &mut chunks {
             for (slot, &v) in acc.iter_mut().zip(chunk) {
@@ -2041,7 +2051,9 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         }
     };
     let step_lane_estimator = mid(step_samples
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|round| mid(round.to_vec()))
         .collect::<Vec<_>>());
 

@@ -30261,8 +30261,20 @@ impl FrankenTorchSession {
         // are LOAD-BEARING — only the interior is written and the border zeros are the
         // padding itself — so `build_uninit` would be unsound.
         let plane_out = out_d * out_h * out_w;
-        Self::pad_ncdhw_copy_planes(&mut dst, src, n * c, in_d, in_h, in_w, plane_out, pad_d,
-            pad_h, pad_w, out_h, out_w);
+        Self::pad_ncdhw_copy_planes(
+            &mut dst,
+            src,
+            n * c,
+            in_d,
+            in_h,
+            in_w,
+            plane_out,
+            pad_d,
+            pad_h,
+            pad_w,
+            out_h,
+            out_w,
+        );
         dst
     }
 
@@ -30327,8 +30339,20 @@ impl FrankenTorchSession {
         // frankentorch-l2zki: same serial plane loop as the f64 form; see
         // `pad_ncdhw_copy_planes`. Zeros stay — they are the padding.
         let plane_out = out_d * out_h * out_w;
-        Self::pad_ncdhw_copy_planes(&mut dst, src, n * c, in_d, in_h, in_w, plane_out, pad_d,
-            pad_h, pad_w, out_h, out_w);
+        Self::pad_ncdhw_copy_planes(
+            &mut dst,
+            src,
+            n * c,
+            in_d,
+            in_h,
+            in_w,
+            plane_out,
+            pad_d,
+            pad_h,
+            pad_w,
+            out_h,
+            out_w,
+        );
         dst
     }
 
@@ -33742,7 +33766,12 @@ impl FrankenTorchSession {
                         )
                     })?;
                     let din = ft_kernel_cpu::max_pool1d_backward_from_indices_f64(
-                        dout, arg_offsets, n, ch, l, output_len,
+                        dout,
+                        arg_offsets,
+                        n,
+                        ch,
+                        l,
+                        output_len,
                     );
                     Ok(vec![Some(din)])
                 },
@@ -142208,21 +142237,29 @@ mod tests {
 
         // ---- route 1: sum(pool(x)) -> the scalar sum shortcut ----
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = sess.tensor_variable(values.clone(), shape.clone(), true).unwrap();
+        let x = sess
+            .tensor_variable(values.clone(), shape.clone(), true)
+            .unwrap();
         let pooled = sess.functional_max_pool1d(x, 2, 2).unwrap();
         let loss = sess.tensor_sum(pooled).unwrap();
         let report = sess.tensor_backward(loss).unwrap();
-        let grad_shortcut = sess.tensor_gradient(&report, x).expect("shortcut input grad");
+        let grad_shortcut = sess
+            .tensor_gradient(&report, x)
+            .expect("shortcut input grad");
 
         // ---- route 2: sum(pool(x)^2) -> the dense backward ----
         let mut sess_sq = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x_sq = sess_sq.tensor_variable(values.clone(), shape.clone(), true).unwrap();
+        let x_sq = sess_sq
+            .tensor_variable(values.clone(), shape.clone(), true)
+            .unwrap();
         let pooled_sq = sess_sq.functional_max_pool1d(x_sq, 2, 2).unwrap();
         let squared = sess_sq.tensor_mul(pooled_sq, pooled_sq).unwrap();
         let loss_sq = sess_sq.tensor_sum(squared).unwrap();
         let pooled_values = sess_sq.tensor_values(pooled_sq).unwrap();
         let report_sq = sess_sq.tensor_backward(loss_sq).unwrap();
-        let grad_dense = sess_sq.tensor_gradient(&report_sq, x_sq).expect("dense input grad");
+        let grad_dense = sess_sq
+            .tensor_gradient(&report_sq, x_sq)
+            .expect("dense input grad");
 
         // Expected: gradient lands on each window's argmax, 1.0 for the sum loss and
         // 2*max for the squared loss; everything else is zero.
@@ -144554,7 +144591,9 @@ mod tests {
     #[test]
     fn pad_ncdhw_zero_parallel_matches_serial_and_keeps_borders() {
         for &(n, c, in_d, in_h, in_w, pad_d, pad_h, pad_w) in &[
-            (1usize, 2usize, 3usize, 4usize, 5usize, 1usize, 1usize, 1usize), // small -> serial
+            (
+                1usize, 2usize, 3usize, 4usize, 5usize, 1usize, 1usize, 1usize,
+            ), // small -> serial
             (2, 32, 8, 16, 16, 1, 1, 1), // the scored conv3d lane -> parallel
         ] {
             let (out_d, out_h, out_w) = (in_d + 2 * pad_d, in_h + 2 * pad_h, in_w + 2 * pad_w);
@@ -144586,7 +144625,11 @@ mod tests {
             }
             assert_eq!(got.len(), want.len());
             for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-                assert_eq!(g.to_bits(), w.to_bits(), "f64 pad diverged at {index} (n={n} c={c})");
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "f64 pad diverged at {index} (n={n} c={c})"
+                );
             }
             for (index, (g, w)) in got32.iter().zip(want.iter()).enumerate() {
                 assert_eq!(

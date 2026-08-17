@@ -47,7 +47,12 @@ const REPS: usize = 9;
 
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|raw| raw.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+        .map(|raw| {
+            raw.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| "unavailable".to_owned())
 }
 
@@ -219,11 +224,20 @@ fn main() {
 
     println!("BACKWARD STAGE ONLY (min of {REPS}), ms:");
     println!("{:>52}  {:>9}", "lane", "min ms");
-    println!("{:>52}  {lane_a:>9.3}", "A  leaf -> conv3d(pad=1) -> sum   [the lane]");
-    println!("{:>52}  {lane_b:>9.3}", "B  leaf(padded) -> conv3d(pad=0) -> sum");
+    println!(
+        "{:>52}  {lane_a:>9.3}",
+        "A  leaf -> conv3d(pad=1) -> sum   [the lane]"
+    );
+    println!(
+        "{:>52}  {lane_b:>9.3}",
+        "B  leaf(padded) -> conv3d(pad=0) -> sum"
+    );
     println!("{:>52}  {lane_c:>9.3}", "C  leaf -> pad -> sum");
     println!("{:>52}  {lane_d:>9.3}", "D  leaf(padded) -> sum");
-    println!("{:>52}  {lane_k:>9.3}", "K  conv3d_backward_f64 kernel, no tape");
+    println!(
+        "{:>52}  {lane_k:>9.3}",
+        "K  conv3d_backward_f64 kernel, no tape"
+    );
     println!();
     println!("SUBTRACTIONS:");
     println!(
@@ -243,8 +257,7 @@ fn main() {
     );
     println!(
         "{:>52}  {:>9.3}",
-        "sum backward + report floor  (D)",
-        lane_d
+        "sum backward + report floor  (D)", lane_d
     );
     println!(
         "{:>52}  {:>9.3}",

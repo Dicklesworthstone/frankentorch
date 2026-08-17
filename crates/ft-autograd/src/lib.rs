@@ -15201,7 +15201,11 @@ impl TensorTape {
                     // parallel run the identical row copy, so the gate changes only the
                     // fan-out, never a value. frankentorch-l2zki.
                     const PAD_BWD_PAR_MIN: usize = 1 << 15;
-                    let inner_len = if ndim == 0 { 0 } else { original_shape[ndim - 1] };
+                    let inner_len = if ndim == 0 {
+                        0
+                    } else {
+                        original_shape[ndim - 1]
+                    };
                     let mut contrib = vec![0.0; in_numel];
                     if inner_len == 0 {
                         // ndim == 0 (scalar) or a zero-length innermost axis: no rows to
@@ -29660,6 +29664,56 @@ mod tests {
         let expected = unpad_gather_reference_4d(&mask, SHAPE, PAD_BEFORE, PADDED_SHAPE);
         assert_eq!(grad.len(), expected.len());
         assert_eq!(grad, expected, "pad backward gathered the wrong positions");
+    }
+
+    /// The pad backward's PRE-ROW-COPY formula, reimplemented here verbatim, still agrees
+    /// with the reference on the hardest case the row copy has to handle.
+    ///
+    /// This test exists to keep the record straight. The row-wise gather landed in
+    /// f34ae89e under a message describing it as a correctness fix — "asymmetric or
+    /// partial padding gathered the wrong region". It did not. The per-element walk
+    /// below is exactly what that commit replaced, and it produces the reference answer
+    /// for asymmetric, partially-specified padding; the change was a bit-identical
+    /// PERFORMANCE lever (2.06-2.82 ms of an 8.81 ms conv3d backward stage), not a bug
+    /// fix, and there is no pad-backward defect in any released build to point at.
+    ///
+    /// It is written as arithmetic rather than as a call into the old code so that it
+    /// keeps proving this after the old code is gone. frankentorch-l2zki.
+    #[test]
+    fn pad_backward_pre_row_copy_formula_was_already_correct() {
+        const SHAPE: [usize; 4] = [3, 5, 7, 11];
+        const PAD_BEFORE: [usize; 4] = [0, 1, 3, 2];
+        const PADDED_SHAPE: [usize; 4] = [3, 5 + 1 + 4, 7 + 3 + 2, 11 + 2 + 1];
+
+        let numel: usize = SHAPE.iter().product();
+        let padded_numel: usize = PADDED_SHAPE.iter().product();
+        let incoming: Vec<f64> = (0..padded_numel).map(|i| i as f64 + 0.25).collect();
+
+        // Verbatim pre-f34ae89e body: un-flatten each element with the input strides,
+        // shift every coordinate by its leading pad, re-flatten with the output strides.
+        let in_strides = ft_core::contiguous_strides(&SHAPE);
+        let out_strides = ft_core::contiguous_strides(&PADDED_SHAPE);
+        let mut old = vec![0.0; numel];
+        let mut coords = vec![0usize; SHAPE.len()];
+        for (flat_in, slot) in old.iter_mut().enumerate() {
+            let mut rem = flat_in;
+            for (d, &in_stride) in in_strides.iter().enumerate() {
+                coords[d] = rem / in_stride;
+                rem %= in_stride;
+            }
+            let mut flat_out = 0;
+            for (d, &out_stride) in out_strides.iter().enumerate() {
+                flat_out += (coords[d] + PAD_BEFORE[d]) * out_stride;
+            }
+            *slot = incoming[flat_out];
+        }
+
+        assert_eq!(
+            old,
+            unpad_gather_reference_4d(&incoming, SHAPE, PAD_BEFORE, PADDED_SHAPE),
+            "the per-element pad backward this repo shipped for months was correct; \
+             the row-copy that replaced it is a perf lever, not a fix"
+        );
     }
 
     /// The same gather below the parallel gate, plus the 1-D case, where the row loop
