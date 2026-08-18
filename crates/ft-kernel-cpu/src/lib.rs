@@ -15592,8 +15592,28 @@ pub fn linear_tensor_f64(
     in_features: usize,
     out_features: usize,
 ) -> Vec<f64> {
-    let mut y = vec![0.0f64; batch * out_features];
-    gemm::dgemm_bt(batch, in_features, out_features, x, weight, &mut y);
+    // DEAD ZERO-FILL: the GEMM below overwrites every element — NEGATIVE_EVIDENCE item 166.
+    //
+    // UNBUILT (build freeze, /data 27G): not compiled, tested or measured. STRUCTURAL, not a
+    // prediction — the claim is "this write is dead", which is a property of the code, not a
+    // guess about scheduling. Item 164 is why that distinction is now stated explicitly.
+    //
+    // SOUNDNESS IS CITED, NOT RE-DERIVED. Handing a GEMM an uninitialized destination is safe
+    // only if EVERY dispatch path writes C without reading it. That audit exists: item 162
+    // verified all eight `dgemm_bt`/`sgemm_bt` branches pass `beta = 0.0` with full coverage of
+    // C, and item 152 did the same for `sgemm`/`sgemm_tb` — finding two ACCUMULATING helpers
+    // (`*_sub_into`, beta = 1.0) that are not on these paths.
+    //
+    // THE GUARD IS LOAD-BEARING: the wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill runs, so a degenerate shape would otherwise hand back an
+    // uninitialized buffer.
+    let mut y = build_uninit(batch * out_features, |y: &mut [f64]| {
+        if batch == 0 || out_features == 0 {
+            y.fill(0.0);
+            return;
+        }
+        gemm::dgemm_bt(batch, in_features, out_features, x, weight, y);
+    });
     if let Some(b) = bias {
         // Row-parallel bias add: each output row is independent and its adds are a
         // pure per-element `+= b[j]` (order-invariant) -> bit-identical to serial.
@@ -15638,8 +15658,28 @@ pub fn linear_backward_f64(
     need_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
     // dx = dy @ weight : [batch,out] @ [out,in] -> [batch,in].
-    let mut dx = vec![0.0f64; batch * in_features];
-    gemm::dgemm(batch, out_features, in_features, dy, weight, &mut dx);
+    // DEAD ZERO-FILL: the GEMM below overwrites every element — NEGATIVE_EVIDENCE item 166.
+    //
+    // UNBUILT (build freeze, /data 27G): not compiled, tested or measured. STRUCTURAL, not a
+    // prediction — the claim is "this write is dead", which is a property of the code, not a
+    // guess about scheduling. Item 164 is why that distinction is now stated explicitly.
+    //
+    // SOUNDNESS IS CITED, NOT RE-DERIVED. Handing a GEMM an uninitialized destination is safe
+    // only if EVERY dispatch path writes C without reading it. That audit exists: item 162
+    // verified all eight `dgemm_bt`/`sgemm_bt` branches pass `beta = 0.0` with full coverage of
+    // C, and item 152 did the same for `sgemm`/`sgemm_tb` — finding two ACCUMULATING helpers
+    // (`*_sub_into`, beta = 1.0) that are not on these paths.
+    //
+    // THE GUARD IS LOAD-BEARING: the wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill runs, so a degenerate shape would otherwise hand back an
+    // uninitialized buffer.
+    let dx = build_uninit(batch * in_features, |dx: &mut [f64]| {
+        if batch == 0 || in_features == 0 {
+            dx.fill(0.0);
+            return;
+        }
+        gemm::dgemm(batch, out_features, in_features, dy, weight, dx);
+    });
     // dweight = dy^T @ x. `dgemm_tb` reads dy [batch,out] AS dy^T via strides
     // (rsa=1, csa=out) — it needs no [out,batch] transpose materialisation, and
     // its K traversal matches the materialise-transpose-then-`dgemm` path for
@@ -15648,8 +15688,28 @@ pub fn linear_backward_f64(
     // that DOMINATED this backward — measured 327ms at [8192,4096], larger than
     // either GEMM; eliminating it (both the alloc and the copy) is the whole win.
     // kgs4-linbwd-tb.
-    let mut dweight = vec![0.0f64; out_features * in_features];
-    gemm::dgemm_tb(out_features, batch, in_features, dy, x, &mut dweight);
+    // DEAD ZERO-FILL: the GEMM below overwrites every element — NEGATIVE_EVIDENCE item 166.
+    //
+    // UNBUILT (build freeze, /data 27G): not compiled, tested or measured. STRUCTURAL, not a
+    // prediction — the claim is "this write is dead", which is a property of the code, not a
+    // guess about scheduling. Item 164 is why that distinction is now stated explicitly.
+    //
+    // SOUNDNESS IS CITED, NOT RE-DERIVED. Handing a GEMM an uninitialized destination is safe
+    // only if EVERY dispatch path writes C without reading it. That audit exists: item 162
+    // verified all eight `dgemm_bt`/`sgemm_bt` branches pass `beta = 0.0` with full coverage of
+    // C, and item 152 did the same for `sgemm`/`sgemm_tb` — finding two ACCUMULATING helpers
+    // (`*_sub_into`, beta = 1.0) that are not on these paths.
+    //
+    // THE GUARD IS LOAD-BEARING: the wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill runs, so a degenerate shape would otherwise hand back an
+    // uninitialized buffer.
+    let dweight = build_uninit(out_features * in_features, |dweight: &mut [f64]| {
+        if out_features == 0 || in_features == 0 {
+            dweight.fill(0.0);
+            return;
+        }
+        gemm::dgemm_tb(out_features, batch, in_features, dy, x, dweight);
+    });
     // dbias = sum over the batch rows of dy.
     let dbias = if need_bias {
         let mut db = vec![0.0f64; out_features];
@@ -15676,8 +15736,28 @@ pub fn linear_tensor_f32(
     in_features: usize,
     out_features: usize,
 ) -> Vec<f32> {
-    let mut y = vec![0.0f32; batch * out_features];
-    gemm::sgemm_bt(batch, in_features, out_features, x, weight, &mut y);
+    // DEAD ZERO-FILL: the GEMM below overwrites every element — NEGATIVE_EVIDENCE item 166.
+    //
+    // UNBUILT (build freeze, /data 27G): not compiled, tested or measured. STRUCTURAL, not a
+    // prediction — the claim is "this write is dead", which is a property of the code, not a
+    // guess about scheduling. Item 164 is why that distinction is now stated explicitly.
+    //
+    // SOUNDNESS IS CITED, NOT RE-DERIVED. Handing a GEMM an uninitialized destination is safe
+    // only if EVERY dispatch path writes C without reading it. That audit exists: item 162
+    // verified all eight `dgemm_bt`/`sgemm_bt` branches pass `beta = 0.0` with full coverage of
+    // C, and item 152 did the same for `sgemm`/`sgemm_tb` — finding two ACCUMULATING helpers
+    // (`*_sub_into`, beta = 1.0) that are not on these paths.
+    //
+    // THE GUARD IS LOAD-BEARING: the wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill runs, so a degenerate shape would otherwise hand back an
+    // uninitialized buffer.
+    let mut y = build_uninit(batch * out_features, |y: &mut [f32]| {
+        if batch == 0 || out_features == 0 {
+            y.fill(0.0);
+            return;
+        }
+        gemm::sgemm_bt(batch, in_features, out_features, x, weight, y);
+    });
     if let Some(b) = bias {
         // Row-parallel bias add (f32 mirror of linear_tensor_f64): independent rows,
         // pure per-element add -> bit-identical to serial; parallelize the

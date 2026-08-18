@@ -32461,3 +32461,56 @@ theirs and mine together. Nothing was lost, but the lesson from item 156e now ha
 **when a diff shows hunks in functions you did not touch, the fix is not only to avoid staging
 them — it is to commit your own work immediately, because someone else is about to stage
 everything.**
+
+## 166. FOUR DEAD ZERO-FILLS IN `linear` — AND THE SOUNDNESS ARGUMENT IS CITED FROM TWO EXISTING AUDITS RATHER THAN RE-DERIVED
+
+`frankentorch-hi9r6` vein, applied to `linear`. UNBUILT: /data 27G / 99%, no cargo run.
+
+Item 164 retracted three of my commits for making a performance claim I had not verified in the
+dependency's source. This entry is deliberately a different KIND of claim: **"this write is
+dead" is a property of the code**, checkable by reading the two statements involved, not a
+prediction about how a scheduler will behave.
+
+`linear` allocates four zeroed buffers and immediately hands each to a GEMM that overwrites
+every element:
+
+    linear_tensor_f64     y        batch x out_features      dgemm_bt
+    linear_backward_f64   dx       batch x in_features       dgemm
+    linear_backward_f64   dweight  out_features x in_features dgemm_tb
+    linear_tensor_f32     y        batch x out_features      sgemm_bt
+
+All four now use `build_uninit`, so the GEMM store is the sole writer and also does the page
+first-touch: one pass over each buffer instead of two.
+
+### THE SOUNDNESS IS BORROWED, WHICH IS THE POINT
+
+Handing a GEMM an uninitialized destination is safe only if EVERY dispatch path writes C without
+reading it. That audit already exists in this ledger and did not need repeating:
+
+  * item 162 (a peer's) verified **all eight** `dgemm_bt`/`sgemm_bt` branches — col-parallel,
+    2-D parallel, row-split and blocked — pass `beta = 0.0` with full coverage of C;
+  * item 152 (mine) did the same for `sgemm`/`sgemm_tb`, and **found two accumulating helpers**
+    (`*_sub_into`, `beta = 1.0`) which are not on these paths.
+
+Between them every GEMM family `linear` uses is source-checked. Item 160 is the precedent for why
+that matters: it explicitly DECLINED this conversion while the `*_bt` branches were unaudited,
+rather than ship a soundness argument it had rushed.
+
+### THE GUARD, AND A DETAIL THE COMPILER WOULD HAVE CAUGHT
+
+Each site guards `m == 0 || n == 0`, because the wrappers return EARLY on those before
+matrixmultiply's own zero-fill can run — the buffer would otherwise come back uninitialized.
+
+`dx` and `dweight` are constructed and returned without further mutation, so they lose their
+`mut`; the two `y` buffers keep it because the bias add writes them afterwards. Under `-D
+warnings` a stray `mut` is a build failure, so that is the kind of thing this freeze cannot
+check and a reader should.
+
+### NOT CLAIMED
+
+Any magnitude. The f64 forward's `y` is `batch x out_features` — 8 MB at 1024x1024, so not
+trivial — but no number is asserted, and `linear` already certifies at 1.41x FASTER than PyTorch
+(a peer's row), so this is tightening a lane that is already winning, not closing a gap.
+
+VERIFIED: `rustfmt --edition 2024 --check` exits 0; mutability hand-checked at all four sites.
+NOT VERIFIED: compilation, tests, timing.
