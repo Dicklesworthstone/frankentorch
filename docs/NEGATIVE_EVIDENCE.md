@@ -31283,3 +31283,58 @@ One observation from the discarded run is deliberately NOT carried forward: PyTo
 `conv2d_big` arm read 6.456 ms there against 11.20 ms in runs A and B, which would suggest the
 incumbent's time depends on which other lanes share the sweep. That would matter a great deal if
 true, and a load-drifted run is not evidence for it.
+
+## 148. THE PANEL-LIFETIME BUG HAS TWO MORE INSTANCES — conv2d_backward_f32 AND conv3d_backward_f32. conv3d_backward_f64 IS CLEAN, AND WHY IT IS CLEAN IS THE USEFUL PART
+
+`frankentorch-hi9r6`. Source-reading only: /data is at 34G / 99% under a build freeze, so nothing
+here is compiled, measured, or changed. Recorded so the next agent with a build budget does not
+have to re-derive it.
+
+Item 146 landed `drop(panel)` in `conv2d_backward_f64` for 1.61-2.00x, arm-internal. The obvious
+question — does the same pattern exist elsewhere — is answerable by reading. Every non-test
+im2col call site in `ft-kernel-cpu`:
+
+    conv2d_backward_f64   line 8841   HAD IT   -> fixed, `drop(panel)` at line 8867 (item 146)
+    conv2d_backward_f32   line 8068   HAS IT   -> panel at flat scope, last used by sgemm_tb,
+                                                  still live through the dpanel alloc, the
+                                                  sgemm, and col2im
+    conv3d_backward_f32   line 13827  HAS IT   -> identical shape
+    conv3d_backward_generic_f64 14167 CLEAN    -> see below
+
+### WHY conv3d's f64 PATH ESCAPED, WHICH EXPLAINS AN OLD ASYMMETRY
+
+Its panel is not at function scope. It is declared INSIDE the `build_uninit(...)` closure that
+produces `dweight`:
+
+    let dweight = build_uninit(out_ch * patch_width, |dweight| {
+        let panel = conv3d_im2col_f64(..);
+        gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+    });                       // <- panel dropped HERE, before dpanel is allocated
+    let dpanel = build_uninit(flat * patch_width, |dpanel| { gemm::dgemm(..) });
+
+The closure boundary frees the panel as a side effect of a style choice made for a different
+reason (uninit-buffer construction, the item 96 vein). **conv3d never paid the 40 MB peak, and
+conv2d did — and that is a mechanical part of why conv3d stood at 1.65-1.80x SLOWER on the
+training route while conv2d stood at 7.4-8.8x.** Items 128 and 130 both remarked on that gap and
+attributed it to scaffolding ratio; this is a concrete second cause neither of them had.
+
+### WHAT I AM NOT CLAIMING ABOUT THE TWO f32 SITES
+
+**The f32 win may be much smaller or absent, and it would be wrong to promise 1.6-2.0x.** The
+mechanism is peak working set against a 32 MiB L3 instance, and f32 panels are HALF the bytes: at
+conv2d's scored shape the pair is ~9 MB + ~9 MB rather than 18 + 18, so peak lands near ~20 MB
+and may already fit. The f64 fix worked because 40 MB did not fit. Whether the f32 sites cross
+that line is a question about their shapes, and it must be MEASURED — the same discipline that
+killed four hypotheses on the f64 path before the fifth held.
+
+There is no f32 conv h2h lane at all, so there is currently no instrument to certify either site
+against PyTorch even if the arm-internal change pays.
+
+### FOR WHOEVER PICKS THIS UP
+
+The edit is one line at each site — `drop(panel);` after the `sgemm_tb` call and before the
+`dpanel` allocation — and it is bit-exact without an argument, because it changes a lifetime and
+not an operation. What it needs is a build and the paired before/after that the freeze forbids
+today, plus honesty about the smaller expected effect. Deliberately NOT applied blind: this
+project has a standing hazard record for pushing uncompiled code to main, and a two-line change
+nobody can compile is exactly that.
