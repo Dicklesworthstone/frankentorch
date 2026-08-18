@@ -29588,6 +29588,47 @@ mod bidiag {
     /// Work (rows x cols) below which rayon dispatch costs more than the sweep.
     const PARALLEL_GATE: u64 = 1 << 14;
 
+    /// The same gate, overridable at RUNTIME so it can be A/B'd in one process —
+    /// `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 156.
+    ///
+    /// WHY THIS EXISTS. `4zjaa`'s wiring comment carries an A/B table whose unblocked arm
+    /// jumps 17.6x for a 1.25x size increase:
+    ///
+    ///     n=128  unblocked   335175 ns
+    ///     n=160  unblocked  5889192 ns
+    ///
+    /// An O(n^3) expansion predicts ~1.95x. The cliff coincides EXACTLY with this gate: in
+    /// `bidiag_form_p_f64` the work per reflector is `nrows * nrows`, so it stays under
+    /// `1 << 14` for every reflector at n=128 (127^2 = 16129) and crosses it at n=160. Above
+    /// the gate, `reduce_scaled_rows_f64` forks into `nrows / REDUCE_CHUNK_ROWS` tasks — just
+    /// THREE at nrows=159 — and `apply_scaled_rank1_f64` forks one task PER ROW, and both run
+    /// once per reflector, so ~320 fork/joins buy almost no width.
+    ///
+    /// FALSIFIABLE PREDICTION: with the gate raised past 159^2, the n=160 unblocked arm should
+    /// fall from 5.889 ms to roughly 650 us — the O(n^3) continuation of n=128's 335 us. If it
+    /// does, then `4zjaa`'s measured "9.11x at n=160" was taken against a BROKEN arm, the real
+    /// crossover is far above 160, and the shipped `n >= 160` threshold is wrong. If it does
+    /// not, this hypothesis is dead and the cliff is something else.
+    ///
+    /// THE DEFAULT IS UNCHANGED ON PURPOSE. Flipping which branch runs CHANGES RESULT BITS —
+    /// `REDUCE_CHUNK_ROWS` is documented as fixed precisely because the parallel partial-sum
+    /// tree associates differently from the serial sweep — so this is a measurement knob, not
+    /// a fix. Whoever measures it and wants to move the constant owes the tolerance argument
+    /// under the ratified eig/SVD policy (`frankentorch-qgce4`), exactly as the blocked
+    /// `form_p` itself did.
+    ///
+    /// Read once into a `OnceLock`, so steady-state cost is a load — the same shape
+    /// `svd_use_blocked_bidiag` already uses for `FT_SVD_FORCE_NR`.
+    fn parallel_gate() -> u64 {
+        static GATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *GATE.get_or_init(|| {
+            std::env::var("FT_LINALG_PARALLEL_GATE")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(PARALLEL_GATE)
+        })
+    }
+
     /// Rows per task in [`reduce_scaled_rows_f64`]. Fixed (not derived from the
     /// thread count) so the partial-sum tree — and therefore the result — is
     /// identical on every machine and every run.
@@ -29616,7 +29657,7 @@ mod bidiag {
             return;
         }
         let block = &block[..nrows * lda];
-        if (nrows as u64) * (ncols as u64) < PARALLEL_GATE || rayon::current_num_threads() <= 1 {
+        if (nrows as u64) * (ncols as u64) < parallel_gate() || rayon::current_num_threads() <= 1 {
             for (row, &vr) in block.chunks_exact(lda).zip(v) {
                 let seg = &row[col0..col0 + ncols];
                 for c in 0..ncols {
@@ -29661,7 +29702,7 @@ mod bidiag {
             return;
         }
         let block = &mut block[..nrows * lda];
-        if (nrows as u64) * (ncols as u64) < PARALLEL_GATE || rayon::current_num_threads() <= 1 {
+        if (nrows as u64) * (ncols as u64) < parallel_gate() || rayon::current_num_threads() <= 1 {
             for (row, &vr) in block.chunks_exact_mut(lda).zip(v) {
                 let seg = &mut row[col0..col0 + ncols];
                 for c in 0..ncols {

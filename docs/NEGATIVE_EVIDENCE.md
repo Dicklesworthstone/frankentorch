@@ -31882,3 +31882,65 @@ Two consequences worth recording:
 The habit that caught it: the working-tree diff showed `for_each_init` as CONTEXT rather than as an
 addition. A line you know you just wrote appearing unchanged means it is already committed — by
 someone else.
+
+## 157. 4zjaa's OWN A/B TABLE CONTAINS A 17.6x CLIFF THAT LANDS EXACTLY ON A PARALLEL GATE — ITS 9.11x CROSSOVER MAY BE MEASURED AGAINST A BROKEN ARM
+
+`frankentorch-4zjaa`. Source-reading under the build freeze (/data 28G, 99%). Nothing measured.
+
+The blocked `form_p` is already implemented and wired (a peer's work, carefully done: measured
+threshold, tolerance policy cited, explicitly labelled "landed, not won"). Its wiring comment
+carries the A/B that chose the threshold:
+
+    n=64   unblocked    47590 ns   blocked    50496 ns   0.94x
+    n=128  unblocked   335175 ns   blocked   384359 ns   0.87x
+    n=160  unblocked  5889192 ns   blocked   646525 ns   9.11x
+    n=192  unblocked  9732548 ns   blocked  1043859 ns   9.32x
+
+The comment notes the unblocked arm's "17x jump between 128 and 160 for a 1.25x size increase"
+and treats it as a property of the unblocked form — "it falls off a cliff there, which is what
+makes the crossover so sharp". An O(n^3) expansion predicts **1.95x**, not 17.6x.
+
+### THE CLIFF LANDS EXACTLY ON `PARALLEL_GATE`
+
+In `bidiag_form_p_f64` the work handed to `reduce_scaled_rows_f64` per reflector is
+`nrows x nrows`, and `PARALLEL_GATE` is `1 << 14` = 16384:
+
+    n=128   max nrows = 127   127^2 = 16129  < 16384  -> EVERY reflector stays serial
+    n=160   max nrows = 159   159^2 = 25281  > 16384  -> the largest ~32 reflectors go parallel
+
+So the arm changes code path between the two rows of the table. And the parallel path buys
+almost nothing at that size: `reduce_scaled_rows_f64` forks into
+`nrows / REDUCE_CHUNK_ROWS` tasks — **three** at nrows=159 — while
+`apply_scaled_rank1_f64` forks **one task per row**; both run once per reflector, so n=160
+pays roughly 320 fork/joins for 3-way width. Item 103 measured a 64-way fork/join on this host
+at 0.1-0.9 ms; 320 of them is the right order for the 5.5 ms that appeared from nowhere.
+
+### THE PREDICTION, WHICH IS FALSIFIABLE
+
+Raise the gate past 159^2 and the n=160 unblocked arm should fall from **5.889 ms to roughly
+650 us** — the O(n^3) continuation of n=128's 335 us. That is almost exactly the blocked arm's
+646 us, so **the 9.11x crossover would collapse to about parity and the shipped
+`n >= 160` threshold would be wrong** — the real crossover would sit far higher, and blocking
+would be buying much less than the table suggests. If the number does not move, this hypothesis
+is dead and the cliff is something else.
+
+### WHAT SHIPPED HERE, AND WHY IT IS NOT THE FIX
+
+`parallel_gate()`, a `OnceLock` reading `FT_LINALG_PARALLEL_GATE`, defaulting to the
+existing constant — so the two row-parallel helpers can be A/B'd **in one process** without a
+rebuild, which is the campaign's paired-lane discipline and the thing that makes the prediction
+cheap to settle.
+
+**The default is deliberately unchanged, and raising the constant is NOT a free fix.**
+`REDUCE_CHUNK_ROWS` is documented as fixed "so the partial-sum tree — and therefore the result
+— is identical on every machine and every run", which means the parallel path associates its
+sums differently from the serial sweep: flipping which branch runs CHANGES OUTPUT BITS. Anyone
+moving the constant owes the tolerance argument under the ratified eig/SVD policy
+(`frankentorch-qgce4`), exactly as the blocked `form_p` itself did.
+
+Worth noting in passing: because the gate also tests `rayon::current_num_threads() <= 1`, this
+kernel's output already depends on the thread count. That is pre-existing and not introduced
+here, but it belongs on the record next to any bit-exactness claim about this path.
+
+VERIFIED: `rustfmt --edition 2024 --check` exits 0. NOT VERIFIED: compilation, and every
+number above is read from a peer's comment rather than re-measured.
