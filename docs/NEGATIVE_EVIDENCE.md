@@ -32069,3 +32069,69 @@ VERIFIED: `rustfmt --edition 2024 --check` exits 0; the rewrite is structurally 
 `chunks_exact` inner loop, same `(row, &vr)` binding — and chunk boundaries stay multiples of
 `lda`, so the final short chunk still yields whole rows. NOT VERIFIED: compilation, execution,
 timing.
+
+## 160. THE f32 FORWARD CARRIED BOTH DEFECTS ITEMS 156 AND 158 FIXED — AND ITS TEST MATTERS MORE THAN THE f64 ONE, NOT LESS
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 28G, 99% used,
+loadavg 8.14/7.77/8.44 — no cargo ran. `rustfmt --edition 2024 --check` exits 0: parses,
+format-clean, not a compile, not a test.
+
+### 160a. THE MIRROR HAD BOTH
+
+`conv2d_forward_f32` is a line-for-line mirror of the f64 forward, and it carried both defects
+found this session:
+
+* the per-tile panel buffer allocated AND zeroed inside the parallel loop (item 156) — 221 KB
+  per tile here, still 43-86 tiles per call, so 9-19 MB of dead zero-stores;
+* the per-channel strided gather transpose (item 158).
+
+Both fixes port directly, and `transpose_2d_into_f32` — the f32 register-blocked transpose — was
+sitting in the same file, exactly as its f64 twin was.
+
+**The f32 stride is not the milder case it looks like.** `out_ch` f32 is 128 bytes at the scored
+shape against 256 for f64, but a cache line is 64 bytes, so each read still lands on its own line
+and the whole buffer is still re-streamed once per output channel. Halving the element size does
+not halve this defect; it does nothing to it.
+
+### 160b. WHY THE TEST IS THE POINT HERE
+
+Item 152 already recorded the awkward fact about f32 conv: **there is no f32 conv h2h lane**, so a
+real gain has no incumbent arm to be certified against. The flip side is the part worth saying
+out loud — **a real BUG there has nothing to catch it either.** No lane exercises this code, no
+parity row covers it, and the campaign's whole verification apparatus is pointed elsewhere.
+
+So the f32 full-panel equivalence test is not a lesser copy of the f64 one. It is the only thing
+standing behind this function.
+
+f32 is also the stricter test of the transpose specifically: a 64-byte line holds 16 f32s against
+8 f64s, so an off-by-one in the blocked kernel's tail is likelier to land inside a line that
+happens to hold a plausible neighbouring value, producing a wrong answer that looks right.
+
+### 160c. WHAT I DECLINED TO DO, AND WHY
+
+`out_flat`'s dead `vec![0.0; ..]` fill — the last one item 156 named as owed, in both the f64 and
+f32 forwards — is still there and stays there.
+
+Converting it needs the same proof item 151 needed: that the GEMM writing it never READS the
+buffer. `dgemm_bt` and `sgemm_bt` each have three paths (column-parallel, row-parallel, blocked),
+and I verified `beta = 0.0` in only the column-parallel one before deciding to stop. Item 152 is
+the reason that is not a formality — the `beta` check there **found two accumulating paths that
+had to be excluded**, so the assumption "our GEMM wrappers overwrite" is already known to be false
+somewhere in this same family.
+
+With five unbuilt changes to this file already outstanding and no compiler available, the honest
+move is to leave the smallest remaining lever alone rather than ship a soundness argument I
+rushed. Reading uninitialized memory here would not crash — it would produce silently wrong
+convolution outputs on a path with no lane watching it.
+
+### 160d. STATUS OF THIS SESSION'S UNBUILT STACK
+
+Six changes now sit on main compiled by nobody: items 151, 153, 156, 158 and 160 from me, plus
+peers' 150, 152, 154, 155, 157, 159 across the same file. They interact — 156 and 158 touch
+adjacent lines of the same function, and 160 mirrors both into a second one.
+
+The verification owed is unchanged and worth restating as one list rather than five: `cargo build`,
+`cargo clippy`, `cargo test -p frankentorch-kernel-cpu --lib` (which now includes four new tests
+that have never run), and then paired before/after runs on `conv2d` and `conv2d_masked` in one
+invocation. `rustfmt --check` is the only gate any of it has passed, and `ubs` has reported this
+file too large to scan on every commit, so none of it has had automated review either.

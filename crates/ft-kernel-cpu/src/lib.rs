@@ -8471,44 +8471,71 @@ pub fn conv2d_forward_f32(
     // frankentorch-conv2d-stream.
     const TILE: usize = 192;
     let mut out_flat = vec![0.0f32; flat * out_ch];
+    // f32 mirror of item 156: one scratch panel per WORKER, not one per tile. Same reasoning,
+    // same coverage proof, half the bytes (221 KB per tile here), and the same 43-86 tiles per
+    // call at the scored shapes. UNBUILT — item 160.
     out_flat
         .par_chunks_mut(TILE * out_ch)
         .enumerate()
-        .for_each(|(ti, oflat_tile)| {
-            let m0 = ti * TILE;
-            let rows = oflat_tile.len() / out_ch;
-            let mut ptile = vec![0.0f32; rows * patch_width];
-            for r in 0..rows {
-                let row = m0 + r;
-                let b = row / patch_count;
-                let pc = row % patch_count;
-                let base_h = (pc / ow) * sh;
-                let base_w = (pc % ow) * sw;
-                let batch_off = b * in_ch * ph * pw;
-                let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                for c in 0..in_ch {
-                    let ch_off = batch_off + c * ph * pw;
-                    let pch = c * kh * kw;
-                    for kr in 0..kh {
-                        let irow = ch_off + (base_h + kr) * pw + base_w;
-                        let prow_off = pch + kr * kw;
-                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+        .for_each_init(
+            || vec![0.0f32; TILE * patch_width],
+            |scratch, (ti, oflat_tile)| {
+                let m0 = ti * TILE;
+                let rows = oflat_tile.len() / out_ch;
+                let ptile = &mut scratch[..rows * patch_width];
+                for r in 0..rows {
+                    let row = m0 + r;
+                    let b = row / patch_count;
+                    let pc = row % patch_count;
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let batch_off = b * in_ch * ph * pw;
+                    let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                    for c in 0..in_ch {
+                        let ch_off = batch_off + c * ph * pw;
+                        let pch = c * kh * kw;
+                        for kr in 0..kh {
+                            let irow = ch_off + (base_h + kr) * pw + base_w;
+                            let prow_off = pch + kr * kw;
+                            prow[prow_off..(kw + prow_off)]
+                                .copy_from_slice(&padded[irow..(kw + irow)]);
+                        }
                     }
                 }
-            }
-            gemm::sgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
-        });
-    let mut out = vec![0.0f32; batch * out_ch * patch_count];
-    out.par_chunks_mut(patch_count)
-        .enumerate()
-        .for_each(|(idx, orow)| {
-            let n = idx / out_ch;
-            let oc = idx % out_ch;
-            let bo = bias.map_or(0.0, |bb| bb[oc]);
-            for p in 0..patch_count {
-                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
-            }
-        });
+                gemm::sgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
+            },
+        );
+    // f32 mirror of item 158: the blocked transpose replaces the per-channel strided gather.
+    // Identical argument — a single transpose of [flat, out_ch] would give out_ch outermost, so
+    // it is taken one batch at a time, and the bias add stays UNCONDITIONAL because
+    // `-0.0 + 0.0 == +0.0` and skipping it would not be bit-exact on signed zeros.
+    //
+    // The stride here is `out_ch` f32 = 128 bytes at the scored shape — still a fresh cache line
+    // per read on a 64-byte line, so the per-channel re-streaming is the same defect, not a
+    // milder one. UNBUILT — item 160.
+    let out = build_uninit(batch * out_ch * patch_count, |o: &mut [f32]| {
+        o.par_chunks_mut(out_ch * patch_count)
+            .enumerate()
+            .for_each(|(n, obatch)| {
+                let base = n * patch_count * out_ch;
+                transpose_2d_into_f32(
+                    &out_flat[base..base + patch_count * out_ch],
+                    obatch,
+                    patch_count,
+                    out_ch,
+                );
+            });
+        if let Some(bb) = bias {
+            o.par_chunks_mut(patch_count)
+                .enumerate()
+                .for_each(|(idx, orow)| {
+                    let bo = bb[idx % out_ch];
+                    for v in orow.iter_mut() {
+                        *v += bo;
+                    }
+                });
+        }
+    });
     out
 }
 
@@ -44577,6 +44604,90 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// frankentorch-hi9r6 item 160: the f32 streaming forward must equal ITS full-panel path
+    /// bit-for-bit, after the same two changes item 158 made to the f64 mirror.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// This test matters MORE than its f64 twin, not less. There is no f32 conv h2h lane, so no
+    /// incumbent arm ever exercises this code, and item 152 already recorded that consequence for
+    /// the f32 backwards: a real gain there has nothing to be certified against. The flip side is
+    /// that a real BUG there has nothing to catch it either, and a unit test is the only thing
+    /// standing behind the f32 forward.
+    ///
+    /// f32 is also the stricter test of the transpose: with 4-byte elements a 64-byte cache line
+    /// holds 16 of them, so an off-by-one in the blocked kernel's tail is likelier to land inside
+    /// a line that happens to hold the right neighbour and produce a plausible wrong answer.
+    #[test]
+    fn conv2d_forward_f32_streaming_matches_the_full_panel_path_bitwise() {
+        // (batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch)
+        let cases = [
+            (
+                1usize, 2usize, 6usize, 6usize, 3usize, 3usize, 4usize, 4usize, 1usize, 1usize,
+                3usize,
+            ),
+            (2, 3, 16, 16, 3, 3, 14, 14, 1, 1, 5),
+            (2, 2, 9, 9, 3, 3, 4, 4, 2, 2, 4),
+            (1, 3, 5, 5, 3, 3, 3, 3, 1, 1, 1),
+        ];
+        for &(b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co) in &cases {
+            let patch_width = ci * kh * kw;
+            let patch_count = oh * ow;
+            let flat = b * patch_count;
+            let padded: Vec<f32> = (0..b * ci * ph * pw)
+                .map(|i| ((i % 251) as f32) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f32> = (0..co * patch_width)
+                .map(|i| ((i % 241) as f32) * 0.001 - 0.11)
+                .collect();
+            // Carries a -0.0, so the unconditional bias add is actually exercised.
+            let bias_vals: Vec<f32> = (0..co)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        -0.0
+                    } else {
+                        0.25 - (i as f32) * 0.01
+                    }
+                })
+                .collect();
+
+            for bias in [None, Some(bias_vals.as_slice())] {
+                let got = super::conv2d_forward_f32(
+                    &padded, &weight, bias, b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co,
+                );
+
+                let panel =
+                    super::conv2d_im2col_f32(&padded, b, ci, ph, pw, kh, kw, oh, ow, sh, sw);
+                let mut of = vec![0.0f32; flat * co];
+                super::gemm::sgemm_bt(flat, patch_width, co, &panel, &weight, &mut of);
+                let mut want = vec![0.0f32; b * co * patch_count];
+                for n in 0..b {
+                    for oc in 0..co {
+                        let bo = bias.map_or(0.0, |bb| bb[oc]);
+                        for p in 0..patch_count {
+                            want[(n * co + oc) * patch_count + p] =
+                                of[(n * patch_count + p) * co + oc] + bo;
+                        }
+                    }
+                }
+
+                let label = format!(
+                    "b={b} ci={ci} ph={ph} pw={pw} k={kh}x{kw} oh={oh} ow={ow} \
+                     s={sh}x{sw} co={co} bias={}",
+                    bias.is_some()
+                );
+                assert_eq!(got.len(), want.len(), "item 160 length differs: {label}");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "item 160 mismatch at {label} idx={i}: streaming={g} full_panel={w}"
+                    );
                 }
             }
         }
