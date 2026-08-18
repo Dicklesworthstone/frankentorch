@@ -35018,3 +35018,44 @@ runs have already been spent learning that a moving host cannot be measured, in 
 
 Compile items 194, 195, 196 and this. Then, when 1m ~ 5m ~ 15m and the slot prints `held`:
 `FT_H2H_LANES=conv2d` at `round_warmup=0`.
+
+## 198. THE RUNNER NOW GATES ON THE HARNESS'S MEASUREMENT SLOT — COMPOSING WITH A PEER'S MECHANISM RATHER THAN GROWING A SECOND ONE
+
+`frankentorch-hi9r6`. **UNBUILT** (disk 43G, at the brake; no cargo, no artifact written). Shell
+only: `bash -n` clean, and the pid parse tested both ways.
+
+### 198a. DETECTION IS NOT PREVENTION
+
+`settle_conv_stack.sh` refuses to start when `loadavg > online_cpus` (item 194c). That catches a
+host which is ALREADY busy and does nothing about the case a peer's item 195 was built for: two
+agents starting in the same quiet moment and ruining each other, which voided four consecutive runs
+before anyone could see why.
+
+Their `announce_measurement()` is the prevention half — it drops a `<pid>.slot` record naming pid,
+host, ELF and lanes. The script now scans that directory and refuses if any recorded pid is live.
+
+**The point is that it consumes their records rather than inventing its own lock.** Two
+independent mutual-exclusion mechanisms in one repo is worse than none: each would be correct
+alone and neither would see the other, which is exactly the class of failure item 195 was written
+to end.
+
+### 198b. TWO DETAILS THAT ARE NOT INCIDENTAL
+
+* **Liveness is `kill -0` on the recorded pid, never a process-list pattern.** A `pgrep -f h2h`
+  would match this script's own command line and refuse against itself — the failure the
+  orchestrator warned about explicitly, and one that would have been invisible until the script
+  mysteriously never ran.
+* **Stale records are ignored deliberately.** If a run is killed, its `.slot` file outlives it, and
+  a gate that honoured dead records would refuse forever. Item 195's own warning is the reason:
+  the failure mode of a lock is not "it did not lock", it is "it never unlocked". `kill -0` makes
+  staleness self-correcting rather than requiring cleanup.
+
+### 198c. WHAT IT DOES NOT DO
+
+It does not wait. A measurement that blocks until the host is quiet is a measurement that runs at
+an unpredictable time under unrecorded conditions, which is item 195's own argument, and the same
+reason mine refuses rather than sleeps. The caller retries when the host is theirs.
+
+It also cannot help the harness itself — the slot lives in the binary and the script only reads its
+records — so a run started by hand still needs the harness's own announcement to be visible to the
+next one.

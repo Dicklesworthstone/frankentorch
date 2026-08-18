@@ -55,6 +55,40 @@ if [ "${CORES}" -gt 0 ] && awk -v l="${PEAK}" -v c="${CORES}" 'BEGIN{exit !(l > 
 fi
 echo "loadavg ${PEAK} against ${CORES} cores"
 
+# Item 197: compose with the harness's MEASUREMENT SLOT rather than inventing a second mechanism.
+#
+# The load gate above catches a host that is ALREADY busy. It cannot catch the case item 195 was
+# written for -- two agents starting at the same quiet moment and ruining each other, which voided
+# four consecutive runs before anyone could see why. Detection and prevention are different things,
+# and `announce_measurement` is the prevention half: it drops a `<pid>.slot` record naming pid,
+# host, ELF and lanes.
+#
+# Liveness is tested with `kill -0` on the RECORDED pid, never by pattern-matching a process list:
+# a `pgrep -f h2h` would match this script's own command line and refuse against itself. Stale
+# records from a killed run are therefore ignored, which is deliberate -- item 195's own warning is
+# that the failure mode of a lock is not "it did not lock" but "it never unlocked".
+SLOT_DIR="${FT_H2H_SLOT_DIR:-/data/tmp/ft-h2h-slots}"
+if [ -d "${SLOT_DIR}" ]; then
+  blocked=0
+  for slot in "${SLOT_DIR}"/*.slot; do
+    [ -e "${slot}" ] || continue
+    holder=$(head -c 200 "${slot}" | tr -dc 'a-zA-Z0-9=_. -')
+    pid=${holder#pid=}
+    pid=${pid%% *}
+    case "${pid}" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    if kill -0 "${pid}" 2>/dev/null; then
+      echo "REFUSING: another h2h measurement is live -- ${holder}" >&2
+      blocked=1
+    fi
+  done
+  [ "${blocked}" -eq 0 ] || exit 1
+  echo "measurement slot clear (${SLOT_DIR})"
+else
+  echo "measurement slot dir absent (${SLOT_DIR}) -- nothing to overlap with yet"
+fi
+
 if [ ! -x "${BIN}" ]; then
   echo "missing ${BIN} — build it first (ONE build per project; check the slot is free):" >&2
   echo "  RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR cargo build --release \\" >&2
