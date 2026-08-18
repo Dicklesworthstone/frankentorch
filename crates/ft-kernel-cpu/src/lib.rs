@@ -9692,6 +9692,11 @@ fn conv2d_ones_dout_tap_mask(y: usize, out_dim: usize, k: usize) -> usize {
 /// from a table keyed on the two tap masks — and since every element is now written, the
 /// `vec![0.0; ..]` it used to accumulate into is dead and the buffer is built uninitialised.
 ///
+/// The table depends only on the CHANNEL, so only `in_ch` planes are actually built from it and
+/// the remaining `batch - 1` planes of each channel are `copy_from_slice` of the first — item
+/// 176's decomposition, applied here after the fact. The table fill is the expensive per-element
+/// path and it now runs `batch` times less.
+///
 /// The interior — where all 9 taps reach, 78% of a plane at the scored shape — is one constant per
 /// channel. The masks make that fall out rather than being special-cased, and they also handle
 /// `oh < ph - kh + 1` (rows no tap reaches stay `0.0`) without the shape assumption the old
@@ -9723,24 +9728,35 @@ fn conv2d_ones_dout_scatter_dpadded_f64(
 ) -> Vec<f64> {
     const KH: usize = 3;
     const KW: usize = 3;
-    build_uninit(batch * in_ch * ph * pw, |d: &mut [f64]| {
-        if ph * pw == 0 {
-            return;
-        }
-        // Depend only on the geometry, so they are shared by every plane.
-        let rmasks: Vec<usize> = (0..ph)
-            .map(|y| conv2d_ones_dout_tap_mask(y, oh, KH))
-            .collect();
-        let cmasks: Vec<usize> = (0..pw)
-            .map(|x| conv2d_ones_dout_tap_mask(x, ow, KW))
-            .collect();
-        // One table per CHANNEL (not per plane): the `batch` planes of a channel share it.
-        let tables: Vec<[[f64; 1 << KW]; 1 << KH]> = (0..in_ch)
-            .map(|c| {
+    use rayon::prelude::*;
+    let plane_len = ph * pw;
+    if plane_len == 0 || in_ch == 0 || batch == 0 {
+        return Vec::new();
+    }
+    // Depend only on the geometry, so every channel and every plane shares them.
+    let rmasks: Vec<usize> = (0..ph)
+        .map(|y| conv2d_ones_dout_tap_mask(y, oh, KH))
+        .collect();
+    let cmasks: Vec<usize> = (0..pw)
+        .map(|x| conv2d_ones_dout_tap_mask(x, ow, KW))
+        .collect();
+    // ONE prototype plane per CHANNEL, then broadcast — item 176. The table below depends only on
+    // the channel, so the `batch` planes of a channel are identical and the old shape of this
+    // function built each of them from the table separately. Building `in_ch` of them and copying
+    // replaces `batch - 1` of every channel's table-driven fills with a `copy_from_slice`, which
+    // is a straight-line copy rather than an indexed load per element.
+    //
+    // Uninitialised is sound for BOTH buffers here, unlike the height-1 sibling: the table fill
+    // writes every element of a prototype (`y` covers `ph`, `x` covers `pw`), and the broadcast
+    // writes every element of every plane. Nothing is accumulated into, so nothing needs a zero.
+    let protos = build_uninit(in_ch * plane_len, |p: &mut [f64]| {
+        p.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(c, plane)| {
                 let pch = c * KH * KW;
                 let mut table = [[0.0f64; 1 << KW]; 1 << KH];
-                for (rm, row) in table.iter_mut().enumerate() {
-                    for (cm, slot) in row.iter_mut().enumerate() {
+                for (rm, trow) in table.iter_mut().enumerate() {
+                    for (cm, slot) in trow.iter_mut().enumerate() {
                         let mut acc = 0.0f64;
                         for kr in (0..KH).rev() {
                             if rm & (1 << kr) == 0 {
@@ -9756,26 +9772,24 @@ fn conv2d_ones_dout_scatter_dpadded_f64(
                         *slot = acc;
                     }
                 }
-                table
-            })
-            .collect();
-        use rayon::prelude::*;
-        d.par_chunks_mut(ph * pw)
-            .enumerate()
-            .for_each(|(plane, dp)| {
-                let table = &tables[plane % in_ch];
                 for (y, rm) in rmasks.iter().enumerate() {
-                    let row = &table[*rm];
-                    for (v, cm) in dp[y * pw..(y + 1) * pw].iter_mut().zip(cmasks.iter()) {
-                        *v = row[*cm];
+                    let trow = &table[*rm];
+                    for (v, cm) in plane[y * pw..(y + 1) * pw].iter_mut().zip(cmasks.iter()) {
+                        *v = trow[*cm];
                     }
                 }
+            });
+    });
+    build_uninit(batch * in_ch * plane_len, |d: &mut [f64]| {
+        d.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, dp)| {
+                let c = plane % in_ch;
+                dp.copy_from_slice(&protos[c * plane_len..(c + 1) * plane_len]);
             });
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 fn conv2d_backward_3x3_stride1_ones_dout_f64(
     padded: &[f64],
     weight_flat: &[f64],

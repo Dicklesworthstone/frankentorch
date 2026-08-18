@@ -33247,3 +33247,53 @@ and explicitly not a predicted speedup.
 Owed: build, run `conv2d_height1_ones_dout_dpadded_matches_per_plane_accumulation_bitwise` and the
 existing `conv2d_height1_ones_dout_backward_matches_generic_reference`, then find out whether this
 route is on any measured lane at all before spending more on it.
+
+## 177. APPLYING ITEM 176's DECOMPOSITION BACK TO ITEM 174's ROUTE — THE EASIER COLLAPSE WAS UNDERNEATH THE HARDER ONE THE WHOLE TIME
+
+`frankentorch-hi9r6`. **UNBUILT AND UNMEASURED.** Build freeze — `/data` 27G, 99% used, loadavg
+4.75/6.84/7.50 on the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 177a. WHAT ITEM 174 LEFT ON THE TABLE
+
+Item 174 collapsed the 3x3 all-ones scatter from `kh*kw` read-modify-writes per output position to
+one write per element, via a table keyed on the two tap masks. That was the harder half and it is
+correct. Item 176 then found the easier half on the sibling route and, writing it up, noticed it
+applies here too: **the tap-mask table depends only on the CHANNEL.** Every one of a channel's
+`batch` planes is therefore identical, and item 174 built each of them from the table separately.
+
+    174 : batch * in_ch  planes built from the table    (256 at the scored shape)
+    177 :         in_ch  planes built from the table    (32),  the other 224 a copy_from_slice
+
+The table fill is an indexed load per element; the copy is a straight-line 9.2 KiB memcpy. This
+does not change what item 174 claimed — it changes how many times the expensive path runs.
+
+### 177b. WHY THIS IS A SEPARATE ROW AND NOT AN AMENDMENT
+
+Item 153's rule, applied to myself: the 3x3 and height-1 adjoints sit on DISJOINT routes reached by
+different dispatch guards, so they stay independently priceable only if they are separate rows. The
+same applies in time — item 174 shipped and can be measured on its own; this sits on top of it and
+must be measurable as its own delta, not folded back into the row that preceded it.
+
+### 177c. THE SOUNDNESS ASYMMETRY, WHICH GOES THE OTHER WAY FROM ITEM 176
+
+Item 176 had to keep `protos` ZERO-FILLED because its prototype is built by accumulation, which
+reads what it adds into. Here BOTH buffers are `build_uninit`: the table fill writes every element
+of a prototype (`y` covers `ph`, `x` covers `pw`), and the broadcast writes every element of every
+plane. Nothing is accumulated into, so nothing needs a zero to start from.
+
+Worth stating because the two functions now look alike and differ in exactly this respect. **The
+question is never "is this buffer overwritten" but "is it READ before it is written" — and an
+accumulation reads.** The height-1 prototype and this one are the same shape of code with opposite
+answers.
+
+### 177d. WHAT IS NOT CLAIMED, AND WHAT CARRIES OVER
+
+No measurement. Bit-exactness needs no new argument: the values are item 174's values, produced by
+item 174's table in item 174's order, and a `copy_from_slice` moves bytes. The existing differential
+test covers this unchanged — it compares the function's output against a literal transcription of
+the original accumulate-scatter, and its fixtures have `batch` of 2 and 3, so the broadcast path is
+exercised by tests already written rather than by new ones asserting the new structure back to
+itself.
+
+Owed: the same build and the same vs-PyTorch arm item 174 owes, measured as its own delta on top of
+item 174 rather than jointly with it.
