@@ -32881,3 +32881,68 @@ nor item 165 stated it; all three should have.
 Owed when the volume frees: build, run the two new tests, and — since the fine arm engages only
 above `batch` threads — a same-invocation 8-vs-64-thread pair on the conv2d forward before any
 number from this is quoted anywhere.
+
+## 172. THE PROBE THAT SETTLES ITEM 170 AT BOTH POOL WIDTHS IN ONE PROCESS — WRITTEN NOW SO THE FIRST QUIET WINDOW COSTS ONE INVOCATION, NOT FOUR
+
+`frankentorch-hi9r6` (P0). **UNBUILT**: build freeze — `/data` 27G, 99% used, loadavg
+6.96/6.57/9.10 — no cargo ran, nothing was measured. `rustfmt --edition 2024 --check` exits 0.
+
+### 172a. WHY A PROBE IS THE RIGHT THING TO WRITE UNDER A FREEZE
+
+Item 170 shipped a default-off toggle rather than an edit, deliberately, because two agents have
+now had granularity changes reverted for reasoning without measuring (their items 159/161/163 via
+164; my 158/160 flagged in 165c and repaired by their 171). A toggle nobody can measure is worth
+nothing, and the measurement it needs is awkward enough that it would plausibly be done wrong:
+two toggle states across two pool widths is four numbers, and taken as four separate runs it is
+four different host states.
+
+**Pairing across runs is this campaign's most repeated error** — items 123, 135 and 139 on pool
+width, 145 on pooled rows, 169 on slot profiles, all mine. The probe removes the opportunity:
+
+* `rayon::ThreadPoolBuilder` builds an explicit pool per width and `install`s the work inside it,
+  so `rayon::current_num_threads()` — which `tile_grid` reads to size the grid — sees that width.
+  No env var, no second invocation, no cross-run subtraction.
+* the toggle is an `AtomicBool` precisely so both arms run in one process, alternating inside each
+  width so any drift in the window lands on both.
+
+### 172b. WHAT IT DOES AND DOES NOT COVER
+
+It times the real `conv2d_backward_f64` on `conv2d_masked`'s shape — in situ, not a standalone GEMM
+ladder, because `feedback_insitu_over_standalone` records a ladder INVERTING in situ (a predicted
+5.7x win measured as a 1.118x regression) on allocator warmth alone.
+
+**Scope, stated in the file because it would otherwise be assumed wrong:** the backward contains
+the two GEMMs item 170 is about and does NOT contain the forward transpose. Item 165c's forward
+defect — since repaired by a peer's item 171 — needs its own forward-side probe. This one does not
+cover it, and reading it as though it did would be exactly the sort of quiet scope creep that
+turns a probe into a misattribution.
+
+Arm-internal: no incumbent, no ratio, no standing. It decides whether the toggle is worth putting
+in front of the h2h board at all.
+
+### 172c. IT CARRIES ITS OWN FALSIFIER
+
+The toggle's whole basis is that changing M/N tiling cannot change a value. The probe accumulates
+a checksum per arm per width and prints an explicit verdict line: identical checksums, or
+`*** MISMATCH — the toggle changed a VALUE; item 170 is void and this is a BUG ***`. It is
+recorded rather than asserted so a mismatch is reported alongside the timings that would explain
+it, instead of aborting the run.
+
+It also prints the predicted tile count per width beside the timings (`6 -> 8` at 8 threads), so
+the number can be read against the scheduling change it is supposed to come from rather than
+against a hypothesis held in someone's head.
+
+### 172d. WHAT THE ANSWER WILL MEAN
+
+Item 170 predicts the adaptive arm helps MORE at 64 threads than at 8, because under-subscription
+scales with pool width while the extra A-panel traffic does not. Three outcomes, all useful:
+
+* **ratio grows with width** — the tile count was the binding constraint; the toggle earns a
+  default-on argument and a paired h2h row.
+* **ratio flat across widths** — tile count was not binding; the toggle stays off and item 170's
+  arithmetic, while correct, described something that did not matter.
+* **adaptive arm SLOWER** — the A-traffic dominates, `project_gemm_bandwidth_vein` was the right
+  prior, and the toggle should be deleted rather than defaulted. That is the outcome I would bet
+  on second, and it is a result, not a failure.
+
+NOT VERIFIED: compilation, execution, and every number this file would print.
