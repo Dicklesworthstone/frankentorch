@@ -32707,3 +32707,76 @@ and item 149b re-confirmed it under the drift-robust estimator. The certified ro
 are also untouched — they are masked lanes, which show no slot-0 step in any run.
 
 NOT VERIFIED: compilation, and the new field has never been printed by a running binary.
+
+## 170. conv2d's LARGEST BACKWARD GEMM GETS 6 UNEVEN TILES ON 8 THREADS — THE COLUMN FLOOR IS A CEILING ON TILE COUNT, AND I DID NOT JUST CHANGE IT
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 27G, 99% used,
+loadavg 9.20/10.04/12.09 — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 170a. THE ARITHMETIC
+
+`dweight` is the conv2d backward's largest GEMM — `dgemm_tb(m = out_ch = 32, k = flat = 8192,
+n = patch_width = 288)`, timed at **2.036 ms** by item 141. Its shape is unusual: `m` is thin, `k`
+is enormous, and `k` is the one axis that cannot be split without changing the summation order.
+
+`n = 288` fails `should_parallelize_cols`'s `n >= 4 * MIN_BLOCK_COLS = 512`, so it takes the 2-D
+tile path. There, with 8 threads:
+
+    tile_grid(8)              -> (p, q) = (2, 4)
+    mb = 32.div_ceil(2).max(8)    = 16          -> 2 row strips
+    nb = 288.div_ceil(4).max(128) = max(72,128) = 128   -> 3 column strips (128, 128, 32)
+                                                 = 6 tiles on an 8-thread pool
+
+Two problems, and the second is worse than the first. The pool is **under-subscribed** — 6 tiles
+for 8 workers — and the tiles are **uneven**: the third column strip is 32 wide against 128, so
+the pool completes five tiles and then waits on a stragger doing a quarter of the work.
+
+The cause is one `.max()`: `MIN_BLOCK_COLS` is a floor on block WIDTH, which makes it a **ceiling
+on block COUNT**. The thread-aware split had already computed 72 columns per strip — the right
+answer for 4 column groups — and the floor overrode it.
+
+### 170b. WHY THIS IS A TOGGLE AND NOT AN EDIT
+
+The obvious move is to lower the floor. I did not make it the default, and the reason is three
+items old.
+
+A peer's items 159, 161 and 163 were reverted wholesale by their own item 164 for making exactly
+this kind of granularity change on reasoning alone — and the correction ran the OPPOSITE way to
+intuition: their "fix" reduced splittable units below the thread count and would have capped
+parallelism. Item 165c then found the same hazard in MY items 158/160. **Two agents, four
+changes, one lesson: granularity arguments made without measurement have been wrong more often
+than right on this board.**
+
+And here the sign is genuinely open, not merely unproven:
+
+* more, narrower strips give rayon more to steal and even out the ragged edge;
+* but every column strip re-reads the whole `A` panel, and `A` is `k x m` = 8192x32 = 2 MB, so
+  narrowing strips multiplies A-traffic. `project_gemm_bandwidth_vein` records this GEMM family
+  as DRAM-bound in precisely that way — the 2-D tiling exists *because* a 1-D row split
+  re-streamed B.
+
+So `FT_GEMM_TILE_COL_ADAPTIVE` / `set_gemm_tile_col_floor_adaptive()` defaults to OFF, mirroring
+`set_sgemm_tile_balanced` and `set_pool_output_zeroed`: an `AtomicBool`, not a `OnceLock`, so a
+paired lane can flip it **inside one process** — which item 25 recorded is what makes a small
+scheduling difference attributable at all.
+
+### 170c. BIT-EXACT, AND A TEST THAT SAYS SO
+
+Changing the tile grid changes M/N blocking only. `K` is never split, and matrixmultiply's
+micro-kernel K-order is independent of M/N blocking — the same argument `dgemm_bt`'s column path
+already carries in its own comment ("K not split => bit-for-bit equal to `dgemm_bt_block`").
+
+The test asserts it rather than restating it: four shapes, three above the parallel gate and one
+far below it (where the toggle must be completely inert), compared by `to_bits()` between the two
+arms. If that test ever fails, the toggle is not a scheduling knob and this whole item is void —
+which is the outcome worth knowing.
+
+### 170d. THE MEASUREMENT THIS EXISTS FOR
+
+Paired arms in one process at BOTH pool widths, because the two effects have opposite
+width-dependence — the under-subscription gets worse as threads rise (6 tiles is 75% of 8 but 9%
+of 64), while the A-traffic penalty is width-independent. Item 165c owes a two-width run for the
+same reason, and they can share one invocation.
+
+The lane to read it on is `conv2d_masked`: its certified 5.73x is the standing this bead exists to
+move, and `dweight` is 2.036 ms of the ~16.6 ms backward that dominates it.

@@ -956,11 +956,25 @@ mod gemm {
         (lim, threads.div_ceil(lim))
     }
 
+    /// Below this a column strip is too narrow to amortise its own `A`-panel re-read, so the
+    /// adaptive floor stops here rather than at `MIN_BLOCK_COLS`. Four AVX2 f64 registers wide.
+    /// item 170 — only consulted when the toggle is on.
+    const MIN_BLOCK_COLS_ADAPTIVE: usize = 32;
+
     fn tile_shape(m: usize, n: usize) -> (usize, usize) {
         let threads = rayon::current_num_threads().max(1);
         let (p, q) = tile_grid(threads);
         let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
-        let nb = n.div_ceil(q).max(MIN_BLOCK_COLS);
+        // item 170: `MIN_BLOCK_COLS` is a floor on block WIDTH and therefore a ceiling on block
+        // COUNT. When the thread-aware split is narrower than the floor, the floor wins and the
+        // grid can produce fewer tiles than there are threads. OFF by default; see
+        // `crate::set_gemm_tile_col_floor_adaptive` for the shape that motivated it and for why
+        // the sign of the effect is open.
+        let nb = if crate::gemm_tile_col_floor_adaptive() {
+            n.div_ceil(q).max(MIN_BLOCK_COLS_ADAPTIVE)
+        } else {
+            n.div_ceil(q).max(MIN_BLOCK_COLS)
+        };
         (mb, nb)
     }
 
@@ -4959,6 +4973,56 @@ pub fn set_sdpa_br_auto() {
 pub fn sdpa_br_current(seq_q: usize, num_bh: usize) -> usize {
     sdpa_br_init();
     sdpa_br_for(seq_q, num_bh)
+}
+
+/// Let the 2-D GEMM tile grid's COLUMN floor adapt when `MIN_BLOCK_COLS` would starve the pool —
+/// `frankentorch-hi9r6`, item 170. UNBUILT, and OFF by default, so no shipping row moves.
+///
+/// `tile_shape` computes `nb = n.div_ceil(q).max(MIN_BLOCK_COLS)`, and that `.max()` is a floor
+/// on the block WIDTH which acts as a CEILING on the block COUNT. At conv2d's dweight shape —
+/// `dgemm_tb(m=32, k=8192, n=288)`, the backward's largest GEMM at 2.036 ms (item 141) — with 8
+/// threads the grid is `(p,q) = (2,4)`, so the thread-aware split would be `288/4 = 72` columns
+/// per strip, but the floor raises it to 128. The result is **6 tiles on an 8-thread pool**, and
+/// uneven ones: two column strips of 128 and one of 32, so the pool finishes 5 tiles and waits.
+///
+/// Whether relaxing the floor helps is NOT knowable without measuring, which is the whole reason
+/// this is a toggle rather than an edit. A peer's items 159/161/163 were reverted wholesale by
+/// their item 164 for making precisely this kind of granularity change on reasoning alone — and
+/// the correction there cut the other way, so the sign of this effect is genuinely open:
+///
+/// * more, narrower strips give the pool more to steal and even out the ragged edge;
+/// * but each strip re-reads the whole `A` panel, so narrowing them multiplies A-traffic, and
+///   `project_gemm_bandwidth_vein` records that this GEMM family is DRAM-bound in exactly that
+///   way — the 2-D tiling exists because a 1-D row split re-streamed B.
+///
+/// BIT-EXACT either way: this changes only the M/N tiling. K is never split, and matrixmultiply's
+/// micro-kernel K-order is independent of the M/N blocking — the same argument `dgemm_bt`'s column
+/// path already carries ("K not split => bit-for-bit equal to dgemm_bt_block").
+static GEMM_TILE_COL_FLOOR_ADAPTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn gemm_tile_col_floor_adaptive_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var("FT_GEMM_TILE_COL_ADAPTIVE").is_ok_and(|v| v == "1") {
+            GEMM_TILE_COL_FLOOR_ADAPTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Select the adaptive column floor; returns nothing, mirroring [`set_sgemm_tile_balanced`].
+/// Measurement-only — an `AtomicBool` and not a `OnceLock` so a paired lane can flip it inside
+/// ONE process, which is what made every other lever on this board decidable.
+pub fn set_gemm_tile_col_floor_adaptive(on: bool) {
+    gemm_tile_col_floor_adaptive_init();
+    GEMM_TILE_COL_FLOOR_ADAPTIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the adaptive column floor is selected. Read once per GEMM call, not per element.
+#[must_use]
+pub fn gemm_tile_col_floor_adaptive() -> bool {
+    gemm_tile_col_floor_adaptive_init();
+    GEMM_TILE_COL_FLOOR_ADAPTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SGEMM_TILE_BALANCED: std::sync::atomic::AtomicBool =
@@ -44858,6 +44922,58 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// frankentorch-hi9r6 item 170: flipping the GEMM tile grid's column floor must change the
+    /// SCHEDULE and nothing else.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// This is the claim that makes the toggle safe to measure: `tile_shape` only decides M/N
+    /// block extents, K is never split, and matrixmultiply's micro-kernel K-order is independent
+    /// of M/N blocking. If that is right the two arms are bit-identical; if it is wrong, the
+    /// toggle is not a scheduling knob at all and the whole item is void.
+    ///
+    /// Shapes are chosen to straddle the gate: the first three satisfy
+    /// `should_parallelize` (`m > 8` and `m*k*n >= 2^24`) so they reach the 2-D tile path where
+    /// the floor applies, and the last is far below it, where the toggle must be completely inert.
+    /// The first case is conv2d's actual dweight shape scaled down in `k`.
+    #[test]
+    fn gemm_tile_col_floor_toggle_changes_schedule_not_values() {
+        // (m, k, n) — a is [k, m], b is [k, n], c is [m, n] for `dgemm_tb`.
+        let cases = [
+            (32usize, 4096usize, 288usize), // conv2d dweight's shape, smaller k
+            (16, 8192, 320),
+            (64, 2048, 512),
+            (4, 64, 32), // below every parallel gate: the toggle must not matter
+        ];
+        for &(m, k, n) in &cases {
+            let a: Vec<f64> = (0..k * m)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let b: Vec<f64> = (0..k * n)
+                .map(|i| ((i % 241) as f64) * 0.0007 - 0.09)
+                .collect();
+
+            super::set_gemm_tile_col_floor_adaptive(false);
+            let mut c_default = vec![0.0f64; m * n];
+            super::gemm::dgemm_tb(m, k, n, &a, &b, &mut c_default);
+
+            super::set_gemm_tile_col_floor_adaptive(true);
+            let mut c_adaptive = vec![0.0f64; m * n];
+            super::gemm::dgemm_tb(m, k, n, &a, &b, &mut c_adaptive);
+
+            super::set_gemm_tile_col_floor_adaptive(false);
+
+            for (i, (d, x)) in c_default.iter().zip(c_adaptive.iter()).enumerate() {
+                assert_eq!(
+                    d.to_bits(),
+                    x.to_bits(),
+                    "item 170: tile column floor changed a VALUE at m={m} k={k} n={n} idx={i}: \
+                     default={d} adaptive={x}"
+                );
             }
         }
     }
