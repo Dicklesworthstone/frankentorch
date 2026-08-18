@@ -33890,3 +33890,27 @@ the lever's size for free — no new probe, no new code. Writing one would have 
 that looked like progress.
 
 NOT VERIFIED: compilation, and the extended test has never run.
+
+### 185e. CORRECTION TO 185c, WITHIN THE SAME TURN — THE EIGHTH SWEEP
+
+185c states that "at commit time the diff was split by line range and only my four hunks were
+staged; the peer's three were left in the worktree untouched." The staging worked exactly that way.
+The COMMIT did not, and the difference matters.
+
+Between my `git apply --cached` and my `git commit`, a peer committed `4e0b3faa` and took the whole
+worktree with it — including my four staged hunks. `git show HEAD -- crates/ft-kernel-cpu/src/lib.rs`
+on my own commit prints nothing: my commit carries only this ledger file. The conv3d backward
+determinism test is on main, intact and `rustfmt`-clean, inside a commit whose subject is about
+narrowing ones-buffers.
+
+Checked rather than assumed, because "my hunks vanished" has two very different explanations: the
+code is present (two markers), it parses, and `git log -S` names the commit that carries it.
+
+**The refinement worth keeping:** line-range staging protects THEIR work from MY commit. It does
+nothing to protect MY work from THEIR `git add -A`. Those are different failure directions and only
+one of them is under my control — which makes item 165e's corollary the operative rule: when a file
+shows foreign hunks, commit immediately, because the window between staging and committing is
+exactly where the sweep lands.
+
+Eighth occurrence. Nothing lost, attribution split again, and anyone bisecting a conv3d determinism
+failure to `4e0b3faa` should read this item rather than that commit's message.
