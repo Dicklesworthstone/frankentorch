@@ -8245,43 +8245,39 @@ pub fn conv2d_backward_f32(
     let patch_count = oh * ow;
     let flat = batch * patch_count;
     // The all-ones adjoints, which this dtype did not have — see
-    // `conv2d_backward_3x3_stride1_ones_dout_f32`. Both guards, and their ORDER, mirror the f64
-    // route's exactly so the two dtypes cannot drift into taking different routes for one call.
-    if ph == 1 && kh == 1 && oh == 1 && !dout.is_empty() && dout_is_all_ones_f32(dout) {
-        return conv2d_backward_height1_ones_dout_f32(
-            padded,
-            weight_flat,
-            batch,
-            in_ch,
-            pw,
-            kw,
-            ow,
-            sw,
-            out_ch,
-            has_bias,
-        );
-    }
-    if ph > 1
-        && oh > 1
-        && kh == 3
-        && kw == 3
-        && sh == 1
-        && sw == 1
-        && !dout.is_empty()
+    // `conv2d_backward_3x3_stride1_ones_dout_f32`. The shape guards live in
+    // `conv2d_ones_dout_route` so this entry and the f64-gradient one cannot disagree about which
+    // route a shape takes; the guards themselves mirror the f64 dtype's.
+    if !dout.is_empty()
+        && let Some(route) = conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw)
         && dout_is_all_ones_f32(dout)
     {
-        return conv2d_backward_3x3_stride1_ones_dout_f32(
-            padded,
-            weight_flat,
-            batch,
-            in_ch,
-            ph,
-            pw,
-            oh,
-            ow,
-            out_ch,
-            has_bias,
-        );
+        return match route {
+            ConvOnesRoute::Height1 => conv2d_backward_height1_ones_dout_f32(
+                padded,
+                weight_flat,
+                batch,
+                in_ch,
+                pw,
+                kw,
+                ow,
+                sw,
+                out_ch,
+                has_bias,
+            ),
+            ConvOnesRoute::ThreeByThreeStride1 => conv2d_backward_3x3_stride1_ones_dout_f32(
+                padded,
+                weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                oh,
+                ow,
+                out_ch,
+                has_bias,
+            ),
+        };
     }
     let mut dout_flat = vec![0.0f32; flat * out_ch];
     dout_flat
@@ -9981,6 +9977,106 @@ fn conv2d_ones_dout_scatter_dpadded_f64(
                 dp.copy_from_slice(&protos[c * plane_len..(c + 1) * plane_len]);
             });
     })
+}
+
+/// Which all-ones-`dout` adjoint a conv2d shape is eligible for, if any.
+///
+/// Extracted so the two f32 entry points cannot drift apart. `conv2d_backward_f32` decides from an
+/// f32 `dout` it already holds; `conv2d_backward_f32_ones_dout_from_f64_grad` decides before one
+/// exists. Two copies of these guards would be two chances to disagree about which route a shape
+/// takes, and the whole point of the second entry is that it reaches the SAME code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConvOnesRoute {
+    /// `ph == kh == oh == 1` — the conv1d-shaped primitive.
+    Height1,
+    /// 3x3, stride 1, both extents above 1.
+    ThreeByThreeStride1,
+}
+
+#[inline]
+fn conv2d_ones_dout_route(
+    ph: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    sh: usize,
+    sw: usize,
+) -> Option<ConvOnesRoute> {
+    if ph == 1 && kh == 1 && oh == 1 {
+        return Some(ConvOnesRoute::Height1);
+    }
+    if ph > 1 && oh > 1 && kh == 3 && kw == 3 && sh == 1 && sw == 1 {
+        return Some(ConvOnesRoute::ThreeByThreeStride1);
+    }
+    None
+}
+
+/// The f32 all-ones adjoints, selected from the f64 upstream gradient the TAPE holds, before any
+/// f32 `dout` has been built. Returns `None` when no fast path applies, leaving the caller to
+/// narrow and take the generic route.
+///
+/// WHAT THIS AVOIDS. `ft-api`'s f32 conv2d backward begins
+/// `grad_outputs[0].iter().map(|&v| v as f32).collect()` — a SERIAL narrow of the whole upstream
+/// gradient, 262,144 elements and 1 MiB at the board's conv2d shape. On the summed route that
+/// buffer is then scanned by `dout_is_all_ones_f32`, found to be all ones, and **never read
+/// again**: neither adjoint looks at `dout`. Items 179 and 181 created that waste by adding the
+/// fast paths; before them the narrow fed a generic route that genuinely needed it.
+///
+/// WHY DECIDING IN f64 IS SOUND, AND STRICTLY CONSERVATIVE. `1.0f64 as f32` is exactly `1.0f32`,
+/// so an all-ones f64 gradient always narrows to an all-ones f32 one — this predicate implies the
+/// f32 one it replaces. The converse fails: `1.0 + 1e-9` in f64 narrows to exactly `1.0f32`, so
+/// there are gradients the old check accepted and this one rejects. Those now take the generic
+/// route, which items 179, 181 and 183 assert is BIT-IDENTICAL to the adjoint on all-ones input —
+/// so the value returned is unchanged either way and only the route differs. Rejecting a case the
+/// old code accepted is the safe direction; accepting one it rejected would not be.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_backward_f32_ones_dout_from_f64_grad(
+    dout_f64: &[f64],
+    padded: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> Option<(Vec<f32>, Vec<f32>, Option<Vec<f32>>)> {
+    if dout_f64.is_empty() || !dout_is_all_ones_f64(dout_f64) {
+        return None;
+    }
+    match conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw)? {
+        ConvOnesRoute::Height1 => Some(conv2d_backward_height1_ones_dout_f32(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            pw,
+            kw,
+            ow,
+            sw,
+            out_ch,
+            has_bias,
+        )),
+        ConvOnesRoute::ThreeByThreeStride1 => Some(conv2d_backward_3x3_stride1_ones_dout_f32(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            oh,
+            ow,
+            out_ch,
+            has_bias,
+        )),
+    }
 }
 
 /// f32 mirror of [`conv2d_ones_dout_height1_dpadded_f64`]: prototype per channel, then broadcast.
@@ -45770,6 +45866,11 @@ mod tests {
         let weight3: Vec<f64> = (0..CO * pw3)
             .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
             .collect();
+        // NON-UNIFORM, so the backward takes the generic route holding both GEMMs rather
+        // than the all-ones adjoint.
+        let dout3: Vec<f64> = (0..B * CO * O * O * O)
+            .map(|i| ((i % 197) as f64) * 0.0007 + 0.25)
+            .collect();
         let bias3: Vec<f64> = (0..CO)
             .map(|i| {
                 if i.is_multiple_of(3) {
@@ -45801,13 +45902,13 @@ mod tests {
             })
             .collect();
 
-        let mut reference: Option<(Vec<f64>, Vec<f32>)> = None;
+        let mut reference: Option<(Vec<f64>, Vec<f64>, Vec<f32>)> = None;
         for width in [1usize, 8] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(width)
                 .build()
                 .expect("pool");
-            let (c3, c2f32) = pool.install(|| {
+            let (c3, c3b, c2f32) = pool.install(|| {
                 let c3 = super::conv3d_forward_f64(
                     &padded3,
                     &weight3,
@@ -45844,11 +45945,20 @@ mod tests {
                     1,
                     CO,
                 );
-                (c3, c2f32)
+                // item 185: the conv3d BACKWARD too. Item 184 covered only forwards, and the
+                // backward is where the im2col/col2im pair and both GEMMs live — more parallel
+                // structure than the forward has, and none of it width-checked anywhere.
+                let (dpadded3, dweight3, _) = super::conv3d_backward_f64(
+                    &dout3, &padded3, &weight3, B, CI, P, P, P, K, K, K, O, O, O, 1, 1, 1, CO,
+                    false,
+                );
+                let mut c3b = dpadded3;
+                c3b.extend_from_slice(&dweight3);
+                (c3, c3b, c2f32)
             });
             match &reference {
-                None => reference = Some((c3, c2f32)),
-                Some((r3, r2)) => {
+                None => reference = Some((c3, c3b, c2f32)),
+                Some((r3, r3b, r2)) => {
                     for (i, (g, w)) in c3.iter().zip(r3.iter()).enumerate() {
                         assert_eq!(
                             g.to_bits(),
@@ -45856,6 +45966,14 @@ mod tests {
                             "item 184: conv3d_forward_f64 differs at pool width {width}, index \
                              {i} (got {g}, 1-thread reference {w}) — a width-dependent result is \
                              a BUG the h2h board cannot see"
+                        );
+                    }
+                    for (i, (g, w)) in c3b.iter().zip(r3b.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "item 185: conv3d_backward_f64 differs at pool width {width}, index \
+                             {i} (got {g}, 1-thread reference {w})"
                         );
                     }
                     for (i, (g, w)) in c2f32.iter().zip(r2.iter()).enumerate() {
@@ -65512,5 +65630,139 @@ mod tests {
             "no case exceeded SGEMM_KC in `out_ch`; the dpanel GEMM's k is then untested, which \
              is the specific blindness this test exists to prevent"
         );
+    }
+
+    /// Deciding the all-ones route from the f64 upstream gradient must reach the SAME result as
+    /// narrowing first and letting `conv2d_backward_f32` decide — that equivalence is the only
+    /// thing letting `ft-api` skip a 1 MiB serial narrow on the summed route.
+    #[test]
+    fn conv2d_backward_f32_from_f64_grad_matches_narrow_then_dispatch() {
+        // (batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch) — one per fast route.
+        let cases: &[(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        )] = &[
+            (2, 2, 14, 14, 3, 3, 12, 12, 1, 1, 3),
+            (4, 2, 1, 605, 1, 5, 1, 301, 1, 2, 4),
+        ];
+        for &(batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch) in cases {
+            let patch_width = in_ch * kh * kw;
+            let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i * 17 % 31) as f32 - 15.0) / 1024.0)
+                .collect();
+            let weight: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| ((i * 29 % 37) as f32 - 18.0) / 2048.0)
+                .collect();
+            let dout64 = vec![1.0f64; batch * out_ch * oh * ow];
+
+            let (fp, fw, fb) = super::conv2d_backward_f32_ones_dout_from_f64_grad(
+                &dout64, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+                true,
+            )
+            .expect("an all-ones f64 gradient on a fast-path shape must select a route");
+
+            let dout32: Vec<f32> = dout64.iter().map(|&v| v as f32).collect();
+            let (wp, ww, wb) = super::conv2d_backward_f32(
+                &dout32, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+                true,
+            );
+
+            assert_eq!(fp.len(), wp.len());
+            for (i, (&g, &w)) in fp.iter().zip(wp.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "dpadded[{i}] at ph={ph} kw={kw}");
+            }
+            for (i, (&g, &w)) in fw.iter().zip(ww.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "dweight[{i}] at ph={ph} kw={kw}");
+            }
+            assert_eq!(fb, wb, "dbias at ph={ph} kw={kw}");
+
+            // A gradient that is not exactly all ones declines, even where it would NARROW to all
+            // ones. This is the conservative direction and it is deliberate: the value is
+            // unchanged because the generic route agrees bit-for-bit on all-ones f32 input, so
+            // only the route differs. Asserted so the behaviour is a decision, not an accident.
+            let mut nearly = dout64.clone();
+            nearly[0] = 1.0 + 1e-9;
+            assert_eq!(
+                ((1.0f64 + 1e-9) as f32).to_bits(),
+                1.0f32.to_bits(),
+                "fixture must narrow to exactly 1.0, or it proves nothing"
+            );
+            assert!(
+                super::conv2d_backward_f32_ones_dout_from_f64_grad(
+                    &nearly, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                    out_ch, true,
+                )
+                .is_none(),
+                "a gradient that merely narrows to all-ones must NOT select the adjoint"
+            );
+
+            // An empty gradient declines rather than indexing.
+            assert!(
+                super::conv2d_backward_f32_ones_dout_from_f64_grad(
+                    &[],
+                    &padded,
+                    &weight,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    true,
+                )
+                .is_none()
+            );
+        }
+
+        // A shape with no fast path declines even on a perfect all-ones gradient: 5x5 is neither
+        // height-1 nor 3x3.
+        let (batch, in_ch, ph, pw, kh, kw, oh, ow, out_ch) = (1, 2, 9, 9, 5, 5, 5, 5, 2);
+        let padded = vec![0.5f32; batch * in_ch * ph * pw];
+        let weight = vec![0.25f32; out_ch * in_ch * kh * kw];
+        let dout64 = vec![1.0f64; batch * out_ch * oh * ow];
+        assert!(
+            super::conv2d_backward_f32_ones_dout_from_f64_grad(
+                &dout64, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, 1, 1, out_ch,
+                false,
+            )
+            .is_none(),
+            "5x5 has no all-ones adjoint and must fall through to the generic route"
+        );
+    }
+
+    /// The shape selector is shared by both f32 entries so they cannot disagree; pin what it
+    /// selects, including the cases it must refuse.
+    #[test]
+    fn conv2d_ones_dout_route_selects_the_documented_shapes() {
+        use super::ConvOnesRoute::{Height1, ThreeByThreeStride1};
+        // (ph, kh, kw, oh, sh, sw) -> route
+        assert_eq!(
+            super::conv2d_ones_dout_route(1, 1, 5, 1, 1, 2),
+            Some(Height1)
+        );
+        assert_eq!(
+            super::conv2d_ones_dout_route(34, 3, 3, 32, 1, 1),
+            Some(ThreeByThreeStride1)
+        );
+        // 3x3 but strided; 3x3 with a degenerate output extent; 5x5; height-1 with kh != 1.
+        assert_eq!(super::conv2d_ones_dout_route(34, 3, 3, 32, 2, 1), None);
+        assert_eq!(super::conv2d_ones_dout_route(34, 3, 3, 32, 1, 2), None);
+        assert_eq!(super::conv2d_ones_dout_route(3, 3, 3, 1, 1, 1), None);
+        assert_eq!(super::conv2d_ones_dout_route(9, 5, 5, 5, 1, 1), None);
+        assert_eq!(super::conv2d_ones_dout_route(1, 3, 3, 1, 1, 1), None);
     }
 }

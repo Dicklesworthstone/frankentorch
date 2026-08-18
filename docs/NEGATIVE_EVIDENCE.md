@@ -33750,3 +33750,78 @@ adds a test rather than more of it. Everything owed remains owed: `cargo build`,
 `cargo test`, then the paired vs-PyTorch runs for items 170, 178 and 182.
 
 NOT VERIFIED: compilation, and this test has never run.
+
+## 185. ITEMS 179 AND 181 MADE A 1 MiB SERIAL NARROW DEAD AND DID NOT REMOVE IT — AND FIRST I CHECKED THE ROUTE WAS REACHABLE AT ALL
+
+`frankentorch-hi9r6`. **UNBUILT.** Build freeze — `/data` 26G, 99% used, loadavg 9.53/10.43/9.49 on
+the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0 on both crates.
+
+### 185a. THE QUESTION I SHOULD HAVE ASKED THREE ITEMS AGO
+
+Items 179, 181 and 183 added and tested two f32 conv2d routes without once establishing that
+anything calls `conv2d_backward_f32`. `feedback_sentinel_before_fixing` exists because source
+reading gave three confident wrong answers about which path executes, and I skipped it.
+
+It is reachable. `ft-api` line ~30969 carries the f32 fused grad path, whose backward does:
+
+    let dout_f32: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+    let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_f32(&dout_f32, ..);
+
+A summed loss puts all-ones in `grad_outputs[0]`, `1.0f64 as f32` is exactly `1.0f32`, so the
+predicate fires and both new adjoints are live. Good — but the answer could have been no, and three
+items of numerical code would have been improving something unreachable.
+
+### 185b. WHAT READING IT FOUND
+
+That narrow is a SERIAL pass over the whole upstream gradient — 262,144 elements, 1 MiB, at the
+board's conv2d shape. On the summed route the buffer it builds is then scanned by
+`dout_is_all_ones_f32`, confirmed to be all ones, and **never read again**: neither adjoint looks at
+`dout`.
+
+Items 179 and 181 created that waste. Before them the narrow fed a generic route that genuinely
+needed every element. **A fast path that makes its own input unnecessary leaves the cost of
+producing that input behind, and the diff that adds the fast path is not where it shows up.**
+
+`project_serial_widen_vein` is the same shape of finding — 20.2 ms of a 31 ms GroupNorm lane was one
+serial `.iter().map(f64::from)` — and this is its narrow-side twin, created rather than inherited.
+
+### 185c. THE CHANGE, AND WHY DECIDING IN f64 IS THE CONSERVATIVE DIRECTION
+
+A new public entry, `conv2d_backward_f32_ones_dout_from_f64_grad`, takes the f64 gradient the tape
+already holds, and returns `None` when no fast path applies so the caller narrows and proceeds as
+before.
+
+`1.0f64 as f32` is exactly `1.0f32`, so an all-ones f64 gradient always narrows to an all-ones f32
+one: this predicate IMPLIES the one it replaces. The converse fails — `1.0 + 1e-9` narrows to
+exactly `1.0f32` — so a few gradients the old check accepted now take the generic route instead.
+That is safe in the direction that matters: items 179/181/183 assert the generic route is
+BIT-IDENTICAL to the adjoint on all-ones f32 input, so the returned value is unchanged and only
+the route differs. Accepting a case the old code rejected would not have been safe; rejecting one
+it accepted is. The test asserts this refusal explicitly, so it reads as a decision rather than as
+an accident.
+
+### 185d. ONE COPY OF THE SHAPE GUARDS
+
+Two entries now select the same two adjoints, so the guards moved into `conv2d_ones_dout_route`
+returning an enum, and both call it. Two copies would be two chances to disagree about which route
+a shape takes, and the entire point of the second entry is that it reaches the SAME code. Its
+selections are pinned by their own test, including the refusals (strided 3x3, degenerate extents,
+5x5, height-1 with `kh != 1`).
+
+### 185e. WHAT I DID NOT DO
+
+I went looking for an f32 conv2d h2h LANE to measure any of this and stopped before writing one.
+The harness's parity gate is a flat `1e-6` relative on a gradient checksum, and the file already
+records two f32 lanes' experience with it: `group_norm_f32` clears it only because its checksum
+accumulates in f64, and the f32 BatchNorm sum lane was DELETED rather than left red because its
+`dx` is analytically zero and the column compared two computations of nothing. Whether a conv2d f32
+checksum clears 1e-6 is a question with an answer, and guessing it while unable to run the harness
+would produce a lane that is either red or silently uninformative on a board a dozen agents read.
+
+Recorded as the next step rather than done badly: decide the f32 conv2d lane's parity treatment
+with a running harness, then add the lane.
+
+### 185f. OWED
+
+Unchanged, and now spanning two crates: build, and run the tests from items 179, 181, 183 and this
+one. Nothing in this chain has been compiled.

@@ -30994,27 +30994,64 @@ impl FrankenTorchSession {
                         Ok((out, vec![b_, oc, oh, ow]))
                     },
                     move |_ctx, grad_outputs, borrowed_inputs| {
-                        let dout_f32: Vec<f32> =
-                            grad_outputs[0].iter().map(|&v| v as f32).collect();
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
-                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_f32(
-                            &dout_f32,
-                            padded_values,
-                            weight_values,
-                            b_,
-                            ic,
-                            ph,
-                            pw,
-                            kh,
-                            kw,
-                            oh,
-                            ow,
-                            sh,
-                            sw,
-                            oc,
-                            has_bias,
-                        );
+                        // ASK BEFORE NARROWING — `frankentorch-hi9r6`, item 185.
+                        //
+                        // The narrow below is a SERIAL pass over the whole upstream gradient:
+                        // 262,144 elements and 1 MiB at the board's conv2d shape. On a summed
+                        // loss every element is 1.0, and the all-ones adjoints items 179/181
+                        // added do not read `dout` at all — so the buffer was being built, then
+                        // scanned by `dout_is_all_ones_f32` to confirm it was all ones, then
+                        // thrown away. Those items created that waste; before them the narrow fed
+                        // a generic route that needed it.
+                        //
+                        // Deciding in f64 is strictly conservative: `1.0f64 as f32` is exactly
+                        // `1.0f32`, so an all-ones f64 gradient always narrows to an all-ones f32
+                        // one. The converse fails (`1.0 + 1e-9` narrows to exactly 1.0f32), so a
+                        // few gradients the f32 check accepted now take the generic route — which
+                        // items 179/181/183 assert is bit-identical to the adjoint on all-ones
+                        // input, so the VALUE is unchanged and only the route differs.
+                        let (dpadded, dweight, dbias) = if let Some(fast) =
+                            ft_kernel_cpu::conv2d_backward_f32_ones_dout_from_f64_grad(
+                                grad_outputs[0],
+                                padded_values,
+                                weight_values,
+                                b_,
+                                ic,
+                                ph,
+                                pw,
+                                kh,
+                                kw,
+                                oh,
+                                ow,
+                                sh,
+                                sw,
+                                oc,
+                                has_bias,
+                            ) {
+                            fast
+                        } else {
+                            let dout_f32: Vec<f32> =
+                                grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            ft_kernel_cpu::conv2d_backward_f32(
+                                &dout_f32,
+                                padded_values,
+                                weight_values,
+                                b_,
+                                ic,
+                                ph,
+                                pw,
+                                kh,
+                                kw,
+                                oh,
+                                ow,
+                                sh,
+                                sw,
+                                oc,
+                                has_bias,
+                            )
+                        };
                         let mut g = vec![
                             Some(dpadded.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
                             Some(dweight.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
