@@ -35222,3 +35222,63 @@ conv3d's copy is deliberately untouched: different bead, and a peer is editing t
 
 Unchanged: compile items 194-201, then `FT_H2H_LANES=conv2d` at `round_warmup=0` once 1m ~ 5m ~ 15m.
 The host has swung between loadavg 4.9 and 85 across the last six ticks.
+
+## 202. THE 28 SITES, PROPERLY ATTRIBUTED — AND DOING IT FOUND A CONV3D CLOSURE MY OWN ITEM 195 MISSED
+
+`frankentorch-hi9r6`. Source reading only: no cargo, no artifact written, no new file. Disk 38-39G,
+below the brake.
+
+### 202a. THE THIRD METHOD IS THE ONE THAT WORKS
+
+Item 200 named its sites by "nearest preceding `pub fn` within 400 lines" and item 200's correction
+showed half those attributions came from 150-390 lines away. So I tried brace-matching, which item
+200's correction had itself recommended — and it named **zero of 28**. Naive brace counting cannot
+work on this file: braces appear in string literals, in doc comments, and in the closures being
+searched.
+
+What works is INDENTATION. Methods sit at exactly four spaces inside `impl FrankenTorchSession`;
+every closure is deeper. The nearest preceding line matching `^    (pub )?fn` is therefore the
+enclosing method, and it names **28 of 28**.
+
+**`tensor_sum` is gone from the list**, which was the tell that started this. Sum takes one input
+and cannot return two gradients; it was never a site.
+
+### 202b. THE CORRECTED INVENTORY
+
+    scaled_dot_product_attention          x3     functional_group_norm_sum          x1
+    tensor_scaled_dot_product_attention   x3     functional_group_norm              x1
+    tensor_smooth_l1_loss                 x2     try_fused_batch_norm               x1
+    functional_conv2d_grouped             x2     functional_batch_norm1d_sum        x1
+    einsum_unary_single_repeated_index    x1     try_batch_norm1d_sum_shortcut      x1
+    tensor_gaussian_nll_loss              x1     try_prelu_sum_shortcut             x1
+    tensor_prelu                          x1     tensor_put                         x1
+    functional_linear                     x1     index_put_accumulate_half          x1
+    functional_conv_transpose2d           x1     tensor_index_add                   x1
+    functional_conv3d                     x1     tensor_diagonal_scatter            x1
+                                                 tensor_cholesky_solve              x1
+                                                 tensor_triangular_solve            x1
+
+SDPA is the largest cluster at six closures across two entry points — worth knowing before anyone
+starts at the top of an alphabetical list.
+
+### 202c. AND IT FOUND A HOLE IN ITEM 195
+
+`functional_conv3d` should not be on this list at all: item 195 wired its first-order backward to
+read `ctx.needs_input_grad()`. It is there because **conv3d has TWO first-order closures**, and I
+wired one. The survivor is the f32 path at `lib.rs:32084`, calling `conv3d_backward_f32`, still
+taking `_ctx` and still computing both gradients.
+
+I would not have found that by re-reading item 195. It fell out of doing the attribution properly
+on a list I had already written off as a hint — **the cheap check that was only worth running
+because the previous two methods had failed.**
+
+Not fixed here: it needs a `conv3d_backward_masked_f32` that does not exist, which is a mirror of
+item 195 in `ft-kernel-cpu` — and that file currently carries uncommitted peer edits. Recorded with
+its exact line so the next hand does not have to rediscover it.
+
+### 202d. WHAT THIS CHANGES ABOUT THE VEIN
+
+Item 200c's ranking rule — prefer sites whose REAL callers freeze an input — is now applicable,
+because the names are trustworthy. It also gains a corollary from 202c: **check whether an op has
+more than one first-order backward before calling it done.** Both conv3d and conv2d have f32
+mirrors, and `functional_conv2d_grouped` appears twice for the same reason.
