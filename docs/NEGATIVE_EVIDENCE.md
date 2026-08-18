@@ -35108,3 +35108,55 @@ the serve loop only runs requested lanes, and not mine to delete.
 ### 199d. OWED
 
 Unchanged: compile items 194-199, then `FT_H2H_LANES=conv2d` at `round_warmup=0` once 1m ~ 5m ~ 15m.
+
+## 200. `output_mask` IS NOT A CONV IDEA — IT IS TORCH'S HOUSE STYLE, AND WE IGNORE IT AT 28 SITES
+
+`frankentorch-hi9r6`. Source reading only: no cargo, no artifact written, disk 43G at the brake.
+
+### 200a. WHAT THE INCUMBENT SOURCE SAYS
+
+Items 178 and 195 fixed conv2d and conv3d after noticing PyTorch's `convolution_backward` takes an
+`output_mask: [bool; 3]`. Reading further, that is not a convolution decision:
+`native_group_norm_backward` takes one too, and `output_mask` appears 27 times across
+`torch/_decomp/decompositions.py`.
+
+**Every torch backward with more than one differentiable input carries the mask.** It is house
+style, not an optimisation someone remembered to add to convolutions.
+
+### 200b. THE SIZE OF THE VEIN HERE
+
+Walking `ft-api`'s first-order backward closures and classifying each by whether it returns two or
+more gradients and whether it reads `ctx.needs_input_grad()`:
+
+    first-order closures returning 2+ gradients, IGNORING needs_input_grad :  28   <- the vein
+    first-order closures returning 2+ gradients, reading it                :  15
+    single-gradient closures (nothing to skip)                             : 126
+
+Among the 28: `functional_linear`, `functional_group_norm`, `tensor_scaled_dot_product_attention`,
+`tensor_prelu`, `functional_conv_transpose2d`, `functional_conv2d_grouped`, `tensor_einsum`,
+`tensor_addbmm`, `tensor_index_add`, `tensor_put`.
+
+**conv2d and conv3d are absent from the list**, which is the check that the classifier works: the
+two sites items 178 and 195 fixed no longer match the pattern that found them.
+
+### 200c. THE HONEST LIMIT ON WHAT THIS IS WORTH
+
+A mask only pays where a caller does not want one of the gradients. Several of the ops above sit on
+lanes that deliberately want BOTH — `timed_linear` gives its weight `requires_grad` on purpose, and
+says why — so masking them changes nothing on the board even though it would help a frozen layer in
+real use.
+
+conv2d was worth ~18% only because its lane happens to freeze the weight, and item 182 flagged that
+this may be a lane-fidelity problem rather than a feature. **The same ambiguity applies to all 28**,
+and it cannot be resolved by counting sites: each needs a caller who genuinely skips a gradient.
+
+So this is a sized vein with a known catch, not 28 pending wins. The ranking rule that follows:
+take the sites whose REAL callers freeze an input (inference paths, frozen backbones), not the ones
+whose h2h lane happens to.
+
+### 200d. NOT DONE, DELIBERATELY
+
+No code this item. Twenty-eight mechanical edits to backward closures, none compilable today, with
+the conv3d pair from items 195-196 still never executed, would be the largest unverified change of
+the session for a benefit that 200c says is conditional. The list is the deliverable; the edits
+wait for a compiler and a caller-level answer.
