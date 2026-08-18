@@ -5231,7 +5231,7 @@ pub fn sdpa_backward_f64(
             let vh = &v[bh * vs..bh * vs + vs];
             let doh = &dout[bh * os..bh * os + os];
             // P = softmax(scale·Q@Kᵀ) row-wise.  [seq_q, seq_k]
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction
@@ -5275,7 +5275,7 @@ pub fn sdpa_backward_f64(
                 }
             }
             // dP = dOut @ Vᵀ  [seq_q, seq_k]
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction
@@ -5356,7 +5356,7 @@ pub fn sdpa_backward_masked_f64(
             let doh = &dout[bh * os..bh * os + os];
             let mask_base = bh * mask_bh_stride;
             // P = softmax(scale·Q@Kᵀ + mask) row-wise.  [seq_q, seq_k]
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction
@@ -5397,7 +5397,7 @@ pub fn sdpa_backward_masked_f64(
                 }
             }
             // dP = dOut @ Vᵀ; dU = P ⊙ (dP − rowsum(P⊙dP)); dV/dQ/dK — same as unmasked.
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction
@@ -5469,7 +5469,7 @@ pub fn sdpa_backward_f32(
             let kh = &k[bh * ks..bh * ks + ks];
             let vh = &v[bh * vs..bh * vs + vs];
             let doh = &dout[bh * os..bh * os + os];
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction
@@ -5512,7 +5512,7 @@ pub fn sdpa_backward_f32(
                     *s = 0.0;
                 }
             }
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction
@@ -5590,7 +5590,7 @@ pub fn sdpa_backward_f32_unit_dout(
             let kh = &k[bh * ks..bh * ks + ks];
             let vh = &v[bh * vs..bh * vs + vs];
 
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
             //
             // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
             // "this write is dead" is a property of these two statements, not a prediction

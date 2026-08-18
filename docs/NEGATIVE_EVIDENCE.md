@@ -32583,3 +32583,51 @@ null failure and they need separating before any lane blocked on a null is chase
 Everything, still: `cargo build`, `cargo clippy`, `cargo test`, and then the runs. This change is
 worth no more than the others until something compiles it — but unlike the others, what it
 unblocks is the ability to certify, rather than another few hundred microseconds.
+
+## 168. SEVEN MORE DEAD ZERO-FILLS, IN THE SDPA BACKWARDS — THE SAME STRUCTURAL CLAIM, NOT ANOTHER SCHEDULING GUESS
+
+`frankentorch-hi9r6` vein. UNBUILT: /data 27G / 99%, no cargo run.
+
+Following item 166, the same structurally-checkable pattern in `sdpa_backward_f64`,
+`sdpa_backward_masked_f64`, `sdpa_backward_f32` and `sdpa_backward_f32_unit_dout`: a
+`seq_q x seq_k` score buffer allocated zeroed and immediately handed to a `*_bt` GEMM that
+overwrites every element. Seven sites, two buffers each in most (`p`, the scores; `du`, the
+`dO @ V^T` product), now built through `build_uninit`.
+
+### WHY THE CAUSAL MASK DOES NOT COMPLICATE IT
+
+The obvious worry is the masked tail: with `causal`, the softmax below only processes
+`limit = i + 1` entries per row. But the GEMM writes the WHOLE rectangle in both the old and new
+code — the zero-fill never survived it — and the loop then explicitly zeroes the tail:
+
+    for s in row.iter_mut().skip(limit) { *s = 0.0; }
+
+So the tail is written twice today and twice after this change; nothing downstream can observe
+the difference. Checked rather than assumed, because "the mask leaves part of the buffer
+untouched" would have made this unsound.
+
+### SOUNDNESS CITED, NOT RE-DERIVED
+
+Item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass `beta = 0.0` with full coverage
+of C; item 152 found the two ACCUMULATING helpers in this family (`*_sub_into`, `beta = 1.0`)
+and confirmed they are off these paths. Each new site guards `seq_q == 0 || seq_k == 0`, because
+the wrapper returns early on `m == 0 || n == 0` before matrixmultiply's own zero-fill runs.
+
+### A CHECK THAT CAUGHT MY OWN INSTRUMENT, NOT THE CODE
+
+The GEMM no longer takes `&mut p`, so if any buffer were not mutated afterwards its `mut` would
+become an `unused_mut` — a build failure under `-D warnings`, and invisible to `rustfmt`. My
+first scan reported 0 mutations at six of seven sites, which would have meant six stray `mut`s.
+The scan was wrong: its window started at `L+10` and the mutation sits at `L+9`. Re-run with the
+right window, all seven mutate. **Under a freeze the verification tooling is itself unverified,
+and a check that reports a problem deserves the same scepticism as one that reports none.**
+
+### NOT CONVERTED, ON PURPOSE
+
+An eighth site (`sdpa_backward_f32_unit_dout`, the second buffer) is followed by a loop rather
+than a GEMM, so the "wholly overwritten" argument does not transfer and it was left alone.
+
+VERIFIED: `rustfmt --edition 2024 --check` exits 0; mutation-after confirmed at all seven sites;
+causal tail-zeroing read directly. NOT VERIFIED: compilation, tests, timing. No magnitude is
+claimed — `seq_q x seq_k` is the attention score matrix, so the buffers are large at real
+sequence lengths, but nothing here is measured.
