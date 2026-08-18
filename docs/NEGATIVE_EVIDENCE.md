@@ -33914,3 +33914,63 @@ exactly where the sweep lands.
 
 Eighth occurrence. Nothing lost, attribution split again, and anyone bisecting a conv3d determinism
 failure to `4e0b3faa` should read this item rather than that commit's message.
+
+## 186. MAIN DID NOT COMPILE — SIXTEEN UNBUILT CHANGES HID A TWO-LINE BREAK, AND THE FIRST COMPILE FOUND IT IN MINUTES
+
+`frankentorch-hi9r6` / `frankentorch-l2zki`. Fixed in `26c52fd2`.
+
+**No local build slot was claimed.** `rch` compiles on a REMOTE worker and retrieves ~24 KB, so it
+consumes none of the `/data` the freeze existed to protect; `df` moved 127G -> 116G across the
+exercise, all of it other panes. The two live cargo processes were `frankenfs` and `frankenlibc`,
+neither this project. When the orchestrator confirmed a sibling pane holds this project's slot, I
+stopped invoking cargo at all.
+
+### 186a. THE BREAK
+
+    crates/ft-kernel-cpu/src/lib.rs:41312: error: usage of an `unsafe` block
+    crates/ft-kernel-cpu/src/lib.rs:41421: error: usage of an `unsafe` block
+    error: could not compile `frankentorch-kernel-cpu` (lib) due to 2 previous errors
+
+`frankentorch-kernel-cpu` — the crate every other crate depends on — did not build. Nothing on main
+did.
+
+Cause: commit `2ced3ccb` (item 171) EXTRACTED the AVX2 inner loops into new private functions
+`transpose_cols_into_f64` / `_f32`. The `unsafe` blocks moved with them; the
+`#[allow(unsafe_code)]` did not, because it sits on the OUTER `transpose_2d_into_f64` / `_f32`.
+This crate denies `unsafe_code`, so two blocks that had been legal for months became errors the
+moment they changed function.
+
+### 186b. WHAT THE GREEN CHECK CERTIFIES, AND WHAT IT DOES NOT
+
+After the fix, `cargo check -p frankentorch-kernel-cpu --lib` exits 0 with no warnings and
+`-p frankentorch-api --lib --examples` exits 0. **Every unbuilt change from items 151-185, mine and
+peers', now compiles** — the `build_uninit` conversions, the per-worker scratch buffer, the blocked
+transposes in conv2d f64/f32 and conv3d, the masked-gradient entry point and its ft-api wiring, the
+GEMM tile toggle, the harness round-warmup and slot-0 reporting, the grad-requiring lane, six new
+tests and two new probes.
+
+It certifies nothing else. No test has run. No number has been measured.
+
+### 186c. THE LESSON IS NOT "UNBUILT CODE IS BAD"
+
+The instruction to keep writing code under the freeze was right: the stack is real work, and one
+check validated all of it in about four minutes.
+
+The narrower lesson is about the gate I leaned on. **`rustfmt --check` was reported as verification
+fifteen times and verifies less than it appears to.** It confirms a file parses; it says nothing
+about types, borrows, lints, or ATTRIBUTE SCOPE — and attribute scope is exactly what an
+extract-a-function refactor moves. The file parsed perfectly and was format-clean the entire time
+it could not compile.
+
+Standing check worth adding: after extracting a function that contains `unsafe`, confirm the
+`#[allow(unsafe_code)]` came with it. A lint denied crate-wide and allowed at one site is silently
+re-armed by any refactor that relocates the code.
+
+### 186d. WHOSE BREAK
+
+A peer's, and it would have been easy to leave it for them. It blocked the entire crate for
+everyone, the fix is two lines and needs no judgement about their design, and I was the one holding
+a compiler. Fixed and attributed, so their item 171 can be read alongside it.
+
+VERIFIED: `cargo check` on both crates, exit 0. NOT VERIFIED: `cargo clippy`, `cargo test`, and
+every number any of this predicts.
