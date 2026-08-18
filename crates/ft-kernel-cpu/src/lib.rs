@@ -9515,6 +9515,59 @@ pub fn conv2d_backward_f64(
     (dpadded, dweight, dbias)
 }
 
+/// `dpadded` for the height-1 all-ones-`dout` adjoint: `[batch, in_ch, 1, pw]`.
+///
+/// THE OBSERVATION, WHICH NEEDS NO ORDERING ARGUMENT AT ALL. The scatter it replaces accumulated
+/// into a zeroed plane using `dpanel_row[c*kw + kc]` and an index `ox*sw + kc` — neither of which
+/// mentions the batch. Every plane of a given channel therefore received the IDENTICAL sequence of
+/// additions into an identical zeroed buffer, so the `batch` planes of a channel were already
+/// bit-identical to each other; the old code just computed each of them separately. This runs the
+/// same loop, unchanged, ONCE per channel and copies. `batch` times less accumulation, and the
+/// bit-exactness is by CONSTRUCTION rather than by an argument about summation order — the loop is
+/// the same loop, on the same zeroed buffer, in the same order.
+///
+/// This is the height-1 sibling of item 174's 3x3 collapse and deliberately does NOT reuse its
+/// tap-mask table: `kw` is unbounded on this route, so a `2^kw` table does not generalise. The
+/// prototype-and-broadcast decomposition does, and it is simpler — it needs no claim about the
+/// order contributions arrive in, because it does not reorder them.
+///
+/// `protos` STAYS ZERO-FILLED, unlike the output. The accumulation reads what it adds into, and
+/// when the taps do not tile the plane — `sw` LARGER THAN `kw` leaves interior gaps, and a `pw`
+/// longer than the last tap reaches leaves a tail — those positions are never written and must
+/// remain `+0.0`. (`sw` above 1 is not by itself enough: `sw == kw` tiles exactly.) Only the broadcast target is
+/// built uninitialised, because only it is wholly overwritten: `copy_from_slice` covers every
+/// element of every plane.
+fn conv2d_ones_dout_height1_dpadded_f64(
+    dpanel_row: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pw: usize,
+    kw: usize,
+    ow: usize,
+    sw: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    if pw == 0 || in_ch == 0 || batch == 0 {
+        return Vec::new();
+    }
+    let mut protos = vec![0.0f64; in_ch * pw];
+    protos.par_chunks_mut(pw).enumerate().for_each(|(c, dp)| {
+        let row = &dpanel_row[c * kw..(c + 1) * kw];
+        for ox in 0..ow {
+            let base = ox * sw;
+            for kc in 0..kw {
+                dp[base + kc] += row[kc];
+            }
+        }
+    });
+    build_uninit(batch * in_ch * pw, |d: &mut [f64]| {
+        d.par_chunks_mut(pw).enumerate().for_each(|(plane, dp)| {
+            let c = plane % in_ch;
+            dp.copy_from_slice(&protos[c * pw..(c + 1) * pw]);
+        });
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 fn conv2d_backward_height1_ones_dout_f64(
@@ -9603,20 +9656,7 @@ fn conv2d_backward_height1_ones_dout_f64(
         &mut dpanel_row,
     );
 
-    let mut dpadded = vec![0.0f64; batch * in_ch * pw];
-    dpadded
-        .par_chunks_mut(pw)
-        .enumerate()
-        .for_each(|(plane, dp)| {
-            let c = plane % in_ch;
-            let row = &dpanel_row[c * kw..(c + 1) * kw];
-            for ox in 0..ow {
-                let base = ox * sw;
-                for kc in 0..kw {
-                    dp[base + kc] += row[kc];
-                }
-            }
-        });
+    let dpadded = conv2d_ones_dout_height1_dpadded_f64(&dpanel_row, batch, in_ch, pw, kw, ow, sw);
 
     let dbias = if has_bias {
         Some(vec![flat as f64; out_ch])
@@ -64167,6 +64207,99 @@ mod tests {
                 super::conv2d_ones_dout_tap_mask(out_dim + k - 1, out_dim, k),
                 0
             );
+        }
+    }
+
+    /// The height-1 all-ones-`dout` adjoint's `dpadded`, computed once per channel and broadcast,
+    /// must equal the per-plane accumulation it replaces BIT FOR BIT.
+    ///
+    /// The reference is a literal transcription of the loop that shipped, run independently on
+    /// every plane exactly as the old code did — so this checks the claim that the `batch` planes
+    /// of a channel were already identical, rather than assuming it.
+    #[test]
+    fn conv2d_height1_ones_dout_dpadded_matches_per_plane_accumulation_bitwise() {
+        for &(batch, in_ch, pw, kw, ow, sw) in &[
+            (2usize, 3usize, 10usize, 3usize, 8usize, 1usize),
+            // sw above 1: interior positions that no tap reaches and must stay +0.0.
+            (3, 2, 9, 3, 3, 3),
+            (1, 1, 5, 5, 1, 1),
+            // pw longer than the last tap reaches: a trailing run never written.
+            (2, 2, 7, 2, 3, 2),
+            (4, 3, 12, 4, 5, 2),
+        ] {
+            // Last channel's taps are all -0.0, so every position it touches is `0.0 + -0.0`,
+            // which is +0.0. A prototype built uninitialised, or a first term assigned rather
+            // than added, would leave -0.0 and only this fixture would catch it.
+            let neg_zero_ch = in_ch - 1;
+            let dpanel_row: Vec<f64> = (0..in_ch * kw)
+                .map(|i| {
+                    if i / kw == neg_zero_ch {
+                        -0.0
+                    } else {
+                        ((i % 13) as f64) * 0.25 - 1.5
+                    }
+                })
+                .collect();
+
+            let mut want = vec![0.0f64; batch * in_ch * pw];
+            for (plane, dp) in want.chunks_mut(pw).enumerate() {
+                let c = plane % in_ch;
+                let row = &dpanel_row[c * kw..(c + 1) * kw];
+                for ox in 0..ow {
+                    let base = ox * sw;
+                    for kc in 0..kw {
+                        dp[base + kc] += row[kc];
+                    }
+                }
+            }
+
+            let got = super::conv2d_ones_dout_height1_dpadded_f64(
+                &dpanel_row,
+                batch,
+                in_ch,
+                pw,
+                kw,
+                ow,
+                sw,
+            );
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "element {i} differs at batch={batch} in_ch={in_ch} pw={pw} kw={kw} \
+                     ow={ow} sw={sw}: got {g} want {w}"
+                );
+            }
+
+            // Every element of the all-(-0.0) channel must be POSITIVE zero, touched or not.
+            for (plane, gp) in got.chunks(pw).enumerate() {
+                if plane % in_ch != neg_zero_ch {
+                    continue;
+                }
+                for (i, v) in gp.iter().enumerate() {
+                    assert_eq!(
+                        v.to_bits(),
+                        0.0f64.to_bits(),
+                        "all-(-0.0) channel produced a NEGATIVE zero at plane {plane} element \
+                         {i} (pw={pw} kw={kw} ow={ow} sw={sw})"
+                    );
+                }
+            }
+
+            // And the claim the collapse rests on, stated directly: the planes of one channel were
+            // already identical to each other in the OLD computation.
+            for (plane, wp) in want.chunks(pw).enumerate() {
+                let first = &want[(plane % in_ch) * pw..(plane % in_ch + 1) * pw];
+                for (a, b) in wp.iter().zip(first) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "the per-plane accumulation was NOT batch-invariant at plane {plane}; \
+                         the prototype-and-broadcast collapse is only valid because it is"
+                    );
+                }
+            }
         }
     }
 }

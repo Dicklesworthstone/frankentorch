@@ -33167,3 +33167,83 @@ and 165. Extending it is cheap and is left as owed rather than done blind, since
 multiplies a test that is already deliberately expensive.
 
 NOT VERIFIED: compilation, and this test has never run.
+
+## 176. THE HEIGHT-1 ADJOINT COMPUTED THE SAME PLANE `batch` TIMES — AND THE FIX NEEDS NO ORDERING ARGUMENT, WHICH MAKES ITEM 174'S LOOK OVERBUILT
+
+`frankentorch-hi9r6`. **UNBUILT AND UNMEASURED.** Build freeze — `/data` 27G, 99% used, loadavg
+5.44/8.09/7.95 on the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 176a. THE OBSERVATION
+
+Item 174 deferred this route with a reason: `kw` is unbounded on the height-1 path, so the `2^kw`
+tap-mask table does not generalise. That reason was correct and the conclusion was lazy — there is
+a decomposition that needs no table at all.
+
+The scatter accumulated into a zeroed plane using `dpanel_row[c*kw + kc]` at index `ox*sw + kc`.
+**Neither mentions the batch.** Every plane of a given channel therefore received the identical
+sequence of additions into an identical zeroed buffer, so the `batch` planes of a channel were
+already bit-identical to one another — the old code simply computed each of them from scratch.
+
+Running the same loop once per CHANNEL and copying gives `batch` times less accumulation:
+
+    old : batch * in_ch * ow * kw  read-modify-writes
+    new :         in_ch * ow * kw  read-modify-writes  +  batch * in_ch * pw  copies
+
+and the copies are the output size, which is the floor for any implementation.
+
+### 176b. WHY THIS IS A BETTER SHAPE OF ARGUMENT THAN ITEM 174's
+
+Item 174 reordered the arithmetic and had to prove the new order matched the old one — contributions
+arriving sorted by `(y - kr, x - kc)` ascending, a `0.0 +` start to preserve signed zeros, and a
+Python transcription to check the claim. All of that was necessary there and all of it is a
+liability: it is bit-exact BY ARGUMENT, and arguments are where item 164's mistake lived.
+
+This one does not reorder anything. It runs the same loop, on the same zeroed buffer, in the same
+order, and copies the result — bit-exact BY CONSTRUCTION. **Given the choice, prefer the collapse
+that removes redundant work over the one that removes work by rearranging it.**
+
+That also flags something about item 174 worth writing down rather than quietly fixing: the 3x3
+route has this same redundancy. Its planes are per-channel too, so it could have been
+prototype-and-broadcast without the tap-mask table, and the table would then only be needed once
+per channel instead of once per plane. Item 174's collapse is real and correct, but it solved the
+harder problem first and left the easier one underneath it untouched. Taken next, as its own row
+on its own route.
+
+### 176c. WHAT `protos` MUST NOT BE
+
+`protos` stays `vec![0.0; ..]` while the broadcast target is `build_uninit`. That asymmetry is the
+whole soundness argument and is easy to get wrong in the direction that looks tidier: the
+accumulation READS what it adds into, and when the taps do not tile the plane — `sw` larger than
+`kw` leaves interior gaps, a `pw` longer than the last tap leaves a tail — those positions are
+never written and must remain `+0.0`. Only the broadcast target is wholly overwritten, because
+`copy_from_slice` covers every element of every plane.
+
+Note `sw` above 1 is NOT by itself enough to leave gaps: `sw == kw` tiles exactly. I had written
+the looser claim in the comment first and corrected it after the shapes below showed
+`(sw, kw) = (3, 3)` leaving zero untouched slots.
+
+### 176d. WHAT WAS CHECKED WITHOUT A COMPILER
+
+Both forms transcribed to Python and compared by bit pattern over five shapes, alongside the three
+properties the collapse actually depends on:
+
+    (b,ic,pw,kw,ow,sw)     inbounds  identical  batch_invariant  pos_zero  untouched_slots
+    (2,3,10,3,8,1)         True      True       True             True      0
+    (3,2,9,3,3,3)          True      True       True             True      0
+    (1,1,5,5,1,1)          True      True       True             True      0
+    (2,2,7,2,3,2)          True      True       True             True      1
+    (4,3,12,4,5,2)         True      True       True             True      0
+
+`batch_invariant` is the interesting column: it is the licence for the whole change, so the shipped
+test asserts it on the REFERENCE computation rather than taking it as given.
+
+### 176e. WHAT IS NOT CLAIMED
+
+No standing exists for this route. The 1.7-2.1x figure item 128 recorded is the 3x3/summed route,
+not this one; this is the height-1 (conv1d-shaped) sibling and nothing has ever measured it. The
+justification here is an operation count — `batch` times less accumulation, read off the source —
+and explicitly not a predicted speedup.
+
+Owed: build, run `conv2d_height1_ones_dout_dpadded_matches_per_plane_accumulation_bitwise` and the
+existing `conv2d_height1_ones_dout_backward_matches_generic_reference`, then find out whether this
+route is on any measured lane at all before spending more on it.
