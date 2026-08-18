@@ -35136,6 +35136,24 @@ Among the 28: `functional_linear`, `functional_group_norm`, `tensor_scaled_dot_p
 `tensor_prelu`, `functional_conv_transpose2d`, `functional_conv2d_grouped`, `tensor_einsum`,
 `tensor_addbmm`, `tensor_index_add`, `tensor_put`.
 
+**CORRECTION (same session, before anyone ranked work off this list).** The COUNT above is
+structural — it comes from walking closure boundaries and matching returns — and it stands. **The
+NAMES do not.** They were attributed by walking backwards to the nearest preceding
+`pub fn tensor_*`/`functional_*`, and that heuristic is unreliable at distance:
+
+    closures flagged                                   28
+    of which a name was found at all                   25
+    of those, attributed from >150 lines away          14   <- roughly half, unreliable
+
+`tensor_sum` is the tell that prompted the check: sum takes ONE input and cannot return two
+gradients, and its two attributions sit 73 and 203 lines from the closure. A closure 200-390 lines
+below a `pub fn` is as likely to belong to some later op that the regex never saw.
+
+So: **28 sites exist, and the op list is a hint rather than an inventory.** Anyone working this
+vein should re-derive the owning function properly — by brace-matching the enclosing `impl` method
+rather than by proximity — before picking a target. Item 200c's ranking rule (prefer sites whose
+REAL callers freeze an input) needs correct names to be applied at all.
+
 **conv2d and conv3d are absent from the list**, which is the check that the classifier works: the
 two sites items 178 and 195 fixed no longer match the pattern that found them.
 
