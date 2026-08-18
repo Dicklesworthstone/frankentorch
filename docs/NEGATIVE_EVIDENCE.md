@@ -31562,3 +31562,56 @@ modest, checkable claim, and three things would refute it:
 The third is the one to watch: `dgemm` writes `dpanel` in blocked/tiled order, not sequentially, and
 `project_outer_gate_serial_vein` records that this vein pays for SEQUENTIAL writes specifically.
 A tiled first-touch is exactly the case that has underdelivered before.
+
+## 152. THE f32 CONV BACKWARDS STOP ZEROING TWO 9 MB BUFFERS THE GEMM OVERWRITES — AND THE beta CHECK FOUND TWO ACCUMULATING PATHS THAT HAD TO BE EXCLUDED
+
+`frankentorch-hi9r6`. UNBUILT: /data at 31G / 99% under a build freeze, so no cargo ran. What
+could be checked without a compiler was; the rest is labelled as owed.
+
+`bf5af229` removed the dead 18.9 MB zero-fill from `conv2d_backward_f64`'s `dpanel`. The same
+dead pass is in both f32 conv backwards, on buffers half the size:
+
+    conv2d_backward_f32   dpanel  vec![0.0f32; flat * patch_width]  -> build_uninit
+    conv3d_backward_f32   dpanel  same
+
+`sgemm` overwrites every element of C immediately afterwards, so the zeroing is pure waste — one
+pass over the buffer instead of two, with the parallel GEMM store also doing the page
+first-touch.
+
+### THE beta CHECK IS THE PART WORTH KEEPING
+
+The `build_uninit` contract is "write every element, read none first", so it is only sound if the
+GEMM OVERWRITES rather than accumulates. Checked by mapping every `sgemm_mm` call site in the
+module to its enclosing function and its beta:
+
+    sgemm_block_scaled          beta = 0.0     on the sgemm path
+    sgemm_col_parallel_scaled   beta = 0.0     on the sgemm path
+    sgemm_2d_parallel_scaled    beta = 0.0     on the sgemm path
+    sgemm_tb_scaled             beta = 0.0
+    sgemm_sub_into              beta = 1.0     ACCUMULATES — not on this path
+    sgemm_bt_sub_into           beta = 1.0     ACCUMULATES — not on this path
+
+Two accumulating call sites exist in this module. They are named `*_sub_into` and are not
+reachable from `gemm::sgemm`, but they had to be found and excluded rather than assumed away:
+had one been on the path, dropping the zero-fill would have made the GEMM READ uninitialized
+memory and produce a WRONG ANSWER silently, not fail to compile.
+
+### A GUARD THE f64 VERSION'S REASONING DOES NOT COVER
+
+`bf5af229` argued the contract holds on every path including degenerate `k == 0`, citing
+matrixmultiply's `c_to_beta_c`. That is true of matrixmultiply — but **our wrapper never reaches
+it**: `gemm::sgemm` (like `dgemm`) returns EARLY on `m == 0 || n == 0`, writing nothing. On a
+degenerate shape the buffer would be handed back uninitialized. Both new sites therefore carry an
+explicit `if flat == 0 || patch_width == 0 { fill(0.0); return; }`, matching the guard
+`conv3d_backward_generic_f64` already uses. Worth flagging for the f64 site too, which relies on
+the dependency's behaviour for a case its own wrapper intercepts first.
+
+### WHAT IS AND IS NOT VERIFIED
+
+VERIFIED WITHOUT CARGO: `rustfmt --edition 2024 --check` exits 0 — parses, format-clean. The
+downstream use is `&dpanel` at both sites, so the binding losing `mut` is consistent.
+
+NOT VERIFIED: compilation, tests, and any timing. Owed when the freeze lifts —
+`cargo test -p frankentorch-kernel-cpu --lib`, then a paired measurement. **The f64 magnitude
+(1.072 ms of a 16.6 ms backward) is NOT claimed here**: these buffers are half the size, and
+there is still no f32 conv h2h lane, so even a real gain has no incumbent arm to certify against.

@@ -8090,15 +8090,38 @@ pub fn conv2d_backward_f32(
     // BIT-EXACT WITHOUT AN ARGUMENT: a LIFETIME changes, not an operation. Nothing is
     // reordered, recomputed, or read after this point.
     drop(panel);
-    let mut dpanel = vec![0.0f32; flat * patch_width];
-    gemm::sgemm(
-        flat,
-        out_ch,
-        patch_width,
-        &dout_flat,
-        weight_flat,
-        &mut dpanel,
-    );
+    // STOP ZEROING A BUFFER THE GEMM OVERWRITES — `frankentorch-hi9r6`, item 152.
+    //
+    // UNBUILT: written under a build freeze (/data 31G, 99%), so this is NOT compiled, tested
+    // or measured. Committed to be priced when the volume frees. The f64 sibling of this exact
+    // change is `bf5af229`; item 141 timed the f64 dpanel's alloc+zero at 1.072 ms of a 16.6 ms
+    // backward. This buffer is HALF that (f32), so expect proportionally less — the number is
+    // not claimed for this path.
+    //
+    // WHY THE `build_uninit` CONTRACT HOLDS FOR THE f32 GEMMs, VERIFIED NOT ASSUMED. The
+    // contract is that `fill` writes every element and reads none first. Every `sgemm_mm` call
+    // reachable from `gemm::sgemm` passes **beta = 0.0** — `sgemm_block_scaled`,
+    // `sgemm_col_parallel_scaled` and `sgemm_2d_parallel_scaled` all do — so C is overwritten,
+    // never accumulated into. The two accumulating call sites in this module,
+    // `sgemm_sub_into` and `sgemm_bt_sub_into`, pass beta = 1.0 and are NOT on this path; they
+    // were checked precisely because an accumulating path would have made this a silent
+    // wrong-answer bug (it would READ uninitialized memory) rather than a compile error.
+    //
+    // THE GUARD IS LOAD-BEARING. `gemm::sgemm` returns EARLY on `m == 0 || n == 0`, before
+    // reaching matrixmultiply — so on a degenerate shape it writes nothing and would leave the
+    // buffer uninitialized. matrixmultiply's own `c_to_beta_c` would have handled it; our
+    // wrapper never gets there. Hence the explicit zero-fill below, matching the guard
+    // `conv3d_backward_generic_f64` already uses on the same pattern.
+    //
+    // BIT-EXACT: allocation changes, computation does not. The GEMM performs the same stores in
+    // the same order; only the dead pass before it is gone.
+    let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
+        if flat == 0 || patch_width == 0 {
+            dpanel.fill(0.0);
+            return;
+        }
+        gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+    });
     let dpadded = conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     let dbias = if has_bias {
         let mut db = vec![0.0f32; out_ch];
@@ -13902,15 +13925,38 @@ pub fn conv3d_backward_f32(
     // BIT-EXACT WITHOUT AN ARGUMENT: a LIFETIME changes, not an operation. Nothing is
     // reordered, recomputed, or read after this point.
     drop(panel);
-    let mut dpanel = vec![0.0f32; flat * patch_width];
-    gemm::sgemm(
-        flat,
-        out_ch,
-        patch_width,
-        &dout_flat,
-        weight_flat,
-        &mut dpanel,
-    );
+    // STOP ZEROING A BUFFER THE GEMM OVERWRITES — `frankentorch-hi9r6`, item 152.
+    //
+    // UNBUILT: written under a build freeze (/data 31G, 99%), so this is NOT compiled, tested
+    // or measured. Committed to be priced when the volume frees. The f64 sibling of this exact
+    // change is `bf5af229`; item 141 timed the f64 dpanel's alloc+zero at 1.072 ms of a 16.6 ms
+    // backward. This buffer is HALF that (f32), so expect proportionally less — the number is
+    // not claimed for this path.
+    //
+    // WHY THE `build_uninit` CONTRACT HOLDS FOR THE f32 GEMMs, VERIFIED NOT ASSUMED. The
+    // contract is that `fill` writes every element and reads none first. Every `sgemm_mm` call
+    // reachable from `gemm::sgemm` passes **beta = 0.0** — `sgemm_block_scaled`,
+    // `sgemm_col_parallel_scaled` and `sgemm_2d_parallel_scaled` all do — so C is overwritten,
+    // never accumulated into. The two accumulating call sites in this module,
+    // `sgemm_sub_into` and `sgemm_bt_sub_into`, pass beta = 1.0 and are NOT on this path; they
+    // were checked precisely because an accumulating path would have made this a silent
+    // wrong-answer bug (it would READ uninitialized memory) rather than a compile error.
+    //
+    // THE GUARD IS LOAD-BEARING. `gemm::sgemm` returns EARLY on `m == 0 || n == 0`, before
+    // reaching matrixmultiply — so on a degenerate shape it writes nothing and would leave the
+    // buffer uninitialized. matrixmultiply's own `c_to_beta_c` would have handled it; our
+    // wrapper never gets there. Hence the explicit zero-fill below, matching the guard
+    // `conv3d_backward_generic_f64` already uses on the same pattern.
+    //
+    // BIT-EXACT: allocation changes, computation does not. The GEMM performs the same stores in
+    // the same order; only the dead pass before it is gone.
+    let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
+        if flat == 0 || patch_width == 0 {
+            dpanel.fill(0.0);
+            return;
+        }
+        gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+    });
     let dpadded = conv3d_col2im_f32(
         &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
