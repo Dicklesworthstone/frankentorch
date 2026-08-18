@@ -33012,3 +33012,104 @@ different pool width — **maintenance**, in the standing orders' sense, and no 
 live same-invocation PyTorch arm that any standing needs.
 
 NOT VERIFIED: compilation, execution, and every number this file would print.
+
+## 174. THE ALL-ONES conv2d ADJOINT SCATTERED THE SAME 9 NUMBERS 2.36 MILLION TIMES TO FILL 296 THOUSAND SLOTS — AND THE GATHER I EXPECTED TO BE THE TWIN DEFECT IS CLEAN
+
+`frankentorch-hi9r6`, second target. **UNBUILT AND UNMEASURED.** Build freeze — `/data` 27G, 99%
+used, loadavg 6.41/5.96/7.19 on the 64-core box — no cargo ran. `rustfmt --edition 2024 --check`
+exits 0.
+
+### 174a. WHERE I EXPECTED THE DEFECT, AND WHY THAT WAS WRONG
+
+The summed route stands at **1.7-2.1x slower than PyTorch** despite having a dedicated all-ones
+adjoint, which item 128 flagged and nothing has probed. My first hypothesis was that the backward's
+`dout_flat` gather is the twin of the per-channel re-stream item 158 fixed in the forward: it reads
+`dout[(n*out_ch + oc)*patch_count + p]` across `oc`, a stride of `patch_count` f64 = 8 KiB, one
+element per cache line.
+
+**It is clean, and the stride is not what decides that.** The reuse dimension is `p`, and `p` is
+the dimension being chunked, so eight consecutive rows share every line they touch:
+
+    lines touched per row : 32 (one per oc)          bytes fetched  : 2048 B  -> fits L1
+    rows served per fetch : 8 (8 p-values per line)  bytes delivered: 2048 B
+    read amplification    : 1.00x
+
+The forward's defect was never "strided reads"; it was that the CHANNEL loop was outermost, so the
+reuse dimension was the one being parallelised over and each thread walked the whole buffer. Same
+stride, opposite verdict. **Recorded so that nobody — including me next week — "fixes" this gather.**
+A stride is not a defect until you say which loop is outside it.
+
+### 174b. THE REAL ONE, WHICH IS ARITHMETIC AND NOT LAYOUT
+
+With an all-ones `dout` every row of the dpanel GEMM is the SAME row — that identity is the entire
+reason the fast path exists, and both halves of the adjoint already use it: `dweight` is one
+column-sum broadcast to `out_ch` rows, `dpanel_row` is one `dgemm(1, out_ch, patch_width)` row.
+
+The scatter then threw the identity away. `dpanel_row` does not depend on `(n, pc)`, so the value
+landing at `(y, x)` depends only on WHICH of the 9 taps reach it — never on which output position
+sent it. The old loop did not use that. It walked all `patch_count` positions doing `kh*kw`
+read-modify-writes each:
+
+    per plane, old : oh*ow*kh*kw = 32*32*9 = 9216 read-modify-writes
+    per plane, new : ph*pw       = 34*34   = 1156 writes
+    whole buffer   : 2,359,296 RMW  ->  295,936 writes      (7.97x fewer, and each RMW was 2 ops)
+
+The interior — all 9 taps reaching, 78% of a plane at the scored shape — is ONE CONSTANT per
+channel. Every element is now written exactly once from an 8x8 table keyed on the two tap masks,
+which also makes the `vec![0.0; ..]` it used to accumulate into dead, so the 2.37 MB buffer is
+built uninitialised. Those two are inseparable here: the fill is only dead BECAUSE every element
+is now written.
+
+The masks also handle `oh < ph - kh + 1` — rows no tap reaches stay `0.0` — without the shape
+assumption the old in-bounds indexing quietly relied on.
+
+**This is an operation count, not a speedup.** 7.97x fewer memory operations is countable from the
+source; what it is worth in wall clock is not, and nothing was built. Item 164's rule applies.
+
+### 174c. THE ORDER IS THE WHOLE CORRECTNESS ARGUMENT
+
+The old loop visited `pc` ascending and added into `(pc/ow + kr, pc%ow + kc)`. For a fixed output
+element the contributions therefore arrived sorted by `(y - kr, x - kc)` ascending — `kr`
+DESCENDING then `kc` DESCENDING. The table reproduces that order exactly.
+
+And the accumulator starts at `0.0` with every term ADDED, never assigned. `dpadded` was zero
+filled and the old code did `+=`, so a first term of `-0.0` produced `0.0 + -0.0 == +0.0`.
+Assigning the first term instead leaves `-0.0`:
+
+    assign-first, all-(-0.0) taps -> bits 0000000000000080   (-0.0)
+    add-into-0.0                  -> bits 0000000000000000   (+0.0)
+
+This is the exact MIRROR of the `folded` flag in the dweight reduction two blocks up, and the pair
+is worth stating together because the rule inverts: **a reduction replacing a GEMM must ASSIGN its
+first block (there is no zero to start from, and `0.0 + -0.0` would canonicalise it); a reduction
+replacing an accumulation into a zeroed buffer must ADD its first term (the zero is real and the
+canonicalisation is the shipped behaviour).** Get them the same way round and one of the two breaks
+on signed zeros. Both traps are in the same 100 lines.
+
+### 174d. WHAT WAS ACTUALLY CHECKED, GIVEN NOTHING COULD BE BUILT
+
+Both algorithms were transcribed into Python — IEEE f64, same `+`, same order — and compared by
+BIT PATTERN across six shapes including the scored 34x34 and three where `oh < ph-2`:
+
+    (2,3,8,8,6,6) (1,2,5,7,3,5) (2,2,9,9,4,4) (1,1,3,3,1,1) (3,4,6,5,4,3) (2,2,34,34,32,32)
+    ALL SHAPES BIT-IDENTICAL: True
+
+That is not a substitute for running the Rust — the two could differ in ways a transcription
+reproduces faithfully — but it does check the part I would otherwise only have argued: the tap
+masks, the descending order, and the signed-zero start.
+
+The shipped test is differential against a LITERAL transcription of the loop that shipped, not
+against a restatement of the new one's reasoning, and asserts the signed-zero property separately
+so it survives the reference being "simplified" later.
+
+### 174e. OWED
+
+Build; run `conv2d_ones_dout_scatter_matches_the_accumulate_scatter_bitwise` and
+`conv2d_ones_dout_tap_mask_marks_exactly_the_reaching_taps`; confirm the existing
+`conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference` still passes (it is the real
+guarantee — this only replaces one phase of the route it checks); then a live vs-PyTorch arm on the
+summed route, which is where the 1.7-2.1x lives.
+
+NOT done, and deliberately: the `height1` all-ones adjoint has the same scatter shape but `kw` is
+unbounded there, so a `2^kw` table does not generalise and it needs a different decomposition. One
+lever per route.

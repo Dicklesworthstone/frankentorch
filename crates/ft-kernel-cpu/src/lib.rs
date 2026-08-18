@@ -9626,6 +9626,114 @@ fn conv2d_backward_height1_ones_dout_f64(
     (dpadded, dweight, dbias)
 }
 
+/// Which of the `k` taps reach output coordinate `y`: bit `kk` is set iff `0 <= y - kk < out_dim`.
+///
+/// This is the ONLY thing the scattered value depends on once `dout` is all ones — see
+/// [`conv2d_ones_dout_scatter_dpadded_f64`].
+#[inline]
+fn conv2d_ones_dout_tap_mask(y: usize, out_dim: usize, k: usize) -> usize {
+    let mut mask = 0usize;
+    for kk in 0..k {
+        if kk <= y && y - kk < out_dim {
+            mask |= 1 << kk;
+        }
+    }
+    mask
+}
+
+/// `dpadded` for the 3x3 stride-1 all-ones-`dout` adjoint: `[batch, in_ch, ph, pw]`.
+///
+/// WHAT COLLAPSES, AND WHY ONLY HERE. With an all-ones `dout` every row of the dpanel GEMM is the
+/// SAME row — that identity is the reason this fast path exists at all — so `dpanel_row` does not
+/// depend on `(n, pc)`. The value landing at `(y, x)` therefore depends only on WHICH `(kr, kc)`
+/// taps reach it and never on which output position sent it. The old loop did not use that: it
+/// walked all `patch_count` positions and did `kh * kw` read-modify-writes each, ~8 per element of
+/// a plane it touched 9216 times to fill 1156 slots. Here each element is written exactly ONCE
+/// from a table keyed on the two tap masks — and since every element is now written, the
+/// `vec![0.0; ..]` it used to accumulate into is dead and the buffer is built uninitialised.
+///
+/// The interior — where all 9 taps reach, 78% of a plane at the scored shape — is one constant per
+/// channel. The masks make that fall out rather than being special-cased, and they also handle
+/// `oh < ph - kh + 1` (rows no tap reaches stay `0.0`) without the shape assumption the old
+/// in-bounds indexing quietly relied on.
+///
+/// BIT-EXACT, and the ORDER is the delicate part. The old loop visited `pc` ASCENDING and added
+/// `dpanel_row[pch + kr*kw + kc]` into `(pc/ow + kr, pc%ow + kc)`. For a fixed output element the
+/// contributions therefore arrived sorted by `(y - kr, x - kc)` ascending — that is, `kr`
+/// DESCENDING then `kc` DESCENDING, which is the order the accumulation below reproduces.
+///
+/// The accumulator starts at `0.0` and every term is ADDED, never assigned to. That is not
+/// stylistic. `dpadded` was zero-filled and the old code did `+=`, so a first term of `-0.0` gave
+/// `0.0 + -0.0 == +0.0`; assigning the first term instead would leave `-0.0` and break
+/// bit-exactness on signed zeros. It is the MIRROR of the `folded` flag in the dweight reduction
+/// above, which exists for the opposite reason — that one replaces a GEMM, which has no zero to
+/// start from, so there the first block must be assigned and here it must not be.
+///
+/// Memoised on the tap MASKS, not on `(y, x)`: at most `2^kh * 2^kw` combinations per channel,
+/// each built by the same expression in the same order, so equal masks give equal bits by
+/// construction rather than by an argument about two loops agreeing.
+fn conv2d_ones_dout_scatter_dpadded_f64(
+    dpanel_row: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f64> {
+    const KH: usize = 3;
+    const KW: usize = 3;
+    build_uninit(batch * in_ch * ph * pw, |d: &mut [f64]| {
+        if ph * pw == 0 {
+            return;
+        }
+        // Depend only on the geometry, so they are shared by every plane.
+        let rmasks: Vec<usize> = (0..ph)
+            .map(|y| conv2d_ones_dout_tap_mask(y, oh, KH))
+            .collect();
+        let cmasks: Vec<usize> = (0..pw)
+            .map(|x| conv2d_ones_dout_tap_mask(x, ow, KW))
+            .collect();
+        // One table per CHANNEL (not per plane): the `batch` planes of a channel share it.
+        let tables: Vec<[[f64; 1 << KW]; 1 << KH]> = (0..in_ch)
+            .map(|c| {
+                let pch = c * KH * KW;
+                let mut table = [[0.0f64; 1 << KW]; 1 << KH];
+                for (rm, row) in table.iter_mut().enumerate() {
+                    for (cm, slot) in row.iter_mut().enumerate() {
+                        let mut acc = 0.0f64;
+                        for kr in (0..KH).rev() {
+                            if rm & (1 << kr) == 0 {
+                                continue;
+                            }
+                            for kc in (0..KW).rev() {
+                                if cm & (1 << kc) == 0 {
+                                    continue;
+                                }
+                                acc += dpanel_row[pch + kr * KW + kc];
+                            }
+                        }
+                        *slot = acc;
+                    }
+                }
+                table
+            })
+            .collect();
+        use rayon::prelude::*;
+        d.par_chunks_mut(ph * pw)
+            .enumerate()
+            .for_each(|(plane, dp)| {
+                let table = &tables[plane % in_ch];
+                for (y, rm) in rmasks.iter().enumerate() {
+                    let row = &table[*rm];
+                    for (v, cm) in dp[y * pw..(y + 1) * pw].iter_mut().zip(cmasks.iter()) {
+                        *v = row[*cm];
+                    }
+                }
+            });
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 fn conv2d_backward_3x3_stride1_ones_dout_f64(
@@ -9719,26 +9827,7 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
         &mut dpanel_row,
     );
 
-    let patch_count = oh * ow;
-    let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
-    dpadded
-        .par_chunks_mut(ph * pw)
-        .enumerate()
-        .for_each(|(plane, dp)| {
-            let c = plane % in_ch;
-            let pch = c * kh * kw;
-            for pc in 0..patch_count {
-                let base_h = pc / ow;
-                let base_w = pc % ow;
-                for kr in 0..kh {
-                    let irow = (base_h + kr) * pw + base_w;
-                    let prow_off = pch + kr * kw;
-                    for kc in 0..kw {
-                        dp[irow + kc] += dpanel_row[prow_off + kc];
-                    }
-                }
-            }
-        });
+    let dpadded = conv2d_ones_dout_scatter_dpadded_f64(&dpanel_row, batch, in_ch, ph, pw, oh, ow);
 
     let dbias = if has_bias {
         Some(vec![flat as f64; out_ch])
@@ -63843,6 +63932,125 @@ mod tests {
                 );
             }
             assert_eq!(got32, naive32, "f32 transpose at {rows}x{cols}");
+        }
+    }
+
+    /// The 3x3 all-ones-`dout` adjoint's `dpadded` scatter, rewritten as a mask-table fill, must
+    /// reproduce the old accumulate-scatter BIT FOR BIT — including its signed zeros.
+    ///
+    /// The reference below is a literal transcription of the loop that shipped, so this is a
+    /// differential test against the previous implementation rather than against a restatement of
+    /// the new one's own reasoning.
+    #[test]
+    fn conv2d_ones_dout_scatter_matches_the_accumulate_scatter_bitwise() {
+        for &(batch, in_ch, ph, pw, oh, ow) in &[
+            (2usize, 3usize, 8usize, 8usize, 6usize, 6usize),
+            (1, 2, 5, 7, 3, 5),
+            // oh/ow SHORTER than ph-2 / pw-2: trailing rows and columns that no tap reaches, which
+            // the old in-bounds indexing happened to leave at zero rather than handling on purpose.
+            (2, 2, 9, 9, 4, 4),
+            (1, 1, 3, 3, 1, 1),
+            (3, 4, 6, 5, 4, 3),
+        ] {
+            // The LAST channel's nine taps are all `-0.0`. Every element of its planes is then
+            // `0.0 + -0.0 + ...`, which is `+0.0` — an implementation that assigned the first term
+            // instead of adding it would leave `-0.0` and only this fixture would catch it.
+            let neg_zero_ch = in_ch - 1;
+            let dpanel_row: Vec<f64> = (0..in_ch * 9)
+                .map(|i| {
+                    if i / 9 == neg_zero_ch {
+                        -0.0
+                    } else {
+                        ((i % 17) as f64) * 0.125 - 1.0
+                    }
+                })
+                .collect();
+
+            let plane_len = ph * pw;
+            let (kh, kw) = (3usize, 3usize);
+            let mut want = vec![0.0f64; batch * in_ch * plane_len];
+            for (plane, dp) in want.chunks_mut(plane_len).enumerate() {
+                let c = plane % in_ch;
+                let pch = c * kh * kw;
+                for pc in 0..oh * ow {
+                    let base_h = pc / ow;
+                    let base_w = pc % ow;
+                    for kr in 0..kh {
+                        let irow = (base_h + kr) * pw + base_w;
+                        let prow_off = pch + kr * kw;
+                        for kc in 0..kw {
+                            dp[irow + kc] += dpanel_row[prow_off + kc];
+                        }
+                    }
+                }
+            }
+
+            let got = super::conv2d_ones_dout_scatter_dpadded_f64(
+                &dpanel_row,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                oh,
+                ow,
+            );
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "element {i} differs at batch={batch} in_ch={in_ch} ph={ph} pw={pw} \
+                     oh={oh} ow={ow}: got {g} want {w}"
+                );
+            }
+
+            // And state the signed-zero property directly, so it cannot be lost if the reference
+            // above is ever "simplified" into the same shape as the implementation.
+            for (plane, gp) in got.chunks(plane_len).enumerate() {
+                if plane % in_ch != neg_zero_ch {
+                    continue;
+                }
+                for (i, v) in gp.iter().enumerate() {
+                    assert_eq!(
+                        v.to_bits(),
+                        0.0f64.to_bits(),
+                        "all-(-0.0) channel produced a NEGATIVE zero at plane {plane} element \
+                         {i} (ph={ph} pw={pw} oh={oh} ow={ow}); the accumulation must ADD the \
+                         first tap into 0.0, not assign it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tap mask is the whole correctness argument for the table, so pin it independently.
+    #[test]
+    fn conv2d_ones_dout_tap_mask_marks_exactly_the_reaching_taps() {
+        for &(out_dim, k, ph) in &[(6usize, 3usize, 8usize), (1, 3, 3), (4, 3, 9)] {
+            for y in 0..ph {
+                let mask = super::conv2d_ones_dout_tap_mask(y, out_dim, k);
+                for kk in 0..k {
+                    let reaches = kk <= y && y - kk < out_dim;
+                    assert_eq!(
+                        mask & (1 << kk) != 0,
+                        reaches,
+                        "tap {kk} at y={y} out_dim={out_dim}"
+                    );
+                }
+            }
+            // Interior coordinates see every tap — but only where the output is at least as long
+            // as the kernel; at out_dim=1 the coordinate k-1 is already PAST the last output and
+            // sees exactly one tap, which is why this is guarded rather than asserted outright.
+            if out_dim >= k {
+                assert_eq!(
+                    super::conv2d_ones_dout_tap_mask(k - 1, out_dim, k),
+                    (1 << k) - 1
+                );
+            }
+            assert_eq!(
+                super::conv2d_ones_dout_tap_mask(out_dim + k - 1, out_dim, k),
+                0
+            );
         }
     }
 }
