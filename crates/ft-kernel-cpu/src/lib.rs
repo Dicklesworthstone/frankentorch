@@ -45591,6 +45591,150 @@ mod tests {
         }
     }
 
+    /// frankentorch-hi9r6 item 180: every gradient a MASKED conv2d backward produces must be
+    /// bit-identical to the unmasked path's, and every one it skips must be `None`.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// Item 178d named this as owed before its change could be trusted, and the reason is the
+    /// failure mode rather than the feature: a wrong `needs_input_grad` reading, or a mask applied
+    /// to the wrong slot, **silently drops a real gradient**. That is a wrong answer, not a slow
+    /// one, and no perf row would ever show it — the lane whose weight is frozen never reads
+    /// `dweight`, so it would keep certifying happily while a training caller got `None`.
+    ///
+    /// The test therefore asserts BOTH directions for every mask: produced gradients match, and
+    /// skipped ones are absent. Asserting only the first would pass a function that ignored the
+    /// mask entirely; asserting only the second would pass one that returned garbage.
+    ///
+    /// It also covers the ALL-ONES routes, where `conv2d_backward_masked_f64` delegates. That path
+    /// re-derives the fast-path gate independently of `conv2d_backward_f64`, so if the two ever
+    /// disagree about which route applies — the exact drift item 178b was written to avoid — the
+    /// two arms produce different values and this fails.
+    #[test]
+    fn conv2d_backward_masked_matches_the_unmasked_path_on_every_mask() {
+        // (batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch)
+        let cases = [
+            // 3x3 stride 1: generic under a non-uniform dout, fast path under all-ones
+            (
+                2usize, 3usize, 6usize, 6usize, 3usize, 3usize, 4usize, 4usize, 1usize, 1usize,
+                4usize,
+            ),
+            // height-1: the other all-ones specialisation
+            (2, 3, 1, 8, 1, 3, 1, 6, 1, 1, 4),
+            // stride 2, so col2im's scatter is sparse
+            (1, 2, 7, 7, 3, 3, 3, 3, 2, 2, 3),
+            // non-square kernel: cannot reach any 3x3 specialisation
+            (2, 2, 5, 6, 2, 3, 4, 4, 1, 1, 3),
+        ];
+        for &(b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co) in &cases {
+            let patch_width = ci * kh * kw;
+            let patch_count = oh * ow;
+            let padded: Vec<f64> = (0..b * ci * ph * pw)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..co * patch_width)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+
+            // `ones` selects the fast-path route, `false` the generic one. Both must behave.
+            for ones in [false, true] {
+                let dout: Vec<f64> = if ones {
+                    vec![1.0f64; b * co * patch_count]
+                } else {
+                    (0..b * co * patch_count)
+                        .map(|i| ((i % 197) as f64) * 0.0007 + 0.25)
+                        .collect()
+                };
+                for has_bias in [false, true] {
+                    let (want_dp, want_dw, want_db) = super::conv2d_backward_f64(
+                        &dout, &padded, &weight, b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co,
+                        has_bias,
+                    );
+                    for need_input in [false, true] {
+                        for need_weight in [false, true] {
+                            let (dp, dw, db) = super::conv2d_backward_masked_f64(
+                                &dout,
+                                &padded,
+                                &weight,
+                                b,
+                                ci,
+                                ph,
+                                pw,
+                                kh,
+                                kw,
+                                oh,
+                                ow,
+                                sh,
+                                sw,
+                                co,
+                                [need_input, need_weight, has_bias],
+                            );
+                            let label = format!(
+                                "b={b} ci={ci} p={ph}x{pw} k={kh}x{kw} o={oh}x{ow} s={sh}x{sw} \
+                                 co={co} ones={ones} bias={has_bias} mask=[{need_input},\
+                                 {need_weight},{has_bias}]"
+                            );
+
+                            // Presence must follow the mask exactly, in BOTH directions.
+                            assert_eq!(
+                                dp.is_some(),
+                                need_input,
+                                "item 180 d_input presence: {label}"
+                            );
+                            assert_eq!(
+                                dw.is_some(),
+                                need_weight,
+                                "item 180 d_weight presence: {label}"
+                            );
+                            assert_eq!(db.is_some(), has_bias, "item 180 d_bias presence: {label}");
+
+                            if let Some(got) = dp.as_ref() {
+                                assert_eq!(
+                                    got.len(),
+                                    want_dp.len(),
+                                    "item 180 d_input len: {label}"
+                                );
+                                for (i, (g, w)) in got.iter().zip(want_dp.iter()).enumerate() {
+                                    assert_eq!(
+                                        g.to_bits(),
+                                        w.to_bits(),
+                                        "item 180 d_input differs at {label} idx={i}: \
+                                         masked={g} unmasked={w}"
+                                    );
+                                }
+                            }
+                            if let Some(got) = dw.as_ref() {
+                                assert_eq!(
+                                    got.len(),
+                                    want_dw.len(),
+                                    "item 180 d_weight len: {label}"
+                                );
+                                for (i, (g, w)) in got.iter().zip(want_dw.iter()).enumerate() {
+                                    assert_eq!(
+                                        g.to_bits(),
+                                        w.to_bits(),
+                                        "item 180 d_weight differs at {label} idx={i}: \
+                                         masked={g} unmasked={w}"
+                                    );
+                                }
+                            }
+                            if let (Some(got), Some(want)) = (db.as_ref(), want_db.as_ref()) {
+                                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                                    assert_eq!(
+                                        g.to_bits(),
+                                        w.to_bits(),
+                                        "item 180 d_bias differs at {label} idx={i}: \
+                                         masked={g} unmasked={w}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// frankentorch-hi9r6 item 175: conv2d's forward and backward must return BIT-IDENTICAL
     /// results at every rayon pool width.
     ///

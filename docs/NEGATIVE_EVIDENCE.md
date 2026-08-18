@@ -33453,3 +33453,53 @@ nothing has been compiled and nothing has been run.
 Owed, and this one is not optional before the route is trusted: build, run the two new tests, and
 confirm `conv2d_backward_f32`'s existing tests still pass now that a shape they may already cover
 takes a different path. Only then is there any point measuring it.
+
+## 180. THE TEST ITEM 178 SAID MUST EXIST BEFORE ITS CHANGE COULD BE TRUSTED
+
+`frankentorch-hi9r6` (P0). **UNBUILT**: build freeze — `/data` 27G, 99% used, loadavg
+12.68/10.20/8.80 — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 180a. WHY THIS BEFORE ANOTHER LEVER
+
+Item 178d ended by naming its own missing guard: "a test that a masked backward's produced
+gradients are bit-identical to the unmasked path's, which does not yet exist and should be written
+before this is trusted." Writing the next optimisation instead would have left that standing.
+
+The reason it matters is the failure mode, not the feature. A wrong `needs_input_grad` reading, or
+a mask applied to the wrong slot, **silently drops a real gradient**. No perf row would ever show
+it: the lane whose weight is frozen never reads `dweight`, so the board would keep certifying while
+a training caller received `None`. This is the one change of the session whose bug is a wrong
+answer rather than a slow one.
+
+### 180b. BOTH DIRECTIONS, WHICH IS THE POINT
+
+For every mask the test asserts that produced gradients match the unmasked path bit-for-bit AND
+that skipped ones are absent.
+
+Either assertion alone is nearly worthless. Checking only the values would pass a function that
+ignored the mask entirely and computed everything — the exact behaviour item 178 set out to remove.
+Checking only the presence would pass one that returned the right *shape* of answer filled with
+garbage. The pair is what pins the contract.
+
+It sweeps all four `[need_input, need_weight]` combinations against both `has_bias` settings, on
+four geometries, under both a non-uniform and an all-ones `dout` — 128 comparisons per geometry.
+
+### 180c. IT ALSO CATCHES THE DRIFT ITEM 178b WAS WRITTEN TO AVOID
+
+`conv2d_backward_masked_f64` re-derives the all-ones fast-path gate independently of
+`conv2d_backward_f64`, because it has to know whether masking can save anything before it decides
+to delegate. Two copies of one predicate is precisely the hazard that got
+`conv2d_im2col_fill_rows_f64` extracted in the conv3d work.
+
+Running every case under an all-ones `dout` as well as a non-uniform one means that if those two
+gate expressions ever disagree about which route applies, the arms compute different values and the
+test fails. The duplication is still a wart; it is now a *guarded* wart.
+
+### 180d. WHAT IS STILL NOT COVERED
+
+The f32 mirror has no masked entry point, so there is nothing to test there yet. Neither
+`conv3d_backward_f64` nor the depthwise paths take a mask. And this test says nothing about whether
+skipping is FASTER — that is item 178's owed paired run, and this test would pass identically if
+the masked path were slower.
+
+NOT VERIFIED: compilation, and this test has never run.
