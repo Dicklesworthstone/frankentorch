@@ -34268,14 +34268,14 @@ A host with the peer builds finished. The lane that prices items 174/177 is `con
 separates "the scatter collapse helped" from "the host moved". Re-run with `FT_H2H_LANES=conv2d`
 when `pgrep rustc` is quiet.
 
-## 189. THE SLOT-0 DIAGNOSTIC AND THE WARM-UP FLAG BOTH WORK — AND THE FIRST THING THEY SHOWED ME IS THAT MY OWN A/B WAS CROSS-RUN
+## 190. THE SLOT-0 DIAGNOSTIC AND THE WARM-UP FLAG BOTH WORK — AND THE FIRST THING THEY SHOWED ME IS THAT MY OWN A/B WAS CROSS-RUN
 
 `frankentorch-hi9r6` (P0). **NO BUILD**: ran the snapshotted ELF
 `2462293598f10e7721efe49ac9786c3bf5edda7b1a700608bfa4df5200805e67`, host `thinkstation1`, AMD Ryzen
 Threadripper PRO 5975WX, governor powersave, `RAYON_NUM_THREADS=8`, incumbent PyTorch 2.12.1+cpu
 self-reported in the same invocation. `/data` 87G, no disk consumed.
 
-### 189a. THE MACHINERY WORKS
+### 190a. THE MACHINERY WORKS
 
 Item 169's field printed under every row without being asked for, and it immediately flagged the
 lane that item 147 predicted:
@@ -34287,7 +34287,7 @@ That is the first time this campaign has had the slot profile and the null on th
 the same run, without a second tool. Item 169's whole argument was that pairing them by hand is
 where runs got mixed.
 
-### 189b. WHAT THE WARM-UP DID
+### 190b. WHAT THE WARM-UP DID
 
     lane                  warmup   slot0    FT null    loadavg
     conv2d_masked            0     1.171     1.059      16.2
@@ -34299,7 +34299,7 @@ The PATTERN item 167d predicted is there: the lane WITH a cold first sample lost
 (1.171 -> 1.030) and its null moved toward 1.0 with it, while the lane WITHOUT one barely moved
 (1.011 -> 1.022). Two quantities moving together is the mechanism item 147 claimed.
 
-### 189c. AND THE CONFOUND, WHICH IS MINE AGAIN
+### 190c. AND THE CONFOUND, WHICH IS MINE AGAIN
 
 **Loadavg was 16.2 in the first run and 27.5 in the second.** That is a two-run comparison across
 different host states — the error items 123, 135, 139, 145, 169 and 185e all document, and the one
@@ -34316,7 +34316,7 @@ scales numerator and denominator together and largely cancels — which is exact
 So: the direction is supported, the magnitude is not, and no row here is quotable — every one
 NULL-FAILED anyway.
 
-### 189d. THE FIX IS A DESIGN CHANGE, NOT MORE RUNS
+### 190d. THE FIX IS A DESIGN CHANGE, NOT MORE RUNS
 
 `FT_H2H_ROUND_WARMUP` is read once into a `let` at startup, so it is process-wide and the two arms
 of its own A/B can only ever be two invocations. That is a defect in how I built it: item 167
@@ -34329,7 +34329,7 @@ The fix is to make the warm-up a PER-LANE property and register the same lane tw
 so one invocation carries both arms through the same window. Recorded rather than done: the harness
 file has uncommitted peer edits again, and this is a change to how every row is produced.
 
-### 189e. THE STANDING IS STILL UNCERTIFIED, AND STILL LOOKS STALE
+### 190e. THE STANDING IS STILL UNCERTIFIED, AND STILL LOOKS STALE
 
 `conv2d_masked` read 2.49x and 2.59x SLOWER in these two runs against a certified board figure of
 **5.73x**. Both failed their nulls, so neither replaces it. PyTorch's arm failed its own null in
@@ -34339,3 +34339,68 @@ passed.
 
 That points at the resize item 144 already built — `conv2d_big_masked` — as the lane most likely to
 certify. Next quiet window: that lane, at `round_warmup=0`, repeated until the gates hold.
+
+## 190. ITEM 178'S SKIP WAS NEVER DEMONSTRATED, ONLY WIRED — NOW IT IS, FOR BOTH DTYPES
+
+`frankentorch-hi9r6`. BUILT AND TESTED. `/data` 68G free, host `thinkstation1`, loadavg
+26.46/28.92/25.42. `frankentorch-kernel-cpu --lib` 687 passed / 0 failed;
+`frankentorch-api --lib` 2580 passed / 0 failed. Repo-local `target/`, never the shared one.
+
+### 190a. THE GAP
+
+Item 178 taught `conv2d_backward_masked_f64` to honour `needs_input_grad`, and item 187 gave f32
+the same treatment. Neither ever showed the skip HAPPENING. Both were wired, tested for producing
+the right values, and trusted for the thing they were actually for.
+
+A gradient returning `None` proves the caller was told nothing was computed. It does not prove the
+2.036 ms GEMM did not run. Those are different claims and only the second one is the optimisation.
+`feedback_sentinel_before_fixing` exists because reading source gave three confident wrong answers
+about which path executes; this was the same bet, unhedged, on a saving item 141 prices at ~18% of
+the backward.
+
+### 190b. THE SENTINEL, AND WHY IT IS THREAD-LOCAL
+
+Two counters at the four GEMM sites in the masked backwards, read through
+`conv2d_backward_gemm_counts()` / `reset_conv2d_backward_gemm_counts()`.
+
+**Thread-local `Cell`s, not global atomics.** Cargo runs tests in parallel threads of ONE process,
+so a global counter would be incremented by whatever else was running and every assertion would be
+a race — the kind that passes for weeks and then fails once on a busy host. The increment sites all
+sit inside closures that `build_uninit` and `build_pool_output` invoke on the CALLING thread (the
+GEMM parallelises internally, but the count is taken once, where the call was made), so a per-thread
+cell observes exactly the work this thread asked for. Cost is a TLS access per call against a GEMM
+that moves megabytes.
+
+### 190c. WHAT IT SHOWS
+
+    mask [d_in, d_w, d_bias]      (dweight GEMMs, dpanel GEMMs)   f64 and f32 alike
+    [true,  false, false]                    (0, 1)     <- dweight GEMM SKIPPED
+    [false, true,  false]                    (1, 0)     <- dpanel  GEMM SKIPPED
+    [false, false, true ]                    (0, 0)
+    [true,  true,  false]                    (0, 0)     <- delegates; see below
+
+`dout` is NON-UNIFORM in the fixture, deliberately: the all-ones adjoints replace both GEMMs
+outright, so on that route a zero count would mean "fast-pathed" rather than "skipped" and the test
+would pass while proving nothing.
+
+`[true, true, _]` counting (0, 0) is not a skip. With both gradients wanted there is nothing to
+save, so the masked entry DELEGATES to the unmasked kernel, whose GEMMs carry no counters. Stated
+in the test rather than left for a reader to misread as a third skip.
+
+The test also asserts the sentinel FIRES — one case where the count must be 1. A counter wired to
+nothing would satisfy every zero above, which is the failure mode a sentinel test is most likely to
+have and the least likely to notice.
+
+### 190d. WHAT IS STILL NOT PROVEN
+
+That `ft-api` SETS the mask correctly end to end — that `ctx.needs_input_grad()` reports `false` for
+a frozen weight on the f32 path. The plumbing is mirrored line for line from item 178's f64 twin,
+which ships and is reviewed, so this is a low-risk mirror rather than a new claim; and the counters
+being thread-local makes an ft-api-level assertion depend on the tape invoking backward closures on
+the calling thread, which is true today and is not a contract. Recorded as owed rather than asserted
+from the same reading that item 190a is about.
+
+### 190e. UNCHANGED
+
+No measurement. The host is at loadavg 26 with peer builds live, and item 189 records why nothing
+from such a window is quotable.

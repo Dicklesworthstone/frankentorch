@@ -8320,12 +8320,14 @@ pub fn conv2d_backward_masked_f32(
                 dw.fill(0.0);
                 return;
             }
+            CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
             gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dw);
         })
     });
 
     let dpadded = output_mask[0].then(|| {
         let dpanel = build_pool_output(flat * patch_width, |dp: &mut [f32]| {
+            CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
             gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
         });
         conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
@@ -9512,6 +9514,53 @@ fn conv2d_dout_flat_f64(dout: &[f64], batch: usize, out_ch: usize, patch_count: 
     })
 }
 
+// Execution sentinels for the two big GEMMs of the conv2d backward — `frankentorch-hi9r6`,
+// item 190.
+//
+// WHY A COUNTER AND NOT AN ARGUMENT. Item 178 taught `conv2d_backward_masked_f64` to honour
+// `needs_input_grad`, and item 187 gave f32 the same treatment, but neither change ever
+// DEMONSTRATED that the skip happens: both were wired and trusted. `feedback_sentinel_before_fixing`
+// records three confident wrong answers about which path executes, arrived at by reading source.
+// A gradient coming back `None` proves the tape was told nothing was computed; it does not prove
+// the GEMM did not run.
+//
+// Counted per CALL, not per element, so the cost is one relaxed atomic add against a GEMM that
+// moves megabytes. `Relaxed` is right: nothing is ordered against these, they are read only after
+// the work they count has been joined.
+
+thread_local! {
+    static CONV2D_DWEIGHT_GEMMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONV2D_DPANEL_GEMMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(dweight GEMMs, dpanel GEMMs)` executed by the MASKED conv2d backwards on THIS THREAD since
+/// the last reset.
+///
+/// THREAD-LOCAL, not global, and that is the point. Cargo runs tests in parallel threads of one
+/// process, so a global counter would be incremented by whatever else happened to be running and
+/// the assertion would be a race. The increment sites all sit in closures that `build_uninit` and
+/// `build_pool_output` invoke on the CALLING thread — the GEMM parallelises internally, but the
+/// count is taken once, where the call was made — so a per-thread cell observes exactly the work
+/// this thread asked for.
+///
+/// Counts the generic route only: the all-ones adjoints replace both GEMMs with a column-sum and a
+/// single one-row GEMM, so a zero here means "skipped OR fast-pathed", never "skipped" alone. A
+/// test that wants the distinction must use a non-uniform `dout`, which is what forces the generic
+/// route.
+#[must_use]
+pub fn conv2d_backward_gemm_counts() -> (usize, usize) {
+    (
+        CONV2D_DWEIGHT_GEMMS.with(std::cell::Cell::get),
+        CONV2D_DPANEL_GEMMS.with(std::cell::Cell::get),
+    )
+}
+
+/// Zero both sentinels for this thread.
+pub fn reset_conv2d_backward_gemm_counts() {
+    CONV2D_DWEIGHT_GEMMS.with(|c| c.set(0));
+    CONV2D_DPANEL_GEMMS.with(|c| c.set(0));
+}
+
 /// conv2d backward computing ONLY the gradients the caller asked for — `frankentorch-hi9r6`,
 /// item 178. `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's
 /// `convolution_backward`, which takes exactly this argument for exactly this reason.
@@ -9605,12 +9654,14 @@ pub fn conv2d_backward_masked_f64(
             if out_ch == 0 || patch_width == 0 {
                 return;
             }
+            CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
             gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dw);
         })
     });
 
     let dpadded = output_mask[0].then(|| {
         let dpanel = build_pool_output(flat * patch_width, |dp: &mut [f64]| {
+            CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
             gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
         });
         conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
@@ -65993,5 +66044,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The mask must SKIP the GEMM, not merely drop its result — `frankentorch-hi9r6`, item 190.
+    ///
+    /// Item 178 taught the f64 masked backward to honour `needs_input_grad` and item 187 gave f32
+    /// the same, but neither ever demonstrated the skip: a gradient returning `None` proves the
+    /// caller was told nothing was computed, not that the 2.036 ms GEMM did not run. This asserts
+    /// the execution counts directly, which is what `feedback_sentinel_before_fixing` asks for.
+    ///
+    /// `dout` is NON-UNIFORM on purpose. The all-ones adjoints replace both GEMMs entirely, so on
+    /// that route a zero count would mean "fast-pathed" rather than "skipped" and the test would
+    /// pass while proving nothing.
+    ///
+    /// `[true, true, _]` is expected to count (0, 0): with both gradients wanted there is nothing
+    /// to save, so the masked entry DELEGATES to the unmasked kernel, whose GEMMs are not
+    /// instrumented. That is a property of where the counters live, stated here so the zero is not
+    /// read as a skip.
+    #[test]
+    fn conv2d_backward_masked_skips_the_gemm_the_mask_declines() {
+        let (batch, in_ch, ph, pw) = (2usize, 3usize, 9usize, 10usize);
+        let (kh, kw, oh, ow, sh, sw, out_ch) =
+            (3usize, 3usize, 7usize, 8usize, 1usize, 1usize, 4usize);
+        let patch_width = in_ch * kh * kw;
+        let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i * 17 % 31) as f64 - 15.0) / 1024.0)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 37) as f64 - 18.0) / 2048.0)
+            .collect();
+        let dout: Vec<f64> = (0..batch * out_ch * oh * ow)
+            .map(|i| ((i * 13 % 23) as f64 - 11.0) / 512.0)
+            .collect();
+        assert!(
+            dout.iter().any(|v| v.to_bits() != 1.0f64.to_bits()),
+            "dout must be non-uniform or this measures the all-ones adjoint instead"
+        );
+        let padded32: Vec<f32> = padded.iter().map(|&v| v as f32).collect();
+        let weight32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
+        let dout32: Vec<f32> = dout.iter().map(|&v| v as f32).collect();
+
+        // (mask, expected (dweight_gemms, dpanel_gemms))
+        let expectations: &[([bool; 3], (usize, usize))] = &[
+            ([true, false, false], (0, 1)),
+            ([false, true, false], (1, 0)),
+            ([false, false, true], (0, 0)),
+            ([true, true, false], (0, 0)), // delegates; see the doc comment
+        ];
+
+        for &(mask, want) in expectations {
+            super::reset_conv2d_backward_gemm_counts();
+            let _ = super::conv2d_backward_masked_f64(
+                &dout, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch, mask,
+            );
+            assert_eq!(
+                super::conv2d_backward_gemm_counts(),
+                want,
+                "f64 mask {mask:?}: (dweight, dpanel) GEMM executions"
+            );
+
+            super::reset_conv2d_backward_gemm_counts();
+            let _ = super::conv2d_backward_masked_f32(
+                &dout32, &padded32, &weight32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, mask,
+            );
+            assert_eq!(
+                super::conv2d_backward_gemm_counts(),
+                want,
+                "f32 mask {mask:?}: (dweight, dpanel) GEMM executions"
+            );
+        }
+
+        // And the sentinel must be able to see a GEMM at all — a counter wired to nothing would
+        // pass every assertion above.
+        super::reset_conv2d_backward_gemm_counts();
+        let _ = super::conv2d_backward_masked_f64(
+            &dout,
+            &padded,
+            &weight,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
+            [false, true, false],
+        );
+        assert_eq!(
+            super::conv2d_backward_gemm_counts().0,
+            1,
+            "the dweight sentinel never fires, so the zeros above prove nothing"
+        );
     }
 }
