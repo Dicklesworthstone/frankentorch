@@ -31338,3 +31338,84 @@ not an operation. What it needs is a build and the paired before/after that the 
 today, plus honesty about the smaller expected effect. Deliberately NOT applied blind: this
 project has a standing hazard record for pushing uncompiled code to main, and a two-line change
 nobody can compile is exactly that.
+
+## 149. ITEM 147e's PREDICTION IS REFUTED — THE SLOT-0 EFFECT IS REAL AND STRONG FOR conv2d, AND IT DOES NOT EXPLAIN THE BOARD's OTHER FAILING NULLS
+
+`frankentorch-hi9r6` (P0). Build freeze in force — `/data` at 34G, 99% used — so no cargo ran and
+nothing was measured for this item. It is re-analysis of slot dumps already on disk plus source
+reading. Host loadavg 7.14/6.18/6.22, recorded for completeness rather than because any timing is
+claimed.
+
+Item 147e predicted that the other lanes whose FT nulls fail — `avg_pool2d_nopool` at 1.317,
+`max_pool3d` at 0.861, the sum-shortcut cluster of item 145d — would show the same cold-slot-0
+signature, and stated that a flat `max_pool3d` profile would confine item 147 to conv2d. **That is
+what came back.**
+
+### 149a. THE ESTIMATOR THAT MADE A VOIDED RUN PARTLY READABLE
+
+Item 147 discarded a third run unread because its own gate said `load_1m start=34.05 end=54.02
+LOAD-DRIFTED`, and that run holds the only slot dumps for `max_pool3d*`, `linear_narrow` and
+`avg_pool2d_nopool`. A per-slot median ACROSS rounds is genuinely unreadable there — a load ramp
+lands directly in it.
+
+The within-round ratio is not. Dividing slot0 by the median of slots 1-3 OF THE SAME ROUND cancels
+whatever is common to that round, and a ramp from 34 to 54 spread over a whole run is common to
+each round at the scale of four consecutive samples. The positional effect therefore survives where
+the absolute times do not. This is strictly weaker than a clean run and is labelled so: one run, in
+a window whose gate failed, for the three lanes that appear only there. The conv2d rows below also
+carry two CLEAN runs, and it is those that carry item 147.
+
+    per-round slot0 / median(slot1..3), n=16 rounds      median      q1      q3   rounds>1.10
+    conv2d_big           run A (clean)                    1.305   1.170   1.406        15/16
+    conv2d_big           run B (clean)                    1.363   1.260   1.491        15/16
+    conv2d_big           run C (VOIDED window)            1.344   1.212   1.483        13/16
+    conv2d               run A (clean)                    1.275   1.015   1.369        11/16
+    conv2d               run B (clean)                    1.313   1.134   1.486        12/16
+    conv2d_masked        runs A / B (clean)         1.027 / 1.082                    4 / 6 of 16
+    conv2d_big_masked    runs A / B / C             0.952 / 0.970 / 0.964            0 / 0 / 1
+    ---- the item 147e prediction, all from the VOIDED window ----
+    avg_pool2d_nopool                                     0.981   0.926   1.088         3/16
+    max_pool3d                                            0.997   0.862   1.339         4/16
+    max_pool3d_nopool                                     1.285   0.987   1.552        11/16
+    max_pool3d_dense                                      1.183   0.919   1.680        10/16
+    linear_narrow                                         1.283   1.071   1.819        11/16
+
+### 149b. ITEM 147's CORE IS STRENGTHENED
+
+`conv2d_big` reads 1.305, 1.363 and 1.344 across three runs with 13-15 of 16 rounds above 1.10,
+while `conv2d_big_masked` reads 0.952, 0.970, 0.964 with 0, 0 and 1. The summed-versus-masked
+contrast now replicates three times under an estimator that between-round drift cannot fake. Item
+147 is not in doubt.
+
+### 149c. THE GENERALISATION IS DEAD, AND IN BOTH DIRECTIONS AT ONCE
+
+* `avg_pool2d_nopool` has the WORST FT null on the board (1.317) and NO slot-0 step (0.981,
+  3/16). A failing null does not require the signature.
+* `max_pool3d` nulls at 0.861 with a flat profile (0.997). Same conclusion, second lane.
+* `linear_narrow` NULLS PERFECTLY — 100% PASS in item 145d — and shows a slot-0 median of 1.283,
+  11/16 rounds above 1.10. The signature does not produce a failing null either.
+
+Slot-0 coldness therefore neither predicts a failing null nor follows from one, and item 147e's
+extrapolation from conv2d to the sum-shortcut cluster is refuted. Item 147's scope should be read
+as conv2d until a clean run says otherwise.
+
+What distinguishes conv2d is CONSISTENCY, not magnitude. `conv2d_big`'s quartiles are tight
+(1.170-1.406) while `linear_narrow`'s span 1.071-1.819. A lane can carry a large median slot-0
+penalty and still null cleanly, because the harness reduces each round to a median of four samples
+before the null ever sees it: a wide, erratic penalty washes out of that reduction and a tight,
+reproducible one does not. **The property that breaks the gate is reproducibility, which is the
+opposite of what calling it "noise" would predict.**
+
+### 149d. WHAT THIS MEANS FOR THE TOP READY BEAD, AND WHAT I DECLINED TO CLAIM
+
+`frankentorch-372h8` (avg_pool1d, P1) is blocked on exactly this class of problem: its note records
+2.50-2.70x FASTER across ten runs with only one clearing both nulls and drift together, and its
+route is selected by a plain `tensor_sum` firing the scalar sum-shortcut — the same family item
+147e generalised to. Handing that bead a ready-made explanation was the tempting move.
+
+149c forbids it. The one sum-shortcut lane with a dump, `avg_pool2d_nopool`, has a flat slot profile
+despite the board's worst null, so there is no basis for asserting the mechanism transfers to
+avg_pool1d. What can be offered is the diagnostic rather than the diagnosis: `FT_H2H_DUMP_SLOTS`
+plus the drift-robust estimator now in `scripts/h2h_slot_profile.py` answers it in one run, and that
+bead's own note says its binary is already on disk — so the check costs no build even under this
+freeze. Left on that bead as a suggestion, explicitly not a finding.
