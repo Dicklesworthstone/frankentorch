@@ -8275,28 +8275,29 @@ pub fn conv2d_forward_f64(
         .for_each_init(
             || vec![0.0f64; TILE * patch_width],
             |scratch, (ti, oflat_tile)| {
-            let m0 = ti * TILE;
-            let rows = oflat_tile.len() / out_ch;
-            let ptile = &mut scratch[..rows * patch_width];
-            for r in 0..rows {
-                let row = m0 + r;
-                let b = row / patch_count;
-                let pc = row % patch_count;
-                let base_h = (pc / ow) * sh;
-                let base_w = (pc % ow) * sw;
-                let batch_off = b * in_ch * ph * pw;
-                let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                for c in 0..in_ch {
-                    let ch_off = batch_off + c * ph * pw;
-                    let pch = c * kh * kw;
-                    for kr in 0..kh {
-                        let irow = ch_off + (base_h + kr) * pw + base_w;
-                        let prow_off = pch + kr * kw;
-                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                let m0 = ti * TILE;
+                let rows = oflat_tile.len() / out_ch;
+                let ptile = &mut scratch[..rows * patch_width];
+                for r in 0..rows {
+                    let row = m0 + r;
+                    let b = row / patch_count;
+                    let pc = row % patch_count;
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let batch_off = b * in_ch * ph * pw;
+                    let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                    for c in 0..in_ch {
+                        let ch_off = batch_off + c * ph * pw;
+                        let pch = c * kh * kw;
+                        for kr in 0..kh {
+                            let irow = ch_off + (base_h + kr) * pw + base_w;
+                            let prow_off = pch + kr * kw;
+                            prow[prow_off..(kw + prow_off)]
+                                .copy_from_slice(&padded[irow..(kw + irow)]);
+                        }
                     }
                 }
-            }
-            gemm::dgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
+                gemm::dgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
             },
         );
     let mut out = vec![0.0f64; batch * out_ch * patch_count];

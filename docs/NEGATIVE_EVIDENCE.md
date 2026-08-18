@@ -31794,3 +31794,91 @@ VERIFIED: `rustfmt --edition 2024 --check` exits 0; every call site hand-checked
 real signatures (`bidiag_test_matrix_rank_scaled(m,n,u64,usize,f64)`,
 `bidiag_form_p_f64(&[f64], usize, &[f64])`, both factorizations returning
 `(d, e, tauq, taup)`). NOT VERIFIED: compilation, execution, or the expected failure.
+
+## 156. conv2d's FORWARD ALLOCATES AND ZEROES ITS PANEL TILE ONCE PER TILE — 43 TIMES A CALL — AND THE FIX NEEDS NO `unsafe`
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 29G, 99% used,
+loadavg 8.97/10.74/10.30 — so no cargo ran. `rustfmt --edition 2024 --check` exits 0 on the file.
+That proves it parses and is format-clean; it is not a compile and not a test.
+
+### 156a. WHY THE FORWARD AT ALL
+
+Every item on this bead from 128 to 155 has been about the BACKWARD. The forward was measured once,
+in passing, by my own engine probe (item 139): **2.685 ms of the 11.46 ms lane at 8 threads**,
+against PyTorch's whole training step of ~2.9 ms. Our forward alone costs about what the incumbent
+spends on forward and backward together, and nothing had looked at it.
+
+### 156b. THE DEAD WORK
+
+`conv2d_forward_f64`'s streaming path tiles the im2col panel — deliberately, so the panel never
+round-trips through DRAM (`frankentorch-conv2d-stream`) — but it allocated and zeroed the tile
+buffer inside the loop:
+
+    let mut ptile = vec![0.0f64; rows * patch_width];   // 442 KB, once per tile
+
+At the scored shape that is 43 tiles at the small batch and 86 at the big one, so **19-38 MB of
+allocation and dead zero-stores per forward call, inside the hot parallel region.** Every byte is
+overwritten by the im2col fill before `dgemm_bt` reads it.
+
+`for_each_init` now hands each rayon worker one buffer sized for the largest tile and reuses it:
+allocations fall from per-tile to roughly per-thread, and the zero pass disappears.
+
+### 156c. THE INTERESTING PART — THIS ONE IS NOT AN `unsafe` LEVER
+
+Items 151, 152, 153 and 154 all removed dead zeroing the same way: hand the kernel an
+UNINITIALIZED buffer via `build_uninit`, which is sound only under a write-every-element contract,
+and which is why item 151 went and read matrixmultiply's `beta == 0` handling before trusting it.
+
+This site does not need any of that. The reused buffer is always fully initialized — it holds the
+PREVIOUS tile's values — so reuse is ordinary safe Rust. The question collapses from soundness to
+correctness: does the fill overwrite everything before the GEMM reads it?
+
+**It does, exactly.** For each row the fill writes, for every `c` and every `kr`, the `kw`-run at
+`c*kh*kw + kr*kw`. Over `kr` that covers `[c*kh*kw, (c+1)*kh*kw)`; over `c` it covers
+`[0, in_ch*kh*kw) == [0, patch_width)` — no gaps, no overlaps.
+
+And that argument was already load-bearing before this change: if the fill had a gap, the zeroed
+version would have multiplied by 0.0 there rather than by the input, and the full-panel path it is
+required to match bit-for-bit would already have disagreed. **The change does not introduce a new
+obligation; it makes an existing one visible.**
+
+BIT-EXACT: the GEMM sees identical bytes with the same `rows`/`patch_width` shape, so
+matrixmultiply's micro-kernel K-order is untouched.
+
+### 156d. PREDICTION, AND WHAT WOULD KILL IT
+
+Removing 19-38 MB of zero-stores and ~43-86 allocations from a 2.685 ms forward could plausibly be
+worth a few hundred microseconds. **Refuted if** mimalloc is already serving this size class from a
+warm per-thread free list, in which case the allocation was nearly free and only the zero-stores
+were real; **also refuted if** the per-tile buffer was acting as an accidental cache-locality
+device, since a per-worker buffer is touched by more distinct tiles and could age differently in
+L2. The second is the one I would bet against but cannot exclude without the measurement.
+
+Left for separate rows, both in the same function and both fully overwritten: `out_flat`
+(2-4 MB, written by `dgemm_bt`) and the final `out` (2 MB, written by the transpose pass). One
+lever per row.
+
+### 156e. THIS CODE REACHED main IN A PEER'S COMMIT, NOT MINE
+
+While I was writing it, commit `d41983c3` — a peer's bidiag ORACLE TEST for `frankentorch-4zjaa`,
+an unrelated bead — swept my uncommitted edit into itself. `feedback_uncommitted_gets_swept`
+records this happening five times in one session; it is now six.
+
+Checked rather than assumed, because a partial capture would matter far more than a misattributed
+one: `git show HEAD:...` piped through `rustfmt --check` exits 1, not 2 — HEAD PARSES, and contains
+all six of my markers. So the swept state is syntactically complete, and the only damage is
+attribution plus formatting.
+
+Two consequences worth recording:
+
+* **main is currently rustfmt-UNCLEAN** because the sweep caught the code before I reindented the
+  moved closure body. Any `cargo fmt --check` in CI fails on `ft-kernel-cpu/src/lib.rs` until the
+  commit carrying this item lands. That is the concrete cost of the sweep, and it is mine to fix
+  rather than theirs to have avoided.
+* A `git log -S` search is how the conv2d forward change will be found, since no commit message
+  mentions it. Anyone bisecting a conv2d forward regression to `d41983c3` should read this item
+  instead of the bidiag test that commit describes.
+
+The habit that caught it: the working-tree diff showed `for_each_init` as CONTEXT rather than as an
+addition. A line you know you just wrote appearing unchanged means it is already committed — by
+someone else.
