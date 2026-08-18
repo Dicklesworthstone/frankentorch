@@ -32514,3 +32514,72 @@ trivial — but no number is asserted, and `linear` already certifies at 1.41x F
 
 VERIFIED: `rustfmt --edition 2024 --check` exits 0; mutability hand-checked at all four sites.
 NOT VERIFIED: compilation, tests, timing.
+
+## 167. THE HARNESS CAN NOW TEST ITEM 147's SLOT-0 DIAGNOSIS — OPT-IN, SYMMETRIC, AND IT MOVES NO EXISTING ROW
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 27G, 99% used,
+loadavg 10.08/14.61/12.87 — no cargo ran. `rustfmt --edition 2024 --check` exits 0 on the file.
+
+### 167a. WHY THIS INSTEAD OF ANOTHER KERNEL CHANGE
+
+Items 151-165 put seven unbuilt changes of mine into the conv kernels, and I have twice recorded
+that the marginal value of another one is falling while the compounding risk rises. The thing
+those changes are all waiting on is not more code — it is a measurement, and one of the
+instruments that measurement depends on has a defect I diagnosed six items ago and left unfixed.
+
+Item 147 located the summed conv2d lanes' failing FT null exactly: **slot 0**. `FT_H2H_WARMUP`
+runs 32 iterations per lane ONCE, before any round begins; the other lanes then run between a
+lane's rounds, so each lane's first sample per round arrives cold and costs 20-30% more than the
+other three, which agree with each other. The null is first-half/second-half and slot 0 lands in
+the first half, so it fails while the 4-sample-median ratio barely moves.
+
+Item 147d named the fix and declined to make it, because changing the default would move every
+lane's numbers on a board a dozen agents quote from.
+
+**That objection is about the default, not about the code.** `FT_H2H_ROUND_WARMUP` defaults to 0,
+so no existing row moves and nothing needs coordinating; setting it to 1 or 2 tests the diagnosis.
+
+### 167b. SYMMETRIC, WHICH IS THE PART THAT MATTERS
+
+The warm-up discards samples from **both** arms — `run_lane()` for ours and `incumbent_sample()`
+for PyTorch's — in the same place in the round.
+
+Warming only our arm would have been the easy version and it would have been misconduct: it
+deletes a real cost from our side while leaving it on the incumbent's, producing a better ratio
+from the harness rather than from the code. The board's whole point is that a win is a live
+same-invocation comparison; a harness that quietly advantages one arm makes every row it produces
+worthless. Item 147 also measured that PyTorch's slot 0 shows no comparable step, so the
+temptation was real — the asymmetry would have looked *justified* by the data.
+
+The isolation modes are respected: `FT_H2H_NO_INCUMBENT` skips the incumbent's warm-up,
+`FT_H2H_NO_FT_ARM` skips ours, so the flag composes with the arm-isolation probes instead of
+fighting them.
+
+### 167c. IT CHANGES WHAT IS MEASURED, AND THE OUTPUT SAYS SO
+
+With the flag set the lanes measure STEADY-STATE cost; without it they measure cost including a
+per-round cold start. Both are legitimate and they are DIFFERENT questions, so a row taken under
+the flag is comparable only to another row taken under it — and **every certified standing on the
+board today was taken at 0.**
+
+That is exactly the kind of distinction that gets lost when a number is copied out of a log three
+weeks later, so the harness prints `round_warmup=<n>` in its provenance block alongside the ELF
+SHA and the thread count, with a line saying in the non-zero case that the row is not comparable
+to any certified standing. A row whose output lacks the line was produced by an older binary.
+
+### 167d. THE PREDICTION IT EXISTS TO TEST
+
+Item 147 predicts that at `FT_H2H_ROUND_WARMUP=1` the summed lanes' FT null moves to ~1.0 while
+the masked lanes — which show no slot-0 step — barely move. If the summed null stays high, item
+147 is wrong about the mechanism and slot 0 is a symptom of something else.
+
+Either outcome is worth the run, and the second would be worth more. It also bears well beyond
+conv2d: item 149 found `avg_pool2d_nopool` failing its null at 1.317 with a FLAT slot profile, so
+if this flag fixes conv2d's null and not that one, the board has at least two distinct causes of
+null failure and they need separating before any lane blocked on a null is chased further.
+
+### 167e. WHAT IS STILL OWED
+
+Everything, still: `cargo build`, `cargo clippy`, `cargo test`, and then the runs. This change is
+worth no more than the others until something compiles it — but unlike the others, what it
+unblocks is the ability to certify, rather than another few hundred microseconds.

@@ -1317,6 +1317,14 @@ LANES = {
     println!(
         "measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)"
     );
+    // Item 167: discarded samples per lane per ROUND, symmetric across both arms. Default 0, so
+    // every existing row is unaffected. Declared here rather than beside the round loop so it can
+    // be REPORTED with the rest of the provenance — a row taken under it is not comparable to one
+    // taken without, so the output has to say which it is.
+    let round_warmup: usize = std::env::var("FT_H2H_ROUND_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     println!(
         "sampling=balanced-square {} (frankentorch-xdw0h); {} rounds, four live samples per arm \
          per round, torch threads=8",
@@ -1325,6 +1333,17 @@ LANES = {
             .map(|incumbent| if *incumbent { 'A' } else { 'B' })
             .collect::<String>(),
         reps,
+    );
+    println!(
+        "round_warmup={round_warmup} (FT_H2H_ROUND_WARMUP; discarded samples per lane per round, \
+         BOTH arms). {}",
+        if round_warmup == 0 {
+            "0 = the board's default: each lane's slot 0 each round arrives cold, which \
+             NEGATIVE_EVIDENCE item 147 measured at +20-30% on the summed conv2d lanes"
+        } else {
+            "NON-ZERO: this row measures STEADY-STATE cost and is NOT comparable to any \
+             certified standing on the board, all of which were taken at 0"
+        }
     );
     println!();
     println!(
@@ -1869,6 +1888,45 @@ LANES = {
             load_series.push(l);
         }
         for (index, (name, run_lane)) in lanes.iter().enumerate() {
+            // PER-ROUND WARM-UP, OPT-IN AND SYMMETRIC — `frankentorch-hi9r6`, item 167.
+            //
+            // NEGATIVE_EVIDENCE item 147 located the summed conv2d lanes' one-sided FT null
+            // exactly: SLOT 0. The round's first FT sample costs 20-30% more than the other
+            // three, which agree with each other, because `FT_H2H_WARMUP` runs ONCE per lane
+            // before any round begins (line ~1766) and the other lanes run in between, so a
+            // lane's first sample each round arrives cold. The null is first-half/second-half
+            // and slot 0 sits in the first half, so it fails while the 4-sample-median ratio
+            // barely moves.
+            //
+            // Item 147d named the fix — a discarded sample per lane per round — and declined to
+            // make it, because changing the default would move EVERY lane's numbers on a board a
+            // dozen agents quote from. That objection is about the DEFAULT, not the code, so the
+            // flag defaults to 0 and nothing moves unless it is asked for.
+            //
+            // SYMMETRIC, AND THAT IS NOT A DETAIL. Warming only our arm would delete a real cost
+            // from our side and leave it on the incumbent's — a better ratio produced by the
+            // harness rather than by the code, which is precisely what this campaign's rules
+            // exist to forbid. Both arms get the same number of discarded samples, in the same
+            // place, so whatever the warm-up removes it removes from both.
+            //
+            // WHAT IT CHANGES, STATED SO NO ROW IS MIXED UP: with this set the lanes measure
+            // STEADY-STATE cost; without it they measure cost including a per-round cold start.
+            // Both are legitimate questions and they are DIFFERENT questions. A row taken with
+            // this flag is comparable only to another row taken with the same flag, and every
+            // certified standing on the board today was taken without it.
+            //
+            // Item 147's diagnosis predicts the summed lanes' FT null moves to ~1.0 here while
+            // the masked lanes (which show no slot-0 step) barely move. If instead the summed
+            // null stays high, item 147 is wrong about the mechanism and slot 0 is a symptom of
+            // something else.
+            for _ in 0..round_warmup {
+                if !isolate_incumbent {
+                    let _ = run_lane();
+                }
+                if !isolate_arm {
+                    let _ = incumbent_sample(&mut stdin, &mut reader, name)?;
+                }
+            }
             let mut incumbent_slots = Vec::with_capacity(4);
             let mut ft_slots = Vec::with_capacity(4);
             for incumbent_slot in BALANCED_SQUARE {
