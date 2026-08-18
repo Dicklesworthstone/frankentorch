@@ -35178,3 +35178,47 @@ No code this item. Twenty-eight mechanical edits to backward closures, none comp
 the conv3d pair from items 195-196 still never executed, would be the largest unverified change of
 the session for a benefit that 200c says is conditional. The list is the deliverable; the edits
 wait for a compiler and a caller-level answer.
+
+## 201. THE MASKED BACKWARD GATED BOTH ITS CONSUMERS AND NOT THE THING THEY CONSUME
+
+`frankentorch-hi9r6`. **UNBUILT** — `/data` 33G, below the hard brake; no cargo, no new files.
+`rustfmt --edition 2024 --check` exits 0. No measurement: loadavg 17.89/13.69/14.68, rising.
+
+### 201a. THE HOLE
+
+`conv2d_backward_masked_{f64,f32}` puts `dweight` behind `output_mask[1]` and `dpadded` behind
+`output_mask[0]`, and then gathers `dout_flat` unconditionally — the one buffer both of them read
+and nothing else does.
+
+So `output_mask = [false, false, true]`, a backward that wants only the bias gradient, built the
+whole `[flat, out_ch]` gather and then looked at none of it: 2 MB in f64, 1 MB in f32 at the
+board's shape, plus the pass that fills it. A frozen conv with a trainable bias is an ordinary
+configuration, not a corner case.
+
+I wrote the f32 one (item 187) by mirroring the f64 one (item 178), so the mirror faithfully
+reproduced the hole. **Gating every consumer is not the same as gating the work, and the diff that
+adds the gates is exactly where the gap hides** — every line of it is about `output_mask`, and the
+one line that is not looks like setup.
+
+The fix is the obvious one: gather only when a consumer will read it. The existing mask test covers
+`[false, false, true]` and passes either way, because this is dead work rather than wrong work —
+which is why it survived being tested.
+
+### 201b. THE ROW DEFERRED FROM 793001ee
+
+That commit unified the f64 all-ones dispatch onto `conv2d_ones_dout_route`, removing the last
+three hand-rolled copies of the route guards, and shipped without a ledger row because a peer had
+an uncommitted item 200 in this file and staging it would have swept their 52 lines.
+
+Worth keeping from it: the copy in `conv2d_backward_masked_f64` carried a comment claiming it
+detected routes "the same way `conv2d_backward_f64` does, so the two functions cannot disagree".
+**That is the one assurance a second copy cannot give.** A comment asserting two copies agree is
+evidence they are expected to drift, not evidence they will not. Net 38 insertions, 38 deletions;
+the scan now runs at most once where the two-guard form could run it twice.
+
+conv3d's copy is deliberately untouched: different bead, and a peer is editing that region.
+
+### 201c. OWED
+
+Unchanged: compile items 194-201, then `FT_H2H_LANES=conv2d` at `round_warmup=0` once 1m ~ 5m ~ 15m.
+The host has swung between loadavg 4.9 and 85 across the last six ticks.

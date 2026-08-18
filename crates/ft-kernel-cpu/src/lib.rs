@@ -8311,7 +8311,15 @@ pub fn conv2d_backward_masked_f32(
         );
     }
 
-    let dout_flat = conv2d_dout_flat_f32(dout, batch, out_ch, patch_count);
+    // Only the dweight and dpanel GEMMs read this, and BOTH sit behind their own mask — so a
+    // bias-only backward was building the whole gather and then looking at none of it. A frozen
+    // conv with a trainable bias is an ordinary configuration, not a corner case, and at the
+    // board's shape the wasted buffer is 1 MB plus the pass that fills it.
+    let dout_flat = if output_mask[0] || output_mask[1] {
+        conv2d_dout_flat_f32(dout, batch, out_ch, patch_count)
+    } else {
+        Vec::new()
+    };
 
     let dweight = output_mask[1].then(|| {
         let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
@@ -9655,7 +9663,15 @@ pub fn conv2d_backward_masked_f64(
         );
     }
 
-    let dout_flat = conv2d_dout_flat_f64(dout, batch, out_ch, patch_count);
+    // Only the dweight and dpanel GEMMs read this, and BOTH sit behind their own mask — so a
+    // bias-only backward was building the whole gather and then looking at none of it. A frozen
+    // conv with a trainable bias is an ordinary configuration, not a corner case, and at the
+    // board's shape the wasted buffer is 2 MB plus the pass that fills it.
+    let dout_flat = if output_mask[0] || output_mask[1] {
+        conv2d_dout_flat_f64(dout, batch, out_ch, patch_count)
+    } else {
+        Vec::new()
+    };
 
     let dweight = output_mask[1].then(|| {
         let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
