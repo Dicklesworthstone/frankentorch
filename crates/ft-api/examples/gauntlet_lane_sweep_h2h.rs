@@ -767,13 +767,37 @@ fn timed_prelu(
 /// `batch` is a parameter rather than `C2_N` so the item 144 `conv2d_big*` twins share this exact
 /// body: a resize whose two sizes ran through different code would test the code as much as the
 /// size.
-fn timed_conv2d(values: &[f64], weights: &[f64], mask: Option<&[f64]>, batch: usize) -> (f64, f64) {
+/// `weight_grad` decides whether the WEIGHT requires grad — `frankentorch-hi9r6`, item 182.
+///
+/// Every conv2d lane on this board has passed `false`, which means PyTorch and FrankenTorch have
+/// both been measured on a step that computes NO weight gradient. `timed_linear` took the opposite
+/// decision deliberately, and says why in its own comment: a no-grad weight "would skip dweight
+/// and measure the wrong half". Conv2d never got that treatment.
+///
+/// This is not a cosmetic difference. Item 178 found that our first-order backward computed
+/// `dweight` regardless and threw it away — about 3.0 ms of a 16.6 ms backward — and fixed it by
+/// honouring `needs_input_grad`. That fix is worth ~18% on a lane whose weight is frozen and
+/// exactly nothing on a lane whose weight is not, so which lane the board carries decides whether
+/// item 178 reads as a real training win or as a faster route around work a training step needs.
+///
+/// Answering that by ARGUMENT is what this campaign keeps getting wrong, so both are now measured.
+fn timed_conv2d(
+    values: &[f64],
+    weights: &[f64],
+    mask: Option<&[f64]>,
+    batch: usize,
+    weight_grad: bool,
+) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(values.to_vec(), vec![batch, C2_CI, C2_H, C2_W], true)
         .expect("conv2d leaf");
     let w = session
-        .tensor_variable(weights.to_vec(), vec![C2_CO, C2_CI, C2_K, C2_K], false)
+        .tensor_variable(
+            weights.to_vec(),
+            vec![C2_CO, C2_CI, C2_K, C2_K],
+            weight_grad,
+        )
         .expect("conv2d weight");
     let m = mask.map(|values| {
         session
@@ -1064,6 +1088,10 @@ c3m=seq(2*32*8*16*16).reshape(2,32,8,16,16)
 c2x=seq(8*32*32*32).reshape(8,32,32,32)
 c2w=seq(32*32*3*3).reshape(32,32,3,3)
 c2m=seq(8*32*32*32).reshape(8,32,32,32)
+# item 182: the SAME weight values, but requiring grad, so the incumbent computes
+# dweight too. A lane where only OUR arm skips the weight gradient would not be a
+# comparison, it would be a handicap.
+c2w_train=seq(32*32*3*3).reshape(32,32,3,3).requires_grad_(True)
 # item 144: the doubled-batch twins, same weights, same generator.
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
@@ -1118,6 +1146,8 @@ LANES = {
     # arm nulls where a ~3 ms one would not.
     "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
+    # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
+    "conv2d_masked_train": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
@@ -1625,24 +1655,39 @@ LANES = {
             // frankentorch-58zjz item 126d: conv2d's SUMMED route, which takes the all-ones
             // fast path its 2026-07-05 adjoint provides.
             "conv2d",
-            Box::new(|| timed_conv2d(&c2x, &c2w, None, C2_N)),
+            Box::new(|| timed_conv2d(&c2x, &c2w, None, C2_N, false)),
         ),
         (
             // The same op under a NON-UNIFORM loss, reaching the generic backward -- the route
             // real training takes, and the one item 124 found algorithmically behind for conv3d.
             "conv2d_masked",
-            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N)),
+            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, false)),
         ),
         (
             // item 144: both routes again at double the batch. Item 137 certified NEITHER
             // conv2d lane because PyTorch's A/A null failed 5/5 while ours passed 5/5, and
             // item 137c blamed the incumbent arm's ~3 ms duration. These twins test that.
             "conv2d_big",
-            Box::new(|| timed_conv2d(&c2bx, &c2w, None, C2B_N)),
+            Box::new(|| timed_conv2d(&c2bx, &c2w, None, C2B_N, false)),
         ),
         (
             "conv2d_big_masked",
-            Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N)),
+            Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false)),
+        ),
+        (
+            // item 182: the SAME masked route with a GRAD-REQUIRING weight, so both arms compute
+            // dweight. Every other conv2d lane freezes the weight, which is not what a training
+            // step does and is the half `timed_linear` deliberately refuses to skip.
+            //
+            // ADDED, not swapped in — item 144e's rule. The frozen-weight lanes carry the
+            // certified 5.73x and every row quoted from it; moving them would invalidate that
+            // history to answer a question a new lane answers for free.
+            //
+            // This is also the control for item 178: honouring `needs_input_grad` is worth ~18%
+            // where the weight is frozen and NOTHING here, so the pair separates "we stopped
+            // computing a discarded gradient" from "conv2d got faster".
+            "conv2d_masked_train",
+            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true)),
         ),
         (
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate

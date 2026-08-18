@@ -33557,3 +33557,64 @@ This adds a route. Until the tests run, a mis-folded reduction is a wrong gradie
 Nothing here has been compiled. Owed: build; the two new f32 tests; the four existing conv2d
 acceptance tests; and then widening the two f64 fixtures above one k-block, which is a real gap in
 coverage independent of anything f32.
+
+## 182. EVERY conv2d LANE ON THE BOARD FREEZES ITS WEIGHT — SO "THE TRAINING ROUTE" HAS NEVER COMPUTED A WEIGHT GRADIENT
+
+`frankentorch-hi9r6` (P0). **UNBUILT**: build freeze — `/data` 26G, 99% used, loadavg
+5.97/7.24/8.06 — no cargo ran, nothing measured. `rustfmt --edition 2024 --check` exits 0.
+
+### 182a. THE FINDING
+
+`timed_conv2d` has always built its weight with `requires_grad = false`. All four conv2d lanes —
+including `conv2d_masked`, which carries this bead's certified **5.73x SLOWER** standing and has
+been described as "the route real training takes" since item 126d — therefore measure a step that
+computes **no weight gradient at all** on either arm.
+
+`timed_linear`, added in the same campaign, took the opposite decision on purpose and wrote down
+why: a no-grad weight "would skip dweight and measure the wrong half", so `linear_wide` and
+`linear_narrow` both carry `requires_grad_(True)`. Conv2d never got that treatment, and nobody
+noticed until item 178 went looking for work the incumbent skips.
+
+### 182b. WHY IT MATTERS MORE THAN IT LOOKS
+
+Item 178 found our first-order backward computing `dweight` and discarding it — ~3.0 ms of a
+16.6 ms backward — and fixed it by honouring `needs_input_grad`. **That fix is worth ~18% on a
+frozen-weight lane and exactly nothing on a lane that wants the weight gradient.**
+
+So the composition of the board decides how item 178 reads. On today's lanes it looks like an 18%
+improvement to the training route; on a lane that actually trains this layer it is worth zero. Both
+statements are true of different lanes, and only one of them is about a training step.
+
+That is the kind of question this campaign has repeatedly answered by argument and got wrong, so it
+is now measured: `conv2d_masked_train` runs the same masked route with a grad-requiring weight on
+BOTH arms.
+
+### 182c. ADDED, NOT SWAPPED — AND THE INCUMBENT ARM CHANGED TOO
+
+The frozen-weight lanes are untouched, per item 144e's rule: they carry the certified standing and
+every row quoted from it, and moving them would invalidate that history to answer a question a new
+lane answers for free. `weight_grad` is a parameter with all four existing call sites pinned to
+`false`, so no existing row can move.
+
+The PyTorch side gets `c2w_train = ....requires_grad_(True)` rather than reusing the frozen `c2w`.
+This is the part it would have been easy to get wrong: a lane where only OUR arm computes the
+weight gradient is not a comparison, it is a handicap — in whichever direction it happens to fall.
+The fixture is a grad-requiring copy of the same values, so both arms do the same work.
+
+### 182d. WHAT THE PAIR WILL SAY
+
+Three readings, and the pair distinguishes them where a single lane cannot:
+
+* `conv2d_masked_train` close to `conv2d_masked` — PyTorch's weight gradient is nearly free, and
+  ours is ~3 ms, which would make the dweight GEMM a much larger share of the real gap than item
+  141's table suggests.
+* both lanes shifted by a similar amount — the weight gradient costs both arms comparably and item
+  178's ~18% is a genuine saving that a training step simply cannot take.
+* the ratio moving in FT's favour on the train lane — we compute `dweight` more efficiently than
+  PyTorch relative to the rest, which would be worth knowing before any further work on that GEMM.
+
+Only the first two are things I would predict; the third would redirect items 170 and 172.
+
+NOT VERIFIED: compilation, and neither arm of this lane has ever run. The lane also needs its own
+A/A null before anything is quoted from it — item 144a is the standing reminder that a new lane's
+nullability is a property to be established, not assumed.
