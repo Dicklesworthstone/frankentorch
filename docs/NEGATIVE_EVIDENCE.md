@@ -35364,3 +35364,57 @@ threshold being measured against was never itself measured.**
 which live on the SUMMED route — the board needs a `conv2d_big` summed lane whose incumbent sits at
 11 ms; `conv2d_big` already is that lane, and its FT null read OFFSET this run, so it is one clean
 window away from being quotable too.
+
+## 204. THE conv3d f32 CLOSURE ITEM 202c FOUND — WIRED, AND THE FIRST VERSION OF THE FIX SAVED ALMOST NOTHING
+
+`frankentorch-l2zki`. **UNBUILT**: absolute throttle, `/data` 37G, no cargo, no artifact written, no
+new file. `rustfmt --edition 2024 --check` exits 0 on both files.
+
+### 204a. CLOSING THE HOLE
+
+Item 195 wired conv3d's first-order backward to honour `needs_input_grad`, and item 202c found that
+conv3d has **two** such closures — the f32 one at `lib.rs:32084` was untouched. `conv3d_backward_f32`
+now has a masked twin (`conv3d_backward_masked_f32`), the old name survives as a thin wrapper so
+existing callers are unaffected, and the ft-api f32 closure reads the mask.
+
+The detector from item 202 confirms it, which is the point of having built it: **28 ungated
+multi-gradient closures before, 27 now**, and `functional_conv3d` no longer appears in the
+conv-family list. `functional_conv2d_grouped` and `functional_conv_transpose2d` remain.
+
+Unlike f64, this route has no all-ones specialisation, so there is no second route predicate to
+duplicate and none of the drift hazard items 180c/195b guard against.
+
+### 204b. THE FIRST VERSION WAS NEARLY WORTHLESS, AND READING CAUGHT IT
+
+The gate initially wrapped only the `dweight` expression — leaving
+
+    let panel = conv3d_im2col_f32(..);   // 28.3 MB, built unconditionally
+    let dweight = output_mask[1].then(|| .. sgemm_tb(.., &panel, ..) ..);
+
+so masking skipped the GEMM and still paid the panel. **Item 188 measured that panel at 1.430 ms of
+the ~2.3 ms branch** — most of what the item exists to remove. The change would have looked correct,
+compiled (eventually), passed a bitwise test, and saved almost nothing.
+
+It surfaced because the gated body still referenced `&panel`, which meant the construction had to be
+outside the gate. Moving it inside is the actual fix.
+
+**This is the second time this session that reading the code after writing it found a defect the
+gates could not**: item 191d caught a `&String == &&str`, and `rustfmt` was happy with both.
+
+### 204c. AND MOVING IT DELETED A `drop(panel)` THAT WOULD NOT HAVE COMPILED
+
+With the panel inside the closure, the later `drop(panel)` — item 146's manual lifetime fix, worth
+1.61-2.00x on the f64 sibling — refers to a binding that no longer exists in that scope. It is
+removed, and the property it bought is now structural: the panel dies when the gated closure
+returns, before `dpanel` is allocated, so no scope has both buffers live.
+
+That is strictly better than the manual drop, and it was a consequence rather than a plan. Worth
+noting for the f64 sibling, which still carries its explicit `drop(panel)` because its panel is
+still built outside the gate — the same near-miss, unexamined, in code I wrote three items ago.
+
+### 204d. OWED
+
+Compilation above all: three edits in this file were applied by line index with asserts, and the
+technique is sound but unverified. Then the masked-vs-unmasked bitwise test for f32, which does not
+exist — item 196's conv3d test covers f64 only. And no f32 conv lane exists to measure any of it, so
+per item 152 this is coverage, not a certifiable win.

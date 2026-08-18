@@ -32081,12 +32081,19 @@ impl FrankenTorchSession {
                         );
                         Ok((out, vec![b_, oc, od_, oh_, ow_]))
                     },
-                    move |_ctx, grad_outputs, borrowed_inputs| {
+                    // item 203: the f32 sibling item 195 missed. Item 202c found it by
+                    // attributing the 28 ungated closures properly — conv3d has TWO
+                    // first-order backwards and item 195 wired only f64, so "I fixed
+                    // conv3d" was true and incomplete. Defensive read as in item 178.
+                    move |ctx, grad_outputs, borrowed_inputs| {
                         let dout_f32: Vec<f32> =
                             grad_outputs[0].iter().map(|&v| v as f32).collect();
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
-                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv3d_backward_f32(
+                        let need = ctx.needs_input_grad();
+                        let need_input = need.first().copied().unwrap_or(true);
+                        let need_weight = need.get(1).copied().unwrap_or(true);
+                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv3d_backward_masked_f32(
                             &dout_f32,
                             padded_values,
                             weight_values,
@@ -32105,20 +32112,16 @@ impl FrankenTorchSession {
                             sh_,
                             sw_,
                             oc,
-                            has_bias,
+                            [need_input, need_weight, has_bias],
                         );
                         let mut g = vec![
-                            Some(dpadded.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                            Some(dweight.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            dpadded.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            dweight.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
                         ];
                         if has_bias {
-                            g.push(Some(
-                                dbias
-                                    .unwrap()
-                                    .iter()
-                                    .map(|&v| v as f64)
-                                    .collect::<Vec<f64>>(),
-                            ));
+                            g.push(
+                                dbias.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            );
                         }
                         Ok(g)
                     },

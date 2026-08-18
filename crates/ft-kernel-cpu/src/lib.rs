@@ -15404,6 +15404,14 @@ pub fn conv3d_col2im_f32(
 /// at f32 precision (matches torch's f32 conv3d backward). frankentorch-lboou.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
+/// Full conv3d f32 backward — every gradient, exactly as before item 203.
+///
+/// Kept so existing callers need no change; `conv3d_backward_masked_f32` holds the body. Unlike
+/// the f64 sibling there is no all-ones specialisation on this route, so the masked entry point is
+/// the only one and no route-predicate is duplicated — the drift hazard items 180c and 195b guard
+/// for does not arise here.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn conv3d_backward_f32(
     dout: &[f32],
     padded: &[f32],
@@ -15425,6 +15433,64 @@ pub fn conv3d_backward_f32(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    let (dpadded, dweight, dbias) = conv3d_backward_masked_f32(
+        dout,
+        padded,
+        weight_flat,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+        has_bias,
+        [true, true, has_bias],
+    );
+    (
+        dpadded.unwrap_or_default(),
+        dweight.unwrap_or_default(),
+        dbias,
+    )
+}
+
+/// conv3d f32 backward computing ONLY the gradients asked for — `frankentorch-l2zki`, item 203.
+///
+/// `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's `convolution_backward`.
+/// The f64 twin is item 195; item 202c found this closure still ungated because conv3d has TWO
+/// first-order backwards and item 195 wired only one.
+///
+/// **UNBUILT**: written under an absolute disk throttle; not compiled, not tested, not measured.
+pub fn conv3d_backward_masked_f32(
+    dout: &[f32],
+    padded: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>) {
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let flat = batch * patch_count;
@@ -15439,9 +15505,6 @@ pub fn conv3d_backward_f32(
                 *d = dout[(n * out_ch + oc) * patch_count + p];
             }
         });
-    let panel = conv3d_im2col_f32(
-        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-    );
     // dweight = dout_flat^T @ panel via sgemm_tb (strided-transpose read of
     // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     // UNBUILT (build freeze, /data 29G): not compiled, tested or measured.
@@ -15458,12 +15521,23 @@ pub fn conv3d_backward_f32(
     // GUARD: `gemm::sgemm`-family wrappers return EARLY on `m == 0 || n == 0`, before
     // matrixmultiply's own zero-fill can run, so a degenerate shape would hand back an
     // uninitialized buffer.
-    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f32]| {
-        if out_ch == 0 || patch_width == 0 || flat == 0 {
-            dweight.fill(0.0);
-            return;
-        }
-        gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+    // item 203: the expensive half — the im2col panel and the dweight GEMM. Item 202c found
+    // this closure still ungated after item 195 wired only the f64 sibling: conv3d has TWO
+    // first-order backwards, and "I fixed conv3d" was true and incomplete.
+    let dweight = output_mask[1].then(|| {
+        // item 204: the panel is built INSIDE the gate. Built outside it, masking would
+        // have skipped only the GEMM and still paid the 28.3 MB im2col materialisation —
+        // which item 188 measured as 1.430 ms of the ~2.3 ms branch, i.e. most of it.
+        let panel = conv3d_im2col_f32(
+            padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        build_uninit(out_ch * patch_width, |dweight: &mut [f32]| {
+            if out_ch == 0 || patch_width == 0 || flat == 0 {
+                dweight.fill(0.0);
+                return;
+            }
+            gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+        })
     });
     // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
     //
@@ -15481,7 +15555,10 @@ pub fn conv3d_backward_f32(
     //
     // BIT-EXACT WITHOUT AN ARGUMENT: a LIFETIME changes, not an operation. Nothing is
     // reordered, recomputed, or read after this point.
-    drop(panel);
+    // item 204: `drop(panel)` is no longer needed and no longer COMPILES — the panel now
+    // lives inside the gated closure above, so it is freed when that closure returns,
+    // before `dpanel` is allocated. Item 146's lifetime fix is now structural rather than
+    // manual: there is no scope in which both buffers are live.
     // STOP ZEROING A BUFFER THE GEMM OVERWRITES — `frankentorch-hi9r6`, item 152.
     //
     // UNBUILT: written under a build freeze (/data 31G, 99%), so this is NOT compiled, tested
@@ -15507,17 +15584,20 @@ pub fn conv3d_backward_f32(
     //
     // BIT-EXACT: allocation changes, computation does not. The GEMM performs the same stores in
     // the same order; only the dead pass before it is gone.
-    let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
-        if flat == 0 || patch_width == 0 {
-            dpanel.fill(0.0);
-            return;
-        }
-        gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+    // item 203: dinput's half, gated. f32 mirror of item 195.
+    let dpadded = output_mask[0].then(|| {
+        let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
+            if flat == 0 || patch_width == 0 {
+                dpanel.fill(0.0);
+                return;
+            }
+            gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+        });
+        conv3d_col2im_f32(
+            &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        )
     });
-    let dpadded = conv3d_col2im_f32(
-        &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-    );
-    let dbias = if has_bias {
+    let dbias = if output_mask[2] {
         let mut db = vec![0.0f32; out_ch];
         db.par_iter_mut().enumerate().for_each(|(oc, dbo)| {
             let mut s = 0.0f32;
