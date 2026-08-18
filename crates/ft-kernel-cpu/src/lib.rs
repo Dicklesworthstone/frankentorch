@@ -8244,9 +8244,23 @@ pub fn conv2d_backward_f32(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let flat = batch * patch_count;
-    // The all-ones adjoint, which this dtype did not have — see
-    // `conv2d_backward_3x3_stride1_ones_dout_f32`. Guard mirrors the f64 route's exactly so the
-    // two dtypes cannot drift into taking different routes for the same call.
+    // The all-ones adjoints, which this dtype did not have — see
+    // `conv2d_backward_3x3_stride1_ones_dout_f32`. Both guards, and their ORDER, mirror the f64
+    // route's exactly so the two dtypes cannot drift into taking different routes for one call.
+    if ph == 1 && kh == 1 && oh == 1 && !dout.is_empty() && dout_is_all_ones_f32(dout) {
+        return conv2d_backward_height1_ones_dout_f32(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            pw,
+            kw,
+            ow,
+            sw,
+            out_ch,
+            has_bias,
+        );
+    }
     if ph > 1
         && oh > 1
         && kh == 3
@@ -9967,6 +9981,135 @@ fn conv2d_ones_dout_scatter_dpadded_f64(
                 dp.copy_from_slice(&protos[c * plane_len..(c + 1) * plane_len]);
             });
     })
+}
+
+/// f32 mirror of [`conv2d_ones_dout_height1_dpadded_f64`]: prototype per channel, then broadcast.
+///
+/// Same reasoning, including the asymmetry that matters — `protos` STAYS ZERO-FILLED because the
+/// accumulation reads what it adds into and the taps need not tile the plane, while the broadcast
+/// target is `build_uninit` because `copy_from_slice` covers every element of every plane.
+fn conv2d_ones_dout_height1_dpadded_f32(
+    dpanel_row: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pw: usize,
+    kw: usize,
+    ow: usize,
+    sw: usize,
+) -> Vec<f32> {
+    if pw == 0 || in_ch == 0 || batch == 0 {
+        return Vec::new();
+    }
+    let mut protos = vec![0.0f32; in_ch * pw];
+    protos.par_chunks_mut(pw).enumerate().for_each(|(c, dp)| {
+        let row = &dpanel_row[c * kw..(c + 1) * kw];
+        for ox in 0..ow {
+            let base = ox * sw;
+            for kc in 0..kw {
+                dp[base + kc] += row[kc];
+            }
+        }
+    });
+    build_uninit(batch * in_ch * pw, |d: &mut [f32]| {
+        d.par_chunks_mut(pw).enumerate().for_each(|(plane, dp)| {
+            let c = plane % in_ch;
+            dp.copy_from_slice(&protos[c * pw..(c + 1) * pw]);
+        });
+    })
+}
+
+/// f32 mirror of [`conv2d_backward_height1_ones_dout_f64`] — the second route f32 did not have.
+///
+/// The height-1 guard (`ph == kh == oh == 1`) is the conv1d-shaped path, and like the 3x3 route it
+/// was f64-only. Both halves keep the f64 reasoning: `dweight_row` folds on [`SGEMM_KC`] because
+/// the GEMM it replaces blocks `k` there, and `dpanel_row` is one real `sgemm` row rather than a
+/// hand-rolled chain over `oc`, which is bit-identical by construction rather than by argument.
+///
+/// `dbias` replays the sequential sum for the reason item 179 gives: `flat as f32` is NOT the value
+/// the generic route's `s += dout[..]` accumulator reaches once `flat` passes `2^24 + 1`, and the
+/// f64 line it mirrors is correct only because 53 bits put that boundary out of reach.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_backward_height1_ones_dout_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pw: usize,
+    kw: usize,
+    ow: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    let patch_width = in_ch * kw;
+    let flat = batch * ow;
+
+    let mut dweight_row = vec![0.0f32; patch_width];
+    dweight_row
+        .par_chunks_mut(kw)
+        .enumerate()
+        .for_each(|(c, dw)| {
+            for (kc, slot) in dw.iter_mut().enumerate() {
+                let mut total = 0.0f32;
+                let mut block = 0.0f32;
+                let mut in_block = 0usize;
+                let mut folded = false;
+                for n in 0..batch {
+                    let base = (n * in_ch + c) * pw + kc;
+                    for ox in 0..ow {
+                        block += padded[base + ox * sw];
+                        in_block += 1;
+                        if in_block == SGEMM_KC {
+                            if folded {
+                                total += block;
+                            } else {
+                                total = block;
+                                folded = true;
+                            }
+                            block = 0.0;
+                            in_block = 0;
+                        }
+                    }
+                }
+                if in_block > 0 {
+                    if folded {
+                        total += block;
+                    } else {
+                        total = block;
+                    }
+                }
+                *slot = total;
+            }
+        });
+
+    let mut dweight = vec![0.0f32; out_ch * patch_width];
+    dweight
+        .par_chunks_mut(patch_width)
+        .for_each(|row| row.copy_from_slice(&dweight_row));
+
+    let ones_out = vec![1.0f32; out_ch];
+    let mut dpanel_row = vec![0.0f32; patch_width];
+    gemm::sgemm(
+        1,
+        out_ch,
+        patch_width,
+        &ones_out,
+        weight_flat,
+        &mut dpanel_row,
+    );
+
+    let dpadded = conv2d_ones_dout_height1_dpadded_f32(&dpanel_row, batch, in_ch, pw, kw, ow, sw);
+
+    let dbias = if has_bias {
+        let mut acc = 0.0f32;
+        for _ in 0..flat {
+            acc += 1.0;
+        }
+        Some(vec![acc; out_ch])
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
 }
 
 /// f32 mirror of [`conv2d_ones_dout_scatter_dpadded_f64`]: prototype per channel, then broadcast.
@@ -64978,5 +65121,96 @@ mod tests {
             z[len - 1] = -0.0;
             assert!(!super::dout_is_all_ones_f32(&z));
         }
+    }
+
+    /// The f32 height-1 all-ones adjoint must be BIT-IDENTICAL to the generic panel+GEMM route.
+    ///
+    /// Like the 3x3 f32 test, one fixture crosses `SGEMM_KC` — the f64 height-1 acceptance test
+    /// runs at `flat = 3*17 = 51`, a single k-block, where a fold on the wrong boundary is
+    /// invisible. Another uses `sw = 2`, so the taps do not tile the plane and the prototype's
+    /// zero-fill is load-bearing: positions no tap reaches must come back `+0.0`.
+    #[test]
+    fn conv2d_height1_ones_dout_backward_f32_matches_generic_reference() {
+        let mut crossed_the_fold = false;
+        for &(batch, in_ch, out_ch, pw, kw, ow, sw) in &[
+            // flat = 400, above SGEMM_KC.
+            (2usize, 3usize, 4usize, 202usize, 3usize, 200usize, 1usize),
+            // the f64 fixture's shape: flat = 51, one block.
+            (3, 4, 5, 19, 3, 17, 1),
+            // sw = 2 with a tail: positions 11 and 12 are never written by any tap.
+            (2, 2, 3, 13, 3, 5, 2),
+        ] {
+            let patch_width = in_ch * kw;
+            let flat = batch * ow;
+            crossed_the_fold |= flat > super::SGEMM_KC;
+
+            let padded: Vec<f32> = (0..batch * in_ch * pw)
+                .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.03125)
+                .collect();
+            let weight: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| ((i * 29 % 97) as f32 - 48.0) * 0.015625)
+                .collect();
+            let dout = vec![1.0f32; batch * out_ch * ow];
+
+            let panel = super::conv2d_im2col_f32(&padded, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw);
+            let mut dout_flat = vec![0.0f32; flat * out_ch];
+            for row in 0..flat {
+                let n = row / ow;
+                let pc = row % ow;
+                for oc in 0..out_ch {
+                    dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * ow + pc];
+                }
+            }
+            let mut want_dw = vec![0.0f32; out_ch * patch_width];
+            super::gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut want_dw);
+            let mut dpanel = vec![0.0f32; flat * patch_width];
+            super::gemm::sgemm(flat, out_ch, patch_width, &dout_flat, &weight, &mut dpanel);
+            let want_dp =
+                super::conv2d_col2im_f32(&dpanel, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw);
+            let want_db = {
+                let mut acc = 0.0f32;
+                for _ in 0..flat {
+                    acc += 1.0;
+                }
+                vec![acc; out_ch]
+            };
+
+            let (got_dp, got_dw, got_db) = super::conv2d_backward_height1_ones_dout_f32(
+                &padded, &weight, batch, in_ch, pw, kw, ow, sw, out_ch, true,
+            );
+            assert_eq!(got_dp.len(), want_dp.len());
+            for (i, (&g, &w)) in got_dp.iter().zip(want_dp.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "dpadded[{i}] direct {g} vs generic {w} at flat={flat} sw={sw}"
+                );
+            }
+            for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "dweight[{i}] direct {g} vs generic {w} at flat={flat} \
+                     (a fold on the wrong boundary shows up HERE and only above SGEMM_KC)"
+                );
+            }
+            assert_eq!(got_db.unwrap(), want_db);
+
+            // The public entry must ROUTE here, not merely agree when called by hand.
+            let (disp_dp, disp_dw, disp_db) = super::conv2d_backward_f32(
+                &dout, &padded, &weight, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw, out_ch, true,
+            );
+            for (i, (&g, &w)) in disp_dp.iter().zip(want_dp.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "dispatched dpadded[{i}]");
+            }
+            for (i, (&g, &w)) in disp_dw.iter().zip(want_dw.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "dispatched dweight[{i}]");
+            }
+            assert_eq!(disp_db.unwrap(), want_db);
+        }
+        assert!(
+            crossed_the_fold,
+            "no fixture exceeded SGEMM_KC, so this test cannot see a mis-folded reduction at all"
+        );
     }
 }

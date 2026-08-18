@@ -33503,3 +33503,57 @@ skipping is FASTER — that is item 178's owed paired run, and this test would p
 the masked path were slower.
 
 NOT VERIFIED: compilation, and this test has never run.
+
+## 181. THE SECOND STRANDED f32 ROUTE — AND BOTH f64 ACCEPTANCE TESTS RUN UNDER ONE k-BLOCK, SO NEITHER CAN SEE THE BUG ITS OWN ROUTE SHIPPED WITH
+
+`frankentorch-hi9r6`. **UNBUILT AND UNVERIFIED.** Build freeze — `/data` 26G, 99% used, loadavg
+6.06/7.23/8.06 on the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 181a. THE CHANGE
+
+Item 179 gave f32 the 3x3 all-ones adjoint. `conv2d_backward_f32` had a second missing dispatch:
+the height-1 (`ph == kh == oh == 1`, conv1d-shaped) route, also f64-only since July. This adds it,
+with both guards and — deliberately — their ORDER mirroring the f64 route's, so the two dtypes
+cannot drift into taking different routes for one call.
+
+The `dbias` here replays the sequential sum for item 179's reason rather than using `flat as f32`.
+That correction was found on the 3x3 route and applies unchanged to this one; had I mirrored the
+f64 line a second time I would have reproduced the same defect twice in two commits.
+
+### 181b. THE TEST OBSERVATION, WHICH IS THE PART WORTH KEEPING
+
+Both f64 acceptance tests for these routes run below one GEMM k-block:
+
+    conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference     flat = 2*30 = 60
+    conv2d_height1_ones_dout_backward_matches_generic_reference         flat = 3*17 = 51
+                                                                        SGEMM_KC/DGEMM_KC = 256
+
+Under one block there is a single partial and **every summation order gives the same answer**. The
+fold these routes perform is therefore untested by their own acceptance tests — and this is not
+hypothetical: the f64 3x3 route SHIPPED with a wrong fold, and `frankentorch-ikw6q` found it at
+`oh = ow = 64` (104 of 108 dweight entries differed), not through these tests, which passed
+throughout.
+
+**A test whose fixture sits entirely inside one block of a blocked algorithm is testing the
+algorithm's easy case and reporting on its hard one.** The two f32 tests added here each carry a
+fixture above `SGEMM_KC` (`flat = 288` and `flat = 400`) and assert that at least one did, so the
+fixtures cannot drift back under the boundary unnoticed. The height-1 test also carries `sw = 2`
+with a tail, so the prototype's zero-fill is load-bearing in at least one fixture.
+
+The f64 tests are NOT changed here. Widening someone else's acceptance fixtures is a separate
+decision from adding my own, and doing it in the same commit would put an unrelated failure into a
+change that is already unverifiable. Recorded as owed instead: both f64 fixtures should gain a
+crossing shape.
+
+### 181c. BOTH ROUTES ALSO DRIVE THE PUBLIC ENTRY
+
+Each test calls `conv2d_backward_f32` in addition to the adjoint directly. An adjoint that agrees
+when called by hand and is never reached is not a fast path, and the dispatch predicate is exactly
+the kind of thing that looks obviously right and is worth one assert.
+
+### 181d. THE HAZARD IS ITEM 179's, UNCHANGED
+
+This adds a route. Until the tests run, a mis-folded reduction is a wrong gradient, not a slow one.
+Nothing here has been compiled. Owed: build; the two new f32 tests; the four existing conv2d
+acceptance tests; and then widening the two f64 fixtures above one k-block, which is a real gap in
+coverage independent of anything f32.
