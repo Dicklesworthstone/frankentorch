@@ -1146,6 +1146,8 @@ LANES = {
     # arm nulls where a ~3 ms one would not.
     "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
+    # item 190: byte-identical twin of conv2d_masked, so the warm/cold A/B is one invocation.
+    "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
     "conv2d_masked_train": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
@@ -1355,6 +1357,43 @@ LANES = {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // PER-LANE warm-up — `frankentorch-hi9r6`, item 190, fixing a defect in item 167.
+    //
+    // Item 167 made the warm-up symmetric across the two ARMS and then made the toggle itself
+    // impossible to alternate within a process: it is read once into a `let`, so its own A/B could
+    // only ever be two invocations. Item 189 then ran exactly that A/B and had to discard the
+    // magnitude, because loadavg was 16.2 in one run and 27.5 in the other — the cross-run pairing
+    // this campaign has got wrong more than any other single thing.
+    //
+    // `set_pool_output_zeroed` and `set_gemm_tile_col_floor_adaptive` were both given in-process
+    // switchability deliberately, for the reason item 25 gives: a cross-binary — or here
+    // cross-invocation — comparison cannot attribute a few percent to any one change. The warm-up
+    // needed the same property and did not have it.
+    //
+    // Naming the lanes rather than flipping a global is what makes it work inside ONE sweep: a
+    // lane registered twice under two names, with only one name listed here, is measured warm and
+    // cold in the same window, on the same ELF, interleaved round by round with the same incumbent.
+    //
+    // Empty (the default) preserves item 167's behaviour exactly: the global applies to every lane,
+    // so no existing invocation changes meaning.
+    let round_warmup_lanes: Vec<String> = std::env::var("FT_H2H_ROUND_WARMUP_LANES")
+        .map(|spec| {
+            spec.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if round_warmup > 0 {
+        println!(
+            "round_warmup_lanes={} (FT_H2H_ROUND_WARMUP_LANES; empty = every lane)",
+            if round_warmup_lanes.is_empty() {
+                "<all>".to_owned()
+            } else {
+                round_warmup_lanes.join(",")
+            }
+        );
+    }
     println!(
         "sampling=balanced-square {} (frankentorch-xdw0h); {} rounds, four live samples per arm \
          per round, torch threads=8",
@@ -1675,6 +1714,14 @@ LANES = {
             Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false)),
         ),
         (
+            // item 190: the SAME lane as conv2d_masked, registered under a second name so one
+            // sweep can measure it warmed and cold in the same window. The closure is identical
+            // on purpose -- if these two rows differ by anything but the warm-up, the difference
+            // is the host, and that is exactly what item 189 could not rule out across two runs.
+            "conv2d_masked_warm",
+            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, false)),
+        ),
+        (
             // item 182: the SAME masked route with a GRAD-REQUIRING weight, so both arms compute
             // dweight. Every other conv2d lane freezes the weight, which is not what a training
             // step does and is the half `timed_linear` deliberately refuses to skip.
@@ -1983,7 +2030,19 @@ LANES = {
             // the masked lanes (which show no slot-0 step) barely move. If instead the summed
             // null stays high, item 147 is wrong about the mechanism and slot 0 is a symptom of
             // something else.
-            for _ in 0..round_warmup {
+            // item 190: warm only the lanes named, so one sweep can carry a lane twice — once
+            // warmed, once not — and the comparison stays inside a single window.
+            let lane_warmup =
+                // `name` is `&&str` here (the lane vec is `Vec<(&str, LaneRun)>`), so this compares
+                // via `as_str()` and a deref rather than `&String == &&str`, which has no impl.
+                if round_warmup_lanes.is_empty()
+                    || round_warmup_lanes.iter().any(|l| l.as_str() == *name)
+                {
+                    round_warmup
+                } else {
+                    0
+                };
+            for _ in 0..lane_warmup {
                 if !isolate_incumbent {
                     let _ = run_lane();
                 }

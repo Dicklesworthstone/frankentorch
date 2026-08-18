@@ -34340,6 +34340,65 @@ passed.
 That points at the resize item 144 already built — `conv2d_big_masked` — as the lane most likely to
 certify. Next quiet window: that lane, at `round_warmup=0`, repeated until the gates hold.
 
+## 191. THE WARM-UP TOGGLE IS NOW PER-LANE, SO ITS OWN A/B FITS IN ONE INVOCATION — AND A PEER'S ITEM 189 SAYS THAT IS NOT OPTIONAL
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED**: disk throttle in force, `/data` 67G and
+falling, no cargo run of any kind. `rustfmt --edition 2024 --check` exits 0 — which item 186
+established proves only that the file PARSES.
+
+### 191a. THE DEFECT, WHICH WAS MINE
+
+Item 167 gave the round warm-up a careful symmetric design across the two ARMS and then made the
+toggle itself un-alternatable: `FT_H2H_ROUND_WARMUP` is read once into a `let`, so warm and cold can
+only ever be two invocations. Item 190 ran that A/B and had to throw the magnitude away, because
+loadavg was 16.2 in one run and 27.5 in the other.
+
+`set_pool_output_zeroed` and `set_gemm_tile_col_floor_adaptive` were both given in-process
+switchability on purpose, for item 25's reason. The warm-up needed the same property and I did not
+give it one.
+
+### 191b. A PEER'S ITEM 189 MAKES THIS URGENT RATHER THAN TIDY
+
+Their item 189, measured on the SAME ELF `2462293598f1` and the same host as item 190, found the
+**incumbent arm moving 1.94x between two invocations**. Not our arm — PyTorch's, byte-identical
+code, same machine.
+
+That is the strongest statement yet that a cross-invocation comparison on this host is worthless at
+the few-percent scale, and it applies directly to item 190's warm/cold pair. Two agents reached the
+same conclusion from opposite directions within the same hour: they by watching the incumbent move,
+I by watching my own A/B dissolve into a load difference.
+
+### 191c. THE CHANGE
+
+`FT_H2H_ROUND_WARMUP_LANES` names which lanes get the warm-up. Empty — the default — keeps item
+167's behaviour exactly, so no existing invocation changes meaning.
+
+`conv2d_masked_warm` is registered as a byte-identical twin of `conv2d_masked` on BOTH arms: same
+Rust closure, same Python lambda, same fixtures. Running it alongside `conv2d_masked` with only the
+twin named in `FT_H2H_ROUND_WARMUP_LANES` measures the same work warmed and cold **in one process,
+one window, one ELF, interleaved round by round against the same incumbent**. If those two rows
+differ by anything other than the warm-up, the difference is the host — which is exactly what item
+190 could not rule out.
+
+### 191d. A TYPE ERROR CAUGHT BY READING, NOT BY THE GATE
+
+The first version compared `round_warmup_lanes.iter().any(|l| l == name)`. The lane vector is
+`Vec<(&str, LaneRun<'_>)>`, so `name` is `&&str` while `l` is `&String` — **`&String == &&str` has
+no `PartialEq` impl and would not have compiled.** `rustfmt --check` passed on it happily, which is
+item 186's lesson arriving again within two turns of being written down.
+
+It was found by checking the existing lane filter's idiom —
+`wanted.iter().any(|w| name.contains(w.as_str()))` — rather than by re-reading the line I had just
+written. **Under a no-compiler rule, reading a neighbouring line that does the same job is the
+strongest check available**, and stronger than re-reading my own, which is where the error came
+from.
+
+### 191e. OWED
+
+A compile, and then the one-invocation A/B this exists for. Item 190e's target is unchanged and now
+cheaper to reach: `conv2d_big_masked` at `round_warmup=0` is the lane most likely to certify,
+because its incumbent arm is long enough to null.
+
 ## 190. ITEM 178'S SKIP WAS NEVER DEMONSTRATED, ONLY WIRED — NOW IT IS, FOR BOTH DTYPES
 
 `frankentorch-hi9r6`. BUILT AND TESTED. `/data` 68G free, host `thinkstation1`, loadavg
