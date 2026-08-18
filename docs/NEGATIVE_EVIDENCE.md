@@ -31944,3 +31944,86 @@ here, but it belongs on the record next to any bit-exactness claim about this pa
 
 VERIFIED: `rustfmt --edition 2024 --check` exits 0. NOT VERIFIED: compilation, and every
 number above is read from a peer's comment rather than re-measured.
+
+## 158. conv2d's FORWARD RE-STREAMED ITS ENTIRE OUTPUT BUFFER ONCE PER CHANNEL — 32x THE TRAFFIC TO MOVE 2 MB — AND THE BLOCKED TRANSPOSE IT NEEDED WAS ALREADY IN THE FILE
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 28G, 99% used,
+loadavg 6.79/7.93/9.04 — no cargo ran. `rustfmt --edition 2024 --check` exits 0: parses,
+format-clean, not a compile and not a test.
+
+### 158a. THE PASS
+
+`conv2d_forward_f64` finishes by turning `out_flat` [flat, out_ch] into NCHW. It did that with a
+strided gather:
+
+    orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo
+
+For each `(n, oc)` row it walks `p` with a stride of `out_ch` f64 — **256 bytes at the scored
+shape**, so every single read lands on its own cache line, and each of the 32 `oc` values
+re-streams the whole buffer. Moving 2 MB costs on the order of 32 x 2 MB of memory traffic.
+
+This was not unknown. The 1x1 fast path twenty lines above names "the strided output-transpose
+pass" as one of the two things it is glad to skip. The general path — the one every 3x3
+convolution takes, including this bead's lanes — had no way to skip it, and nothing had gone back
+to make it cheaper.
+
+### 158b. THE FIX WAS ALREADY IN THE FILE
+
+`transpose_2d_into_f64` is this crate's register-blocked AVX2 transpose: 4x4 blocks transposed in
+registers so BOTH the loads and the stores are contiguous, parallel above `1 << 16`, and already
+documented as pure data movement writing each destination element exactly once. It backs the
+permute/transpose surface (`project_permute_parallel_vein`, 3.55-5.50x there).
+
+The forward was hand-rolling a scalar gather next door to it.
+
+**PER BATCH, WHICH IS THE ONLY REASON THIS IS NOT A ONE-LINER.** A single transpose of `out_flat`
+[flat, out_ch] produces [out_ch, batch, patch_count] — `out_ch` outermost — and NCHW needs
+[batch, out_ch, patch_count]. Taken one batch at a time, `out_flat`'s rows
+`n*patch_count .. (n+1)*patch_count` form a [patch_count, out_ch] matrix whose transpose is
+exactly `out[n]`. The batch loop supplies the outer dimension; the blocked kernel does the rest.
+
+The per-batch matrix is 32768 elements, *below* `transpose_2d_into_f64`'s own `1 << 16` gate, so
+each inner transpose runs serial and the parallelism comes from the batch chunks — 8 or 16 tasks
+at the scored shapes, which is what `RAYON_NUM_THREADS=8` wants, with no nested fork/join.
+
+### 158c. THE SIGNED-ZERO TRAP I ALMOST WALKED INTO
+
+The bias add is now a second pass, and the obvious optimisation is to skip rows whose bias is
+zero. **That would break bit-exactness.** `-0.0 + 0.0` is `+0.0`, so skipping leaves `-0.0` where
+the old fused `src + bo` produced `+0.0`. Any output element that comes out as negative zero with
+a `+0.0` bias would differ.
+
+It is written unconditionally, and the test seeds a bias containing `-0.0` so the case is actually
+exercised rather than merely reasoned about. `project_prelu_zero_convention` (torch branches on
+`x > 0`, not `x >= 0`) and `project_lerp_fma_parity` are the same class of mistake, both found
+long after the code shipped, and both in code whose author had thought about zeros.
+
+### 158d. THE TEST LOCKS A CLAIM THAT WAS NEVER ASSERTED
+
+The streaming path has always claimed in its own comment that tiling M leaves matrixmultiply's
+micro-kernel K-order untouched, so it is bit-identical to one wide GEMM over the full panel.
+Nothing checked that. The new test builds the full-panel reference out of public pieces of the
+same crate — `conv2d_im2col_f64`, one wide `dgemm_bt`, a scalar index-by-index transpose — and
+compares by `to_bits()` across four geometries including a three-tile case and `out_ch = 5` and
+`out_ch = 1` (so the transpose's non-multiple-of-4 tail and single-row degenerate cases are hit).
+
+**A failure here would be more interesting than a pass**, and the two causes are distinguishable:
+the reference's single wide GEMM takes the parallel row-split while each tile's GEMM runs serial,
+so if M-tiling does perturb K-order the values move by an ULP everywhere; a transpose error
+instead puts correct values at wrong indices. That would be a finding about the streaming path as
+it has stood since `frankentorch-conv2d-stream`, not about this change.
+
+### 158e. PREDICTION
+
+The gather is ~2 MB of output built from ~64 MB of read traffic; the blocked transpose reads and
+writes each byte once. If the pass is bandwidth-bound, most of that traffic disappears. Against a
+2.685 ms forward this is the largest single lever I have found in it.
+
+**Refuted if** the hardware prefetcher was already hiding the stride — 32 concurrent streams is
+within range of a modern prefetcher, and `project_bandwidth_bound_frontier` records this vein
+delivering under 2x when the access pattern was already being predicted. **Also refuted if** the
+AVX2 path declines at `out_ch = 32` for a reason I have not read closely enough, in which case
+this buys only the loop restructuring and not the vectorisation.
+
+Also folded in, and noted because item 156 listed it as owed: `out`'s dead `vec![0.0; ..]` fill is
+gone, since the transpose writes every element. `out_flat`'s remains, and is still owed.

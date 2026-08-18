@@ -8300,17 +8300,68 @@ pub fn conv2d_forward_f64(
                 gemm::dgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
             },
         );
-    let mut out = vec![0.0f64; batch * out_ch * patch_count];
-    out.par_chunks_mut(patch_count)
-        .enumerate()
-        .for_each(|(idx, orow)| {
-            let n = idx / out_ch;
-            let oc = idx % out_ch;
-            let bo = bias.map_or(0.0, |bb| bb[oc]);
-            for p in 0..patch_count {
-                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
-            }
-        });
+    // THE OUTPUT TRANSPOSE READS `out_flat` ONCE, NOT ONCE PER CHANNEL — item 158.
+    //
+    // UNBUILT — written under a build freeze; not compiled, not measured.
+    //
+    // The pass this replaces gathered with a stride: for each `(n, oc)` row it walked
+    // `out_flat[(n*patch_count + p)*out_ch + oc]`, a stride of `out_ch` f64 = 256 bytes at the
+    // scored shape, so every read landed on its own cache line and each of the 32 `oc` values
+    // re-streamed the whole [flat, out_ch] buffer. Moving 2 MB cost roughly 32 x 2 MB of traffic.
+    // The 1x1 fast path above already calls this out as "the strided output-transpose pass" it is
+    // glad to skip; the general path had to pay it.
+    //
+    // `transpose_2d_into_f64` is this file's register-blocked AVX2 transpose (4x4 blocks in
+    // registers, so BOTH loads and stores are contiguous), already parallel and already documented
+    // as pure data movement writing each destination element exactly once.
+    //
+    // PER BATCH, WHICH IS THE WHOLE TRICK. A single transpose of `out_flat` [flat, out_ch] yields
+    // [out_ch, batch, patch_count] — `out_ch` outermost — but NCHW needs [batch, out_ch,
+    // patch_count]. Taken one batch at a time, `out_flat`'s rows `n*patch_count ..
+    // (n+1)*patch_count` are a [patch_count, out_ch] matrix whose transpose is exactly `out[n]`.
+    // So the batch loop supplies the outer dimension and the blocked kernel does the rest.
+    //
+    // The per-batch matrix is `patch_count*out_ch` = 32768 elements, below
+    // `transpose_2d_into_f64`'s own `1 << 16` parallel gate, so each inner transpose runs SERIAL
+    // and the parallelism comes from the batch chunks — 8 or 16 tasks at the scored shapes, which
+    // is what `RAYON_NUM_THREADS=8` wants. No nested fork/join.
+    //
+    // BIT-EXACT, in two parts. The transpose is pure movement, so every output value is a byte
+    // copy of the value the old gather read. The bias is then one addition per element with the
+    // same two operands as before (`src + bo`), and additions on distinct elements are independent,
+    // so iteration order cannot change any rounding.
+    //
+    // THE BIAS ADD IS DELIBERATELY UNCONDITIONAL. Skipping it when `bo == 0.0` looks free and is
+    // not: `-0.0 + 0.0` is `+0.0`, so a skip would leave `-0.0` where the old code produced `+0.0`
+    // and this would stop being bit-exact on signed zeros. `project_prelu_zero_convention` and
+    // `project_lerp_fma_parity` are both this same class of mistake found late.
+    //
+    // `build_uninit` is sound here for the usual reason plus an ordering one: the transpose pass
+    // writes every element of `o` before the bias pass reads any of them, so nothing reads
+    // uninitialized memory. It also subsumes the dead `vec![0.0; ..]` fill item 156 listed as owed.
+    let out = build_uninit(batch * out_ch * patch_count, |o: &mut [f64]| {
+        o.par_chunks_mut(out_ch * patch_count)
+            .enumerate()
+            .for_each(|(n, obatch)| {
+                let base = n * patch_count * out_ch;
+                transpose_2d_into_f64(
+                    &out_flat[base..base + patch_count * out_ch],
+                    obatch,
+                    patch_count,
+                    out_ch,
+                );
+            });
+        if let Some(bb) = bias {
+            o.par_chunks_mut(patch_count)
+                .enumerate()
+                .for_each(|(idx, orow)| {
+                    let bo = bb[idx % out_ch];
+                    for v in orow.iter_mut() {
+                        *v += bo;
+                    }
+                });
+        }
+    });
     out
 }
 
@@ -44505,6 +44556,103 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// frankentorch-hi9r6 item 158: the streaming conv2d forward must equal the FULL-PANEL path
+    /// bit-for-bit, including after the output transpose was replaced with the blocked kernel.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// This is the claim the streaming path has always made in its own comment — that tiling M
+    /// leaves matrixmultiply's micro-kernel K-order untouched — and which nothing asserted. Item
+    /// 157 rewrote the transpose that follows it, so the claim now covers two things at once:
+    /// M-tiling must not perturb the GEMM, and the register-blocked transpose must land every
+    /// element where the strided gather used to put it.
+    ///
+    /// The reference is built from PUBLIC pieces of the same crate (`conv2d_im2col_f64`, one wide
+    /// `dgemm_bt`, and a scalar index-by-index transpose) rather than from a stored golden, so a
+    /// layout error shows up as a mismatch instead of being frozen into the expectation.
+    ///
+    /// **If this test fails, the interesting possibility is that the M-tiling claim is false** —
+    /// the reference's single wide GEMM takes the parallel row-split while each tile's GEMM runs
+    /// serial. That would be a finding about the streaming path predating item 158, not about the
+    /// transpose, and the two are distinguishable: a K-order difference perturbs values by an ULP
+    /// everywhere, while a transpose error puts right values at wrong indices.
+    #[test]
+    fn conv2d_forward_f64_streaming_matches_the_full_panel_path_bitwise() {
+        // (batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch)
+        let cases = [
+            // single tile (flat = 16 <= TILE)
+            (
+                1usize, 2usize, 6usize, 6usize, 3usize, 3usize, 4usize, 4usize, 1usize, 1usize,
+                3usize,
+            ),
+            // three tiles (flat = 392 > 2*TILE), out_ch not a multiple of 4 so the transpose's
+            // tail chunk is exercised
+            (2, 3, 16, 16, 3, 3, 14, 14, 1, 1, 5),
+            // stride 2
+            (2, 2, 9, 9, 3, 3, 4, 4, 2, 2, 4),
+            // out_ch = 1: the transpose degenerates to a single output row
+            (1, 3, 5, 5, 3, 3, 3, 3, 1, 1, 1),
+        ];
+        for &(b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co) in &cases {
+            let patch_width = ci * kh * kw;
+            let patch_count = oh * ow;
+            let flat = b * patch_count;
+            let padded: Vec<f64> = (0..b * ci * ph * pw)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..co * patch_width)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            // A bias with a NEGATIVE zero in it, so the unconditional-add decision item 158
+            // documents is actually covered: skipping a `+0.0` would leave `-0.0` behind.
+            let bias_vals: Vec<f64> = (0..co)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        -0.0
+                    } else {
+                        0.25 - (i as f64) * 0.01
+                    }
+                })
+                .collect();
+
+            for bias in [None, Some(bias_vals.as_slice())] {
+                let got = super::conv2d_forward_f64(
+                    &padded, &weight, bias, b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co,
+                );
+
+                // Reference: whole panel, ONE wide GEMM, scalar transpose.
+                let panel =
+                    super::conv2d_im2col_f64(&padded, b, ci, ph, pw, kh, kw, oh, ow, sh, sw);
+                let mut of = vec![0.0f64; flat * co];
+                super::gemm::dgemm_bt(flat, patch_width, co, &panel, &weight, &mut of);
+                let mut want = vec![0.0f64; b * co * patch_count];
+                for n in 0..b {
+                    for oc in 0..co {
+                        let bo = bias.map_or(0.0, |bb| bb[oc]);
+                        for p in 0..patch_count {
+                            want[(n * co + oc) * patch_count + p] =
+                                of[(n * patch_count + p) * co + oc] + bo;
+                        }
+                    }
+                }
+
+                let label = format!(
+                    "b={b} ci={ci} ph={ph} pw={pw} k={kh}x{kw} oh={oh} ow={ow} \
+                     s={sh}x{sw} co={co} bias={}",
+                    bias.is_some()
+                );
+                assert_eq!(got.len(), want.len(), "item 158 length differs: {label}");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "item 158 mismatch at {label} idx={i}: streaming={g} full_panel={w}"
+                    );
                 }
             }
         }
