@@ -34463,3 +34463,84 @@ from the same reading that item 190a is about.
 
 No measurement. The host is at loadavg 26 with peer builds live, and item 189 records why nothing
 from such a window is quotable.
+
+## 192. THE f32 conv2d LANE ITEM 185e DEFERRED — THE DEFERRAL WAS RIGHT, THE REASON WAS WRONG, AND THE REAL BLOCKER WAS ARM LENGTH
+
+`frankentorch-hi9r6`. **UNBUILT** — disk throttle, no cargo of any kind ran; `/data` 64G.
+`rustfmt --edition 2024 --check` exits 0. The PyTorch arm IS executed, because it is an embedded
+script and torch 2.12.1+cpu is installed: syntax-checked with `ast.parse` and run for real.
+
+### 192a. THE DEFERRED QUESTION, ANSWERED WITH THE INCUMBENT AS THE INSTRUMENT
+
+Item 185e refused to write this lane because the harness's parity gate is a flat `1e-6` relative on
+a gradient checksum, and this file records two f32 lanes' trouble with it — `group_norm_f32` clears
+it only by accumulating in f64, and the f32 BatchNorm sum lane was DELETED rather than left red.
+Guessing which an f32 conv2d lane resembles would have put a bad row on a shared board.
+
+It did not need guessing. Torch has TWO independent f32 implementations of this convolution — the
+fused kernel and an unfold+matmul composition — so their disagreement estimates what any second
+implementation would show, with no FrankenTorch involved:
+
+    route     f32-native vs f32-unfold      f32-native vs f64
+    summed              7.012e-08                 8.729e-08
+    masked              9.640e-09                 9.271e-09
+
+Both clear `1e-6` by 14-100x. **The lane is gate-able and the deferral is lifted.**
+
+### 192b. BUT READ ITS PARITY COLUMN WEAKLY
+
+The same experiment reports the WORST PER-ELEMENT relative disagreement between those two f32
+implementations at **4.032e-03** on the masked route — five orders of magnitude above what the
+checksum shows. `sum(|dx|)` over 262,144 elements lets independent errors cancel almost completely.
+
+So on an f32 lane, `match` certifies "computed the same thing", NOT "computed it to the same bits".
+On an f64 lane the distinction is academic (per-element error ~1e-16); here it is five orders wide.
+**A checksum's agreement is an upper bound on the elements' agreement only when the elements cannot
+cancel, and 262k signed roundings cancel very well.** The bit-level claims for these routes stay
+where they belong, in the kernel crate's differential tests.
+
+### 192c. THE THING THAT WOULD ACTUALLY HAVE KILLED THE LANE
+
+Not parity. **Arm length.** Running the incumbent lane for real, at the f64 lane's batch of 8:
+
+    conv2d      (f64)  1.406 ms
+    conv2d_f32  (f32)  0.656 ms
+
+f32 conv2d is about twice as fast, so the lane inherits an incumbent arm four times SHORTER than
+the ~3 ms one item 137c already blamed for conv2d's nulls failing 5 of 5, and twice as short as the
+0.199-0.310 ms GroupNorm arm `uilzh` resized 16x after it nulled 0 of 11. Written at the obvious
+batch, this lane would have been born uncertifiable — the exact outcome item 185e was trying to
+avoid, reached by a route it never considered.
+
+Sized by measurement instead of by a round multiple, at 8 torch threads:
+
+    batch      8     16     32     48     64     96
+    summed  0.756  0.943  1.754  3.671  3.236  5.790 ms
+    masked  0.703  0.981  1.763  3.667  3.402  5.789 ms
+
+`C2F32_N = 96` puts both routes at ~5.8 ms, inside the 4-7 ms band where `max_pool3d_nopool`,
+`conv3d` and `prelu` null cleanly. BATCH is the axis grown, per item 144: it scales `flat` and both
+GEMMs proportionally while leaving `out_ch` and `patch_width` fixed, so the resize does not slide
+the lane along the `out_ch` GEMM-efficiency curve item 136 measured — which is what the bead is
+trying to see. The lane is therefore NOT comparable with the f64 conv2d rows and is not meant to
+be; it carries its own control at its own size.
+
+**Generalising: a new lane's first question is not "is it correct" but "is its incumbent arm long
+enough to null".** Three lanes on this board have now been resized or deleted for failing it, and
+this is the first one to be sized before it was written rather than after it failed.
+
+### 192d. WHAT THE LANES ARE
+
+    conv2d_f32          summed route — the ONLY lane reaching the f32 all-ones adjoints of items
+                        179/181 and the ft-api narrow-skip of item 185
+    conv2d_f32_masked   generic route — control; shares every path except the adjoints, so the
+                        pair separates "the f32 adjoints help" from "f32 conv2d moved". Also where
+                        item 187's needs_input_grad skip acts, the weight being frozen.
+
+Both arms verified as far as the throttle allows: the embedded PyTorch script parses, both new
+lanes execute and backward cleanly, and their fixtures come from the same f64 generator on both
+sides (`as f32` here, `.float()` there) so the arms carry identical bits.
+
+### 192e. OWED
+
+Compile it. Then a quiet host, per item 189.

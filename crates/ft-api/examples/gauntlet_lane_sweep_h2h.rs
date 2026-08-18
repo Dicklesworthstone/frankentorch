@@ -144,6 +144,29 @@ const C2_N: usize = 8;
 /// GEMM efficiency rising with `out_ch`, so growing THAT would move the lane along the very
 /// curve the bead is trying to measure and confound the resize with a shape change.
 const C2B_N: usize = 16;
+/// The f32 conv2d lanes' batch — `frankentorch-hi9r6`, item 191.
+///
+/// NOT `C2_N`, and the difference is the whole reason the lane can be certified. f32 conv2d runs
+/// about twice as fast as f64, so at the f64 lane's batch of 8 the INCUMBENT arm measures
+/// **0.656 ms** — four times shorter than the ~3 ms arm item 137c already blamed for conv2d's
+/// nulls failing 5 of 5, and twice as short as the 0.199-0.310 ms GroupNorm arm that `uilzh`
+/// resized 16x after it nulled 0 of 11.
+///
+/// Sized by MEASURING the incumbent rather than by picking a round multiple, at 8 torch threads:
+///
+///     batch      8     16     32     48     64     96
+///     summed  0.756  0.943  1.754  3.671  3.236  5.790 ms
+///     masked  0.703  0.981  1.763  3.667  3.402  5.789 ms
+///
+/// 96 puts both routes at ~5.8 ms, inside the 4-7 ms band where `max_pool3d_nopool`, `conv3d` and
+/// `prelu` all null cleanly. BATCH is the axis grown, per item 144: it scales `flat` and both
+/// GEMMs proportionally while leaving `out_ch` and `patch_width` fixed, so the resize does not
+/// slide the lane along the `out_ch` GEMM-efficiency curve item 136 measured — which is the very
+/// thing this bead is trying to see.
+///
+/// This lane is therefore NOT comparable with the f64 conv2d rows, and is not meant to be. It
+/// carries its own control (`conv2d_f32_masked`) at the same size.
+const C2F32_N: usize = 96;
 const C2_CI: usize = 32;
 const C2_CO: usize = 32;
 const C2_H: usize = 32;
@@ -824,6 +847,84 @@ fn timed_conv2d(
     (elapsed, checksum)
 }
 
+/// conv2d f32 train step — `frankentorch-hi9r6`, item 191. The dtype twin of [`timed_conv2d`],
+/// and the only lane that can price items 179, 181, 185 and 187.
+///
+/// WHY THIS LANE DID NOT EXIST UNTIL NOW. Item 185e declined to write it because the harness's
+/// parity gate is a flat `1e-6` relative on a gradient checksum, and this file already records two
+/// f32 lanes' trouble with it: `group_norm_f32` clears it only by accumulating the checksum in
+/// f64, and the f32 BatchNorm sum lane was DELETED rather than left red because its `dx` is
+/// analytically zero. Guessing which of those an f32 conv2d lane resembles would have put a red or
+/// uninformative row on a board a dozen agents read.
+///
+/// IT WAS MEASURED INSTEAD, with torch alone and no FrankenTorch involved. Torch has two
+/// independent f32 implementations of this convolution — the fused kernel and an unfold+matmul
+/// composition — so their disagreement estimates what any second implementation would show:
+///
+///     route     f32-native vs f32-unfold      f32-native vs f64
+///     summed              7.012e-08                 8.729e-08
+///     masked              9.640e-09                 9.271e-09
+///
+/// Both clear `1e-6` with 14-100x of margin, so the lane is gate-able and the deferral is lifted.
+///
+/// READ ITS PARITY COLUMN WEAKLY, THOUGH. The same experiment puts the WORST PER-ELEMENT relative
+/// disagreement at **4.0e-03** on the masked route — five orders of magnitude above what the
+/// checksum shows, because `sum(|dx|)` over 262,144 elements lets independent errors cancel. On an
+/// f64 lane that headroom is irrelevant (per-element error ~1e-16); on this one it means `match`
+/// certifies "computed the same thing", NOT "computed it to the same bits". The bit-level claims
+/// for these routes live in the kernel crate's differential tests, which is where they belong.
+///
+/// The lane runs at `C2F32_N`, not `C2_N`, because at the f64 batch the incumbent arm is 0.656 ms
+/// and could not have nulled; see that constant for the measured sizing table.
+///
+/// `weight_grad` mirrors `timed_conv2d`'s parameter for the same reason item 182 added it: a
+/// frozen weight and a training weight exercise different halves, and item 187 gave f32 the
+/// `needs_input_grad` skip whose whole effect is on the frozen one.
+fn timed_conv2d_f32(
+    values: &[f32],
+    weights: &[f32],
+    mask: Option<&[f32]>,
+    batch: usize,
+    weight_grad: bool,
+) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable_f32(values.to_vec(), vec![batch, C2_CI, C2_H, C2_W], true)
+        .expect("conv2d f32 leaf");
+    let w = session
+        .tensor_variable_f32(
+            weights.to_vec(),
+            vec![C2_CO, C2_CI, C2_K, C2_K],
+            weight_grad,
+        )
+        .expect("conv2d f32 weight");
+    let m = mask.map(|values| {
+        session
+            .tensor_variable_f32(values.to_vec(), vec![batch, C2_CO, C2_H, C2_W], false)
+            .expect("conv2d f32 mask")
+    });
+    let started = Instant::now();
+    let out = session
+        .functional_conv2d(x, w, None, (1, 1), (1, 1))
+        .expect("conv2d f32");
+    let scored = match m {
+        Some(mask_leaf) => session.tensor_mul(out, mask_leaf).expect("mask multiply"),
+        None => out,
+    };
+    let loss = session.tensor_sum(scored).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    // f64 accumulator, per the `timed_group_norm_f32` precedent: summing 262,144 f32 magnitudes
+    // in f32 carries enough error on its own to swamp the gradients' actual agreement.
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// Linear train step: `y = x @ W^T`, with the WEIGHT requiring grad — the only reason this lane
 /// exists (`frankentorch-58zjz`).
 ///
@@ -1020,6 +1121,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c2m = seq(C2_N * C2_CO * C2_H * C2_W);
     // item 144's doubled-batch twins. Same `seq` generator, same weights -- only the batch
     // differs, so any change in the ratio is the resize and not a different workload.
+    // f32 twins of the conv2d fixtures — item 191. Same generator then `as f32`, which is exactly
+    // what `.float()` does to the same f64 values on the incumbent arm, so both arms carry
+    // identical bits and the parity column means what it claims. Sized at `C2F32_N`, not `C2_N`,
+    // for the reason that constant documents.
+    #[allow(clippy::cast_possible_truncation)]
+    let c2x32: Vec<f32> = seq(C2F32_N * C2_CI * C2_H * C2_W)
+        .into_iter()
+        .map(|value| value as f32)
+        .collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let c2w32: Vec<f32> = c2w.iter().map(|&v| v as f32).collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let c2m32: Vec<f32> = seq(C2F32_N * C2_CO * C2_H * C2_W)
+        .into_iter()
+        .map(|value| value as f32)
+        .collect();
     let c2bx = seq(C2B_N * C2_CI * C2_H * C2_W);
     let c2bm = seq(C2B_N * C2_CO * C2_H * C2_W);
     let linx = seq(LIN_B * LIN_IN);
@@ -1092,6 +1209,16 @@ c2m=seq(8*32*32*32).reshape(8,32,32,32)
 # dweight too. A lane where only OUR arm skips the weight gradient would not be a
 # comparison, it would be a handicap.
 c2w_train=seq(32*32*3*3).reshape(32,32,3,3).requires_grad_(True)
+# item 191: f32 twins. `.float()` here, `as f32` there, from the SAME f64 generator, so both
+# arms carry identical bits. Measured justification for the lane existing at all is in
+# `timed_conv2d_f32`'s comment: two independent f32 conv implementations agree to 7.0e-08 on
+# the summed route and 9.6e-09 on the masked one, well inside the 1e-6 parity gate.
+# Batch 96, NOT 8: f32 conv2d is ~2x faster than f64, and at batch 8 this arm measures
+# 0.656 ms -- far below the 4-7 ms band where lanes null. Measured sizing table is in
+# C2F32_N's comment on the Rust side. Keep this in lockstep with C2F32_N.
+c2x32=seq(96*32*32*32).reshape(96,32,32,32).float()
+c2w32=c2w.float()
+c2m32=seq(96*32*32*32).reshape(96,32,32,32).float()
 # item 144: the doubled-batch twins, same weights, same generator.
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
@@ -1150,6 +1277,10 @@ LANES = {
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
     "conv2d_masked_train": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
+    # item 191: f32 conv2d, both loss routes. The summed one is the only lane that reaches the
+    # f32 all-ones adjoints; the masked one is its control on the generic route.
+    "conv2d_f32":        (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
+    "conv2d_f32_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
@@ -1735,6 +1866,21 @@ LANES = {
             // computing a discarded gradient" from "conv2d got faster".
             "conv2d_masked_train",
             Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true)),
+        ),
+        (
+            // item 191: the f32 SUMMED route. This is the only lane that reaches the all-ones
+            // adjoints items 179/181 added for f32, and the `ft-api` narrow-skip of item 185 --
+            // none of which any board row has ever priced, because f32 conv2d had no lane.
+            "conv2d_f32",
+            Box::new(|| timed_conv2d_f32(&c2x32, &c2w32, None, C2F32_N, false)),
+        ),
+        (
+            // The f32 GENERIC route, and the control for the row above: it shares every code path
+            // except the all-ones adjoints, so the pair separates "the f32 adjoints help" from
+            // "f32 conv2d moved". It is also where item 187's `needs_input_grad` skip acts, the
+            // weight being frozen here exactly as it is on the f64 masked lane.
+            "conv2d_f32_masked",
+            Box::new(|| timed_conv2d_f32(&c2x32, &c2w32, Some(&c2m32), C2F32_N, false)),
         ),
         (
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate
