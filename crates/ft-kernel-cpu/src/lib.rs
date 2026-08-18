@@ -30168,18 +30168,40 @@ mod bidiag {
                 if (xrows as u64) * (vlen as u64) >= PARALLEL_GATE
                     && rayon::current_num_threads() > 1
                 {
-                    x.par_chunks_mut(ldx)
+                    // CHUNKED, AND SLICED RATHER THAN SKIPPED — `frankentorch-4zjaa`,
+                    // NEGATIVE_EVIDENCE item 161.
+                    //
+                    // This forked ONE TASK PER ROW, and did it by splitting the WHOLE `x`
+                    // workspace into `m_sub` chunks and then discarding the first `i + 1` with
+                    // `.skip()`. Both halves are wasteful and it sits inside the panel loop, so
+                    // the fork/join is paid once per COLUMN of every panel — the same
+                    // per-iteration dispatch cost item 157 traced 4zjaa's 17.6x A/B cliff to,
+                    // and the same shape item 159 removed from `apply_scaled_rank1_f64`.
+                    //
+                    // Now the row range is sliced first, so no chunk is produced only to be
+                    // skipped, and each task carries `REDUCE_CHUNK_ROWS` rows instead of one.
+                    //
+                    // BIT-EXACT: the comment above already states each output row is an
+                    // independent contiguous dot product. The row partition therefore cannot
+                    // change an association — every `s` is accumulated in the same `c` order it
+                    // was before, and only the assignment of rows to tasks moves.
+                    //
+                    // UNBUILT and UNMEASURED (build freeze, /data 28G).
+                    let xstart = (i + 1) * ldx;
+                    x[xstart..xstart + xrows * ldx]
+                        .par_chunks_mut(REDUCE_CHUNK_ROWS * ldx)
                         .enumerate()
-                        .skip(i + 1)
-                        .take(xrows)
-                        .for_each(|(r, xrow)| {
-                            let start = at(r, i + 1);
-                            let arow = &a_ro[start..start + vlen];
-                            let mut s = 0.0;
-                            for c in 0..vlen {
-                                s += arow[c] * vrow[c];
+                        .for_each(|(blk, rows)| {
+                            let row0 = i + 1 + blk * REDUCE_CHUNK_ROWS;
+                            for (k, xrow) in rows.chunks_exact_mut(ldx).enumerate() {
+                                let start = at(row0 + k, i + 1);
+                                let arow = &a_ro[start..start + vlen];
+                                let mut s = 0.0;
+                                for c in 0..vlen {
+                                    s += arow[c] * vrow[c];
+                                }
+                                xrow[i] = s;
                             }
-                            xrow[i] = s;
                         });
                 } else {
                     for r in (i + 1)..m_sub {

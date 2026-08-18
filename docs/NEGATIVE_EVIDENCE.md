@@ -32135,3 +32135,45 @@ The verification owed is unchanged and worth restating as one list rather than f
 that have never run), and then paired before/after runs on `conv2d` and `conv2d_masked` in one
 invocation. `rustfmt --check` is the only gate any of it has passed, and `ubs` has reported this
 file too large to scan on every commit, so none of it has had automated review either.
+
+## 161. THE SAME ONE-TASK-PER-ROW FORK IS IN dlabrd_panel_f64, INSIDE THE PANEL LOOP — AND IT BUILT CHUNKS ONLY TO SKIP THEM
+
+`frankentorch-4zjaa`. UNBUILT: /data 28G / 99%, no cargo run.
+
+Item 157 found 4zjaa's 17.6x A/B cliff sitting on per-reflector fork/join cost; item 159 removed
+one of the two sources. This is a third instance of the same shape, in the reduction rather than
+the expansion, and it is the one furthest inside a loop.
+
+`dlabrd_panel_f64` step (12) computes `x[i+1.., i] = A[i+1.., i+1..] * v` — a matrix-vector
+product — and parallelised it as:
+
+    x.par_chunks_mut(ldx).enumerate().skip(i + 1).take(xrows)
+
+Two separate wastes in one expression. It forks ONE TASK PER ROW, each doing a `vlen` dot
+product; and it splits the ENTIRE `x` workspace into `m_sub` chunks before discarding the first
+`i + 1` of them with `.skip()`. Step (12) runs once per COLUMN of every panel, so this dispatch
+is paid on the innermost loop of the reduction, not once per call.
+
+Now the row range is sliced first, so no chunk is produced only to be thrown away, and each task
+carries `REDUCE_CHUNK_ROWS` rows instead of one.
+
+### FREE FOR THE SAME REASON ITEM 159 WAS
+
+The existing comment already states it: "Each output row is an independent contiguous dot
+product, so the parallel arm here is bit-exact with the serial one." Every `s` is still summed in
+the same `c` order; only the assignment of rows to tasks changes. That makes this the third
+helper in this file whose parallel arm is bit-exact by row-independence, against
+`reduce_scaled_rows_f64` which genuinely is not — a distinction now worth checking FIRST in any
+of them, because it decides whether a change is free or needs a tolerance argument.
+
+### WHAT IS NOT CLAIMED
+
+No measurement, and no claim that this moves 4zjaa's numbers. Item 157's gate question — whether
+these helpers should take the parallel branch at these sizes at all — is still the one that would
+move them, and it remains unsettled because settling it changes bits.
+
+VERIFIED WITHOUT A COMPILER: `rustfmt --edition 2024 --check` exits 0. Index math hand-checked:
+`(i+1)*ldx + xrows*ldx` is exactly `m_sub*ldx`, which the original `.take(xrows)` already implied
+is in bounds; chunk lengths stay multiples of `ldx`, so `chunks_exact_mut` drops no remainder
+row; and `a_ro` and `x` were already proven disjoint by the code that compiled before this
+change. NOT VERIFIED: compilation, execution, timing.
