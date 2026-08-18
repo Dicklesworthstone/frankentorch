@@ -32027,3 +32027,45 @@ this buys only the loop restructuring and not the vectorisation.
 
 Also folded in, and noted because item 156 listed it as owed: `out`'s dead `vec![0.0; ..]` fill is
 gone, since the transpose writes every element. `out_flat`'s remains, and is still owed.
+
+## 159. THE APPLY HALF OF ITEM 157's FORK/JOIN COST IS FIXABLE WITHOUT TOUCHING NUMERICS — ONE TASK PER ROW BECOMES ONE PER 64
+
+`frankentorch-4zjaa`. UNBUILT: /data 28G / 99% under the build freeze; no cargo run.
+
+Item 157 traced 4zjaa's 17.6x A/B cliff to fork/join cost in the two row-parallel helpers that
+`bidiag_form_p_f64` calls once per reflector, and showed the crossover it produced may have been
+measured against a broken arm. That item deliberately shipped only a measurement knob, because
+the `reduce` half cannot be re-gated without changing result bits.
+
+The `apply` half can, and this does it.
+
+`apply_scaled_rank1_f64` forked with `par_chunks_mut(lda)` — **one rayon task per row**. At the
+bidiag shapes each task is `ncols` multiply-subtracts, about 1.2 KB of work, and the helper runs
+once per reflector: an n=160 expansion queued ~160 tasks per call across ~160 calls. It now
+chunks 64 rows per task, mirroring `reduce_scaled_rows_f64`, cutting task count 64x.
+
+### WHY THIS ONE IS FREE AND THE OTHER IS NOT
+
+`reduce` accumulates ACROSS rows, so its chunk width fixes a partial-sum tree — the constant is
+documented as fixed "so the result is identical on every machine and every run", and its serial
+and parallel arms already differ in bits. Re-gating it is a tolerance decision.
+
+`apply` is `block[r][c] -= v[r] * acc[c]`: pure elementwise, no cross-row reduction. Its own doc
+already says "Every row is independent, so the parallel arm is bit-exact." A different row
+partition therefore cannot change an association, and **any** chunk width gives identical
+results — `REDUCE_CHUNK_ROWS` is reused here only for symmetry, not because the value matters.
+
+### WHAT IS NOT CLAIMED
+
+That this fixes the cliff. It removes one of the two fork/join sources; item 157's point about
+the GATE — that these helpers should not be taking the parallel branch at `nrows` ~ 159 at all —
+is separate and still unsettled, and it is the one that would move the n=160 number. Nor is
+there a measurement: coarser chunks trade scheduling overhead for width, which is the right
+trade at large `nrows` and irrelevant at small ones, but "right trade" here is reasoning, not a
+number.
+
+VERIFIED: `rustfmt --edition 2024 --check` exits 0; the rewrite is structurally identical to
+`reduce`'s parallel arm, which compiles today — same `par_chunks`/`par_chunks_mut` zip, same
+`chunks_exact` inner loop, same `(row, &vr)` binding — and chunk boundaries stay multiples of
+`lda`, so the final short chunk still yields whole rows. NOT VERIFIED: compilation, execution,
+timing.

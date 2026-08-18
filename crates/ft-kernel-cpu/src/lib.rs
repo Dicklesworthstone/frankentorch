@@ -29762,13 +29762,34 @@ mod bidiag {
             }
             return;
         }
+        // CHUNKED LIKE `reduce_scaled_rows_f64`, NOT ONE TASK PER ROW — `frankentorch-4zjaa`,
+        // NEGATIVE_EVIDENCE item 159.
+        //
+        // This forked `nrows` tasks, one per row, each doing `ncols` multiply-subtracts — at
+        // the bidiag shapes that is ~1.2 KB of work per task, and the helper is called ONCE PER
+        // REFLECTOR, so an n=160 expansion queued ~160 tasks per call across ~160 calls. Item
+        // 157 traced 4zjaa's 17.6x A/B cliff to fork/join cost in exactly this pair of helpers;
+        // this is the half of it that can be fixed without touching numerics.
+        //
+        // BIT-EXACT, AND UNLIKE `reduce` NOT EVEN CONDITIONALLY: this is a pure elementwise
+        // update — `block[r][c] -= v[r] * acc[c]` — with no cross-row reduction, so the row
+        // partition cannot change an association. `reduce`'s chunk width is load-bearing for
+        // ITS determinism; here the same constant is reused only for symmetry, and any width
+        // would give identical results.
+        //
+        // UNBUILT and UNMEASURED (build freeze, /data 28G). It reduces task COUNT 64x at the
+        // cost of coarser width, which is the right trade at large `nrows` and irrelevant at
+        // small ones — those should not be taking the parallel branch at all, which is item
+        // 157's separate and still-unsettled point about the gate itself.
         block
-            .par_chunks_mut(lda)
-            .zip(v.par_iter())
-            .for_each(|(row, &vr)| {
-                let seg = &mut row[col0..col0 + ncols];
-                for c in 0..ncols {
-                    seg[c] -= vr * acc[c];
+            .par_chunks_mut(REDUCE_CHUNK_ROWS * lda)
+            .zip(v.par_chunks(REDUCE_CHUNK_ROWS))
+            .for_each(|(rows, vs)| {
+                for (row, &vr) in rows.chunks_exact_mut(lda).zip(vs) {
+                    let seg = &mut row[col0..col0 + ncols];
+                    for c in 0..ncols {
+                        seg[c] -= vr * acc[c];
+                    }
                 }
             });
     }
