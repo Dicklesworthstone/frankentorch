@@ -32780,3 +32780,104 @@ same reason, and they can share one invocation.
 
 The lane to read it on is `conv2d_masked`: its certified 5.73x is the standing this bead exists to
 move, and `dweight` is 2.036 ms of the ~16.6 ms backward that dominates it.
+
+## 171. conv2d's FORWARD OUTPUT TRANSPOSE WAS CAPPED AT `batch`-WAY PARALLELISM — THE SAME "SIZE FLOOR IS A COUNT CEILING" DEFECT ITEM 170 FOUND IN THE BACKWARD, ONE PASS EARLIER
+
+`frankentorch-hi9r6`. **UNBUILT AND UNMEASURED.** Build freeze — `/data` 27G, 99% used, loadavg
+5.90/6.36/8.90 on the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 171a. THE DEFECT, AND WHO FOUND IT
+
+I did not find this. **Item 165c did, recorded it against its own change, and declined to fix it**,
+which is the reason it was still there to fix:
+
+> My replacement is `out.par_chunks_mut(out_ch * patch_count)` — **`batch` chunks, so 8 and 16.**
+> I reduced the splittable units by a factor of 32. … At `RAYON_NUM_THREADS=64`, where several
+> board rows are also taken, 8 chunks caps the pass at 8-way parallelism where the old code could
+> use all 64. I am not reverting it: the traffic reduction and the granularity loss pull in
+> opposite directions and neither is measured.
+
+That reasoning is right about the trade and wrong about the options: the two effects only pull in
+opposite directions **if the fix has to be a revert**. It does not. Item 158's traffic reduction
+and a finer split are independent, and this item keeps the first and repairs the second.
+
+The mechanism is item 164's, in the one direction item 164 established rather than the one it
+retracted: `par_chunks_mut` cannot split BELOW a chunk boundary, so a chunk count bounds rayon's
+task count **from above**. Eight chunks is eight tasks whatever the pool width.
+
+### 171b. WHY conv3d IS FINE AND conv2d IS NOT — THE TWO LANES GENUINELY DIFFER
+
+Item 165b argued the same pass is sound in conv3d because the inner transpose parallelises and
+supplies the rest. That argument is correct **there** and does not transfer:
+
+    conv3d   patch_count * out_ch = 2048 * 32 = 65536  >= 1<<16 gate  -> inner runs PARALLEL
+    conv2d   patch_count * out_ch = 1024 * 32 = 32768  <  1<<16 gate  -> inner runs SERIAL
+
+conv2d sits one factor of two under `transpose_2d_into_f64`'s own gate, so nothing rescues it and
+the `batch` ceiling is the whole pass. I have left conv3d's site untouched: it is `l2zki`'s lane,
+its argument holds, and the number that decides it is on the other side of the gate.
+
+### 171c. THE CHANGE
+
+`transpose_2d_into_{f64,f32}`'s per-chunk closure is lifted to a free `transpose_cols_into_*`,
+unchanged. Both the whole-matrix gate path and the new conv2d path call it, so "the fine split is
+bit-identical to the coarse one" holds by CONSTRUCTION — one copy of the loop, not two copies
+argued to agree.
+
+Chunking moves into `conv2d_transpose_bias_into_{f64,f32}`, which picks its arm from the pool width:
+
+    batch >= threads   coarse: `par_chunks_mut(out_ch * patch_count)` — EXACTLY what ships today
+    batch <  threads   fine:   `par_chunks_mut(BLK * patch_count)` — BLK output rows of one batch
+
+The ceiling goes from `batch` to `batch * out_ch / BLK`: **8 -> 64** at the scored f64 shape.
+
+### 171d. WHAT IS AND IS NOT CLAIMED
+
+**No speedup is claimed.** Nothing was built and nothing was measured, and item 164's lesson is
+that an unmeasured scheduling prediction is a guess with a citation attached. The claim is
+narrower and checkable by reading: the available parallelism of this pass was `batch`, and it is
+no longer `batch`.
+
+**It is a no-op at the width that certifies.** `batch >= threads` takes the coarse arm, so at
+`RAYON_NUM_THREADS=8` with `batch=8` — the width `project_rayon_pool_width` records as the one
+that lets the board certify — this emits byte-identical work to the current code. A change that
+cannot be measured this week should not be able to move a certified row, and this one cannot. The
+finer split engages only where the cap is provably binding.
+
+### 171e. THE TEST DRIVES THE CHOICE INSTEAD OF HOPING FOR IT
+
+A scheduling decision read from the ambient pool cannot be shown bit-exact by a test running in
+that pool — the test would exercise one arm and assert nothing about the other. So `threads` is a
+PARAMETER, and `conv2d_output_transpose_is_bit_identical_under_both_chunkings` calls the pass twice
+in one process, `threads = 1` and `threads = usize::MAX`, comparing `to_bits()`.
+
+Three details are deliberate:
+
+- **`to_bits()`, not `==`.** `-0.0 == 0.0` is true, so an `==` comparison would pass while item
+  158's unconditional bias add — which exists precisely to keep `-0.0 + 0.0 == +0.0` — was broken.
+  The fixture puts signed zeros in `out_flat` and pairs them with a zero bias.
+- **NaN fill, then assert no NaN survives.** Both buffers start as `f64::NAN`, so a chunking that
+  silently skipped a block would agree with itself on the fill and pass a bits comparison. The
+  completeness assert is what makes the equality assert mean something.
+- **Shapes straddle every branch**, per `project_prelu_zero_convention`'s lesson: the scored shape,
+  a batch that already exceeds a small pool, `out_ch % BLK != 0` (fine arm declines), `out_ch < BLK`,
+  and three zero-dimension cases — which also cover a latent `par_chunks_mut(0)` panic that the
+  shipping code would have hit at `out_ch == 0` or `patch_count == 0` and that the new guard closes.
+
+### 171f. THE SAME DEFECT TWICE IN ONE OP, WHICH IS THE PART WORTH KEEPING
+
+Item 170 found that `MIN_BLOCK_COLS` — a floor on block WIDTH — is a ceiling on block COUNT, giving
+the backward's largest GEMM 6 uneven tiles on 8 threads. This item is the same sentence with the
+nouns changed: a chunk SIZE is a ceiling on task COUNT, giving the forward's transpose 8 tasks on
+64 threads. Both are in conv2d, one pass apart, and both were introduced by a change that was
+correct about traffic and silent about granularity.
+
+The generalisation to carry forward: **whenever a rewrite improves memory traffic by making the
+unit of work bigger, it has also changed the task count, and that second effect is invisible in
+the diff.** `par_chunks_mut(X)` should be read as "at most `len/X` threads will ever run this",
+and that number belongs next to the traffic argument in the comment. Neither item 158, item 160,
+nor item 165 stated it; all three should have.
+
+Owed when the volume frees: build, run the two new tests, and — since the fine arm engages only
+above `batch` threads — a same-invocation 8-vs-64-thread pair on the conv2d forward before any
+number from this is quoted anywhere.

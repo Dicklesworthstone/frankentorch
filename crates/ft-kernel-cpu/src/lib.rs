@@ -8351,6 +8351,136 @@ pub fn conv2d_backward_f32(
     (dpadded, dweight, dbias)
 }
 
+/// conv2d's output transpose + bias pass: `out_flat` `[batch*patch_count, out_ch]` -> NCHW
+/// `[batch, out_ch, patch_count]`, bias added in place.
+///
+/// WHY THIS TAKES `threads`. The chunking below is chosen from the pool width, and a scheduling
+/// choice that cannot be driven from a test cannot be shown bit-exact by one. Passing the width in
+/// lets `conv2d_output_transpose_is_bit_identical_under_both_chunkings` run BOTH arms in one
+/// process and compare bit patterns; the shipping callers pass `rayon::current_num_threads()`.
+///
+/// THE GRANULARITY THIS FIXES (item 171). Item 158 replaced a per-channel strided gather with this
+/// blocked transpose and chunked it `par_chunks_mut(out_ch * patch_count)` — exactly `batch`
+/// chunks. Item 164 established the direction that matters here: `par_chunks_mut` cannot split
+/// BELOW a chunk boundary, so a chunk count bounds rayon's task count from ABOVE. This pass is
+/// therefore capped at `batch`-way parallelism — 8 at the scored shape.
+///
+/// The inner transpose does not rescue it. `patch_count * out_ch` is 32768 at that shape, under
+/// `transpose_2d_into_f64`'s own `1 << 16` gate, so every inner transpose runs SERIAL. (conv3d's
+/// same-shaped pass computes 65536 and DOES clear the gate, which is why item 165's nesting
+/// argument holds there and not here — the two lanes differ, and only conv2d is capped.)
+///
+/// THE FINE ARM keeps item 158's traffic reduction untouched and splits the SAME blocked transpose
+/// finer: a chunk becomes `TRANSPOSE_BLK_F64` output rows of ONE batch instead of all `out_ch` of
+/// them, lifting the ceiling from `batch` to `batch * out_ch / 4` (8 -> 64 at the scored shape).
+/// Both arms call `transpose_cols_into_f64` with the same `(src, rows, cols, jb)`, and a transpose
+/// is pure data movement, so the two are bit-identical by construction.
+///
+/// IT IS A NO-OP AT THE CERTIFYING WIDTH. `batch >= threads` takes the coarse arm that ships
+/// today, so at `RAYON_NUM_THREADS=8` with `batch=8` this emits byte-identical work to the current
+/// code and cannot move a certified row. The finer split engages only where the cap is provably
+/// binding — which is also why no speedup is claimed here: UNBUILT and UNMEASURED, and item 164's
+/// lesson is that an unmeasured scheduling prediction is a guess with a citation attached. What is
+/// claimed is narrower and checkable: the ceiling was `batch`, and it no longer is.
+fn conv2d_transpose_bias_into_f64(
+    o: &mut [f64],
+    out_flat: &[f64],
+    bias: Option<&[f64]>,
+    batch: usize,
+    out_ch: usize,
+    patch_count: usize,
+    threads: usize,
+) {
+    use rayon::prelude::*;
+    // `o` is empty in these cases and `par_chunks_mut(0)` panics, so this guard is load-bearing.
+    if out_ch == 0 || patch_count == 0 || batch == 0 {
+        return;
+    }
+    let plane = patch_count * out_ch;
+    if batch < threads && out_ch % TRANSPOSE_BLK_F64 == 0 {
+        let per_batch = out_ch / TRANSPOSE_BLK_F64;
+        o.par_chunks_mut(TRANSPOSE_BLK_F64 * patch_count)
+            .enumerate()
+            .for_each(|(ci, oblk)| {
+                let base = (ci / per_batch) * plane;
+                let jb = (ci % per_batch) * TRANSPOSE_BLK_F64;
+                transpose_cols_into_f64(
+                    &out_flat[base..base + plane],
+                    oblk,
+                    patch_count,
+                    out_ch,
+                    jb,
+                );
+            });
+    } else {
+        o.par_chunks_mut(plane).enumerate().for_each(|(n, obatch)| {
+            let base = n * plane;
+            transpose_2d_into_f64(&out_flat[base..base + plane], obatch, patch_count, out_ch);
+        });
+    }
+    // UNCONDITIONAL, per item 158: `-0.0 + 0.0` is `+0.0`, so skipping a zero bias would leave
+    // `-0.0` where the old gather produced `+0.0` and stop being bit-exact on signed zeros.
+    if let Some(bb) = bias {
+        o.par_chunks_mut(patch_count)
+            .enumerate()
+            .for_each(|(idx, orow)| {
+                let bo = bb[idx % out_ch];
+                for v in orow.iter_mut() {
+                    *v += bo;
+                }
+            });
+    }
+}
+
+/// f32 mirror of [`conv2d_transpose_bias_into_f64`]. The block is 8 output rows here, so the
+/// ceiling the fine arm lifts to is `batch * out_ch / 8`.
+fn conv2d_transpose_bias_into_f32(
+    o: &mut [f32],
+    out_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    out_ch: usize,
+    patch_count: usize,
+    threads: usize,
+) {
+    use rayon::prelude::*;
+    if out_ch == 0 || patch_count == 0 || batch == 0 {
+        return;
+    }
+    let plane = patch_count * out_ch;
+    if batch < threads && out_ch % TRANSPOSE_BLK_F32 == 0 {
+        let per_batch = out_ch / TRANSPOSE_BLK_F32;
+        o.par_chunks_mut(TRANSPOSE_BLK_F32 * patch_count)
+            .enumerate()
+            .for_each(|(ci, oblk)| {
+                let base = (ci / per_batch) * plane;
+                let jb = (ci % per_batch) * TRANSPOSE_BLK_F32;
+                transpose_cols_into_f32(
+                    &out_flat[base..base + plane],
+                    oblk,
+                    patch_count,
+                    out_ch,
+                    jb,
+                );
+            });
+    } else {
+        o.par_chunks_mut(plane).enumerate().for_each(|(n, obatch)| {
+            let base = n * plane;
+            transpose_2d_into_f32(&out_flat[base..base + plane], obatch, patch_count, out_ch);
+        });
+    }
+    if let Some(bb) = bias {
+        o.par_chunks_mut(patch_count)
+            .enumerate()
+            .for_each(|(idx, orow)| {
+                let bo = bb[idx % out_ch];
+                for v in orow.iter_mut() {
+                    *v += bo;
+                }
+            });
+    }
+}
+
 /// Fused conv2d forward (f64) on a PADDED input: im2col + `panel @ weight_flat^T`
 /// (via `dgemm_bt`, no weight transpose) written straight to NCHW `[batch,
 /// out_ch, oh, ow]`, plus optional per-channel bias. Bit-exact to the no-grad
@@ -8538,8 +8668,10 @@ pub fn conv2d_forward_f64(
     //
     // The per-batch matrix is `patch_count*out_ch` = 32768 elements, below
     // `transpose_2d_into_f64`'s own `1 << 16` parallel gate, so each inner transpose runs SERIAL
-    // and the parallelism comes from the batch chunks — 8 or 16 tasks at the scored shapes, which
-    // is what `RAYON_NUM_THREADS=8` wants. No nested fork/join.
+    // and the parallelism comes from the chunking alone. That made the pass a hard `batch`-way
+    // ceiling — fine at `RAYON_NUM_THREADS=8`, 8 of 64 threads elsewhere. Item 171 moved the
+    // chunking into `conv2d_transpose_bias_into_f64`, which keeps this exact per-batch split when
+    // `batch >= threads` and splits per 4 output rows when it does not. Still no nested fork/join.
     //
     // BIT-EXACT, in two parts. The transpose is pure movement, so every output value is a byte
     // copy of the value the old gather read. The bias is then one addition per element with the
@@ -8555,27 +8687,15 @@ pub fn conv2d_forward_f64(
     // writes every element of `o` before the bias pass reads any of them, so nothing reads
     // uninitialized memory. It also subsumes the dead `vec![0.0; ..]` fill item 156 listed as owed.
     let out = build_uninit(batch * out_ch * patch_count, |o: &mut [f64]| {
-        o.par_chunks_mut(out_ch * patch_count)
-            .enumerate()
-            .for_each(|(n, obatch)| {
-                let base = n * patch_count * out_ch;
-                transpose_2d_into_f64(
-                    &out_flat[base..base + patch_count * out_ch],
-                    obatch,
-                    patch_count,
-                    out_ch,
-                );
-            });
-        if let Some(bb) = bias {
-            o.par_chunks_mut(patch_count)
-                .enumerate()
-                .for_each(|(idx, orow)| {
-                    let bo = bb[idx % out_ch];
-                    for v in orow.iter_mut() {
-                        *v += bo;
-                    }
-                });
-        }
+        conv2d_transpose_bias_into_f64(
+            o,
+            &out_flat,
+            bias,
+            batch,
+            out_ch,
+            patch_count,
+            rayon::current_num_threads(),
+        );
     });
     out
 }
@@ -8728,29 +8848,18 @@ pub fn conv2d_forward_f32(
     //
     // The stride here is `out_ch` f32 = 128 bytes at the scored shape — still a fresh cache line
     // per read on a 64-byte line, so the per-channel re-streaming is the same defect, not a
-    // milder one. UNBUILT — item 160.
+    // milder one. UNBUILT — item 160. Chunking now lives in `conv2d_transpose_bias_into_f32`,
+    // which lifts item 171's `batch`-way ceiling without changing the coarse arm.
     let out = build_uninit(batch * out_ch * patch_count, |o: &mut [f32]| {
-        o.par_chunks_mut(out_ch * patch_count)
-            .enumerate()
-            .for_each(|(n, obatch)| {
-                let base = n * patch_count * out_ch;
-                transpose_2d_into_f32(
-                    &out_flat[base..base + patch_count * out_ch],
-                    obatch,
-                    patch_count,
-                    out_ch,
-                );
-            });
-        if let Some(bb) = bias {
-            o.par_chunks_mut(patch_count)
-                .enumerate()
-                .for_each(|(idx, orow)| {
-                    let bo = bb[idx % out_ch];
-                    for v in orow.iter_mut() {
-                        *v += bo;
-                    }
-                });
-        }
+        conv2d_transpose_bias_into_f32(
+            o,
+            &out_flat,
+            bias,
+            batch,
+            out_ch,
+            patch_count,
+            rayon::current_num_threads(),
+        );
     });
     out
 }
@@ -40380,53 +40489,68 @@ pub fn transpose_2d_into_f64(src: &[f64], dst: &mut [f64], rows: usize, cols: us
     if rows == 0 || cols == 0 {
         return;
     }
+    const PAR_MIN: usize = 1 << 16;
+    if rows * cols >= PAR_MIN {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(TRANSPOSE_BLK_F64 * rows)
+            .enumerate()
+            .for_each(|(ci, ch)| {
+                transpose_cols_into_f64(src, ch, rows, cols, ci * TRANSPOSE_BLK_F64);
+            });
+    } else {
+        for (ci, ch) in dst.chunks_mut(TRANSPOSE_BLK_F64 * rows).enumerate() {
+            transpose_cols_into_f64(src, ch, rows, cols, ci * TRANSPOSE_BLK_F64);
+        }
+    }
+}
+
+/// Output rows per chunk of the blocked f64 transpose: the AVX2 kernel below transposes a 4x4
+/// register block, so a chunk owns 4 consecutive OUTPUT rows (= 4 consecutive src columns).
+const TRANSPOSE_BLK_F64: usize = 4;
+
+/// Write OUTPUT rows `jb .. jb + chunk.len()/rows` of the transpose of the `rows x cols` matrix
+/// `src` into `chunk` — that is, src columns `jb..`, each laid down contiguously.
+///
+/// This is [`transpose_2d_into_f64`]'s per-chunk closure, lifted to a free function and otherwise
+/// unchanged. Lifting it lets a caller that wants a FINER split than one whole matrix (conv2d's
+/// per-batch output transpose, item 171) reach the same code, so "the fine split is bit-identical
+/// to the coarse one" holds by CONSTRUCTION rather than by an argument about two copies of a loop.
+///
+/// The AVX2 probe moves from once-per-matrix to once-per-chunk. `is_x86_feature_detected!` caches
+/// its answer in a static after the first call, so this is a relaxed atomic load against a chunk
+/// that writes `4 * rows` elements — 32 KiB at conv2d's scored shape.
+fn transpose_cols_into_f64(src: &[f64], chunk: &mut [f64], rows: usize, cols: usize, jb: usize) {
     #[cfg(target_arch = "x86_64")]
     let simd = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let simd = false;
 
-    // Each chunk owns 4 consecutive OUTPUT rows (= 4 consecutive src columns `jb..jb+4`), a disjoint
-    // contiguous dst region. `process(jb, chunk)` fills it.
-    let process = |jb: usize, chunk: &mut [f64]| {
-        let n_out = chunk.len() / rows;
-        if simd && n_out == 4 && jb + 4 <= cols {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut ib = 0;
-                while ib + 4 <= rows {
-                    // SAFETY: `simd` ⇒ AVX2 present at runtime; `ib+4<=rows` and `jb+4<=cols` keep
-                    // every src load in `[0, rows*cols)`, and `chunk.len()==4*rows` keeps every dst
-                    // store in bounds (max index 3*rows+ib+3 < 4*rows since ib+3 < rows).
-                    unsafe { transpose_block_4x4_avx2_f64(src, chunk, ib, jb, cols, rows) };
-                    ib += 4;
-                }
-                // Tail rows (rows not a multiple of 4): scalar.
-                for i in ib..rows {
-                    for k in 0..4 {
-                        chunk[k * rows + i] = src[i * cols + jb + k];
-                    }
-                }
+    let n_out = chunk.len() / rows;
+    if simd && n_out == TRANSPOSE_BLK_F64 && jb + TRANSPOSE_BLK_F64 <= cols {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut ib = 0;
+            while ib + 4 <= rows {
+                // SAFETY: `simd` ⇒ AVX2 present at runtime; `ib+4<=rows` and `jb+4<=cols` keep
+                // every src load in `[0, rows*cols)`, and `chunk.len()==4*rows` keeps every dst
+                // store in bounds (max index 3*rows+ib+3 < 4*rows since ib+3 < rows).
+                unsafe { transpose_block_4x4_avx2_f64(src, chunk, ib, jb, cols, rows) };
+                ib += 4;
             }
-        } else {
-            // Scalar: chunk covers output rows `jb..jb+n_out`.
-            for k in 0..n_out {
-                let oj = jb + k;
-                for i in 0..rows {
-                    chunk[k * rows + i] = src[i * cols + oj];
+            // Tail rows (rows not a multiple of 4): scalar.
+            for i in ib..rows {
+                for k in 0..4 {
+                    chunk[k * rows + i] = src[i * cols + jb + k];
                 }
             }
         }
-    };
-
-    const PAR_MIN: usize = 1 << 16;
-    if rows * cols >= PAR_MIN {
-        use rayon::prelude::*;
-        dst.par_chunks_mut(4 * rows)
-            .enumerate()
-            .for_each(|(ci, ch)| process(ci * 4, ch));
     } else {
-        for (ci, ch) in dst.chunks_mut(4 * rows).enumerate() {
-            process(ci * 4, ch);
+        // Scalar: chunk covers output rows `jb..jb+n_out`.
+        for k in 0..n_out {
+            let oj = jb + k;
+            for i in 0..rows {
+                chunk[k * rows + i] = src[i * cols + oj];
+            }
         }
     }
 }
@@ -40485,50 +40609,55 @@ pub fn transpose_2d_into_f32(src: &[f32], dst: &mut [f32], rows: usize, cols: us
     if rows == 0 || cols == 0 {
         return;
     }
+    const PAR_MIN: usize = 1 << 16;
+    if rows * cols >= PAR_MIN {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(TRANSPOSE_BLK_F32 * rows)
+            .enumerate()
+            .for_each(|(ci, ch)| {
+                transpose_cols_into_f32(src, ch, rows, cols, ci * TRANSPOSE_BLK_F32);
+            });
+    } else {
+        for (ci, ch) in dst.chunks_mut(TRANSPOSE_BLK_F32 * rows).enumerate() {
+            transpose_cols_into_f32(src, ch, rows, cols, ci * TRANSPOSE_BLK_F32);
+        }
+    }
+}
+
+/// Output rows per chunk of the blocked f32 transpose (8x8 AVX2 register block).
+const TRANSPOSE_BLK_F32: usize = 8;
+
+/// f32 mirror of [`transpose_cols_into_f64`]: OUTPUT rows `jb ..` of `src`'s transpose.
+fn transpose_cols_into_f32(src: &[f32], chunk: &mut [f32], rows: usize, cols: usize, jb: usize) {
     #[cfg(target_arch = "x86_64")]
     let simd = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let simd = false;
 
-    // Each chunk owns 8 consecutive OUTPUT rows (= 8 consecutive src columns `jb..jb+8`).
-    let process = |jb: usize, chunk: &mut [f32]| {
-        let n_out = chunk.len() / rows;
-        if simd && n_out == 8 && jb + 8 <= cols {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mut ib = 0;
-                while ib + 8 <= rows {
-                    // SAFETY: `simd` ⇒ AVX2 present; `ib+8<=rows` & `jb+8<=cols` keep every src load in
-                    // `[0, rows*cols)`; `chunk.len()==8*rows` keeps every dst store in bounds (max
-                    // index 7*rows+ib+7 < 8*rows since ib+7 < rows).
-                    unsafe { transpose_block_8x8_avx2_f32(src, chunk, ib, jb, cols, rows) };
-                    ib += 8;
-                }
-                for i in ib..rows {
-                    for k in 0..8 {
-                        chunk[k * rows + i] = src[i * cols + jb + k];
-                    }
-                }
+    let n_out = chunk.len() / rows;
+    if simd && n_out == TRANSPOSE_BLK_F32 && jb + TRANSPOSE_BLK_F32 <= cols {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut ib = 0;
+            while ib + 8 <= rows {
+                // SAFETY: `simd` ⇒ AVX2 present; `ib+8<=rows` & `jb+8<=cols` keep every src load in
+                // `[0, rows*cols)`; `chunk.len()==8*rows` keeps every dst store in bounds (max
+                // index 7*rows+ib+7 < 8*rows since ib+7 < rows).
+                unsafe { transpose_block_8x8_avx2_f32(src, chunk, ib, jb, cols, rows) };
+                ib += 8;
             }
-        } else {
-            for k in 0..n_out {
-                let oj = jb + k;
-                for i in 0..rows {
-                    chunk[k * rows + i] = src[i * cols + oj];
+            for i in ib..rows {
+                for k in 0..8 {
+                    chunk[k * rows + i] = src[i * cols + jb + k];
                 }
             }
         }
-    };
-
-    const PAR_MIN: usize = 1 << 16;
-    if rows * cols >= PAR_MIN {
-        use rayon::prelude::*;
-        dst.par_chunks_mut(8 * rows)
-            .enumerate()
-            .for_each(|(ci, ch)| process(ci * 8, ch));
     } else {
-        for (ci, ch) in dst.chunks_mut(8 * rows).enumerate() {
-            process(ci * 8, ch);
+        for k in 0..n_out {
+            let oj = jb + k;
+            for i in 0..rows {
+                chunk[k * rows + i] = src[i * cols + oj];
+            }
         }
     }
 }
@@ -63552,6 +63681,168 @@ mod tests {
                 lhs.to_bits() == rhs.to_bits(),
                 "singular value {idx} not bit-identical: svd {lhs} vs svdvals {rhs}"
             );
+        }
+    }
+
+    /// conv2d's output transpose picks its chunking from the pool width (item 171). BOTH arms must
+    /// produce the same bytes, or the fine split silently changes a certified forward.
+    ///
+    /// This drives the choice directly instead of hoping the ambient pool takes both branches:
+    /// `threads = 1` forces the coarse per-batch arm that ships today, `threads = usize::MAX`
+    /// forces the fine per-4-output-row arm. Comparing `to_bits()` rather than `==` is the point —
+    /// `-0.0 == 0.0` is true, and a signed zero is exactly what item 158's unconditional bias add
+    /// exists to preserve, so an `==` comparison here would pass while the property was broken.
+    #[test]
+    fn conv2d_output_transpose_is_bit_identical_under_both_chunkings() {
+        // Shapes chosen to straddle every branch: the scored shape, a batch that already exceeds a
+        // small pool, `out_ch % 4 != 0` (fine arm declines), `out_ch < 4`, and a zero dimension
+        // (which must not reach `par_chunks_mut(0)`).
+        for &(batch, out_ch, patch_count) in &[
+            (2usize, 32usize, 1024usize),
+            (8, 32, 1024),
+            (3, 12, 257),
+            (2, 6, 33),
+            (1, 4, 5),
+            (2, 2, 7),
+            (2, 32, 0),
+            (2, 0, 16),
+            (0, 8, 16),
+        ] {
+            let plane = patch_count * out_ch;
+            let n = batch * plane;
+            // Signed zeros on purpose, paired with a zero bias below.
+            let out_flat: Vec<f64> = (0..n)
+                .map(|i| match i % 5 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    _ => ((i % 251) as f64) * 0.001 - 0.12,
+                })
+                .collect();
+            let zero_bias = vec![0.0f64; out_ch];
+            let real_bias: Vec<f64> = (0..out_ch).map(|c| ((c % 7) as f64) * 0.25 - 0.5).collect();
+
+            for bias in [None, Some(&zero_bias[..]), Some(&real_bias[..])] {
+                let mut coarse = vec![f64::NAN; n];
+                let mut fine = vec![f64::NAN; n];
+                super::conv2d_transpose_bias_into_f64(
+                    &mut coarse,
+                    &out_flat,
+                    bias,
+                    batch,
+                    out_ch,
+                    patch_count,
+                    1,
+                );
+                super::conv2d_transpose_bias_into_f64(
+                    &mut fine,
+                    &out_flat,
+                    bias,
+                    batch,
+                    out_ch,
+                    patch_count,
+                    usize::MAX,
+                );
+                for (i, (c, f)) in coarse.iter().zip(&fine).enumerate() {
+                    assert_eq!(
+                        c.to_bits(),
+                        f.to_bits(),
+                        "f64 chunking changed element {i} at \
+                         batch={batch} out_ch={out_ch} patch_count={patch_count}: \
+                         coarse={c} fine={f}"
+                    );
+                }
+                // Both arms must have WRITTEN every element — a chunking that silently skipped a
+                // block would otherwise agree with itself on the NaN fill and pass the loop above.
+                assert!(
+                    coarse.iter().all(|v| !v.is_nan()),
+                    "coarse arm left an element unwritten at \
+                     batch={batch} out_ch={out_ch} patch_count={patch_count}"
+                );
+                assert!(
+                    fine.iter().all(|v| !v.is_nan()),
+                    "fine arm left an element unwritten at \
+                     batch={batch} out_ch={out_ch} patch_count={patch_count}"
+                );
+            }
+
+            // f32 mirror, block of 8.
+            let out_flat32: Vec<f32> = out_flat.iter().map(|&v| v as f32).collect();
+            let real_bias32: Vec<f32> = real_bias.iter().map(|&v| v as f32).collect();
+            for bias in [None, Some(&real_bias32[..])] {
+                let mut coarse = vec![f32::NAN; n];
+                let mut fine = vec![f32::NAN; n];
+                super::conv2d_transpose_bias_into_f32(
+                    &mut coarse,
+                    &out_flat32,
+                    bias,
+                    batch,
+                    out_ch,
+                    patch_count,
+                    1,
+                );
+                super::conv2d_transpose_bias_into_f32(
+                    &mut fine,
+                    &out_flat32,
+                    bias,
+                    batch,
+                    out_ch,
+                    patch_count,
+                    usize::MAX,
+                );
+                for (i, (c, f)) in coarse.iter().zip(&fine).enumerate() {
+                    assert_eq!(
+                        c.to_bits(),
+                        f.to_bits(),
+                        "f32 chunking changed element {i} at \
+                         batch={batch} out_ch={out_ch} patch_count={patch_count}"
+                    );
+                }
+                assert!(coarse.iter().all(|v| !v.is_nan()) && fine.iter().all(|v| !v.is_nan()));
+            }
+        }
+    }
+
+    /// The transpose itself: the lifted `transpose_cols_into_*` must reproduce a naive transpose,
+    /// including the scalar tail when `rows`/`cols` are not multiples of the register block.
+    #[test]
+    fn transpose_cols_into_matches_naive_transpose() {
+        for &(rows, cols) in &[
+            (1usize, 1usize),
+            (4, 4),
+            (7, 9),
+            (33, 8),
+            (8, 33),
+            (257, 12),
+        ] {
+            let src: Vec<f64> = (0..rows * cols).map(|i| (i as f64) * 0.5 - 3.0).collect();
+            let mut naive = vec![0.0f64; rows * cols];
+            for i in 0..rows {
+                for j in 0..cols {
+                    naive[j * rows + i] = src[i * cols + j];
+                }
+            }
+            let mut got = vec![f64::NAN; rows * cols];
+            for (ci, ch) in got.chunks_mut(super::TRANSPOSE_BLK_F64 * rows).enumerate() {
+                super::transpose_cols_into_f64(&src, ch, rows, cols, ci * super::TRANSPOSE_BLK_F64);
+            }
+            assert_eq!(got, naive, "f64 transpose at {rows}x{cols}");
+
+            let src32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+            let naive32: Vec<f32> = naive.iter().map(|&v| v as f32).collect();
+            let mut got32 = vec![f32::NAN; rows * cols];
+            for (ci, ch) in got32
+                .chunks_mut(super::TRANSPOSE_BLK_F32 * rows)
+                .enumerate()
+            {
+                super::transpose_cols_into_f32(
+                    &src32,
+                    ch,
+                    rows,
+                    cols,
+                    ci * super::TRANSPOSE_BLK_F32,
+                );
+            }
+            assert_eq!(got32, naive32, "f32 transpose at {rows}x{cols}");
         }
     }
 }
