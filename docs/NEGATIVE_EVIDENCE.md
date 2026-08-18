@@ -34951,3 +34951,70 @@ Compilation, `cargo clippy`, and this test actually running — for conv3d and f
 twin, neither of which has ever executed. Then the paired vs-PyTorch run on `conv3d_masked`, which
 per item 193b needs a binary built `--features fair-alloc`; the snapshot every measurement this
 session used was built without it.
+
+## 197. THE END OF THE needs_input_grad CHAIN — AND THE READ THAT HAD TO COME FIRST
+
+`frankentorch-hi9r6`. **UNBUILT** — `/data` 43G, one gigabyte above the hard brake; no cargo of any
+kind ran. `rustfmt --edition 2024 --check` exits 0. No measurement: loadavg 8.75/20.79/31.33 is the
+quietest window of the session and is FALLING fast, which is drift in the direction that voids a
+run exactly as surely as rising.
+
+### 197a. WHAT WAS OPEN
+
+Item 190 proved the masked kernels skip the GEMM their mask declines, and then stopped, saying so:
+it could not show that `ft-api` SETS that mask from the tape's actual grad requirements, and
+declined to assert it from the same kind of source-reading the item was about. Item 178 (f64) and
+item 187 (f32) both rest on that unproven link.
+
+### 197b. THE READ THAT DECIDED WHETHER THE TEST WAS EVEN POSSIBLE
+
+The sentinel is a THREAD-LOCAL cell, chosen in item 190b so parallel tests cannot race it. That
+choice has a price: an `ft-api`-level assertion is only meaningful if the backward closure runs on
+the thread that reads the counter. Item 190d recorded that as an unverified dependency.
+
+It holds, and the check is worth writing down because the answer was not obvious:
+
+- `TensorTape::backward_with_options` is 3982 lines and contains **23 rayon constructs**, which
+  looks disqualifying.
+- Node dispatch is `while let Some(node_id) = queue.pop()` — a SERIAL loop on the calling thread.
+- All 23 parallel constructs sit INSIDE individual op gradient formulas (e.g. the fused normp
+  backward's per-lane products), never around the dispatch of a node's closure.
+
+So closures run on the calling thread and the sentinel is observable. **A count of rayon
+constructs in a function says nothing about whether that function is parallel where it matters.**
+Had dispatch been parallel, the right move would have been to change the test, not the sentinel.
+
+### 197c. THE TEST
+
+Two cases through the PUBLIC session API, both reaching the f32 fused path (selected by dtype, not
+by grad flags):
+
+    x.requires_grad  w.requires_grad     (dweight GEMMs, dpanel GEMMs)
+         true             false                    (0, 1)
+         false            true                     (1, 0)
+
+Three details are deliberate:
+
+- **The upstream gradient is non-uniform** (a mask multiply, asserted non-uniform). Under an
+  all-ones gradient the adjoints replace both GEMMs and there is no GEMM to skip — the test would
+  pass while proving nothing, which is item 190c's trap one level up.
+- **Both cases are SINGLE-output masks.** `[true, true, _]` delegates to the uninstrumented
+  unmasked kernel and reads (0, 0), which cannot distinguish "skipped" from "counted elsewhere".
+- **The wanted gradient is asserted to exist.** Otherwise a zero count is equally consistent with
+  the backward having quietly done nothing at all, which is the failure a counter cannot see.
+
+Together the pair shows the mask VARIES with the leaves. A mask hard-wired either way gives the
+same pair for both cases and fails.
+
+### 197d. WHY THIS AND NOT A MEASUREMENT
+
+The window was the quietest of the session — loadavg 8.75 against 24-85 for every earlier attempt,
+and the `/proc` scan from item 194 reported `concurrent_measurements=none`. It was still refused:
+1m 8.75 against 15m 31.33 is a host in free-fall, and a run started into a decaying transient
+finishes at a different load than it began, which is precisely the drift the gate rejects. Four
+runs have already been spent learning that a moving host cannot be measured, in both directions.
+
+### 197e. OWED
+
+Compile items 194, 195, 196 and this. Then, when 1m ~ 5m ~ 15m and the slot prints `held`:
+`FT_H2H_LANES=conv2d` at `round_warmup=0`.

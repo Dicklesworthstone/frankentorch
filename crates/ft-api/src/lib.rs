@@ -170822,4 +170822,85 @@ mod tests {
             );
         }
     }
+
+    /// END TO END: the mask the kernel skips on is the one `needs_input_grad` reports — item 196,
+    /// closing the gap item 190d left open.
+    ///
+    /// Item 190 proved the masked kernels SKIP the GEMM the mask declines, but stopped there: it
+    /// could not show that `ft-api` sets that mask from the tape's actual grad requirements, and
+    /// said so rather than asserting it from the same kind of source-reading the item was about.
+    /// Two things were checked before writing this, both by reading:
+    ///
+    /// 1. The tensor backward driver dispatches nodes with `while let Some(node_id) = queue.pop()`
+    ///    — a SERIAL loop on the calling thread. Its 23 rayon constructs are all inside individual
+    ///    op gradient formulas, not around node dispatch. So the kernel's thread-local sentinel is
+    ///    observable from here; had dispatch been parallel it would not have been.
+    /// 2. The f32 fused path is selected by DTYPE, not by grad flags, so both cases below reach it.
+    ///
+    /// The mask is NON-UNIFORM on purpose: with an all-ones upstream gradient the adjoints replace
+    /// both GEMMs and there would be no GEMM to skip, so the test would pass while proving nothing.
+    ///
+    /// The two cases are single-output masks deliberately. `[true, true, _]` delegates to the
+    /// unmasked kernel, whose GEMMs are not instrumented, so it would read (0, 0) and could not
+    /// distinguish "skipped" from "counted elsewhere". Together these two show the mask VARIES
+    /// with the leaves, which is the claim.
+    #[test]
+    fn conv2d_f32_backward_computes_only_the_gradients_the_tape_wants() {
+        let (n, cin, cout, ih, iw, k) = (2usize, 3usize, 4usize, 9usize, 10usize, 3usize);
+        let xv: Vec<f32> = (0..n * cin * ih * iw)
+            .map(|i| (i % 23) as f32 * 0.1 - 1.0)
+            .collect();
+        let wv: Vec<f32> = (0..cout * cin * k * k)
+            .map(|i| (i % 17) as f32 * 0.1 - 0.7)
+            .collect();
+        let mv: Vec<f32> = (0..n * cout * ih * iw)
+            .map(|i| (i % 13) as f32 * 0.05 + 0.25)
+            .collect();
+        assert!(
+            mv.iter().any(|v| v.to_bits() != 1.0f32.to_bits()),
+            "the upstream gradient must be non-uniform or the all-ones adjoint runs and there is \
+             no GEMM to skip"
+        );
+
+        // (x requires grad, w requires grad) -> expected (dweight GEMMs, dpanel GEMMs)
+        for (x_grad, w_grad, want) in [(true, false, (0usize, 1usize)), (false, true, (1, 0))] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xt = s
+                .tensor_variable_f32(xv.clone(), vec![n, cin, ih, iw], x_grad)
+                .unwrap();
+            let wt = s
+                .tensor_variable_f32(wv.clone(), vec![cout, cin, k, k], w_grad)
+                .unwrap();
+            let mt = s
+                .tensor_variable_f32(mv.clone(), vec![n, cout, ih, iw], false)
+                .unwrap();
+            let o = s.functional_conv2d(xt, wt, None, (1, 1), (1, 1)).unwrap();
+            let scored = s.tensor_mul(o, mt).unwrap();
+            let loss = s.tensor_sum(scored).unwrap();
+
+            ft_kernel_cpu::reset_conv2d_backward_gemm_counts();
+            s.tensor_backward(loss).unwrap();
+            let counts = ft_kernel_cpu::conv2d_backward_gemm_counts();
+
+            assert_eq!(
+                counts, want,
+                "x_grad={x_grad} w_grad={w_grad}: (dweight, dpanel) GEMM executions. A mask that \
+                 never varies would give the same pair for both cases."
+            );
+            // The gradient that WAS wanted must exist, so a zero count cannot be explained by the
+            // backward having quietly done nothing at all.
+            if x_grad {
+                assert!(
+                    s.tensor_grad(xt).unwrap().is_some(),
+                    "d_input was requested and not produced"
+                );
+            }
+            if w_grad {
+                assert!(
+                    s.tensor_grad(wt).unwrap().is_some(),
+                    "d_weight was requested and not produced"
+                );
+            }
+        }
+    }
 }
