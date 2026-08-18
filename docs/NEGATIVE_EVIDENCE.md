@@ -33618,3 +33618,75 @@ Only the first two are things I would predict; the third would redirect items 17
 NOT VERIFIED: compilation, and neither arm of this lane has ever run. The lane also needs its own
 A/A null before anything is quoted from it — item 144a is the standing reminder that a new lane's
 nullability is a property to be established, not assumed.
+
+## 183. ITEM 181d OVERSTATED A COVERAGE GAP — THE f64 FOLD IS WELL TESTED, AND CHASING MY OWN CLAIM FOUND THE REAL HOLE IN f32 INSTEAD
+
+`frankentorch-hi9r6`. **UNBUILT.** Build freeze — `/data` 26G, 99% used, loadavg 7.64/9.16/8.87 on
+the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 183a. THE WITHDRAWAL
+
+Item 181d listed as owed: *"widening the two f64 fixtures above one k-block, which is a real gap in
+coverage independent of anything f32."* **That is withdrawn.** It is wrong, and I only found out
+because I went to do the work and read the surrounding tests first.
+
+`conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise` already exists and is thorough. Its
+case matrix is exactly what item 181 asked for and more:
+
+    flat = 2*64*64 = 8192 = 32 * DGEMM_KC     the bead's own repro
+    flat = 2*30*30 = 1800                     ragged tail, not a multiple of 256
+    flat = 4*301   = 1204                     strided height-1 shape
+    flat = 30                                 control, inside one block
+    out_ch = 300, 512                         the OTHER GEMM's k, ragged and exact
+
+It also asserts `saw_flat_above_block` and `saw_out_ch_above_block`, so its own fixtures cannot
+drift under the boundary. The f64 fold is not undertested; it has a dedicated regression test built
+around the failure that produced it.
+
+What item 181b said narrowly — that the two ACCEPTANCE tests sit inside one block — remains true,
+and the general lesson stands. What 181d inferred from it, that f64 coverage of the fold was
+missing, did not follow: I reasoned from the tests I had happened to read to the tests that exist.
+**A gap you infer from the tests you have looked at is a claim about your reading, not about the
+suite.**
+
+### 183b. THE REAL HOLE, WHICH IS IN MY OWN NEW CODE
+
+f32 has no counterpart of that test at all, and the f32 acceptance tests I wrote in items 179 and
+181 do not substitute for it. They cover `flat` above `SGEMM_KC` — but every fixture in both of
+them runs at `out_ch` of 3 or 4.
+
+`out_ch` is the k dimension of the OTHER GEMM in these routes, the one producing `dpanel_row`. Its
+blocking was therefore completely unexercised for f32. That is the same blindness the original f64
+proofs had for `flat`, one function over — and the f64 version of this test carries a comment
+saying that repeating it one function over is the specific failure it exists to prevent. I repeated
+it one dtype over.
+
+The claim at stake is not a hand-rolled fold here: `dpanel_row` comes from a real
+`sgemm(1, out_ch, patch_width, ..)`, and the claim is that ONE row of it is bit-identical to every
+row the generic route's `sgemm(flat, out_ch, ..)` produces — i.e. that the k-blocking does not
+depend on `m`. Cheap to believe, never checked for f32, and `out_ch = 300` and `512` are what check
+it.
+
+### 183c. WHAT LANDED
+
+`conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise_f32`, mirroring the f64 case matrix
+verbatim, driving the PUBLIC `conv2d_backward_f32` so both routes added in items 179 and 181 are
+reached — the height-1 strided case reaches one, the rest reach the other — and carrying both
+boundary assertions.
+
+Case matrix as it will execute, computed rather than assumed:
+
+    (2,3,66,66,3,3,1,1) oh=64 ow=64 flat=8192 out_ch=4    -> 3x3_f32
+    (2,3,32,32,3,3,1,1) oh=30 ow=30 flat=1800 out_ch=4    -> 3x3_f32
+    (4,2, 1,605,1,5,1,2) oh=1 ow=301 flat=1204 out_ch=4   -> height1_f32
+    (2,3, 7, 8,3,3,1,1) oh=5  ow=6  flat=  60 out_ch=4    -> 3x3_f32
+    (1,2, 9, 9,3,3,1,1) oh=7  ow=7  flat=  49 out_ch=300  -> 3x3_f32
+    (1,2, 7, 7,3,3,1,1) oh=5  ow=5  flat=  25 out_ch=512  -> 3x3_f32
+
+The f64 fixtures are NOT widened, because they did not need it.
+
+### 183d. OWED
+
+Unchanged and still the gate on everything in items 179, 181 and 183: build, and run these tests.
+Three commits of unverified numerical code have now stacked up behind the freeze, and the f32
+routes should be considered unproven until this test in particular passes.

@@ -65213,4 +65213,167 @@ mod tests {
             "no fixture exceeded SGEMM_KC, so this test cannot see a mis-folded reduction at all"
         );
     }
+
+    /// f32 mirror of `conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise` — the test
+    /// that actually caught the f64 fold bug, which the f32 routes did not have.
+    ///
+    /// WHY THIS AND NOT JUST THE ACCEPTANCE TESTS. The two f32 acceptance tests added with the
+    /// routes cover `flat` above `SGEMM_KC`, but every one of their fixtures runs at `out_ch` of 3
+    /// or 4. `out_ch` is the k dimension of the OTHER GEMM in this route — the one producing
+    /// `dpanel_row` — so its blocking was completely unexercised. That is the same blindness the
+    /// original f64 proofs had for `flat`, one function over, which is precisely the mistake the
+    /// f64 version of this test was written to stop being repeated.
+    ///
+    /// The case matrix is the f64 one: the bead's repro at `flat = 32 * SGEMM_KC`, a ragged tail, a
+    /// strided height-1 shape, a control inside one block, and two `out_ch` above a block (one
+    /// ragged, one exact). Both routes added for f32 are reached through the PUBLIC entry.
+    #[test]
+    fn conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise_f32() {
+        /// `(batch, in_ch, ph, pw, kh, kw, sh, sw)`
+        type ConvCase = (usize, usize, usize, usize, usize, usize, usize, usize);
+        /// `ConvCase` plus `out_ch`, the dpanel GEMM's k.
+        type ConvCaseWithOutCh = (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        );
+
+        let cases: &[ConvCase] = &[
+            // the bead's repro: oh = ow = 64, flat = 2*64*64 = 8192 = 32 * SGEMM_KC
+            (2, 3, 66, 66, 3, 3, 1, 1),
+            // flat = 2*30*30 = 1800, NOT a multiple of 256 (ragged tail)
+            (2, 3, 32, 32, 3, 3, 1, 1),
+            // height-1 (conv1d's primitive), strided — reaches the OTHER new f32 route
+            (4, 2, 1, 605, 1, 5, 1, 2),
+            // control: inside ONE block, the regime the narrow acceptance fixtures live in
+            (2, 3, 7, 8, 3, 3, 1, 1),
+        ];
+
+        let all: Vec<ConvCaseWithOutCh> = cases
+            .iter()
+            .map(|&(b, ic, ph, pw, kh, kw, sh, sw)| (b, ic, ph, pw, kh, kw, sh, sw, 4usize))
+            .chain([
+                // out_ch = 300 > SGEMM_KC: a ragged tail in the dpanel GEMM's k
+                (
+                    1usize, 2usize, 9usize, 9usize, 3usize, 3usize, 1usize, 1usize, 300usize,
+                ),
+                // out_ch = 512 = 2 * SGEMM_KC exactly
+                (
+                    1usize, 2usize, 7usize, 7usize, 3usize, 3usize, 1usize, 1usize, 512usize,
+                ),
+            ])
+            .collect();
+
+        let mut saw_flat_above_block = false;
+        let mut saw_out_ch_above_block = false;
+        for &(batch, in_ch, ph, pw, kh, kw, sh, sw, out_ch) in &all {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_width = in_ch * kh * kw;
+            let flat = batch * oh * ow;
+            saw_flat_above_block |= flat > super::SGEMM_KC;
+            saw_out_ch_above_block |= out_ch > super::SGEMM_KC;
+
+            let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i as f32 * 0.037).sin() * 0.7 + (i % 13) as f32 * 0.011 - 0.4) / 1024.0)
+                .collect();
+            let weight_flat: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| ((i as f32 * 0.041).cos() * 0.5) / 1024.0)
+                .collect();
+            let dout = vec![1.0f32; batch * out_ch * oh * ow];
+
+            // Reference: exactly what the kernel does without the fast paths.
+            let panel =
+                super::conv2d_im2col_f32(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+            let ones_flat = vec![1.0f32; flat];
+            let mut want_row = vec![0.0f32; patch_width];
+            super::gemm::sgemm(1, flat, patch_width, &ones_flat, &panel, &mut want_row);
+
+            let mut dout_flat = vec![0.0f32; flat * out_ch];
+            for v in dout_flat.iter_mut() {
+                *v = 1.0;
+            }
+            let mut want_dpanel = vec![0.0f32; flat * patch_width];
+            super::gemm::sgemm(
+                flat,
+                out_ch,
+                patch_width,
+                &dout_flat,
+                &weight_flat,
+                &mut want_dpanel,
+            );
+            let want_dpadded = super::conv2d_col2im_f32(
+                &want_dpanel,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+            );
+
+            let (got_dp, got_dw, _) = super::conv2d_backward_f32(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
+            );
+
+            assert_eq!(got_dp.len(), want_dpadded.len());
+            for (j, (&g, &w)) in got_dp.iter().zip(want_dpadded.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "dpadded[{j}] moved at batch={batch} in_ch={in_ch} out_ch={out_ch} \
+                     ph={ph} pw={pw} flat={flat} (SGEMM_KC={}): no-panel {g:e} vs \
+                     panel+GEMM {w:e}",
+                    super::SGEMM_KC
+                );
+            }
+            assert_eq!(got_dw.len(), out_ch * patch_width);
+            for oc in 0..out_ch {
+                let row = &got_dw[oc * patch_width..(oc + 1) * patch_width];
+                for (j, (&g, &w)) in row.iter().zip(want_row.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "dweight[oc={oc}][{j}] moved at batch={batch} in_ch={in_ch} \
+                         ph={ph} pw={pw} kh={kh} kw={kw} flat={flat} (SGEMM_KC={}): \
+                         no-panel {g:e} vs panel+GEMM {w:e}",
+                        super::SGEMM_KC
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_flat_above_block,
+            "no case exceeded SGEMM_KC in `flat`; the dweight fold is then untested"
+        );
+        assert!(
+            saw_out_ch_above_block,
+            "no case exceeded SGEMM_KC in `out_ch`; the dpanel GEMM's k is then untested, which \
+             is the specific blindness this test exists to prevent"
+        );
+    }
 }
