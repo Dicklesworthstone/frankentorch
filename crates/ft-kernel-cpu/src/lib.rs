@@ -8073,6 +8073,23 @@ pub fn conv2d_backward_f32(
     // transpose pass (~110ms of a 322ms weight-grad => 1.5x). kgs4-convtb.
     let mut dweight = vec![0.0f32; out_ch * patch_width];
     gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
+    // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
+    //
+    // `panel`'s last use is the GEMM above, but without this it lives to the end of the
+    // function, so it and the `dpanel` allocated on the next line are BOTH resident through
+    // the second GEMM and through col2im. On the f64 sibling that doubled peak working set
+    // (18.0 MB + 18.0 MB, against a 32 MiB L3 instance -- `lscpu`: 128 MiB in 4 instances) and
+    // removing it measured **1.61-2.00x** on the whole backward, with the unaccounted residual
+    // falling from 63% to 19%.
+    //
+    // SMALLER EXPECTED EFFECT HERE, stated so nobody quotes the f64 number for this path: f32
+    // panels are HALF the bytes, so the pair is ~9 MB + ~9 MB and the peak may already fit in
+    // one L3 instance. The change is applied because it is free and cannot hurt -- not because
+    // the f64 magnitude is claimed for it. UNMEASURED on this path.
+    //
+    // BIT-EXACT WITHOUT AN ARGUMENT: a LIFETIME changes, not an operation. Nothing is
+    // reordered, recomputed, or read after this point.
+    drop(panel);
     let mut dpanel = vec![0.0f32; flat * patch_width];
     gemm::sgemm(
         flat,
@@ -13831,6 +13848,23 @@ pub fn conv3d_backward_f32(
     // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     let mut dweight = vec![0.0f32; out_ch * patch_width];
     gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
+    // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
+    //
+    // `panel`'s last use is the GEMM above, but without this it lives to the end of the
+    // function, so it and the `dpanel` allocated on the next line are BOTH resident through
+    // the second GEMM and through col2im. On the f64 sibling that doubled peak working set
+    // (18.0 MB + 18.0 MB, against a 32 MiB L3 instance -- `lscpu`: 128 MiB in 4 instances) and
+    // removing it measured **1.61-2.00x** on the whole backward, with the unaccounted residual
+    // falling from 63% to 19%.
+    //
+    // SMALLER EXPECTED EFFECT HERE, stated so nobody quotes the f64 number for this path: f32
+    // panels are HALF the bytes, so the pair is ~9 MB + ~9 MB and the peak may already fit in
+    // one L3 instance. The change is applied because it is free and cannot hurt -- not because
+    // the f64 magnitude is claimed for it. UNMEASURED on this path.
+    //
+    // BIT-EXACT WITHOUT AN ARGUMENT: a LIFETIME changes, not an operation. Nothing is
+    // reordered, recomputed, or read after this point.
+    drop(panel);
     let mut dpanel = vec![0.0f32; flat * patch_width];
     gemm::sgemm(
         flat,

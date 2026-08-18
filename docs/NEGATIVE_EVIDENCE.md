@@ -31419,3 +31419,57 @@ avg_pool1d. What can be offered is the diagnostic rather than the diagnosis: `FT
 plus the drift-robust estimator now in `scripts/h2h_slot_profile.py` answers it in one run, and that
 bead's own note says its binary is already on disk — so the check costs no build even under this
 freeze. Left on that bead as a suggestion, explicitly not a finding.
+
+## 150. THE PANEL DROP IS APPLIED TO BOTH f32 CONV BACKWARDS — UNBUILT UNDER THE FREEZE — AND THE INCUMBENT'S LAYOUT STRATEGY ALREADY EXISTS IN THIS REPO, IN A SIBLING OP
+
+`frankentorch-hi9r6`. Written under a build freeze (/data 33G, 99%): no cargo, no benchmark, no
+artifact written. What could be verified without a build was, and what could not is labelled.
+
+### 1. CODE LANDED, UNBUILT
+
+`drop(panel)` applied at the two sites item 148 identified by reading:
+
+    conv2d_backward_f32   panel freed after `sgemm_tb`, before the `dpanel` alloc
+    conv3d_backward_f32   same
+
+Item 146 measured this on the f64 sibling at **1.61-2.00x** on the whole backward, with the
+unaccounted residual dropping 63% -> 19%. It is bit-exact without an argument — a LIFETIME
+changes, not an operation; nothing is reordered, recomputed, or read afterwards.
+
+**VERIFIED WITHOUT CARGO:** `rustfmt --edition 2024 --check` exits 0 on the file, so it parses
+and is already format-clean. That is the only check available today; it is NOT a compile and NOT
+a test. Both sites need `cargo test -p frankentorch-kernel-cpu --lib` and a paired before/after
+when the volume frees.
+
+**THE f64 MAGNITUDE IS NOT CLAIMED FOR THESE.** f32 panels are half the bytes, so the pair is
+~9 MB + ~9 MB and the peak may already fit inside one 32 MiB L3 instance. The change is applied
+because it is free and cannot hurt, not because 1.6-2.0x is expected. There is also no f32 conv
+h2h lane, so even a real arm-internal gain has no incumbent to be certified against.
+
+### 2. WHAT THE INCUMBENT'S OWN SOURCE SAYS, AND WHERE WE ALREADY AGREE WITH IT
+
+conv backward is native C++ and not shipped in the wheel, but `torch/_inductor/kernel/conv.py`
+IS readable and states the strategy plainly: `channels_last_order`, a `conv_layout` that requires
+channels-last stride order, and `conv1x1_via_mm` / `convert_1x1_conv_to_mm` so that only 1x1
+convolutions become matmuls. **PyTorch does not run NCHW im2col+GEMM for general convolutions**,
+which is consistent with everything measured on this bead: our GEMMs are fine (99-138 GFLOP/s,
+item 140) and the loss is in what surrounds them.
+
+**AND WE ALREADY IMPLEMENT THAT STRATEGY — IN conv_transpose2d.** Its backward transposes `dout`
+to `[N,oh,ow,Cout]` and `weight` to `[Cin,kh,kw,Cout]` ONCE, precisely so the inner `Σ_oc` reads
+two contiguous Cout-vectors instead of striding both operands, and it documents the sum staying
+sequential so the result is bit-for-bit identical (`frankentorch-ctp-cl`).
+
+So the direction conv2d's remaining ~4.4x needs is not speculative and does not need to be
+imported from the incumbent: **it is a proven, bit-exact, in-repo pattern in a neighbouring
+kernel.** conv2d reaches for im2col+GEMM; conv_transpose2d reaches for a layout change. The
+incumbent agrees with conv_transpose2d.
+
+### WHAT THIS DOES NOT ESTABLISH
+
+That a channels-last conv2d backward would be faster here. It is a direction with an in-repo
+precedent and incumbent agreement, not a measurement, and this bead has already killed five
+plausible directions by measuring them. It also is not free: conv2d's generic backward currently
+gets its parallel width from one wide GEMM, and item 116/117 recorded a 1.7x REGRESSION when a
+restructuring fragmented that width. Any layout rewrite has to keep one wide parallel region, and
+that constraint should be designed in before a line is written.
