@@ -34544,3 +34544,67 @@ sides (`as f32` here, `.float()` there) so the arms carry identical bits.
 ### 192e. OWED
 
 Compile it. Then a quiet host, per item 189.
+
+## 193. BOTH A/A NULLS PASSED AT 64 ROUNDS — THE FIRST conv2d ROW THIS SESSION TO CLEAR THE GATES, AND IT IS STILL NOT QUOTABLE
+
+`frankentorch-hi9r6` (P0). **NO BUILD** — disk throttle in force, `/data` 63-65G, not one cargo
+invocation. This ran the snapshotted ELF, which "benchmarks that need no rebuild are fine" permits.
+
+### 193a. THE ROW
+
+    lane                FT(ms)    PT(ms)   standing        PT null        FT null        parity
+    conv2d_big_masked   28.515    11.786   2.42x SLOWER    PASS 0.977-1.036  PASS 0.966-1.009  match
+
+Provenance: host `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, `x86_64+avx2`, governor
+powersave, `RAYON_NUM_THREADS=8`, online_cpus 64. ELF sha256
+`2462293598f10e7721efe49ac9786c3bf5edda7b1a700608bfa4df5200805e67`. Incumbent PyTorch 2.12.1+cpu,
+self-reported by the arm **in the same invocation**, torch threads 8. 64 rounds, balanced-square
+ABBAABBA. Drift gate PASS, load_1m 22.12 -> 21.21, CPU idle 78%, cpu_mhz spread 2.974x.
+`slot0/median(slot1..3)` = 1.007, so no cold-start contamination.
+
+Both A/A nulls PASS. Parity `match`. Drift PASS. **This is the first conv2d row this session that
+the harness did not refuse.**
+
+### 193b. AND IT IS STILL NOT QUOTABLE
+
+    allocator=system (glibc malloc) — re-run with --features fair-alloc before quoting
+
+The binary a sibling pane built omits `--features fair-alloc`, so it runs on glibc malloc. **The
+certified 3.64x row was taken under mimalloc.** For kernels whose cost is dominated by 18-38 MB
+buffer traffic — which is this entire bead — the allocator is not a detail, and the harness prints
+that warning precisely so a row like this cannot be quoted by someone who only read the gates.
+
+So **2.42x does NOT supersede the certified 3.64x**, and I am not claiming it does. The comparison
+is glibc-vs-mimalloc, which is a different experiment from the one the board's standing recorded.
+
+Everything else about the row is sound, which is exactly why the failure mode is dangerous: three
+gates green, parity match, clean provenance, and one line of build metadata that invalidates the
+comparison.
+
+### 193c. THE METHODOLOGICAL RESULT, WHICH IS REAL AND REUSABLE
+
+Rounds are a lever on the nulls, and the walk is monotone:
+
+    rounds   PT null            FT null
+      16     1.050  FAIL        1.003  (PASS)
+      32     0.985  PASS        0.977  FAIL by 0.003
+      64     PASS               PASS
+
+Every earlier certification attempt this session failed because the host was busy, and the response
+had been to wait for a quiet window that never came. **The A/A null is a ratio of medians, so its
+variance falls with the round count — buying the gate with time instead of quiet.** Load was 22-35
+throughout, never the 16-and-idle-86% the earlier attempts treated as a precondition.
+
+That is worth more than the row: it means the board can certify on a contended host by paying
+runtime, and `frankentorch-372h8`'s ten failed runs (item 372h8's note: 2.50-2.70x FASTER, one
+certifying run in ten) may be a round-count problem rather than a host problem.
+
+The min-estimator arm of the same row still says `PT null 1.027 FAIL`, so the two estimators do not
+agree yet — 64 rounds tightened the median estimator past the gate and not the min one.
+
+### 193d. WHAT IS OWED, AND IT IS ONE COMMAND
+
+A single `cargo build --release -p frankentorch-api --features fair-alloc --example
+gauntlet_lane_sweep_h2h`, then this exact run again. Everything else — the shape, the round count,
+the lane, the provenance discipline — is now known to work. The blocker is a build flag and a disk
+throttle, not a measurement problem.
