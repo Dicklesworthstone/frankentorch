@@ -9621,11 +9621,12 @@ pub fn conv2d_backward_masked_f64(
     let flat = batch * patch_count;
 
     // The generic route is the only one this can save work on: the height-1 and 3x3 all-ones
-    // adjoints are separate kernels that produce both halves together. Detect them the same way
-    // `conv2d_backward_f64` does, so the two functions cannot disagree about which route applies.
-    let ones_route = (ph == 1 && kh == 1 && oh == 1
-        || ph > 1 && oh > 1 && kh == 3 && kw == 3 && sh == 1 && sw == 1)
-        && !dout.is_empty()
+    // adjoints are separate kernels that produce both halves together. Detected through the SHARED
+    // `conv2d_ones_dout_route`, not a local copy of the guards — item 200. The comment this
+    // replaces said the two functions "cannot disagree" while they each carried their own copy,
+    // which is the assurance a second copy is least able to give.
+    let ones_route = !dout.is_empty()
+        && conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw).is_some()
         && dout_is_all_ones_f64(dout);
     let both = output_mask[0] && output_mask[1];
 
@@ -9713,41 +9714,40 @@ pub fn conv2d_backward_f64(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let flat = batch * patch_count;
-    if ph == 1 && kh == 1 && oh == 1 && !dout.is_empty() && dout_is_all_ones_f64(dout) {
-        return conv2d_backward_height1_ones_dout_f64(
-            padded,
-            weight_flat,
-            batch,
-            in_ch,
-            pw,
-            kw,
-            ow,
-            sw,
-            out_ch,
-            has_bias,
-        );
-    }
-    if ph > 1
-        && oh > 1
-        && kh == 3
-        && kw == 3
-        && sh == 1
-        && sw == 1
-        && !dout.is_empty()
+    // Both all-ones adjoints, selected through the shared `conv2d_ones_dout_route` so this entry,
+    // the masked f64 entry and both f32 entries cannot drift into disagreeing about which route a
+    // shape takes — item 200. The scan is now evaluated at most once, and only when a route
+    // matches, where the two-guard form could run it twice.
+    if !dout.is_empty()
+        && let Some(route) = conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw)
         && dout_is_all_ones_f64(dout)
     {
-        return conv2d_backward_3x3_stride1_ones_dout_f64(
-            padded,
-            weight_flat,
-            batch,
-            in_ch,
-            ph,
-            pw,
-            oh,
-            ow,
-            out_ch,
-            has_bias,
-        );
+        return match route {
+            ConvOnesRoute::Height1 => conv2d_backward_height1_ones_dout_f64(
+                padded,
+                weight_flat,
+                batch,
+                in_ch,
+                pw,
+                kw,
+                ow,
+                sw,
+                out_ch,
+                has_bias,
+            ),
+            ConvOnesRoute::ThreeByThreeStride1 => conv2d_backward_3x3_stride1_ones_dout_f64(
+                padded,
+                weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                oh,
+                ow,
+                out_ch,
+                has_bias,
+            ),
+        };
     }
     // Gather dout [N,out_ch,patch_count] -> dout_flat [flat, out_ch].
     //
