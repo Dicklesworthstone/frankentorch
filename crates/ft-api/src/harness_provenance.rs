@@ -218,6 +218,101 @@ fn first_line_of(path: &str) -> String {
     )
 }
 
+/// Other processes that were MEASURING when this run started — `frankentorch-hi9r6`, item 193.
+///
+/// WHY THIS IS PROVENANCE AND NOT A NICETY. Item 193 records a run whose drift gates BOTH passed
+/// while every conv2d ratio inverted — `conv2d_masked` read 2.45x SLOWER at loadavg 27 and 1.63x
+/// FASTER at loadavg 85, same ELF, same torch build, twenty minutes apart. The drift gate measures
+/// STABILITY, and a uniformly overloaded host is perfectly stable; the incumbent's absolute time
+/// went 3.1 ms -> 89 ms and the gate had nothing to say about it. What refused those rows was the
+/// A/A nulls, which is one layer of defence for a confound that inverts the sign of the answer.
+///
+/// The specific cause was two h2h harnesses and an unrelated numerical benchmark all sampling at
+/// once. That is invisible in loadavg (which cannot say WHAT the load is) and invisible to every
+/// gate here, but it is trivially visible in `/proc` — so the run can simply say so, and a reader
+/// three weeks later can tell a contended row from a quiet one without having been in the room.
+///
+/// Deliberately a REPORT and not a refusal: agents share this host by design, and a harness that
+/// exits because a peer is busy would be a worse failure than one that says what it saw. It is
+/// also deliberately not a wait — blocking until the host is quiet is how a measurement turns into
+/// a hang.
+///
+/// PRECISION, STATED HONESTLY. The classifier matches substrings of `/proc/<pid>/cmdline`, so a
+/// SHELL that merely names one of these paths is reported too — verified against a live host,
+/// where a `zsh -c` invoking a harness was flagged as a `torch-arm`. That over-reports, and the
+/// direction is chosen: a spurious line makes a reader check, while a missed one makes a contended
+/// row look clean. What it cannot see at all is a measurement that shares neither a name nor a
+/// path with these patterns, so `none` means "none of the shapes we know", never "the host is
+/// quiet" — the loadavg and clock lines beside it are what say that.
+#[must_use]
+pub fn concurrent_measurement_block() -> String {
+    let others = concurrent_measurement_processes();
+    if others.is_empty() {
+        return "concurrent_measurements=none (scanned /proc for other h2h harnesses, criterion \
+                benches and torch processes; this run's own incumbent child is excluded)"
+            .to_owned();
+    }
+    let mut listed: Vec<String> = others
+        .iter()
+        .map(|(pid, kind)| format!("{kind}[{pid}]"))
+        .collect();
+    listed.sort();
+    format!(
+        "concurrent_measurements={} DETECTED: {} — another process was sampling inside this \
+         window, so BOTH runs' arms are contended and NEITHER is quotable however its gates read. \
+         The drift gate cannot see this: it measures stability, and a uniformly overloaded host is \
+         stable.",
+        others.len(),
+        listed.join(" ")
+    )
+}
+
+/// `(pid, kind)` for processes that look like they are measuring, excluding this process and its
+/// direct children — the incumbent arm is our own child and must not count as contention.
+fn concurrent_measurement_processes() -> Vec<(u32, &'static str)> {
+    let me = std::process::id();
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let dir = entry.path();
+        // `/proc/<pid>/stat` is `pid (comm) state ppid ...`, and `comm` may contain spaces and
+        // parentheses, so the fields are taken from AFTER the last ')' rather than by index.
+        if let Ok(stat) = std::fs::read_to_string(dir.join("stat"))
+            && let Some(tail) = stat.rsplit(')').next()
+            && let Some(ppid) = tail
+                .split_whitespace()
+                .nth(1)
+                .and_then(|field| field.parse::<u32>().ok())
+            && ppid == me
+        {
+            continue; // our own incumbent arm
+        }
+        let Ok(raw) = std::fs::read_to_string(dir.join("cmdline")) else {
+            continue;
+        };
+        let cmdline = raw.replace('\0', " ");
+        let kind = if cmdline.contains("_h2h") || cmdline.contains("gauntlet") {
+            "h2h-harness"
+        } else if cmdline.contains("torchvenv") || cmdline.contains("site-packages/torch") {
+            "torch-arm"
+        } else if cmdline.contains("--bench") || cmdline.contains("/benches/") {
+            "criterion-bench"
+        } else {
+            continue;
+        };
+        found.push((pid, kind));
+    }
+    found
+}
+
 /// Render the rows that identify the MACHINE a row was measured on.
 ///
 /// # Why the machine is provenance

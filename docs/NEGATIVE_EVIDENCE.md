@@ -34669,3 +34669,86 @@ to try on that bead when the host is quiet.
 
 Also unchanged: this snapshot lacks `--features fair-alloc`, so even a clean avg_pool1d row from it
 would carry item 193b's caveat.
+
+## 194. THE DRIFT GATE PASSED AT LOADAVG 85 WHILE EVERY conv2d RATIO INVERTED — A STEADY HOST CAN STILL BE A LYING HOST
+
+`frankentorch-hi9r6`. **UNBUILT** (disk throttle, `/data` 62G, no cargo of any kind). The
+measurement described here needed no rebuild; the code added does.
+
+### 194a. THE RUN, AND WHY IT IS DISCARDED
+
+Testing whether `FT_H2H_ROUND_WARMUP=1` would fix the A/A nulls item 189 recorded — the harness
+itself suggests it, and item 147 measured the cold slot-0 at +20-30% on the summed conv2d lanes.
+Snapshot ELF `sha256=24622935...`, PyTorch 2.12.1+cpu same invocation, `RAYON_NUM_THREADS=8`,
+`FT_H2H_LANES=conv2d`.
+
+Loadavg went 75 -> 85 DURING the run: a peer's `frankenscipy` python at 3263% CPU and **two**
+FrankenTorch h2h harnesses at 336% and 283%, all sampling at once. The row set is discarded and
+nothing from it is a standing.
+
+### 194b. WHAT THE DISCARDED ROWS SHOW, WHICH IS THE POINT
+
+Same ELF, same torch build, twenty minutes apart:
+
+    lane                 loadavg ~27        loadavg ~85
+    conv2d               1.36x SLOWER       1.72x FASTER
+    conv2d_masked        2.45x SLOWER       1.63x FASTER
+    conv2d_masked_train  2.37x SLOWER       3.09x FASTER
+    incumbent absolute   PT 3.1 ms          PT 89.3 ms      (29x)
+
+The ratio did not merely widen. **It changed sign**, on every lane, by up to 4x. Contention does
+not degrade the two arms equally — a single-process 8-thread incumbent and a 64-core rayon arm
+starve differently — so a contended window does not produce a noisy estimate of the truth, it
+produces a confident estimate of something else.
+
+### 194c. AND BOTH DRIFT GATES PASSED
+
+    load_1m start=75.17 end=85.77   drift_gate=PASS
+    load_series n=18 worst_drift=1.141x   endpoint_gate=PASS  series_gate=PASS
+
+Correctly, by their own definition: `frankentorch-2h8vi` built them to catch a host that MOVES, and
+a uniformly overloaded host is beautifully steady. **The drift gate is a necessary condition, and
+item 189 already said so; this run shows the failure mode it cannot see is the one that inverts the
+answer.** What refused these rows was the A/A nulls — every lane OFFSET or WIDE — which is a single
+layer of defence against a confound that flips the sign.
+
+Note also `round_warmup=1` prints its own disclaimer: rows taken with it are NOT comparable to any
+certified standing on the board, all of which were taken at 0. So the experiment was void twice
+over, and the second reason would have applied on a quiet host too. **A lever that changes what is
+measured cannot be used to fix how well it is measured.**
+
+### 194d. THE CODE: SAY WHO ELSE WAS MEASURING
+
+Loadavg cannot distinguish 85 of compilation from 85 of three harnesses sampling, and only the
+second inverts ratios. `/proc` can. `concurrent_measurement_block()` scans it for other h2h
+harnesses, criterion benches and torch processes, excluding this process and its own children (the
+incumbent arm is our child and must not count against us), and the harness prints it beside the
+host block.
+
+Verified without cargo, by transcribing the scan into Python and running it on this host:
+
+    quiet host          -> concurrent_measurements=none
+    positive control    -> concurrent_measurements=1 DETECTED  torch-arm[3880643]
+
+The positive control matters: a detector that has only ever printed `none` is the same failure as
+item 190's counter wired to nothing. It also exposed the precision honestly — the control fired on
+a SHELL whose command line merely names the path, which over-reports. That direction is chosen: a
+spurious line makes a reader check, a missed one makes a contended row look clean. `none` therefore
+means "none of the shapes we know", never "the host is quiet".
+
+It reports and does not refuse or wait. Agents share this host by design; a harness that exits
+because a peer is busy is a worse failure than one that says what it saw, and blocking until quiet
+is how a measurement becomes a hang.
+
+### 194e. THE COORDINATION PROBLEM THIS EXPOSES
+
+Two FrankenTorch h2h harnesses ran simultaneously. Neither agent could have known: there is a
+build slot mechanism on this host and no MEASUREMENT slot. Both runs are void, and the other agent
+may not know theirs is. The block added here at least makes it visible after the fact, in the
+output, where a row is read — but the real fix is a measurement slot, which is a bead and not a
+line of provenance.
+
+### 194f. OWED
+
+Compile this. Re-run `FT_H2H_LANES=conv2d` at `round_warmup=0` when the block prints `none` and
+loadavg is both low and steady.
