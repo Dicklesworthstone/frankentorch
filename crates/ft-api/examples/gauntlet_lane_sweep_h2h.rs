@@ -1803,6 +1803,25 @@ LANES = {
     let mut ft_first_half_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_second_half_min: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut pt_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    // Per-round `slot0 / median(slot1..3)` for OUR arm — `frankentorch-hi9r6`, item 169.
+    //
+    // NEGATIVE_EVIDENCE item 147 found the summed conv2d lanes' failing FT null is entirely a
+    // cold slot 0, and item 149 then tried to test whether that generalises. Item 149's answer
+    // was wrong, and the reason is the whole justification for this field: it paired slot
+    // profiles taken in ONE run against null outcomes quoted from OTHER runs. Re-paired inside a
+    // single run, its own strongest counterexample reverses — `linear_narrow` had a FAILING null
+    // (1.102) alongside a slot-0 step of 1.283, which supports the mechanism it was cited against.
+    //
+    // The defect was structural, not careless: the null is printed by the harness while the slot
+    // profile needed `FT_H2H_DUMP_SLOTS` plus an external script, so pairing them was always a
+    // manual cross-referencing step, and that step is where runs got mixed. Computing the ratio
+    // here and printing it next to the null makes the pairing automatic and same-run by
+    // construction.
+    //
+    // Kept as a per-round ratio and reduced by MEDIAN, deliberately: a ratio of medians across
+    // rounds would let a between-round load ramp leak into it, which is exactly the failure the
+    // drift-robust estimator in `scripts/h2h_slot_profile.py` exists to avoid.
+    let mut ft_slot0_ratio: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_second_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut pt_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
@@ -2025,6 +2044,11 @@ LANES = {
             pt_first_half[index].push(paired_slot_median([incumbent_slots[0], incumbent_slots[1]]));
             pt_second_half[index]
                 .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));
+            // item 169: slot 0 against the median of the other three, WITHIN this round.
+            let tail_median = median(vec![ft_slots[1], ft_slots[2], ft_slots[3]]);
+            if tail_median > 0.0 {
+                ft_slot0_ratio[index].push(ft_slots[0] / tail_median);
+            }
             ft_first_half[index].push(paired_slot_median([ft_slots[0], ft_slots[1]]));
             ft_second_half[index].push(paired_slot_median([ft_slots[2], ft_slots[3]]));
             // frankentorch-rled4: the same halves reduced by MIN. The A/A null is
@@ -2174,6 +2198,24 @@ LANES = {
         if !(pt_null_quotable && ft_null_quotable) {
             println!(
                 "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must be within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0 and carry a calm CI; do not quote this row"
+            );
+        }
+        // item 169: print the slot-0 ratio on EVERY row, passing or failing, next to the null it
+        // is meant to explain. Printed unconditionally on purpose — item 149 went wrong by
+        // pairing a slot profile from one run against a null from another, and a diagnostic that
+        // only appears on failing rows would still force that cross-referencing for the passing
+        // ones it has to be compared against.
+        if !ft_slot0_ratio[index].is_empty() {
+            let slot0 = median(ft_slot0_ratio[index].clone());
+            println!(
+                "    slot0/median(slot1..3) = {slot0:.3} (our arm, per-round median over {} rounds){}",
+                ft_slot0_ratio[index].len(),
+                if slot0 > 1.0 + BALANCED_NULL_MAX_DEVIATION {
+                    " <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. \
+                     Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it"
+                } else {
+                    ""
+                }
             );
         }
         // frankentorch-rled4: the SAME row under the min estimator, nulls

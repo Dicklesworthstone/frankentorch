@@ -32631,3 +32631,79 @@ VERIFIED: `rustfmt --edition 2024 --check` exits 0; mutation-after confirmed at 
 causal tail-zeroing read directly. NOT VERIFIED: compilation, tests, timing. No magnitude is
 claimed — `seq_q x seq_k` is the attention score matrix, so the buffers are large at real
 sequence lengths, but nothing here is measured.
+
+## 169. ITEM 149 REFUTED ITEM 147e BY PAIRING ACROSS RUNS — THE REFUTATION IS WITHDRAWN, AND THE HARNESS NOW PAIRS THEM FOR YOU
+
+`frankentorch-hi9r6` (P0). **UNBUILT.** Build freeze — `/data` 27G, 99% used, loadavg
+7.66/13.31/13.36 — no cargo ran. `rustfmt --edition 2024 --check` exits 0 on the file. The
+analysis below is re-reading of data already on disk.
+
+### 169a. THE WITHDRAWAL
+
+Item 149 claimed to refute item 147e's prediction that the slot-0 signature generalises beyond
+conv2d, and it made that claim "in both directions at once":
+
+    avg_pool2d_nopool   worst FT null on the board (1.317)   slot-0 FLAT (0.981)
+    max_pool3d          null 0.861                            slot-0 FLAT (0.997)
+    linear_narrow       nulls 100% PASS                       slot-0 1.283
+
+**Every one of those pairings crosses runs.** The slot profiles came from the single dump I had
+(`slots_c`, the run item 147 voided for load drift); the null figures came from item 145d's pool
+of 46 banked logs. The same lane in two different windows is two different measurements, and
+items 123, 135, 139 and 145 all exist because I made that mistake before.
+
+`slots_c` printed BOTH quantities. Re-paired inside that one run:
+
+    lane                 slot0/med(1..3)   FT null   consistent with the slot-0 mechanism?
+    conv2d_big                     1.344     1.153   yes
+    conv2d_big_masked              0.964     0.987   yes
+    linear_narrow                  1.283     1.102   yes
+    max_pool3d                     0.997     0.970   yes
+    max_pool3d_dense               1.183     1.157   yes
+    avg_pool2d_nopool              0.981     1.036   marginal (null 0.016 outside the band)
+    max_pool3d_nopool              1.285     0.983   NO
+
+**`linear_narrow` reverses outright.** Item 149 cited it as the strongest counterexample — a lane
+that nulls perfectly while carrying a big slot-0 step. In the run where its slot-0 step was
+measured, its null FAILED at 1.102. The 100%-PASS came from other runs entirely. It is evidence
+FOR the mechanism, and I published it as the evidence that killed it.
+
+So item 149c's conclusion is withdrawn: the generalisation is neither established nor refuted.
+
+### 169b. WHAT IS ACTUALLY LEFT STANDING
+
+Five of seven lanes pair consistently. One is marginal. **One is a genuine counterexample**:
+`max_pool3d_nopool`, with a slot-0 step of 1.285 and a null of 0.983 — a cold first sample that
+did not produce a failing null. That single case is enough to say slot-0 coldness is not
+SUFFICIENT, which is a weaker and more defensible claim than either item 147e or item 149 made.
+
+All of it rests on one run whose drift gate failed, so it settles nothing on its own. What it
+does is redirect the next measurement: item 167's `FT_H2H_ROUND_WARMUP` was built to test this,
+and `max_pool3d_nopool` is now the lane whose behaviour under it is most informative — the
+mechanism predicts its null should NOT move, since its null was already clean.
+
+### 169c. THE CODE, BECAUSE THE DEFECT WAS STRUCTURAL
+
+This is my third cross-run pairing error in this campaign (items 123/135/139 on pool width, item
+145 on pooled rows, now this). Three occurrences of one mistake is not carelessness, it is a
+missing affordance: **the null is printed by the harness, while the slot profile required setting
+`FT_H2H_DUMP_SLOTS` and running an external script.** Pairing them was always a manual
+cross-referencing step performed later, from separate artefacts — and that step is where runs got
+mixed, every time.
+
+The harness now computes `slot0 / median(slot1..3)` per round, reduces it by median, and prints it
+directly beneath the null on EVERY row, passing or failing, with a pointer to
+`FT_H2H_ROUND_WARMUP` when it exceeds the null's own tolerance band. Printed unconditionally on
+purpose: a diagnostic that appeared only on failing rows would still force cross-referencing for
+the passing rows they must be compared against, which is exactly how item 149 went wrong.
+
+Per-round then median, not a ratio of cross-round medians — the same drift-robustness argument as
+`scripts/h2h_slot_profile.py`, so a between-round load ramp cannot leak into it.
+
+### 169d. WHAT THIS DOES NOT CHANGE
+
+Item 147's core is untouched: it rests on two CLEAN runs of conv2d lanes, paired within each run,
+and item 149b re-confirmed it under the drift-robust estimator. The certified rows in item 144b
+are also untouched — they are masked lanes, which show no slot-0 step in any run.
+
+NOT VERIFIED: compilation, and the new field has never been printed by a running binary.
