@@ -34267,3 +34267,75 @@ A host with the peer builds finished. The lane that prices items 174/177 is `con
 `conv2d_masked` is its control, untouched by everything this session at 8 threads, so the pair
 separates "the scatter collapse helped" from "the host moved". Re-run with `FT_H2H_LANES=conv2d`
 when `pgrep rustc` is quiet.
+
+## 189. THE SLOT-0 DIAGNOSTIC AND THE WARM-UP FLAG BOTH WORK — AND THE FIRST THING THEY SHOWED ME IS THAT MY OWN A/B WAS CROSS-RUN
+
+`frankentorch-hi9r6` (P0). **NO BUILD**: ran the snapshotted ELF
+`2462293598f10e7721efe49ac9786c3bf5edda7b1a700608bfa4df5200805e67`, host `thinkstation1`, AMD Ryzen
+Threadripper PRO 5975WX, governor powersave, `RAYON_NUM_THREADS=8`, incumbent PyTorch 2.12.1+cpu
+self-reported in the same invocation. `/data` 87G, no disk consumed.
+
+### 189a. THE MACHINERY WORKS
+
+Item 169's field printed under every row without being asked for, and it immediately flagged the
+lane that item 147 predicted:
+
+    conv2d_masked         slot0/median(slot1..3) = 1.171  <- flagged COLD automatically
+    conv2d_masked_train   slot0/median(slot1..3) = 1.011  <- no step
+
+That is the first time this campaign has had the slot profile and the null on the same line, from
+the same run, without a second tool. Item 169's whole argument was that pairing them by hand is
+where runs got mixed.
+
+### 189b. WHAT THE WARM-UP DID
+
+    lane                  warmup   slot0    FT null    loadavg
+    conv2d_masked            0     1.171     1.059      16.2
+    conv2d_masked            1     1.030     1.029      27.5
+    conv2d_masked_train      0     1.011     0.991       16.2
+    conv2d_masked_train      1     1.022     0.962       27.5
+
+The PATTERN item 167d predicted is there: the lane WITH a cold first sample lost most of it
+(1.171 -> 1.030) and its null moved toward 1.0 with it, while the lane WITHOUT one barely moved
+(1.011 -> 1.022). Two quantities moving together is the mechanism item 147 claimed.
+
+### 189c. AND THE CONFOUND, WHICH IS MINE AGAIN
+
+**Loadavg was 16.2 in the first run and 27.5 in the second.** That is a two-run comparison across
+different host states — the error items 123, 135, 139, 145, 169 and 185e all document, and the one
+I have made more than any other.
+
+It is not fatal here, and the reason is worth stating precisely rather than hand-waving: both
+statistics are RATIOS taken within a round. `slot0/median(slot1..3)` divides one sample by three
+others metres away in time, and the null is a ratio of paired half-medians. A uniformly higher load
+scales numerator and denominator together and largely cancels — which is exactly the argument item
+149a used to recover a partial answer from a drift-voided run.
+
+"Largely cancels" is not "cancels". `conv2d_masked_train`'s null moved the WRONG way (0.991 PASS ->
+0.962) while its slot profile barely changed, and I cannot separate that from the load difference.
+So: the direction is supported, the magnitude is not, and no row here is quotable — every one
+NULL-FAILED anyway.
+
+### 189d. THE FIX IS A DESIGN CHANGE, NOT MORE RUNS
+
+`FT_H2H_ROUND_WARMUP` is read once into a `let` at startup, so it is process-wide and the two arms
+of its own A/B can only ever be two invocations. That is a defect in how I built it: item 167
+carefully made the warm-up SYMMETRIC across arms, and then made the toggle itself impossible to
+alternate within a process — the exact property that `set_pool_output_zeroed` and
+`set_gemm_tile_col_floor_adaptive` were both given deliberately, and which item 25 says is what
+makes a small difference attributable at all.
+
+The fix is to make the warm-up a PER-LANE property and register the same lane twice, warm and cold,
+so one invocation carries both arms through the same window. Recorded rather than done: the harness
+file has uncommitted peer edits again, and this is a change to how every row is produced.
+
+### 189e. THE STANDING IS STILL UNCERTIFIED, AND STILL LOOKS STALE
+
+`conv2d_masked` read 2.49x and 2.59x SLOWER in these two runs against a certified board figure of
+**5.73x**. Both failed their nulls, so neither replaces it. PyTorch's arm failed its own null in
+three of the four rows here (3.1-5.0 ms), which is item 144a's finding recurring: a ~3 ms incumbent
+arm does not null on this host, and `conv2d_masked_train`'s longer 5.0 ms arm is the one that
+passed.
+
+That points at the resize item 144 already built — `conv2d_big_masked` — as the lane most likely to
+certify. Next quiet window: that lane, at `round_warmup=0`, repeated until the gates hold.
