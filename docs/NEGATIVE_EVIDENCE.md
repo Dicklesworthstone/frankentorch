@@ -33825,3 +33825,68 @@ with a running harness, then add the lane.
 
 Unchanged, and now spanning two crates: build, and run the tests from items 179, 181, 183 and this
 one. Nothing in this chain has been compiled.
+
+## 185. ITEM 184a's RISK ASSESSMENT WAS WRONG — THE conv3d LEVER IS FOUR SMALL EDITS, NOT A BODY MOVE. I STILL DID NOT SHIP IT, FOR A DIFFERENT REASON
+
+`frankentorch-l2zki` / `frankentorch-hi9r6`. **UNBUILT**: build freeze, `/data` 26G at 99%, loadavg
+13.06/9.70/8.99. No cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 185a. THE CORRECTION
+
+Item 184a declined to mask conv3d's backward and justified it this way: the dweight branch "builds
+its panel in blocks INSIDE the `build_uninit` closure, so threading a mask through it means moving
+that body wholesale — the riskiest edit shape there is with no compiler."
+
+I checked that against the code instead of against my memory of it, and it is wrong. Both halves are
+SELF-CONTAINED EXPRESSIONS:
+
+    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f64]| { .. });
+    let dpanel  = build_uninit(flat * patch_width,  |dpanel:  &mut [f64]| { .. });
+    let dpadded = conv3d_col2im_f64(&dpanel, ..);
+
+Wrapping each in a conditional is a local edit at four points — signature, two expressions, and the
+return tuple — with the old name kept as a thin unwrapping wrapper so its three existing callers
+(one real, two tests) need no change at all. That is the same shape item 178 used for conv2d, and it
+is small.
+
+**An assessment written from memory of a function is not an assessment of the function.** The cost
+of that error was a turn: item 184 recorded the lever as harder than it is, and anyone reading it
+would have budgeted accordingly.
+
+### 185b. WHY I STILL DID NOT SHIP IT — A DIFFERENT AND BETTER REASON
+
+While preparing the edit, `git status` showed the file carrying UNCOMMITTED PEER CHANGES: hunks in
+`conv2d_backward_f32` and ~100 new lines near `conv2d_ones_dout_scatter_dpadded_f64`, with a further
+134-line block appearing in a second tests module during the same turn. My own anchor text
+(`let dweight = build_uninit(out_ch * patch_width`) matches **four** places in this file — the
+conv2d and conv3d, f64 and f32 variants — so the tool refused the edit, correctly.
+
+A four-point brace-aware edit, by non-unique anchors, in a file another agent is actively rewriting,
+with no compiler to catch a mis-landed hunk, is precisely the situation in which I corrupted two of
+a peer's ledger references with a blind `sed` (item 153). The variance, not the difficulty, is what
+stopped it.
+
+**This is a coordination limit, not a technical one, and it is recorded as such**: the lever is
+ready, its shape is now known to be small, and the next agent to hold this file uncontended can take
+it in one sitting.
+
+### 185c. WHAT WENT IN INSTEAD, CHOSEN TO NOT COLLIDE
+
+Item 184's determinism test covered conv3d's FORWARD. The backward — which holds im2col, col2im and
+both GEMMs, strictly more parallel structure than the forward — was width-checked nowhere. It is now
+in the same test, sharing the same pool so both are exercised at the same widths.
+
+The edit was confined to my own test by locating it via a unique marker and rewriting only the lines
+between it and the next item's test, so nothing outside my own code could move. At commit time the
+diff was split by line range and **only my four hunks were staged**; the peer's three were left in
+the worktree untouched. That is item 165e's rule applied deliberately rather than after the fact.
+
+### 185d. AND A SIZING NUMBER NOBODY NEEDS TO WRITE CODE FOR
+
+The saving item 184a describes can be BOUNDED with a probe that already exists.
+`conv3d_generic_phase_probe` already times `conv3d_im2col_f64` separately, and that panel
+materialisation is the bulk of the dweight branch at this shape (28.3 MB). Whoever runs it first gets
+the lever's size for free — no new probe, no new code. Writing one would have been redundant work
+that looked like progress.
+
+NOT VERIFIED: compilation, and the extended test has never run.
