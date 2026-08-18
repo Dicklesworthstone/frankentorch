@@ -33974,3 +33974,80 @@ a compiler. Fixed and attributed, so their item 171 can be read alongside it.
 
 VERIFIED: `cargo check` on both crates, exit 0. NOT VERIFIED: `cargo clippy`, `cargo test`, and
 every number any of this predicts.
+
+## 187. THE STACK RUNS — AND A SMOKE TEST SAYS THE LANE MAY HAVE HALVED. NOT ONE NUMBER HERE IS QUOTABLE
+
+`frankentorch-hi9r6` (P0). **NO BUILD WAS STARTED**: the project's slot was held by another pane
+(pid 2179046, a frankentorch git checkout), so this ran an EXISTING binary. Running a binary is not
+a build and claims no slot.
+
+### 187a. PROVENANCE FIRST, BECAUSE THE BINARY IS NOT MINE
+
+A sibling pane produced `target/release/examples/gauntlet_lane_sweep_h2h` at 18:14:49 — **90 seconds
+after** my compile fix landed at 18:13:19. Rather than assume it matched HEAD, I checked it for
+strings only this session's changes introduce:
+
+    round_warmup=              present   (item 167)
+    conv2d_masked_train        present   (item 182)
+    slot0/median(slot1..3)     present   (item 169)
+
+So it carries the full stack, which is independent confirmation from another pane's compiler that
+everything from items 151-186 builds. It was snapshotted before use (item 66a: peers rebuild the
+shared target mid-session).
+
+### 187b. THE CODE DOES NOT JUST COMPILE, IT RUNS
+
+Three pieces that had never executed did what they were written to do:
+
+* the `round_warmup=0` provenance line prints, with its not-comparable warning (item 167);
+* `slot0/median(slot1..3)` prints under every row — 0.990 and 1.011 here (item 169);
+* `conv2d_masked_train` runs on BOTH arms, so the grad-requiring lane and its `c2w_train` fixture
+  are wired correctly (item 182).
+
+### 187c. THE NUMBERS, AND WHY THEY ARE NOT A STANDING
+
+    lane                  FT(ms)   PT(ms)   reading        vs the certified row
+    conv2d_masked          8.010    3.452   2.32x SLOWER   certified: 16.697 / 2.913 = 5.73x
+    conv2d_masked_train   11.225    5.162   2.17x SLOWER   no prior row (new lane)
+
+**Nothing above may be quoted.** Both rows NULL-FAILED (`conv2d_masked`: PT 1.064, FT 0.962;
+`conv2d_masked_train`: PT 0.981, FT 1.062), it was a 2-repeat smoke run rather than the 16 the
+board uses, and loadavg was **25-26** — not a quiet window by any reading. The drift gate passed
+and the ELF sha is recorded, which is why it is worth writing down at all, but a failing null means
+the instrument could not resolve the difference it was asked about.
+
+What it IS: evidence the machinery works end to end, and a strong hint about where a real
+certification will land.
+
+### 187d. THE ONE INFERENCE THE SMOKE TEST SUPPORTS, BECAUSE IT IS INTERNAL
+
+Item 182d asked what the frozen/train pair would say. Within this single invocation, on one binary
+in one window, the two lanes differ by:
+
+    ours   11.225 - 8.010 = 3.2 ms   to compute dweight
+    theirs  5.162 - 3.452 = 1.7 ms   to compute dweight
+
+Our 3.2 ms is almost exactly item 141's prediction for the dweight branch — `im2col` 0.990 plus the
+dweight GEMM 2.036 = 3.03 ms — which is a real cross-check of that phase table from an entirely
+different direction.
+
+It also answers item 182d in the middle: **both arms shifted, so item 178's saving is genuine but
+is one a training step cannot take** — and our weight gradient costs about 1.9x what PyTorch's
+does. That last figure, if it survives certification, redirects items 170 and 172: the dweight GEMM
+is not a rounding error in the gap, it is a visible part of it.
+
+This inference is worth more than the ratios above because it is a difference between two lanes in
+ONE invocation, which is the comparison the load does not corrupt. It is still 2 repeats and still
+needs the real thing.
+
+### 187e. WHAT IS NOW TOP PRIORITY
+
+A quiet-window certification of `conv2d_masked`. The certified standing is 5.73x SLOWER; this run
+suggests something far better, and until a proper row exists the board carries a number that may be
+badly stale in our own favour's opposite direction. `scripts/settle_conv_stack.sh` (item 187) runs
+the probes at both pool widths and the h2h lanes at both, on one snapshotted ELF, with df gating and
+host state recorded around every run — so the first genuinely quiet window costs one invocation
+rather than five.
+
+NOT VERIFIED: `cargo clippy`, `cargo test` — the six tests written this session have still never
+run — and every ratio above.
