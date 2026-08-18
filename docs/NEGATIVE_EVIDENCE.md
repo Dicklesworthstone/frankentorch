@@ -31615,3 +31615,90 @@ NOT VERIFIED: compilation, tests, and any timing. Owed when the freeze lifts —
 `cargo test -p frankentorch-kernel-cpu --lib`, then a paired measurement. **The f64 magnitude
 (1.072 ms of a 16.6 ms backward) is NOT claimed here**: these buffers are half the size, and
 there is still no f32 conv h2h lane, so even a real gain has no incumbent arm to certify against.
+
+## 153. conv2d's ALL-ONES GATE IS A SERIAL 4.2 MB SCAN — PARALLELISED WITH A PROBE, BECAUSE THE NAIVE CONVERSION WOULD HAVE SLOWED THE WORST LANE
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 29-31G, 99% used,
+loadavg 6.34/9.85/9.77 — so no cargo ran. `rustfmt --edition 2024 --check` exits 0, which proves
+the file parses and is format-clean and proves nothing else. Committed on instruction to be
+compiled and priced when the volume frees; two predictions below, both refutable.
+
+### 153a. THE LEVER ITEM 145e FOUND BY READING
+
+`conv2d_backward_f64` decides between its all-ones adjoint and the generic im2col route with
+
+    dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+
+at two sites, and that scan is SERIAL. On the summed route every element is 1.0, so it runs to
+completion over the whole of `dout` — 2.1 MB at the small scored shape, 4.2 MB at the big one —
+on one thread, before any real work begins. Per `feedback_cycle_profile_hides_serial`, a serial
+region divides its cycle share by the pool width, so at `RAYON_NUM_THREADS=8` this would appear as
+roughly an eighth of its wall-clock share in a profile.
+
+This is not a new idea in this crate. Three other sites in the same file already write
+`dy.par_iter().all(|&v| v.to_bits() == 1.0f64.to_bits())`; conv2d's two were the stragglers.
+
+### 153b. WHY THE OBVIOUS CONVERSION WOULD HAVE BEEN A REGRESSION ON THE WORST LANE
+
+Replacing `iter()` with `par_iter()` — matching the three existing sites — would have made the
+`conv2d_masked` lane SLOWER, and that lane is this bead's certified 5.73x standing.
+
+The reason is short-circuiting. `all()` stops at the first failure, and on the masked route the
+first element already fails: the lane's mask starts at -0.12, so the serial scan exits after ONE
+comparison, essentially free. A bare `par_iter().all()` would instead split ~500k elements across
+the pool, start scanning on every thread, and only then propagate the abort — strictly more work
+than the code it replaced, paid on every masked-route call.
+
+The shipped form checks a 64-element SERIAL prefix first and only engages the pool if the prefix
+looks all-ones (and the remainder is at least `1 << 16`, the threshold convention this file already
+uses for `SOFTMAX_PARALLEL_NUMEL_THRESHOLD`). The summed route then gets its parallel scan and the
+masked route keeps its one-comparison exit. Neither route takes a worse path than before.
+
+**That asymmetry is the whole content of this item.** The lever is trivial; noticing that the two
+routes want opposite things from the same line is what took reading item 145e's finding twice.
+
+**It also flags something in the three EXISTING parallel sites, which I did not change**: they have
+no probe, so if any of them is ever reached with an upstream that fails early, they pay the same
+penalty this item exists to avoid. Naming it rather than fixing it — they are other beads' code,
+none of them is on a measured lane, and a fix nobody can compile today is not worth spreading.
+
+### 153c. THE SIBLING ITEM 151d DEFERRED
+
+`dout_flat` (2 MB) also zeroed a buffer its own gather completely overwrites, exactly as item 151's
+`dpanel` did. Converted to `build_uninit` here, with the same contract argument — every chunk is
+exactly `out_ch` long and the inner loop writes every element of its chunk — and the same precedent,
+since `conv2d_im2col_f64` in this file has been built that way since item l2zki.
+
+It is a SEPARATE change from item 151 on purpose, and the reason is that the two sit on DISJOINT
+ROUTES: if the all-ones fast path returns, `dout_flat` is never allocated, and `dpanel` is only
+reached when it does not. So each stays independently priceable rather than one measurement having
+to apportion credit between them. Expected effect ~0.1 ms — recorded as bookkeeping, not as a lever
+with a number worth defending.
+
+### 153d. PREDICTIONS, AND WHAT WOULD KILL THEM
+
+* Summed route: ~0.2 ms at the small shape and ~0.4 ms at the big one, on lanes of 4.9 ms and
+  9.0 ms. **Refuted if** a single core already saturates DRAM for a pure strided read, in which
+  case the scan is bandwidth-bound and splitting it buys nothing.
+* Masked route: no change, by construction. **Refuted if** the probe itself is measurable, which
+  would mean 64 serial comparisons are visible against a 16.7 ms lane — they should not be.
+
+A third possibility worth stating because it would invalidate the framing rather than the number:
+if the summed route's cost is dominated by the FIRST touch of `dout` rather than by the comparisons,
+then whichever pass reads it first pays, and moving the scan to the pool just relocates that cost
+into the adjoint that follows. The lane subtraction that would separate those two is owed.
+
+### VERIFICATION OWED
+
+`cargo test -p frankentorch-kernel-cpu --lib` for both new tests, `cargo clippy`, and a paired
+before/after on `conv2d` and `conv2d_masked` in one invocation. Until then this is a reading, a
+mechanism and two tests that have never run.
+
+**A process note, because it nearly cost a peer their ledger references.** Renumbering my own item
+with `sed -i 's/item 152/item 153/g'` over the whole file also rewrote TWO comments in
+`conv2d_backward_f32` and `conv3d_backward_f32` that belong to a peer's item 152, committed into
+this shared checkout minutes earlier. Caught by reading `git diff -U0 --@@` headers before staging
+and seeing hunks in functions I had not touched, then restored. `feedback_file_clobber_safety`
+covers whole-file writes; this is the same hazard through a blind in-place substitution, and the
+check that caught it — enumerate the diff's hunk headers and account for every one before staging —
+is the one worth keeping.

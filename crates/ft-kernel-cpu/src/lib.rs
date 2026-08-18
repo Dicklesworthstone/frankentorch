@@ -8805,6 +8805,59 @@ pub fn depthwise_conv3d_forward_f32(
 /// col2im(dpanel)`, `dbias = sum over (n,oh,ow)`.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
+/// Is every element of `dout` exactly `+1.0` bitwise? — `frankentorch-hi9r6`, item 153.
+///
+/// UNBUILT — written under a build freeze, not compiled, not measured.
+///
+/// This decides whether a conv2d backward can take its all-ones adjoint, and it is the gate
+/// NEGATIVE_EVIDENCE item 145e found being paid SERIALLY: on the summed route the predicate reads
+/// the whole of `dout` — 4.2 MB at the big-batch scored shape — on one thread, and per
+/// `feedback_cycle_profile_hides_serial` a serial region like that is invisible in a cycle profile
+/// at pool width 8.
+///
+/// The crate already parallelizes this exact predicate elsewhere (`dy.par_iter().all(..)` at three
+/// sites in this file), so a parallel scan is established practice here rather than a new idea.
+/// What is new is the PROBE, and it exists because the naive conversion would have been a
+/// REGRESSION on this bead's worst lane:
+///
+/// * On the SUMMED route every element is 1.0, so the scan runs to completion and parallelising it
+///   is a straight win.
+/// * On the MASKED/generic route the first element already fails (the lane's mask starts at
+///   -0.12), so the serial `all` exits after ONE comparison. A bare `par_iter().all()` would
+///   instead split ~500k elements across the pool and scan until the abort propagated — strictly
+///   more work than the code it replaced, on the route that stands at 5.73x SLOWER.
+///
+/// So: check a short serial prefix first, and only pay for the pool if the prefix looks all-ones.
+/// Both routes then take their better path and neither takes a worse one.
+///
+/// BIT-EXACT: this is a boolean predicate over independent elements, so `all` is order-independent
+/// and no arithmetic is performed at all. Splitting it changes no value and no rounding.
+///
+/// An empty `dout` returns `true` (both `all` calls are vacuous). Every call site guards with
+/// `!dout.is_empty()` first, which is what makes that harmless — the fast paths are not valid for
+/// an empty upstream.
+fn dout_is_all_ones_f64(dout: &[f64]) -> bool {
+    /// Serial elements checked before the pool is considered. Large enough that a mask which
+    /// differs anywhere early is rejected without touching rayon, small enough to be noise
+    /// against the memory traffic the caller is about to do either way.
+    const PROBE: usize = 64;
+    /// Below this remaining length the scan stays serial: a short scan cannot repay a join.
+    /// Matches the `1 << 16` convention `SOFTMAX_PARALLEL_NUMEL_THRESHOLD` uses in this file.
+    const PAR_MIN: usize = 1 << 16;
+
+    let one = 1.0f64.to_bits();
+    let probe = PROBE.min(dout.len());
+    if !dout[..probe].iter().all(|&v| v.to_bits() == one) {
+        return false;
+    }
+    let rest = &dout[probe..];
+    if rest.len() >= PAR_MIN {
+        rest.par_iter().all(|&v| v.to_bits() == one)
+    } else {
+        rest.iter().all(|&v| v.to_bits() == one)
+    }
+}
+
 pub fn conv2d_backward_f64(
     dout: &[f64],
     padded: &[f64],
@@ -8825,12 +8878,7 @@ pub fn conv2d_backward_f64(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let flat = batch * patch_count;
-    if ph == 1
-        && kh == 1
-        && oh == 1
-        && !dout.is_empty()
-        && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
-    {
+    if ph == 1 && kh == 1 && oh == 1 && !dout.is_empty() && dout_is_all_ones_f64(dout) {
         return conv2d_backward_height1_ones_dout_f64(
             padded,
             weight_flat,
@@ -8851,7 +8899,7 @@ pub fn conv2d_backward_f64(
         && sh == 1
         && sw == 1
         && !dout.is_empty()
-        && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+        && dout_is_all_ones_f64(dout)
     {
         return conv2d_backward_3x3_stride1_ones_dout_f64(
             padded,
@@ -8867,17 +8915,31 @@ pub fn conv2d_backward_f64(
         );
     }
     // Gather dout [N,out_ch,patch_count] -> dout_flat [flat, out_ch].
-    let mut dout_flat = vec![0.0f64; flat * out_ch];
-    dout_flat
-        .par_chunks_mut(out_ch)
-        .enumerate()
-        .for_each(|(row, dr)| {
+    //
+    // UNBUILT — item 153, written under a build freeze; not compiled, not measured.
+    //
+    // The sibling item 151d named and deliberately left alone: this buffer is 2 MB at the scored
+    // shape and the gather below overwrites ALL of it, so the `vec![0.0f64; ..]` zeroing was dead.
+    // It is safe to convert for the same reason `conv2d_im2col_f64` already is — every chunk is
+    // exactly `out_ch` long, and the inner loop writes every element of its chunk, so `fill`
+    // satisfies `build_uninit`'s contract by construction and reads nothing.
+    //
+    // It is taken now, in a SEPARATE change from item 151's `dpanel`, because the two sit on
+    // DISJOINT ROUTES and so stay independently priceable: if the all-ones fast path above
+    // returns, this line never executes, and `dpanel` is only reached when it does not. One lever
+    // per route, one row each.
+    //
+    // ~9x smaller than `dpanel`, so the expected effect is ~0.1 ms and it is recorded as
+    // bookkeeping rather than as a lever with a prediction worth defending.
+    let dout_flat = build_uninit(flat * out_ch, |df: &mut [f64]| {
+        df.par_chunks_mut(out_ch).enumerate().for_each(|(row, dr)| {
             let n = row / patch_count;
             let p = row % patch_count;
             for (oc, d) in dr.iter_mut().enumerate() {
                 *d = dout[(n * out_ch + oc) * patch_count + p];
             }
         });
+    });
     let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     // dweight_flat [out_ch, patch_width] = dout_flat^T @ panel.
     // dweight = dout_flat^T @ panel via dgemm_tb (reads dout_flat [flat,out_ch] AS
@@ -44308,6 +44370,102 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// frankentorch-hi9r6 item 153: the probe+parallel all-ones predicate must agree with the
+    /// serial `iter().all()` it replaced, on EVERY input.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// The assertion is equivalence to the replaced expression rather than to a hand-written table
+    /// of expected booleans, because that is the actual claim: the routing decision must not move.
+    /// A table would let both sides drift together if the helper were wrong in the same way I
+    /// wrote the expectation.
+    ///
+    /// The lengths are chosen to straddle both internal boundaries — `PROBE` (64) and `PAR_MIN`
+    /// (65536) — and the mismatch positions to sit on either side of them, since a probe that
+    /// mishandled its boundary would still pass on a mid-array mismatch.
+    #[test]
+    fn dout_all_ones_probe_and_parallel_scan_agree_with_the_serial_predicate() {
+        fn serial(v: &[f64]) -> bool {
+            v.iter().all(|&x| x.to_bits() == 1.0f64.to_bits())
+        }
+        let par_min = 1usize << 16;
+        let lengths = [
+            0usize,
+            1,
+            2,
+            63,
+            64,
+            65,
+            100,
+            par_min - 1,
+            par_min,
+            par_min + 1,
+            par_min + 64,
+            par_min + 65,
+            2 * par_min + 7,
+        ];
+        for &len in &lengths {
+            // all ones
+            let ones = vec![1.0f64; len];
+            assert_eq!(
+                super::dout_is_all_ones_f64(&ones),
+                serial(&ones),
+                "item 153 disagreement on all-ones len={len}"
+            );
+
+            // one element spoiled, at every position that could interact with a boundary
+            let spoilers = [
+                0usize,
+                1,
+                63,
+                64,
+                65,
+                par_min - 1,
+                par_min,
+                par_min + 63,
+                len / 2,
+            ];
+            for &at in spoilers.iter().filter(|&&a| a < len) {
+                for &bad in &[
+                    0.0f64,
+                    -1.0,
+                    1.0 + f64::EPSILON,
+                    f64::NAN,
+                    f64::INFINITY,
+                    -0.0,
+                ] {
+                    let mut v = vec![1.0f64; len];
+                    v[at] = bad;
+                    assert_eq!(
+                        super::dout_is_all_ones_f64(&v),
+                        serial(&v),
+                        "item 153 disagreement len={len} spoiled at {at} with {bad}"
+                    );
+                    assert!(
+                        !super::dout_is_all_ones_f64(&v),
+                        "item 153: a spoiled element must reject, len={len} at={at} bad={bad}"
+                    );
+                }
+            }
+
+            // nothing that is not exactly +1.0 may pass, even when uniform
+            if len > 0 {
+                for &fill in &[1.0f64 - f64::EPSILON, 2.0, -1.0, 0.0] {
+                    let v = vec![fill; len];
+                    assert_eq!(
+                        super::dout_is_all_ones_f64(&v),
+                        serial(&v),
+                        "item 153 disagreement on uniform {fill} len={len}"
+                    );
+                    assert!(
+                        !super::dout_is_all_ones_f64(&v),
+                        "item 153: uniform {fill} must not be read as all-ones, len={len}"
+                    );
                 }
             }
         }
