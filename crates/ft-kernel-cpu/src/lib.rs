@@ -8220,6 +8220,135 @@ pub fn conv2d_col2im_f32(
     dpadded
 }
 
+/// f32 mirror of [`conv2d_dout_flat_f64`]: gather `dout` `[N, out_ch, patch_count]` into
+/// `[flat, out_ch]`.
+///
+/// The `vec![0.0f32; ..]` this replaces was dead — the gather writes every element — which item
+/// 153 fixed on the f64 side and left here. Note the access pattern is NOT the per-channel
+/// re-stream item 158 removed from the forward: the reuse dimension is `p`, and `p` is the
+/// dimension being chunked, so eight consecutive rows share every cache line they touch and the
+/// read amplification is 1.00x (item 174a).
+fn conv2d_dout_flat_f32(dout: &[f32], batch: usize, out_ch: usize, patch_count: usize) -> Vec<f32> {
+    build_uninit(batch * patch_count * out_ch, |df: &mut [f32]| {
+        df.par_chunks_mut(out_ch).enumerate().for_each(|(row, dr)| {
+            let n = row / patch_count;
+            let p = row % patch_count;
+            for (oc, d) in dr.iter_mut().enumerate() {
+                *d = dout[(n * out_ch + oc) * patch_count + p];
+            }
+        });
+    })
+}
+
+/// f32 mirror of [`conv2d_backward_masked_f64`] — item 178's fix, which f32 never received.
+///
+/// **UNBUILT**: written under a build freeze; not compiled, not tested, not measured.
+///
+/// WHY IT MATTERS HERE AS MUCH AS THERE. `conv2d_backward_f32` computes both gradients
+/// unconditionally, and `ft-api`'s f32 fused path called it without consulting
+/// `ctx.needs_input_grad()`, so a frozen weight paid for a `dweight` nothing read. Item 141 priced
+/// the f64 equivalent at `im2col` 0.990 ms plus the dweight GEMM 2.036 ms — about 3.0 ms of a
+/// 16.6 ms backward — and the certified conv2d standing's own lane builds its weight with
+/// `requires_grad = false`, so the frozen case is the common one rather than an edge.
+///
+/// `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's `convolution_backward`.
+///
+/// BIT-EXACT BY CONSTRUCTION: every gradient still requested is computed by the same calls in the
+/// same order as before. Not computing a gradient nobody reads cannot change one that is read.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_backward_masked_f32(
+    dout: &[f32],
+    padded: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+
+    // The generic route is the only one this can save work on: the all-ones adjoints are separate
+    // kernels producing both halves together. Detected through the SHARED selector, so this and
+    // `conv2d_backward_f32` cannot disagree about which route a shape takes.
+    let ones_route = !dout.is_empty()
+        && conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw).is_some()
+        && dout_is_all_ones_f32(dout);
+    let both = output_mask[0] && output_mask[1];
+
+    if ones_route || both {
+        let (dpadded, dweight, dbias) = conv2d_backward_f32(
+            dout,
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
+            output_mask[2],
+        );
+        return (
+            output_mask[0].then_some(dpadded),
+            output_mask[1].then_some(dweight),
+            dbias,
+        );
+    }
+
+    let dout_flat = conv2d_dout_flat_f32(dout, batch, out_ch, patch_count);
+
+    let dweight = output_mask[1].then(|| {
+        let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        build_uninit(out_ch * patch_width, |dw: &mut [f32]| {
+            if out_ch == 0 || patch_width == 0 || flat == 0 {
+                dw.fill(0.0);
+                return;
+            }
+            gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dw);
+        })
+    });
+
+    let dpadded = output_mask[0].then(|| {
+        let dpanel = build_pool_output(flat * patch_width, |dp: &mut [f32]| {
+            gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
+        });
+        conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
+    });
+
+    let dbias = output_mask[2].then(|| {
+        let mut db = vec![0.0f32; out_ch];
+        db.par_iter_mut().enumerate().for_each(|(oc, dbo)| {
+            let mut s = 0.0f32;
+            for n in 0..batch {
+                let base = (n * out_ch + oc) * patch_count;
+                for p in 0..patch_count {
+                    s += dout[base + p];
+                }
+            }
+            *dbo = s;
+        });
+        db
+    });
+
+    (dpadded, dweight, dbias)
+}
+
 /// f32 mirror of [`conv2d_backward_f64`]. Returns `(dpadded, dweight_flat,
 /// dbias?)`. Used by the f32 conv2d grad fast path (frankentorch-48w0b).
 #[allow(clippy::too_many_arguments)]
@@ -8279,17 +8408,8 @@ pub fn conv2d_backward_f32(
             ),
         };
     }
-    let mut dout_flat = vec![0.0f32; flat * out_ch];
-    dout_flat
-        .par_chunks_mut(out_ch)
-        .enumerate()
-        .for_each(|(row, dr)| {
-            let n = row / patch_count;
-            let p = row % patch_count;
-            for (oc, d) in dr.iter_mut().enumerate() {
-                *d = dout[(n * out_ch + oc) * patch_count + p];
-            }
-        });
+    // Item 153's dead-zero-fill fix, which f32 did not get: the gather writes every element.
+    let dout_flat = conv2d_dout_flat_f32(dout, batch, out_ch, patch_count);
     let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     // dweight = dout_flat^T @ panel. sgemm_tb reads dout_flat [flat,out_ch] AS its
     // transpose via strides — no [out_ch,flat] dout_t materialisation — with a
@@ -65639,8 +65759,11 @@ mod tests {
     /// thing letting `ft-api` skip a 1 MiB serial narrow on the summed route.
     #[test]
     fn conv2d_backward_f32_from_f64_grad_matches_narrow_then_dispatch() {
-        // (batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch) — one per fast route.
-        let cases: &[(
+        // Named, not a bare 11-tuple: clippy flags those as complex types, and the name says
+        // what the positions MEAN — the same reason
+        // `conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise` introduced `ConvCase`.
+        /// `(batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch)` — one per fast route.
+        type RouteCase = (
             usize,
             usize,
             usize,
@@ -65652,7 +65775,8 @@ mod tests {
             usize,
             usize,
             usize,
-        )] = &[
+        );
+        let cases: &[RouteCase] = &[
             (2, 2, 14, 14, 3, 3, 12, 12, 1, 1, 3),
             (4, 2, 1, 605, 1, 5, 1, 301, 1, 2, 4),
         ];
@@ -65766,5 +65890,108 @@ mod tests {
         assert_eq!(super::conv2d_ones_dout_route(3, 3, 3, 1, 1, 1), None);
         assert_eq!(super::conv2d_ones_dout_route(9, 5, 5, 5, 1, 1), None);
         assert_eq!(super::conv2d_ones_dout_route(1, 3, 3, 1, 1, 1), None);
+    }
+
+    /// f32 mirror of `conv2d_backward_masked_matches_the_unmasked_path_on_every_mask` — item 187.
+    ///
+    /// Every gradient the mask ASKS for must be bit-identical to what the unmasked path produces,
+    /// and every gradient it does not ask for must be `None` rather than an empty vector. Both
+    /// halves matter: the first is the correctness claim, the second is what `ft-api` relies on to
+    /// hand the tape an absent gradient instead of a zero-length one.
+    ///
+    /// Covers the all-ones route (which delegates and re-masks) and the generic route (which
+    /// actually skips work), since only the latter can save anything and only the former exercises
+    /// the delegation.
+    #[test]
+    fn conv2d_backward_masked_f32_matches_the_unmasked_path_on_every_mask() {
+        /// `(batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch, all_ones_dout)`
+        type MaskCase = (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            bool,
+        );
+        let cases: &[MaskCase] = &[
+            // generic route: a non-uniform dout, so the mask can actually skip a GEMM
+            (2, 3, 9, 10, 3, 3, 7, 8, 1, 1, 4, false),
+            // 5x5, no fast path at all
+            (1, 2, 9, 9, 5, 5, 5, 5, 1, 1, 3, false),
+            // all-ones on the 3x3 adjoint: delegates, then re-masks
+            (2, 3, 9, 10, 3, 3, 7, 8, 1, 1, 4, true),
+            // all-ones on the height-1 adjoint
+            (3, 2, 1, 19, 1, 3, 1, 17, 1, 1, 4, true),
+        ];
+        for &(batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch, ones) in cases {
+            let patch_width = in_ch * kh * kw;
+            let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i * 17 % 31) as f32 - 15.0) / 1024.0)
+                .collect();
+            let weight: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| ((i * 29 % 37) as f32 - 18.0) / 2048.0)
+                .collect();
+            let dout: Vec<f32> = (0..batch * out_ch * oh * ow)
+                .map(|i| {
+                    if ones {
+                        1.0
+                    } else {
+                        ((i * 13 % 23) as f32 - 11.0) / 512.0
+                    }
+                })
+                .collect();
+
+            for mask in 0..8u8 {
+                let m = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                let (dp, dw, db) = super::conv2d_backward_masked_f32(
+                    &dout, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+                    m,
+                );
+                let (wp, ww, wb) = super::conv2d_backward_f32(
+                    &dout, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+                    m[2],
+                );
+
+                assert_eq!(dp.is_some(), m[0], "d_input presence at mask {mask:03b}");
+                assert_eq!(dw.is_some(), m[1], "d_weight presence at mask {mask:03b}");
+                assert_eq!(db.is_some(), m[2], "d_bias presence at mask {mask:03b}");
+
+                if let Some(dp) = dp {
+                    assert_eq!(dp.len(), wp.len(), "d_input len at mask {mask:03b}");
+                    for (i, (&g, &w)) in dp.iter().zip(wp.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "d_input[{i}] at mask {mask:03b} ones={ones} kh={kh}"
+                        );
+                    }
+                }
+                if let Some(dw) = dw {
+                    assert_eq!(dw.len(), ww.len(), "d_weight len at mask {mask:03b}");
+                    for (i, (&g, &w)) in dw.iter().zip(ww.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "d_weight[{i}] at mask {mask:03b} ones={ones} kh={kh}"
+                        );
+                    }
+                }
+                if let (Some(db), Some(wb)) = (db, wb.clone()) {
+                    for (i, (&g, &w)) in db.iter().zip(wb.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "d_bias[{i}] at mask {mask:03b} ones={ones}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

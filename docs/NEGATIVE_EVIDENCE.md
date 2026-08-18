@@ -34051,3 +34051,81 @@ rather than five.
 
 NOT VERIFIED: `cargo clippy`, `cargo test` — the six tests written this session have still never
 run — and every ratio above.
+
+## 188. EVERY LINE WRITTEN BLIND UNDER THE FREEZE COMPILED AND PASSED FIRST TIME — INCLUDING THE GUESSES THAT COULD HAVE SHIPPED WRONG GRADIENTS
+
+`frankentorch-hi9r6`. Build freeze LIFTED. `/data` 100G free. Host `thinkstation1`, 64 cores.
+`cargo check`/`test`/`clippy` via `RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR`, repo-local
+`target/`, never the shared one.
+
+### 188a. THE RESULT
+
+Items 171, 174, 176, 177, 179, 181, 183 and 185 were written, tested and committed without a
+compiler. All of it compiled with **zero errors** and every test passed on the first run:
+
+    frankentorch-kernel-cpu  --lib   686 passed, 0 failed, 4 ignored
+    frankentorch-api         --lib  2580 passed, 0 failed, 1 ignored
+
+The tests that mattered are the ones whose claims were guesses:
+
+    conv2d_3x3_stride1_ones_dout_backward_f32_matches_generic_reference   PASS  (flat=288 > SGEMM_KC)
+    conv2d_height1_ones_dout_backward_f32_matches_generic_reference       PASS  (flat=400 > SGEMM_KC)
+    conv2d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise_f32      PASS  (out_ch=300, 512)
+    conv2d_backward_f32_from_f64_grad_matches_narrow_then_dispatch        PASS
+    conv2d_ones_dout_scatter_matches_the_accumulate_scatter_bitwise       PASS
+    conv2d_output_transpose_is_bit_identical_under_both_chunkings         PASS
+
+So three things read from source rather than measured were right: `SGEMM_KC = 256` from
+`matrixmultiply` 0.3.11's `archparam_defaults.rs`; the contribution order of item 174's collapsed
+scatter (`kr` descending, `kc` descending, from `0.0`); and the f64-gradient predicate of item 185
+implying the f32 one it replaces.
+
+**This is not a licence to write unverified numerical code.** Item 179 shipped a `dbias` bug that
+only a per-dtype re-derivation caught, and it was caught by reading the incumbent computation, not
+by cleverness. What the freeze forced — deriving each claim from the dependency's source, the
+adjacent code, or an IEEE simulation, and building the fixture that would catch it being wrong — is
+what made the guesses good. The lesson is the method, not the outcome.
+
+### 188b. ITEM 178'S FIX, WHICH f32 NEVER RECEIVED
+
+Found by asking the same question one more time: `conv2d_backward_masked_f64` honours
+`ctx.needs_input_grad()`, `conv2d_backward_masked_f32` did not exist, and `ft-api`'s f32 path called
+the unmasked kernel. A frozen weight therefore paid for a `dweight` nothing read — item 141 prices
+the f64 equivalent at `im2col` 0.990 ms + the dweight GEMM 2.036 ms, about 3.0 ms of a 16.6 ms
+backward, and the conv2d lanes on the board build their weight with `requires_grad = false`, so the
+frozen case is the common one.
+
+`conv2d_backward_masked_f32` lands with the f32 mirror of the f64 mask test — all 8 masks across 4
+shapes, both routes — and `conv2d_dout_flat_f32`, which also removes the dead `vec![0.0f32; ..]`
+that item 153 fixed on the f64 side and left here.
+
+One trap in the wiring, caught before it compiled: `dp.unwrap_or_default()` hands the tape
+`Some(vec![])` for a gradient the mask declined. **An empty gradient is not the absence of one.**
+The Options are now preserved end to end, and the all-ones fast path — which returns all three
+concretely — is re-masked rather than allowed to report work nobody asked for.
+
+### 188c. THE MEASUREMENT IS NOT QUOTABLE, AND THE HARNESS SAID SO BEFORE I DID
+
+PyTorch 2.12.1+cpu provisioned per `reference_torch_arm_provisioning` (the version is part of the
+measurement). Harness ELF `sha256=24622935...`, `RAYON_NUM_THREADS=8`, 16 rounds, balanced-square
+ABBAABBA, same invocation as the incumbent.
+
+    load_1m start=18.56 end=32.56  drift_gate=LOAD-DRIFTED
+    load_series n=18 worst_drift=2.268x  endpoint_gate=DRIFTED series_gate=DRIFTED
+    cpu_mhz min=1429 median=3347 max=4192 spread=2.934x
+
+**No row from that invocation is quotable, whatever its nulls say**, and the numbers it printed are
+not recorded here as a standing. Peers had ~30 loadavg of work running; that is the host, not the
+code.
+
+One column IS load-independent and is worth banking: **parity reads `match` on all five conv2d
+lanes** — `conv2d`, `conv2d_masked`, `conv2d_big`, `conv2d_big_masked`, `conv2d_masked_train` —
+against a live PyTorch arm. Items 174, 176 and 177 rewrote the f64 summed route's scatter, and the
+gradient checksums still agree with the incumbent to 1e-6. That is the claim those items made, now
+checked against torch rather than against our own reference.
+
+### 188d. OWED
+
+A quiet window. The f64 summed route (`conv2d`) is what items 174/177 changed and is the lane that
+prices them; nothing else this session has an f64 lane. The f32 work has no lane at all — item 185e
+gives the reason that is not a trivial addition, and it stands.

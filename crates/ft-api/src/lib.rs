@@ -30993,9 +30993,16 @@ impl FrankenTorchSession {
                         );
                         Ok((out, vec![b_, oc, oh, ow]))
                     },
-                    move |_ctx, grad_outputs, borrowed_inputs| {
+                    move |ctx, grad_outputs, borrowed_inputs| {
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
+                        // Item 178's fix, which f32 never received — `frankentorch-hi9r6`, item
+                        // 187. Same defensive reading of a short/absent `need` as the f64 twin:
+                        // "unknown" means COMPUTE it, because dropping a gradient somebody wants
+                        // is a correctness bug while computing a spare one is only slow.
+                        let need = ctx.needs_input_grad();
+                        let need_input = need.first().copied().unwrap_or(true);
+                        let need_weight = need.get(1).copied().unwrap_or(true);
                         // ASK BEFORE NARROWING — `frankentorch-hi9r6`, item 185.
                         //
                         // The narrow below is a SERIAL pass over the whole upstream gradient:
@@ -31030,11 +31037,14 @@ impl FrankenTorchSession {
                                 oc,
                                 has_bias,
                             ) {
-                            fast
+                            // The adjoint returns all three concretely; re-mask so a gradient
+                            // nobody asked for is not reported as one.
+                            let (dp, dw, db) = fast;
+                            (need_input.then_some(dp), need_weight.then_some(dw), db)
                         } else {
                             let dout_f32: Vec<f32> =
                                 grad_outputs[0].iter().map(|&v| v as f32).collect();
-                            ft_kernel_cpu::conv2d_backward_f32(
+                            let (dp, dw, db) = ft_kernel_cpu::conv2d_backward_masked_f32(
                                 &dout_f32,
                                 padded_values,
                                 weight_values,
@@ -31049,21 +31059,22 @@ impl FrankenTorchSession {
                                 sh,
                                 sw,
                                 oc,
-                                has_bias,
-                            )
+                                [need_input, need_weight, has_bias],
+                            );
+                            (dp, dw, db)
                         };
+                        // Options all the way to the tape: a mask that says "not wanted" must
+                        // yield `None`, not `Some(vec![])`. An empty gradient is not the absence
+                        // of one — the tape would treat a zero-length vector as a real gradient of
+                        // the wrong shape.
                         let mut g = vec![
-                            Some(dpadded.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                            Some(dweight.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            dpadded.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            dweight.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
                         ];
                         if has_bias {
-                            g.push(Some(
-                                dbias
-                                    .unwrap()
-                                    .iter()
-                                    .map(|&v| v as f64)
-                                    .collect::<Vec<f64>>(),
-                            ));
+                            g.push(
+                                dbias.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            );
                         }
                         Ok(g)
                     },
