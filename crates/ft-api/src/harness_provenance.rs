@@ -218,6 +218,134 @@ fn first_line_of(path: &str) -> String {
     )
 }
 
+/// Live announcements in `dir`, excluding `me`, reclaiming every slot whose holder is gone.
+///
+/// The liveness predicate is a parameter so the dead / recycled / live branches can all be driven
+/// by a test — the reclaim path in particular, which is the one that decides whether a killed run
+/// strands every future run behind a phantom overlap.
+fn scan_measurement_slots(
+    dir: &std::path::Path,
+    me: u32,
+    is_live: &dyn Fn(u32) -> bool,
+) -> Vec<String> {
+    let mut others = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return others;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(pid) = stem.parse::<u32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        if is_live(pid) {
+            others.push(
+                std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            );
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    others
+}
+
+/// An announcement that this process is MEASURING, removed when it drops.
+///
+/// `frankentorch-hi9r6`, item 195. Item 194 recorded two FrankenTorch h2h harnesses sampling
+/// simultaneously, inverting every conv2d ratio by up to 4x, with neither agent able to know: this
+/// host has a BUILD slot and no MEASUREMENT slot. `concurrent_measurement_block` can see the
+/// overlap in `/proc` afterwards; this lets a run see it BEFORE it spends ten minutes, and lets
+/// the other agent's run be named rather than merely counted.
+///
+/// Advisory, never blocking. It does not wait for the slot to free — a measurement that waits is a
+/// measurement that hangs, and agents share this host by design. It reports, the row carries the
+/// report, and a reader three weeks later can tell an overlapped row from a clean one.
+#[derive(Debug)]
+pub struct MeasurementSlot {
+    path: std::path::PathBuf,
+}
+
+impl Drop for MeasurementSlot {
+    fn drop(&mut self) {
+        // Best effort: a slot left behind by a killed process is reclaimed by the liveness check
+        // in `announce_measurement`, so failing here costs a stale line and not correctness.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Announce this measurement and report any other live one.
+///
+/// Returns the guard — which must be BOUND (`let _slot = ...`, never `let _ = ...`) so the
+/// announcement lives as long as the run — and the provenance line to print.
+///
+/// The slot directory is `FT_H2H_SLOT_DIR` or `/data/tmp/ft-h2h-slots`. Files are ~100 bytes and
+/// named by pid. A slot whose pid is gone, or whose pid has been recycled by a process that is not
+/// a harness, is deleted on sight: the directory self-heals rather than accumulating tombstones
+/// that would make every future run look contended.
+#[must_use]
+pub fn announce_measurement(label: &str) -> (Option<MeasurementSlot>, String) {
+    let dir =
+        std::env::var("FT_H2H_SLOT_DIR").unwrap_or_else(|_| "/data/tmp/ft-h2h-slots".to_owned());
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return (
+            None,
+            format!(
+                "measurement_slot=UNAVAILABLE (cannot create {}); overlap with another harness \
+                 cannot be detected in advance, only after the fact by the /proc scan above",
+                dir.display()
+            ),
+        );
+    }
+
+    let me = std::process::id();
+    let mut others = scan_measurement_slots(&dir, me, &slot_holder_is_live);
+
+    let path = dir.join(format!("{me}.slot"));
+    let elf = executing_elf_sha256();
+    let record = format!(
+        "pid={me} host={} elf={} lanes={label}",
+        first_line_of("/proc/sys/kernel/hostname"),
+        &elf[..elf.len().min(16)]
+    );
+    let guard = std::fs::write(&path, &record)
+        .ok()
+        .map(|()| MeasurementSlot { path });
+
+    let line = if others.is_empty() {
+        format!("measurement_slot=held [{record}]; no other live h2h announcement")
+    } else {
+        others.sort();
+        format!(
+            "measurement_slot=OVERLAPPED [{record}]; {} other live announcement(s): {} — those \
+             runs and this one sample the same cores at the same time. Item 194 measured what that \
+             does: every conv2d ratio changed SIGN, and both drift gates passed while it happened. \
+             No row from an overlapped window is quotable.",
+            others.len(),
+            others.join(" | ")
+        )
+    };
+    (guard, line)
+}
+
+/// Is `pid` still a live harness? A bare `/proc/<pid>` check would accept a recycled pid belonging
+/// to something else entirely, which would strand a slot forever and make every later run report a
+/// phantom overlap.
+fn slot_holder_is_live(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| {
+        let cmdline = raw.replace('\0', " ");
+        cmdline.contains("_h2h") || cmdline.contains("gauntlet")
+    })
+}
+
 /// Other processes that were MEASURING when this run started — `frankentorch-hi9r6`, item 193.
 ///
 /// WHY THIS IS PROVENANCE AND NOT A NICETY. Item 193 records a run whose drift gates BOTH passed
@@ -925,5 +1053,73 @@ mod tests {
         assert!(load_series_is_quotable(&[0.0, 0.9, 0.4]));
         // Above the floor the ratio bites again.
         assert!(!load_series_is_quotable(&[1.0, 1.4, 1.1]));
+    }
+
+    /// The slot's branches: self-exclusion, overlap reporting, and — the one that matters —
+    /// reclaiming a slot whose holder is gone. A stale slot that is never reclaimed would make
+    /// every future run report a phantom overlap and quietly disqualify itself forever.
+    #[test]
+    fn measurement_slots_report_live_peers_and_reclaim_dead_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "ft-h2h-slot-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("slot test dir");
+
+        let write = |pid: u32, body: &str| {
+            std::fs::write(dir.join(format!("{pid}.slot")), body).expect("slot write");
+        };
+        write(100, "pid=100 host=h elf=abc lanes=conv2d");
+        write(200, "pid=200 host=h elf=abc lanes=conv2d_f32");
+        write(300, "pid=300 host=h elf=abc lanes=all");
+
+        // 100 alive, 200 and 300 gone.
+        let live = |pid: u32| pid == 100;
+        let others = super::scan_measurement_slots(&dir, 999, &live);
+        assert_eq!(
+            others.len(),
+            1,
+            "only the live peer is reported: {others:?}"
+        );
+        assert!(others[0].contains("pid=100"));
+        assert!(
+            !dir.join("200.slot").exists() && !dir.join("300.slot").exists(),
+            "slots whose holder is gone must be reclaimed, not left to strand future runs"
+        );
+        assert!(
+            dir.join("100.slot").exists(),
+            "a live peer's slot must survive"
+        );
+
+        // A run must never report itself, even though its own slot is present.
+        write(999, "pid=999 host=h elf=abc lanes=mine");
+        let others = super::scan_measurement_slots(&dir, 999, &|pid| pid == 100 || pid == 999);
+        assert!(
+            others.iter().all(|o| !o.contains("pid=999")),
+            "a run reported itself as contention: {others:?}"
+        );
+
+        // Nothing live: a clean host, with no tombstones left behind.
+        let others = super::scan_measurement_slots(&dir, 999, &|_| false);
+        assert!(others.is_empty(), "expected a clean host, got {others:?}");
+        assert!(!dir.join("100.slot").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real liveness predicate must reject a pid that is alive but is NOT a harness, or a
+    /// recycled pid would hold a slot forever. Pid 1 is always alive and never a harness.
+    #[test]
+    fn slot_liveness_rejects_a_live_non_harness_pid() {
+        assert!(
+            !super::slot_holder_is_live(1),
+            "pid 1 is alive but is not an h2h harness; treating it as a holder would strand a slot"
+        );
+        assert!(
+            !super::slot_holder_is_live(u32::MAX),
+            "a pid that does not exist cannot hold a slot"
+        );
     }
 }

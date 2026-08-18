@@ -34752,3 +34752,75 @@ line of provenance.
 
 Compile this. Re-run `FT_H2H_LANES=conv2d` at `round_warmup=0` when the block prints `none` and
 loadavg is both low and steady.
+
+## 195. A MEASUREMENT SLOT — THE FIX ITEM 194e NAMED, BECAUSE FOUR CONSECUTIVE RUNS WERE VOIDED BY OVERLAP NOBODY COULD SEE
+
+`frankentorch-hi9r6`. **UNBUILT** — disk 49G, below the 58G floor, no cargo of any kind ran.
+`rustfmt --edition 2024 --check` exits 0 on both files. No measurement attempted: run queue was
+101 this tick.
+
+### 195a. WHY THIS AND NOT MORE conv2d
+
+Four measurement attempts this session produced no quotable row:
+
+    item 188c   21 lanes, load drifted 18 -> 32          both drift gates DRIFTED
+    item 189    5 lanes, drift gates PASSED              every A/A null failed; clock spread 2.9x
+    item 194    5 lanes, warmup=1, load 75 -> 85         two peer harnesses sampling; ratios INVERTED
+    (this)      not attempted                            run queue 101
+
+The binding constraint on `frankentorch-hi9r6` is not a missing conv2d lever. It is that conv2d
+cannot be measured, and the largest single cause — two harnesses sampling the same cores — is
+invisible to every gate the harness has. This host has a BUILD slot and no MEASUREMENT slot.
+
+### 195b. THE MECHANISM
+
+`announce_measurement(label)` writes a ~100 byte record to `FT_H2H_SLOT_DIR` (default
+`/data/tmp/ft-h2h-slots`) naming pid, host, ELF sha and lane filter, returns an RAII guard that
+removes it, and reports every OTHER live announcement. The harness prints that line beside the host
+block and binds the guard for the length of the run.
+
+Three decisions, each the opposite of the obvious one:
+
+- **It does not wait.** A measurement that blocks until the host is quiet is a measurement that
+  hangs, and this campaign's rules forbid wait loops for exactly that reason.
+- **It does not refuse.** Agents share this host by design; a harness that exits because a peer is
+  busy is a worse failure than one that says what it saw. The row carries the overlap and a reader
+  three weeks later can tell an overlapped row from a clean one.
+- **It reclaims aggressively.** A slot whose holder is gone is deleted on sight, and liveness is
+  checked by reading `/proc/<pid>/cmdline` rather than by the existence of `/proc/<pid>` — a
+  recycled pid belonging to something else would otherwise strand a slot forever and make every
+  future run report a phantom overlap. **The failure mode of a lock is not "it did not lock", it is
+  "it never unlocked".**
+
+### 195c. VERIFIED WITHOUT A COMPILER
+
+The scan takes its liveness predicate as a parameter, which is what lets the dead / recycled / live
+branches be driven at all. Transcribed into Python and run on this host:
+
+    1. clean host              held         others=[]                    reclaimed=[]
+    2. peer live               OVERLAPPED   others=[pid=100 ...]         reclaimed=[]
+    3. self-exclusion          OVERLAPPED   (never reports pid=200)
+    4. dead peer reclaimed     OVERLAPPED   others=[pid=200 ...]         reclaimed=[100]
+    5. all gone                held         others=[]                    reclaimed=[200,300]
+    6. real predicate, pid 1   live_harness=False   (alive, not a harness -> reclaimable)
+
+Case 5 is the one worth having: without it a killed run leaves a tombstone and every later run
+disqualifies itself against a process that no longer exists. Case 6 exercises the REAL predicate,
+not the injected one.
+
+The same branches are now Rust `#[cfg(test)]` tests, so they run when the build returns rather than
+living only in a scratch file that nobody will execute again.
+
+### 195d. WHAT IT DOES NOT DO
+
+It coordinates FrankenTorch harnesses with each other. It cannot see `frankenscipy`, criterion, or
+anything else that measures — item 194's `/proc` scan is what catches those, and only by name
+patterns. The two are complementary and neither is a guarantee: `measurement_slot=held` plus
+`concurrent_measurements=none` means "no overlap of the shapes we know", never "the host is quiet".
+Loadavg, run queue and the clock spread are still what say that.
+
+### 195e. OWED
+
+Compile both this and item 194's block. Then, in a window where the slot prints `held`, the
+`/proc` scan prints `none`, and the run queue is low and steady: `FT_H2H_LANES=conv2d` at
+`round_warmup=0`, which is the pair that prices items 174 and 177.

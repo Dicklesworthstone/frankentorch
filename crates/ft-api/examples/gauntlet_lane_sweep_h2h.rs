@@ -1458,6 +1458,13 @@ LANES = {
         "{}",
         ft_api::harness_provenance::measurement_host_block(rayon::current_num_threads())
     );
+    // frankentorch-hi9r6 item 195: announce this run BEFORE the /proc scan below, so a peer that
+    // starts while we sample sees us. `_slot` must be bound, not discarded: the announcement lives
+    // exactly as long as this binding, and `let _ = ..` would drop it here and announce nothing.
+    let (_slot, slot_line) = ft_api::harness_provenance::announce_measurement(
+        &std::env::var("FT_H2H_LANES").unwrap_or_else(|_| "all".to_owned()),
+    );
+    println!("{slot_line}");
     // frankentorch-hi9r6 item 193: WHO ELSE was measuring. Printed next to the host block because
     // it answers the question loadavg cannot — a run at loadavg 85 of compilation and a run at
     // loadavg 85 of two other harnesses sampling are not the same measurement, and only the second
