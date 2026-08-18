@@ -34129,3 +34129,58 @@ checked against torch rather than against our own reference.
 A quiet window. The f64 summed route (`conv2d`) is what items 174/177 changed and is the lane that
 prices them; nothing else this session has an f64 lane. The f32 work has no lane at all — item 185e
 gives the reason that is not a trivial addition, and it stands.
+
+## 188. THE conv3d MASKED-GRADIENT LEVER IS ~41% OF ITS BACKWARD — MORE THAN DOUBLE conv2d's SHARE, ON THE ONE CERTIFIED LANE
+
+`frankentorch-l2zki`. **NO BUILD STARTED**, no disk consumed: `/data` was 90G and falling ~10G a
+tick with cold builds live, so this ran an EXISTING probe binary. Arm-internal — no incumbent, no
+ratio, nothing here is a standing.
+
+### 188a. THE SIZING ITEM 185d SAID WAS FREE
+
+Item 184a found conv3d computing a `dweight` both its lanes discard, and item 185d observed that
+`conv3d_generic_phase_probe` already times the panel separately, so the lever could be sized
+without writing anything. It could:
+
+    conv3d_backward_f64 (non-uniform)      5.671 ms   100%
+      im2col (dweight's panel)             1.430       25.2%
+      col2im (dpanel -> dpadded)           2.346       41.4%
+      RESIDUAL (both GEMMs + dout_flat)    1.894       33.4%
+
+shape [2,32,8,16,16] k=3 s=1 pad=1 out_ch=32, `RAYON_NUM_THREADS=8`, min of 9, loadavg 31.5,
+cpu_mhz spread 2.83x.
+
+The two GEMMs have IDENTICAL MAC counts here — dweight is `32 x 4096 x 864` and dpanel is
+`4096 x 32 x 864`, both 113M — so the residual splits about evenly and the dweight GEMM is roughly
+0.9 ms. The skippable branch is therefore **im2col 1.430 + ~0.9 ≈ 2.3 ms of 5.671, about 41%**.
+
+conv2d's equivalent was ~18% (item 141). conv3d's is more than double, because its panel is 27 MiB
+against conv2d's 18.9 MB while its GEMMs are no bigger in proportion. **The unexploited lever is
+larger on the lane that is certified.**
+
+### 188b. THE PROVENANCE CAVEAT, WHICH IS NOT SMALL
+
+**This binary was built 2026-08-17 17:02** — before items 165, 178, 184 and everything else this
+session landed. It therefore measures YESTERDAY's kernel, and the absolute milliseconds are stale.
+
+I ran it anyway, and quote only the SHARE, because the structure the share describes has not
+changed: nothing has masked conv3d's backward, so its dweight branch is still computed and still
+discarded on both lanes. A fresh binary would move all four numbers together and leave the ratio
+between them roughly where it is.
+
+That is a weaker claim than a fresh run, and it is the strongest one available while the disk is
+falling. It is enough to rank the lever, which is what it was for.
+
+### 188c. THE OTHER THING THE TABLE SAYS
+
+**`col2im` is 41.4% — the single largest phase in conv3d's backward**, and no item in this campaign
+has ever attacked it. Unlike the dweight branch it cannot be skipped: it produces `dinput`, which
+both lanes need.
+
+It is also not obviously improvable — item 165d established that conv2d's col2im has no bit-exact
+lever, because reordering the accumulation changes the summation order for overlapping windows, and
+the same argument applies here with 27 windows per element instead of 9. Recorded as the biggest
+phase with no known lever, so the next agent ranking conv3d work starts from the right place rather
+than rediscovering it.
+
+NOT VERIFIED: nothing here is a vs-PyTorch measurement, and the binary predates this session.
