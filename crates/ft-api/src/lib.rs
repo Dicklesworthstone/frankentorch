@@ -31831,11 +31831,28 @@ impl FrankenTorchSession {
                         );
                         Ok((out, vec![b_, oc, od_, oh_, ow_]))
                     },
-                    move |_ctx, grad_outputs, borrowed_inputs| {
+                    // SKIP THE GRADIENT NOBODY ASKED FOR — `frankentorch-l2zki`, item 195.
+                    //
+                    // UNBUILT: written under a disk throttle, not compiled or measured.
+                    //
+                    // The conv2d twin is item 178; this is the same defect on the lane that is
+                    // CERTIFIED. Both conv3d h2h lanes freeze their weight, so `conv3d_masked`
+                    // has been paying for a `dweight` nothing reads — item 188 prices that branch
+                    // at ~41% of this backward (a 28.3 MB im2col panel plus a 113M-MAC GEMM),
+                    // against conv2d's ~18%.
+                    //
+                    // As in item 178, `needs_input_grad` is read DEFENSIVELY: an absent entry
+                    // means the tape did not record what is wanted, and the safe reading of
+                    // "unknown" is COMPUTE IT. Dropping a gradient somebody needs is a wrong
+                    // answer; computing a spare one is merely slow.
+                    move |ctx, grad_outputs, borrowed_inputs| {
                         let dout = grad_outputs[0];
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
-                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv3d_backward_f64(
+                        let need = ctx.needs_input_grad();
+                        let need_input = need.first().copied().unwrap_or(true);
+                        let need_weight = need.get(1).copied().unwrap_or(true);
+                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv3d_backward_masked_f64(
                             dout,
                             padded_values,
                             weight_values,
@@ -31854,11 +31871,11 @@ impl FrankenTorchSession {
                             sh_,
                             sw_,
                             oc,
-                            has_bias,
+                            [need_input, need_weight, has_bias],
                         );
-                        let mut g = vec![Some(dpadded), Some(dweight)];
+                        let mut g = vec![dpadded, dweight];
                         if has_bias {
-                            g.push(Some(dbias.unwrap()));
+                            g.push(dbias);
                         }
                         Ok(g)
                     },

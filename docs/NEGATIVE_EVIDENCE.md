@@ -34753,6 +34753,71 @@ line of provenance.
 Compile this. Re-run `FT_H2H_LANES=conv2d` at `round_warmup=0` when the block prints `none` and
 loadavg is both low and steady.
 
+## 195. THE conv3d MASKED GRADIENT, FINALLY WRITTEN — THE ~41% LEVER ON THE ONE CERTIFIED LANE
+
+`frankentorch-l2zki`, applying `frankentorch-hi9r6`'s item 178. **UNBUILT AND UNMEASURED**: `/data`
+50G, below the 58G floor, no cargo of any kind; runq hit 101 this tick so nothing was measured
+either. `rustfmt --edition 2024 --check` exits 0 on both files — which item 186 established proves
+only that they PARSE.
+
+### 195a. THE LEVER, AND WHY IT WAITED THREE ITEMS
+
+Item 184a found conv3d computing a `dweight` both its lanes discard and declined to fix it, citing
+a wholesale body move. Item 185a checked that against the code and found the claim wrong — both
+halves are self-contained expressions — but declined again, because the file carried uncommitted
+peer edits and my anchor text matched four places. Item 188 then sized it: **~41% of the conv3d
+backward**, against conv2d's ~18%, because its im2col panel is 28.3 MB while its GEMMs are no
+bigger in proportion.
+
+This turn the working tree was clean for the first time in many turns, so it went in.
+
+**It is the larger lever on the better lane.** Every conv2d lane is uncertified; `conv3d_masked`
+carries a certified standing.
+
+### 195b. THE SHAPE, MIRRORING ITEM 178 DELIBERATELY
+
+* `conv3d_backward_generic_masked_f64` holds the body and takes `output_mask: [bool; 3]`, the same
+  argument PyTorch's `convolution_backward` takes for the same reason.
+* `conv3d_backward_generic_f64` survives as a thin wrapper passing `[true, true, has_bias]`, so its
+  three existing callers — the dispatcher and two tests — need no change. The mask is an addition,
+  not a migration.
+* `conv3d_backward_masked_f64` is the public entry point, and **it does not bypass the all-ones
+  route**: when `dout` is uniformly 1.0 it delegates and masks afterwards, saving nothing. Reaching
+  the generic path merely because a mask was passed would trade a fast path for a skip and could
+  easily be a net loss on the summed route. The route predicate is a copy of the dispatcher's,
+  which is the drift hazard item 180c guards for conv2d — and the same test shape will guard it.
+* ft-api's conv3d first-order closure now reads `ctx.needs_input_grad()` instead of ignoring
+  `_ctx`, DEFENSIVELY: an absent entry means the tape did not record what is wanted, and "unknown"
+  reads as COMPUTE IT, because dropping a needed gradient is a wrong answer while computing a spare
+  one is only slow.
+
+### 195c. HOW IT WAS EDITED, AFTER TWO FAILURES
+
+Text anchors do not work in this file: `let dweight = build_uninit(out_ch * patch_width` matches
+four places, and `) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {` matches nine. My first attempt
+asserted on a non-unique anchor and aborted — writing nothing, because the script only writes at
+the end, which is the one design decision that saved it.
+
+The edits were then applied by LINE INDEX within the function's span, **bottom-up so earlier
+indices stay valid**, with every target line asserted before any write. That is the technique this
+file demands, and it is worth reusing: a 66,000-line file with nine near-identical kernels defeats
+text matching, and a partial write into it is far worse than a failed one.
+
+### 195d. WHAT IS OWED
+
+A compile, `cargo clippy`, and a masked-vs-unmasked bitwise test mirroring item 180's — which does
+not exist for conv3d and should before this is trusted, for item 180's reason: a wrong
+`needs_input_grad` reading silently drops a real gradient, and no perf row would show it. Then the
+paired vs-PyTorch run on `conv3d_masked`, which is the one lane where this can be certified.
+
+### 195e. A NUMBERING COLLISION, LEFT ALONE
+
+There are now two item 194s: mine, and a peer's — and they are the SAME FINDING, reached
+independently within one window. Both say the drift gate passes on a host whose load is steady but
+oversubscribed; theirs adds that every conv2d ratio inverted at loadavg 85. Convergent discovery on
+a measurement defect is worth more than either item alone, and I have left their heading untouched
+rather than renumber someone else's work mid-edit.
+
 ## 195. A MEASUREMENT SLOT — THE FIX ITEM 194e NAMED, BECAUSE FOUR CONSECUTIVE RUNS WERE VOIDED BY OVERLAP NOBODY COULD SEE
 
 `frankentorch-hi9r6`. **UNBUILT** — disk 49G, below the 58G floor, no cargo of any kind ran.

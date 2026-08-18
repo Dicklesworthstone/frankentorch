@@ -15751,6 +15751,107 @@ fn conv3d_backward_ones_dout_f64(
 
 #[allow(clippy::too_many_arguments)]
 #[must_use]
+/// conv3d backward computing ONLY the gradients asked for — `frankentorch-l2zki`, item 195.
+///
+/// `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's `convolution_backward`,
+/// which takes exactly this argument for exactly this reason. The conv2d twin is item 178.
+///
+/// **UNBUILT**: written under a disk throttle with no cargo available; not compiled, not tested,
+/// not measured.
+///
+/// WHY THIS ONE MATTERS MORE THAN conv2d's. Both conv3d h2h lanes build their weight with
+/// `requires_grad = false`, and `conv3d_masked` carries a CERTIFIED standing — unlike any conv2d
+/// lane. Item 188 priced the skippable branch at **~41% of this backward** (a 28.3 MB im2col panel
+/// plus a 113M-MAC GEMM), against conv2d's ~18%. The larger lever sits on the measured lane.
+///
+/// THE ALL-ONES ROUTE IS NOT BYPASSED. `conv3d_backward_f64` takes its ones-dout specialisation
+/// when every element of `dout` is exactly 1.0, and that kernel produces both halves together.
+/// Reaching the generic path just because a mask was passed would trade a fast path for a skip and
+/// could easily be a net LOSS on the summed route, so this delegates and masks afterwards there —
+/// saving nothing, and saying so rather than implying otherwise.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_backward_masked_f64(
+    dout: &[f64],
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
+    // Same predicate `conv3d_backward_f64` uses, so the two cannot disagree about which route
+    // applies. A second copy of a route gate is the drift hazard item 180c guards for conv2d.
+    let ones_route = !dout.is_empty() && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits());
+    if ones_route || (output_mask[0] && output_mask[1]) {
+        let (dpadded, dweight, dbias) = conv3d_backward_f64(
+            dout,
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+            out_ch,
+            output_mask[2],
+        );
+        return (
+            output_mask[0].then_some(dpadded),
+            output_mask[1].then_some(dweight),
+            dbias,
+        );
+    }
+    conv3d_backward_generic_masked_f64(
+        dout,
+        padded,
+        weight_flat,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+        output_mask[2],
+        output_mask,
+    )
+}
+
+/// Full conv3d generic backward — every gradient, exactly as before item 195.
+///
+/// Kept so the three existing callers (the dispatcher and two tests) need no change: the mask is
+/// an addition, not a migration. `conv3d_backward_generic_masked_f64` holds the body.
+#[allow(clippy::too_many_arguments)]
 fn conv3d_backward_generic_f64(
     dout: &[f64],
     padded: &[f64],
@@ -15772,6 +15873,57 @@ fn conv3d_backward_generic_f64(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let (dpadded, dweight, dbias) = conv3d_backward_generic_masked_f64(
+        dout,
+        padded,
+        weight_flat,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+        has_bias,
+        [true, true, has_bias],
+    );
+    (
+        dpadded.unwrap_or_default(),
+        dweight.unwrap_or_default(),
+        dbias,
+    )
+}
+
+fn conv3d_backward_generic_masked_f64(
+    dout: &[f64],
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let flat = batch * patch_count;
@@ -15818,20 +15970,25 @@ fn conv3d_backward_generic_f64(
     // The generic path is the one REAL TRAINING takes — item 99 scoped item 98's removal to
     // the `sum()`-loss branch only, and this closes the other half.
     // frankentorch-l2zki, NEGATIVE_EVIDENCE items 97/99/100.
-    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f64]| {
-        if flat == 0 || patch_width == 0 {
-            dweight.fill(0.0);
-            return;
-        }
-        // ONE WIDE GEMM, not sixteen narrow ones. Item 104 blocked this on `k` to keep the
-        // im2col panel out of DRAM, and that blocking dropped each call to
-        // m*k*n = 32*256*864 = 7.1M MACs -- BELOW `PAR_MIN_FLOPS_COLS` (16.8M), so every one
-        // of the sixteen ran single-threaded even after `dgemm_tb` gained a column split. The
-        // full-panel call is 113M MACs and clears the gate. NEGATIVE_EVIDENCE item 118.
-        let panel = conv3d_im2col_f64(
-            padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-        );
-        gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+    // item 195: the expensive half — a 28.3 MB im2col panel in D_KC blocks plus a 113M-MAC
+    // GEMM, ~41% of this backward by item 188's table. BOTH conv3d lanes freeze their weight,
+    // so on the certified conv3d_masked row every one of those MACs was computed and discarded.
+    let dweight = output_mask[1].then(|| {
+        build_uninit(out_ch * patch_width, |dweight: &mut [f64]| {
+            if flat == 0 || patch_width == 0 {
+                dweight.fill(0.0);
+                return;
+            }
+            // ONE WIDE GEMM, not sixteen narrow ones. Item 104 blocked this on `k` to keep the
+            // im2col panel out of DRAM, and that blocking dropped each call to
+            // m*k*n = 32*256*864 = 7.1M MACs -- BELOW `PAR_MIN_FLOPS_COLS` (16.8M), so every one
+            // of the sixteen ran single-threaded even after `dgemm_tb` gained a column split. The
+            // full-panel call is 113M MACs and clears the gate. NEGATIVE_EVIDENCE item 118.
+            let panel = conv3d_im2col_f64(
+                padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            );
+            gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+        })
     });
     // frankentorch-l2zki / NEGATIVE_EVIDENCE item 116: the fused block-at-a-time form of the
     // two steps below was tried and REVERTED. It removed the 28.3 MB `dpanel` and it was
@@ -15840,13 +15997,16 @@ fn conv3d_backward_generic_f64(
     // into 16 phases and leave each scatter with only `in_ch` tasks. Memory was not the
     // binding constraint on this route; parallel WIDTH was. Do not re-fuse without a design
     // that keeps one wide parallel region.
-    let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f64]| {
-        gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+    // item 195: dinput's half — the second GEMM and the col2im scatter.
+    let dpadded = output_mask[0].then(|| {
+        let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f64]| {
+            gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+        });
+        conv3d_col2im_f64(
+            &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        )
     });
-    let dpadded = conv3d_col2im_f64(
-        &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-    );
-    let dbias = if has_bias {
+    let dbias = if output_mask[2] {
         // Parallel over out_ch: each channel's bias gradient is an independent
         // reduction with the same (n outer, p inner) summation order, so the
         // result is bit-identical to the serial loop. frankentorch-convbwd.
