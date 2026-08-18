@@ -13768,17 +13768,59 @@ fn conv3d_forward_streamed_f64(
                 gemm::dgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
             });
     });
+    // THE SAME PER-CHANNEL RE-STREAM ITEM 158 FIXED IN conv2d — `frankentorch-l2zki`, item 163.
+    //
+    // UNBUILT — written under a build freeze; not compiled, not measured.
+    //
+    // This function had already taken the uninit-allocation lever (all three buffers are
+    // `build_uninit`, and its own comment prices the removed memset at ~28 MB per forward). What
+    // it kept was the OTHER half of conv2d's problem: the output transpose gathered with a stride
+    // of `out_ch` f64 = 256 bytes, so every read took its own cache line and each of the 32 output
+    // channels re-streamed the whole `out_flat`. At this lane's shape that is a 1 MB buffer read
+    // ~32 times, ~32 MB of traffic to move 1 MB.
+    //
+    // Unlike the conv2d forward, THIS one sits under a certified standing: `conv3d_masked` is
+    // measured against PyTorch in the h2h board, so the change has an incumbent arm to be priced
+    // against rather than only an arm-internal number.
+    //
+    // PER BATCH, for the reason item 158 gives: a single transpose of `out_flat`
+    // [batch*patch_count, out_ch] yields `out_ch` outermost, but NCDHW needs
+    // [batch, out_ch, patch_count]. One batch at a time, `out_flat`'s rows
+    // `n*patch_count .. (n+1)*patch_count` are a [patch_count, out_ch] matrix whose transpose is
+    // exactly `out[n]`.
+    //
+    // NESTED PARALLELISM IS DELIBERATE HERE, AND IS THE ONE THING THAT DIFFERS FROM conv2d. This
+    // lane's `patch_count * out_ch` is 2048*32 = 65536, exactly `transpose_2d_into_f64`'s own
+    // `1 << 16` gate, so each inner transpose parallelises. That is wanted: `batch` is 2 on this
+    // lane, so the outer chunks alone would cap the whole pass at 2-way parallelism on a 64-core
+    // box. Rayon nests without deadlock — the inner join runs on the same pool.
+    //
+    // BIT-EXACT: the transpose is pure data movement, and the bias is then one addition per
+    // element with the same two operands as before. The add is UNCONDITIONAL for item 158's
+    // reason — `-0.0 + 0.0` is `+0.0`, so skipping a zero bias would leave `-0.0` where the fused
+    // form produced `+0.0`.
     build_uninit(batch * out_ch * patch_count, |out: &mut [f64]| {
-        out.par_chunks_mut(patch_count)
+        out.par_chunks_mut(out_ch * patch_count)
             .enumerate()
-            .for_each(|(idx, orow)| {
-                let n = idx / out_ch;
-                let oc = idx % out_ch;
-                let bo = bias.map_or(0.0, |bb| bb[oc]);
-                for (p, slot) in orow.iter_mut().enumerate() {
-                    *slot = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
-                }
+            .for_each(|(n, obatch)| {
+                let base = n * patch_count * out_ch;
+                transpose_2d_into_f64(
+                    &out_flat[base..base + patch_count * out_ch],
+                    obatch,
+                    patch_count,
+                    out_ch,
+                );
             });
+        if let Some(bb) = bias {
+            out.par_chunks_mut(patch_count)
+                .enumerate()
+                .for_each(|(idx, orow)| {
+                    let bo = bb[idx % out_ch];
+                    for v in orow.iter_mut() {
+                        *v += bo;
+                    }
+                });
+        }
     })
 }
 
@@ -21308,14 +21350,6 @@ pub fn lu_factor_contiguous_f64(
     // precision, checked by `lu_factor_reconstructs_pa_eq_lu`).
     const NB: usize = 64;
     const LU_PAR_MIN_ROWS: usize = 64;
-    /// Rows per rayon task in the panel elimination — NEGATIVE_EVIDENCE item 163.
-    ///
-    /// The elimination below is PANEL-ONLY: each row touches `pe - k - 1` columns — the panel
-    /// width — not `n`. One task per row therefore dispatched a rayon task per ~panel-width
-    /// flops, once per pivot, which is order `n^2` dispatches across a factorization. Note the
-    /// gate above tests ROWS (`LU_PAR_MIN_ROWS`) while the per-task WORK is set by COLUMNS, so
-    /// a rows-only gate cannot see that each task is tiny.
-    const LU_PAR_CHUNK_ROWS: usize = 64;
     let singular_tol = f64::EPSILON * 1e3;
 
     let mut k0 = 0;
@@ -21357,16 +21391,11 @@ pub fn lu_factor_contiguous_f64(
             if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n..(k + 1) * n];
-                // CHUNKED, NOT ONE TASK PER ROW — item 163. BIT-EXACT: each row reads only
-                // `pivot_row` and writes only its own cells, so repartitioning rows across
-                // tasks cannot change an association or a value. UNBUILT, UNMEASURED.
-                tail.par_chunks_mut(LU_PAR_CHUNK_ROWS * n).for_each(|rows| {
-                    for row_i in rows.chunks_exact_mut(n) {
-                        let m = row_i[k] / diag;
-                        row_i[k] = m;
-                        for j in (k + 1)..pe {
-                            row_i[j] -= m * pivot_row[j];
-                        }
+                tail.par_chunks_mut(n).for_each(|row_i| {
+                    let m = row_i[k] / diag;
+                    row_i[k] = m;
+                    for j in (k + 1)..pe {
+                        row_i[j] -= m * pivot_row[j];
                     }
                 });
             } else {
@@ -21466,14 +21495,6 @@ pub fn lu_factor_contiguous_f32(
 
     const NB: usize = 64;
     const LU_PAR_MIN_ROWS: usize = 64;
-    /// Rows per rayon task in the panel elimination — NEGATIVE_EVIDENCE item 163.
-    ///
-    /// The elimination below is PANEL-ONLY: each row touches `pe - k - 1` columns — the panel
-    /// width — not `n`. One task per row therefore dispatched a rayon task per ~panel-width
-    /// flops, once per pivot, which is order `n^2` dispatches across a factorization. Note the
-    /// gate above tests ROWS (`LU_PAR_MIN_ROWS`) while the per-task WORK is set by COLUMNS, so
-    /// a rows-only gate cannot see that each task is tiny.
-    const LU_PAR_CHUNK_ROWS: usize = 64;
     let singular_tol = f32::EPSILON * 1e3;
 
     let mut k0 = 0;
@@ -21509,16 +21530,11 @@ pub fn lu_factor_contiguous_f32(
             if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n..(k + 1) * n];
-                // CHUNKED, NOT ONE TASK PER ROW — item 163. BIT-EXACT: each row reads only
-                // `pivot_row` and writes only its own cells, so repartitioning rows across
-                // tasks cannot change an association or a value. UNBUILT, UNMEASURED.
-                tail.par_chunks_mut(LU_PAR_CHUNK_ROWS * n).for_each(|rows| {
-                    for row_i in rows.chunks_exact_mut(n) {
-                        let m = row_i[k] / diag;
-                        row_i[k] = m;
-                        for j in (k + 1)..pe {
-                            row_i[j] -= m * pivot_row[j];
-                        }
+                tail.par_chunks_mut(n).for_each(|row_i| {
+                    let m = row_i[k] / diag;
+                    row_i[k] = m;
+                    for j in (k + 1)..pe {
+                        row_i[j] -= m * pivot_row[j];
                     }
                 });
             } else {
@@ -29841,34 +29857,13 @@ mod bidiag {
             }
             return;
         }
-        // CHUNKED LIKE `reduce_scaled_rows_f64`, NOT ONE TASK PER ROW — `frankentorch-4zjaa`,
-        // NEGATIVE_EVIDENCE item 159.
-        //
-        // This forked `nrows` tasks, one per row, each doing `ncols` multiply-subtracts — at
-        // the bidiag shapes that is ~1.2 KB of work per task, and the helper is called ONCE PER
-        // REFLECTOR, so an n=160 expansion queued ~160 tasks per call across ~160 calls. Item
-        // 157 traced 4zjaa's 17.6x A/B cliff to fork/join cost in exactly this pair of helpers;
-        // this is the half of it that can be fixed without touching numerics.
-        //
-        // BIT-EXACT, AND UNLIKE `reduce` NOT EVEN CONDITIONALLY: this is a pure elementwise
-        // update — `block[r][c] -= v[r] * acc[c]` — with no cross-row reduction, so the row
-        // partition cannot change an association. `reduce`'s chunk width is load-bearing for
-        // ITS determinism; here the same constant is reused only for symmetry, and any width
-        // would give identical results.
-        //
-        // UNBUILT and UNMEASURED (build freeze, /data 28G). It reduces task COUNT 64x at the
-        // cost of coarser width, which is the right trade at large `nrows` and irrelevant at
-        // small ones — those should not be taking the parallel branch at all, which is item
-        // 157's separate and still-unsettled point about the gate itself.
         block
-            .par_chunks_mut(REDUCE_CHUNK_ROWS * lda)
-            .zip(v.par_chunks(REDUCE_CHUNK_ROWS))
-            .for_each(|(rows, vs)| {
-                for (row, &vr) in rows.chunks_exact_mut(lda).zip(vs) {
-                    let seg = &mut row[col0..col0 + ncols];
-                    for c in 0..ncols {
-                        seg[c] -= vr * acc[c];
-                    }
+            .par_chunks_mut(lda)
+            .zip(v.par_iter())
+            .for_each(|(row, &vr)| {
+                let seg = &mut row[col0..col0 + ncols];
+                for c in 0..ncols {
+                    seg[c] -= vr * acc[c];
                 }
             });
     }
@@ -30220,40 +30215,18 @@ mod bidiag {
                 if (xrows as u64) * (vlen as u64) >= PARALLEL_GATE
                     && rayon::current_num_threads() > 1
                 {
-                    // CHUNKED, AND SLICED RATHER THAN SKIPPED — `frankentorch-4zjaa`,
-                    // NEGATIVE_EVIDENCE item 161.
-                    //
-                    // This forked ONE TASK PER ROW, and did it by splitting the WHOLE `x`
-                    // workspace into `m_sub` chunks and then discarding the first `i + 1` with
-                    // `.skip()`. Both halves are wasteful and it sits inside the panel loop, so
-                    // the fork/join is paid once per COLUMN of every panel — the same
-                    // per-iteration dispatch cost item 157 traced 4zjaa's 17.6x A/B cliff to,
-                    // and the same shape item 159 removed from `apply_scaled_rank1_f64`.
-                    //
-                    // Now the row range is sliced first, so no chunk is produced only to be
-                    // skipped, and each task carries `REDUCE_CHUNK_ROWS` rows instead of one.
-                    //
-                    // BIT-EXACT: the comment above already states each output row is an
-                    // independent contiguous dot product. The row partition therefore cannot
-                    // change an association — every `s` is accumulated in the same `c` order it
-                    // was before, and only the assignment of rows to tasks moves.
-                    //
-                    // UNBUILT and UNMEASURED (build freeze, /data 28G).
-                    let xstart = (i + 1) * ldx;
-                    x[xstart..xstart + xrows * ldx]
-                        .par_chunks_mut(REDUCE_CHUNK_ROWS * ldx)
+                    x.par_chunks_mut(ldx)
                         .enumerate()
-                        .for_each(|(blk, rows)| {
-                            let row0 = i + 1 + blk * REDUCE_CHUNK_ROWS;
-                            for (k, xrow) in rows.chunks_exact_mut(ldx).enumerate() {
-                                let start = at(row0 + k, i + 1);
-                                let arow = &a_ro[start..start + vlen];
-                                let mut s = 0.0;
-                                for c in 0..vlen {
-                                    s += arow[c] * vrow[c];
-                                }
-                                xrow[i] = s;
+                        .skip(i + 1)
+                        .take(xrows)
+                        .for_each(|(r, xrow)| {
+                            let start = at(r, i + 1);
+                            let arow = &a_ro[start..start + vlen];
+                            let mut s = 0.0;
+                            for c in 0..vlen {
+                                s += arow[c] * vrow[c];
                             }
+                            xrow[i] = s;
                         });
                 } else {
                     for r in (i + 1)..m_sub {
@@ -44678,6 +44651,96 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// frankentorch-l2zki item 163: conv3d's STREAMED forward must equal its full-panel path
+    /// bit-for-bit after the output transpose was replaced with the blocked kernel.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// Calls `conv3d_forward_streamed_f64` DIRECTLY rather than `conv3d_forward_f64`, so the
+    /// 3x3x3 stride-1 direct-kernel gate cannot silently route the test past the code it is meant
+    /// to cover. `project_conv3d_direct_gate_misset` is the precedent: a fast path validated at
+    /// one shape and gated open-endedly is only known-good at that shape, and a test that lets a
+    /// dispatcher choose its own path is testing the dispatcher.
+    ///
+    /// The `oh*ow*od * out_ch` products here are far below `transpose_2d_into_f64`'s `1 << 16`
+    /// gate, so these cases exercise its SERIAL path. The shipping lane's shape sits exactly at
+    /// that gate and takes the parallel one, which this test therefore does NOT cover — noted
+    /// rather than papered over, and the reason a paired measurement on `conv3d_masked` is still
+    /// owed before the change is trusted.
+    #[test]
+    fn conv3d_forward_streamed_f64_matches_the_full_panel_path_bitwise() {
+        // (batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw, out_ch)
+        let cases = [
+            (
+                1usize, 2usize, 4usize, 5usize, 5usize, 2usize, 3usize, 3usize, 3usize, 3usize,
+                3usize, 1usize, 1usize, 1usize, 3usize,
+            ),
+            (2, 3, 5, 6, 6, 3, 3, 3, 3, 4, 4, 1, 1, 1, 5),
+            // stride 2 in every axis
+            (2, 2, 7, 7, 7, 3, 3, 3, 3, 3, 3, 2, 2, 2, 4),
+            // out_ch = 1: the transpose degenerates to a single output row
+            (1, 2, 4, 4, 4, 2, 2, 2, 3, 3, 3, 1, 1, 1, 1),
+        ];
+        for &(b, ci, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw, co) in &cases {
+            let patch_width = ci * kd * kh * kw;
+            let patch_count = od * oh * ow;
+            let flat = b * patch_count;
+            let padded: Vec<f64> = (0..b * ci * pd * ph * pw)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..co * patch_width)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            // Carries a -0.0 so the unconditional bias add is exercised, not just argued.
+            let bias_vals: Vec<f64> = (0..co)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        -0.0
+                    } else {
+                        0.25 - (i as f64) * 0.01
+                    }
+                })
+                .collect();
+
+            for bias in [None, Some(bias_vals.as_slice())] {
+                let got = super::conv3d_forward_streamed_f64(
+                    &padded, &weight, bias, b, ci, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+                    co,
+                );
+
+                let panel = super::conv3d_im2col_f64(
+                    &padded, b, ci, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+                );
+                let mut of = vec![0.0f64; flat * co];
+                super::gemm::dgemm_bt(flat, patch_width, co, &panel, &weight, &mut of);
+                let mut want = vec![0.0f64; b * co * patch_count];
+                for n in 0..b {
+                    for oc in 0..co {
+                        let bo = bias.map_or(0.0, |bb| bb[oc]);
+                        for p in 0..patch_count {
+                            want[(n * co + oc) * patch_count + p] =
+                                of[(n * patch_count + p) * co + oc] + bo;
+                        }
+                    }
+                }
+
+                let label = format!(
+                    "b={b} ci={ci} p={pd}x{ph}x{pw} k={kd}x{kh}x{kw} o={od}x{oh}x{ow} \
+                     s={sd}x{sh}x{sw} co={co} bias={}",
+                    bias.is_some()
+                );
+                assert_eq!(got.len(), want.len(), "item 163 length differs: {label}");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "item 163 mismatch at {label} idx={i}: streamed={g} full_panel={w}"
+                    );
                 }
             }
         }

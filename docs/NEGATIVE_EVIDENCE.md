@@ -32302,3 +32302,63 @@ item 157 is still the one that would move 4zjaa's published A/B.
 VERIFIED WITHOUT A COMPILER: `rustfmt --edition 2024 --check` exits 0; `tail` has length
 `(n-k-1)*n`, an exact multiple of `n`, so `chunks_exact_mut(n)` drops no remainder row; the inner
 body is unchanged apart from its binding. NOT VERIFIED: compilation, execution, timing.
+
+## 164. I WAS WRONG ABOUT RAYON — `par_chunks_mut(n)` DOES NOT FORK A TASK PER ROW, AND THREE OF MY OWN "FIXES" ARE REVERTED
+
+`frankentorch-4zjaa`. Source-reading under the freeze. **This retracts the mechanism claimed in
+items 159, 161 and 163 and reverts all four code sites they touched.**
+
+Those items each said a helper "forks ONE RAYON TASK PER ROW", and chunked rows to cut the task
+count. I never verified that claim against rayon's source. It is false.
+
+### WHAT RAYON ACTUALLY DOES, FROM ITS SOURCE
+
+`rayon-1.10.0/src/iter/plumbing/mod.rs:271`:
+
+    fn try_split(&mut self, stolen: bool) -> bool {
+        if stolen { self.splits = max(current_num_threads(), self.splits / 2); true }
+        else if splits > 0 { self.splits /= 2; true }
+        else { false }
+    }
+
+The default splitter starts at `current_num_threads()` and HALVES on each split, stopping at
+zero — it splits only enough to fill the pool, roughly `log2(#threads)` levels, and splits
+further only when a job is actually STOLEN. `par_chunks_mut(n)` therefore does not spawn a task
+per chunk; rayon coalesces adjacent chunks into O(#threads) tasks and re-splits on demand.
+
+So the thing my three items claimed to remove was never there.
+
+### AND THE "FIX" WAS PLAUSIBLY A REGRESSION
+
+`par_chunks_mut(64 * n)` reduces the number of SPLITTABLE UNITS from `nrows` to `nrows / 64`. At
+the sizes item 157 is about — `nrows` = 159 — that is THREE units, so rayon can produce at most
+three tasks and parallelism is capped at 3 on an 8-thread pool, where before it could balance
+159 chunks across all 8. **I made the granularity coarser than the thread count in exactly the
+regime the investigation was about.** Had I wanted to raise granularity, the correct tool is
+`with_min_len`, which raises the floor WITHOUT capping the ceiling.
+
+Reverted, byte-for-byte, at all four sites: `apply_scaled_rank1_f64`, `dlabrd_panel_f64` step
+(12), and both LU panel eliminations. `LU_PAR_CHUNK_ROWS` is removed.
+
+### WHAT SURVIVES, AND WHAT DOES NOT
+
+SURVIVES — item 157's core observation. Each `.for_each()` is one parallel REGION with a
+dispatch and a barrier, and the bidiag expansion enters ~320 of them at n=160 (two helpers, once
+per reflector). That count is a property of the call structure, not of the splitter, and my
+reverts do not change it. The correlation with `PARALLEL_GATE` firing exactly between n=128 and
+n=160 also stands, and `FT_LINALG_PARALLEL_GATE` (item 157) remains the way to settle it.
+
+DOES NOT SURVIVE — every per-task claim: "one task per row", "~320 fork/joins", "order n^2 task
+dispatches", "10^6 tasks of ~64 flops". Those numbers counted chunks and called them tasks.
+
+The LU observation that its gate tests ROWS while per-task work is set by COLUMNS still stands as
+written; what does not stand is my inference that this produced a task-count explosion.
+
+### THE LESSON, WHICH IS THE POINT OF THE ENTRY
+
+I verified `beta` in matrixmultiply's source before trusting it (item 152), and `sgemm`'s
+accumulating paths before trusting those (item 152 again) — then spent three commits on a claim
+about rayon I never opened rayon to check. **The dependency I did not read is the one I was
+wrong about.** Under a build freeze there is no test to catch this: it is not a compile error and
+not a wrong answer, it is a performance claim, and performance claims made without either a
+measurement or the dependency's source are guesses with citations attached.
