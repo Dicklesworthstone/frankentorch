@@ -32946,3 +32946,69 @@ scales with pool width while the extra A-panel traffic does not. Three outcomes,
   on second, and it is a result, not a failure.
 
 NOT VERIFIED: compilation, execution, and every number this file would print.
+
+## 173. THE FORWARD-SIDE PAIR ITEM 171 ASKED FOR — A WIDTH SWEEP, BECAUSE AN EDIT LEAVES NOTHING TO ALTERNATE AGAINST
+
+`frankentorch-hi9r6` (P0). **UNBUILT**: build freeze — `/data` 27G, 99% used, loadavg
+8.42/7.20/8.16 — no cargo ran, nothing measured. `rustfmt --edition 2024 --check` exits 0.
+
+### 173a. CLOSING A LOOP RATHER THAN OPENING ONE
+
+Item 165c recorded a defect against my own item 158: the per-batch blocked transpose cut the
+forward's splittable units from `batch * out_ch` (256) to `batch` (8), and item 164's mechanism
+makes that bite — `par_chunks_mut` cannot split below a chunk boundary, so a chunk count bounds
+rayon's task count from above at any pool width. A peer's item 171 repaired it, keeping item 158's
+traffic reduction and restoring the finer split, and closed by asking for **"a same-invocation
+8-vs-64-thread pair on the conv2d forward before any number from this is quoted anywhere."**
+
+Item 172 then wrote a probe that explicitly does NOT cover it — it times `conv2d_backward_f64`,
+which holds the GEMMs item 170 is about and none of the forward transpose.
+
+So the pair item 171 asked for was named twice and written by nobody. This is it.
+
+### 173b. WHY A WIDTH SWEEP AND NOT A BEFORE/AFTER
+
+Item 171 was an edit, not a toggle, so there is no second arm to alternate against inside one
+binary. The tempting substitute — time a pre-171 binary and compare — is a cross-binary
+comparison, which item 25 recorded cannot attribute a few percent to any one change, and which
+this campaign has now got wrong five times (items 123/135/139 on pool width, 145 on pooled rows,
+169 on slot profiles; all mine).
+
+A width sweep needs no second arm, because **the defect has a shape, not just a size.** A pass
+capped at `batch` tasks stops improving the moment the pool exceeds `batch`, so its curve goes
+flat after 8 threads however many cores are added; a pass split finer keeps improving. The
+prediction is about the curve's elbow, so the curve is the measurement — and `batch = 8` puts the
+elbow exactly where the sweep's points are densest.
+
+Widths 1, 2, 4, 8, 16, 32, 64, all in one process on one ELF in one window, with a `vs previous`
+column so the elbow is visible directly rather than inferred from a ratio to the baseline.
+
+### 173c. WHAT IT WOULD CATCH THAT NOBODY IS LOOKING FOR
+
+The probe checksums the output at every width by summing raw BITS — `wrapping_add(v.to_bits())`,
+not a float sum, which would hide exactly the reordering being tested for — and prints:
+
+    *** NO — the forward's output DEPENDS ON POOL WIDTH; that is a BUG and
+        every conv2d row ever taken is suspect ***
+
+Nothing in the h2h board would notice that. Its parity column compares FT against PyTorch within
+one run at one width, so an output that varied with pool width would pass parity in every run and
+still be wrong. Six changes have landed in this forward this session, unbuilt, several touching
+parallel structure — this is the cheapest place to find out that one of them broke determinism.
+
+The bias fixture carries a `-0.0` deliberately: item 158 made the bias add a separate
+UNCONDITIONAL pass because `-0.0 + 0.0` is `+0.0`, and if anyone later "optimises" that pass by
+skipping zero biases, this checksum moves.
+
+### 173d. THE CAVEAT THAT KEEPS IT HONEST
+
+It times the WHOLE forward, not the transpose alone, so a flat tail could equally mean some other
+phase became the constraint. That is stated in the file's own output rather than left for a reader
+to notice: the im2col and GEMM phases are already tiled and parallel, so they are where to look
+first if the curve flattens with the transpose repaired.
+
+And nothing here is a win. Every ratio it prints is FrankenTorch against FrankenTorch at a
+different pool width — **maintenance**, in the standing orders' sense, and no substitute for the
+live same-invocation PyTorch arm that any standing needs.
+
+NOT VERIFIED: compilation, execution, and every number this file would print.
