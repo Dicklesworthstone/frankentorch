@@ -45144,6 +45144,122 @@ mod tests {
         }
     }
 
+    /// frankentorch-hi9r6 item 175: conv2d's forward and backward must return BIT-IDENTICAL
+    /// results at every rayon pool width.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// WHY THIS IS A TEST AND NOT ONLY A PROBE. Items 172 and 173 check the same property, but a
+    /// probe only helps if somebody remembers to run it. Nothing in the automated surface watches
+    /// for width-dependence: the h2h board's parity column compares FrankenTorch against PyTorch
+    /// **within one run at one width**, so an output that varied with pool width would pass parity
+    /// in every run ever taken and still be wrong. `cargo test` is where an invariant belongs.
+    ///
+    /// It is worth the seconds it costs because this session put nine unbuilt changes into these
+    /// two functions — `build_uninit` conversions, a per-worker scratch buffer, a blocked
+    /// transpose, a reworked chunking — several of which touch parallel structure directly. Any
+    /// one of them could have introduced a split-dependent result, and every one of them was
+    /// reviewed only by reading.
+    ///
+    /// The shape is chosen to CLEAR the parallel gates rather than to be fast: `m*k*n` for the
+    /// dweight GEMM is `32 * 2048 * 288` = 18.9M, above the `2^24` flop gate, and `flat = 2048`
+    /// spans multiple `TILE = 192` streaming tiles. A smaller shape would run serial at every
+    /// width and pass vacuously — which is the failure mode of most determinism tests.
+    ///
+    /// Pools are built explicitly and `install`ed, so this does not depend on `RAYON_NUM_THREADS`
+    /// and cannot be silently neutered by the environment the suite happens to run in.
+    #[test]
+    fn conv2d_f64_results_do_not_depend_on_rayon_pool_width() {
+        const BATCH: usize = 2;
+        const IN_CH: usize = 32;
+        const OUT_CH: usize = 32;
+        const H: usize = 32;
+        const W: usize = 32;
+        const K: usize = 3;
+        const PH: usize = H + 2;
+        const PW: usize = W + 2;
+        const OH: usize = PH - K + 1;
+        const OW: usize = PW - K + 1;
+
+        let patch_width = IN_CH * K * K;
+        let patch_count = OH * OW;
+        let padded: Vec<f64> = (0..BATCH * IN_CH * PH * PW)
+            .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+            .collect();
+        let weight: Vec<f64> = (0..OUT_CH * patch_width)
+            .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+            .collect();
+        // A `-0.0` in the bias: item 158 made the bias add unconditional because `-0.0 + 0.0` is
+        // `+0.0`, so a later "skip the zero bias" optimisation would show up here.
+        let bias: Vec<f64> = (0..OUT_CH)
+            .map(|i| {
+                if i.is_multiple_of(3) {
+                    -0.0
+                } else {
+                    0.25 - (i as f64) * 0.01
+                }
+            })
+            .collect();
+        // NON-UNIFORM, so the backward takes the generic im2col route that holds both GEMMs
+        // rather than the all-ones adjoint.
+        let dout: Vec<f64> = (0..BATCH * OUT_CH * patch_count)
+            .map(|i| ((i % 197) as f64) * 0.0007 + 0.25)
+            .collect();
+
+        let mut reference: Option<(Vec<f64>, Vec<f64>, Vec<f64>)> = None;
+        for width in [1usize, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
+            let (fwd, dpadded, dweight) = pool.install(|| {
+                let fwd = super::conv2d_forward_f64(
+                    &padded,
+                    &weight,
+                    Some(&bias),
+                    BATCH,
+                    IN_CH,
+                    PH,
+                    PW,
+                    K,
+                    K,
+                    OH,
+                    OW,
+                    1,
+                    1,
+                    OUT_CH,
+                );
+                let (dpadded, dweight, _) = super::conv2d_backward_f64(
+                    &dout, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, OH, OW, 1, 1, OUT_CH,
+                    false,
+                );
+                (fwd, dpadded, dweight)
+            });
+
+            match &reference {
+                None => reference = Some((fwd, dpadded, dweight)),
+                Some((rf, rp, rw)) => {
+                    for (label, got, want) in [
+                        ("forward", &fwd, rf),
+                        ("dpadded", &dpadded, rp),
+                        ("dweight", &dweight, rw),
+                    ] {
+                        assert_eq!(got.len(), want.len(), "item 175 {label} length at {width}");
+                        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                            assert_eq!(
+                                g.to_bits(),
+                                w.to_bits(),
+                                "item 175: {label} differs at pool width {width}, index {i} \
+                                 (got {g}, 1-thread reference {w}). A result that depends on pool \
+                                 width is a BUG, and the h2h board's parity column cannot see it."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// frankentorch-hi9r6 item 170: flipping the GEMM tile grid's column floor must change the
     /// SCHEDULE and nothing else.
     ///

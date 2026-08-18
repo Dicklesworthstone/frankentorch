@@ -33113,3 +33113,57 @@ summed route, which is where the 1.7-2.1x lives.
 NOT done, and deliberately: the `height1` all-ones adjoint has the same scatter shape but `kw` is
 unbounded there, so a `2^kw` table does not generalise and it needs a different decomposition. One
 lever per route.
+
+## 175. NOTHING IN THE AUTOMATED SURFACE WOULD NOTICE IF conv2d's OUTPUT DEPENDED ON POOL WIDTH — NOW SOMETHING DOES
+
+`frankentorch-hi9r6` (P0). **UNBUILT**: build freeze — `/data` 27G, 99% used, loadavg
+6.04/5.90/7.08 — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 175a. THE GAP
+
+Items 172 and 173 wrote probes that check whether conv2d's results vary with rayon pool width.
+Probes only help if somebody remembers to run them, and this one would be remembered exactly once.
+
+The gap underneath is worth stating on its own, because it is a property of the whole board rather
+than of conv2d: **the h2h harness's parity column compares FrankenTorch against PyTorch within one
+run at one pool width.** An output that varied with pool width would agree with PyTorch in every
+run ever taken — parity `match`, every time — and still be wrong. The A/A nulls would not see it
+either; they compare our arm against itself at the same width.
+
+So the automated surface has no way to detect a split-dependent result, and this session put NINE
+unbuilt changes into `conv2d_forward_f64` and `conv2d_backward_f64` — `build_uninit` conversions,
+a per-worker scratch buffer, a blocked transpose, reworked chunking — several touching parallel
+structure directly, all reviewed only by reading.
+
+### 175b. WHAT THE TEST DOES, AND THE MISTAKE IT AVOIDS
+
+It runs both functions inside explicitly built rayon pools of width 1, 3 and 8 and compares every
+element by `to_bits()` against the single-thread reference.
+
+Two deliberate choices, both about not passing vacuously:
+
+* **The shape clears the parallel gates.** `m*k*n` for the dweight GEMM is `32 * 2048 * 288` =
+  18.9M, above the `2^24` flop gate, and `flat = 2048` spans multiple `TILE = 192` streaming
+  tiles. A small shape would run serial at every width and the test would prove nothing — which is
+  the normal failure mode of determinism tests, and the reason this one costs seconds rather than
+  milliseconds.
+* **The pools are explicit, not environmental.** Reading `RAYON_NUM_THREADS` would let whatever
+  environment the suite happens to run in silently neuter the test.
+
+Width 3 is in the list on purpose: it is not a divisor of anything the tiling arithmetic likes, so
+it produces ragged blocks where 1 and 8 produce clean ones.
+
+The bias fixture carries a `-0.0`, so if anyone later "optimises" item 158's unconditional bias
+pass by skipping zero biases, this test fails rather than the property being quietly lost.
+
+### 175c. WHAT IT IS NOT
+
+It is not a performance test and not a win — it asserts an invariant that should already hold. If
+it passes, it confirms nothing new about speed; if it fails, one of this session's nine unbuilt
+changes broke determinism and every conv2d number taken since would need re-examining.
+
+It also does not cover the f32 mirrors or conv3d, which received the same treatment in items 160
+and 165. Extending it is cheap and is left as owed rather than done blind, since each addition
+multiplies a test that is already deliberately expensive.
+
+NOT VERIFIED: compilation, and this test has never run.
