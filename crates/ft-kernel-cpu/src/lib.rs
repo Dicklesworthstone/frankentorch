@@ -41294,6 +41294,7 @@ const TRANSPOSE_BLK_F64: usize = 4;
 /// The AVX2 probe moves from once-per-matrix to once-per-chunk. `is_x86_feature_detected!` caches
 /// its answer in a static after the first call, so this is a relaxed atomic load against a chunk
 /// that writes `4 * rows` elements — 32 KiB at conv2d's scored shape.
+#[allow(unsafe_code)]
 fn transpose_cols_into_f64(src: &[f64], chunk: &mut [f64], rows: usize, cols: usize, jb: usize) {
     #[cfg(target_arch = "x86_64")]
     let simd = std::arch::is_x86_feature_detected!("avx2");
@@ -41403,6 +41404,7 @@ pub fn transpose_2d_into_f32(src: &[f32], dst: &mut [f32], rows: usize, cols: us
 const TRANSPOSE_BLK_F32: usize = 8;
 
 /// f32 mirror of [`transpose_cols_into_f64`]: OUTPUT rows `jb ..` of `src`'s transpose.
+#[allow(unsafe_code)]
 fn transpose_cols_into_f32(src: &[f32], chunk: &mut [f32], rows: usize, cols: usize, jb: usize) {
     #[cfg(target_arch = "x86_64")]
     let simd = std::arch::is_x86_feature_detected!("avx2");
