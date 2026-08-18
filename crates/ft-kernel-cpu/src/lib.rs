@@ -8236,13 +8236,48 @@ pub fn conv2d_forward_f64(
     // full-panel path. frankentorch-conv2d-stream.
     const TILE: usize = 192;
     let mut out_flat = vec![0.0f64; flat * out_ch];
+    // ONE SCRATCH PANEL PER WORKER, NOT ONE PER TILE — `frankentorch-hi9r6`, item 154.
+    //
+    // UNBUILT — written under a build freeze; not compiled, not measured. The figures below are
+    // this change's PREDICTION, not a result.
+    //
+    // The streaming loop above allocated AND zeroed `ptile` on every iteration: 442 KB at the
+    // scored shape, once per tile, 43 tiles at the small batch and 86 at the big one — roughly
+    // 19-38 MB of allocation and dead zero-stores per forward call, inside the hot parallel
+    // region. Every one of those bytes is then overwritten by the im2col fill before the GEMM
+    // reads it, so the zeroing was never observable.
+    //
+    // `for_each_init` hands each rayon worker one buffer sized for the largest tile and reuses it,
+    // so the allocation count falls from per-tile to roughly per-thread and the zero pass
+    // disappears entirely.
+    //
+    // WHY THIS NEEDS NO `unsafe` AND NO `build_uninit`. Items 151-153 removed dead zeroing by
+    // handing kernels an UNINITIALIZED buffer, which is sound only under `build_uninit`'s
+    // write-every-element contract. Here the buffer is always fully initialized — it holds the
+    // PREVIOUS tile's values — so reuse is ordinary safe Rust and the only question is
+    // correctness, not soundness.
+    //
+    // COVERAGE, WHICH IS WHAT MAKES IT CORRECT: for each row the fill writes, for every `c` and
+    // every `kr`, the `kw`-run at `c*kh*kw + kr*kw`. Over `kr` that covers `[c*kh*kw,
+    // (c+1)*kh*kw)`; over `c` it covers `[0, in_ch*kh*kw) == [0, patch_width)` exactly — no gaps
+    // and no overlaps. Every element of every row is written before `dgemm_bt` reads it, so a
+    // stale value from the previous tile cannot survive into the GEMM.
+    //
+    // That is the same coverage argument the zeroed version needed anyway: if the fill had a gap,
+    // the old code would have silently multiplied by 0.0 there instead of by the input, and the
+    // panel path it must match bit-for-bit would already have disagreed.
+    //
+    // BIT-EXACT: the GEMM sees identical bytes and the same `rows`/`patch_width` shape, so the
+    // matrixmultiply micro-kernel K-order is untouched. Nothing is reordered or recomputed.
     out_flat
         .par_chunks_mut(TILE * out_ch)
         .enumerate()
-        .for_each(|(ti, oflat_tile)| {
+        .for_each_init(
+            || vec![0.0f64; TILE * patch_width],
+            |scratch, (ti, oflat_tile)| {
             let m0 = ti * TILE;
             let rows = oflat_tile.len() / out_ch;
-            let mut ptile = vec![0.0f64; rows * patch_width];
+            let ptile = &mut scratch[..rows * patch_width];
             for r in 0..rows {
                 let row = m0 + r;
                 let b = row / patch_count;
@@ -8261,8 +8296,9 @@ pub fn conv2d_forward_f64(
                     }
                 }
             }
-            gemm::dgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
-        });
+            gemm::dgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
+            },
+        );
     let mut out = vec![0.0f64; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
@@ -62517,6 +62553,80 @@ mod tests {
     /// reference: `Q * B * P^T == A`. This is what proves the two GEMM trailing
     /// updates discharged exactly the work the panel deferred — a wrong sign or
     /// a transposed operand still produces plausible `d`/`e` but fails here.
+    /// ACCEPTANCE TEST FOR THE `form_p` BLOCKING REWRITE — `frankentorch-4zjaa`.
+    ///
+    /// The bead names two holes and this closes the first: every existing bidiag test feeds
+    /// `bidiag_test_matrix`, which is full rank at unit scale, so
+    /// `bidiag_blocked_matches_unblocked_oracle` has never seen a rank-deficient or scaled
+    /// input. A blocked rewrite can therefore match the unblocked path on every case the suite
+    /// runs and still diverge on the configuration `ga99y` actually broke on.
+    ///
+    /// `#[ignore]` DELIBERATELY, AND THIS IS THE POINT OF THE TEST. The bead requires a test
+    /// that FAILS on today's code — "a new test that passes before the fix is not testing the
+    /// fix" — and rank 2 / scale 1e-20 is measured at 1.228e-2 leaving the prologue. Landing a
+    /// red test un-ignored would break the shared gate for every agent, so it is parked here
+    /// with its expected verdict written down instead.
+    ///
+    /// PROCEDURE when a toolchain exists:
+    ///   1. run it on TODAY's code and confirm it FAILS (if it passes, this test is worthless
+    ///      and the hole is elsewhere — say so rather than deleting it);
+    ///   2. land the blocked `form_p`;
+    ///   3. re-run, confirm it passes, and REMOVE the `#[ignore]`.
+    ///
+    /// UNVERIFIED: written under a build freeze (/data 29G, 99%), never compiled or run.
+    #[test]
+    #[ignore = "4zjaa acceptance: expected to FAIL on today's code — see doc comment"]
+    fn bidiag_blocked_matches_unblocked_on_rank_deficient_and_scaled_input() {
+        // rank and scale chosen from the bead: rank 2 / scale 1e-20 is the configuration
+        // ga99y measured at 1.228e-2. The unit-scale rank-deficient case is kept beside it so a
+        // failure can be attributed to RANK or to SCALE rather than to their combination.
+        for &(m, n, nb, rank, scale) in &[
+            (9usize, 6usize, 2usize, 2usize, 1.0f64),
+            (9, 6, 2, 2, 1e-20),
+            (12, 8, 3, 3, 1e-20),
+        ] {
+            let original =
+                bidiag_test_matrix_rank_scaled(m, n, 0x4AAA_u64 ^ (nb as u64), rank, scale);
+            let mut a_ref = original.clone();
+            let mut a_blk = original.clone();
+            let (d_ref, e_ref, _, taup_ref) = super::bidiag::bidiag_unblocked_f64(&mut a_ref, m, n);
+            let (d_blk, e_blk, _, taup_blk) =
+                super::bidiag::bidiag_blocked_f64(&mut a_blk, m, n, nb);
+
+            // The bidiagonal itself, as the existing oracle checks it.
+            for i in 0..n {
+                assert!(
+                    (d_ref[i] - d_blk[i]).abs() <= 1e-9 * d_ref[i].abs().max(1.0),
+                    "d[{i}] diverged at m={m} n={n} nb={nb} rank={rank} scale={scale:e}:                      {} vs {}",
+                    d_ref[i],
+                    d_blk[i]
+                );
+            }
+            for i in 0..n.saturating_sub(1) {
+                assert!(
+                    (e_ref[i] - e_blk[i]).abs() <= 1e-9 * e_ref[i].abs().max(1.0),
+                    "e[{i}] diverged at m={m} n={n} nb={nb} rank={rank} scale={scale:e}"
+                );
+            }
+
+            // AND P ITSELF, which the existing oracle discards as `_`. This is the half that
+            // matters for 4zjaa: the rewrite changes how P is formed, so an oracle that throws
+            // taup away cannot see the rewrite at all.
+            let p_ref = super::bidiag::bidiag_form_p_f64(&a_ref, n, &taup_ref);
+            let p_blk = super::bidiag::bidiag_form_p_f64(&a_blk, n, &taup_blk);
+            let err_ref = bidiag_p_orthonormality_error(&p_ref, n);
+            let err_blk = bidiag_p_orthonormality_error(&p_blk, n);
+            assert!(
+                err_ref < 1e-9,
+                "UNBLOCKED P is not orthonormal at m={m} n={n} rank={rank} scale={scale:e}:                  {err_ref:e} — this is ga99y's defect, and it is the reason this test exists"
+            );
+            assert!(
+                err_blk < 1e-9,
+                "BLOCKED P is not orthonormal at m={m} n={n} nb={nb} rank={rank}                  scale={scale:e}: {err_blk:e}"
+            );
+        }
+    }
+
     #[test]
     fn bidiag_blocked_reconstructs_original_matrix() {
         for &(m, n, nb) in &[

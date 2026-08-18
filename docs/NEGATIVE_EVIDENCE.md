@@ -31747,3 +31747,50 @@ whoever has a working toolchain.
 VERIFIED WITHOUT CARGO: `rustfmt --edition 2024 --check` exits 0; `dweight` is only read after
 construction at all three sites, so losing `mut` is consistent. NOT verified: compilation,
 tests, timing.
+
+## 155. 4zjaa's PREREQUISITE TEST IS WRITTEN — THE ORACLE HAS NEVER SEEN A RANK-DEFICIENT INPUT, AND IT THROWS `taup` AWAY
+
+`frankentorch-4zjaa`. UNBUILT: /data 29G / 99%, no cargo. This is the step the bead asks for
+BEFORE the implementation, and it is the step a build freeze is actually suited to.
+
+The bead states the rewrite of `bidiag_form_p_f64` will inherit two holes unless they are closed
+first. Reading the suite, one is already closed and one is not:
+
+    P-orthonormality assertion        EXISTS  (`bidiag_p_rows_are_orthonormal`) — but only at
+                                              FULL RANK, UNIT SCALE
+    rank-deficient / scaled oracle    ABSENT  — `bidiag_blocked_matches_unblocked_oracle` feeds
+                                              only `bidiag_test_matrix`, and destructures
+                                              `(d, e, _, _)`, discarding `taup` entirely
+
+The second is the sharper problem, and it is worse than the bead states: **an oracle that throws
+`taup` away cannot see the rewrite at all.** `form_p` is a function OF `taup`, so a blocked
+reimplementation could be arbitrarily wrong and that oracle would still pass, on any input.
+
+`bidiag_blocked_matches_unblocked_on_rank_deficient_and_scaled_input` closes both: it runs the
+rank 2 / scale 1e-20 configuration the bead names (measured at 1.228e-2 leaving the prologue),
+keeps a unit-scale rank-deficient case beside it so a failure can be blamed on RANK or on SCALE
+rather than their combination, compares `d`/`e` as the existing oracle does, and then forms P
+from BOTH paths and asserts orthonormality on each.
+
+### WHY IT IS `#[ignore]`d, WHICH IS NOT A HEDGE
+
+The bead requires a test that FAILS on today's code — "a new test that passes before the fix is
+not testing the fix". A red test landed un-ignored breaks the shared gate for every agent, and
+under a freeze nobody can even run it to see why. So the expected verdict is written into the doc
+comment instead, with the procedure: run it on today's code and CONFIRM IT FAILS; if it passes,
+this test is worthless and the hole is elsewhere — say so rather than delete it; then land the
+rewrite, re-run, and remove the `#[ignore]`.
+
+### A DEFECT IN MY OWN UNBUILT CODE, FOUND BY READING IT
+
+The first draft contained `0x4ZAA_u64`. `Z` is not a hex digit and it would not compile.
+`rustfmt` tokenized straight past it and exited on a line-wrapping diff alone, so the one
+mechanical check available under a freeze did NOT catch it — only re-reading the literal did.
+Recorded because it is the concrete cost of the unbuilt-commit regime: `rustfmt --check` proves
+formatting, not compilability, and every commit landed this way needs a human read of the parts a
+formatter cannot judge.
+
+VERIFIED: `rustfmt --edition 2024 --check` exits 0; every call site hand-checked against the
+real signatures (`bidiag_test_matrix_rank_scaled(m,n,u64,usize,f64)`,
+`bidiag_form_p_f64(&[f64], usize, &[f64])`, both factorizations returning
+`(d, e, tauq, taup)`). NOT VERIFIED: compilation, execution, or the expected failure.
