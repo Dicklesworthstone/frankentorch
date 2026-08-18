@@ -8235,71 +8235,96 @@ pub fn conv2d_forward_f64(
     // (independent of the M tiling), so the result is BIT-FOR-BIT identical to the
     // full-panel path. frankentorch-conv2d-stream.
     const TILE: usize = 192;
-    let mut out_flat = vec![0.0f64; flat * out_ch];
-    // ONE SCRATCH PANEL PER WORKER, NOT ONE PER TILE — `frankentorch-hi9r6`, item 154.
+    // `out_flat` IS UNINITIALIZED TOO — `frankentorch-hi9r6`, item 162.
     //
-    // UNBUILT — written under a build freeze; not compiled, not measured. The figures below are
-    // this change's PREDICTION, not a result.
+    // UNBUILT. Item 156 named this buffer as owed and item 160 explicitly DECLINED it, because
+    // handing a GEMM an uninitialized destination is sound only if every path of that GEMM writes
+    // C without reading it, and I had checked only one of `dgemm_bt`'s branches. Item 152's `beta`
+    // audit had already found two ACCUMULATING paths elsewhere in this family, so the assumption
+    // was known to be unsafe in general.
     //
-    // The streaming loop above allocated AND zeroed `ptile` on every iteration: 442 KB at the
-    // scored shape, once per tile, 43 tiles at the small batch and 86 at the big one — roughly
-    // 19-38 MB of allocation and dead zero-stores per forward call, inside the hot parallel
-    // region. Every one of those bytes is then overwritten by the im2col fill before the GEMM
-    // reads it, so the zeroing was never observable.
+    // The audit is now done, and all four branches of `dgemm_bt` (and all four of `sgemm_bt`)
+    // pass `beta = 0.0` and cover the whole output:
     //
-    // `for_each_init` hands each rayon worker one buffer sized for the largest tile and reuses it,
-    // so the allocation count falls from per-tile to roughly per-thread and the zero pass
-    // disappears entirely.
+    //   col-parallel     `dgemm_mm(.., 1.0, .., 0.0, ..)`; blocks tile `[0,n)` by `div_ceil`
+    //   2-D parallel     same call; `tile_blocks` walks `i0 < m` x `j0 < n`, so the grid is covered
+    //   row-split        `c.par_chunks_mut(br*n).zip(a.par_chunks(br*k))` — both sides yield
+    //                    `ceil(m/br)` chunks, so the `zip` truncates nothing — each to `*_bt_block`
+    //   blocked          `dgemm_bt_block` -> `dgemm_mm(.., 1.0, .., 0.0, ..)`
     //
-    // WHY THIS NEEDS NO `unsafe` AND NO `build_uninit`. Items 151-153 removed dead zeroing by
-    // handing kernels an UNINITIALIZED buffer, which is sound only under `build_uninit`'s
-    // write-every-element contract. Here the buffer is always fully initialized — it holds the
-    // PREVIOUS tile's values — so reuse is ordinary safe Rust and the only question is
-    // correctness, not soundness.
+    // With item 151's reading of matrixmultiply (`beta.is_zero()` stores rather than reads, and
+    // the degenerate `k == 0` case routes to `c_to_beta_c`, which also stores), every element of
+    // every tile is written before anything reads it.
     //
-    // COVERAGE, WHICH IS WHAT MAKES IT CORRECT: for each row the fill writes, for every `c` and
-    // every `kr`, the `kw`-run at `c*kh*kw + kr*kw`. Over `kr` that covers `[c*kh*kw,
-    // (c+1)*kh*kw)`; over `c` it covers `[0, in_ch*kh*kw) == [0, patch_width)` exactly — no gaps
-    // and no overlaps. Every element of every row is written before `dgemm_bt` reads it, so a
-    // stale value from the previous tile cannot survive into the GEMM.
-    //
-    // That is the same coverage argument the zeroed version needed anyway: if the fill had a gap,
-    // the old code would have silently multiplied by 0.0 there instead of by the input, and the
-    // panel path it must match bit-for-bit would already have disagreed.
-    //
-    // BIT-EXACT: the GEMM sees identical bytes and the same `rows`/`patch_width` shape, so the
-    // matrixmultiply micro-kernel K-order is untouched. Nothing is reordered or recomputed.
-    out_flat
-        .par_chunks_mut(TILE * out_ch)
-        .enumerate()
-        .for_each_init(
-            || vec![0.0f64; TILE * patch_width],
-            |scratch, (ti, oflat_tile)| {
-                let m0 = ti * TILE;
-                let rows = oflat_tile.len() / out_ch;
-                let ptile = &mut scratch[..rows * patch_width];
-                for r in 0..rows {
-                    let row = m0 + r;
-                    let b = row / patch_count;
-                    let pc = row % patch_count;
-                    let base_h = (pc / ow) * sh;
-                    let base_w = (pc % ow) * sw;
-                    let batch_off = b * in_ch * ph * pw;
-                    let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                    for c in 0..in_ch {
-                        let ch_off = batch_off + c * ph * pw;
-                        let pch = c * kh * kw;
-                        for kr in 0..kh {
-                            let irow = ch_off + (base_h + kr) * pw + base_w;
-                            let prow_off = pch + kr * kw;
-                            prow[prow_off..(kw + prow_off)]
-                                .copy_from_slice(&padded[irow..(kw + irow)]);
+    // At the scored shapes this call takes the `blocked` branch — `n = out_ch = 32` fails
+    // `should_parallelize_cols`'s `n > 4m`, and `rows*patch_width*out_ch` = 1.77M is under the
+    // `2^24` flop gate — but the other three are verified because the shape is not fixed.
+    let out_flat = build_uninit(flat * out_ch, |out_flat: &mut [f64]| {
+        // ONE SCRATCH PANEL PER WORKER, NOT ONE PER TILE — `frankentorch-hi9r6`, item 156.
+        //
+        // UNBUILT — written under a build freeze; not compiled, not measured. The figures below are
+        // this change's PREDICTION, not a result.
+        //
+        // The streaming loop above allocated AND zeroed `ptile` on every iteration: 442 KB at the
+        // scored shape, once per tile, 43 tiles at the small batch and 86 at the big one — roughly
+        // 19-38 MB of allocation and dead zero-stores per forward call, inside the hot parallel
+        // region. Every one of those bytes is then overwritten by the im2col fill before the GEMM
+        // reads it, so the zeroing was never observable.
+        //
+        // `for_each_init` hands each rayon worker one buffer sized for the largest tile and reuses it,
+        // so the allocation count falls from per-tile to roughly per-thread and the zero pass
+        // disappears entirely.
+        //
+        // WHY THIS NEEDS NO `unsafe` AND NO `build_uninit`. Items 151-153 removed dead zeroing by
+        // handing kernels an UNINITIALIZED buffer, which is sound only under `build_uninit`'s
+        // write-every-element contract. Here the buffer is always fully initialized — it holds the
+        // PREVIOUS tile's values — so reuse is ordinary safe Rust and the only question is
+        // correctness, not soundness.
+        //
+        // COVERAGE, WHICH IS WHAT MAKES IT CORRECT: for each row the fill writes, for every `c` and
+        // every `kr`, the `kw`-run at `c*kh*kw + kr*kw`. Over `kr` that covers `[c*kh*kw,
+        // (c+1)*kh*kw)`; over `c` it covers `[0, in_ch*kh*kw) == [0, patch_width)` exactly — no gaps
+        // and no overlaps. Every element of every row is written before `dgemm_bt` reads it, so a
+        // stale value from the previous tile cannot survive into the GEMM.
+        //
+        // That is the same coverage argument the zeroed version needed anyway: if the fill had a gap,
+        // the old code would have silently multiplied by 0.0 there instead of by the input, and the
+        // panel path it must match bit-for-bit would already have disagreed.
+        //
+        // BIT-EXACT: the GEMM sees identical bytes and the same `rows`/`patch_width` shape, so the
+        // matrixmultiply micro-kernel K-order is untouched. Nothing is reordered or recomputed.
+        out_flat
+            .par_chunks_mut(TILE * out_ch)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0f64; TILE * patch_width],
+                |scratch, (ti, oflat_tile)| {
+                    let m0 = ti * TILE;
+                    let rows = oflat_tile.len() / out_ch;
+                    let ptile = &mut scratch[..rows * patch_width];
+                    for r in 0..rows {
+                        let row = m0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_h = (pc / ow) * sh;
+                        let base_w = (pc % ow) * sw;
+                        let batch_off = b * in_ch * ph * pw;
+                        let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                        for c in 0..in_ch {
+                            let ch_off = batch_off + c * ph * pw;
+                            let pch = c * kh * kw;
+                            for kr in 0..kh {
+                                let irow = ch_off + (base_h + kr) * pw + base_w;
+                                let prow_off = pch + kr * kw;
+                                prow[prow_off..(kw + prow_off)]
+                                    .copy_from_slice(&padded[irow..(kw + irow)]);
+                            }
                         }
                     }
-                }
-                gemm::dgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
-            },
-        );
+                    gemm::dgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
+                },
+            );
+    });
     // THE OUTPUT TRANSPOSE READS `out_flat` ONCE, NOT ONCE PER CHANNEL — item 158.
     //
     // UNBUILT — written under a build freeze; not compiled, not measured.
@@ -8470,41 +8495,42 @@ pub fn conv2d_forward_f32(
     // Avoids writing the whole replicated panel to DRAM (~65% of the conv cost).
     // frankentorch-conv2d-stream.
     const TILE: usize = 192;
-    let mut out_flat = vec![0.0f32; flat * out_ch];
-    // f32 mirror of item 156: one scratch panel per WORKER, not one per tile. Same reasoning,
-    // same coverage proof, half the bytes (221 KB per tile here), and the same 43-86 tiles per
-    // call at the scored shapes. UNBUILT — item 160.
-    out_flat
-        .par_chunks_mut(TILE * out_ch)
-        .enumerate()
-        .for_each_init(
-            || vec![0.0f32; TILE * patch_width],
-            |scratch, (ti, oflat_tile)| {
-                let m0 = ti * TILE;
-                let rows = oflat_tile.len() / out_ch;
-                let ptile = &mut scratch[..rows * patch_width];
-                for r in 0..rows {
-                    let row = m0 + r;
-                    let b = row / patch_count;
-                    let pc = row % patch_count;
-                    let base_h = (pc / ow) * sh;
-                    let base_w = (pc % ow) * sw;
-                    let batch_off = b * in_ch * ph * pw;
-                    let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
-                    for c in 0..in_ch {
-                        let ch_off = batch_off + c * ph * pw;
-                        let pch = c * kh * kw;
-                        for kr in 0..kh {
-                            let irow = ch_off + (base_h + kr) * pw + base_w;
-                            let prow_off = pch + kr * kw;
-                            prow[prow_off..(kw + prow_off)]
-                                .copy_from_slice(&padded[irow..(kw + irow)]);
+    // f32 mirror of item 156 (one scratch panel per WORKER, not one per tile — same coverage
+    // proof, 221 KB per tile here) and of item 162's `out_flat` conversion. UNBUILT — items 160
+    // and 161.
+    let out_flat = build_uninit(flat * out_ch, |out_flat: &mut [f32]| {
+        out_flat
+            .par_chunks_mut(TILE * out_ch)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0f32; TILE * patch_width],
+                |scratch, (ti, oflat_tile)| {
+                    let m0 = ti * TILE;
+                    let rows = oflat_tile.len() / out_ch;
+                    let ptile = &mut scratch[..rows * patch_width];
+                    for r in 0..rows {
+                        let row = m0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_h = (pc / ow) * sh;
+                        let base_w = (pc % ow) * sw;
+                        let batch_off = b * in_ch * ph * pw;
+                        let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                        for c in 0..in_ch {
+                            let ch_off = batch_off + c * ph * pw;
+                            let pch = c * kh * kw;
+                            for kr in 0..kh {
+                                let irow = ch_off + (base_h + kr) * pw + base_w;
+                                let prow_off = pch + kr * kw;
+                                prow[prow_off..(kw + prow_off)]
+                                    .copy_from_slice(&padded[irow..(kw + irow)]);
+                            }
                         }
                     }
-                }
-                gemm::sgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
-            },
-        );
+                    gemm::sgemm_bt(rows, patch_width, out_ch, ptile, weight_flat, oflat_tile);
+                },
+            );
+    });
     // f32 mirror of item 158: the blocked transpose replaces the per-channel strided gather.
     // Identical argument — a single transpose of [flat, out_ch] would give out_ch outermost, so
     // it is taken one batch at a time, and the bias add stays UNCONDITIONAL because

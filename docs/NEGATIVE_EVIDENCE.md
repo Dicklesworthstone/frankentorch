@@ -32177,3 +32177,77 @@ VERIFIED WITHOUT A COMPILER: `rustfmt --edition 2024 --check` exits 0. Index mat
 is in bounds; chunk lengths stay multiples of `ldx`, so `chunks_exact_mut` drops no remainder
 row; and `a_ro` and `x` were already proven disjoint by the code that compiled before this
 change. NOT VERIFIED: compilation, execution, timing.
+
+## 162. THE `beta` AUDIT ITEM 160 DECLINED TO RUSH — ALL EIGHT `*_bt` PATHS VERIFIED, AND `out_flat` CONVERTED IN BOTH FORWARDS
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze — `/data` 28G, 99% used,
+loadavg 6.71/8.21/8.78 — no cargo ran. `rustfmt --edition 2024 --check` exits 0: parses,
+format-clean, not a compile and not a test.
+
+### 162a. THE POINT OF THIS ITEM IS THE AUDIT, NOT THE LEVER
+
+Item 156 named `out_flat`'s dead `vec![0.0; ..]` fill as owed. Item 160 explicitly DECLINED it,
+and said why: handing a GEMM an uninitialized destination is sound only if EVERY path of that GEMM
+writes C without reading it, I had checked one of `dgemm_bt`'s branches, and item 152's own `beta`
+audit had already **found two accumulating paths** elsewhere in this family. Shipping on the
+unchecked branches would have been a soundness argument I rushed.
+
+Under a freeze the audit is exactly the work that can be done. It is now complete:
+
+    dgemm_bt / sgemm_bt, all four branches each
+      col-parallel   dgemm_mm(.., alpha 1.0, .., beta 0.0, ..)   blocks tile [0,n) by div_ceil
+      2-D parallel   same call                                    tile_blocks walks i0<m x j0<n
+      row-split      c.par_chunks_mut(br*n).zip(a.par_chunks(br*k)) -> *_bt_block (beta 0.0)
+      blocked        *_bt_block -> *_mm(.., 1.0, .., 0.0, ..)
+
+Two things needed checking beyond the literal `0.0`, because "writes C" needs coverage as well as
+non-reading:
+
+* **`tile_blocks` covers the grid.** It walks `while i0 < m { while j0 < n { .. } }`, so every
+  output tile is emitted; a tiling that skipped the ragged edge would leave elements unwritten.
+* **The row-split `zip` truncates nothing.** `c` is `m*n` chunked by `br*n` and `a` is `m*k`
+  chunked by `br*k`, so both yield exactly `ceil(m/br)` chunks. A `zip` is silent when the sides
+  differ in length, and an unequal split would have dropped the tail of `c` — written by nobody,
+  read by the transpose.
+
+With item 151's reading of matrixmultiply (`beta.is_zero()` STORES rather than reads, and the
+degenerate `k == 0` path routes to `c_to_beta_c`, which also stores), every element is written
+before anything reads it. `out_flat` is now `build_uninit` in both `conv2d_forward_f64` and
+`conv2d_forward_f32`.
+
+**Which branch actually runs at the scored shape:** the blocked one. `n = out_ch = 32` fails
+`should_parallelize_cols`'s `n > 4m`, and `rows*patch_width*out_ch` = 1.77M is under the `2^24`
+flop gate. The other three were audited anyway because the kernel is public and the shape is not
+fixed — a caller with a wide `out_ch` takes a different path, and a soundness argument that only
+holds at one shape is `project_conv3d_direct_gate_misset` all over again.
+
+### 162b. A STALE CROSS-REFERENCE, FIXED
+
+The scratch-panel comment in the f64 forward cited "item 154". I wrote that number when 154 looked
+next, then peers took 154 and 155 while I was writing and my entry landed as 156 — but the code
+comment was never renumbered, because that was the turn a peer's `git add -A` swept the change in
+before I could. Item 154 is now somebody else's dweight work, so the comment pointed at an
+unrelated item. Corrected to 156.
+
+Small, but it is the second-order cost of the sweep recorded in item 156e, and it is the kind of
+thing that makes a ledger unnavigable a month later.
+
+### 162c. EFFECT, HONESTLY
+
+`out_flat` is 2 MB (f64) and 1 MB (f32) at the scored shape — the smallest of the three buffers
+this session has converted, and item 156 already called it bookkeeping rather than a lever. The
+expected effect is a fraction of a millisecond against a 2.685 ms forward.
+
+**The audit is worth more than the lever**, and it is reusable: any future caller of `dgemm_bt` or
+`sgemm_bt` that wants an uninitialized destination can now cite this item rather than re-reading
+eight branches, and the two coverage traps (a tiling that misses the ragged edge, a `zip` that
+silently truncates) are the ones to check first in the next such conversion.
+
+### 162d. WHAT REMAINS UNVERIFIED
+
+Unchanged and now larger: `cargo build`, `cargo clippy`, `cargo test -p frankentorch-kernel-cpu
+--lib` including the four tests written this session that have never run, then paired before/after
+on `conv2d` and `conv2d_masked` in one invocation. Six of my changes and six peers' now sit on
+main compiled by nobody, several touching adjacent lines of the same two functions. `rustfmt` is
+the only gate any of it has passed; `ubs` has reported this file too large to scan on every
+commit. **Compiling this stack should come before any new lever when the volume frees.**
