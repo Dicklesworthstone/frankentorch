@@ -13768,7 +13768,7 @@ fn conv3d_forward_streamed_f64(
                 gemm::dgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
             });
     });
-    // THE SAME PER-CHANNEL RE-STREAM ITEM 158 FIXED IN conv2d — `frankentorch-l2zki`, item 163.
+    // THE SAME PER-CHANNEL RE-STREAM ITEM 158 FIXED IN conv2d — `frankentorch-l2zki`, item 165.
     //
     // UNBUILT — written under a build freeze; not compiled, not measured.
     //
@@ -44656,7 +44656,7 @@ mod tests {
         }
     }
 
-    /// frankentorch-l2zki item 163: conv3d's STREAMED forward must equal its full-panel path
+    /// frankentorch-l2zki item 165: conv3d's STREAMED forward must equal its full-panel path
     /// bit-for-bit after the output transpose was replaced with the blocked kernel.
     ///
     /// UNBUILT — written under a build freeze, never executed.
@@ -44734,12 +44734,12 @@ mod tests {
                      s={sd}x{sh}x{sw} co={co} bias={}",
                     bias.is_some()
                 );
-                assert_eq!(got.len(), want.len(), "item 163 length differs: {label}");
+                assert_eq!(got.len(), want.len(), "item 165 length differs: {label}");
                 for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
                     assert_eq!(
                         g.to_bits(),
                         w.to_bits(),
-                        "item 163 mismatch at {label} idx={i}: streamed={g} full_panel={w}"
+                        "item 165 mismatch at {label} idx={i}: streamed={g} full_panel={w}"
                     );
                 }
             }

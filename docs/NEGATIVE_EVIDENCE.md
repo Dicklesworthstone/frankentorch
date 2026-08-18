@@ -32362,3 +32362,102 @@ about rayon I never opened rayon to check. **The dependency I did not read is th
 wrong about.** Under a build freeze there is no test to catch this: it is not a compile error and
 not a wrong answer, it is a performance claim, and performance claims made without either a
 measurement or the dependency's source are guesses with citations attached.
+
+## 165. conv3d's FORWARD HAS THE SAME PER-CHANNEL RE-STREAM ITEM 158 FIXED — ON A CERTIFIED LANE — AND ITEM 164 EXPOSES A GRANULARITY RISK IN MY OWN 158/160
+
+`frankentorch-l2zki`, applying a `frankentorch-hi9r6` lever. **UNBUILT AND UNMEASURED.** Build
+freeze — `/data` 28G, 99% used, loadavg 6.87/10.89/10.93 — no cargo ran. `rustfmt --edition 2024
+--check` exits 0.
+
+### 165a. THE CHANGE
+
+`conv3d_forward_streamed_f64` had already taken the uninit-allocation lever — all three buffers
+are `build_uninit`, and its own comment prices the removed memset at ~28 MB per forward. What it
+kept was the OTHER half of conv2d's problem: the output transpose gathered with a stride of
+`out_ch` f64 = 256 bytes, so every read took its own cache line and each of the 32 output channels
+re-streamed the whole `out_flat` — a 1 MB buffer read ~32 times to produce 1 MB.
+
+Replaced with the same per-batch `transpose_2d_into_f64` decomposition item 158 used, for the same
+reason (a single transpose puts `out_ch` outermost; NCDHW needs batch outermost), with the same
+unconditional bias add (`-0.0 + 0.0` is `+0.0`, so skipping a zero bias is not bit-exact).
+
+**Unlike every other forward change this session, this one sits under a CERTIFIED standing.**
+`conv3d_masked` is measured against PyTorch on the h2h board, so it has an incumbent arm to be
+priced against rather than only an arm-internal number. The conv2d forward changes (156, 158) and
+the f32 ones (160) have no such arm.
+
+### 165b. ITEM 164 CHECKED AGAINST MY OWN REASONING — IT HOLDS HERE
+
+A peer's item 164 retracted three of their items after reading rayon's source: `par_chunks_mut(n)`
+does NOT fork a task per chunk, because the default splitter starts at `current_num_threads()` and
+halves, splitting further only when a job is stolen. Chunk count therefore bounds task count from
+ABOVE, not below.
+
+I wrote the nested-parallelism justification here before that item landed, so it needed checking
+rather than assuming. **It survives, and for exactly item 164's reason:** this lane's `batch` is 2,
+so `par_chunks_mut(out_ch * patch_count)` yields two chunks and rayon cannot split below a chunk
+boundary — outer parallelism is capped at 2 on a 64-core box. The inner transpose is `2048*32 =
+65536`, exactly `transpose_2d_into_f64`'s `1 << 16` gate, so it parallelises and supplies the rest.
+Nesting is wanted here, and rayon nests on the same pool without deadlock.
+
+### 165c. THE SAME READING FLAGS A RISK IN MY ITEMS 158 AND 160 — RECORDED AGAINST MYSELF
+
+Item 164's mechanism cuts both ways, and applied to my own conv2d change it says something I did
+not consider when I wrote it.
+
+The pass item 158 replaced was `out.par_chunks_mut(patch_count)` — `batch * out_ch` chunks, 256 at
+the small shape and 512 at the big one. My replacement is `out.par_chunks_mut(out_ch *
+patch_count)` — **`batch` chunks, so 8 and 16.** I reduced the splittable units by a factor of 32.
+
+At the certified width that is survivable: 8 chunks on an 8-thread pool is exactly one per thread,
+and 16 gives two. But it leaves NO slack for work stealing — item 164's own failure was making
+granularity coarser than the thread count, and this is the same move stopping one step short of
+it. At `RAYON_NUM_THREADS=64`, where several board rows are also taken, 8 chunks caps the pass at
+8-way parallelism where the old code could use all 64.
+
+I am not reverting it: the traffic reduction (32x re-stream removed) and the granularity loss pull
+in opposite directions and neither is measured. But the claim in item 158e — "a few hundred
+microseconds" — was made without this consideration, and the honest version is that the change
+trades memory traffic for parallel width. **The measurement that settles it is the paired
+before/after at BOTH pool widths**, since the two effects have opposite width-dependence: the
+traffic win is width-independent, the granularity loss grows with width. A row taken only at 8
+threads would miss it entirely.
+
+### 165d. col2im IS NOT A LEVER, SO NOBODY SHOULD RE-PROBE IT
+
+Item 141 timed `col2im` at 1.129 ms, the largest non-GEMM phase left in the conv2d backward, and
+nothing had looked at it. It has two paths gated on `COL2IM_PLANE_MAX_BATCH = 8`:
+
+* `batch < 8` — per (batch, channel) plane. For a fixed plane the `dpanel` read stride is
+  `patch_width`, so this path re-streams `dpanel` once per channel: the same defect as the
+  transposes above.
+* `batch >= 8` — per batch. For fixed `(b, pc)` it reads a CONTIGUOUS `patch_width` run across all
+  `c, kr, kc`, so `dpanel` is read sequentially.
+
+**Both conv2d lanes take the per-batch path** (`batch` is 8 and 16, and the test is `batch < 8`),
+so the locality defect does not apply at the measured shapes. The zero-fill of `dpadded` is
+genuinely required — col2im ACCUMULATES overlapping windows, so it cannot use `build_uninit`.
+
+The small-batch path's per-channel re-stream is real but is a deliberate, measured trade already
+recorded as `kgs4-col2im-plane` (5.2x at batch=1, 1.5x at batch=4, regressing at batch>=16): the
+per-batch path has no parallelism at batch=1. Fixing its locality without losing that parallelism
+would require reordering the accumulation, and **that is not bit-exact** — for a fixed output
+element the contributing `(pc, kr, kc)` would arrive in a different order.
+
+So: no lever, for our shapes or in general without a tolerance decision. Recorded so the next
+agent reading item 141's table does not spend a window rediscovering it.
+
+### 165e. SWEPT AGAIN — SEVENTH
+
+Commit `af6d40fb` — the peer's REVERT commit for `frankentorch-4zjaa`, an unrelated bead — swept
+this change in while I was writing it. Checked rather than assumed: HEAD is `rustfmt --check`
+CLEAN this time (my formatting ran before the sweep) and both markers are present, so the capture
+was complete.
+
+One new wrinkle worth recording: the sweep also took the change while a peer had OTHER uncommitted
+edits in the same file (`lu_factor_contiguous_f64/f32`, `mod bidiag`), which I had already
+detected and was preparing to filter out of my own staging by line range. The sweep committed
+theirs and mine together. Nothing was lost, but the lesson from item 156e now has a corollary:
+**when a diff shows hunks in functions you did not touch, the fix is not only to avoid staging
+them — it is to commit your own work immediately, because someone else is about to stage
+everything.**
