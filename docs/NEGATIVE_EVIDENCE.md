@@ -34184,3 +34184,86 @@ phase with no known lever, so the next agent ranking conv3d work starts from the
 than rediscovering it.
 
 NOT VERIFIED: nothing here is a vs-PyTorch measurement, and the binary predates this session.
+
+## 189. NARROWING THE LANE SET FIXED THE DRIFT GATE AND CHANGED NOTHING ELSE — THE INCUMBENT ARM MOVED 1.94x BETWEEN TWO INVOCATIONS OF THE SAME ELF
+
+`frankentorch-hi9r6`. A measurement attempt that produced **no quotable row**, recorded because the
+reason is specific and reusable.
+
+### 189a. PROVENANCE
+
+    measurement_host = thinkstation1   AMD Ryzen Threadripper PRO 5975WX 32-Cores
+    isa = x86_64+avx2   governor = powersave   online_cpus = 64   rayon_threads = 8
+    executing_elf_sha256 = 2462293598f10e7721efe49ac9786c3bf5edda7b1a700608bfa4df5200805e67
+    incumbent = PyTorch 2.12.1+cpu, self-reported by the arm, SAME invocation, torch threads = 8
+    sampling = balanced-square ABBAABBA, 16 rounds, four live samples per arm per round
+    FT_H2H_LANES=conv2d   (5 lanes instead of 21)
+    concurrent load: 5 cargo + 21 rustc processes (peers), loadavg 25.4 at start
+
+The ELF predates items 187/188, so it prices items 171-185 and not the masked-f32 work.
+
+### 189b. THE ONE THING THAT WORKED
+
+Item 188c's sweep failed the load gates outright (`worst_drift=2.268x`, both gates DRIFTED). Cutting
+the sweep to the conv2d family with `FT_H2H_LANES` shortened the window about fourfold, and the
+gates flipped:
+
+    before (21 lanes)  load_1m 18.56 -> 32.56   worst_drift 2.268x   endpoint DRIFTED  series DRIFTED
+    after  ( 5 lanes)  load_1m 27.96 -> 26.26   worst_drift 1.065x   endpoint PASS     series PASS
+
+At a HIGHER absolute load. That is the gate behaving exactly as `frankentorch-2h8vi` documents —
+the signal is drift, not level, and a steady busy host is measurable. **`FT_H2H_LANES` is a real
+tool for a loaded host: a shorter window is a smaller target for drift.**
+
+### 189c. AND IT WAS NOT THE BINDING CONSTRAINT
+
+Every lane still fails the quoting rule, for two independent reasons.
+
+**The A/A nulls.** Not one of the five lanes has both gates PASS:
+
+    conv2d               PT FAIL    FT WIDE
+    conv2d_masked        PT OFFSET  FT PASS
+    conv2d_big           PT OFFSET  FT PASS
+    conv2d_big_masked    PT PASS    FT FAIL
+    conv2d_masked_train  PT PASS    FT FAIL
+
+**The clocks.** Cross-core spread WHILE sampling was min 2.794x, median 2.864x, max 3.009x, against
+an idle-snapshot spread of 2.831x. The harness's own reading of that comparison is that a large
+idle spread with a small sampling spread means the cores boosted once work arrived and the confound
+did not bite. Here the sampling spread is just as large as the idle one, so it did bite: the two
+arms are not known to have run at comparable clocks, independently of any gate.
+
+So window length and arm noise fail for different reasons, and fixing the window fixed only the
+first. **A passing drift gate is a necessary condition being met, not a measurement becoming valid.**
+
+### 189d. THE CLEANEST EVIDENCE THAT THE HOST IS THE PROBLEM
+
+`conv2d_big`'s INCUMBENT arm, across two invocations of the same ELF against the same torch build
+within fifteen minutes:
+
+    item 188c run   PT 5.934 ms
+    this run        PT 11.530 ms      1.94x
+
+PyTorch's code is byte-identical in both. Nothing we ship can move the incumbent, so a 1.94x swing
+in it is a direct reading of what the host is doing to any arm placed on it right now. Any FT/PT
+ratio taken here inherits that swing whole. This is why no number from either invocation is
+recorded as a standing, and why `feedback_peer_bench_contention`'s rule — pgrep before believing a
+baseline — is worth the two seconds.
+
+### 189e. WHAT IS BANKABLE
+
+**Parity reads `match` on all five conv2d lanes, in both invocations.** Parity is a bit comparison
+against the incumbent's gradients, not a timing, so it is indifferent to load. Items 174, 176 and
+177 rewrote the f64 summed route's scatter and items 171 changed the forward transpose's chunking;
+two independent runs against a live PyTorch arm agree to 1e-6 on every conv2d lane, including the
+summed route those items actually changed.
+
+That is the correctness claim confirmed against the incumbent rather than against our own reference.
+The performance claim remains unmeasured.
+
+### 189f. OWED
+
+A host with the peer builds finished. The lane that prices items 174/177 is `conv2d` (f64, summed);
+`conv2d_masked` is its control, untouched by everything this session at 8 threads, so the pair
+separates "the scatter collapse helped" from "the host moved". Re-run with `FT_H2H_LANES=conv2d`
+when `pgrep rustc` is quiet.
