@@ -5231,8 +5231,26 @@ pub fn sdpa_backward_f64(
             let vh = &v[bh * vs..bh * vs + vs];
             let doh = &dout[bh * os..bh * os + os];
             // P = softmax(scale·Q@Kᵀ) row-wise.  [seq_q, seq_k]
-            let mut p = vec![0.0f64; seq_q * seq_k];
-            gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, &mut p);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut p = build_uninit(seq_q * seq_k, |p: &mut [f64]| {
+                if seq_q == 0 || seq_k == 0 {
+                    p.fill(0.0);
+                    return;
+                }
+                gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
+            });
             for i in 0..seq_q {
                 let limit = if causal { (i + 1).min(seq_k) } else { seq_k };
                 let row = &mut p[i * seq_k..(i + 1) * seq_k];
@@ -5257,8 +5275,26 @@ pub fn sdpa_backward_f64(
                 }
             }
             // dP = dOut @ Vᵀ  [seq_q, seq_k]
-            let mut du = vec![0.0f64; seq_q * seq_k];
-            gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, &mut du);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut du = build_uninit(seq_q * seq_k, |du: &mut [f64]| {
+                if seq_q == 0 || seq_k == 0 {
+                    du.fill(0.0);
+                    return;
+                }
+                gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
+            });
             // dU = P ⊙ (dP − rowsum(P⊙dP)); overwrite du in place.
             for i in 0..seq_q {
                 let pr = &p[i * seq_k..(i + 1) * seq_k];
@@ -5320,8 +5356,26 @@ pub fn sdpa_backward_masked_f64(
             let doh = &dout[bh * os..bh * os + os];
             let mask_base = bh * mask_bh_stride;
             // P = softmax(scale·Q@Kᵀ + mask) row-wise.  [seq_q, seq_k]
-            let mut p = vec![0.0f64; seq_q * seq_k];
-            gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, &mut p);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut p = build_uninit(seq_q * seq_k, |p: &mut [f64]| {
+                if seq_q == 0 || seq_k == 0 {
+                    p.fill(0.0);
+                    return;
+                }
+                gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
+            });
             for i in 0..seq_q {
                 let mrow = &mask[mask_base + i * seq_k..mask_base + (i + 1) * seq_k];
                 let row = &mut p[i * seq_k..(i + 1) * seq_k];
@@ -5343,8 +5397,26 @@ pub fn sdpa_backward_masked_f64(
                 }
             }
             // dP = dOut @ Vᵀ; dU = P ⊙ (dP − rowsum(P⊙dP)); dV/dQ/dK — same as unmasked.
-            let mut du = vec![0.0f64; seq_q * seq_k];
-            gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, &mut du);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut du = build_uninit(seq_q * seq_k, |du: &mut [f64]| {
+                if seq_q == 0 || seq_k == 0 {
+                    du.fill(0.0);
+                    return;
+                }
+                gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
+            });
             for i in 0..seq_q {
                 let pr = &p[i * seq_k..(i + 1) * seq_k];
                 let dr = &mut du[i * seq_k..(i + 1) * seq_k];
@@ -5397,8 +5469,26 @@ pub fn sdpa_backward_f32(
             let kh = &k[bh * ks..bh * ks + ks];
             let vh = &v[bh * vs..bh * vs + vs];
             let doh = &dout[bh * os..bh * os + os];
-            let mut p = vec![0.0f32; seq_q * seq_k];
-            gemm::sgemm_bt(seq_q, d_k, seq_k, qh, kh, &mut p);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut p = build_uninit(seq_q * seq_k, |p: &mut [f32]| {
+                if seq_q == 0 || seq_k == 0 {
+                    p.fill(0.0);
+                    return;
+                }
+                gemm::sgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
+            });
             for i in 0..seq_q {
                 let limit = if causal { (i + 1).min(seq_k) } else { seq_k };
                 let row = &mut p[i * seq_k..(i + 1) * seq_k];
@@ -5422,8 +5512,26 @@ pub fn sdpa_backward_f32(
                     *s = 0.0;
                 }
             }
-            let mut du = vec![0.0f32; seq_q * seq_k];
-            gemm::sgemm_bt(seq_q, d_v, seq_k, doh, vh, &mut du);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut du = build_uninit(seq_q * seq_k, |du: &mut [f32]| {
+                if seq_q == 0 || seq_k == 0 {
+                    du.fill(0.0);
+                    return;
+                }
+                gemm::sgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
+            });
             for i in 0..seq_q {
                 let pr = &p[i * seq_k..(i + 1) * seq_k];
                 let dr = &mut du[i * seq_k..(i + 1) * seq_k];
@@ -5482,8 +5590,26 @@ pub fn sdpa_backward_f32_unit_dout(
             let kh = &k[bh * ks..bh * ks + ks];
             let vh = &v[bh * vs..bh * vs + vs];
 
-            let mut p = vec![0.0f32; seq_q * seq_k];
-            gemm::sgemm_bt(seq_q, d_k, seq_k, qh, kh, &mut p);
+            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 167.
+            //
+            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
+            // "this write is dead" is a property of these two statements, not a prediction
+            // about scheduling (item 164 is why that distinction is now spelled out).
+            //
+            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
+            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
+            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
+            // so the softmax below sees exactly what it saw before.
+            //
+            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
+            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
+            let mut p = build_uninit(seq_q * seq_k, |p: &mut [f32]| {
+                if seq_q == 0 || seq_k == 0 {
+                    p.fill(0.0);
+                    return;
+                }
+                gemm::sgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
+            });
             for i in 0..seq_q {
                 let limit = if causal { (i + 1).min(seq_k) } else { seq_k };
                 let row = &mut p[i * seq_k..(i + 1) * seq_k];
