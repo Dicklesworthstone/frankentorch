@@ -33297,3 +33297,80 @@ itself.
 
 Owed: the same build and the same vs-PyTorch arm item 174 owes, measured as its own delta on top of
 item 174 rather than jointly with it.
+
+## 178. WE COMPUTE A GRADIENT THE CERTIFIED LANE THROWS AWAY — ~3.0 ms OF A 16.6 ms BACKWARD, AND PyTorch HAS AN ARGUMENT FOR NOT PAYING IT
+
+`frankentorch-hi9r6` (P0). **UNBUILT**: build freeze — `/data` 27G, 99% used, loadavg
+4.76/6.95/7.55 — no cargo ran, nothing measured. `rustfmt --edition 2024 --check` exits 0 on both
+files. **This is the largest change of this session and should be compiled before any other
+unbuilt work.**
+
+### 178a. WHAT READING THE INCUMBENT ACTUALLY BOUGHT
+
+PyTorch's `convolution_backward` takes an `output_mask: [bool; 3]`. Ours takes none: it returns
+`(dpadded, dweight, dbias)` and always computes the first two.
+
+ft-api's FIRST-ORDER backward closure calls it that way — while the create_graph closure twenty
+lines below has always gated on `ctx.needs_input_grad()`. The gate existed, on the harder path, and
+was never applied to the common one.
+
+**This is live on the certified lane.** `timed_conv2d` builds its weight with
+`requires_grad = false`, so `conv2d_masked` — the lane behind the certified **5.73x SLOWER**
+standing — has been computing a `dweight` that nothing reads, every round of every run. Item 141's
+phase table prices it: `im2col` 0.990 ms + the dweight GEMM 2.036 ms ≈ **3.0 ms of a 16.6 ms
+backward, about 18%**.
+
+So one concrete part of the gap is not kernel quality at all — it is work the incumbent has an
+argument for skipping and we did not.
+
+### 178b. THE SHAPE OF THE CHANGE
+
+`conv2d_backward_masked_f64(.., output_mask)` returns `(Option, Option, Option)`. ft-api's
+first-order closure reads `ctx.needs_input_grad()` and passes it through; returning `None` for a
+skipped gradient is already this API's convention, since the backward returns
+`Vec<Option<Vec<f64>>>`, so nothing downstream changes.
+
+Three deliberate restrictions, so the diff stays small and honest:
+
+* **`conv2d_backward_f64` is untouched.** Every probe, test and other caller keeps working, and the
+  masked path delegates to it whenever both gradients are wanted.
+* **The all-ones adjoints are not split.** When a fast path applies, the masked entry point
+  delegates and masks afterwards, saving nothing. Those kernels produce both halves together and
+  splitting them is a separate question; the comment says so rather than implying a saving.
+* **`conv2d_dout_flat_f64` is EXTRACTED, not copied.** Both gradients need `dout_flat`, so it is the
+  one phase no mask can skip. A second copy in the masked path would be exactly the drift hazard
+  `conv3d_im2col_fill_rows_f64` was extracted to remove.
+
+`needs_input_grad` is read defensively: a short or empty slice means the tape did not record what
+is wanted, and the safe reading of "unknown" is COMPUTE IT. Dropping a gradient somebody needs is a
+correctness bug; computing a spare one is merely slow.
+
+### 178c. WHAT IT DOES AND DOES NOT PREDICT
+
+It removes ~18% of the backward **on lanes whose weight is frozen**, which includes the certified
+one. It changes nothing where both gradients are genuinely wanted — a normal training step updating
+this layer's weights pays exactly what it paid before.
+
+That distinction matters for how the result is read: this makes our LANE faster without making
+conv2d faster. The lane is what the standing is measured on, so the standing should move; the op is
+not better than it was. Anyone quoting the improvement should say which of those they mean.
+
+**It is also a question about the lane's fidelity.** A conv layer in real training normally does
+want `dweight`. If the board's conv2d lanes model inference-with-input-grad rather than a training
+step, that is worth knowing on its own — and the honest fix might be to give the lane a
+grad-requiring weight rather than to celebrate a faster route around one. `timed_linear` already
+takes the opposite choice deliberately: its weight requires grad precisely so `dweight` is measured,
+and its comment says a no-grad weight "would skip dweight and measure the wrong half".
+
+**So this item may have found a lane defect and a real optimisation at the same time, and they pull
+in opposite directions.** Both are recorded; neither is resolved here.
+
+### 178d. VERIFICATION OWED, AND WHY IT IS MORE THAN USUAL
+
+`cargo build`, `cargo clippy`, `cargo test` — and specifically a test that a masked backward's
+produced gradients are bit-identical to the unmasked path's, which does not yet exist and should be
+written before this is trusted. Then the paired vs-PyTorch arm on `conv2d_masked`.
+
+Beyond the usual: this change alters what a public API RETURNS in the skipped case, and a wrong
+`needs_input_grad` reading would silently drop a real gradient. That failure mode is a wrong answer,
+not a slow one, and it is the first thing the gradient-parity suite should be pointed at.

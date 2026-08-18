@@ -30775,11 +30775,38 @@ impl FrankenTorchSession {
                         Ok((out, vec![b_, oc, oh, ow]))
                     },
                     // 1st-order backward (zero-copy, borrows live input storage).
-                    move |_ctx, grad_outputs, borrowed_inputs| {
+                    // SKIP THE GRADIENT NOBODY ASKED FOR — `frankentorch-hi9r6`, item 178.
+                    //
+                    // UNBUILT: written under a build freeze, not compiled or measured.
+                    //
+                    // This closure used to compute BOTH gradients unconditionally, while the
+                    // create_graph closure directly below has always gated on
+                    // `ctx.needs_input_grad()`. So a frozen weight, or a non-grad input leaf, paid
+                    // in full for a gradient that was discarded the moment it was returned.
+                    //
+                    // It is not hypothetical here: the `conv2d_masked` lane behind this bead's
+                    // certified 5.73x standing builds its weight with `requires_grad = false`, so
+                    // every round computed a `dweight` nothing read. Item 141 prices that at
+                    // `im2col` 0.990 ms + the dweight GEMM 2.036 ms — about 3.0 ms of a 16.6 ms
+                    // backward. PyTorch's `convolution_backward` takes an `output_mask` for
+                    // exactly this reason, so the incumbent has never paid it.
+                    //
+                    // `needs_input_grad` is indexed like `inputs`: [padded, weight, (bias)].
+                    // Returning `None` for a skipped gradient is already this API's convention —
+                    // the backward returns `Vec<Option<Vec<f64>>>` — so nothing downstream needs
+                    // to change to accept it.
+                    move |ctx, grad_outputs, borrowed_inputs| {
                         let dout = grad_outputs[0];
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
-                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_f64(
+                        let need = ctx.needs_input_grad();
+                        // Defensive: an empty/short `need` means the tape did not record what is
+                        // wanted, and the safe reading of "unknown" is "compute it" — silently
+                        // dropping a gradient somebody needs is a correctness bug, while
+                        // computing a spare one is only slow.
+                        let need_input = need.first().copied().unwrap_or(true);
+                        let need_weight = need.get(1).copied().unwrap_or(true);
+                        let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_masked_f64(
                             dout,
                             padded_values,
                             weight_values,
@@ -30794,11 +30821,11 @@ impl FrankenTorchSession {
                             sh,
                             sw,
                             oc,
-                            has_bias,
+                            [need_input, need_weight, has_bias],
                         );
-                        let mut g = vec![Some(dpadded), Some(dweight)];
+                        let mut g = vec![dpadded, dweight];
                         if has_bias {
-                            g.push(Some(dbias.unwrap()));
+                            g.push(dbias);
                         }
                         Ok(g)
                     },

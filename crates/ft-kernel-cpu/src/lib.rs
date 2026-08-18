@@ -9317,6 +9317,148 @@ fn dout_is_all_ones_f64(dout: &[f64]) -> bool {
     }
 }
 
+/// Gather `dout` `[N, out_ch, patch_count]` into `dout_flat` `[flat, out_ch]`.
+///
+/// Extracted by item 178 so the full backward and the masked one cannot drift apart. Both
+/// gradients need this buffer, so it is the one phase no output mask can skip — which is exactly
+/// why it had to become shared rather than be copied into a second code path.
+///
+/// `build_uninit`'s contract holds by construction: every chunk is exactly `out_ch` long and the
+/// inner loop writes every element of its chunk.
+fn conv2d_dout_flat_f64(dout: &[f64], batch: usize, out_ch: usize, patch_count: usize) -> Vec<f64> {
+    build_uninit(batch * patch_count * out_ch, |df: &mut [f64]| {
+        df.par_chunks_mut(out_ch).enumerate().for_each(|(row, dr)| {
+            let n = row / patch_count;
+            let p = row % patch_count;
+            for (oc, d) in dr.iter_mut().enumerate() {
+                *d = dout[(n * out_ch + oc) * patch_count + p];
+            }
+        });
+    })
+}
+
+/// conv2d backward computing ONLY the gradients the caller asked for — `frankentorch-hi9r6`,
+/// item 178. `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's
+/// `convolution_backward`, which takes exactly this argument for exactly this reason.
+///
+/// **UNBUILT**: written under a build freeze; not compiled, not tested, not measured.
+///
+/// WHY THIS EXISTS. `conv2d_backward_f64` computes both gradients unconditionally, and ft-api's
+/// FIRST-ORDER backward closure calls it that way — while its create_graph sibling twenty lines
+/// below already gates on `ctx.needs_input_grad()`. So a conv whose weight is frozen, or whose
+/// input is a non-grad leaf, pays for a gradient that is discarded on return.
+///
+/// That is not hypothetical on this bead: the `conv2d_masked` lane behind the certified **5.73x
+/// SLOWER** standing builds its weight with `requires_grad = false`. Item 141's phase table prices
+/// what that wastes — `im2col` 0.990 ms plus the dweight GEMM 2.036 ms, about **3.0 ms of a
+/// 16.6 ms backward**, computed and thrown away every round. PyTorch does not pay it, which is one
+/// concrete, structural reason its arm is shorter that has nothing to do with kernel quality.
+///
+/// The two single-sided routes share `conv2d_dout_flat_f64` with the full path rather than copying
+/// it, because `dout_flat` is the one phase both gradients need and a second copy of it would be a
+/// drift hazard of the kind `conv3d_im2col_fill_rows_f64` was extracted to remove.
+///
+/// BIT-EXACT: each gradient that IS produced is computed by the same calls in the same order as
+/// the unmasked path. Nothing is reordered; work is only omitted.
+///
+/// NOT OPTIMISED, AND SAID SO: when a fast path applies, or when both gradients are wanted, this
+/// delegates to `conv2d_backward_f64` and masks the result afterwards. The all-ones adjoints
+/// compute both halves internally and are cheap enough that splitting them is a separate question;
+/// masking after the fact saves nothing there and is not claimed to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_backward_masked_f64(
+    dout: &[f64],
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+
+    // The generic route is the only one this can save work on: the height-1 and 3x3 all-ones
+    // adjoints are separate kernels that produce both halves together. Detect them the same way
+    // `conv2d_backward_f64` does, so the two functions cannot disagree about which route applies.
+    let ones_route = (ph == 1 && kh == 1 && oh == 1
+        || ph > 1 && oh > 1 && kh == 3 && kw == 3 && sh == 1 && sw == 1)
+        && !dout.is_empty()
+        && dout_is_all_ones_f64(dout);
+    let both = output_mask[0] && output_mask[1];
+
+    if ones_route || both {
+        let (dpadded, dweight, dbias) = conv2d_backward_f64(
+            dout,
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
+            output_mask[2],
+        );
+        return (
+            output_mask[0].then_some(dpadded),
+            output_mask[1].then_some(dweight),
+            dbias,
+        );
+    }
+
+    let dout_flat = conv2d_dout_flat_f64(dout, batch, out_ch, patch_count);
+
+    let dweight = output_mask[1].then(|| {
+        let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        build_uninit(out_ch * patch_width, |dw: &mut [f64]| {
+            if out_ch == 0 || patch_width == 0 {
+                return;
+            }
+            gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dw);
+        })
+    });
+
+    let dpadded = output_mask[0].then(|| {
+        let dpanel = build_pool_output(flat * patch_width, |dp: &mut [f64]| {
+            gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
+        });
+        conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
+    });
+
+    let dbias = output_mask[2].then(|| {
+        let mut db = vec![0.0f64; out_ch];
+        db.par_iter_mut().enumerate().for_each(|(oc, dbo)| {
+            let mut s = 0.0f64;
+            for n in 0..batch {
+                let base = (n * out_ch + oc) * patch_count;
+                for p in 0..patch_count {
+                    s += dout[base + p];
+                }
+            }
+            *dbo = s;
+        });
+        db
+    });
+
+    (dpadded, dweight, dbias)
+}
+
 pub fn conv2d_backward_f64(
     dout: &[f64],
     padded: &[f64],
@@ -9390,15 +9532,7 @@ pub fn conv2d_backward_f64(
     //
     // ~9x smaller than `dpanel`, so the expected effect is ~0.1 ms and it is recorded as
     // bookkeeping rather than as a lever with a prediction worth defending.
-    let dout_flat = build_uninit(flat * out_ch, |df: &mut [f64]| {
-        df.par_chunks_mut(out_ch).enumerate().for_each(|(row, dr)| {
-            let n = row / patch_count;
-            let p = row % patch_count;
-            for (oc, d) in dr.iter_mut().enumerate() {
-                *d = dout[(n * out_ch + oc) * patch_count + p];
-            }
-        });
-    });
+    let dout_flat = conv2d_dout_flat_f64(dout, batch, out_ch, patch_count);
     let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     // dweight_flat [out_ch, patch_width] = dout_flat^T @ panel.
     // dweight = dout_flat^T @ panel via dgemm_tb (reads dout_flat [flat,out_ch] AS
