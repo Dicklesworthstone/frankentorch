@@ -46322,6 +46322,152 @@ mod tests {
         }
     }
 
+    /// frankentorch-l2zki item 196: the conv3d twin of item 180 — every gradient a MASKED conv3d
+    /// backward produces must be bit-identical to the unmasked path's, and every one it skips
+    /// must be `None`.
+    ///
+    /// UNBUILT — written under a disk throttle with no cargo available; never executed.
+    ///
+    /// Item 195d named this as owed before item 195 could be trusted, and the reason is the
+    /// failure mode rather than the feature. A wrong `needs_input_grad` read, or a mask applied to
+    /// the wrong slot, **silently drops a real gradient** — and no perf row would ever show it,
+    /// because BOTH conv3d lanes freeze their weight and so never read `dweight`. The board would
+    /// keep certifying `conv3d_masked` happily while a training caller received `None`.
+    ///
+    /// That risk is larger here than it was for conv2d: item 195 sits under the one CERTIFIED
+    /// standing this session has touched, so a silent gradient loss would be masked by the very
+    /// lane that makes the change look worthwhile.
+    ///
+    /// Both directions are asserted for every mask, for item 180b's reason: checking only values
+    /// would pass a function that ignored the mask and computed everything, and checking only
+    /// presence would pass one returning the right shape filled with garbage.
+    ///
+    /// The all-ones cases matter especially. `conv3d_backward_masked_f64` re-derives the
+    /// ones-route predicate independently of the dispatcher so it can decide whether masking can
+    /// save anything; running every geometry under a uniform `dout` as well as a non-uniform one
+    /// means that if those two gates ever disagree, the arms differ and this fails.
+    #[test]
+    fn conv3d_backward_masked_matches_the_unmasked_path_on_every_mask() {
+        // (batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw, out_ch)
+        let cases = [
+            (
+                1usize, 2usize, 5usize, 5usize, 5usize, 3usize, 3usize, 3usize, 3usize, 3usize,
+                3usize, 1usize, 1usize, 1usize, 3usize,
+            ),
+            (2, 3, 4, 5, 6, 2, 3, 3, 3, 3, 4, 1, 1, 1, 4),
+            // stride 2 on every axis: col2im's scatter is sparse
+            (1, 2, 7, 7, 7, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2),
+        ];
+        for &(b, ci, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw, co) in &cases {
+            let patch_width = ci * kd * kh * kw;
+            let patch_count = od * oh * ow;
+            let padded: Vec<f64> = (0..b * ci * pd * ph * pw)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..co * patch_width)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+
+            for ones in [false, true] {
+                let dout: Vec<f64> = if ones {
+                    vec![1.0f64; b * co * patch_count]
+                } else {
+                    (0..b * co * patch_count)
+                        .map(|i| ((i % 197) as f64) * 0.0007 + 0.25)
+                        .collect()
+                };
+                for has_bias in [false, true] {
+                    let (want_dp, want_dw, want_db) = super::conv3d_backward_f64(
+                        &dout, &padded, &weight, b, ci, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh,
+                        sw, co, has_bias,
+                    );
+                    for need_input in [false, true] {
+                        for need_weight in [false, true] {
+                            let (dp, dw, db) = super::conv3d_backward_masked_f64(
+                                &dout,
+                                &padded,
+                                &weight,
+                                b,
+                                ci,
+                                pd,
+                                ph,
+                                pw,
+                                kd,
+                                kh,
+                                kw,
+                                od,
+                                oh,
+                                ow,
+                                sd,
+                                sh,
+                                sw,
+                                co,
+                                [need_input, need_weight, has_bias],
+                            );
+                            let label = format!(
+                                "b={b} ci={ci} p={pd}x{ph}x{pw} k={kd}x{kh}x{kw} \
+                                 o={od}x{oh}x{ow} s={sd}x{sh}x{sw} co={co} ones={ones} \
+                                 bias={has_bias} mask=[{need_input},{need_weight},{has_bias}]"
+                            );
+                            assert_eq!(
+                                dp.is_some(),
+                                need_input,
+                                "item 196 d_input presence: {label}"
+                            );
+                            assert_eq!(
+                                dw.is_some(),
+                                need_weight,
+                                "item 196 d_weight presence: {label}"
+                            );
+                            assert_eq!(db.is_some(), has_bias, "item 196 d_bias presence: {label}");
+
+                            if let Some(got) = dp.as_ref() {
+                                assert_eq!(
+                                    got.len(),
+                                    want_dp.len(),
+                                    "item 196 d_input len: {label}"
+                                );
+                                for (i, (g, w)) in got.iter().zip(want_dp.iter()).enumerate() {
+                                    assert_eq!(
+                                        g.to_bits(),
+                                        w.to_bits(),
+                                        "item 196 d_input differs at {label} idx={i}: \
+                                         masked={g} unmasked={w}"
+                                    );
+                                }
+                            }
+                            if let Some(got) = dw.as_ref() {
+                                assert_eq!(
+                                    got.len(),
+                                    want_dw.len(),
+                                    "item 196 d_weight len: {label}"
+                                );
+                                for (i, (g, w)) in got.iter().zip(want_dw.iter()).enumerate() {
+                                    assert_eq!(
+                                        g.to_bits(),
+                                        w.to_bits(),
+                                        "item 196 d_weight differs at {label} idx={i}: \
+                                         masked={g} unmasked={w}"
+                                    );
+                                }
+                            }
+                            if let (Some(got), Some(want)) = (db.as_ref(), want_db.as_ref()) {
+                                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                                    assert_eq!(
+                                        g.to_bits(),
+                                        w.to_bits(),
+                                        "item 196 d_bias differs at {label} idx={i}: \
+                                         masked={g} unmasked={w}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// frankentorch-hi9r6 item 180: every gradient a MASKED conv2d backward produces must be
     /// bit-identical to the unmasked path's, and every one it skips must be `None`.
     ///

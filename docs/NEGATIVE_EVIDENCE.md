@@ -34889,3 +34889,65 @@ Loadavg, run queue and the clock spread are still what say that.
 Compile both this and item 194's block. Then, in a window where the slot prints `held`, the
 `/proc` scan prints `none`, and the run queue is low and steady: `FT_H2H_LANES=conv2d` at
 `round_warmup=0`, which is the pair that prices items 174 and 177.
+
+## 196. THE GUARD ITEM 195d SAID MUST EXIST — conv3d's MASKED GRADIENT, CHECKED BOTH WAYS ON EVERY MASK
+
+`frankentorch-l2zki`. **UNBUILT**: `/data` 43G, one gigabyte above the hard brake; no cargo of any
+kind and no artifact written. `rustfmt --edition 2024 --check` exits 0, which item 186 established
+proves only that the file PARSES.
+
+### 196a. WHY THIS BEFORE ANYTHING ELSE
+
+Item 195d named its own missing guard, and the reason is the failure mode rather than the feature.
+A wrong `needs_input_grad` read, or a mask applied to the wrong slot, **silently drops a real
+gradient** — and no perf row would ever show it, because BOTH conv3d lanes freeze their weight and
+so never read `dweight`.
+
+**That risk is worse here than it was for conv2d.** Item 195 sits under the one CERTIFIED standing
+this session has touched, so a silent gradient loss would be hidden by the very lane that makes the
+change look worthwhile: `conv3d_masked` would keep certifying while a training caller received
+`None`.
+
+The test asserts BOTH directions for every mask — produced gradients bit-identical, skipped ones
+absent — for item 180b's reason: values alone would pass a function that ignored the mask and
+computed everything, presence alone would pass one returning the right shape full of garbage.
+Three geometries x all-ones and non-uniform `dout` x `has_bias` x four mask combinations.
+
+The all-ones cases carry extra weight. `conv3d_backward_masked_f64` re-derives the ones-route
+predicate independently of the dispatcher, because it must know whether masking can save anything
+before deciding to delegate. Running every geometry under a uniform `dout` means that if those two
+gates ever disagree, the arms compute different values and this fails.
+
+### 196b. WHAT I CHECKED BY READING, SINCE NOTHING CAN COMPILE IT
+
+Item 186's lesson — `rustfmt` verifies parsing and nothing else — earned its keep two turns ago
+when reading caught a `&String == &&str` that would not have compiled. So, deliberately, before
+claiming this is done:
+
+* `conv3d_backward_masked_f64` is `pub`, so `super::` reaches it from the test module;
+* the unmasked signature takes 19 parameters and both call sites pass 19, with `has_bias` replaced
+  by `output_mask` in the masked one;
+* `want_db` is `Option<Vec<f64>>` and is matched as one, while `want_dp`/`want_dw` are plain `Vec`;
+* every geometry is arithmetically consistent — `od = (pd - kd)/sd + 1` and its two siblings hold
+  for all three cases, including the stride-2 one.
+
+That is not a substitute for a compiler. It is what is available, and it is stronger than
+re-reading my own line, which is where the last error came from.
+
+### 196c. A PEER'S ITEM 195 SOLVES THE PROBLEM MY RUNNER ONLY DETECTED
+
+A peer landed a MEASUREMENT SLOT this turn — the fix item 194e named — after four consecutive runs
+were voided by overlap nobody could see. That is the mechanism my `settle_conv_stack.sh` lacks:
+mine refuses to START when `loadavg > online_cpus` (item 194c), which catches a host already busy
+but does nothing to stop two agents beginning at the same quiet moment and ruining each other.
+
+Detection and prevention are different things, and theirs is the better half. When the throttle
+lifts, that script should acquire the slot rather than merely sample the load — recorded here so
+the two mechanisms are composed rather than duplicated.
+
+### 196d. OWED
+
+Compilation, `cargo clippy`, and this test actually running — for conv3d and for item 180's conv2d
+twin, neither of which has ever executed. Then the paired vs-PyTorch run on `conv3d_masked`, which
+per item 193b needs a binary built `--features fair-alloc`; the snapshot every measurement this
+session used was built without it.
