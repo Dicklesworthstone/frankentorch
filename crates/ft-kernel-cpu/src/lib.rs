@@ -8883,15 +8883,52 @@ pub fn conv2d_backward_f64(
     // rare change where parity needs no reasoning at all.
     drop(panel);
     // dpanel [flat, patch_width] = dout_flat @ weight_flat.
-    let mut dpanel = vec![0.0f64; flat * patch_width];
-    gemm::dgemm(
-        flat,
-        out_ch,
-        patch_width,
-        &dout_flat,
-        weight_flat,
-        &mut dpanel,
-    );
+    //
+    // UNBUILT — written under a build freeze (/data at 33G, 99% used), so this has NOT been
+    // compiled, tested or measured. It is committed on the orchestrator's instruction so it can
+    // be compiled and priced the moment the volume frees up. Reviewer: treat the numbers below
+    // as the PREDICTION this change makes, not as a result.
+    //
+    // THE DEAD PASS THIS REMOVES — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE item 151.
+    //
+    // `vec![0.0f64; flat * patch_width]` zeroes 18.9 MB at the scored shape and `dgemm`
+    // immediately overwrites every one of those elements. Item 141 enumerated this function and
+    // timed the phase it belongs to at **1.072 ms** of a 16.6 ms backward without attributing
+    // it; the zeroing is the whole of it, and it is pure waste. `build_pool_output` hands the
+    // GEMM an uninitialized buffer instead, so the parallel GEMM store is the sole writer and
+    // also does the page first-touch — one pass over 18.9 MB instead of two.
+    //
+    // WHY THE `build_uninit` CONTRACT HOLDS, VERIFIED IN THE DEPENDENCY RATHER THAN ASSUMED.
+    // The contract is that `fill` writes every element and reads none before writing it, and
+    // `gemm::dgemm` passes `beta = 0.0` (see `dgemm_block_scaled`). In matrixmultiply 0.3.11:
+    //
+    //   gemm.rs:548   if beta.is_zero() { *cptr = *ab; /* initialize */ }  else { read-modify }
+    //   gemm.rs:277   if m == 0 || k == 0 || n == 0 { return c_to_beta_c(..) }
+    //   gemm.rs:570   c_to_beta_c: if beta.is_zero() { *cptr = T::zero(); /* initialize C */ }
+    //
+    // So on EVERY path — including the degenerate k == 0 (`out_ch == 0`) one that `dgemm`'s own
+    // `m == 0 || n == 0` guard does not cover — C is written and never read. That mattered
+    // enough to check: had matrixmultiply instead computed `beta * c + ab` unconditionally, it
+    // would have READ uninitialized memory, and `0.0 * <sNaN bit pattern>` is NaN, so the bug
+    // would have been wrong OUTPUT rather than merely undefined behaviour.
+    //
+    // BIT-EXACT: no arithmetic is reordered and no value is recomputed. The GEMM writes the same
+    // stores in the same order; only the dead pass before it is gone. Same class of argument as
+    // item 143's `drop(panel)` — a change to allocation, not to computation.
+    //
+    // MEASURABLE IN ONE BINARY: `build_pool_output` honours `set_pool_output_zeroed` /
+    // `FT_POOL_ZEROED_OUTPUT=1`, so the pre-lever zeroed path is selectable at runtime and a
+    // paired lane can flip arms inside one process. That is deliberate — item 25 recorded that
+    // this vein's first attempt could only be judged across two binaries built ninety minutes
+    // apart, which cannot attribute a small difference to any one change.
+    //
+    // NOT CLAIMED, and left for a separate row on purpose: `dout_flat` above is 2 MB and is also
+    // fully overwritten (every chunk is exactly `out_ch` long and the inner loop writes all of
+    // them), so it carries the same dead zeroing. It is ~9x smaller than `dpanel` and folding it
+    // in would blur which buffer paid, so this change moves ONE buffer and item 151 prices it.
+    let dpanel = build_pool_output(flat * patch_width, |dp| {
+        gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
+    });
     let dpadded = conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     let dbias = if has_bias {
         // Parallel over out_ch: each channel's bias gradient is an independent
@@ -44226,6 +44263,109 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// frankentorch-hi9r6 item 151: conv2d's generic backward must produce BIT-IDENTICAL
+    /// gradients whether its `dpanel` arrives zeroed or uninitialized.
+    ///
+    /// UNBUILT — written under a build freeze, so this test has never been executed. It is
+    /// committed with the change it guards so both are compiled together when the volume frees.
+    ///
+    /// WHAT THIS DOES AND DOES NOT PROVE. It proves the GEMM covers every element of the buffer:
+    /// if any element were left unwritten, the uninit arm would differ from the zeroed arm. It
+    /// does NOT prove the absence of a read-before-write, because a freshly-mapped page reads as
+    /// zero and would hide one — the allocator, not the assertion, would be deciding the result.
+    /// That question is settled instead by reading matrixmultiply 0.3.11: `gemm.rs:548` takes
+    /// `*cptr = *ab` when `beta.is_zero()` and `gemm.rs:277/570` route the degenerate `k == 0`
+    /// case to `c_to_beta_c`, which writes `T::zero()`. Neither reads C. The test is the
+    /// regression guard for that reasoning, not a substitute for it.
+    ///
+    /// Every case uses a NON-UNIFORM `dout`: an all-ones upstream takes the 3x3 stride-1
+    /// specialisation, which allocates no `dpanel` at all and would exercise nothing here.
+    #[test]
+    fn conv2d_backward_f64_dpanel_uninit_matches_the_zeroed_route_bitwise() {
+        // (batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch, has_bias)
+        let cases = [
+            // 3x3 stride 1 — the scored geometry's kernel, reached generically by a
+            // non-uniform dout.
+            (
+                2usize, 3usize, 6usize, 6usize, 3usize, 3usize, 4usize, 4usize, 1usize, 1usize,
+                4usize, false,
+            ),
+            (2, 3, 6, 6, 3, 3, 4, 4, 1, 1, 4, true),
+            // stride 2, so the col2im scatter is sparse rather than total.
+            (1, 2, 7, 7, 3, 3, 3, 3, 2, 2, 3, true),
+            // non-square kernel, which cannot reach any 3x3 specialisation.
+            (2, 2, 5, 6, 2, 3, 4, 4, 1, 1, 3, false),
+            // single output element: exercises the small-GEMM path, not the parallel one.
+            (1, 1, 3, 3, 3, 3, 1, 1, 1, 1, 1, true),
+        ];
+        for &(b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co, has_bias) in &cases {
+            let patch_width = ci * kh * kw;
+            let padded: Vec<f64> = (0..b * ci * ph * pw)
+                .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+                .collect();
+            let weight: Vec<f64> = (0..co * patch_width)
+                .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+                .collect();
+            // Non-uniform, and deliberately seeded with a NaN and an infinity so a buffer that
+            // were read-before-written could not hide behind well-behaved finite arithmetic.
+            let mut dout: Vec<f64> = (0..b * co * oh * ow)
+                .map(|i| ((i % 197) as f64) * 0.0007 + 0.25)
+                .collect();
+            if dout.len() > 3 {
+                dout[1] = f64::NAN;
+                dout[2] = f64::INFINITY;
+                dout[3] = -0.0;
+            }
+
+            let previous = super::set_pool_output_zeroed(true);
+            let (zp, zw, zb) = super::conv2d_backward_f64(
+                &dout, &padded, &weight, b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co, has_bias,
+            );
+            super::set_pool_output_zeroed(false);
+            let (up, uw, ub) = super::conv2d_backward_f64(
+                &dout, &padded, &weight, b, ci, ph, pw, kh, kw, oh, ow, sh, sw, co, has_bias,
+            );
+            super::set_pool_output_zeroed(previous);
+
+            let label = format!(
+                "b={b} ci={ci} ph={ph} pw={pw} kh={kh} kw={kw} oh={oh} ow={ow} \
+                 sh={sh} sw={sw} co={co} bias={has_bias}"
+            );
+            assert_eq!(zp.len(), up.len(), "dpadded length differs: {label}");
+            for (i, (z, u)) in zp.iter().zip(up.iter()).enumerate() {
+                assert_eq!(
+                    z.to_bits(),
+                    u.to_bits(),
+                    "item 151 dpadded mismatch at {label} idx={i}: zeroed={z} uninit={u}"
+                );
+            }
+            assert_eq!(zw.len(), uw.len(), "dweight length differs: {label}");
+            for (i, (z, u)) in zw.iter().zip(uw.iter()).enumerate() {
+                assert_eq!(
+                    z.to_bits(),
+                    u.to_bits(),
+                    "item 151 dweight mismatch at {label} idx={i}: zeroed={z} uninit={u}"
+                );
+            }
+            match (&zb, &ub) {
+                (Some(z), Some(u)) => {
+                    assert_eq!(z.len(), u.len(), "dbias length differs: {label}");
+                    for (i, (z, u)) in z.iter().zip(u.iter()).enumerate() {
+                        assert_eq!(
+                            z.to_bits(),
+                            u.to_bits(),
+                            "item 151 dbias mismatch at {label} idx={i}: zeroed={z} uninit={u}"
+                        );
+                    }
+                }
+                (None, None) => assert!(!has_bias, "dbias absent despite has_bias: {label}"),
+                _ => panic!(
+                    "item 151: one arm produced a bias gradient and the other did not: {label}"
+                ),
             }
         }
     }

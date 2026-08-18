@@ -31473,3 +31473,92 @@ plausible directions by measuring them. It also is not free: conv2d's generic ba
 gets its parallel width from one wide GEMM, and item 116/117 recorded a 1.7x REGRESSION when a
 restructuring fragmented that width. Any layout rewrite has to keep one wide parallel region, and
 that constraint should be designed in before a line is written.
+
+## 151. conv2d's dpanel ZEROES 18.9 MB THAT THE GEMM IMMEDIATELY OVERWRITES — ITEM 141's UNATTRIBUTED 1.072 ms PHASE, FIXED UNBUILT
+
+`frankentorch-hi9r6` (P0). **UNBUILT AND UNMEASURED.** Build freeze in force — `/data` at 33G, 99%
+used, loadavg 8.31/7.93/7.13 — so no cargo ran. Committed on the orchestrator's instruction to be
+compiled and priced when the volume frees. Everything below is a PREDICTION with a mechanism, not a
+result, and the item stays open until a paired run either confirms it or kills it.
+
+### 151a. THE DEAD PASS, AND WHOSE NUMBER IT IS
+
+Item 141 enumerated the generic conv2d backward and timed nine phases directly. One line of its
+table was never attributed to anything:
+
+    dpanel alloc+zero      1.072 ms      of a 16.595 ms backward
+
+`conv2d_backward_f64` allocated it as `vec![0.0f64; flat * patch_width]` — 18.9 MB at the scored
+shape — and then called `gemm::dgemm` on it, which passes `beta = 0.0` and therefore overwrites
+every element. The zeroing was never read by anything. The fix routes the buffer through this
+crate's existing `build_pool_output`, so the parallel GEMM store is the sole writer and also does
+the page first-touch: one pass over 18.9 MB instead of two.
+
+This is the vein `project_expand_uninit_firsttouch` describes and the instrument (`build_uninit`,
+the `set_pool_output_zeroed` toggle) was already in the crate. What was missing was noticing that
+conv2d's largest intermediate qualifies.
+
+### 151b. THE CONTRACT WAS VERIFIED IN THE DEPENDENCY, NOT ASSUMED
+
+`build_uninit` requires that `fill` write every element and read none before writing it. Handing an
+uninitialized buffer to a GEMM is only sound if the GEMM honours `beta == 0` by STORING rather than
+by computing `beta * c + ab`. That is a question about matrixmultiply, not about our code, so it was
+read there — matrixmultiply 0.3.11:
+
+    gemm.rs:548   if beta.is_zero() { *cptr = *ab; /* initialize */ } else { mul_assign; add_assign }
+    gemm.rs:277   if m == 0 || k == 0 || n == 0 { return c_to_beta_c(m, n, beta, c, rsc, csc) }
+    gemm.rs:570   c_to_beta_c: if beta.is_zero() { *cptr = T::zero(); /* initialize C */ }
+
+Every path writes C and none reads it, including the degenerate `k == 0` case that `gemm::dgemm`'s
+own `m == 0 || n == 0` guard does not cover.
+
+**Why this was worth ten minutes rather than an assumption.** Had matrixmultiply multiplied by beta
+unconditionally, it would have read uninitialized memory — and `0.0 * <signalling NaN pattern>` is
+NaN, not 0.0. The failure mode would have been WRONG GRADIENTS, silently, on a path with no
+all-zeros tell, not a crash. A "surely beta=0 skips the read" would have shipped that.
+
+### 151c. BIT-EXACT BY CONSTRUCTION
+
+No arithmetic is reordered and no value is recomputed; the GEMM issues the same stores in the same
+order and only the dead pass ahead of it is gone. This is the same class of argument as item 143's
+`drop(panel)` — a change to allocation, not to computation — and it is the rare kind where parity
+needs no tolerance discussion.
+
+A lock test ships with it: `conv2d_backward_f64_dpanel_uninit_matches_the_zeroed_route_bitwise`
+flips `set_pool_output_zeroed` inside ONE process across five geometries (3x3 stride 1 with and
+without bias, stride 2, a non-square kernel, and a single-output-element case), every one with a
+non-uniform `dout` so the all-ones specialisation — which allocates no `dpanel` at all — cannot be
+what runs, and compares `dpadded`, `dweight` and `dbias` by `to_bits()`.
+
+**What that test does NOT prove, stated in the test itself:** it cannot demonstrate the absence of a
+read-before-write, because a freshly-mapped page reads as zero and would hide one. The allocator,
+not the assertion, would be deciding the outcome. 151b is the proof; the test is the regression
+guard, and its real work is proving the GEMM covers every element — if any were left unwritten, the
+two arms would diverge.
+
+### 151d. WHAT IS DELIBERATELY NOT IN THIS CHANGE
+
+`dout_flat`, allocated 30 lines earlier, is 2 MB and is also fully overwritten — every chunk is
+exactly `out_ch` long and the inner loop writes all of them — so it carries the identical dead
+zeroing. It is left alone on purpose: it is ~9x smaller than `dpanel`, and moving both would leave
+no way to say which buffer paid. ONE lever, one buffer, one row. `dweight` (73 KB) is negligible and
+also untouched.
+
+### 151e. THE PREDICTION, SO IT CAN FAIL
+
+If item 141's 1.072 ms is the zeroing, this removes most of it from a backward that item 146 has
+already taken to roughly 7 ms — call it 10-15% of the kernel, and less of the lane. That is a
+modest, checkable claim, and three things would refute it:
+
+* the phase is dominated by the ALLOCATION (mmap/page-fault cost) rather than the zero STORES, in
+  which case an uninit buffer of the same size saves little and the first-touch simply moves into
+  the GEMM;
+* mimalloc already serves this size class from a warm, pre-zeroed free list, making the `vec!`
+  zeroing far cheaper than a cold 18.9 MB write;
+* the GEMM's own store pattern first-touches pages less efficiently than the sequential zero pass
+  it replaces — the write-pattern effect that item 36 measured when the same lever paid 2.44x on a
+  contiguous fill and only 1.27x on strided stores.
+
+The third is the one to watch: `dgemm` writes `dpanel` in blocked/tiled order, not sequentially, and
+`project_outer_gate_serial_vein` records that this vein pays for SEQUENTIAL writes specifically.
+A tiled first-touch is exactly the case that has underdelivered before.
