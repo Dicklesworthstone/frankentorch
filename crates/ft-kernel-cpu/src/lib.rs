@@ -45734,6 +45734,143 @@ mod tests {
         }
     }
 
+    /// frankentorch-l2zki item 184: the conv3d forward and the f32 conv2d forward must also be
+    /// independent of rayon pool width — the coverage item 175 named as owed.
+    ///
+    /// UNBUILT — written under a build freeze, never executed.
+    ///
+    /// Item 175 covered `conv2d_forward_f64` / `conv2d_backward_f64` and said explicitly that it
+    /// "does not cover the f32 mirrors or conv3d, which received the same treatment in items 160
+    /// and 165", leaving it owed rather than doing it blind. This is that.
+    ///
+    /// Those two are not filler. Item 165 replaced conv3d's output transpose with the same
+    /// per-batch blocked kernel — on the ONE function here that sits under a certified standing
+    /// (`conv3d_masked`) — and item 160 did the same to the f32 forward, which has NO h2h lane at
+    /// all and therefore nothing else watching it. A width-dependent result in either would be
+    /// invisible to the board, whose parity column compares against PyTorch within one run at one
+    /// width.
+    ///
+    /// conv3d's shape is chosen so `patch_count * out_ch` = 4096*16 = 65536 reaches
+    /// `transpose_2d_into_f64`'s own `1 << 16` parallel gate — the inner transpose item 165 relies
+    /// on. Below that gate it runs serial at every width and the test would pass vacuously.
+    #[test]
+    fn conv3d_and_f32_forwards_do_not_depend_on_rayon_pool_width() {
+        const B: usize = 1;
+        const CI: usize = 8;
+        const CO: usize = 16;
+        const S: usize = 16; // spatial extent, all three axes
+        const K: usize = 3;
+        const P: usize = S + 2; // padded extent
+        const O: usize = P - K + 1;
+
+        let pw3 = CI * K * K * K;
+        let padded3: Vec<f64> = (0..B * CI * P * P * P)
+            .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+            .collect();
+        let weight3: Vec<f64> = (0..CO * pw3)
+            .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+            .collect();
+        let bias3: Vec<f64> = (0..CO)
+            .map(|i| {
+                if i.is_multiple_of(3) {
+                    -0.0
+                } else {
+                    0.25 - (i as f64) * 0.01
+                }
+            })
+            .collect();
+
+        // f32 mirror, smaller: it has no lane, so this is its only coverage of any kind.
+        const F32_S: usize = 32;
+        const F32_P: usize = F32_S + 2;
+        const F32_O: usize = F32_P - K + 1;
+        let pw2 = CI * K * K;
+        let padded2: Vec<f32> = (0..2 * CI * F32_P * F32_P)
+            .map(|i| ((i % 251) as f32) * 0.001 - 0.12)
+            .collect();
+        let weight2: Vec<f32> = (0..CO * pw2)
+            .map(|i| ((i % 241) as f32) * 0.001 - 0.11)
+            .collect();
+        let bias2: Vec<f32> = (0..CO)
+            .map(|i| {
+                if i.is_multiple_of(3) {
+                    -0.0
+                } else {
+                    0.25 - (i as f32) * 0.01
+                }
+            })
+            .collect();
+
+        let mut reference: Option<(Vec<f64>, Vec<f32>)> = None;
+        for width in [1usize, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
+            let (c3, c2f32) = pool.install(|| {
+                let c3 = super::conv3d_forward_f64(
+                    &padded3,
+                    &weight3,
+                    Some(&bias3),
+                    B,
+                    CI,
+                    P,
+                    P,
+                    P,
+                    K,
+                    K,
+                    K,
+                    O,
+                    O,
+                    O,
+                    1,
+                    1,
+                    1,
+                    CO,
+                );
+                let c2f32 = super::conv2d_forward_f32(
+                    &padded2,
+                    &weight2,
+                    Some(&bias2),
+                    2,
+                    CI,
+                    F32_P,
+                    F32_P,
+                    K,
+                    K,
+                    F32_O,
+                    F32_O,
+                    1,
+                    1,
+                    CO,
+                );
+                (c3, c2f32)
+            });
+            match &reference {
+                None => reference = Some((c3, c2f32)),
+                Some((r3, r2)) => {
+                    for (i, (g, w)) in c3.iter().zip(r3.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "item 184: conv3d_forward_f64 differs at pool width {width}, index \
+                             {i} (got {g}, 1-thread reference {w}) — a width-dependent result is \
+                             a BUG the h2h board cannot see"
+                        );
+                    }
+                    for (i, (g, w)) in c2f32.iter().zip(r2.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "item 184: conv2d_forward_f32 differs at pool width {width}, index \
+                             {i} (got {g}, 1-thread reference {w})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// frankentorch-hi9r6 item 180: every gradient a MASKED conv2d backward produces must be
     /// bit-identical to the unmasked path's, and every one it skips must be `None`.
     ///

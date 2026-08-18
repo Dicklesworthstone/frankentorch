@@ -33690,3 +33690,63 @@ The f64 fixtures are NOT widened, because they did not need it.
 Unchanged and still the gate on everything in items 179, 181 and 183: build, and run these tests.
 Three commits of unverified numerical code have now stacked up behind the freeze, and the f32
 routes should be considered unproven until this test in particular passes.
+
+## 184. THE DETERMINISM COVERAGE ITEM 175 LEFT OWED — AND A conv3d MASKED-GRADIENT LEVER I DECLINED TO SHIP UNBUILT
+
+`frankentorch-l2zki` and `frankentorch-hi9r6`. **UNBUILT**: build freeze — `/data` 26G, 99% used,
+loadavg 6.84/9.27/8.89 — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 184a. THE LEVER I FOUND AND DID NOT TAKE
+
+conv3d has the identical defect item 178 fixed in conv2d, and on better ground: ft-api's conv3d
+FIRST-ORDER backward closure (`lib.rs:31786`) takes `_ctx` and computes all three gradients, while
+its create_graph sibling gates on `needs_input_grad`. **Both conv3d lanes freeze the weight**
+(`tensor_variable(.., false)` at two sites), so `conv3d_masked` — which carries a CERTIFIED
+standing, unlike any conv2d lane — has been computing a discarded `dweight` every round.
+
+It is worth more than conv2d's was. conv3d's dweight path builds a **28.3 MB** im2col panel (in
+`D_KC` blocks, per the kernel's own comment) and runs a `32 x 4096 x 864` = 113M-MAC GEMM. That is
+a larger share of its backward than the ~18% item 141 priced for conv2d.
+
+**I did not implement it.** conv2d's version worked because `conv2d_backward_f64`'s pieces were
+separable behind a new entry point that delegates. conv3d's generic path is a private ~120-line
+function whose dweight branch builds its panel in blocks INSIDE the `build_uninit` closure, so
+threading a mask through it means moving that body wholesale — the riskiest edit shape there is
+with no compiler, on what would be my fourteenth unbuilt change. Copying the branch instead would
+duplicate the blocked-panel algebra, which is the drift hazard `conv3d_im2col_fill_rows_f64` was
+extracted to remove.
+
+So it is written down with its location, its size, and its shape, and the next agent with a
+compiler can take it in one sitting. **A lever recorded is worth more than a lever shipped blind**
+— items 159/161/163 were reverted wholesale for the opposite choice.
+
+### 184b. WHAT I DID INSTEAD, AND WHY IT IS NOT FILLER
+
+Item 175 built a pool-width determinism test for `conv2d_forward_f64` / `conv2d_backward_f64` and
+said plainly that it "does not cover the f32 mirrors or conv3d, which received the same treatment
+in items 160 and 165", leaving it owed rather than doing it blind. This closes that.
+
+Those two functions are where the gap matters most:
+
+* **conv3d's forward** is the only function this session touched that sits under a CERTIFIED
+  standing (`conv3d_masked`), and item 165 replaced its output transpose with the per-batch blocked
+  kernel.
+* **the f32 conv2d forward** has NO h2h lane at all (item 152 recorded that consequence), so
+  nothing else in the automated surface exercises it in any way.
+
+And per item 175a, the board structurally cannot catch this class of bug: its parity column
+compares FrankenTorch against PyTorch **within one run at one pool width**, so a width-dependent
+result would match PyTorch in every run and still be wrong.
+
+The conv3d shape is picked so `patch_count * out_ch` = 4096*16 = 65536 reaches
+`transpose_2d_into_f64`'s `1 << 16` gate — the inner parallel transpose item 165 depends on. Below
+it the kernel runs serial at every width and the test passes vacuously, which is the standard way
+determinism tests end up proving nothing.
+
+### 184c. STATUS
+
+The unbuilt stack is now fourteen of my changes plus a comparable number of peers', and this item
+adds a test rather than more of it. Everything owed remains owed: `cargo build`, `cargo clippy`,
+`cargo test`, then the paired vs-PyTorch runs for items 170, 178 and 182.
+
+NOT VERIFIED: compilation, and this test has never run.
