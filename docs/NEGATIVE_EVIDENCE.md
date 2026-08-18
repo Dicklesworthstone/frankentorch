@@ -32251,3 +32251,54 @@ on `conv2d` and `conv2d_masked` in one invocation. Six of my changes and six pee
 main compiled by nobody, several touching adjacent lines of the same two functions. `rustfmt` is
 the only gate any of it has passed; `ubs` has reported this file too large to scan on every
 commit. **Compiling this stack should come before any new lever when the volume frees.**
+
+## 163. LU's PANEL ELIMINATION DISPATCHED A RAYON TASK PER ~64 FLOPS — AND ITS GATE TESTS ROWS WHILE TASK SIZE IS SET BY COLUMNS
+
+`frankentorch-4zjaa` vein, applied outside SVD. UNBUILT: /data 28G / 99%, no cargo run.
+
+Items 157/159/161 found three helpers forking one rayon task per row inside a loop. Sweeping the
+rest of the file for the same shape turned up `lu_factor_contiguous_f64` and its f32 twin, and
+they are a worse case than any of the bidiag ones.
+
+The panel elimination is:
+
+    if rows_below >= LU_PAR_MIN_ROWS && threads > 1 {
+        tail.par_chunks_mut(n).for_each(|row_i| { ... for j in (k+1)..pe { ... } });
+    }
+
+### WHY THIS IS WORSE THAN THE BIDIAG CASES
+
+Its own comment says the elimination is panel-only — "eliminate WITHIN the panel only (columns
+k+1..pe); trailing columns are deferred to the GEMM". So each task's work is `pe - k - 1`
+columns, **the panel width**, not `n`. One task per row means a rayon dispatch per roughly a
+panel-width of multiply-subtracts, and this runs once per pivot: order `n^2` task dispatches
+across a factorization. At n=1000 with a 64-wide panel that is on the order of a million tasks of
+~64 flops each, against a rayon dispatch cost item 103 measured in the hundreds of nanoseconds.
+
+**And the gate cannot see it.** `rows_below >= LU_PAR_MIN_ROWS` tests ROWS, while the per-task
+work is set by COLUMNS (`pe - k - 1`). A rows-only gate admits the parallel branch exactly when
+there are many rows to split — which is also when there are many tiny tasks to dispatch. The
+bidiag gate at least multiplies `nrows * ncols`; this one does not look at width at all.
+
+### THE CHANGE
+
+Both LU variants now bundle `LU_PAR_CHUNK_ROWS` (64) rows per task. BIT-EXACT, and for the
+strongest available reason: each row reads only `pivot_row` and writes only its own cells, so
+repartitioning rows across tasks cannot change an association or a value. This is the same
+row-independence argument that made items 159 and 161 free, and it does NOT apply to
+`reduce_scaled_rows_f64`, which remains the one helper in this family whose parallel arm really
+does differ in bits.
+
+### WHAT IS NOT CLAIMED
+
+No measurement. The gate itself is left alone: making it width-aware would change WHICH inputs
+take the parallel branch, and — unlike chunking — that is a decision that wants a number behind
+it. Recorded as the obvious follow-up, not done blind.
+
+Four instances of this pattern are now fixed (items 159, 161, and this one covering two
+functions); one, `reduce_scaled_rows_f64`, is deliberately untouched; and the gate question from
+item 157 is still the one that would move 4zjaa's published A/B.
+
+VERIFIED WITHOUT A COMPILER: `rustfmt --edition 2024 --check` exits 0; `tail` has length
+`(n-k-1)*n`, an exact multiple of `n`, so `chunks_exact_mut(n)` drops no remainder row; the inner
+body is unchanged apart from its binding. NOT VERIFIED: compilation, execution, timing.

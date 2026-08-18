@@ -21308,6 +21308,14 @@ pub fn lu_factor_contiguous_f64(
     // precision, checked by `lu_factor_reconstructs_pa_eq_lu`).
     const NB: usize = 64;
     const LU_PAR_MIN_ROWS: usize = 64;
+    /// Rows per rayon task in the panel elimination — NEGATIVE_EVIDENCE item 163.
+    ///
+    /// The elimination below is PANEL-ONLY: each row touches `pe - k - 1` columns — the panel
+    /// width — not `n`. One task per row therefore dispatched a rayon task per ~panel-width
+    /// flops, once per pivot, which is order `n^2` dispatches across a factorization. Note the
+    /// gate above tests ROWS (`LU_PAR_MIN_ROWS`) while the per-task WORK is set by COLUMNS, so
+    /// a rows-only gate cannot see that each task is tiny.
+    const LU_PAR_CHUNK_ROWS: usize = 64;
     let singular_tol = f64::EPSILON * 1e3;
 
     let mut k0 = 0;
@@ -21349,11 +21357,16 @@ pub fn lu_factor_contiguous_f64(
             if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n..(k + 1) * n];
-                tail.par_chunks_mut(n).for_each(|row_i| {
-                    let m = row_i[k] / diag;
-                    row_i[k] = m;
-                    for j in (k + 1)..pe {
-                        row_i[j] -= m * pivot_row[j];
+                // CHUNKED, NOT ONE TASK PER ROW — item 163. BIT-EXACT: each row reads only
+                // `pivot_row` and writes only its own cells, so repartitioning rows across
+                // tasks cannot change an association or a value. UNBUILT, UNMEASURED.
+                tail.par_chunks_mut(LU_PAR_CHUNK_ROWS * n).for_each(|rows| {
+                    for row_i in rows.chunks_exact_mut(n) {
+                        let m = row_i[k] / diag;
+                        row_i[k] = m;
+                        for j in (k + 1)..pe {
+                            row_i[j] -= m * pivot_row[j];
+                        }
                     }
                 });
             } else {
@@ -21453,6 +21466,14 @@ pub fn lu_factor_contiguous_f32(
 
     const NB: usize = 64;
     const LU_PAR_MIN_ROWS: usize = 64;
+    /// Rows per rayon task in the panel elimination — NEGATIVE_EVIDENCE item 163.
+    ///
+    /// The elimination below is PANEL-ONLY: each row touches `pe - k - 1` columns — the panel
+    /// width — not `n`. One task per row therefore dispatched a rayon task per ~panel-width
+    /// flops, once per pivot, which is order `n^2` dispatches across a factorization. Note the
+    /// gate above tests ROWS (`LU_PAR_MIN_ROWS`) while the per-task WORK is set by COLUMNS, so
+    /// a rows-only gate cannot see that each task is tiny.
+    const LU_PAR_CHUNK_ROWS: usize = 64;
     let singular_tol = f32::EPSILON * 1e3;
 
     let mut k0 = 0;
@@ -21488,11 +21509,16 @@ pub fn lu_factor_contiguous_f32(
             if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n..(k + 1) * n];
-                tail.par_chunks_mut(n).for_each(|row_i| {
-                    let m = row_i[k] / diag;
-                    row_i[k] = m;
-                    for j in (k + 1)..pe {
-                        row_i[j] -= m * pivot_row[j];
+                // CHUNKED, NOT ONE TASK PER ROW — item 163. BIT-EXACT: each row reads only
+                // `pivot_row` and writes only its own cells, so repartitioning rows across
+                // tasks cannot change an association or a value. UNBUILT, UNMEASURED.
+                tail.par_chunks_mut(LU_PAR_CHUNK_ROWS * n).for_each(|rows| {
+                    for row_i in rows.chunks_exact_mut(n) {
+                        let m = row_i[k] / diag;
+                        row_i[k] = m;
+                        for j in (k + 1)..pe {
+                            row_i[j] -= m * pivot_row[j];
+                        }
                     }
                 });
             } else {
