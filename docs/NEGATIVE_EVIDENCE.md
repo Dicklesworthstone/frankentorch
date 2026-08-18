@@ -35059,3 +35059,52 @@ reason mine refuses rather than sleeps. The caller retries when the host is thei
 It also cannot help the harness itself — the slot lives in the binary and the script only reads its
 records — so a run started by hand still needs the harness's own announcement to be visible to the
 next one.
+
+## 199. THE SENTINEL HAD A ZERO THAT MEANT TWO DIFFERENT THINGS
+
+`frankentorch-hi9r6`. **UNBUILT** — `/data` 43G, at the brake; no cargo ran. `rustfmt --edition
+2024 --check` exits 0. No measurement: loadavg 5.51/7.30/18.42 is still decaying, so a run would
+end at a different load than it began.
+
+### 199a. THE WART
+
+Item 190 instrumented the two MASKED conv2d backwards and documented a quirk: `[true, true, _]`
+counts `(0, 0)`, because with both gradients wanted there is nothing to save and the masked entry
+delegates to the unmasked kernel, which carried no counters.
+
+That was honest and it was still wrong to leave. The instrument's entire job is to distinguish
+"this GEMM did not run" from "this GEMM ran"; a `(0, 0)` meaning *counted somewhere else* sitting
+in the same table as `(0, 1)` meaning *skipped* is two facts sharing one representation. Anyone
+reading the table later — including me — has to remember a footnote to interpret a row correctly,
+and footnotes do not survive.
+
+### 199b. THE CHANGE
+
+The four GEMM sites in `conv2d_backward_f64` and `conv2d_backward_f32` now increment the same
+thread-local counters. The counters mean "a conv2d-backward GEMM executed on this thread", route
+independent, and the delegating case reads `(1, 1)` — nothing skipped, which is the truth of it.
+
+One route-dependence survives and cannot be counted away: the all-ones adjoints replace both GEMMs
+with a column-sum and a single one-row GEMM, so there is no GEMM to count and a zero there means
+"fast-pathed". That is why every test using these counters forces the generic route with a
+non-uniform `dout`, and why the doc says so rather than leaving it to be rediscovered.
+
+Item 197's ft-api test is unaffected: it uses single-output masks precisely because the delegating
+case could not distinguish anything, and it still can't tell them apart — it now simply has no
+reason to try.
+
+### 199c. ALSO CHECKED, COSTING NOTHING
+
+The two arms of the h2h harness were compared for lane-name symmetry, since I have been editing
+both:
+
+    registered on the FT arm with no incumbent twin ("PyTorch row missing"):  none
+    defined on the incumbent arm and never registered:                        prelu
+    matched:                                                                  38
+
+The direction that matters is clean. `prelu` is dead weight on the incumbent side — harmless, since
+the serve loop only runs requested lanes, and not mine to delete.
+
+### 199d. OWED
+
+Unchanged: compile items 194-199, then `FT_H2H_LANES=conv2d` at `round_warmup=0` once 1m ~ 5m ~ 15m.

@@ -8437,6 +8437,7 @@ pub fn conv2d_backward_f32(
             dweight.fill(0.0);
             return;
         }
+        CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
         gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
     });
     // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
@@ -8486,6 +8487,7 @@ pub fn conv2d_backward_f32(
             dpanel.fill(0.0);
             return;
         }
+        CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
         gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
     });
     let dpadded = conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
@@ -9543,10 +9545,16 @@ thread_local! {
 /// count is taken once, where the call was made — so a per-thread cell observes exactly the work
 /// this thread asked for.
 ///
-/// Counts the generic route only: the all-ones adjoints replace both GEMMs with a column-sum and a
-/// single one-row GEMM, so a zero here means "skipped OR fast-pathed", never "skipped" alone. A
-/// test that wants the distinction must use a non-uniform `dout`, which is what forces the generic
-/// route.
+/// Counts every conv2d-backward GEMM on this thread, in the masked entries AND the unmasked ones
+/// they delegate to (item 198). Before that the masked entry's `[true, true]` case read (0, 0) --
+/// it delegates, and the delegate was not instrumented -- which put a zero meaning "counted
+/// somewhere else" right beside zeros meaning "skipped". Two different facts should not share a
+/// representation in an instrument whose entire job is telling them apart.
+///
+/// Still route-dependent in one way that counting harder cannot fix: the all-ones adjoints replace
+/// both GEMMs with a column-sum and a single one-row GEMM, so on that route there is no GEMM to
+/// count and a zero means "fast-pathed". A test that wants to see "skipped" must therefore use a
+/// non-uniform `dout`, which is what forces the generic route.
 #[must_use]
 pub fn conv2d_backward_gemm_counts() -> (usize, usize) {
     (
@@ -9785,6 +9793,7 @@ pub fn conv2d_backward_f64(
             dweight.fill(0.0);
             return;
         }
+        CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
         gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
     });
     // FREE THE PANEL HERE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE item 143.
@@ -9850,6 +9859,7 @@ pub fn conv2d_backward_f64(
     // them), so it carries the same dead zeroing. It is ~9x smaller than `dpanel` and folding it
     // in would blur which buffer paid, so this change moves ONE buffer and item 151 prices it.
     let dpanel = build_pool_output(flat * patch_width, |dp| {
+        CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
         gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
     });
     let dpadded = conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
@@ -66363,10 +66373,10 @@ mod tests {
     /// that route a zero count would mean "fast-pathed" rather than "skipped" and the test would
     /// pass while proving nothing.
     ///
-    /// `[true, true, _]` is expected to count (0, 0): with both gradients wanted there is nothing
-    /// to save, so the masked entry DELEGATES to the unmasked kernel, whose GEMMs are not
-    /// instrumented. That is a property of where the counters live, stated here so the zero is not
-    /// read as a skip.
+    /// `[true, true, _]` counts (1, 1): with both gradients wanted there is nothing to save, so the
+    /// masked entry delegates to the unmasked kernel — which item 198 instrumented too, precisely
+    /// so this case reads "both ran" instead of the (0, 0) it used to, which was a zero meaning
+    /// "counted somewhere else" sitting among zeros meaning "skipped".
     #[test]
     fn conv2d_backward_masked_skips_the_gemm_the_mask_declines() {
         let (batch, in_ch, ph, pw) = (2usize, 3usize, 9usize, 10usize);
@@ -66395,7 +66405,9 @@ mod tests {
             ([true, false, false], (0, 1)),
             ([false, true, false], (1, 0)),
             ([false, false, true], (0, 0)),
-            ([true, true, false], (0, 0)), // delegates; see the doc comment
+            // Delegates to the unmasked kernel, which is instrumented too since item 198, so
+            // this reads (1, 1): nothing is skipped when both gradients are wanted.
+            ([true, true, false], (1, 1)),
         ];
 
         for &(mask, want) in expectations {
