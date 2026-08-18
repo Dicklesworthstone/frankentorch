@@ -1458,6 +1458,14 @@ LANES = {
         "{}",
         ft_api::harness_provenance::measurement_host_block(rayon::current_num_threads())
     );
+    // frankentorch-hi9r6 item 193: WHO ELSE was measuring. Printed next to the host block because
+    // it answers the question loadavg cannot — a run at loadavg 85 of compilation and a run at
+    // loadavg 85 of two other harnesses sampling are not the same measurement, and only the second
+    // one inverts ratios.
+    println!(
+        "{}",
+        ft_api::harness_provenance::concurrent_measurement_block()
+    );
     // frankentorch-68pwz: the clock domain each arm ran in. Printed unconditionally
     // because a row that does not say this cannot be read: at a 2.8x cross-core spread,
     // a ratio can be a frequency artefact and every gate in this harness is blind to it.
@@ -2383,6 +2391,35 @@ LANES = {
         if endpoint_quotable { "PASS" } else { "DRIFTED" },
         if load_quotable { "PASS" } else { "DRIFTED" }
     );
+    // OVERSUBSCRIPTION GATE — `frankentorch-hi9r6`, item 194.
+    //
+    // The drift gate below tests whether load MOVED, and says so in its own message: "a steady
+    // busy host is measurable". That is true up to a point and false past it. This invocation
+    // proved where the line is — it ran at load 79.87 -> 88.19 on a 64-core box, the drift gate
+    // said PASS because the load was steady, and PyTorch's arm read 78-113 ms on lanes where it
+    // normally reads a few. A steady queue of 88 runnable tasks on 64 cores is not a busy host,
+    // it is a host where every arm is waiting for a core, and the wait lands on whichever arm
+    // happens to be scheduled worse.
+    //
+    // `loadavg > online_cpus` is the principled form of that: above it the run queue exceeds the
+    // machine, so timings include queueing delay rather than work. Below it a busy host really is
+    // measurable and the drift gate is the right instrument.
+    //
+    // Reported, not enforced. The harness refuses nothing on its own — it prints what it saw and
+    // the reader decides — but a row taken above this line should be treated exactly like a
+    // LOAD-DRIFTED one, whatever its nulls say. The nulls do NOT protect against this: in the run
+    // that motivated the gate, one lane's FT null read 1.013 and its PT null 1.032 while the
+    // incumbent arm was inflated twentyfold.
+    let peak_load = load_series.iter().copied().fold(f64::NAN, f64::max);
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    if cores > 0 && peak_load.is_finite() && peak_load > cores as f64 {
+        println!(
+            "OVERSUBSCRIBED: peak loadavg {peak_load:.2} exceeds online_cpus {cores} — the run \
+             queue was longer than the machine, so every arm spent time WAITING rather than \
+             working. Treat every row below as unquotable, exactly as if the drift gate had \
+             failed; passing A/A nulls do not rescue it (item 194)."
+        );
+    }
     let fmt_load = |value: Option<f64>| {
         value.map_or_else(|| "unknown".to_owned(), |load| format!("{load:.2}"))
     };

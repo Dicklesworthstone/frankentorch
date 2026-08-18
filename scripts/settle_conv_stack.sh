@@ -41,6 +41,20 @@ if [ -z "${free_gb}" ] || [ "${free_gb}" -lt "${FLOOR_GB}" ]; then
 fi
 echo "/data ${free_gb}G free (floor ${FLOOR_GB}G)"
 
+# Item 194: refuse to START when the run queue already exceeds the machine. The harness's drift
+# gate tests whether load MOVED and explicitly permits "a steady busy host"; at loadavg 88 on 64
+# cores that permission is wrong -- PyTorch's arm inflated twentyfold while the drift gate said
+# PASS and the A/A nulls looked calm. Recording host state after the fact does not help if the
+# run should never have started, so this is a gate rather than a note.
+CORES=$(nproc 2>/dev/null || echo 0)
+PEAK=$(cut -d' ' -f1 /proc/loadavg)
+if [ "${CORES}" -gt 0 ] && awk -v l="${PEAK}" -v c="${CORES}" 'BEGIN{exit !(l > c)}'; then
+  echo "REFUSING: loadavg ${PEAK} exceeds ${CORES} cores -- the run queue is longer than the" >&2
+  echo "machine, so every arm would be waiting rather than working. Wait for a quiet window." >&2
+  exit 1
+fi
+echo "loadavg ${PEAK} against ${CORES} cores"
+
 if [ ! -x "${BIN}" ]; then
   echo "missing ${BIN} — build it first (ONE build per project; check the slot is free):" >&2
   echo "  RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR cargo build --release \\" >&2

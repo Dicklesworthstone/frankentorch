@@ -34608,3 +34608,64 @@ A single `cargo build --release -p frankentorch-api --features fair-alloc --exam
 gauntlet_lane_sweep_h2h`, then this exact run again. Everything else — the shape, the round count,
 the lane, the provenance discipline — is now known to work. The blocker is a build flag and a disk
 throttle, not a measurement problem.
+
+## 194. THE DRIFT GATE PASSED ON A RUN WHERE THE INCUMBENT ARM INFLATED TWENTYFOLD — "A STEADY BUSY HOST IS MEASURABLE" HAS A CEILING, AND IT IS `online_cpus`
+
+`frankentorch-hi9r6` (P0). **UNBUILT** (disk throttle, `/data` 62-63G, no cargo). `rustfmt
+--edition 2024 --check` exits 0.
+
+### 194a. WHAT HAPPENED
+
+I ran the `avg_pool1d` lanes to test item 193c's round-count hypothesis on the top P1 bead. The
+orchestrator flagged, mid-run, that the host had a run queue of 90 with CPU idle 0: a frankenscipy
+python at 3263% CPU plus **two** frankentorch PyTorch harnesses at 336% and 283%. One of those two
+was mine — I was part of the contention I was measuring through.
+
+The harness recorded `load_1m start=79.87 end=88.19` and **`drift_gate=PASS`**.
+
+    avg_pool1d               FT  24.242   PT  78.113    "3.22x FASTER"
+    avg_pool1d_dense         FT  70.972   PT 113.777    "1.60x FASTER"
+    avg_pool1d_dense_zeroed  FT  82.645   PT 118.545    "1.43x FASTER"   FT null 1.013, PT null 1.032
+
+Every row NULL-FAILED, so nothing was quoted and nothing needs retracting. But the numbers are
+worth recording as a specimen: PyTorch's arm read 78-118 ms on lanes where it reads a few, because
+it was queueing for cores rather than working. **A contention artifact wearing the shape of a 3.2x
+win.**
+
+### 194b. THE GAP THIS EXPOSES
+
+The drift gate tests whether load MOVED, and says so in its own message: *"the signal is DRIFT in
+either direction, not level — a steady busy host is measurable"*. That is correct up to a point,
+and this run found the point. Load was steady — 79.87 to 88.19 is well inside the drift band — so
+the gate passed on a run in which every arm spent most of its time waiting.
+
+**The A/A nulls do not protect against it either.** `avg_pool1d_dense_zeroed` posted FT 1.013 and
+PT 1.032 — nearly clean — while its incumbent arm was inflated roughly twentyfold. A null asks
+whether an arm is self-consistent, and an arm can be consistently starved.
+
+### 194c. THE GATE, AND WHY `online_cpus` IS THE RIGHT LINE
+
+`loadavg > online_cpus` is the principled form of "the run queue is longer than the machine".
+Below it, a busy host really is measurable and the drift gate is the right instrument; above it,
+timings include queueing delay rather than work, and no amount of averaging removes that because
+it is not noise — it is a different quantity.
+
+Two changes, both defaulting to loud rather than silent:
+
+* the harness prints an `OVERSUBSCRIBED:` banner when the PEAK of its per-round load series exceeds
+  `available_parallelism()`, telling the reader to treat every row exactly as if the drift gate had
+  failed. **Reported, not enforced** — this harness's design is to print what it saw and let the
+  reader decide, and a hard refusal would also destroy the specimen above, which was worth having.
+* `scripts/settle_conv_stack.sh` REFUSES to start at all in that state. That one is a hard gate
+  because recording host state after the fact does not help if the run should never have begun, and
+  a script exists precisely to stop a queue of runs being fired into a bad window.
+
+### 194d. WHAT IS NOT SETTLED
+
+Item 193c's hypothesis — that `frankentorch-372h8`'s ten failed runs are a round-count problem
+rather than a host problem — remains untested. The 16-round baseline above is void, and the
+64-round follow-up was not started once the contention was flagged. It is still the cheapest thing
+to try on that bead when the host is quiet.
+
+Also unchanged: this snapshot lacks `--features fair-alloc`, so even a clean avg_pool1d row from it
+would carry item 193b's caveat.
