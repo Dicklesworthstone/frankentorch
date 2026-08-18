@@ -8244,6 +8244,31 @@ pub fn conv2d_backward_f32(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let flat = batch * patch_count;
+    // The all-ones adjoint, which this dtype did not have — see
+    // `conv2d_backward_3x3_stride1_ones_dout_f32`. Guard mirrors the f64 route's exactly so the
+    // two dtypes cannot drift into taking different routes for the same call.
+    if ph > 1
+        && oh > 1
+        && kh == 3
+        && kw == 3
+        && sh == 1
+        && sw == 1
+        && !dout.is_empty()
+        && dout_is_all_ones_f32(dout)
+    {
+        return conv2d_backward_3x3_stride1_ones_dout_f32(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            oh,
+            ow,
+            out_ch,
+            has_bias,
+        );
+    }
     let mut dout_flat = vec![0.0f32; flat * out_ch];
     dout_flat
         .par_chunks_mut(out_ch)
@@ -9317,6 +9342,26 @@ fn dout_is_all_ones_f64(dout: &[f64]) -> bool {
     }
 }
 
+/// f32 mirror of [`dout_is_all_ones_f64`]. Same probe-then-parallel shape, same bit comparison —
+/// `to_bits()` and not `==`, so a `-1.0` can never be mistaken for a `1.0` and, more to the point,
+/// so the predicate means exactly "every element IS the constant the adjoint assumes".
+fn dout_is_all_ones_f32(dout: &[f32]) -> bool {
+    const PROBE: usize = 64;
+    const PAR_MIN: usize = 1 << 16;
+
+    let one = 1.0f32.to_bits();
+    let probe = PROBE.min(dout.len());
+    if !dout[..probe].iter().all(|&v| v.to_bits() == one) {
+        return false;
+    }
+    let rest = &dout[probe..];
+    if rest.len() >= PAR_MIN {
+        rest.par_iter().all(|&v| v.to_bits() == one)
+    } else {
+        rest.iter().all(|&v| v.to_bits() == one)
+    }
+}
+
 /// Gather `dout` `[N, out_ch, patch_count]` into `dout_flat` `[flat, out_ch]`.
 ///
 /// Extracted by item 178 so the full backward and the masked one cannot drift apart. Both
@@ -9922,6 +9967,204 @@ fn conv2d_ones_dout_scatter_dpadded_f64(
                 dp.copy_from_slice(&protos[c * plane_len..(c + 1) * plane_len]);
             });
     })
+}
+
+/// f32 mirror of [`conv2d_ones_dout_scatter_dpadded_f64`]: prototype per channel, then broadcast.
+///
+/// The tap masks are dtype-free, so [`conv2d_ones_dout_tap_mask`] is shared rather than mirrored.
+/// Everything else follows items 174 and 177 unchanged — contributions accumulate `kr` DESCENDING
+/// then `kc` DESCENDING starting from `0.0`, which is what the loop this replaces did, and both
+/// buffers are `build_uninit` because neither is accumulated into.
+fn conv2d_ones_dout_scatter_dpadded_f32(
+    dpanel_row: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f32> {
+    const KH: usize = 3;
+    const KW: usize = 3;
+    let plane_len = ph * pw;
+    if plane_len == 0 || in_ch == 0 || batch == 0 {
+        return Vec::new();
+    }
+    let rmasks: Vec<usize> = (0..ph)
+        .map(|y| conv2d_ones_dout_tap_mask(y, oh, KH))
+        .collect();
+    let cmasks: Vec<usize> = (0..pw)
+        .map(|x| conv2d_ones_dout_tap_mask(x, ow, KW))
+        .collect();
+    let protos = build_uninit(in_ch * plane_len, |p: &mut [f32]| {
+        p.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(c, plane)| {
+                let pch = c * KH * KW;
+                let mut table = [[0.0f32; 1 << KW]; 1 << KH];
+                for (rm, trow) in table.iter_mut().enumerate() {
+                    for (cm, slot) in trow.iter_mut().enumerate() {
+                        let mut acc = 0.0f32;
+                        for kr in (0..KH).rev() {
+                            if rm & (1 << kr) == 0 {
+                                continue;
+                            }
+                            for kc in (0..KW).rev() {
+                                if cm & (1 << kc) == 0 {
+                                    continue;
+                                }
+                                acc += dpanel_row[pch + kr * KW + kc];
+                            }
+                        }
+                        *slot = acc;
+                    }
+                }
+                for (y, rm) in rmasks.iter().enumerate() {
+                    let trow = &table[*rm];
+                    for (v, cm) in plane[y * pw..(y + 1) * pw].iter_mut().zip(cmasks.iter()) {
+                        *v = trow[*cm];
+                    }
+                }
+            });
+    });
+    build_uninit(batch * in_ch * plane_len, |d: &mut [f32]| {
+        d.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, dp)| {
+                let c = plane % in_ch;
+                dp.copy_from_slice(&protos[c * plane_len..(c + 1) * plane_len]);
+            });
+    })
+}
+
+/// f32 mirror of [`conv2d_backward_3x3_stride1_ones_dout_f64`] — the route f32 did not have.
+///
+/// THE GAP THIS CLOSES. The all-ones adjoint was f64-only: `conv2d_backward_f32` had no such
+/// dispatch at all, so an f32 summed loss built the full `[flat, patch_width]` im2col panel and ran
+/// both large GEMMs to compute a `dweight` whose `out_ch` rows are all equal and a `dpanel` whose
+/// `flat` rows are all equal. `project_asymmetric_dtype_fastpath` is exactly this shape of defect:
+/// a fast path gated on ONE dtype strands the other.
+///
+/// The two halves keep the f64 route's reasoning verbatim, because it is the same arithmetic:
+///
+/// - `dweight_row` replaces `sgemm_tb(out_ch, flat, patch_width, ones, panel)`, whose every row is
+///   the same row. It folds its partials on [`SGEMM_KC`] boundaries because the GEMM blocks `k`
+///   there, and a single ascending chain over `flat` is a DIFFERENT summation order that diverges
+///   once `flat` exceeds one block — the f64 twin shipped without this and 104 of 108 entries
+///   differed at `oh = ow = 64`. `folded` keeps the FIRST block ASSIGNED rather than added into
+///   `0.0`, so a `-0.0` first block is not canonicalised to `+0.0`.
+/// - `dpanel_row` is one real `sgemm` row rather than a hand-rolled chain over `oc`, for the same
+///   reason and with the same failure mode above 256 channels.
+///
+/// UNVERIFIED. The fold constant is read from the pinned dependency and the ordering argument is
+/// inherited from the f64 route, but nothing here has been compiled or run. Unlike the collapses in
+/// items 174-177, which only change how an existing result is computed, this ADDS A ROUTE: if the
+/// fold is wrong the failure is a wrong gradient, not a slow one. The acceptance test below is
+/// therefore written to cross `SGEMM_KC` — the f64 acceptance test uses `flat = 60` and could not
+/// have caught this class of bug at all.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_backward_3x3_stride1_ones_dout_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    let kh = 3usize;
+    let kw = 3usize;
+    let patch_width = in_ch * kh * kw;
+    let flat = batch * oh * ow;
+
+    let mut dweight_row = vec![0.0f32; patch_width];
+    dweight_row
+        .par_chunks_mut(kh * kw)
+        .enumerate()
+        .for_each(|(c, dwc)| {
+            for kr in 0..kh {
+                for kc in 0..kw {
+                    let mut total = 0.0f32;
+                    let mut block = 0.0f32;
+                    let mut in_block = 0usize;
+                    let mut folded = false;
+                    for n in 0..batch {
+                        let ch_off = (n * in_ch + c) * ph * pw;
+                        for oy in 0..oh {
+                            let irow = ch_off + (oy + kr) * pw + kc;
+                            for ox in 0..ow {
+                                block += padded[irow + ox];
+                                in_block += 1;
+                                if in_block == SGEMM_KC {
+                                    if folded {
+                                        total += block;
+                                    } else {
+                                        total = block;
+                                        folded = true;
+                                    }
+                                    block = 0.0;
+                                    in_block = 0;
+                                }
+                            }
+                        }
+                    }
+                    if in_block > 0 {
+                        if folded {
+                            total += block;
+                        } else {
+                            total = block;
+                        }
+                    }
+                    dwc[kr * kw + kc] = total;
+                }
+            }
+        });
+
+    let mut dweight = vec![0.0f32; out_ch * patch_width];
+    dweight
+        .par_chunks_mut(patch_width)
+        .for_each(|row| row.copy_from_slice(&dweight_row));
+
+    let ones_out = vec![1.0f32; out_ch];
+    let mut dpanel_row = vec![0.0f32; patch_width];
+    gemm::sgemm(
+        1,
+        out_ch,
+        patch_width,
+        &ones_out,
+        weight_flat,
+        &mut dpanel_row,
+    );
+
+    let dpadded = conv2d_ones_dout_scatter_dpadded_f32(&dpanel_row, batch, in_ch, ph, pw, oh, ow);
+
+    // dbias is NOT `flat as f32`, and this is the one place the f64 route could not be mirrored.
+    //
+    // The generic route accumulates `s += dout[..]` SEQUENTIALLY in f32 over `flat` elements, all
+    // of which are exactly 1.0 here. That sum equals `flat` only while the running total stays
+    // exactly representable: at `flat = 2^24 + 2` the sequential sum has already STALLED at 2^24
+    // (adding 1.0 to 2^24 rounds back to 2^24) while `flat as f32` keeps climbing. `batch*oh*ow`
+    // reaching 16.7M is a large but ordinary conv, so the divergence is reachable.
+    //
+    // The f64 route's `vec![flat as f64; out_ch]` is correct for the same computation purely
+    // because its mantissa is 53 bits and `flat` cannot approach 2^53 — a coincidence of dtype,
+    // not a shared argument, and mirroring it here would have shipped a wrong bias gradient.
+    //
+    // Replaying the sum costs `flat` adds once (not `out_ch * flat`), and needs no read of `dout`:
+    // the dispatch predicate has already established every addend is exactly 1.0.
+    let dbias = if has_bias {
+        let mut s = 0.0f32;
+        for _ in 0..flat {
+            s += 1.0;
+        }
+        Some(vec![s; out_ch])
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
 }
 
 fn conv2d_backward_3x3_stride1_ones_dout_f64(
@@ -14935,6 +15178,22 @@ pub fn conv3d_backward_f64(
 /// test that depends on it compares against the real GEMM rather than against this number,
 /// and fails loudly if they ever diverge. NEGATIVE_EVIDENCE item 97.
 const DGEMM_KC: usize = 256;
+
+/// `sgemm`'s k-block, the f32 counterpart of [`DGEMM_KC`].
+///
+/// `matrixmultiply` 0.3.11 (pinned in `Cargo.lock`) defines `S_KC` in `src/archparam_defaults.rs`
+/// as an UNCONDITIONAL `256` — one definition, no `cfg` variants — reached through
+/// `conf_env_or_default!("MATMUL_SGEMM_KC", ...)` exactly as `D_KC` is.
+///
+/// IT IS A SEPARATE CONSTANT THAT HAPPENS TO BE EQUAL, and it is written out rather than aliased
+/// to `DGEMM_KC` on purpose: they are independent knobs in the dependency, either can move alone
+/// in a `cargo update` or via that env var, and a fold that silently inherited the other type's
+/// block size would produce WRONG GRADIENTS with no compile error. `ft-api`'s widen/narrow gate
+/// pair carries a compile-time assert for the same class of mistake.
+///
+/// As with `DGEMM_KC`, the tests that depend on this compare against the REAL GEMM rather than
+/// against the number, so a divergence fails loudly instead of silently.
+const SGEMM_KC: usize = 256;
 
 #[allow(clippy::too_many_arguments)]
 fn conv3d_backward_ones_dout_f64(
@@ -64448,6 +64707,132 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The f32 all-ones adjoint must be BIT-IDENTICAL to the generic panel+GEMM route it now
+    /// intercepts — the f32 mirror of the f64 acceptance test, with one fixture the f64 test does
+    /// not have.
+    ///
+    /// WHY A SHAPE THAT CROSSES `SGEMM_KC`. The dweight reduction folds its partials on the GEMM's
+    /// own k-block boundaries, and a wrong fold is INVISIBLE below one block: with `flat` under
+    /// 256 there is a single block and any summation order gives the same answer. The f64
+    /// acceptance test runs at `flat = 60` and therefore could never have caught the very bug the
+    /// f64 route shipped with (104 of 108 dweight entries wrong at oh=ow=64). The first fixture
+    /// here has `flat = 288`, and the assert below pins that so the fixture cannot silently drift
+    /// back under the boundary.
+    #[test]
+    fn conv2d_3x3_stride1_ones_dout_backward_f32_matches_generic_reference() {
+        let mut crossed_the_fold = false;
+        for &(batch, in_ch, out_ch, ph, pw, oh, ow) in &[
+            // flat = 2*144 = 288, above SGEMM_KC: exercises the fold boundary.
+            (2usize, 2usize, 3usize, 14usize, 14usize, 12usize, 12usize),
+            // flat = 2*30 = 60, the f64 fixture's shape: one block, no fold.
+            (2, 3, 4, 7, 8, 5, 6),
+        ] {
+            let (kh, kw, sh, sw) = (3usize, 3usize, 1usize, 1usize);
+            let patch_width = in_ch * kh * kw;
+            let patch_count = oh * ow;
+            let flat = batch * patch_count;
+            crossed_the_fold |= flat > super::SGEMM_KC;
+
+            let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i * 17 % 31) as f32 - 15.0) / 1024.0)
+                .collect();
+            let weight: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| ((i * 29 % 37) as f32 - 18.0) / 2048.0)
+                .collect();
+            let dout = vec![1.0f32; batch * out_ch * patch_count];
+
+            let mut dout_flat = vec![0.0f32; flat * out_ch];
+            for row in 0..flat {
+                let n = row / patch_count;
+                let pc = row % patch_count;
+                for oc in 0..out_ch {
+                    dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * patch_count + pc];
+                }
+            }
+            let panel =
+                super::conv2d_im2col_f32(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+            let mut want_dw = vec![0.0f32; out_ch * patch_width];
+            super::gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut want_dw);
+            let mut dpanel = vec![0.0f32; flat * patch_width];
+            super::gemm::sgemm(flat, out_ch, patch_width, &dout_flat, &weight, &mut dpanel);
+            let want_dp =
+                super::conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+            let want_db = {
+                let mut s = 0.0f32;
+                for _ in 0..flat {
+                    s += 1.0;
+                }
+                vec![s; out_ch]
+            };
+
+            let (got_dp, got_dw, got_db) = super::conv2d_backward_3x3_stride1_ones_dout_f32(
+                &padded, &weight, batch, in_ch, ph, pw, oh, ow, out_ch, true,
+            );
+            assert_eq!(got_dp.len(), want_dp.len());
+            assert_eq!(got_dw.len(), want_dw.len());
+            for (i, (&g, &w)) in got_dp.iter().zip(want_dp.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "dpadded[{i}] direct {g} vs generic {w} at flat={flat}"
+                );
+            }
+            for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "dweight[{i}] direct {g} vs generic {w} at flat={flat} \
+                     (a fold on the wrong boundary shows up HERE and only above SGEMM_KC)"
+                );
+            }
+            assert_eq!(got_db.unwrap(), want_db);
+
+            // And the public entry must actually ROUTE here, not merely agree when called directly.
+            let (disp_dp, disp_dw, disp_db) = super::conv2d_backward_f32(
+                &dout, &padded, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch, true,
+            );
+            for (i, (&g, &w)) in disp_dp.iter().zip(want_dp.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "dispatched dpadded[{i}]");
+            }
+            for (i, (&g, &w)) in disp_dw.iter().zip(want_dw.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "dispatched dweight[{i}]");
+            }
+            assert_eq!(disp_db.unwrap(), want_db);
+        }
+        assert!(
+            crossed_the_fold,
+            "no fixture exceeded SGEMM_KC, so this test cannot see a mis-folded reduction at all"
+        );
+    }
+
+    /// The f32 all-ones predicate must accept only an exactly-all-ones buffer, and must agree with
+    /// itself across the serial and parallel halves of its own scan.
+    #[test]
+    fn dout_is_all_ones_f32_accepts_only_exact_ones() {
+        for &len in &[1usize, 63, 64, 65, 1 << 16, (1 << 16) + 65] {
+            let ones = vec![1.0f32; len];
+            assert!(super::dout_is_all_ones_f32(&ones), "all ones at len {len}");
+            // One perturbed element, swept across both the probe prefix and the scanned tail.
+            for &at in &[0usize, 1, 63, 64, len / 2, len - 1] {
+                if at >= len {
+                    continue;
+                }
+                for bad in [0.0f32, -1.0, 1.0 + f32::EPSILON, f32::NAN] {
+                    let mut v = ones.clone();
+                    v[at] = bad;
+                    assert!(
+                        !super::dout_is_all_ones_f32(&v),
+                        "len {len} element {at} set to {bad} was accepted as all-ones"
+                    );
+                }
+            }
+            // -0.0 and +0.0 compare equal under `==` but are not ones; bit comparison must reject.
+            let mut z = ones.clone();
+            z[len - 1] = -0.0;
+            assert!(!super::dout_is_all_ones_f32(&z));
         }
     }
 }

@@ -33374,3 +33374,82 @@ written before this is trusted. Then the paired vs-PyTorch arm on `conv2d_masked
 Beyond the usual: this change alters what a public API RETURNS in the skipped case, and a wrong
 `needs_input_grad` reading would silently drop a real gradient. That failure mode is a wrong answer,
 not a slow one, and it is the first thing the gradient-parity suite should be pointed at.
+
+## 179. f32 HAD NO ALL-ONES conv2d ADJOINT AT ALL — AND MIRRORING THE f64 ONE VERBATIM WOULD HAVE SHIPPED A WRONG BIAS GRADIENT
+
+`frankentorch-hi9r6`. **UNBUILT AND UNVERIFIED.** Build freeze — `/data` 27G, 99% used, loadavg
+8.30/9.13/8.37 on the 64-core box — no cargo ran. `rustfmt --edition 2024 --check` exits 0.
+
+### 179a. THE GAP
+
+`conv2d_backward_f64` has dispatched all-ones `dout` to a dedicated adjoint since 2026-07-05.
+`conv2d_backward_f32` had **no such dispatch at all** — not a worse one, none. An f32 summed loss
+therefore built the full `[flat, patch_width]` im2col panel and ran both large GEMMs to produce a
+`dweight` whose `out_ch` rows are all equal and a `dpanel` whose `flat` rows are all equal.
+
+`project_asymmetric_dtype_fastpath` is exactly this shape: a fast path gated on ONE dtype strands
+the other. Items 174-177 spent four rows improving the f64 route while f32 had no route to improve.
+
+### 179b. THE PART THAT DOES NOT MIRROR — AND WHY I ALMOST SHIPPED IT
+
+The f64 adjoint ends with `dbias = vec![flat as f64; out_ch]`. That is correct, and the reason it is
+correct does NOT survive the change of dtype. The generic route computes the same quantity by
+accumulating `s += dout[..]` SEQUENTIALLY, over `flat` elements all equal to 1.0. A sequential sum
+of N ones equals N only while the running total stays exactly representable:
+
+           flat        seq sum    flat as f32  agree
+       16777215     16777215.0     16777215.0  True
+       16777216     16777216.0     16777216.0  True
+       16777217     16777216.0     16777216.0  True     <- both round the same way
+       16777218     16777216.0     16777218.0  FALSE    <- the sum has STALLED, the cast has not
+
+At `2^24 + 2` the f32 sum stops moving — adding 1.0 to 2^24 rounds back to 2^24 — while the cast
+keeps climbing. `batch * oh * ow` reaching 16.7M is a large but entirely ordinary conv.
+
+**The f64 line is safe because its mantissa is 53 bits and `flat` cannot approach 2^53. That is a
+coincidence of dtype, not a shared argument, and the f32 mirror of it is wrong.** I wrote the
+verbatim mirror first and caught it only by asking how the generic route computes the value I was
+about to hard-code — which is the check, not the instinct. The shipped version replays the sum
+(`flat` adds once, not `out_ch * flat`, and no read of `dout`, since the dispatch predicate has
+already established every addend is exactly 1.0).
+
+Generalising, because this will recur across the f32 mirroring surface: **a closed form that
+replaces a reduction is a claim about the accumulator's precision, not just about the arithmetic.
+Re-derive it per dtype.** Every `vec![count as T; ..]` standing in for a summation of ones is this
+same claim.
+
+### 179c. SGEMM_KC IS A SEPARATE CONSTANT THAT HAPPENS TO EQUAL DGEMM_KC
+
+The dweight reduction folds its partials on the GEMM's k-block boundaries. `matrixmultiply` 0.3.11
+(pinned in `Cargo.lock`) defines `S_KC` in `src/archparam_defaults.rs` as an unconditional `256` —
+one definition, no `cfg` variants — reached through `conf_env_or_default!("MATMUL_SGEMM_KC", ...)`
+exactly as `D_KC` is.
+
+It is written as its own constant rather than aliased to `DGEMM_KC`. They are independent knobs in
+the dependency, either can move alone through a `cargo update` or that env var, and a fold that
+silently inherited the other type's block size would produce wrong gradients with no compile error.
+`ft-api`'s widen/narrow gate pair carries a compile-time assert against the same class of mistake.
+
+### 179d. THE ACCEPTANCE TEST HAS A FIXTURE THE f64 ONE LACKS
+
+A wrong fold is INVISIBLE below one k-block: with `flat` under 256 there is a single block and any
+summation order gives the same answer. `conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference`
+— the f64 acceptance test — runs at **`flat = 60`**, so it could never have caught the very bug the
+f64 route shipped with and item ikw6q later fixed (104 of 108 dweight entries wrong at oh=ow=64).
+
+The f32 test runs two fixtures, `flat = 288` and `flat = 60`, and asserts that at least one exceeded
+`SGEMM_KC` so the fixture cannot silently drift back under the boundary. It also calls the PUBLIC
+`conv2d_backward_f32`, not only the adjoint directly, so the dispatch itself is covered rather than
+assumed — a route that agrees when called by hand and is never reached is not a fast path.
+
+### 179e. THE HAZARD, STATED PLAINLY
+
+Items 174-177 only changed how an existing result is computed; if they were wrong the failure would
+have shown up as a mismatch against a route that still existed. **This ADDS a route.** Until the
+tests run, a mis-folded reduction here is a WRONG GRADIENT, not a slow one. The fold constant is
+read from the pinned dependency and the ordering argument is inherited from the f64 twin, but
+nothing has been compiled and nothing has been run.
+
+Owed, and this one is not optional before the route is trusted: build, run the two new tests, and
+confirm `conv2d_backward_f32`'s existing tests still pass now that a shape they may already cover
+takes a different path. Only then is there any point measuring it.
