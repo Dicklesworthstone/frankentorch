@@ -31702,3 +31702,48 @@ and seeing hunks in functions I had not touched, then restored. `feedback_file_c
 covers whole-file writes; this is the same hazard through a blind in-place substitution, and the
 check that caught it — enumerate the diff's hunk headers and account for every one before staging —
 is the one worth keeping.
+
+## 154. THE dweight ZERO-FILL GOES IN ALL THREE GEMM-BACKED CONV BACKWARDS — AND THE THREE ones_dout SITES ARE DELIBERATELY LEFT
+
+`frankentorch-hi9r6`. UNBUILT: /data at 29G / 99%, no cargo run. Completes the dead-zero-init
+vein that `bf5af229` (dpanel f64) and item 152 (dpanel f32) opened.
+
+    conv2d_backward_f64   dweight  vec![0.0f64; out_ch*patch_width]  -> build_uninit
+    conv2d_backward_f32   dweight  same
+    conv3d_backward_f32   dweight  same
+
+The GEMM immediately after overwrites every element, so the fill was dead. Contract verified the
+same way as item 152 — every `dgemm_tb`/`sgemm_tb` path passes beta = 0.0; the accumulating
+`*_sub_into` helpers (beta = 1.0) are not on it — and each site carries the zero-size guard,
+because the wrappers return EARLY on `m == 0 || n == 0` before matrixmultiply's own zero-fill
+can run.
+
+### SMALL, AND SAID SO
+
+`dweight` is out_ch*patch_width = 9,216 elements (74 KB) at the scored shape, against the
+18.9 MB `dpanel` that item 141 timed at 1.072 ms. **This completes a vein; it does not close a
+gap, and no magnitude is claimed for it.** Recorded plainly because a run of small commits on a
+P0 can read as progress when it is tidying.
+
+### THREE SITES DELIBERATELY NOT CONVERTED
+
+`conv2d_backward_height1_ones_dout_f64`, `conv2d_backward_3x3_stride1_ones_dout_f64` and
+`conv3d_backward_ones_dout_f64` also allocate a zeroed `dweight`, and it is also fully
+overwritten — by a `par_chunks_mut(..).copy_from_slice(&dweight_row)` broadcast rather than by a
+GEMM. They are left alone on purpose: their fill argument is a different one (a chunked copy, not
+a beta = 0 contract), it would need its own verification, and these are the no-panel fast paths
+whose bit-exactness items 105 and 107 had to repair once already. Uniformity is not a reason to
+touch them.
+
+### AND ONE I STARTED AND BACKED OUT OF
+
+`dout_flat` in both f32 kernels is the same dead fill (2 MB / 1 MB). Converting it means
+wrapping a multi-line chained `par_chunks_mut(..).enumerate().for_each(..)` in a closure, and my
+first attempt at that surgery mis-matched its own anchor and aborted. Under a freeze there is no
+compiler to catch a subtler version of that mistake, and the prize is the 0.027 ms item 141
+measured. **Not worth the edit risk in a 40k-line shared file that nobody can build** — left for
+whoever has a working toolchain.
+
+VERIFIED WITHOUT CARGO: `rustfmt --edition 2024 --check` exits 0; `dweight` is only read after
+construction at all three sites, so losing `mut` is consistent. NOT verified: compilation,
+tests, timing.

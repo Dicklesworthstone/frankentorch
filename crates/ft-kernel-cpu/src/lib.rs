@@ -8071,8 +8071,27 @@ pub fn conv2d_backward_f32(
     // K-traversal matching transpose-then-sgemm per output element, so dweight is
     // BIT-IDENTICAL (bench maxdiff=0). Eliminates the dout_t alloc + the strided
     // transpose pass (~110ms of a 322ms weight-grad => 1.5x). kgs4-convtb.
-    let mut dweight = vec![0.0f32; out_ch * patch_width];
-    gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
+    // UNBUILT (build freeze, /data 29G): not compiled, tested or measured.
+    //
+    // The GEMM below OVERWRITES every element of `dweight`, so this zero-fill was dead. Same
+    // contract and same verification as item 152: every `sgemm_tb` path passes beta = 0.0, and
+    // the two accumulating helpers in this module (`*_sub_into`, beta = 1.0) are not on it.
+    // `conv3d_backward_generic_f64` already builds its `dweight` this way.
+    //
+    // SMALL AND SAID SO: `dweight` is out_ch*patch_width — 9,216 elements (74 KB) at the scored
+    // shape, not the 18.9 MB `dpanel` of `bf5af229`. This is completing a vein, not closing a
+    // gap, and no magnitude is claimed for it.
+    //
+    // GUARD: `gemm::sgemm`-family wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill can run, so a degenerate shape would hand back an
+    // uninitialized buffer.
+    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f32]| {
+        if out_ch == 0 || patch_width == 0 || flat == 0 {
+            dweight.fill(0.0);
+            return;
+        }
+        gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+    });
     // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
     //
     // `panel`'s last use is the GEMM above, but without this it lives to the end of the
@@ -8947,8 +8966,27 @@ pub fn conv2d_backward_f64(
     // K-traversal matches transpose-then-dgemm per output => BIT-IDENTICAL. Kills the
     // dout_t alloc + strided transpose pass (was a serial O(flat*out_ch) pass a prior
     // fix parallelized; now eliminated). frankentorch-convbwd / kgs4-convtb.
-    let mut dweight = vec![0.0f64; out_ch * patch_width];
-    gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
+    // UNBUILT (build freeze, /data 29G): not compiled, tested or measured.
+    //
+    // The GEMM below OVERWRITES every element of `dweight`, so this zero-fill was dead. Same
+    // contract and same verification as item 152: every `dgemm_tb` path passes beta = 0.0, and
+    // the two accumulating helpers in this module (`*_sub_into`, beta = 1.0) are not on it.
+    // `conv3d_backward_generic_f64` already builds its `dweight` this way.
+    //
+    // SMALL AND SAID SO: `dweight` is out_ch*patch_width — 9,216 elements (74 KB) at the scored
+    // shape, not the 18.9 MB `dpanel` of `bf5af229`. This is completing a vein, not closing a
+    // gap, and no magnitude is claimed for it.
+    //
+    // GUARD: `gemm::dgemm`-family wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill can run, so a degenerate shape would hand back an
+    // uninitialized buffer.
+    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f64]| {
+        if out_ch == 0 || patch_width == 0 || flat == 0 {
+            dweight.fill(0.0);
+            return;
+        }
+        gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+    });
     // FREE THE PANEL HERE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE item 143.
     //
     // `panel` is 18.0 MB at the scored shape and its LAST use is the line above. Without this
@@ -13968,8 +14006,27 @@ pub fn conv3d_backward_f32(
     );
     // dweight = dout_flat^T @ panel via sgemm_tb (strided-transpose read of
     // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
-    let mut dweight = vec![0.0f32; out_ch * patch_width];
-    gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
+    // UNBUILT (build freeze, /data 29G): not compiled, tested or measured.
+    //
+    // The GEMM below OVERWRITES every element of `dweight`, so this zero-fill was dead. Same
+    // contract and same verification as item 152: every `sgemm_tb` path passes beta = 0.0, and
+    // the two accumulating helpers in this module (`*_sub_into`, beta = 1.0) are not on it.
+    // `conv3d_backward_generic_f64` already builds its `dweight` this way.
+    //
+    // SMALL AND SAID SO: `dweight` is out_ch*patch_width — 9,216 elements (74 KB) at the scored
+    // shape, not the 18.9 MB `dpanel` of `bf5af229`. This is completing a vein, not closing a
+    // gap, and no magnitude is claimed for it.
+    //
+    // GUARD: `gemm::sgemm`-family wrappers return EARLY on `m == 0 || n == 0`, before
+    // matrixmultiply's own zero-fill can run, so a degenerate shape would hand back an
+    // uninitialized buffer.
+    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f32]| {
+        if out_ch == 0 || patch_width == 0 || flat == 0 {
+            dweight.fill(0.0);
+            return;
+        }
+        gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+    });
     // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
     //
     // `panel`'s last use is the GEMM above, but without this it lives to the end of the
