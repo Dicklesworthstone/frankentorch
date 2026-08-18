@@ -35282,3 +35282,85 @@ Item 200c's ranking rule — prefer sites whose REAL callers freeze an input —
 because the names are trustworthy. It also gains a corollary from 202c: **check whether an op has
 more than one first-order backward before calling it done.** Both conv3d and conv2d have f32
 mirrors, and `functional_conv2d_grouped` appears twice for the same reason.
+
+## 203. THE FIRST CERTIFIABLE conv2d ROW OF THE SESSION — AND IT SETTLES ITEM 144's QUESTION, WHICH IS WORTH MORE THAN THE ROW
+
+`frankentorch-hi9r6`. MEASURED. No cargo ran (disk 38G, below the brake); the snapshot ELF needed
+no rebuild and the run wrote no files.
+
+### 203a. PROVENANCE
+
+    measurement_host = thinkstation1   AMD Ryzen Threadripper PRO 5975WX 32-Cores
+    isa = x86_64+avx2   governor = powersave   online_cpus = 64   rayon_threads = 8
+    executing_elf_sha256 = 2462293598f10e7721efe49ac9786c3bf5edda7b1a700608bfa4df5200805e67
+    incumbent = PyTorch 2.12.1+cpu, self-reported, SAME invocation, torch threads = 8
+    sampling = balanced-square ABBAABBA, 16 rounds, round_warmup = 0 (board default)
+    FT_H2H_LANES = conv2d;  concurrent measurements: none;  rustc processes: 1
+    loadavg before = 9.64 / 10.27 / 12.58
+    load_1m start = 17.89  end = 17.77   drift_gate = PASS
+    load_series n = 18  worst_drift = 1.013x   endpoint_gate = PASS  series_gate = PASS
+    cpu_mhz idle    min 1429 median 2454 max 4269   spread 2.987x
+    cpu_mhz sampled min 1429 median 3144 max 4262   CROSS-CORE spread median 3.004x
+
+The drift gates are the tightest of the session by a wide margin — 1.013x against 1.141x, 1.065x
+and 2.268x on the three earlier attempts. Five turns of waiting for `1m ~ 5m ~ 15m` bought exactly
+that.
+
+### 203b. THE ONE ROW THAT MEETS THE QUOTING RULE
+
+    conv2d_big_masked   FT 28.339 ms   PT 11.590 ms   FT 2.45x SLOWER
+                        PT PASS [0.954,1.058]   FT PASS [0.951,1.004]
+                        ratio 0.409 [0.392,0.422]   parity match
+
+Both A/A nulls PASS, parity matches, drift passes. **Recorded as a measured LOSS**, which is the
+result, not a failure to find a win.
+
+Two honest qualifications:
+
+- The CROSS-CORE clock spread while sampling was 3.004x against an idle 2.987x. The harness's own
+  reading is that a large idle spread with a SMALL sampling spread means the cores boosted and the
+  confound did not bite; here they are equal, so it did. The arms are not known to have run at
+  comparable clocks, and no gate in this harness can see that.
+- **This lane is not touched by anything I shipped this session.** It is the GENERIC route, and the
+  ELF predates items 187-201; items 174/176/177 changed the all-ones adjoints, which this lane does
+  not reach, and item 171's transpose is byte-identical at `batch >= threads`. The row is a
+  baseline, not a verdict on my work.
+
+The lane that WOULD price my levers, `conv2d` (summed, f64), failed its PT null for the third time.
+
+### 203c. WHAT THE FAILURES SAY, WHICH IS THE REAL FINDING
+
+Item 137c hypothesised that the incumbent arm's DURATION decides whether it nulls, and item 144
+added the `_big` twins expressly to test it, saying "either way the answer is a ledger item". The
+answer, from one settled invocation:
+
+    conv2d               PT  3.217 ms   FAIL
+    conv2d_masked        PT  3.390 ms   OFFSET
+    conv2d_masked_train  PT  5.081 ms   OFFSET
+    conv2d_big          PT 11.019 ms   PASS
+    conv2d_big_masked   PT 11.590 ms   PASS
+
+Monotonic, with no exception. **Item 137c's explanation HOLDS and item 144's question is settled:
+the `_big` twins are conv2d's certifiable lanes and the small ones are not.**
+
+It also CORRECTS the received number. This file's folklore is a "4-7 ms band where lanes null
+cleanly"; 5.081 ms is OFFSET here, not PASS. The passing arms are at 11 ms. A lane wanting to be
+quotable should be sized toward 11 ms, not 5.
+
+### 203d. WHICH IMMEDIATELY REFUTED MY OWN ITEM 192
+
+Item 192 sized the new f32 conv2d lane at `C2F32_N = 96` to put its incumbent arm at ~5.8 ms,
+explicitly targeting that 4-7 ms band, and congratulated itself for being the first lane sized
+before it was written rather than after it failed. It was sized before it was written and against
+the wrong target: 5.8 ms is the OFFSET band.
+
+`C2F32_N` is now 160, measured at ~9-13 ms on both routes, and the comment carries the null-versus-
+duration table instead of the folklore. **Sizing a lane by measurement is worth nothing if the
+threshold being measured against was never itself measured.**
+
+### 203e. OWED
+
+`conv2d_big` and `conv2d_big_masked` are the lanes to quote from here on. To price items 174/177 —
+which live on the SUMMED route — the board needs a `conv2d_big` summed lane whose incumbent sits at
+11 ms; `conv2d_big` already is that lane, and its FT null read OFFSET this run, so it is one clean
+window away from being quotable too.

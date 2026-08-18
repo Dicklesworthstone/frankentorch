@@ -158,15 +158,25 @@ const C2B_N: usize = 16;
 ///     summed  0.756  0.943  1.754  3.671  3.236  5.790 ms
 ///     masked  0.703  0.981  1.763  3.667  3.402  5.789 ms
 ///
-/// 96 puts both routes at ~5.8 ms, inside the 4-7 ms band where `max_pool3d_nopool`, `conv3d` and
-/// `prelu` all null cleanly. BATCH is the axis grown, per item 144: it scales `flat` and both
+/// **The "4-7 ms band" this constant originally targeted was wrong, and item 203 measured it.** In
+/// one settled invocation the incumbent A/A null tracked arm duration monotonically:
+///
+///     conv2d               PT  3.217 ms   FAIL
+///     conv2d_masked        PT  3.390 ms   OFFSET
+///     conv2d_masked_train  PT  5.081 ms   OFFSET
+///     conv2d_big           PT 11.019 ms   PASS
+///     conv2d_big_masked    PT 11.590 ms   PASS
+///
+/// 5.08 ms is OFFSET, not PASS, so a lane sized to ~5.8 ms would have been born unquotable for the
+/// second time — the very failure this constant exists to avoid. 160 puts both routes near 11 ms,
+/// which is where the incumbent actually nulls. BATCH is the axis grown, per item 144: it scales `flat` and both
 /// GEMMs proportionally while leaving `out_ch` and `patch_width` fixed, so the resize does not
 /// slide the lane along the `out_ch` GEMM-efficiency curve item 136 measured — which is the very
 /// thing this bead is trying to see.
 ///
 /// This lane is therefore NOT comparable with the f64 conv2d rows, and is not meant to be. It
 /// carries its own control (`conv2d_f32_masked`) at the same size.
-const C2F32_N: usize = 96;
+const C2F32_N: usize = 160;
 const C2_CI: usize = 32;
 const C2_CO: usize = 32;
 const C2_H: usize = 32;
@@ -1213,12 +1223,13 @@ c2w_train=seq(32*32*3*3).reshape(32,32,3,3).requires_grad_(True)
 # arms carry identical bits. Measured justification for the lane existing at all is in
 # `timed_conv2d_f32`'s comment: two independent f32 conv implementations agree to 7.0e-08 on
 # the summed route and 9.6e-09 on the masked one, well inside the 1e-6 parity gate.
-# Batch 96, NOT 8: f32 conv2d is ~2x faster than f64, and at batch 8 this arm measures
-# 0.656 ms -- far below the 4-7 ms band where lanes null. Measured sizing table is in
+# Batch 160, NOT 8: f32 conv2d is ~2x faster than f64, and at batch 8 this arm measures
+# 0.656 ms. Item 203 measured where the incumbent actually nulls: OFFSET at 5.08 ms, PASS at
+# 11.0 and 11.6 ms. 160 puts both routes near 11 ms. Measured sizing table is in
 # C2F32_N's comment on the Rust side. Keep this in lockstep with C2F32_N.
-c2x32=seq(96*32*32*32).reshape(96,32,32,32).float()
+c2x32=seq(160*32*32*32).reshape(160,32,32,32).float()
 c2w32=c2w.float()
-c2m32=seq(96*32*32*32).reshape(96,32,32,32).float()
+c2m32=seq(160*32*32*32).reshape(160,32,32,32).float()
 # item 144: the doubled-batch twins, same weights, same generator.
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
