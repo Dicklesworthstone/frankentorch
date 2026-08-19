@@ -83,6 +83,8 @@ fn main() {
 
     let _ = run_f32(batch, &x32, &w32);
     let _ = run_f64(batch, &x64, &w64);
+    sentinel(batch, &x32, &w32, &x64, &w64);
+    sentinel(batch, &x32, &w32, &x64, &w64);
 
     let mut p32: Vec<Phases> = Vec::with_capacity(reps);
     let mut p64: Vec<Phases> = Vec::with_capacity(reps);
@@ -128,6 +130,75 @@ fn main() {
         "\n  Read the f64/f32 column: a phase below 1.0 is one where f32 is SLOWER than f64, which \
          is the direction that has to be explained. A phase near or above 1.5 is behaving as f32 \
          should (the raw kernels measure 1.53-1.55x)."
+    );
+}
+
+/// SENTINEL: does the f32 all-ones adjoint actually FIRE at the board's shape, and what does it
+/// cost against the f64 entry the session uses?
+///
+/// The phase split put the whole f32 deficit in the backward. Reading the source explains only half
+/// of it: both dtypes share `conv2d_ones_dout_route`, and the board's shape (ph=34, kh=kw=3, oh=32,
+/// stride 1) selects `ThreeByThreeStride1` for both — so the f32 fast path SHOULD fire. What
+/// differs is the entry: ft-api calls `conv2d_backward_f32_ones_dout_from_f64_grad` as a
+/// pre-check on the tape's f64 gradient, while the f64 side calls `conv2d_backward_masked_f64` and
+/// lets it dispatch internally.
+///
+/// `feedback_sentinel_before_fixing`: prove which path EXECUTES before changing anything — source
+/// reading gave three confident wrong answers on one bug. `Some`/`None` here is that proof, and the
+/// timing beside it says whether firing is enough.
+fn sentinel(batch: usize, x32: &[f32], w32: &[f32], x64: &[f64], w64: &[f64]) {
+    let ph = H + 2;
+    let pw = W + 2;
+    let mut padded32 = vec![0.0f32; batch * CI * ph * pw];
+    let mut padded64 = vec![0.0f64; batch * CI * ph * pw];
+    for bc in 0..batch * CI {
+        for row in 0..H {
+            let from = bc * H * W + row * W;
+            let to = bc * ph * pw + (row + 1) * pw + 1;
+            padded32[to..to + W].copy_from_slice(&x32[from..from + W]);
+            padded64[to..to + W].copy_from_slice(&x64[from..from + W]);
+        }
+    }
+    // The tape hands the backward an f64 gradient in BOTH dtypes: the f32 entry takes `dout_f64`
+    // by design, deciding in f64 because `1.0f64 as f32` is exactly `1.0f32`.
+    let dout64 = vec![1.0f64; batch * CO * H * W];
+
+    let t = Instant::now();
+    let fired = ft_kernel_cpu::conv2d_backward_f32_ones_dout_from_f64_grad(
+        &dout64, &padded32, w32, batch, CI, ph, pw, K, K, H, W, 1, 1, CO, false,
+    );
+    let f32_ms = ms(t);
+    let verdict = if fired.is_some() {
+        "FIRED"
+    } else {
+        "DID NOT FIRE"
+    };
+    std::hint::black_box(&fired);
+
+    let t = Instant::now();
+    let out64 = ft_kernel_cpu::conv2d_backward_masked_f64(
+        &dout64,
+        &padded64,
+        w64,
+        batch,
+        CI,
+        ph,
+        pw,
+        K,
+        K,
+        H,
+        W,
+        1,
+        1,
+        CO,
+        [true, true, false],
+    );
+    let f64_ms = ms(t);
+    std::hint::black_box(&out64);
+
+    println!(
+        "\n  SENTINEL (what ft-api actually calls, all-ones adjoint, same shape):\n             f32 ones-entry  {f32_ms:8.3} ms   {verdict}\n             f64 masked-entry{f64_ms:8.3} ms   (dispatches to its adjoint internally)\n             f64/f32 {:.2}x   (>1 = f32 faster; the raw generic kernels measure 1.5x)",
+        f64_ms / f32_ms
     );
 }
 

@@ -28485,6 +28485,42 @@ impl FrankenTorchSession {
     }
 
     #[inline]
+    /// Widen an f32 gradient to the f64 the tape holds, in parallel.
+    ///
+    /// # Why this exists — `frankentorch-qif1n`
+    ///
+    /// The autograd tape is f64, so every f32 op's gradients are widened on the way out. Both conv2d
+    /// and conv3d were doing that with a SERIAL `.iter().map(..).collect()`. At the board's f32 conv2d
+    /// lane `dpadded` is `batch * in_ch * ph * pw` = 160*32*34*34 = **5,914,880 elements and ~47 MiB**,
+    /// converted one element at a time on one core while sixteen sat idle.
+    ///
+    /// MEASURED, NOT GUESSED, and the measurement is what found it:
+    ///
+    /// * a kernels-only h2h twin priced the whole session surround at 47 ms — 61% of the lane, with our
+    ///   f32 conv2d KERNELS only 1.18x behind PyTorch's entire op;
+    /// * a session phase split put the entire f32 deficit in the BACKWARD (f32 60.7 ms against f64
+    ///   39.7 ms) while every other phase behaved as f32 should — leaf 2.22x, forward 1.69x, loss sum
+    ///   2.01x, all in f32's favour;
+    /// * a sentinel proved the f32 all-ones adjoint FIRES at that shape and costs 7.6-8.4 ms against
+    ///   the f64 entry's 9.4-9.5 ms.
+    ///
+    /// So ~52 ms of that 60.7 ms backward was never kernel work, and this widen is the largest single
+    /// piece of it. `project_serial_widen_vein` records the identical shape costing 20.2 ms of a 31 ms
+    /// GroupNorm lane.
+    ///
+    /// # Why it is bit-exact, which is what makes it a legal lever
+    ///
+    /// `f64::from(v)` is an exact widening of each element independently. There is no reduction and
+    /// nothing is reassociated, so a parallel map produces identical bytes in identical positions —
+    /// unlike a k-split GEMM, which needed a far longer argument to justify.
+    ///
+    /// Small gradients (a bias vector is `out_ch` elements) are left to the serial path by the caller:
+    /// a rayon fork costs more than the work.
+    fn widen_grad_f32_to_f64(values: &[f32]) -> Vec<f64> {
+        use rayon::prelude::*;
+        values.par_iter().map(|&v| f64::from(v)).collect()
+    }
+
     fn is_exact_all_ones_f64(values: &[f64]) -> bool {
         !values.is_empty() && values.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
     }
@@ -31068,8 +31104,8 @@ impl FrankenTorchSession {
                         // of one — the tape would treat a zero-length vector as a real gradient of
                         // the wrong shape.
                         let mut g = vec![
-                            dpadded.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                            dweight.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            dpadded.map(|d| Self::widen_grad_f32_to_f64(&d)),
+                            dweight.map(|d| Self::widen_grad_f32_to_f64(&d)),
                         ];
                         if has_bias {
                             g.push(
@@ -32115,8 +32151,8 @@ impl FrankenTorchSession {
                             [need_input, need_weight, has_bias],
                         );
                         let mut g = vec![
-                            dpadded.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                            dweight.map(|d| d.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                            dpadded.map(|d| Self::widen_grad_f32_to_f64(&d)),
+                            dweight.map(|d| Self::widen_grad_f32_to_f64(&d)),
                         ];
                         if has_bias {
                             g.push(
