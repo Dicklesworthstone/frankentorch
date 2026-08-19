@@ -1541,6 +1541,10 @@ LANES = {
     );
     // frankentorch-2h8vi: the host's own movement, which no A/A null can see.
     let load_at_start = ft_api::harness_provenance::load_average_1m();
+    // frankentorch-vyaia: how long the load series spans. `loadavg` is a 1-minute EWMA, so the
+    // DURATION of the window decides how much of any load step it could have shown at all — a
+    // figure the load lines have never carried and cannot be read without.
+    let load_window_started = Instant::now();
     println!(
         "allocator={}",
         if cfg!(feature = "fair-alloc") {
@@ -2665,13 +2669,39 @@ LANES = {
     // The rise is a LOWER bound on our own contribution and an UPPER bound on nothing: a peer that
     // started while we sampled lands in it too. `concurrent_measurements` above is what separates
     // those two, and it is printed first for that reason.
+    //
+    // THE WINDOW LENGTH IS PART OF THE READING, and the first run under this code is why. It
+    // printed `rise=+0.00` over a seven-second sweep, which reads as "this harness self-loads
+    // nothing" and means no such thing: `loadavg` is a 1-minute EWMA, so a step of S sustained
+    // for T seconds moves it by S * (1 - exp(-T/60)) and a seven-second window can show at most
+    // 11% of our own load however large it is. A short sweep CANNOT refute self-load. The response
+    // factor is therefore printed next to the rise, so the two can never be read apart.
+    let load_window = load_window_started.elapsed().as_secs_f64();
+    let ewma_response = 1.0 - (-load_window / 60.0).exp();
     if let Some(start) = load_at_start.filter(|_| peak_load.is_finite()) {
         let rise = peak_load - start;
         println!(
-            "self_load rise={rise:+.2} (start {start:.2} -> peak {peak_load:.2}) at lane_count={} \
-             rounds={reps} (frankentorch-vyaia: the harness's own load, measured, not assumed)",
-            lanes.len()
+            "self_load rise={rise:+.2} (start {start:.2} -> peak {peak_load:.2}) over \
+             window={load_window:.0}s at lane_count={} rounds={reps} — loadavg is a 1-minute EWMA, \
+             so this window could show at most {:.0}% of any sustained step \
+             (frankentorch-vyaia: measured, not assumed)",
+            lanes.len(),
+            ewma_response * 100.0
         );
+        if load_window < 60.0 {
+            println!(
+                "self_load NOT INTERPRETABLE: a {load_window:.0}s window is shorter than the \
+                 loadavg time constant, so this rise is a floor and a +0.00 is not evidence of \
+                 anything. If the whole rise were ours and sustained it would imply {:.2}. \
+                 Re-derive the bound on a FULL sweep — the configuration every banked row and \
+                 frankentorch-5q3io's stale ~+0.62 were taken under (frankentorch-vyaia).",
+                if ewma_response > 0.0 {
+                    rise / ewma_response
+                } else {
+                    f64::NAN
+                }
+            );
+        }
         if rise > start {
             println!(
                 "COLD-START: this invocation supplied MORE load ({rise:.2}) than the host was \
