@@ -37008,3 +37008,94 @@ explanation and it is the one I would check first** — items 147 and 149 predat
 Not another A/B. Until a run appears whose CONTROL shows slot-0 materially above 1.0, the warm-up has
 nothing to act on, and re-running the pair is the same mistake item 224 caught on the top bead —
 re-running a lane for a gate whose failure mode has already moved.
+
+## 229. THE form_p CLIFF IS THE RAYON GATE — SO "9.11x AT n=160" WAS MEASURED AGAINST A THRASHING ARM, AND THE THRESHOLD IT SET LEFT n IN [130,160) ON THE BAD PATH
+
+`frankentorch-4zjaa`. Item 65 corrected this dispatch's threshold from an inherited 64 to a
+measured 160 and wrote down the right lesson — "a threshold is a measurement, not a convention".
+**The corrected constant was still wrong, because the measurement it rested on had a broken arm,
+and the grid it was read off had no point between 128 and 160.**
+
+### 229a. THE PREDICTION WAS ALREADY WRITTEN DOWN, AND NOBODY HAD RUN IT
+
+Item 156 built `FT_LINALG_PARALLEL_GATE` — a runtime override of `bidiag`'s `PARALLEL_GATE` —
+and left a falsifiable prediction beside it: with the gate raised past 159², n=160's unblocked arm
+should fall from 5.889 ms to roughly 650 µs, and if it does, "`4zjaa`'s measured 9.11x at n=160
+was taken against a BROKEN arm, the real crossover is far above 160, and the shipped `n >= 160`
+threshold is wrong."
+
+It cost one build and two process invocations. `RAYON_NUM_THREADS=8`, one process per gate value,
+same test binary `7a7bf82ce7111520`, loadavg 23-38:
+
+    n      unblocked, default gate   unblocked, gate raised   blocked
+    128         393 µs                   350-407 µs            387-399 µs
+    136        1357-3199 µs              416-508 µs            546-550 µs
+    144        1441-10154 µs             506-596 µs            601-627 µs
+    160        2130-11483 µs             798-827 µs            761-818 µs
+    256       22326-37289 µs            3296-3416 µs          2311-2591 µs
+
+**Confirmed.** With the gate raised the unblocked arm is a smooth curve — n=128 → ~380 µs,
+n=160 → ~810 µs, a 2.1x step for a 1.25x size increase against the ~1.95x an O(n³) expansion
+predicts. The 5.889 ms was never the algorithm.
+
+**So the banked "9.11x at n=160" is withdrawn.** Against a non-thrashing unblocked arm the blocked
+expansion is worth **~1.0x at n=160** (798-827 vs 761-818 µs) and ~1.5x at n=256. The lever is
+real and an order of magnitude smaller than recorded.
+
+### 229b. THE MECHANISM, CONFIRMED BY ARITHMETIC AND THEN BY MEASUREMENT
+
+Work per reflector in `bidiag_form_p_f64` is `(n-1)²`, which crosses `PARALLEL_GATE = 1 << 14`
+between n=128 (127² = 16129) and n=130 (129² = 16641). Above it `reduce_scaled_rows_f64` forks
+into `nrows / REDUCE_CHUNK_ROWS` tasks — two or three at these sizes — and
+`apply_scaled_rank1_f64` forks one task PER ROW, both once per reflector. Hundreds of fork/joins
+buying almost no width.
+
+The measured flip lands exactly there. Three replications, every n agreeing on the ordering:
+
+    n=128   unblocked 268-340 µs   blocked 317-384 µs   0.85-0.89x   unblocked wins
+    n=129   unblocked 427-440 µs   blocked 426-443 µs   0.98-1.00x   tie
+    n=130   unblocked 449-517 µs   blocked 418-444 µs   1.07-1.16x   blocked wins
+    n=131                                               1.19-1.36x
+    n=136   unblocked 697-781 µs   blocked 462-586 µs   1.33-1.51x
+
+**A prediction derived from a constant, confirmed to the integer.** That is the strongest form of
+attribution this campaign has produced on a threshold, and it cost less than the six invocations a
+single h2h row costs.
+
+### 229c. WHAT SHIPPED
+
+`n >= 160` → **`n >= 130`**, the measured crossover. Every n in [130,160) was taking the thrashing
+path: **1.33-1.51x** at n=136 in a quiet window, and up to **5.8x** in a loaded one.
+
+That spread is the second finding. What the gate costs is **variance** as much as time — the
+unblocked arm read 697 µs and 3199 µs for the same n in two windows minutes apart, while the
+blocked arm did not move (462-586 µs vs 543-550 µs). A path whose cost swings 4.6x with host load
+is not merely slow, it is unmeasurable, and it is what made item 65's single-window table look
+like a 9x lever.
+
+FT-vs-FT, so **MAINTENANCE evidence under section 1, not a win** — it says the dispatch was
+mis-set, not that we beat PyTorch. The vs-PyTorch SVD row at these shapes is owed and is not
+claimed here.
+
+### 229d. THE ROUTE IS NOW PINNED FROM OUTSIDE
+
+`svd_prologue_routes_form_p_across_the_measured_threshold` asserts n=128 takes the unblocked
+expansion and n=136 the blocked one, **observed from a caller rather than read off the constant**.
+It needs no poison return: the two expansions are not bit-identical (that is why they are compared
+at 1e-11 and why the substitution needs the ratified `qgce4` tolerance policy), so the prologue's
+`v` matches one bit-for-bit and not the other. The test asserts that premise too, so it cannot
+quietly become vacuous if blocking ever turns bit-exact.
+
+**Verified by sentinel, not asserted:** restoring `n >= 160` makes it fail with "n=136: expected
+the BLOCKED expansion, got the unblocked one". This call site has now inherited a wrong constant
+twice — once from `svd_use_blocked_bidiag`, once from a coarse grid — and it is the third time
+this ledger records a gate that was read rather than exercised
+(`frankentorch-conv3d-direct-gate-misset` is the other).
+
+### 229e. NOT FIXED HERE, AND WHY
+
+Raising `PARALLEL_GATE` itself is worth more than this threshold — it would make the unblocked
+path fast at *every* n, and at n=136 the raised-gate unblocked arm (416-508 µs) beats the blocked
+one (546-550 µs). But the gate is shared by every caller of `reduce_scaled_rows_f64` and
+`apply_scaled_rank1_f64`, and moving it changes their result bits. Filed rather than smuggled in
+behind an SVD dispatch change, which is exactly how the 64 got here in the first place.
