@@ -36442,3 +36442,60 @@ The rule this earns: **a row whose incumbent arm has no prior figure to be check
 invocation short of readable, however its gates read.** The campaign already knows an incumbent that
 moved is not a win (the harness prints it); this is the same rule for an incumbent that moved in our
 disfavour, which is the direction nobody audits.
+
+## 220. THE TILE TOGGLE CAN NOW BE MEASURED AGAINST PyTorch INSIDE ONE PROCESS — THE STEP THAT TURNS ITEM 217 FROM MAINTENANCE INTO A CANDIDATE WIN
+
+`frankentorch-hi9r6` (P0). Source only: `cargo check -p frankentorch-api --example
+gauntlet_lane_sweep_h2h` exits 0, compiled on a REMOTE worker so it added nothing to a host already
+at loadavg 45 with CPU idle 38. **No measurement taken** — the orchestrator's instruction not to
+certify in this window is why, and item 194's gate would refuse it anyway.
+
+### 220a. WHAT WAS STUCK
+
+Item 217 measured `set_gemm_tile_col_floor_adaptive` at **1.223x at 8 threads** on conv2d's two
+backward GEMMs — a large effect at the width every certified row uses — and at **0.950x**, a
+regression, at 64. Both numbers are FrankenTorch against FrankenTorch. **That is MAINTENANCE, not a
+win, however large**, and it stays that way until a PyTorch arm sees it.
+
+The toggle was built as an `AtomicBool` exactly so both arms could run in one process (item 25), and
+then nothing could use that property: it is global, so a sweep is all-on or all-off, and comparing
+two sweeps is the cross-invocation comparison a peer's item 189 destroyed — **the incumbent arm
+moved 1.94x between two runs of the same ELF**.
+
+### 220b. THE FIX, WHICH IS ITEM 190's
+
+`FT_H2H_TILE_ADAPTIVE_LANES` names which lanes run with the adaptive floor, exactly as
+`FT_H2H_ROUND_WARMUP_LANES` names which get the warm-up. `conv2d_big_masked_tile` is a
+byte-identical twin of `conv2d_big_masked` on both arms, so naming only the twin measures the same
+work with and without the toggle **in one window, one ELF, interleaved round by round against the
+same incumbent**. Empty — the default — changes nothing.
+
+Two details that are not incidental:
+
+* **The setting is applied around OUR arm only**, and restored immediately after each sample, so a
+  later lane in the same round cannot inherit it. The incumbent is untouched: same PyTorch arm, our
+  knob moved. A toggle that leaked into the incumbent's samples would produce a difference and
+  attribute it to the wrong thing.
+* **It uses the existing public getter and setter** rather than adding a swap-style API, so
+  `ft-kernel-cpu` is not touched at all — a file three agents have been editing this session.
+
+### 220c. THE LANE WAS CHOSEN BY EVIDENCE, NOT BY CONVENIENCE
+
+The twin sits on `conv2d_big_masked`, which item 219 measured certifying **4 of 4** at batch 16, and
+not on `conv2d_masked`, whose ~3.8 ms incumbent arm item 219a showed cannot null on this host. Item
+209's rule and item 144a's finding both say the same thing: a new lane inherits the nullability of
+the size it is built at, so build it at a size that has been observed to certify.
+
+That is the mistake item 216 made without knowing it — a certified row at batch 8 with no control
+beside it, because the control could not certify.
+
+### 220d. WHAT THE PAIR WILL SAY, AND WHAT WOULD MAKE IT A WIN
+
+Item 217 predicts the tile lane is ~1.2x faster than its twin at `RAYON_NUM_THREADS=8` and slower at
+64. If the 8-thread pair certifies with both nulls passing, that is a **vs-PyTorch** row showing the
+toggle moves the standing — the first thing on this bead that would justify changing a default, and
+it would have to be a WIDTH-CONDITIONAL default, since 64 threads goes the other way.
+
+If the twins come out equal against PyTorch while item 217's arm-internal gap persists, the
+difference is being absorbed somewhere outside the GEMMs, and item 217's 1.223x is real but not
+reachable from the lane — which is worth knowing before anyone edits `MIN_BLOCK_COLS`.

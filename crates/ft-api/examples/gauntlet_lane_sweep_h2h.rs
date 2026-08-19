@@ -1325,6 +1325,8 @@ LANES = {
     # control. The FrankenTorch side of this name runs the pre-item-174 scatter.
     "conv2d_xl_legacy":  (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
+    # item 220: identical twin; only OUR arm's tile floor differs between the two lanes.
+    "conv2d_big_masked_tile": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
     # item 216: the train twin of the line above -- c2w_train, so BOTH arms compute dweight.
     # Sized at batch 16 because that is the one masked conv2d lane measured certifying 4 of 4.
     "conv2d_big_masked_train": (c2bx, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2bm),
@@ -1585,6 +1587,36 @@ LANES = {
                 .collect()
         })
         .unwrap_or_default();
+    // PER-LANE GEMM TILE FLOOR — `frankentorch-hi9r6`, item 220.
+    //
+    // Item 217 measured `set_gemm_tile_col_floor_adaptive` arm-internally at **1.223x at 8
+    // threads** on conv2d's two backward GEMMs, and a REGRESSION (0.950x) at 64. That is a large
+    // effect at the width every certified row uses, and it is MAINTENANCE until a PyTorch arm sees
+    // it — a FrankenTorch-versus-FrankenTorch number is not a win, however big.
+    //
+    // The toggle is an `AtomicBool` precisely so both arms can run in one process (item 25), but
+    // nothing could USE that: it is global, so a sweep could only ever be all-on or all-off, and
+    // two invocations is the cross-run comparison a peer's item 189 showed is worthless here — the
+    // incumbent arm moved 1.94x between two runs of the SAME ELF.
+    //
+    // Naming lanes fixes it the way item 190 fixed the warm-up: register a lane twice and list one
+    // name, and the same work is measured with and without the toggle **in one window, one ELF,
+    // interleaved round by round against the same incumbent**. Empty (the default) touches nothing.
+    let tile_adaptive_lanes: Vec<String> = std::env::var("FT_H2H_TILE_ADAPTIVE_LANES")
+        .map(|spec| {
+            spec.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !tile_adaptive_lanes.is_empty() {
+        println!(
+            "tile_adaptive_lanes={} (FT_H2H_TILE_ADAPTIVE_LANES; item 217 measured this at 1.223x \
+             at 8 threads and 0.950x at 64, so a row taken under it is width-specific)",
+            tile_adaptive_lanes.join(",")
+        );
+    }
     if round_warmup > 0 {
         println!(
             "round_warmup_lanes={} (FT_H2H_ROUND_WARMUP_LANES; empty = every lane)",
@@ -1912,6 +1944,17 @@ LANES = {
         ),
         (
             "conv2d_big_masked",
+            Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false)),
+        ),
+        (
+            // item 220: byte-identical twin of conv2d_big_masked, existing only so
+            // FT_H2H_TILE_ADAPTIVE_LANES can name ONE of the pair. Item 219 measured
+            // conv2d_big_masked certifying 4 of 4 at this size, so the pair inherits a lane whose
+            // nullability is established rather than hoped for -- item 209's rule.
+            //
+            // The closure is identical on purpose: if the two rows differ by anything but the tile
+            // floor, the difference is the host, and both rows are in the same window to say so.
+            "conv2d_big_masked_tile",
             Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false)),
         ),
         (
@@ -2297,6 +2340,10 @@ LANES = {
             // something else.
             // item 190: warm only the lanes named, so one sweep can carry a lane twice — once
             // warmed, once not — and the comparison stays inside a single window.
+            // item 220: this lane's tile-floor setting, chosen by name exactly as
+            // `lane_warmup` is. Applied around OUR arm only — the incumbent is
+            // untouched, which is the point: the same PyTorch arm, our knob moved.
+            let lane_tile = tile_adaptive_lanes.iter().any(|l| l.as_str() == *name);
             let lane_warmup =
                 // `name` is `&&str` here (the lane vec is `Vec<(&str, LaneRun)>`), so this compares
                 // via `as_str()` and a deref rather than `&String == &&str`, which has no impl.
@@ -2347,7 +2394,10 @@ LANES = {
                         ft_slots.push(1.0);
                         continue;
                     }
+                    let prev_tile = ft_kernel_cpu::gemm_tile_col_floor_adaptive();
+                    ft_kernel_cpu::set_gemm_tile_col_floor_adaptive(lane_tile);
                     let (ms, checksum) = run_lane();
+                    ft_kernel_cpu::set_gemm_tile_col_floor_adaptive(prev_tile);
                     ft_slots.push(ms);
                     checksums[index] = checksum;
                 }
