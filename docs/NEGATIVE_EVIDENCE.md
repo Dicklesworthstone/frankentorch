@@ -36713,3 +36713,53 @@ kernel.
 **A pair of certified rows differing by one component prices that component for free.** Item 182
 built the frozen/train pair to answer a question about item 178's skip; it turns out to be a
 general instrument for attribution, and the board has other pairs that could be read the same way.
+
+## 224. THE TOP READY BEAD'S OWN NOTE WOULD HAVE WASTED A QUIET WINDOW — AND A CHECK THAT MY conv2d ROWS ARE INSULATED FROM WHAT KILLED IT
+
+`frankentorch-372h8` and `frankentorch-hi9r6`. **No measurement**: my sampling read runq **75-78 on
+64 cores** with idle swinging 67% -> 1%, so item 194's gate fires and my own runner would refuse.
+Reported idle was 76; one of my three samples agreed and the next read 1%.
+
+### 224a. THE TRAP IN THE TOP BEAD
+
+`frankentorch-372h8` is the top ready capability bead, and its note says it "REMAINS OPEN for one
+reason only: its vs-PyTorch row is still a CANDIDATE at one certifying run (2.546 FASTER, both nulls
+PASS)... Nine further runs read 2.50-2.70x FASTER and not one cleared both nulls and drift together.
+**No build is needed to close it.**"
+
+Read alone, that is an instruction to spend the next quiet window re-running the lane — and item
+193c's round-count lever makes it look cheap and likely to work.
+
+It is stale. A peer's item 221 found the buffer pool's hit rate on that lane fell from **72% to
+12%**, so the lever's value has halved to 1.62-1.73x FASTER, and their comment on the bead says
+directly: *"stop re-running this lane for its null"*. The nine failures were not a sampling problem
+that more rounds fix; the quantity being measured moved underneath them.
+
+**A bead's note is a claim with a timestamp.** This one is contradicted by a ledger item filed after
+it, and the only thing that surfaced the contradiction was reading the bead's comments before acting
+on its description.
+
+### 224b. THE CHECK THAT FOLLOWED, BECAUSE ITEM 221 DESCRIBES A BOARD-WIDE SHIFT
+
+Item 221's cause is a shared, contended resource — the global buffer pool — and other lanes "now
+take pooled buffers themselves". If that shift reached conv2d, items 216, 222 and 223's certified
+rows would be standing on the same moving ground.
+
+They are not. Both certification runs report:
+
+    buffer_pool: hits=0 misses=0 parked=64 buffers
+
+**Zero hits and zero misses means the conv2d lanes never enter the pooled path at all**, so a change
+in its hit rate cannot move them. The rows in items 216, 222 and 223 are insulated from what
+invalidated 372h8's, and that is now checked rather than assumed.
+
+It also says something about the instrument: the harness has been printing `buffer_pool:` under
+every row for the whole campaign, and it took a peer's item 221 to make anyone read it. A provenance
+field nobody reads is not provenance until something forces the question.
+
+### 224c. WHAT THE TOP BEAD ACTUALLY NEEDS
+
+Not a re-run. Item 221 ends by asking whether the lever should stop depending on a contended global
+cache at all — that is a design question about `ft-core::buffer_pool`, owned by the item that found
+it, and it is the live work on this bead. I have not started it: it is a peer's finding one item
+old, and duplicating it would be worse than leaving it.
