@@ -36656,3 +36656,60 @@ now in the ledger beside it.
 Third row in the same invocation, unrelated to the toggle but certified and worth banking:
 `conv2d_big_masked_train` at **1.95x SLOWER** (PT PASS 0.960-1.028, FT PASS 0.972-1.041, parity
 match), replicating item 219c's 1.89-1.96x on a different ELF.
+
+## 223. THE conv2d GAP IS NOT WHERE FOUR ITEMS HAVE BEEN LOOKING — dweight IS 1.40x AND EVERYTHING ELSE IS 2.38x
+
+`frankentorch-hi9r6` (P0). **No measurement taken**: my own sampling read CPU idle **2%**, user 95%,
+runq 68-73 on a 64-core box — oversubscribed, so item 194's gate voids any ratio and the reported
+"idle 83" did not survive checking. This is arithmetic on item 222's two certified rows, which were
+taken in ONE invocation on one ELF against one incumbent.
+
+### 223a. THE DECOMPOSITION
+
+    lane                       FT(ms)    PT(ms)   ratio    what it contains
+    conv2d_big_masked          29.759    12.513   2.38x    forward + dinput backward + tape
+    conv2d_big_masked_train    43.750    22.485   1.95x    the whole training step
+    ------------------------------------------------------------------------------
+    difference = dweight       13.991     9.972   1.40x    weight gradient alone
+
+`dweight` is **32% of our step and 44% of theirs**. It is also the part we do RELATIVELY WELL:
+1.40x, against 2.38x for everything else. This corroborates item 219d's 1.24-1.38x from a different
+ELF and a different invocation, and it is the same derived quantity — a difference of two certified
+rows, not a certified row itself, and quoted as such.
+
+### 223b. WHERE THE GAP ACTUALLY LIVES
+
+Whatever is NOT the weight gradient — the forward, the `dpanel` GEMM, `col2im`, and the tape — runs
+at **2.38x**. That single number reframes this bead:
+
+* Items 170, 172, 217, 220 and 222 spent four items and two probes on the tile floor of the two
+  GEMMs, one of which is `dweight`'s. Item 222 then certified that lever as a regression.
+* Item 178 and its four descendants made the `dweight` branch SKIPPABLE. Worth having, and it is
+  live in the frozen lane's 2.38x — but it removes work from the component we were already winning
+  relative to PyTorch.
+* Item 188 measured `col2im` as the largest single phase of conv3d's backward and found no
+  bit-exact lever. Item 165d found the same for conv2d. **That phase sits inside the 2.38x.**
+
+The remaining gap is concentrated in the half of the backward nobody has a lever for, plus a forward
+that item 218 showed stops scaling at `batch` threads.
+
+### 223c. WHAT WOULD ACTUALLY MOVE IT
+
+Two candidates, both previously noted and neither pursued:
+
+* **The `dpanel` GEMM is `dgemm(m = flat, k = out_ch, n = patch_width)` — `k = 32`.** A rank-32
+  update is arithmetic-intensity 32 MACs per output, so it is bandwidth-bound by construction, and
+  no tiling knob fixes an intensity problem. Item 141 timed it at 1.557 ms.
+* **`col2im` cannot be reordered bit-exactly** (items 165d, 188c), so the only honest routes are a
+  tolerance decision or the channels-last layout a peer's item 150 identified as PyTorch's actual
+  strategy — the direction that has been named repeatedly and never designed.
+
+### 223d. THE METHODOLOGICAL POINT
+
+This decomposition cost one `python3 -c` on numbers already banked. It was available the moment item
+222's pair certified, and it says the four items before it were aimed at the wrong third of the
+kernel.
+
+**A pair of certified rows differing by one component prices that component for free.** Item 182
+built the frozen/train pair to answer a question about item 178's skip; it turns out to be a
+general instrument for attribution, and the board has other pairs that could be read the same way.
