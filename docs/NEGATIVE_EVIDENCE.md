@@ -36499,3 +36499,92 @@ it would have to be a WIDTH-CONDITIONAL default, since 64 threads goes the other
 If the twins come out equal against PyTorch while item 217's arm-internal gap persists, the
 difference is being absorbed somewhere outside the GEMMs, and item 217's 1.223x is real but not
 reachable from the lane — which is worth knowing before anyone edits `MIN_BLOCK_COLS`.
+
+## 221. THE avg_pool1d UNINIT LEVER HAS LOST HALF ITS VALUE ON THE CURRENT BOARD — THE BUFFER POOL'S HIT RATE FELL FROM 72% TO 12%, AND THE BEAD'S "BLOCKED ON A/A NULLS" DIAGNOSIS IS SUPERSEDED
+
+`frankentorch-372h8`. The bead has stood for two sessions as a CANDIDATE win — "2.546
+[2.426,2.638] FASTER, nine further runs read 2.50-2.70x FASTER and not one cleared both nulls" —
+with the stated blocker being the A/A gate. **That diagnosis is now wrong, and the number has
+moved.** On the current board the same lane reads **1.62-1.73x FASTER**, and the lever behind it is
+worth **1.28-1.34x** where it was worth **2.33-2.37x**.
+
+### 221a. THE MEASUREMENT
+
+Both binaries are on disk; no build was made for this. `RAYON_NUM_THREADS=8`, PyTorch 2.12.1+cpu
+self-reported in the same invocation, mimalloc, host thinkstation1.
+
+The lever is a lane pair (`set_pool_output_zeroed`), so the on/off ratio is a WITHIN-INVOCATION
+FT-vs-FT quantity — immune to the cross-run load differences below, which is the only reason these
+two binaries can be compared at all.
+
+    binary       run                    avg_pool1d  _zeroed   lever   PT arm   pool hits/misses
+    741989be     full board, drifted        2.438     5.668   2.33x    7.249   (not printed)
+    741989be     full board, 08-18 23:21    2.504     5.941   2.37x    7.524   342/134   72%
+    d5b22475     4 lanes, quiet             4.289     5.502   1.28x    7.348    47/337   12%
+    d5b22475     full board, contended      4.548     6.109   1.34x    7.379   217/935   19%
+    d5b22475     4 lanes, load 48           4.367     5.784   1.32x    7.575    47/337   12%
+
+**The incumbent arm did not move** (7.25-7.58 ms throughout), and **the lever-OFF twin did not move**
+(5.50-6.11 ms). Only the lever-ON arm did, 2.4 -> 4.3 ms. The vs-PyTorch standing fell with it, from
+3.00x FASTER to 1.62-1.73x FASTER.
+
+The pool counters are **deterministic** for a given lane set — 47/337/32-parked reproduced exactly
+across two invocations taken 12 minutes and 30 loadavg apart.
+
+### 221b. THE MECHANISM, WHICH THE POOL'S OWN DOCS ALREADY NAMED
+
+`avg_pool1d_backward_scalar_f64`'s total-coverage lever is not "skip the memset". It is
+`buffer_pool::try_take_exact(numel)` — take a buffer whose **pages are already committed**, so the
+`fill(g)` is the only thing touching the memory. Its miss path is `build_uninit`, a *fresh*
+allocation, where the same fill pays first-touch page faults. So the lever's value is the pool's hit
+rate, and the pool is a process-global resource shared with every other consumer.
+
+`try_take_exact` requires an **exact length match**, and the pool is capped at
+`MAX_PARKED_BYTES` = 512 MiB / `MAX_PARKED_BUFFERS` = 64. In both current-binary runs the pool sits
+at **exactly 512.0 MiB, saturated**, holding 32 buffers averaging 16 MiB — while this lever needs
+the 33.5 MB gradient buffer (`8*64*8192` f64). The forward-output buffers (`8*64*4096` = 16.8 MB)
+fill the cap and the gradient size is evicted, so the exact-length scan misses 337 times out of 384.
+
+The old board parked 18 buffers averaging 28 MiB — the gradient size dominated, and it hit 342/476.
+
+**This is the failure mode `buffer_pool.rs` already documents in `try_take_exact`'s own comment**:
+"take side widened to seven pooling backwards, the hit rate fell to 45/134 and `avg_pool2d`'s pooled
+arm went 4-9% SLOWER than its unpooled arm across five invocations — the misses were each paying a
+fresh 16 MiB memset." That was written about `avg_pool2d`. It has now happened to `avg_pool1d`, and
+nobody noticed because the lane kept being re-run for its A/A null rather than read for its time.
+
+### 221c. WHAT IS AND IS NOT CLAIMED
+
+* **NOT a code regression.** `avg_pool1d_backward_scalar_f64` is intact; I read it. The lever fires,
+  its guards are unchanged, and its off-twin is unchanged.
+* **NOT a clean like-for-like.** The old binary predates `FT_H2H_LANES` (item 58) so it could only
+  run the whole board, and that board had ~20 lanes against today's, which has since grown roughly
+  fifteen conv2d lanes — several of which now take pooled buffers themselves (`bf5af229`). Part of
+  the shift is the board changing around the lever, not the lever changing.
+* **What IS claimed:** the banked 2.44x lever and the 2.5x candidate standing **do not reproduce on
+  the board as it stands**, in five invocations across two binaries, and the cause is a measured
+  collapse in pool hit rate rather than the estimator the bead blames.
+
+### 221d. THE CONSEQUENCE THAT OUTLIVES THIS LANE
+
+**A lever whose mechanism is a shared cache does not have a value; it has a value *in a context*.**
+Every buffer-pool win on this board is quoted as a property of its kernel, and at least this one is
+really a property of what else was resident in the same process. The pool has a 512 MiB ceiling and
+a 64-buffer ceiling, and the board is now well past both — so these levers are in competition with
+each other, and adding a lane can silently halve a banked row belonging to a different bead.
+
+Two things follow, neither of them a new framework:
+
+* Any row resting on `buffer_pool` must print `hits/misses` beside its ratio. The counter already
+  exists and is already printed at the end of every sweep; nothing reads it. **Every number in 221a
+  was recoverable from logs nobody was looking at.**
+* `FT_H2H_LANES` is not the neutral filter item 58 claims ("It changes no arm, no estimator and no
+  gate"). For a pool-dependent lane it changes the arm, because it changes who else parks buffers.
+  That claim should be narrowed where it is written.
+
+### 221e. WHAT THIS DOES TO THE BEAD
+
+`frankentorch-372h8` should stop re-running for its null. The lane is still FrankenTorch-FASTER —
+1.62-1.73x, uncertified — but the 2.5x it has been trying to certify for two sessions is not
+currently there to certify, and ten more invocations will not find it. The open question is now
+whether the lever should stop depending on a contended global cache at all.
