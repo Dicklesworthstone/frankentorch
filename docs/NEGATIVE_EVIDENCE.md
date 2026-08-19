@@ -38441,7 +38441,7 @@ What still blocks a flip is unchanged and worth stating plainly: the max_pool3d 
 precondition, and no other machine has been tried. A default that is right here and wrong on a
 uniform-clock box would be a worse outcome than an env var that nobody sets.
 
-## 248. frankenpandas HAS ALREADY SOLVED HALF THE FLEET CONTENTION PROBLEM, UNILATERALLY, WITH `taskset`
+## 249. frankenpandas HAS ALREADY SOLVED HALF THE FLEET CONTENTION PROBLEM, UNILATERALLY, WITH `taskset`
 
 `frankentorch-4zjaa`. No measurement. An observation about the blocker itself, which has now cost
 more ticks than any technical problem in this campaign.
