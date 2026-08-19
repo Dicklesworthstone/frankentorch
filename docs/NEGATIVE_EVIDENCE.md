@@ -35870,3 +35870,60 @@ unverified, since the slot was taken before I could re-check.
 
 That last point is the honest shape of this turn: a compiler was available for about ten minutes,
 it found four real defects, and it went away again mid-repair.
+
+## 211. THE WHOLE UNBUILT STACK COMPILES AND PASSES; THE CONTENTION DETECTOR CAUGHT A REAL PEER ON ITS FIRST RUN; conv2d_xl's ARM NULLS AT LOADAVG 60
+
+`frankentorch-hi9r6`. BUILT AND TESTED. Throttle lifted, `/data` 331G. All via
+`RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR`, repo-local `target/`.
+
+### 211a. EVERYTHING WRITTEN UNDER THE THROTTLE IS GREEN
+
+    frankentorch-kernel-cpu  --lib    688 passed, 0 failed, 4 ignored
+    frankentorch-api         --lib   2583 passed, 0 failed, 1 ignored
+    cargo check --tests --examples   0 errors
+
+Items 192, 194, 195, 197, 199, 201, 203 and 209 were all written without a compiler and all
+compile. The one error in the crate was a 20-vs-19 argument mismatch in `conv3d_backward_generic_
+masked_f64` — `frankentorch-l2zki`'s lane, not mine — and a peer fixed it between my check and my
+read of the file.
+
+**The end-to-end sentinel passes**: `conv2d_f32_backward_computes_only_the_gradients_the_tape_wants`
+is green, which closes the chain items 178, 187, 190 and 197 built one link at a time — `ft-api`
+sets the mask from the tape's grad requirements AND the kernel skips the GEMM the mask declines.
+Item 197's source-reading conclusion — that node dispatch is serial on the calling thread, so a
+thread-local sentinel is observable from `ft-api` — is confirmed by the test running at all.
+
+### 211b. THE CONTENTION DETECTOR'S FIRST RUN FOUND A REAL PEER
+
+    measurement_slot=held [pid=2103892 host=thinkstation1 elf=6a1018ab22a9057c lanes=conv2d_xl]
+                     no other live h2h announcement
+    concurrent_measurements=1 DETECTED: h2h-harness[2103559]
+
+A peer WAS sampling. Item 194's `/proc` scan caught it on its first live invocation — not a
+self-match this time, a real one — and the two mechanisms disagreed exactly as item 195d predicted
+they would: the slot saw nothing because the peer's binary predates item 195 and does not announce,
+while the scan sees any process whatever its vintage. Neither alone is sufficient and the pair is
+why.
+
+That also means every measurement in items 205, 207 and 208 was taken without knowing whether a
+peer was sampling. Those rows had `concurrent_measurements` checked by hand through a transcription
+of the same scan, which reported `none` — so they stand — but the check is now in the output where
+it cannot be forgotten.
+
+### 211c. conv2d_xl DOES WHAT IT WAS SIZED TO DO
+
+    conv2d_xl   FT 28.929 ms   PT 43.427 ms   PT OFFSET [0.948,1.025]   FT PASS [0.980,1.010]
+
+**Not quotable** — a peer harness was sampling and loadavg was 60. But the FT null PASSED with a CI
+width of 0.030, at loadavg 60, in an 8-round smoke run. `conv2d_big`'s 8.8 ms arm failed that same
+null in four quiet windows at 16 and 32 rounds.
+
+Item 209 predicted our arm at ~35 ms by linear extrapolation and it measured 28.9 under heavy load;
+the incumbent was predicted 32.9 and measured 43.4 at loadavg 60 against 9-13 when it was sized.
+Both are longer than any arm on this board that has failed to null, which is what the size was for.
+
+### 211d. OWED
+
+A quiet window with `concurrent_measurements=none` in the OUTPUT, then `conv2d_xl` at the board
+default. And then the thing none of this has yet done: a two-ELF A/B across item 174, which is the
+only way to attribute anything on that lane to the levers.
