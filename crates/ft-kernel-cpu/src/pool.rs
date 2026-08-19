@@ -59,16 +59,67 @@ pub enum PoolOutcome {
     Invalid(String),
 }
 
-/// Width to use for `FT_RAYON_WIDTH=auto`, capped by the machine.
+/// Physical cores, from Linux CPU topology; `None` when it cannot be determined.
 ///
-/// 16 is measured (item 240), not chosen: it is the minimum of the five-lane curve and the widest
-/// setting whose repeated passes still agree with each other. The `min` with the core count keeps
-/// it sane on a small machine, where asking for 16 workers on 4 cores would reintroduce exactly the
-/// oversubscription this is meant to avoid.
+/// Counts distinct `(physical id, core id)` pairs in `/proc/cpuinfo`, which is how an SMT machine
+/// reports two logical CPUs sharing one core. Returns `None` rather than guessing on any platform
+/// or format that does not provide both fields — a wrong physical count silently selects a wrong
+/// width, and [`auto_width`] falls back to the logical count where that is at least explicable.
 #[must_use]
-pub fn auto_width(cores: usize) -> usize {
-    const MEASURED_OPTIMUM: usize = 16;
-    MEASURED_OPTIMUM.min(cores.max(1))
+pub fn physical_cores() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut pairs = std::collections::BTreeSet::new();
+    let (mut package, mut core) = (None, None);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            // A blank line ends one CPU's block. Record whatever that block declared.
+            if line.trim().is_empty()
+                && let (Some(p), Some(c)) = (package.take(), core.take())
+            {
+                pairs.insert((p, c));
+            }
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "physical id" => package = value.parse::<u32>().ok(),
+            "core id" => core = value.parse::<u32>().ok(),
+            _ => {}
+        }
+    }
+    if let (Some(p), Some(c)) = (package, core) {
+        pairs.insert((p, c));
+    }
+    (!pairs.is_empty()).then_some(pairs.len())
+}
+
+/// Width to use for `FT_RAYON_WIDTH=auto`: `min(16, physical cores)`.
+///
+/// # This is fitted to exactly two machines, and it says so
+///
+/// The first version of this function was `min(16, LOGICAL cores)`, because 16 was the measured
+/// optimum on the development host (item 240). Running the same curve on a second machine refuted
+/// it outright:
+///
+/// ```text
+/// host             CPU                 physical/logical   measured best   min(16,logical) picks
+/// thinkstation1    Threadripper 5975WX      32 / 64             16t              16  correct
+/// fixmydocuments   Ryzen 7 5800X             8 / 16              8t              16  WORST of 4/8/16
+/// ```
+///
+/// On the second box 16 workers was worse than 8 on five lanes out of five (0.68x-0.93x), so the
+/// shipped constant would have selected the worst of the three widths tested there. `min(16,
+/// PHYSICAL)` is the simplest rule consistent with both: 32 physical caps to 16, and 8 physical
+/// caps to 8, each landing on that machine's measured optimum.
+///
+/// **Two points do not make a law.** This is a heuristic fitted to two machines that happen to
+/// disagree in the informative direction, and it is why `FT_RAYON_WIDTH` stays opt-in: a caller who
+/// has measured their own hardware should pass a number, and `auto` is for one who has not.
+#[must_use]
+pub fn auto_width(logical_cores: usize) -> usize {
+    const MEASURED_CAP: usize = 16;
+    let cores = physical_cores().unwrap_or(logical_cores).max(1);
+    MEASURED_CAP.min(cores)
 }
 
 /// Resolve a requested width from the two environment inputs, without touching any global state.
@@ -162,18 +213,46 @@ mod tests {
         );
     }
 
-    /// `auto` is the measured optimum, and it must not exceed the machine: 16 workers on 4 cores
-    /// would reintroduce the oversubscription the whole finding is about.
+    /// `auto` must never exceed the machine, and must never exceed the measured cap of 16.
+    ///
+    /// The exact value depends on the host's PHYSICAL core count, which the test cannot fake, so
+    /// the assertions are the invariants rather than a number: bounded above by 16, bounded above
+    /// by the physical count when that is readable, and at least 1 whatever the input.
     #[test]
-    fn auto_is_the_measured_optimum_capped_by_the_machine() {
-        assert_eq!(auto_width(64), 16);
-        assert_eq!(auto_width(16), 16);
-        assert_eq!(auto_width(4), 4);
-        assert_eq!(auto_width(0), 1, "a machine must have at least one worker");
+    fn auto_is_bounded_by_the_cap_and_by_the_machine() {
+        for logical in [0usize, 1, 4, 16, 64, 512] {
+            let width = auto_width(logical);
+            assert!(width >= 1, "a machine must have at least one worker");
+            assert!(
+                width <= 16,
+                "the measured cap is 16, got {width} for {logical}"
+            );
+            if let Some(physical) = super::physical_cores() {
+                assert!(
+                    width <= physical.max(1),
+                    "auto must not exceed the physical cores ({physical}), got {width}"
+                );
+            }
+        }
         assert_eq!(
             resolve_width(Some("AUTO"), None, 64),
-            PoolOutcome::Configured(16),
+            PoolOutcome::Configured(auto_width(64)),
             "the keyword is case-insensitive; an operator typing AUTO meant auto"
+        );
+    }
+
+    /// The physical count must be plausible where it is readable at all: at least one, and never
+    /// more than the logical count, since SMT only ever adds logical CPUs.
+    #[test]
+    fn physical_cores_is_plausible_or_absent() {
+        let Some(physical) = super::physical_cores() else {
+            return; // not a Linux /proc/cpuinfo with topology fields; nothing to check
+        };
+        let logical = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert!(physical >= 1);
+        assert!(
+            physical <= logical,
+            "physical ({physical}) cannot exceed logical ({logical})"
         );
     }
 
