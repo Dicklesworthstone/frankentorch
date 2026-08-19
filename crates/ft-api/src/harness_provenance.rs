@@ -1230,4 +1230,54 @@ mod tests {
             "a pid that does not exist cannot hold a slot"
         );
     }
+
+    /// The CPU probe underpins two separate claims — the contention detector's ACTIVE/idle split
+    /// and the harness's DIRECT self-load figure — and both are silently wrong if the field
+    /// indices are off, because a neighbouring field in `/proc/<pid>/stat` also parses as a
+    /// number. Burning a little CPU and requiring the counter to MOVE catches an off-by-one that
+    /// a "returns Some" assertion would not: `cutime` sits next to `stime` and stays at zero in a
+    /// process with no children.
+    #[test]
+    fn cpu_ticks_tracks_work_this_process_actually_does() {
+        let me = std::process::id();
+        let before = super::cpu_ticks_of(me).expect("our own /proc/self/stat must parse");
+        let mut spin = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            spin = spin.wrapping_add(1);
+        }
+        assert!(spin > 0, "the spin loop must not be optimised away");
+        let after = super::cpu_ticks_of(me).expect("our own /proc/self/stat must parse");
+        assert!(
+            after > before,
+            "400ms of spinning moved the counter from {before} to {after}; the field index is \
+             probably wrong (utime is field 14, at index 11 after the last parenthesis)"
+        );
+    }
+
+    /// A pid that does not exist is not contention. The detector samples candidates twice and a
+    /// process may exit in between, so this path is taken on a live host, not only in tests.
+    #[test]
+    fn cpu_ticks_of_a_dead_pid_is_none() {
+        assert!(
+            super::cpu_ticks_of(u32::MAX).is_none(),
+            "a pid that cannot exist must not report CPU time"
+        );
+    }
+
+    /// The block must always say which of the two questions it answered. Before the CPU probe it
+    /// reported a NAME match as a detection, which voided runs on shell wrappers and on rch
+    /// clients whose bench runs on another machine.
+    #[test]
+    fn contention_block_reports_activity_not_just_names() {
+        let block = super::concurrent_measurement_block();
+        assert!(
+            block.contains("ACTIVE") || block.contains("DETECTED"),
+            "the block must state whether a candidate was burning CPU, got: {block}"
+        );
+        assert!(
+            block.starts_with("concurrent_measurements="),
+            "the field name is parsed out of banked logs, got: {block}"
+        );
+    }
 }
