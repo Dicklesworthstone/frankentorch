@@ -38555,3 +38555,64 @@ falls on.
 The vs-PyTorch SVD row at items 246/247 — a genuinely quiet host, unpinned, comparable with the
 banked ~1.49x. Given 250c, that row cannot be taken beside a measuring peer at n=128-136 with any
 confidence about the reduction phase, which is bandwidth-bound. It needs the real window.
+
+## 251. QUIET IS NOT STABLE — THE FIRST RUN OF THE QUIETEST WINDOW IN NINE TICKS WAS 15% OFF, AND n=136 MAY HAVE MOVED
+
+`frankentorch-4zjaa`. The vs-PyTorch row owed since item 243, taken at last — and it arrives with
+a caveat the run itself produced.
+
+### 251a. THE ROWS
+
+`svd_v247` `2ce80f96b53da75f` (post-246/247), SVD forward only, `RAYON_NUM_THREADS=8` matched to
+torch 8, PyTorch 2.12.1+cpu self-reported in the SAME invocation, guard re-checked before every
+invocation, **iowait 0 on every FT block**, parity MATCH in all six rows.
+
+    run   n=128              n=136              loadavg 1m
+    1     FT 2.151 / 1.70x   FT 2.724 / 1.90x   7.32
+    2     FT 1.713 / 1.38x   FT 2.302 / 1.66x   7.58
+    3     FT 1.728 / 1.34x   FT 2.454 / 1.65x   7.53
+
+**Run 1 is discarded**, for a reason visible in the provenance rather than chosen after the fact:
+the 1-minute loadavg read 7.32 while the **5- and 15-minute read 62 and 77**. The host had just
+come out of a sustained load-77 period; its page cache and clocks had not settled. Runs 2 and 3
+then agree to 3% and 0.6%. That is `frankentorch-vyaia`'s "discard the first run after idle" in
+its sharpest form yet — **15% at n=128 and 15% at n=136**.
+
+    STANDING, runs 2-3:   n=128  ~1.36x SLOWER      n=136  ~1.65x SLOWER
+
+### 251b. THE GUARD COULD NOT SEE IT, AND NOW CAN
+
+The guard passed that window: no peer measurement, loadavg 7.38, iowait 0.1%. **Every check it
+had said go.** A 1-minute average cannot distinguish a genuinely idle host from one two minutes
+out of a storm.
+
+Added: a **stability gate** on the ratio of the 1/5/15-minute averages (`FT_GUARD_MAX_LOAD_RATIO`,
+default 4x). Run against the same window it now refuses it — `7.3 / 52.6 / 72.9`, a 6.6x spread.
+This is the standing orders' own "prefer a STABLE window over a quiet one" made executable; it had
+been advice I was applying by eye and got wrong.
+
+Also excluded this tick: `ssh`/`scp`/`rsync` from the peer scan, the same remote-transport family
+as the `rch`/`cargo` exclusions — an ssh client to a build worker was refusing the window.
+
+### 251c. THE PART I CANNOT EXPLAIN, STATED AS SUCH
+
+    n=136       item 243 (nb=8, pre-246/247, loadavg 19-29)   1.49  1.50  1.59
+                this run (post-246/247, loadavg 7.3-7.8)      1.65  1.66   (run 1 discarded)
+
+    FT arm min at n=136   item 243  2.176 ms      now  2.302 ms
+    PT arm min at n=136   item 243  1.446 ms      now  1.387 ms
+
+The two three-run samples do not overlap, and both are internally tight. Our arm is ~6% slower and
+the incumbent ~4% faster, which compounds into the ratio. n=128 shows nothing of the sort — it is
+flat to slightly better (1.34-1.38 against 1.37-1.57).
+
+**Items 246 and 247 cannot be excluded as the cause.** Item 250's internal A/B measured them at
+n=128 (not resolvable), n=256 and n=512 (both unresolvable under contention) — **it never tested
+n=136**, which is the one size that moved. That is a gap in my own verification, not a defect I
+have identified, and I am not going to assert either that the interchanges caused it or that they
+did not.
+
+OWED, and specifically: the pre-246 binary against the post-247 binary **at n=136**, ABBA in one
+stable window. Both binaries are on disk (`ftk_nb8`, `ftk_v247`); it costs one invocation. If the
+interchanges did cost ~6% at that size the honest response is to revert them, since item 250
+already showed they buy nothing measurable anywhere else.

@@ -26,6 +26,7 @@ set -uo pipefail
 
 MAX_LOAD="${FT_GUARD_MAX_LOAD:-35}"
 MAX_IOWAIT="${FT_GUARD_MAX_IOWAIT:-10}"
+MAX_LOAD_RATIO="${FT_GUARD_MAX_LOAD_RATIO:-4}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --max-load) MAX_LOAD="$2"; shift 2 ;;
@@ -46,7 +47,7 @@ done
 # that always fires is a guard that gets ignored. `torchvenv` is the incumbent arm's actual
 # signature.
 readonly ARGS_PATTERN='torchvenv|bench|h2h|criterion|rayon_width|pytorch_gauntlet'
-readonly COMM_EXCLUDE='^(rustc|rustfmt|clippy-driver|cc1|cc1plus|ld|lld|ld[.]lld|collect2|as|zsh|bash|sh|dash|ps|grep|awk|sed|tee)$'
+readonly COMM_EXCLUDE='^(rustc|rustfmt|clippy-driver|cc1|cc1plus|ld|lld|ld[.]lld|collect2|as|zsh|bash|sh|dash|ps|grep|awk|sed|tee|ssh|sshd|scp|rsync)$'
 
 mapfile -t HITS < <(
     ps -eo pid=,comm=,args= 2>/dev/null | awk \
@@ -115,9 +116,26 @@ if awk -v w="$IOWAIT_PCT" -v m="$MAX_IOWAIT" 'BEGIN { exit !(w > m) }'; then
     STATUS=1
 fi
 
+# STABILITY, not just level. The standing orders say to prefer a window whose 1-, 5- and
+# 15-minute averages are CLOSE TOGETHER over one that is merely quiet right now, and item 251
+# is why: a run taken at 1-min 7.3 while the 5- and 15-min read 62 and 77 produced a first
+# invocation 15% off the two that followed it. The host had just come out of a load-77 period
+# and its page cache and clocks had not settled. A 1-minute average cannot see that.
+LOAD5="$(cut -d' ' -f2 /proc/loadavg)"
+LOAD15="$(cut -d' ' -f3 /proc/loadavg)"
+if awk -v a="$LOAD1" -v b="$LOAD5" -v c="$LOAD15" -v r="$MAX_LOAD_RATIO" '
+       BEGIN { hi = a; lo = a;
+               if (b > hi) hi = b; if (b < lo) lo = b;
+               if (c > hi) hi = c; if (c < lo) lo = c;
+               if (lo < 0.5) lo = 0.5;
+               exit !(hi / lo > r) }'; then
+    echo "REFUSING TO MEASURE: loadavg $LOAD1 / $LOAD5 / $LOAD15 spread exceeds ${MAX_LOAD_RATIO}x — the host is still settling, quiet is not stable." >&2
+    STATUS=1
+fi
+
 if [ "$STATUS" -ne 0 ]; then
     echo "Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)" >&2
     exit "$STATUS"
 fi
 
-echo "guard PASS: no peer measurement detected, loadavg $LOAD1 <= $MAX_LOAD, iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"
+echo "guard PASS: no peer measurement detected, loadavg $LOAD1/$LOAD5/$LOAD15 (spread <= ${MAX_LOAD_RATIO}x), iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"
