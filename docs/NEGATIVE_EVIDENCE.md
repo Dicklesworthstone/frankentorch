@@ -36226,3 +36226,195 @@ Both behaved as designed on their first live certification.
 The frozen-weight lanes still cannot certify on this host, and item 144a says why. Items 170, 172
 and 173 still owe their arm-internal probe runs; the probes are built and the gates now exist to run
 them honestly.
+
+## 217. ITEM 170's TILE TOGGLE IS WORTH 1.223x AT 8 THREADS AND A REGRESSION AT 64 — ITS STATED MECHANISM IS REFUTED, ITS DEFAULT-OFF DECISION VINDICATED
+
+`frankentorch-hi9r6` (P0). Arm-internal: no incumbent, no ratio against PyTorch, **MAINTENANCE not a
+win**. `gemm_tile_floor_probe` (item 172), min of 9, both arms alternating inside ONE process, pools
+built explicitly so `tile_grid` sees each width. loadavg 40.74/23.41/15.33, cpu_mhz spread 2.86x
+pre / 1.26x post, `/data` 291G. Peak load stayed under `online_cpus`, so item 194's gate is clear.
+
+    threads   floor=128   adaptive    ratio     tiles
+          8       5.517      4.512   1.223x    6 -> 8
+         64       7.755      8.159   0.950x   12 -> 32
+
+### 217a. THE PREDICTION WAS EXACTLY BACKWARDS
+
+Item 170d predicted the adaptive floor would help MORE at 64 threads, "because under-subscription
+scales with pool width while the extra A-panel traffic does not". **The opposite happened**: 1.223x
+faster at 8, 0.950x — a regression — at 64.
+
+The mechanism item 170b listed as a refuter is the one that operates. At 64 threads the adaptive
+floor produces 32 tiles instead of 12, so each column strip is narrower and **every strip re-reads
+the whole `A` panel**; `project_gemm_bandwidth_vein`'s prior was right and my under-subscription
+story was wrong. At 8 threads, 6 -> 8 tiles fixes the ragged under-subscription without narrowing
+enough to matter.
+
+### 217b. WHY THE TOGGLE WAS RIGHT TO SHIP DEFAULT-OFF
+
+Item 170b refused to change the default on reasoning alone, citing two agents whose granularity
+changes had been reverted for exactly that. Had I edited `MIN_BLOCK_COLS` instead of adding a
+toggle, this would have shipped a **regression at 64 threads** with no way to A/B it in one process.
+
+The measurement that settles it exists only because the toggle does. That is the whole argument of
+item 25, arriving as a concrete number.
+
+### 217c. WHAT IT IS AND IS NOT
+
+**1.223x on the conv2d backward's two GEMMs at the width every certified row uses** is a large
+arm-internal effect. It is not a win: no PyTorch arm ran. Turning it into one means an h2h lane at
+`RAYON_NUM_THREADS=8` with the toggle flipped between arms — and the default must stay off for 64,
+so any default change has to be width-conditional rather than global.
+
+Bit-exactness held: identical checksums across both arms at both widths, so item 170c's falsifier
+did not fire.
+
+## 218. conv2d's FORWARD SCALES TO 8 THREADS AND THEN STOPS — THE ELBOW IS EXACTLY AT `batch`, AND 64 THREADS IS A 2x REGRESSION
+
+`frankentorch-hi9r6`. Arm-internal, FT-versus-FT, **MAINTENANCE**. `conv2d_forward_width_probe`
+(item 173), min of 9, explicit pools, loadavg 36.20/23.50/15.53, cpu_mhz spread 2.85x pre / 1.01x
+post.
+
+    threads   min ms   vs 1 thread   vs previous
+          1    6.895        1.000x            -
+          2    3.775        1.827x       1.827x
+          4    2.126        3.243x       1.776x
+          8    1.196        5.763x       1.777x
+         16    1.032        6.680x       1.159x
+         32    0.889        7.757x       1.161x
+         64    1.828        3.772x       0.486x
+
+### 218a. THE ELBOW IS WHERE ITEM 165c SAID IT WOULD BE
+
+Near-linear to 8 threads — 1.78x per doubling — then 1.16x per doubling, with the knee exactly at
+`batch = 8`. Item 165c predicted a pass capped at `batch` tasks would stop improving past that
+width; the probe's shape is that prediction, softened.
+
+**A peer's item 171 repaired it partially, not completely.** A fully-removed cap would keep
+compounding near 1.7x; a surviving cap would collapse to ~1.00x. 1.16x is neither, so some
+parallelism was recovered and some ceiling remains. Item 173's own caveat applies and is why this
+is not stated more strongly: the WHOLE forward is timed, so the residual could be another phase
+becoming binding rather than the transpose still capping.
+
+### 218b. 64 THREADS IS ACTIVELY HARMFUL
+
+`0.486x` versus 32 threads — the forward is **twice as slow** at 64 as at 32, and slower than at 16.
+Together with item 217's `0.950x` at 64, two independent probes on two different phases now say the
+same thing on this box, which is what `project_rayon_pool_width` has claimed for the whole campaign
+from board-level rows. This is that claim reproduced from the kernel side.
+
+### 218c. THE FREE CHECK THAT PASSED
+
+The probe compares raw output BITS across every width and reports `identical output across every
+pool width: yes`. That is the property item 175a argued the h2h board structurally cannot see, now
+confirmed by a second instrument at seven widths rather than the unit test's three.
+
+## 219. THE WEIGHT GRADIENT IS OUR BEST PART OF conv2d's BACKWARD, NOT ITS WORST — ADDING IT MOVES THE RATIO IN OUR FAVOUR, AND ITEM 182's EXPECTATION IS REFUTED
+
+`frankentorch-hi9r6` (P0). Item 182 built `conv2d_masked_train` to ask whether item 178's
+`needs_input_grad` skip is a saving a real training step can take, and named three outcomes. It
+predicted the first two and said of the third — "the ratio moves in FT's favour on the train lane,
+we compute dweight relatively well and items 170 and 172 should be redirected" — that it was not an
+outcome it would predict. **The third is what happened.**
+
+### 219a. THE LANE THAT COULD NOT ANSWER IT, AND WHY
+
+Item 182's lane sits at `C2_N` (batch 8), whose incumbent arm runs ~3.8 ms. Three invocations of it
+this session, at 16 and 32 rounds, with and without per-round warm-up:
+
+    conv2d_masked        2.31x  2.49x  2.06x SLOWER     PT null 1.128  1.135  1.036   all FAIL
+    conv2d_masked_warm   2.34x  2.43x  2.60x SLOWER     PT null 1.057  1.026  1.029   all FAIL
+    conv2d_masked_train  2.34x  2.22x  2.16x SLOWER     PT null 0.974  0.954  0.914   all FAIL
+
+Item 203's sizing table already said this: the incumbent is OFFSET at 5.08 ms and PASSES only at
+11.0 and 11.6 ms. Chasing the null with more rounds on a 3.8 ms arm is re-running a lever this
+ledger has already rejected. **Item 214's fix was to resize the lane, not to average the noise**,
+and item 209's table names the one masked conv2d lane ever measured certifying 4 of 4:
+`conv2d_big_masked`, batch 16.
+
+So item 216 (`conv2d_masked_train` alone) is a real certified row, but it is a row without its
+control — the frozen lane beside it could not certify, so nothing could be *compared* to it. That
+comparison is the whole question item 182 asked.
+
+### 219b. THE LEVER: A TRAIN TWIN AT A SIZE THAT IS MEASURED TO CERTIFY
+
+`conv2d_big_masked_train` — the same masked route at batch 16, differing from `conv2d_big_masked`
+in exactly the weight's `requires_grad`, on BOTH arms. No new fixture: `c2bx`/`c2bm` already existed
+on both sides and the incumbent already had `c2w_train`. Sized by a certification this board has
+already observed rather than by a guess about how long is long enough.
+
+### 219c. THE CERTIFIED ROWS
+
+Host thinkstation1, AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2, governor powersave,
+`RAYON_NUM_THREADS=8`, online_cpus 64, torch threads 8. Incumbent PyTorch 2.12.1+cpu self-reported
+in the same invocation. `allocator=mimalloc (--features fair-alloc)`, ELF `d5b22475cfa4d654`,
+32 rounds. `concurrent_measurements=none` in every run below; drift and series gates PASS in all.
+
+    run   lane                       FT(ms)   PT(ms)   standing        load_1m        MHz median
+    9     conv2d_big_masked_train    41.063   21.378   1.92x SLOWER    24.87 -> 24.03   3329
+    11    conv2d_big_masked_train    40.988   21.633   1.89x SLOWER    26.63 -> 30.83   3274
+    11    conv2d_big_masked          29.079   12.016   2.42x SLOWER    26.63 -> 30.83   3274
+
+Run 10 read 1.98x on the train lane and 2.49x on the frozen one; both failed the incumbent's null
+(0.970, 1.032) and are NOT counted.
+
+The system-allocator ELF `199e95fde4119ff6` corroborates at four more certified train rows (1.96x,
+1.91x, 1.95x, 1.92x) and two more certified frozen rows (2.41x, 2.44x). **The allocator does not act
+on this lane** — batch 16 reads the same to within 1-3% either way, unlike batch 8, where item 216
+needed `fair-alloc`.
+
+    CERTIFIED STANDING   conv2d_big_masked        FT 2.41-2.44x SLOWER   (3 certified rows)
+                         conv2d_big_masked_train  FT 1.89-1.96x SLOWER   (6 certified rows)
+
+### 219d. WHAT IT MEANS: THE GAP IS NOT IN THE WEIGHT GEMM
+
+Adding the weight gradient makes our standing BETTER, from 2.42x to 1.9x. The two lanes differ by
+exactly dweight, in the same invocation under the same estimator, so their difference prices it —
+a derived quantity, not a certified row, and quoted as such:
+
+    run    FT dweight (ms)   PT dweight (ms)   FT/PT on dweight alone
+    5      12.567            9.103             1.38x
+    6      12.116            9.359             1.29x
+    7      12.347            9.182             1.34x
+    8      12.097            9.327             1.30x
+    9      12.048            9.394             1.28x
+    10     12.588            9.398             1.34x
+    11     11.909            9.617             1.24x
+                                        mean  ~1.31x, range 1.24-1.38x, 7 invocations, 2 binaries
+
+**Our weight-gradient GEMM runs at ~1.3x PyTorch while the rest of the masked backward runs at
+~2.4x.** It is the strongest component of conv2d's backward, and the gap lives in the dinput path —
+the im2col/col2im transform and the dinput GEMM — not in the weight GEMM.
+
+Two consequences, both of which change where work should go rather than adding to it:
+
+* **Items 170 and 172 are aimed at our best component.** Item 141's phase table priced the dweight
+  GEMM at 2.036 ms of a 16.6 ms backward and that made it look like the target; measured against the
+  incumbent rather than against our own total, it is the part we already do nearly as well.
+* **The board's frozen-weight conv2d lanes UNDERSTATE us, they do not flatter us.** Item 182
+  expected the opposite, and item 216 reasoned from a train lane with no control beside it. A real
+  training step of this layer is the *better* of the two numbers we can quote.
+
+Item 178 keeps its value — it stopped us computing a gradient nothing read — but it closes no gap
+against the incumbent, because PyTorch takes the same skip and takes slightly more from it
+(its arm falls 21.4 -> 12.0 ms, ours 41.1 -> 29.1).
+
+### 219e. NEGATIVE EVIDENCE ON THE INSTRUMENT: EVERY GATE PASSED AND THE INCUMBENT ARM WAS STILL WRONG BY 2x
+
+The first invocation of the new pair certified on sight — both A/A nulls PASS, parity `match`, drift
+and series PASS, `concurrent_measurements=none` — and read **4.68x and 4.23x SLOWER**. Its FrankenTorch
+arm (28.443 / 40.603 ms) agrees with every later run to under 2%. Its **incumbent** arm read
+6.075 / 9.598 ms against ~12.0 / ~21.4 ms everywhere else, and against item 209's banked 11.0 ms for
+the same lane. PyTorch ran at roughly half cost for that one invocation and nothing in the harness
+objected.
+
+It cannot object: **the A/A null compares two positions INSIDE one run, so a uniformly scaled arm
+cancels out of it exactly.** Drift cannot see it either — the run was stable, just stable at the
+wrong level. Only replication against a prior banked incumbent figure caught it, and had this been a
+single-invocation row it would have been banked as a 4.2x loss and sent items 170/172 further in the
+wrong direction.
+
+The rule this earns: **a row whose incumbent arm has no prior figure to be checked against is one
+invocation short of readable, however its gates read.** The campaign already knows an incumbent that
+moved is not a win (the harness prints it); this is the same rule for an incumbent that moved in our
+disfavour, which is the direction nobody audits.

@@ -1325,6 +1325,9 @@ LANES = {
     # control. The FrankenTorch side of this name runs the pre-item-174 scatter.
     "conv2d_xl_legacy":  (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
+    # item 216: the train twin of the line above -- c2w_train, so BOTH arms compute dweight.
+    # Sized at batch 16 because that is the one masked conv2d lane measured certifying 4 of 4.
+    "conv2d_big_masked_train": (c2bx, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2bm),
     # item 190: byte-identical twin of conv2d_masked, so the warm/cold A/B is one invocation.
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
@@ -1910,6 +1913,30 @@ LANES = {
         (
             "conv2d_big_masked",
             Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false)),
+        ),
+        (
+            // item 216: the TRAIN twin of the lane above, and the whole point of the pair.
+            //
+            // Item 182 added `conv2d_masked_train` to ask whether item 178's `needs_input_grad`
+            // skip is a saving a real training step can take. That lane is at `C2_N` (batch 8),
+            // whose incumbent arm runs ~3.8 ms -- the SHORTEST on this board, and item 203's
+            // sizing table measured the incumbent as OFFSET at 5.08 ms and PASS only at 11.0 and
+            // 11.6 ms. Three invocations confirmed it: the pair reads consistently but its A/A
+            // null failed every time, so the question has never been answerable from it.
+            //
+            // `conv2d_big_masked` is the SAME masked route at batch 16, and item 209's table
+            // recorded it certifying 4 of 4 -- the only masked conv2d lane on this board that
+            // ever has. So this twin is sized by a MEASURED certification, not by a guess about
+            // how long is long enough, and it needs no new fixture: `c2bx`/`c2bm` already exist
+            // on both arms and the incumbent already has `c2w_train`.
+            //
+            // The two lanes differ in EXACTLY the weight's `requires_grad`, on both arms, so the
+            // pair separates the two readings item 182 could not: if the ratio is unchanged
+            // between them, item 178's skip is worth nothing to a training step and the board's
+            // frozen-weight conv2d lanes flatter us; if the train ratio is worse, our dweight
+            // GEMM is a disproportionate offender and items 170/172 should aim there.
+            "conv2d_big_masked_train",
+            Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, true)),
         ),
         (
             // item 209: the SUMMED route, sized so our arm lands near 35 ms. `conv2d_big` reaches
