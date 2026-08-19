@@ -37425,3 +37425,73 @@ is the instrument, not the constant: **the DIRECT figure is printed per run**, w
 resolution at which it is true. Item 230f's threshold table should be read per sweep shape, not as
 two universal numbers — and it holds up when it is: at `DIRECT=17.37` over a 16 s window the formula
 demands a starting load of ~16, the run started at 23.21, and its drift gate PASSED.
+
+## 234. THE GATE'S TOLERANCE ARGUMENT, MADE WITH A NUMBER FOR THE FIRST TIME — IT IS A TOLERANCE QUESTION, NOT A CORRECTNESS ONE
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. **No timing, no quiet host, no build
+slot** — this is the half of that bead the saturated host could not stop.
+
+### 234a. THE OBLIGATION THAT HAD BEEN ASSERTED THREE TIMES AND NEVER MEASURED
+
+`PARALLEL_GATE` decides whether `reduce_scaled_rows_f64` accumulates in one serial sweep or in a
+partial-sum tree, and `REDUCE_CHUNK_ROWS` is documented as FIXED precisely because those two
+associate differently. So every proposal to move the gate — the entire content of this bead — is
+a proposal to change result bits, and item 156's note is explicit that whoever moves it owes the
+tolerance argument under the ratified eig/SVD policy (`frankentorch-qgce4`).
+
+That argument has been stated in prose in three separate places and never carried a figure.
+**A tolerance claim without a measured deviation is not an argument, it is a hope.**
+
+### 234b. HOW THE BRANCH WAS FORCED WITHOUT TOUCHING THE GATE
+
+Both helpers take the serial path when `rayon::current_num_threads() <= 1`. Running the same call
+inside a **one-thread rayon pool** selects the serial branch on identical input, in the SAME
+process, with the gate and the environment untouched — so the difference measured is the branch
+and nothing else.
+
+`FT_LINALG_PARALLEL_GATE` cannot do this: it is read into a `OnceLock`, so one process only ever
+sees one value of it, and any A/B through it is cross-process. That is why this obligation kept
+being deferred to a quiet window it never actually needed.
+
+### 234c. THE NUMBERS
+
+`gated_helper_branches_agree_within_the_ratified_svd_tolerance`, all three callers item 232
+enumerated, at sizes above the crossing:
+
+    n      reduction (dlabrd_panel)   form_q      form_p      any bit-identical?
+    136          9.268e-13           1.943e-16   2.220e-16   no, none of the three
+    192          9.885e-13           2.776e-16   2.637e-16   no, none of the three
+
+**Two findings, and they point in opposite directions:**
+
+* **The branches really do move bits** — nothing here is bit-identical, so the caution in
+  `REDUCE_CHUNK_ROWS`'s comment was well founded and the concern was not theoretical.
+* **Every deviation is far inside the ratified 1e-11.** The expansions differ at the ULP
+  (~2e-16); the reduction at ~1e-12, three orders larger but still ten times inside the bound.
+  **So moving `PARALLEL_GATE` is a tolerance question the `qgce4` policy already covers, not a
+  correctness one.** That is the blocker on this bead's remaining work, and it is now cleared.
+
+The bound is not one invented to fit the measurement: 1e-11 is the figure
+`bidiag_blocked_form_p_matches_the_unblocked_expansion` already applies to the same KIND of
+change — a reassociation of the same arithmetic.
+
+### 234d. THE TEST CANNOT GO VACUOUS, AND IT PROVES ITS OWN ARM
+
+Two ways this could have measured nothing, both closed:
+
+* If the ambient pool were single-threaded (`RAYON_NUM_THREADS=1`), both arms would be serial and
+  every printed deviation would be a zero that means nothing. Asserted, with that message.
+* **The non-zero deviations ARE the proof the parallel branch ran.** Both expansions are fed the
+  same `packed`/`tau` from the same reduction, so any difference between their arms is the
+  expansion's own branch and cannot come from upstream. A gate that failed to fire would print
+  exact zeros.
+
+Orthonormality is also asserted on **both** branches rather than only on their agreement —
+agreeing with a reference is not the same as being correct, which is item 39's lesson.
+
+### 234e. WHAT IS STILL OWED
+
+The per-call-site A/B across the gate, and a route test pinning its outcome from outside. Both
+need timing, and the host has been saturated for two ticks (loadavg 62-102, runq 60-83, four peer
+local builds). **The measurement half of this bead is deferred, not attempted and failed** — and
+the new fleet-wide measurement slot is the right instrument for it when the host allows.

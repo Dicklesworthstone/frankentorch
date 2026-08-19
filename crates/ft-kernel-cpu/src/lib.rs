@@ -65144,6 +65144,117 @@ mod tests {
         }
     }
 
+    /// How far apart ARE the gated helpers' two branches? —
+    /// `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`, NEGATIVE_EVIDENCE item 234.
+    ///
+    /// WHY THIS IS THE FIRST THING THAT BEAD OWES. `PARALLEL_GATE` decides whether
+    /// `reduce_scaled_rows_f64` accumulates in one serial sweep or in a partial-sum tree, and
+    /// `REDUCE_CHUNK_ROWS` is documented as FIXED precisely because those two associate
+    /// differently. So every proposal to move the gate — the whole point of that bead — is a
+    /// proposal to change result bits, and item 156's note is explicit that whoever moves it
+    /// owes the tolerance argument under the ratified eig/SVD policy (`frankentorch-qgce4`).
+    ///
+    /// That argument has been made in prose three times and never with a number. This produces
+    /// the number, deterministically, with no timing and no quiet host required.
+    ///
+    /// HOW IT FORCES THE OTHER BRANCH WITHOUT TOUCHING THE GATE. Both helpers take the serial
+    /// path when `rayon::current_num_threads() <= 1`. Running the same call inside a
+    /// one-thread rayon pool therefore selects the serial branch on identical input, in the
+    /// SAME process, with the gate and the environment untouched — so the difference measured
+    /// here is the branch and nothing else. `FT_LINALG_PARALLEL_GATE` cannot do this: it is
+    /// read into a `OnceLock`, so one process only ever sees one value of it.
+    ///
+    /// ALL THREE CALLERS are covered, which is the enumeration item 232 completed:
+    /// `bidiag_blocked_f64` (via `dlabrd_panel_f64`), `bidiag_form_q_f64`, `bidiag_form_p_f64`.
+    /// Sizes are above the crossing — at n=136 roughly eight or nine steps per expansion take
+    /// the parallel branch, at n=192 about sixty-five.
+    #[test]
+    fn gated_helper_branches_agree_within_the_ratified_svd_tolerance() {
+        // The premise. If the ambient pool is single-threaded (RAYON_NUM_THREADS=1 in the
+        // environment, say) then BOTH arms below are serial, the comparison is of a thing with
+        // itself, and every number it prints is a zero that means nothing.
+        assert!(
+            rayon::current_num_threads() > 1,
+            "ambient rayon pool is single-threaded, so the 'parallel' arm is serial too and \
+             this test cannot measure a branch difference"
+        );
+        let serial_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread pool");
+
+        let worst = |a: &[f64], b: &[f64]| -> f64 {
+            a.iter()
+                .zip(b.iter())
+                .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()))
+        };
+
+        for &n in &[136usize, 192] {
+            let nb = super::svd_bidiag_block_size();
+
+            // (1) the REDUCTION, which reaches the gate through `dlabrd_panel_f64`.
+            let mut packed_par = bidiag_test_matrix(n, n, 0x6A7E ^ n as u64);
+            let mut packed_ser = packed_par.clone();
+            let (d_par, e_par, tauq_par, taup_par) =
+                super::bidiag::bidiag_blocked_f64(&mut packed_par, n, n, nb);
+            let (d_ser, e_ser, tauq_ser, taup_ser) = serial_pool
+                .install(|| super::bidiag::bidiag_blocked_f64(&mut packed_ser, n, n, nb));
+
+            let red_worst = worst(&d_par, &d_ser)
+                .max(worst(&e_par, &e_ser))
+                .max(worst(&tauq_par, &tauq_ser))
+                .max(worst(&taup_par, &taup_ser))
+                .max(worst(&packed_par, &packed_ser));
+
+            // (2) and (3) the two EXPANSIONS, both fed the parallel reduction's reflectors so
+            // only the expansion's own branch differs between the arms.
+            let q_par = super::bidiag::bidiag_form_q_f64(&packed_par, n, n, &tauq_par);
+            let q_ser = serial_pool
+                .install(|| super::bidiag::bidiag_form_q_f64(&packed_par, n, n, &tauq_par));
+            let p_par = super::bidiag::bidiag_form_p_f64(&packed_par, n, &taup_par);
+            let p_ser =
+                serial_pool.install(|| super::bidiag::bidiag_form_p_f64(&packed_par, n, &taup_par));
+
+            let q_worst = worst(&q_par, &q_ser);
+            let p_worst = worst(&p_par, &p_ser);
+
+            println!(
+                "gate-branch deviation n={n}: reduction {red_worst:.3e}  form_q {q_worst:.3e}                   form_p {p_worst:.3e}  (bit-identical: reduction {} form_q {} form_p {})",
+                red_worst == 0.0,
+                q_worst == 0.0,
+                p_worst == 0.0
+            );
+
+            // Orthonormality is the property the ratified policy actually protects, so it is
+            // checked on the branch a caller would get, not just the agreement between them.
+            for (label, mat) in [("parallel", &q_par), ("serial", &q_ser)] {
+                let err = bidiag_p_orthonormality_error(mat, n);
+                assert!(
+                    err < 1e-9,
+                    "n={n}: form_q's {label} branch is not orthonormal, |QQ^T - I| = {err}"
+                );
+            }
+            for (label, mat) in [("parallel", &p_par), ("serial", &p_ser)] {
+                let err = bidiag_p_orthonormality_error(mat, n);
+                assert!(
+                    err < 1e-9,
+                    "n={n}: form_p's {label} branch is not orthonormal, |PP^T - I| = {err}"
+                );
+            }
+
+            // The bound. 1e-11 is the figure the blocked/unblocked oracle already uses for the
+            // same KIND of change (a reassociation of the same arithmetic), so the gate is held
+            // to the tolerance this codebase has already ratified rather than to a new one
+            // invented to fit the measurement.
+            assert!(
+                red_worst < 1e-11 && q_worst < 1e-11 && p_worst < 1e-11,
+                "n={n}: a gate branch moves a value by more than the ratified 1e-11 — \
+                 reduction {red_worst:.3e}, form_q {q_worst:.3e}, form_p {p_worst:.3e}. \
+                 Moving PARALLEL_GATE is then not a tolerance question but a correctness one."
+            );
+        }
+    }
+
     /// frankentorch-4zjaa: the owed post-fix ratio for the blocked `form_p`.
     ///
     /// FT-vs-FT, so this is MAINTENANCE evidence under section 1, not a win — it
