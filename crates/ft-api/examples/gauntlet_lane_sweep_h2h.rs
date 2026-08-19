@@ -1474,7 +1474,27 @@ LANES = {
     "prelu_dense": (prx, lambda x: Fn.prelu(x,prw)**2),
 }
 "#;
-    let py = format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY);
+    // ISOLATION MODE PICKS A DIFFERENT CO-PROCESS — `frankentorch-rayon-pool-width-qq8as`.
+    //
+    // With `FT_H2H_NO_INCUMBENT` the driver never sends a SAMPLE request, so the incumbent's work
+    // was already unused; what it was NOT was absent. The full program still imported torch, built
+    // every lane, and ran 32 warm-ups PER LANE before `PT_READY`, so an "isolated" run was preceded
+    // by minutes of torch work on the same box — warming the same caches and pulling the same
+    // clocks the run then measures.
+    //
+    // It also kept the mode off any machine without torch, which is precisely where it is needed:
+    // qq8as asks whether the width finding generalises past THIS host, and the second machines
+    // available (rch workers) have no torch. An arm-internal measurement that cannot run without
+    // torch cannot visit a second machine.
+    //
+    // Read here rather than at the flag's other use site further down, because the decision has to
+    // be made BEFORE the child is spawned.
+    let isolate_arm_early = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
+    let py = if isolate_arm_early {
+        ft_api::harness_interleave::ISOLATION_STUB_PY.to_owned()
+    } else {
+        format!("{py_setup}{}", ft_api::harness_interleave::SAMPLE_LOOP_PY)
+    };
 
     // `-c`, never `-`: the latter reads the program from stdin until EOF, which
     // deadlocks a co-process whose stdin must stay open for requests.
@@ -1540,10 +1560,24 @@ LANES = {
         "executing_elf_sha256={}",
         ft_api::harness_provenance::executing_elf_sha256()
     );
-    println!(
-        "{}",
-        ft_api::harness_provenance::incumbent_provenance_block(torch_version, INCUMBENT_THREADS)
-    );
+    if isolate_arm_early {
+        // Never print `incumbent=PyTorch <version>` for a run that had no incumbent. The stub
+        // reports a stub identifier precisely so this branch can be honest rather than plausible.
+        println!(
+            "incumbent=NONE (FT_H2H_NO_INCUMBENT: the co-process is a stub that imports no torch \
+             and does no work, so this run carries NO vs-PyTorch claim and its PT columns are \
+             placeholders). Arm-internal comparisons only: FT time against FT time, within this \
+             one invocation on this one machine."
+        );
+    } else {
+        println!(
+            "{}",
+            ft_api::harness_provenance::incumbent_provenance_block(
+                torch_version,
+                INCUMBENT_THREADS
+            )
+        );
+    }
     // Names the machine this row was measured on. Both arms are sampled in this
     // one invocation on this one host, so the row is internally comparable; the
     // block exists so it can still be PLACED against other rows afterwards.
@@ -2361,7 +2395,8 @@ LANES = {
         let previous = ft_kernel_cpu::set_narrow_pool_enabled(on);
         println!("narrow_pool={on} (was {previous})");
     }
-    let isolate_arm = std::env::var("FT_H2H_NO_INCUMBENT").is_ok();
+    // Same flag, read once above so the co-process choice could be made before the spawn.
+    let isolate_arm = isolate_arm_early;
     // frankentorch-68pwz item 48: the MIRROR of the probe above. With
     // `FT_H2H_NO_FT_ARM` the incumbent keeps its four slots in their square positions
     // and NO FrankenTorch work runs between them, so its uncontended per-slot times can

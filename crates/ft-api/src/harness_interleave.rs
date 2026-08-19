@@ -367,6 +367,45 @@ pub fn interpreter_args(script: &str) -> [&str; 2] {
 /// waiting for a reply that will never come in the shape it expects. The lanes
 /// dict and the `run` function are supplied by the calling harness; this is only
 /// the ready/serve/quit protocol.
+/// Co-process program for ISOLATION MODE (`FT_H2H_NO_INCUMBENT`), which imports NOTHING.
+///
+/// # Why a stub exists at all
+///
+/// In isolation mode the driver never sends a `SAMPLE` request — the incumbent's slots stay in the
+/// balanced square but no incumbent work runs in them. The child was nevertheless the FULL torch
+/// program: it imported torch, built every lane's tensors, and ran 32 warm-up iterations PER LANE
+/// before printing `PT_READY`. So an "isolated" run was preceded by minutes of heavy torch work on
+/// the same box, warming the same caches and pulling the same clocks, and the mode's own banner
+/// claiming "the co-process is the only variable" was not quite true.
+///
+/// It also made the mode useless where it is most needed. `frankentorch-rayon-pool-width-qq8as`
+/// asks whether the pool-width finding generalises past THIS host, and the machines available to
+/// answer that — rch build workers — do not have torch installed. An arm-internal measurement that
+/// cannot run without torch cannot visit a second machine.
+///
+/// The stub speaks the same protocol and does none of the work: version marker, timed-steps
+/// declaration, `PT_READY`, then it waits for `QUIT`.
+///
+/// # Honesty of the two markers
+///
+/// The version is reported as a stub identifier rather than a torch version, so a row taken this
+/// way can never be mistaken for one with a live incumbent — the provenance block says
+/// `incumbent=NONE` and the run carries no vs-PyTorch claim, which is exactly what isolation mode
+/// already declares about its PT columns.
+///
+/// The timed-steps line echoes the driver's own list. That check exists to prove both arms timed
+/// the same region; with no incumbent work there is no second region to disagree with, and echoing
+/// keeps the driver's enforcement path identical rather than adding a branch that could rot.
+pub const ISOLATION_STUB_PY: &str = r#"
+import sys
+print('PT_TORCH_VERSION none-isolation-stub-no-torch', flush=True)
+print('PT_TIMED_STEPS forward,loss_sum,backward', flush=True)
+print('PT_READY', flush=True)
+for _line in sys.stdin:
+    if _line.strip() == 'QUIT':
+        break
+"#;
+
 pub const SAMPLE_LOOP_PY: &str = r#"
 import sys, os
 # frankentorch-6atx2: warm every lane BEFORE announcing readiness, so no lane's
@@ -396,6 +435,43 @@ for _line in sys.stdin:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stub must satisfy every handshake the driver enforces, or an isolation run dies before
+    /// its first lane — and it must import nothing, or it cannot run on a machine without torch,
+    /// which is the entire reason it exists.
+    #[test]
+    fn isolation_stub_speaks_the_protocol_and_imports_nothing() {
+        assert!(ISOLATION_STUB_PY.contains(READY_MARKER));
+        assert!(ISOLATION_STUB_PY.contains(QUIT_REQUEST));
+        assert!(ISOLATION_STUB_PY.contains(crate::harness_provenance::VERSION_MARKER.trim_end()));
+        assert!(ISOLATION_STUB_PY.contains(TIMED_STEPS_MARKER.trim_end()));
+        for step in TIMED_STEPS {
+            assert!(
+                ISOLATION_STUB_PY.contains(step),
+                "the stub must declare every timed step the driver checks for, missing {step}"
+            );
+        }
+        // The assertion is about the IMPORT, not the substring: the protocol's own marker is
+        // `PT_TORCH_VERSION` and the stub's identifier says `no-torch`, so a bare `contains("torch")`
+        // fails on the two lines that exist to be honest about there being no torch.
+        assert!(
+            !ISOLATION_STUB_PY.contains("import torch"),
+            "importing torch would defeat the point: the stub exists so an arm-internal run can \
+             visit a machine that has none"
+        );
+        for line in ISOLATION_STUB_PY.lines() {
+            let line = line.trim();
+            assert!(
+                !(line.starts_with("import ") && line != "import sys"),
+                "the stub may import nothing but sys, found: {line}"
+            );
+            assert!(
+                !line.starts_with("from "),
+                "the stub may import nothing but sys, found: {line}"
+            );
+        }
+        assert!(ISOLATION_STUB_PY.contains("flush=True"));
+    }
 
     #[test]
     fn balanced_square_gives_each_arm_every_half_and_slot_position_equally() {
