@@ -25,6 +25,7 @@
 set -uo pipefail
 
 MAX_LOAD="${FT_GUARD_MAX_LOAD:-35}"
+MAX_IOWAIT="${FT_GUARD_MAX_IOWAIT:-10}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --max-load) MAX_LOAD="$2"; shift 2 ;;
@@ -90,9 +91,28 @@ if awk -v l="$LOAD1" -v m="$MAX_LOAD" 'BEGIN { exit !(l > m) }'; then
     STATUS=1
 fi
 
+# IOWAIT, SAMPLED AS A DELTA. A host can sit at a modest loadavg with no peer benchmark and
+# still be unmeasurable because it is disk-bound — five concurrent local builds will do it, and
+# neither of the checks above can see that.
+#
+# It has to be a DELTA over a short window: /proc/stat's iowait field is CUMULATIVE since boot
+# (it reads ~20.6 million jiffies here), so the raw number carries no information about now.
+# Sampling twice and differencing is the only form of this check that means anything.
+IOWAIT_BEFORE="$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $6}' /proc/stat)"
+sleep "${FT_GUARD_IOWAIT_WINDOW:-2}"
+IOWAIT_AFTER="$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $6}' /proc/stat)"
+IOWAIT_PCT="$(
+    echo "$IOWAIT_BEFORE $IOWAIT_AFTER" \
+        | awk '{ dt = $3 - $1; dw = $4 - $2; if (dt <= 0) print "0.0"; else printf "%.1f", 100 * dw / dt }'
+)"
+if awk -v w="$IOWAIT_PCT" -v m="$MAX_IOWAIT" 'BEGIN { exit !(w > m) }'; then
+    echo "REFUSING TO MEASURE: iowait ${IOWAIT_PCT}% exceeds ${MAX_IOWAIT}% — host is disk-bound." >&2
+    STATUS=1
+fi
+
 if [ "$STATUS" -ne 0 ]; then
-    echo "Guard FAILED — do source work and retry. (override: FT_GUARD_MAX_LOAD)" >&2
+    echo "Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)" >&2
     exit "$STATUS"
 fi
 
-echo "guard PASS: no peer measurement detected, loadavg $LOAD1 <= $MAX_LOAD"
+echo "guard PASS: no peer measurement detected, loadavg $LOAD1 <= $MAX_LOAD, iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"
