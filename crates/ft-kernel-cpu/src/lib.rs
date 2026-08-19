@@ -65255,6 +65255,81 @@ mod tests {
         }
     }
 
+    /// Is the reduction's panel width right at the sizes we actually measure? —
+    /// `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 239.
+    ///
+    /// WHY ASK. `svd_bidiag_block_size()` returns a hardcoded 16, and its comment records the
+    /// evidence: "Measured on the shared workers at `N = 256` and `N = 512`: 16 beat 32 and 64
+    /// at both sizes". Item 237 then measured the reduction at **70-74% of the SVD forward** at
+    /// n=128-136, where that constant has never been checked. This session has already found
+    /// the same shape of defect twice — item 229's `form_p` threshold was set from a grid with
+    /// no point near the crossover, and `frankentorch-conv3d-direct-gate-misset` is the
+    /// standing example. **A constant validated at one size is only known at that size.**
+    ///
+    /// `bidiag_blocked_f64` takes `nb` as a PARAMETER, so this sweeps it directly: no env knob,
+    /// no dispatch change, no `OnceLock` forcing one value per process. Every arm runs in ONE
+    /// process over the SAME input, interleaved by round so a load ramp lands on all of them.
+    ///
+    /// FT-vs-FT, so this is MAINTENANCE evidence under section 1 — it can say which panel width
+    /// is fastest, never that we beat the incumbent.
+    ///
+    /// Correctness is not at stake in the sweep itself: `nb` changes only the blocking, and
+    /// `bidiag_blocked_matches_unblocked_oracle` already pins the output against the unblocked
+    /// expansion across several widths. Any DISPATCH change that follows from this would move
+    /// result bits by reassociation, which is admissible only under the ratified `qgce4` policy
+    /// — the same argument the blocked `form_p` needed.
+    #[test]
+    #[ignore = "timing sweep; run explicitly in a measured window"]
+    fn bidiag_blocked_panel_width_sweep() {
+        const WIDTHS: [usize; 6] = [8, 16, 24, 32, 48, 64];
+        const ROUNDS: usize = 5;
+
+        println!(
+            "panel-width sweep, rayon_threads={} (FT-vs-FT: MAINTENANCE, not a win)",
+            rayon::current_num_threads()
+        );
+        for &n in &[128usize, 136, 160, 256] {
+            let base = bidiag_test_matrix(n, n, 0x8ADE ^ n as u64);
+            let mut best = [u128::MAX; WIDTHS.len()];
+
+            for _ in 0..ROUNDS {
+                for (slot, &nb) in best.iter_mut().zip(WIDTHS.iter()) {
+                    let mut packed = base.clone();
+                    let started = std::time::Instant::now();
+                    let out = super::bidiag::bidiag_blocked_f64(&mut packed, n, n, nb);
+                    let elapsed = started.elapsed().as_nanos();
+                    // Consume the result so nothing is optimised away.
+                    std::hint::black_box(&out);
+                    *slot = (*slot).min(elapsed);
+                }
+            }
+
+            let shipped = best[WIDTHS.iter().position(|&w| w == 16).expect("16 is swept")];
+            #[allow(clippy::cast_precision_loss)]
+            let rel = |v: u128| shipped as f64 / v.max(1) as f64;
+            let mut line = format!("panel-width n={n}: ");
+            for (&nb, &v) in WIDTHS.iter().zip(best.iter()) {
+                line.push_str(&format!(
+                    "nb={nb} {:.3}ms ({:.2}x) ",
+                    v as f64 / 1e6,
+                    rel(v)
+                ));
+            }
+            let winner = WIDTHS[best
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| **v)
+                .map(|(i, _)| i)
+                .expect("non-empty")];
+            line.push_str(&format!("-- fastest nb={winner}, shipped nb=16"));
+            println!("{line}");
+        }
+        println!(
+            "READ: the ratio is against the SHIPPED nb=16, so >1.00x means that width beats what \
+             we ship. A width that wins at 256 and loses at 136 is the whole question."
+        );
+    }
+
     /// frankentorch-4zjaa: the owed post-fix ratio for the blocked `form_p`.
     ///
     /// FT-vs-FT, so this is MAINTENANCE evidence under section 1, not a win — it

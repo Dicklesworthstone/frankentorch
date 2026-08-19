@@ -37730,3 +37730,57 @@ Under the pre-today detector (item 233) those two idle matches would have voided
 run that first cleared every gate on this lane. Ten prior runs failed to be admissible; part of what
 made three of four admissible today is that the instrument stopped refusing runs for the wrong
 reason.
+
+## 239. THE REDUCTION'S PANEL WIDTH WAS TUNED AT n=256/512 AND IS USED AT n=136 — INSTRUMENT BUILT, NOT RUN, AND THE BUILD IS WHY
+
+`frankentorch-4zjaa`. **No measurement in this item.** A hypothesis, an instrument, and the
+reason the instrument did not run — recorded because the reason is itself the recurring one.
+
+### 239a. THE HYPOTHESIS
+
+Item 237 measured the reduction at **70-74% of the SVD forward** at n=128-136. Reading it,
+`svd_bidiag_block_size()` is a hardcoded `16`, and its own comment records the evidence for that
+number: *"Measured on the shared workers at `N = 256` and `N = 512`: 16 beat 32 and 64 at both
+sizes."*
+
+So the panel width governing three-quarters of the op at n=136 was chosen from measurements two
+to four times larger, and has never been checked where item 231's standing actually lives. At
+n=136 with nb=16 the reduction runs 8-9 panels; the panel is BLAS-2 and the trailing update
+BLAS-3, so the split between them moves with nb, and the right nb is a function of size.
+
+**This session has now found the same shape of defect three times** — item 229's `form_p`
+threshold read off a grid with no point near its crossover, `frankentorch-conv3d-direct-gate-misset`
+before it, and now this. A constant validated at one size is only known at that size.
+
+### 239b. THE INSTRUMENT
+
+`bidiag_blocked_panel_width_sweep`, marked `#[ignore]` so it cannot slow an ordinary suite.
+It sweeps nb ∈ {8, 16, 24, 32, 48, 64} at n ∈ {128, 136, 160, 256}, all arms in ONE process over
+the SAME input, interleaved by round, min of 5, and reports each width relative to the shipped 16.
+
+`bidiag_blocked_f64` takes `nb` as a **parameter**, so this needs no env knob and no dispatch
+change — and crucially no `OnceLock`, which is what forced the gate A/B of item 234 to be
+cross-process until a one-thread rayon pool was found instead.
+
+Correctness is not at stake in the sweep: nb changes only the blocking and
+`bidiag_blocked_matches_unblocked_oracle` already pins the output across several widths. A
+DISPATCH change following from it would move bits by reassociation and would need the ratified
+`qgce4` argument, exactly as the blocked `form_p` did.
+
+### 239c. WHY IT DID NOT RUN, WHICH IS THE PART WORTH RECORDING
+
+The tick opened at loadavg 18 with runq 10 and no local builds — the cleanest window in days.
+Two things closed it:
+
+* **A peer FrankenTorch session was already mid-measurement** (a `torchvenv-2121` torch benchmark
+  visible in `/proc`), which the fleet measurement slot exists to prevent and which a manual
+  `/proc` scan caught instead. `acquire_build_slot` has returned *"Build slots are disabled.
+  Enable WORKTREES_ENABLED"* on **every attempt across three ticks**, so the rule cannot bind.
+* **Building the instrument took 8m15s and put the host at loadavg 140.** The build destroyed the
+  window it was meant to measure in. That is a known trap — redis reported it and this is the
+  same failure — and the lesson is sharper than it looks: **on this host a local release build of
+  `ft-kernel-cpu` and a measurement cannot occupy the same tick.** The build must land in a tick
+  whose window is already spent, so the *next* tick can measure.
+
+The sweep is committed, gated, and costs one invocation whenever a window appears. No ratio is
+claimed from this item and none was taken.
