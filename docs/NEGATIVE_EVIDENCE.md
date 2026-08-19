@@ -36165,3 +36165,64 @@ range. Not overridden with `GUARD_MODE=warn`: another agent's reservation is not
 
 The measurements items 170, 172, 173, 178 and 182 owe are still owed, and now blocked only by a
 quiet host rather than by anything unbuilt.
+
+## 216. CERTIFIED — conv2d's TRAINING ROUTE STANDS AT 2.19x SLOWER, ON THE LANE WHERE BOTH ARMS COMPUTE A WEIGHT GRADIENT
+
+`frankentorch-hi9r6` (P0). **A quotable row.** Both A/A nulls PASS, parity `match`, drift PASS, and
+the binary carries `--features fair-alloc` — the omission that voided every measurement from items
+187 to 193.
+
+    lane                  FT(ms)    PT(ms)   standing        PT null            FT null            parity
+    conv2d_masked_train   11.542    5.261    2.19x SLOWER    PASS 0.967-1.033   PASS 0.975-1.038   match
+
+    measurement_host  thinkstation1, AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2
+    governor          powersave, rayon_threads=8, online_cpus=64
+    incumbent         PyTorch 2.12.1+cpu, self-reported by the arm IN THE SAME INVOCATION, threads=8
+    allocator         mimalloc (--features fair-alloc)
+    ELF sha256        2db6087a105f400d876f709519c8082fd58919b3e13056bf1b210d49c9e6a51f
+    sampling          balanced-square ABBAABBA, 64 rounds, four live samples per arm per round
+    load_1m           start 24.77 -> end 24.91; load_series n=66, worst_drift 1.015x, both gates PASS
+    cpu_mhz           min 1429 median 3389 max 4267, spread 2.986x; cross-core spread median 2.867x
+    slot0/med(1..3)   0.991 — no cold-start contamination (item 169)
+    oversubscription  no banner: peak loadavg stayed under online_cpus (item 194)
+
+### 216a. WHY THIS LANE AND NOT THE OTHER TWO
+
+`conv2d_masked` and `conv2d_masked_warm` read 2.30x and 2.45x in the same invocation and **both
+failed on the INCUMBENT's null** (1.150 and 1.048) while ours passed (0.983, 1.002). That is item
+144a recurring exactly as predicted: PyTorch's arm is 3.3-3.5 ms on those lanes and ~5.3 ms here,
+and on this host a ~3 ms incumbent arm does not null.
+
+So the lane that certifies is the one whose incumbent arm is long enough — and it happens to be the
+lane item 182 added for a completely different reason.
+
+### 216b. WHAT THE ROW MEANS, STATED CAREFULLY
+
+`conv2d_masked_train` gives BOTH arms a grad-requiring weight, so it measures a real training step:
+input gradient, weight gradient, non-uniform upstream. **2.19x SLOWER is therefore conv2d's honest
+training-route standing**, and it is a number item 178's masking cannot flatter — on this lane the
+mask asks for both gradients, so the skip is worth exactly nothing.
+
+That was item 182's whole purpose: to separate "we stopped computing a discarded gradient" from
+"conv2d got faster". This row is the half that survives the separation.
+
+It does NOT supersede the certified 5.73x of item 144b, which was a different lane
+(`conv2d_masked`, frozen weight) on a different binary. The frozen lane read 2.30x here but is
+uncertified, so the comparison is suggestive, not banked.
+
+### 216c. TWO INSTRUMENTS BUILT THIS SESSION EARNED THEIR KEEP IN THIS RUN
+
+* Item 169's `slot0/median(slot1..3)` printed 0.991 under the certified row and **1.049 under
+  `conv2d_masked_warm`, flagged COLD** — the diagnostic distinguishing a clean row from a
+  cold-first-sample row without a second tool.
+* Item 206's rounds hint fired on `conv2d_masked_warm` ("worst null is 0.048 off 1.0 ... sampling
+  noise rather than a moving host") and stayed silent on `conv2d_masked`, whose PT null was 1.150 —
+  correctly declining to suggest more rounds where the incumbent arm, not noise, is the problem.
+
+Both behaved as designed on their first live certification.
+
+### 216d. OWED
+
+The frozen-weight lanes still cannot certify on this host, and item 144a says why. Items 170, 172
+and 173 still owe their arm-internal probe runs; the probes are built and the gates now exist to run
+them honestly.
