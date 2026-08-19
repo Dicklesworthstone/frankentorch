@@ -48,6 +48,36 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
+/// Total CPU seconds this process and its REAPED children have burned, from `/proc/self/stat`.
+///
+/// `frankentorch-vyaia` acceptance item 2 asks for the harness's own load to be re-derived at the
+/// current lane count. The obvious instrument — watch `loadavg` rise while we run — cannot do it
+/// on this box: the first full sweep under it read `+50.18` while three peer `rustc` processes
+/// were live, and no amount of waiting makes a shared machine quiet on demand.
+///
+/// This one does not care. Mean parallelism is our own CPU time divided by wall time, and a peer's
+/// compile contributes exactly zero to our `utime`. It is the same quantity loadavg approximates
+/// — the average number of tasks we kept runnable — measured on us alone.
+///
+/// `cutime`/`cstime` cover the incumbent arm, which is a child process and is reaped by
+/// `child.wait()` before this is sampled, so the returned figure is BOTH arms.
+///
+/// The comm field can contain spaces and parentheses, so the split is after the LAST `)`, never on
+/// whitespace from the start.
+fn self_cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // `after_comm` starts at field 3 (state), so field N lives at index N - 3:
+    // utime 14, stime 15, cutime 16, cstime 17.
+    let ticks: u64 = [11usize, 12, 13, 14]
+        .iter()
+        .map(|&i| fields.get(i).and_then(|v| v.parse::<u64>().ok()))
+        .sum::<Option<u64>>()?;
+    // USER_HZ, which the kernel fixes at 100 for /proc regardless of CONFIG_HZ.
+    Some(ticks as f64 / 100.0)
+}
+
 /// Threads the incumbent arm runs with, reported in the provenance block and used as half of the
 /// self-load ceiling in `frankentorch-vyaia`'s EXTERNAL LOAD check. It was a bare `8` in the
 /// provenance call; the ceiling needs the same number, and two literals that must agree is how
@@ -1551,6 +1581,7 @@ LANES = {
     // DURATION of the window decides how much of any load step it could have shown at all — a
     // figure the load lines have never carried and cannot be read without.
     let load_window_started = Instant::now();
+    let cpu_at_start = self_cpu_seconds();
     println!(
         "allocator={}",
         if cfg!(feature = "fair-alloc") {
@@ -2684,6 +2715,31 @@ LANES = {
     // factor is therefore printed next to the rise, so the two can never be read apart.
     let load_window = load_window_started.elapsed().as_secs_f64();
     let ewma_response = 1.0 - (-load_window / 60.0).exp();
+    // THE DERIVATION THAT DOES NOT NEED A QUIET HOST — `frankentorch-vyaia` acceptance item 2.
+    //
+    // Everything above measures the HOST moving and cannot say how much of the movement is ours.
+    // This measures us directly: CPU seconds burned by this process and its reaped incumbent
+    // child, over the wall time of the window. That ratio is mean parallelism — the average number
+    // of tasks we kept runnable — which is the quantity loadavg approximates, computed on our own
+    // accounting where a peer's compile contributes exactly zero.
+    //
+    // It reads slightly LOW against loadavg by construction: loadavg also counts tasks in
+    // uninterruptible sleep, and CPU time does not. For a compute-bound sweep that gap is small,
+    // and it errs in the safe direction for a bound that exists to be compared against ~+0.62.
+    if let (Some(before), Some(after)) = (cpu_at_start, self_cpu_seconds()) {
+        let cpu = after - before;
+        if load_window > 0.0 {
+            println!(
+                "self_load DIRECT={:.2} (both arms burned {cpu:.1} CPU-seconds over \
+                 window={load_window:.0}s at lane_count={} rounds={reps}) — measured on our own \
+                 /proc accounting, so a peer's compile contributes nothing to it. Compare against \
+                 frankentorch-5q3io's ~+0.62, which was inferred from loadavg deltas at an \
+                 unrecorded lane count (frankentorch-vyaia acceptance item 2).",
+                cpu / load_window,
+                lanes.len()
+            );
+        }
+    }
     if let Some(start) = load_at_start.filter(|_| peak_load.is_finite()) {
         let rise = peak_load - start;
         println!(
