@@ -37784,3 +37784,60 @@ Two things closed it:
 
 The sweep is committed, gated, and costs one invocation whenever a window appears. No ratio is
 claimed from this item and none was taken.
+
+## 240. THE POOL-WIDTH CURVE: 16 THREADS BEATS 8 ON 5/5 LANES — THE CAP EVERYONE HAS BEEN QUOTING IS ONE STOP TOO NARROW
+
+`frankentorch-rayon-pool-width-qq8as` established that `RAYON_NUM_THREADS=8` beats the default 64 on
+21/21 lanes and said plainly what it had not established: *"that 8 is the optimum. 8 was chosen to
+match torch's hard-coded `set_num_threads(8)`; the curve between 8 and 64 is unmeasured."* It also
+named the sweep that would settle it. Here it is.
+
+Arm-internal (`FT_H2H_NO_INCUMBENT`), one ELF `bd89b709df35aa8682c15aa6`, one window,
+`RAYON_NUM_THREADS` the only variable, ten passes in palindrome order 4,8,16,32,64,64,32,16,8,4 so a
+monotone host trend lands symmetrically on every width (item 51). Per-lane median of the two passes,
+milliseconds:
+
+    lane                    4t       8t      16t      32t      64t     best
+    prelu_noshortcut    26.312   15.581   10.732   20.371   17.165   16t  (1.60x vs 64t)
+    avg_pool2d           3.836    2.280    1.750    3.092    2.479   16t  (1.42x vs 64t)
+    max_pool3d           1.855    1.456    1.427    2.497    2.545   16t  (1.78x vs 64t)
+    conv3d               6.853    4.484    3.566    9.983    9.872   16t  (2.77x vs 64t)
+    max_pool1d_nopool   16.200   10.220    7.403    8.720    8.420   16t  (1.14x vs 64t)
+
+**16 wins on five lanes out of five, and it beats 8 on all five too** — by 1.02x (max_pool3d) up to
+1.45x (prelu_noshortcut), with conv3d at 1.26x and max_pool1d_nopool at 1.38x. Four is worse than
+eight everywhere, so the curve has an interior optimum rather than being monotone in either
+direction.
+
+### 240a. THE NARROW WIDTHS ARE REPEATABLE AND THE WIDE ONES ARE NOT
+
+Both passes of each width, in order:
+
+    4t   26.0/26.6   3.78/3.90   2.16/1.55   7.14/6.57   16.1/16.3
+    8t   15.7/15.5   2.28/2.28   1.31/1.60   4.16/4.81   10.4/10.1
+    16t  10.6/10.8   1.73/1.77   1.34/1.51   3.42/3.72    7.44/7.37
+    32t   9.06/31.7  1.73/4.45   1.96/3.03   4.40/15.6    6.90/10.5
+    64t  14.1/20.3   2.47/2.49   2.59/2.50   8.15/11.6    8.12/8.72
+
+At 4, 8 and 16 the two passes agree within a few percent. At 32 they disagree by up to **3.5x**
+(conv3d 4.40 vs 15.6; prelu 9.06 vs 31.7), and 64 is unstable too. That is the bead's own stated
+mechanism showing up as VARIANCE rather than as level: a wide join waits on whichever core is parked
+at 1429 MHz, so its cost is set by whatever else is on the box, while a narrow pool fits inside the
+fast set and is insensitive.
+
+So the case for capping is stronger than the median table alone says — a wide pool is not just
+slower on average, it is **unpredictable**, and the 32t column's best reading (9.06 for prelu) is
+better than its own 16t median while its worst is three times worse.
+
+### 240b. WHAT THIS DOES NOT SETTLE
+
+Two passes per width is thin, and I am not proposing a default change on it. The next step is the
+one that matters: **the cap has to be worth something against PyTorch**, and the arm-internal curve
+cannot say that. A first vs-PyTorch attempt at 16t on `max_pool1d_nopool` read `FT 1.15x FASTER`
+(median, [1.060,1.242]) against the 1.02-1.06x this lane shows at 8t, but its drift gate FAILED
+(load 37.40 -> 53.87 as a peer ramped) and its PT null failed, so it is a lead and not a row.
+
+That lead is worth stating precisely because it is checkable: **item 238 closed `frankentorch-3ja43`
+at parity measured entirely at 8 threads.** If 16t holds up, that lane is a win rather than a draw,
+and the same question applies to every row this campaign has banked at 8 — the width was a free
+parameter set to match the incumbent, not one that was optimised.
