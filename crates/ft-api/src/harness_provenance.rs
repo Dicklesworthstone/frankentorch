@@ -397,8 +397,32 @@ pub fn concurrent_measurement_block() -> String {
 
 /// `(pid, kind)` for processes that look like they are measuring, excluding this process and its
 /// direct children — the incumbent arm is our own child and must not count as contention.
+/// `ppid` from `/proc/<pid>/stat`, which is `pid (comm) state ppid ...`. `comm` may contain
+/// spaces and parentheses, so the fields are taken from AFTER the last ')' rather than by index.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit(')')
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .and_then(|field| field.parse::<u32>().ok())
+}
+
 fn concurrent_measurement_processes() -> Vec<(u32, &'static str)> {
     let me = std::process::id();
+    // Our ancestor chain, walked once. Bounded because a pid cannot be its own ancestor and pid 1
+    // has no parent; the explicit cap is belt-and-braces against a malformed `/proc`.
+    let mut ancestors = Vec::new();
+    let mut walk = me;
+    for _ in 0..64 {
+        match parent_of(walk) {
+            Some(parent) if parent != 0 && parent != walk => {
+                ancestors.push(parent);
+                walk = parent;
+            }
+            _ => break,
+        }
+    }
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return found;
@@ -411,16 +435,16 @@ fn concurrent_measurement_processes() -> Vec<(u32, &'static str)> {
             continue;
         }
         let dir = entry.path();
-        // `/proc/<pid>/stat` is `pid (comm) state ppid ...`, and `comm` may contain spaces and
-        // parentheses, so the fields are taken from AFTER the last ')' rather than by index.
-        if let Ok(stat) = std::fs::read_to_string(dir.join("stat"))
-            && let Some(tail) = stat.rsplit(')').next()
-            && let Some(ppid) = tail
-                .split_whitespace()
-                .nth(1)
-                .and_then(|field| field.parse::<u32>().ok())
-            && ppid == me
-        {
+        // Skip our own family in BOTH directions — item 213. Children are the incumbent arm we
+        // spawned. ANCESTORS are the shell that launched us, and excluding them is not cosmetic:
+        // this harness is normally invoked as `PYTORCH_PYTHON=/…/torchvenv-…/bin/python …`, so the
+        // invoking shell's command line names the torch venv and matches the `torch-arm` pattern.
+        // Every single run therefore self-reported one concurrent measurement, which is the
+        // failure mode that makes a detector worthless: an alarm that is always on is not read.
+        if ancestors.contains(&pid) {
+            continue;
+        }
+        if parent_of(pid) == Some(me) {
             continue; // our own incumbent arm
         }
         let Ok(raw) = std::fs::read_to_string(dir.join("cmdline")) else {
