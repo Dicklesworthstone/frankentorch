@@ -58,7 +58,26 @@ struct Block {
     ms: f64,
     load: f64,
     mhz: f64,
+    /// `/proc/stat` iowait jiffies consumed while this block ran. Recorded per arm because
+    /// a ratio taken while the host is in iowait is not measuring either implementation.
+    iowait: u64,
     checksum: f64,
+    /// FT only: `(reduction, form_p/q expansion, QR sweep)` nanoseconds for ONE representative
+    /// call, from the counters `ft_kernel_cpu` already maintains. `None` for the incumbent —
+    /// PyTorch's LAPACK does not expose its phases, which is exactly why this split can say
+    /// where OUR time goes and cannot say where the GAP is.
+    phases: Option<(u64, u64, u64)>,
+}
+
+/// Cumulative iowait jiffies from `/proc/stat`'s aggregate `cpu` line.
+fn iowait_jiffies() -> u64 {
+    std::fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|text| {
+            let line = text.lines().next()?;
+            line.split_whitespace().nth(5)?.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
 }
 
 fn provenance() -> (f64, f64) {
@@ -71,6 +90,7 @@ fn provenance() -> (f64, f64) {
 fn ft_block(n: usize, data: &[f64]) -> Block {
     let mut best = f64::INFINITY;
     let mut checksum = 0.0;
+    let iowait_before = iowait_jiffies();
     // One discarded warm sample, matching the incumbent's warm-up in kind.
     for i in 0..=SAMPLES {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -85,12 +105,27 @@ fn ft_block(n: usize, data: &[f64]) -> Block {
             checksum = s.tensor_values(sv).expect("singular values").iter().sum();
         }
     }
+    // One EXTRA call, with the counters cleared first, purely to attribute this shape's
+    // phases. It is deliberately not the timed min sample — mixing an instrumented call into
+    // the estimator would report a number nothing else in this campaign is comparable to.
+    let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
+    {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(data.to_vec(), vec![n, n], false)
+            .expect("svd leaf");
+        let _ = s.tensor_linalg_svd(x, true).expect("svd");
+    }
+    let phases = ft_kernel_cpu::svd_reduction_sweep_ns_take();
+
     let (load, mhz) = provenance();
     Block {
         ms: best,
         load,
         mhz,
+        iowait: iowait_jiffies().saturating_sub(iowait_before),
         checksum,
+        phases: Some(phases),
     }
 }
 
@@ -117,6 +152,7 @@ print("VER", torch.__version__)
 print("THREADS", torch.get_num_threads())
 "#
     );
+    let iowait_before = iowait_jiffies();
     let out = Command::new(python).arg("-c").arg(&src).output().ok()?;
     if !out.status.success() {
         eprintln!("{}", String::from_utf8_lossy(&out.stderr));
@@ -140,7 +176,9 @@ print("THREADS", torch.get_num_threads())
         ms,
         load,
         mhz,
+        iowait: iowait_jiffies().saturating_sub(iowait_before),
         checksum,
+        phases: None,
     })
 }
 
@@ -197,12 +235,25 @@ fn main() {
             }
         );
         println!(
-            "      FT blocks {:.3}/{:.3} ms  load {:.2}/{:.2}  MHz {:.0}/{:.0}",
-            ft_a.ms, ft_b.ms, ft_a.load, ft_b.load, ft_a.mhz, ft_b.mhz
+            "      FT blocks {:.3}/{:.3} ms  load {:.2}/{:.2}  MHz {:.0}/{:.0}  iowait {}/{} jiffies",
+            ft_a.ms, ft_b.ms, ft_a.load, ft_b.load, ft_a.mhz, ft_b.mhz, ft_a.iowait, ft_b.iowait
         );
+        if let Some((red, formpq, sweep)) = ft_a.phases {
+            let total = (red + formpq + sweep).max(1) as f64;
+            println!(
+                "      FT phases (ours only, one instrumented call): reduction {:.3} ms {:.0}%  \
+                 form_p/q {:.3} ms {:.0}%  QR sweep {:.3} ms {:.0}%",
+                red as f64 / 1e6,
+                100.0 * red as f64 / total,
+                formpq as f64 / 1e6,
+                100.0 * formpq as f64 / total,
+                sweep as f64 / 1e6,
+                100.0 * sweep as f64 / total
+            );
+        }
         println!(
-            "      PT blocks {:.3}/{:.3} ms  load {:.2}/{:.2}  MHz {:.0}/{:.0}",
-            pt_a.ms, pt_b.ms, pt_a.load, pt_b.load, pt_a.mhz, pt_b.mhz
+            "      PT blocks {:.3}/{:.3} ms  load {:.2}/{:.2}  MHz {:.0}/{:.0}  iowait {}/{} jiffies",
+            pt_a.ms, pt_b.ms, pt_a.load, pt_b.load, pt_a.mhz, pt_b.mhz, pt_a.iowait, pt_b.iowait
         );
         println!(
             "      parity singular-value sum: FT {:.12e} PT {:.12e} rel {:.2e} {}",

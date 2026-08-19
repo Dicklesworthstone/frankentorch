@@ -37610,3 +37610,69 @@ Two hypotheses of mine have now been refuted by direct measurement in as many da
 the buffer pool, this one on the gate), both after the correlation looked strong and the
 arithmetic looked supportive. The pattern is the same each time: **a mechanism that is real
 somewhere gets attributed to a lane that does not actually run it.**
+
+## 237. THE SVD FORWARD IS 70-74% REDUCTION — AND AT n=136 OUR REDUCTION ALONE COSTS MORE THAN PyTorch'S ENTIRE FORWARD
+
+`frankentorch-4zjaa`. Item 231 banked square SVD forward at 1.6-1.7x SLOWER and named the next
+step as "phase-split the reduction and the QR sweep". This is that split, and it says the last
+three items were spent on the wrong fifth of the op.
+
+### 237a. WHY THIS IS READABLE ON A SATURATED HOST
+
+The fleet measurement slot is **still unavailable** (`acquire_build_slot` → "Build slots are
+disabled. Enable WORKTREES_ENABLED"), and loadavg sat at 33-46 throughout. No cross-arm ratio is
+banked from that.
+
+What IS banked is a **share of our own time within one call**, read from the
+`SVD_BIDIAG_NS` / `SVD_FORM_PQ_NS` / `SVD_SWEEP_NS` counters `ft-kernel-cpu` already maintained
+and already exposed through `svd_reduction_sweep_ns_take`. Contention scales the phases of one
+call together, so the SHARE survives what the ratio does not — and that is a prediction the data
+confirms rather than an excuse offered after the fact:
+
+    n=128   reduction 72 / 70 / 70 %   form_p/q 17 / 18 / 18 %   QR sweep 11 / 12 / 12 %
+    n=136   reduction 73 / 73 / 74 %   form_p/q 21 / 21 / 20 %   QR sweep  7 /  7 /  6 %
+
+Three invocations at loadavg 46.3, 35.2 and 33.2 — **the shares move by at most two points while
+the absolute times move by 25%.** Instrumentation is one EXTRA call per block with the counters
+cleared first, deliberately not the timed min sample, so the estimator every other row uses is
+untouched.
+
+### 237b. THE STRUCTURE, AND WHAT IT SAYS ABOUT THE LAST THREE ITEMS
+
+    phase                        share      what has been done to it
+    reduction (bidiag_blocked)   70-74%     nothing this session
+    form_p / form_q expansion    17-21%     items 229, 232, 234, 236 — four items
+    bidiagonal QR sweep           6-12%     nothing this session
+
+**I spent four items on the phase worth a fifth of the op.** Items 229 and 234 produced real
+results and 232 and 236 cancelled each other out, but the whole sequence was aimed at `form_p`
+and the gate because that is where an old measurement (item 36's "31.6%") pointed. At these sizes
+the expansion is 17-21%, not 31.6%, and the reduction — quoted at 57.8% by the same item — is now
+**70-74%**. The proportions moved and nobody re-read them.
+
+### 237c. THE COMPARISON THAT MAKES IT A TARGET
+
+Both arms in the same invocation, so this one figure is cross-arm and legitimate even though the
+ratio is not banked:
+
+    n=136   PyTorch's ENTIRE forward   1.475 - 1.494 ms
+            OUR REDUCTION ALONE        1.926 - 2.037 ms
+
+**Our reduction on its own costs about 1.3x PyTorch's whole SVD**, before we have formed a single
+vector or run a sweep. At n=128 it is nearer parity (our reduction 1.110-1.401 ms against their
+1.323-1.337 ms total), so the reduction is also where our scaling is worst between the two sizes.
+
+That is the target item 231 asked for, now named and sized: **`bidiag_blocked_f64`**, which is
+already blocked and GEMM-shaped, and which `dlabrd_panel_f64` sits inside.
+
+### 237d. WHAT IS NOT CLAIMED
+
+The split says where OUR time goes. It cannot say where the GAP is, because PyTorch's LAPACK does
+not expose its phases — if their reduction is also ~72% of their forward then the gap is uniform
+and the reduction is merely the biggest slice of it, not the cause. Distinguishing those needs a
+phase-level comparison the incumbent cannot give, so the honest next step is to attack the
+reduction and re-measure the whole-op row, not to assert that the reduction is "the" 1.6x.
+
+The instrument also now records **iowait jiffies per arm** alongside loadavg and MHz. It read 0
+on every FT block and 1-12 on the PyTorch blocks in these runs, which is the process-launch cost
+of the incumbent arm rather than host I/O pressure.
