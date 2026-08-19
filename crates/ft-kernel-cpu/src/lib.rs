@@ -4,6 +4,8 @@
 
 use std::fmt;
 
+pub mod pool;
+
 use rayon::prelude::*;
 use wide::{f32x8, f64x4};
 
