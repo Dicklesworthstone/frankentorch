@@ -36108,3 +36108,60 @@ arithmetic on the four data points those failures produced.
 
 Items 176, 187 and 201 still have no number. Each is a candidate for the same paired treatment now
 that the mechanism exists and costs one toggle plus one lane.
+
+## 215. ALL NINE TESTS WRITTEN BLIND THIS SESSION NOW PASS, AND CLIPPY IS CLEAN — THE UNVERIFIED STACK IS VERIFIED
+
+`frankentorch-l2zki` / `frankentorch-hi9r6`. Compiled and run through `rch` on a REMOTE worker, so
+nothing here touched the local run queue. **No ratio measured, none claimed** — the host was
+oversubscribed and item 194's gate makes any timing taken now unquotable.
+
+### 215a. THE NINE
+
+    conv2d_backward_masked_matches_the_unmasked_path_on_every_mask        ok   (180)
+    conv3d_backward_masked_matches_the_unmasked_path_on_every_mask        ok   (196)
+    conv2d_f64_results_do_not_depend_on_rayon_pool_width                  ok   (175)
+    conv3d_and_f32_forwards_do_not_depend_on_rayon_pool_width             ok   (184)
+    conv2d_forward_f64_streaming_matches_the_full_panel_path_bitwise      ok   (158)
+    conv2d_forward_f32_streaming_matches_the_full_panel_path_bitwise      ok   (160)
+    conv3d_forward_streamed_f64_matches_the_full_panel_path_bitwise       ok   (165)
+    gemm_tile_col_floor_toggle_changes_schedule_not_values                ok   (170)
+    dout_all_ones_probe_and_parallel_scan_agree_with_the_serial_predicate ok   (153)
+
+Every one was written with no compiler available, several by line-indexed edits into a 66,000-line
+file. Item 210 found four defects the moment a compiler existed; these nine are what survived that
+and then ran.
+
+### 215b. THE ONE WHOSE PASS SETTLES AN OLD CLAIM
+
+Item 158's test was written expecting that a FAILURE would be the more interesting outcome, because
+the streaming conv2d forward has asserted since `frankentorch-conv2d-stream` that tiling M leaves
+matrixmultiply's micro-kernel K-order untouched — a bit-exactness claim carried in a comment and
+verified by nothing.
+
+It passes, in f64 and f32, and conv3d's streamed forward passes the same check. **A load-bearing
+claim that had been taken on trust for the whole campaign is now tested.** Several later items lean
+on it: item 170's toggle is safe only because M/N blocking cannot move a value, and that test passes
+too.
+
+### 215c. CLIPPY
+
+`cargo clippy -p frankentorch-kernel-cpu --lib` exits 0 — warnings only, no deny-level lints.
+
+Six are mine in kind: `very complex type used` on the masked entry points, whose returns are
+`(Option<Vec<T>>, Option<Vec<T>>, Option<Vec<T>>)`. A single `type ConvGrads<T>` alias would clear
+all six.
+
+**Not done, because `crates/ft-kernel-cpu/src/lib.rs` is currently reserved by MaroonCarp** — the
+same reservation that is blocking the `main:master` mirror push. Editing a file another agent holds,
+to silence a warning, is not worth the collision; recorded so whoever holds it next can take it in
+one line.
+
+### 215d. WHAT REMAINS
+
+`main` is current. The `master` mirror is 5 commits behind and blocked by the guard on MaroonCarp's
+reservations over three files — none of them touched by my commits, which are ledger-only in that
+range. Not overridden with `GUARD_MODE=warn`: another agent's reservation is not mine to bypass, and
+`main` carries the work regardless.
+
+The measurements items 170, 172, 173, 178 and 182 owe are still owed, and now blocked only by a
+quiet host rather than by anything unbuilt.
