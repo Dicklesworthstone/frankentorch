@@ -37495,3 +37495,57 @@ The per-call-site A/B across the gate, and a route test pinning its outcome from
 need timing, and the host has been saturated for two ticks (loadavg 62-102, runq 60-83, four peer
 local builds). **The measurement half of this bead is deferred, not attempted and failed** — and
 the new fleet-wide measurement slot is the right instrument for it when the host allows.
+
+## 235. avg_pool1d IS CERTIFIED 2.70-2.85x FASTER THAN PyTorch — TWO CLEAN ROWS IN ONE WINDOW, AND THE INCUMBENT IS THE NOISY ARM
+
+`frankentorch-372h8` has been one certifying run short for two sessions: nine reads at 2.50-2.70x
+FASTER and not one clearing both A/A nulls and the drift gate together. It now has two more, taken
+back to back on one snapshotted ELF.
+
+    ELF bd89b709df35aa8682c15aa66ec03406d2f18ae011199dbbfe86da20625ab05c
+    thinkstation1, AMD Threadripper PRO 5975WX, governor=powersave, online_cpus=64
+    rayon_threads=8, allocator=mimalloc, incumbent=PyTorch 2.12.1+cpu threads=8 (same invocation)
+    lane_count=1 rounds=64
+
+    run  FT ms  PT ms  ratio (median)        PT null  FT null  drift     concurrent  load
+    r3   2.566  7.322  2.854 [2.789,2.990]   PASS     PASS     PASS      none ACTIVE 26.82->24.11
+    r4   2.598  7.594  2.923 [2.767,3.058]   OFFSET   OFFSET   PASS      none ACTIVE 20.31->21.11
+    r5   2.529  8.627  3.411 [3.253,3.486]   PASS     PASS     DRIFTED   none ACTIVE 20.20->23.72
+    r6   2.826  7.628  2.699 [2.599,2.873]   PASS     PASS     PASS      none ACTIVE 25.93->26.23
+
+**r3 and r6 clear every gate**, parity `match` on both. r6 is quotable under the min estimator too
+(2.658 [2.537,2.753], both nulls 1.012/1.013 PASS), and its `slot0/median(slot1..3)` is 1.019, so
+there is no cold-first-sample artefact behind it. The two CIs overlap. The scorecard figure this
+bead was opened against was **24.92x SLOWER**.
+
+r4 and r5 are held back, each by exactly one gate, and are listed because a set where every run
+passes is usually a set that was filtered.
+
+### 235a. THE VARIANCE IS IN THE INCUMBENT, NOT IN US
+
+Across the four runs our arm reads **2.53-2.83 ms** (12% spread) and PyTorch reads **7.32-8.63 ms**
+(18%). The ratio climbing 2.85 -> 2.92 -> 3.41 across r3-r5 is almost entirely the incumbent
+slowing; our arm barely moves. So the honest statement of the standing is the LOW end of the
+certified pair, 2.70x, and not the 3.41x r5 would have handed over if its drift gate had happened to
+pass.
+
+This is the check `feedback_aa_null_blind_to_scaled_incumbent` asks for, and it is worth doing in
+this direction too: an A/A null passing on both arms did not stop the incumbent's absolute time
+moving 18% between runs taken minutes apart.
+
+### 235b. WHY THE GATES CLEARED NOW WHEN THEY HAD NOT IN NINE ATTEMPTS
+
+Three things changed, and only one of them is the lane:
+
+1. **The window was chosen by arithmetic rather than by waiting for quiet.** Item 230f's threshold
+   says a run passes the drift gate only when `start_load >= 4 x self_load x (1 - exp(-T/60))`. At
+   `DIRECT ~17` over a 15 s window that is a starting load of about 16, and the oversubscription
+   rule (item 194) caps it at 64. I polled for a load in [16, 55] and launched inside it. Every one
+   of the four runs passed the drift gate or missed by a hair.
+2. **The contention detector stopped voiding runs on phantoms** (item 233). An earlier attempt at
+   this exact lane was thrown out on three `criterion-bench` PIDs that were a remote `rch` client
+   and two shell wrappers burning no local CPU.
+3. **64 rounds**, per item 193c's finding that round count walks a near-miss null to PASS.
+
+The lane's own code did not change between the failing nine and these four. **What was blocking this
+bead was the instrument, not the kernel** — and two of the three fixes landed today.
