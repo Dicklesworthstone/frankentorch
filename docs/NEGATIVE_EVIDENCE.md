@@ -34040,6 +34040,30 @@ This inference is worth more than the ratios above because it is a difference be
 ONE invocation, which is the comparison the load does not corrupt. It is still 2 repeats and still
 needs the real thing.
 
+**CORRECTED by a peer's item 219 — the 1.9x is wrong, and it was mine to get wrong.** Item 219 built
+the train twin at batch 16, the one size this board has observed certifying, and priced dweight
+across seven invocations on two binaries:
+
+    FT/PT on dweight alone   mean ~1.31x, range 1.24-1.38x
+
+not the ~1.9x above. The direction was right — our weight gradient does cost more than PyTorch's —
+but the magnitude was overstated by about 45%, and the conclusion drawn from it ("the dweight GEMM
+is a visible part of the gap") points the wrong way: item 219d shows adding dweight makes our
+standing BETTER, 2.42x -> 1.9x, so the weight gradient is our best component of that backward
+rather than a target.
+
+Two things I did right and one I did not. The row was labelled unquotable and the caveat "still 2
+repeats" was written down — but I then called this "the one inference the smoke test supports" and
+gave it a number to three significant figures, which is how a 2-repeat figure with failing nulls
+gets quoted later. **A difference of differences taken from an unquotable row is not rescued by the
+difference being internal to one invocation**; both terms carried the same noise the nulls were
+rejecting.
+
+Item 219a also names the limitation of item 216 fairly: it certified `conv2d_masked_train` alone at
+batch 8, where the frozen lane could not certify, so the certified row had no control beside it and
+the comparison item 182 asked for could not be made from it. Item 219's batch-16 pair is the right
+instrument, and its 1.89-1.96x train / 2.41-2.44x frozen standings supersede the inference here.
+
 ### 187e. WHAT IS NOW TOP PRIORITY
 
 A quiet-window certification of `conv2d_masked`. The certified standing is 5.73x SLOWER; this run
