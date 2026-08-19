@@ -156,6 +156,24 @@ const C3_K: usize = 3;
 // frankentorch-58zjz item 126d. 3x3 stride-1 pad-1, so the output extents equal the input's and
 // the 2026-07-05 all-ones adjoint is eligible. Sized so the im2col panel (8192 x 288 f64,
 // 18.9 MB) is the same order as conv3d's, keeping the two lanes comparable.
+// frankentorch-58zjz: THE ATTENTION LANE THE BEAD NAMED AND NOBODY BUILT.
+//
+// The bead's list of `dgemm_tb` callers has two attention entries (ft-kernel-cpu `lib.rs:5214` and
+// `:5298`, the dV gradient), and item 119 gave that GEMM a column-parallel path on the strength of
+// a conv3d row. Linear lanes landed under item 126 and conv2d lanes under items 144/209; attention
+// was the last of the three the bead opened with and had no live incumbent arm at all.
+//
+// [4, 8, 256, 64] is a small transformer block's self-attention: the scores matrix is
+// 4*8*256*256 = 2.1M elements, so the lane spends real time in softmax and in BOTH matmuls rather
+// than in leaf construction. Deliberately ONE lane, not a straddling pair — the bead asks for
+// shapes either side of the `n > 4*m` gate, and which side a given attention shape lands on depends
+// on the argument mapping into `dgemm_tb`, which this lane is the instrument for discovering rather
+// than something to assert in a constant.
+const ATTN_B: usize = 4;
+const ATTN_H: usize = 8;
+const ATTN_S: usize = 256;
+const ATTN_D: usize = 64;
+
 const C2_N: usize = 8;
 /// The `conv2d_big*` twins' batch — `frankentorch-hi9r6`, item 144.
 ///
@@ -1042,6 +1060,44 @@ fn timed_linear(
     (elapsed, checksum)
 }
 
+/// Scaled dot-product attention, `[B, H, S, D]`, with Q, K and V all requiring grad.
+///
+/// `frankentorch-58zjz`. The bead's point is that `dgemm_tb` — given a column-parallel path by item
+/// 119 — is the dV gradient for every attention backward in the library and had never faced a live
+/// incumbent. All three inputs require grad so the backward reaches dV, dK and the softmax's dQ
+/// path rather than only one of them.
+///
+/// The timed region matches every other lane on this board: forward, loss sum, backward, with the
+/// leaves built OUTSIDE the timer. The checksum is the query gradient, which is the leaf the
+/// incumbent arm also differentiates, so the two sides are compared on the same tensor.
+fn timed_attention(query: &[f64], key: &[f64], value: &[f64]) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let shape = vec![ATTN_B, ATTN_H, ATTN_S, ATTN_D];
+    let q = session
+        .tensor_variable(query.to_vec(), shape.clone(), true)
+        .expect("attention query");
+    let k = session
+        .tensor_variable(key.to_vec(), shape.clone(), true)
+        .expect("attention key");
+    let v = session
+        .tensor_variable(value.to_vec(), shape, true)
+        .expect("attention value");
+    let started = Instant::now();
+    let out = session
+        .functional_scaled_dot_product_attention(q, k, v, None, false, None)
+        .expect("scaled_dot_product_attention");
+    let loss = session.tensor_sum(out).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(q)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 /// Conv3d under a NON-UNIFORM loss — the only lane on this board that reaches conv3d's
 /// GENERIC backward.
 ///
@@ -1218,6 +1274,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c2xlx = seq(C2XL_N * C2_CI * C2_H * C2_W);
     let c2bx = seq(C2B_N * C2_CI * C2_H * C2_W);
     let c2bm = seq(C2B_N * C2_CO * C2_H * C2_W);
+    let attnq = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
+    let attnk = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
+    let attnv = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
     let linx = seq(LIN_B * LIN_IN);
     let linw_wide = seq(LIN_OUT_WIDE * LIN_IN);
     let linw_narrow = seq(LIN_OUT_NARROW * LIN_IN);
@@ -1305,6 +1364,9 @@ c2m32=seq(160*32*32*32).reshape(160,32,32,32).float()
 c2xlx=seq(64*32*32*32).reshape(64,32,32,32)
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
+attnq=seq(4*8*256*64).reshape(4,8,256,64)
+attnk=seq(4*8*256*64).reshape(4,8,256,64).requires_grad_(True)
+attnv=seq(4*8*256*64).reshape(4,8,256,64).requires_grad_(True)
 linx=seq(512*1024).reshape(512,1024)
 linw_wide=seq(128*1024).reshape(128,1024).requires_grad_(True)
 linw_narrow=seq(512*1024).reshape(512,1024).requires_grad_(True)
@@ -1376,6 +1438,9 @@ LANES = {
     "conv2d_f32_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
+    # frankentorch-58zjz: the query is the timed leaf; K and V require grad too, so the backward
+    # reaches BOTH dV (the dgemm_tb entry this bead is about) and the softmax/dQ path.
+    "attention": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
     # frankentorch-l2zki: NON-UNIFORM loss, the only lane here that reaches conv3d's GENERIC
     # backward. The `*c3m` sits inside the lane's own fn, so `run`'s `fn(x).sum()` becomes
@@ -2131,6 +2196,10 @@ LANES = {
             // rather than implying it acts everywhere.
             "linear_narrow",
             Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW)),
+        ),
+        (
+            "attention",
+            Box::new(|| timed_attention(&attnq, &attnk, &attnv)),
         ),
         (
             "conv3d",
