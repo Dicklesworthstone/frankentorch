@@ -37301,3 +37301,74 @@ TWO CONSEQUENCES WORTH CARRYING:
   and `concurrent_measurements` to do the work the drift gate is not doing.
 - **The gate is passable by waiting for load, not for quiet** — which is the reverse of every
   runbook instruction in this repo, and is worth stating in the one place people read before a run.
+
+## 231. THE CONTENTION DETECTOR HAS BEEN VOIDING RUNS ON SHELL WRAPPERS AND ON BENCHES RUNNING ON ANOTHER MACHINE
+
+An `avg_pool1d` run of mine was declared unquotable by
+
+    concurrent_measurements=3 DETECTED: criterion-bench[90285] criterion-bench[90321]
+                                        criterion-bench[90322]
+
+I caught the three while they were still alive:
+
+    90321   rch exec -- cargo bench --profile release-perf -p fnp-python --bench …
+            an rch CLIENT. The bench executes on a REMOTE worker; locally it is idle.
+    90285   zsh -c … (a wrapper whose command line contains that text)
+    90322   zsh -c … (ditto)
+
+**One logical job, executing on a different machine, counted three times, and the run was thrown
+away.** The same shape voids any run taken while a peer's shell merely MENTIONS `--bench` — a peer's
+`pgrep`, or my own. On this box that is how every agent launches everything.
+
+### 231a. IT IS ITEM 213'S BUG, IN THE HALF THAT WAS LEFT
+
+Item 213 removed the detector's SELF-detection: our own invoking shell names the torch venv, so
+every run reported one concurrent measurement, and *an alarm that is always on is not read*. The
+ancestor walk it added fixes us. It does not fix a PEER's wrapper, or a client for work that is not
+running here at all.
+
+**Naming is not evidence of sampling. Burning CPU is, and it is measurable in 300 ms.** The detector
+now reads `utime + stime` for every name-matched candidate, sleeps once for the whole set, and
+re-reads. Below 10% of one core a match is printed but does not void:
+
+    concurrent_measurements=1 DETECTED: torch-arm[424283] 100% — … AND burning local CPU …
+    concurrent_measurements_idle=6 (matched by name, burning no local CPU — shell wrappers, and
+      rch clients whose bench runs on a remote worker; reported, not voiding):
+      criterion-bench[90285] 0% criterion-bench[90321] 0% criterion-bench[90322] 0%
+      h2h-harness[421936] 0% h2h-harness[424261] 0% h2h-harness[424264] 0%
+
+That is one scan separating **six phantoms from one real** peer torch process. Under the old rule
+all seven voided the run; under the new one the row is refused for the right reason, by the one
+process that was actually taking cores off us.
+
+Idle matches stay visible because the detector's own doc chooses that direction deliberately — a
+spurious line makes a reader check, a missed one makes a contended row look clean.
+
+### 231b. ITEM 228's VOID CARRIES THE SAME SIGNATURE
+
+Item 228 discarded a two-lane run on `concurrent_measurements=2 DETECTED: criterion-bench[3605057]
+criterion-bench[3971008]`. Two PIDs, criterion-bench, no CPU figure — the exact shape of a wrapper
+plus its client. Those processes are long gone and it cannot be settled now, which is the point: **a
+detector that reports a name and not a measurement leaves nothing behind to re-check.** Item 228's
+conclusion does not depend on the void (its experiment was inconclusive for an unrelated reason),
+but its discard should be read as unproven rather than justified.
+
+### 231c. AND THE SELF-LOAD FIGURE IS NOT ONE NUMBER — LANE COUNT DOES NOT PARAMETERIZE IT
+
+Item 230 banked 5.59 and 6.36 from full 43-lane sweeps. Single-lane runs on the same build, same
+host, same pool width:
+
+    lane_count=43  rounds=16   DIRECT=5.59, 6.36
+    lane_count=1   rounds=64   DIRECT=17.37, 12.22
+
+**Three times the self-load from one forty-third of the lanes.** Mean parallelism is not a function
+of how many lanes run: a single small lane hammered 64 times keeps 8 rayon threads and the incumbent
+saturated back to back, while the full sweep spends much of its window in serial setup, tape
+building and arm handoff. Lane COMPOSITION drives it, and `lane_count` — the field item 230 added
+because 5q3io's bound rotted for want of it — does not capture that either.
+
+This is the same rot one level down, and I filed it while closing the bead about it. What survives
+is the instrument, not the constant: **the DIRECT figure is printed per run**, which is the only
+resolution at which it is true. Item 230f's threshold table should be read per sweep shape, not as
+two universal numbers — and it holds up when it is: at `DIRECT=17.37` over a 16 s window the formula
+demands a starting load of ~16, the run started at 23.21, and its drift gate PASSED.
