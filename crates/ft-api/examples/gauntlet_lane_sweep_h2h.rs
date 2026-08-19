@@ -177,6 +177,37 @@ const C2B_N: usize = 16;
 /// This lane is therefore NOT comparable with the f64 conv2d rows, and is not meant to be. It
 /// carries its own control (`conv2d_f32_masked`) at the same size.
 const C2F32_N: usize = 160;
+/// The SUMMED conv2d lane's batch — `frankentorch-hi9r6`, item 209.
+///
+/// WHY A THIRD SIZE. `conv2d_big` is the only lane that reaches the all-ones adjoints items
+/// 174/176/177 rewrote, and across four invocations it certified ONCE: PT PASS/FT PASS, then
+/// PASS/OFFSET, WIDE/OFFSET, OFFSET/PASS, with the ratio spanning 1.135-1.421. Item 208 showed
+/// doubling the rounds does not fix it — more rounds narrows an interval, it does not move a
+/// biased point estimate.
+///
+/// What DOES separate the lanes on this board is arm duration, and the evidence is now four-deep:
+///
+///     lane                FT arm    PT arm    certified
+///     conv2d_big           8.8 ms   10.5 ms   1 of 4
+///     conv2d_big_masked   27.9 ms   11.0 ms   4 of 4
+///
+/// So our arm at ~9 ms is the short one, and ~28 ms demonstrably nulls. The incumbent side was
+/// measured directly here at 8 torch threads, and our side extrapolated linearly from the 8.8 ms
+/// at `C2B_N` — sound because every phase of the summed route (the dweight column-sum, the dpadded
+/// scatter, im2col and the forward GEMM) is linear in batch:
+///
+///     batch   PT ms    our arm, extrapolated
+///        16    9.406    8.8
+///        32   17.917   17.6
+///        48   26.412   26.4
+///        64   32.908   35.2
+///
+/// 64 puts BOTH arms past every duration that has certified on this board. 48 would put ours at
+/// 26.4 ms, just under the 27.9 that works, and item 203 is one turn old and exactly about sizing
+/// a lane to the edge of a threshold. The margin is deliberate.
+///
+/// Frozen weight and no mask, matching `conv2d_big` exactly, so the two differ only in size.
+const C2XL_N: usize = 64;
 const C2_CI: usize = 32;
 const C2_CO: usize = 32;
 const C2_H: usize = 32;
@@ -1147,6 +1178,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|value| value as f32)
         .collect();
+    // item 209: the summed route at a size where BOTH arms are long enough to null.
+    let c2xlx = seq(C2XL_N * C2_CI * C2_H * C2_W);
     let c2bx = seq(C2B_N * C2_CI * C2_H * C2_W);
     let c2bm = seq(C2B_N * C2_CO * C2_H * C2_W);
     let linx = seq(LIN_B * LIN_IN);
@@ -1231,6 +1264,9 @@ c2x32=seq(160*32*32*32).reshape(160,32,32,32).float()
 c2w32=c2w.float()
 c2m32=seq(160*32*32*32).reshape(160,32,32,32).float()
 # item 144: the doubled-batch twins, same weights, same generator.
+# item 209: summed route at batch 64, where both arms clear every duration that has
+# certified on this board. Keep in lockstep with C2XL_N.
+c2xlx=seq(64*32*32*32).reshape(64,32,32,32)
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
 linx=seq(512*1024).reshape(512,1024)
@@ -1283,6 +1319,8 @@ LANES = {
     # item 144: the same two routes at double the batch, to test whether a ~5-6 ms incumbent
     # arm nulls where a ~3 ms one would not.
     "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
+    # item 209: the summed route, long enough on BOTH arms to null.
+    "conv2d_xl":         (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
     # item 190: byte-identical twin of conv2d_masked, so the warm/cold A/B is one invocation.
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
@@ -1869,6 +1907,13 @@ LANES = {
         (
             "conv2d_big_masked",
             Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false)),
+        ),
+        (
+            // item 209: the SUMMED route, sized so our arm lands near 35 ms. `conv2d_big` reaches
+            // the same code at 8.8 ms and certified 1 of 4; this is the same lane with the one
+            // property that separates certifying lanes from non-certifying ones on this board.
+            "conv2d_xl",
+            Box::new(|| timed_conv2d(&c2xlx, &c2w, None, C2XL_N, false)),
         ),
         (
             // item 190: the SAME lane as conv2d_masked, registered under a second name so one

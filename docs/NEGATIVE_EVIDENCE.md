@@ -35758,3 +35758,68 @@ nulls are unstable, warming helps the FT side, and why is open.
 Neither prices items 174/176/177: the banked lane never reaches the all-ones adjoints, and the
 lane that does has no certified BEFORE value to difference against. That remains a two-ELF A/B and
 a build.
+
+## 209. A SUMMED LANE SIZED SO OUR OWN ARM CAN NULL — THE ONE PROPERTY THAT SEPARATES THIS BOARD'S CERTIFYING LANES
+
+`frankentorch-hi9r6`. **UNBUILT** — no cargo ran. `rustfmt --edition 2024 --check` exits 0; the
+PyTorch arm parses and its new lane executes. Disk was 38G when the work started.
+
+### 209a. WHY
+
+`conv2d_big` is the only lane reaching the all-ones adjoints of items 174/176/177, and across four
+invocations it certified once — PT PASS/FT PASS, then PASS/OFFSET, WIDE/OFFSET, OFFSET/PASS, ratio
+spanning 1.135-1.421. Item 208 established that doubling the rounds does not fix it.
+
+What separates this board's certifying lanes from its failing ones is arm duration, and the
+evidence is now four invocations deep on each:
+
+    lane                FT arm    PT arm    certified
+    conv2d_big           8.8 ms   10.5 ms   1 of 4
+    conv2d_big_masked   27.9 ms   11.0 ms   4 of 4
+
+Our arm at ~9 ms is the short one. Note the certifying lane's arms are badly MISMATCHED (27.9 vs
+11.0) and it certifies anyway, while the failing lane's are well matched (8.8 vs 10.5) and it does
+not — so matching is not the property, absolute duration is. That is worth stating because the
+opposite is the intuitive guess.
+
+### 209b. SIZED BY MEASUREMENT, WITH THE EXTRAPOLATION NAMED
+
+The incumbent was measured directly at 8 torch threads. Our arm cannot be measured under the
+throttle, so it is extrapolated linearly from the 8.8 ms at `C2B_N` — sound because every phase of
+the summed route is linear in batch: the dweight column-sum, the dpadded scatter, im2col and the
+forward GEMM.
+
+    batch   PT ms    our arm, extrapolated
+       16    9.406    8.8
+       32   17.917   17.6
+       48   26.412   26.4
+       64   32.908   35.2
+
+`C2XL_N = 64`. 48 would put our arm at 26.4 ms, just under the 27.9 that demonstrably works, and
+item 203 is one turn old and precisely about sizing a lane to the edge of an unmeasured threshold.
+The margin is deliberate, and the extrapolation is flagged as an extrapolation rather than passed
+off as a measurement.
+
+Frozen weight, no mask, matching `conv2d_big` exactly, so the two lanes differ only in size.
+
+### 209c. VERIFIED AS FAR AS THE THROTTLE ALLOWS
+
+    PyTorch arm syntax           ast.parse OK
+    lanes registered with no incumbent twin   none
+    conv2d_xl present on both arms            yes
+    incumbent lane executes                   42.268 ms at loadavg 15 (32.9 ms measured at loadavg 9)
+
+The FT-only set being empty is the direction that matters: a registered lane with no twin prints
+"PyTorch row missing" and wastes a whole sweep.
+
+### 209d. WHAT IT CANNOT DO
+
+Certifying this lane still would not attribute anything to items 174/176/177: the lane is new, so
+it has no BEFORE value either. Attribution needs two ELFs — one at the commit before item 174 and
+one at HEAD — measured in one window. That is now a build away rather than a design away.
+
+### 209e. DISK
+
+`/data` read 349G free at the end of this turn, up from 38G — the non-franken rebuild in the shared
+target directory was reclaimed. The throttle was predicated on the brake; the premise has changed
+and the standing rule is to df before a build and decline below 42G. Not resumed unilaterally.
