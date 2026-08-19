@@ -23,10 +23,10 @@ Legacy corpus:
 
 Project contracts:
 - `/data/projects/frankentorch/docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md` (sections 14-21)
-- `/data/projects/frankentorch/EXISTING_PYTORCH_STRUCTURE.md`
+- `/data/projects/frankentorch/docs/planning/EXISTING_PYTORCH_STRUCTURE.md`
 - `/data/projects/frankentorch/docs/planning/PLAN_TO_PORT_PYTORCH_TO_RUST.md`
 - `/data/projects/frankentorch/docs/planning/PROPOSED_ARCHITECTURE.md`
-- `/data/projects/frankentorch/FEATURE_PARITY.md`
+- `/data/projects/frankentorch/docs/planning/FEATURE_PARITY.md`
 
 ## 2. Quantitative Legacy Inventory (Measured)
 

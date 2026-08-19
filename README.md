@@ -137,9 +137,9 @@ For agent-heavy or shared-host workflows, prefer offloading these commands with 
 ## Porting Artifact Set
 
 - docs/planning/PLAN_TO_PORT_PYTORCH_TO_RUST.md
-- EXISTING_PYTORCH_STRUCTURE.md
+- docs/planning/EXISTING_PYTORCH_STRUCTURE.md
 - docs/planning/PROPOSED_ARCHITECTURE.md
-- FEATURE_PARITY.md
+- docs/planning/FEATURE_PARITY.md
 
 These four docs are now the canonical porting-to-rust workflow for this repo.
 
