@@ -32237,6 +32237,147 @@ mod bidiag {
         }
         p
     }
+
+    #[cfg(test)]
+    mod i3nqm_house_gen_tests {
+        use super::house_gen_strided_f64;
+
+        /// `frankentorch-i3nqm`: the Householder generator at the scales its own bead named.
+        ///
+        /// The safmin rescale landed for `frankentorch-ga99y`, whose fixture reaches ~1e-158
+        /// only INDIRECTLY — the reduction sweeps down to it from an input at 1e-20. So the
+        /// gate that guards the fix is an end-to-end orthonormality check on a 64x64 SVD, and
+        /// nothing tests the generator at the boundary i3nqm actually specified. This does.
+        ///
+        /// THE NEGATIVE CASE, which is the whole point: at scale 1e-170 each `value * value`
+        /// underflows to EXACTLY zero, so the pre-fix `tail_sq` was 0 and the function
+        /// returned `tau == 0` — "already a multiple of e_1". The caller then skips the
+        /// reflector and leaves an identity column where one belonged, which is a WRONG
+        /// ANSWER, not a slow one, and no reconstruction test at ordinary scale can see it.
+        /// `assert!(tau != 0.0)` at that scale fails against the naive implementation.
+        /// 1e160 is the mirror: the squares overflow to infinity and `beta` comes back NaN.
+        ///
+        /// The checks are the two that define a reflector, and they are chosen because they
+        /// are SCALE-FREE — both are ratios, so the assertions themselves do not underflow:
+        ///   * `tau * (v^T v) == 2`, exactly the condition for `I - tau*v*v^T` to be
+        ///     orthogonal. This is the quantity ga99y measured at 1.422e-8 away from 2.
+        ///   * `(I - tau*v*v^T) x == beta * e_1`, the defining contract.
+        ///
+        /// `v` is scale-invariant (a tail divided by a quantity of its own scale), so `v^T v`
+        /// is O(1) at every scale below and the test's own arithmetic stays in range.
+        #[test]
+        fn house_gen_survives_the_scales_i3nqm_named() {
+            // Well below sqrt(f64::MIN_POSITIVE) = 1.49e-154 and above sqrt(f64::MAX) = 1.34e154,
+            // plus 1.0 as the control that must be unaffected by the rescale existing at all.
+            for &scale in &[1.0f64, 1e-170, 1e-200, 1e160, 1e-300] {
+                for &stride in &[1usize, 3] {
+                    let len = 8usize;
+                    // Deliberately NOT a multiple of e_1: every tail entry is nonzero, so a
+                    // correct generator must return a nonzero tau at every scale.
+                    let seed: [f64; 8] = [-0.75, 0.5, -1.25, 2.0, 0.125, -0.375, 1.5, -0.625];
+                    let x: Vec<f64> = seed.iter().map(|v| v * scale).collect();
+
+                    let mut a = vec![0.0f64; 1 + (len - 1) * stride];
+                    for (k, &v) in x.iter().enumerate() {
+                        a[k * stride] = v;
+                    }
+
+                    let tau = house_gen_strided_f64(&mut a, 0, len, stride);
+
+                    assert!(
+                        tau != 0.0,
+                        "scale {scale:e} stride {stride}: tau == 0 means the reflector is \
+                         SKIPPED and an identity column is left in the factor — this is the \
+                         i3nqm underflow, not a vector that was already a multiple of e_1"
+                    );
+                    assert!(
+                        tau.is_finite(),
+                        "scale {scale:e} stride {stride}: tau {tau} not finite"
+                    );
+
+                    let beta = a[0];
+                    assert!(
+                        beta.is_finite() && beta != 0.0,
+                        "scale {scale:e} stride {stride}: beta {beta} not finite/nonzero"
+                    );
+
+                    // v = [1, tail...]; scale-invariant, so this stays O(1) at every scale.
+                    let mut vtv = 1.0f64;
+                    for k in 1..len {
+                        let vk = a[k * stride];
+                        assert!(
+                            vk.is_finite(),
+                            "scale {scale:e} stride {stride}: v[{k}] not finite"
+                        );
+                        vtv += vk * vk;
+                    }
+                    let orth = tau * vtv;
+                    assert!(
+                        (orth - 2.0).abs() < 1e-12,
+                        "scale {scale:e} stride {stride}: tau*(v^T v) = {orth}, must be 2 for \
+                         I - tau*v*v^T to be orthogonal (ga99y measured 1.422e-8 off)"
+                    );
+
+                    // (I - tau*v*v^T) x must equal beta*e_1. v^T x involves no squaring of a
+                    // tiny value, so it is representable wherever x is.
+                    let mut vtx = x[0];
+                    for k in 1..len {
+                        vtx += a[k * stride] * x[k];
+                    }
+                    let f = tau * vtx;
+                    let w0 = x[0] - f;
+                    assert!(
+                        (w0 - beta).abs() <= 1e-12 * beta.abs(),
+                        "scale {scale:e} stride {stride}: reflected head {w0} != beta {beta}"
+                    );
+                    for k in 1..len {
+                        let wk = x[k] - f * a[k * stride];
+                        assert!(
+                            wk.abs() <= 1e-12 * beta.abs(),
+                            "scale {scale:e} stride {stride}: reflected tail[{k}] = {wk}, \
+                             must be 0 relative to beta {beta}"
+                        );
+                    }
+
+                    // A reflector preserves norm: |beta| == ||x||. Computed scaled, so the
+                    // CHECK cannot underflow where the code under test once did.
+                    let peak = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                    let norm = peak
+                        * x.iter()
+                            .map(|v| (v / peak) * (v / peak))
+                            .sum::<f64>()
+                            .sqrt();
+                    assert!(
+                        (beta.abs() - norm).abs() <= 1e-12 * norm,
+                        "scale {scale:e} stride {stride}: |beta| {} != ||x|| {norm}",
+                        beta.abs()
+                    );
+                }
+            }
+        }
+
+        /// The generator must still return `tau == 0` for a vector that genuinely IS a
+        /// multiple of `e_1`, at every scale. Without this, the test above could be passed by
+        /// a wrong implementation that simply never returns zero.
+        #[test]
+        fn house_gen_still_reports_a_pure_e1_vector_at_every_scale() {
+            for &scale in &[1.0f64, 1e-170, 1e160, 1e-300] {
+                let len = 8usize;
+                let mut a = vec![0.0f64; len];
+                a[0] = -1.75 * scale;
+                let tau = house_gen_strided_f64(&mut a, 0, len, 1);
+                assert_eq!(
+                    tau, 0.0,
+                    "scale {scale:e}: a pure e_1 vector needs no reflector, got tau {tau}"
+                );
+                assert_eq!(
+                    a[0],
+                    -1.75 * scale,
+                    "scale {scale:e}: e_1 vector must not be modified"
+                );
+            }
+        }
+    }
 } // mod bidiag
 
 /// Panel width for the blocked bidiagonalization. Measured on the shared
