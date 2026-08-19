@@ -35927,3 +35927,69 @@ Both are longer than any arm on this board that has failed to null, which is wha
 A quiet window with `concurrent_measurements=none` in the OUTPUT, then `conv2d_xl` at the board
 default. And then the thing none of this has yet done: a two-ELF A/B across item 174, which is the
 only way to attribute anything on that lane to the levers.
+
+## 212. THE SCATTER COLLAPSE IS WORTH ~1.10x, MEASURED AS A PAIRED LANE — THE FIRST ATTRIBUTION OF ANYTHING THIS CAMPAIGN SHIPPED ON conv2d
+
+`frankentorch-hi9r6`. BUILT, TESTED, MEASURED. `/data` 315G. Host `thinkstation1`, 64 cores,
+governor powersave, `RAYON_NUM_THREADS=8`, PyTorch 2.12.1+cpu self-reported in the same invocation.
+
+### 212a. WHY A TOGGLE AND NOT TWO BINARIES
+
+Items 174/176/177 collapsed the f64 all-ones scatter and four turns of measurement could not price
+it: the lane reaching it certified 1 of 4, and item 209's new lane has no BEFORE value either. A
+two-ELF A/B would answer it badly — item 25's rule is that a cross-binary or cross-invocation
+comparison cannot attribute a few percent to any one change, because the halves never sample the
+same host minute.
+
+`set_conv2d_ones_scatter_legacy` restores the pre-174 accumulate-scatter in process, the way
+`set_pool_output_zeroed` and `set_gemm_tile_col_floor_adaptive` already do for their levers. The
+two paths are BIT-IDENTICAL and a test says so
+(`conv2d_ones_scatter_toggle_selects_a_bit_identical_path`), which also makes the global safe to
+race: another test flipping it takes the other path and cannot notice.
+
+### 212b. THE RESULT, TWO INVOCATIONS
+
+    run   FT xl   FT legacy    raw    ratio xl  ratio leg   paired   PT control
+      A  29.466      31.650  1.074       1.463      1.313    1.114       0.964
+      B  29.374      31.822  1.083       1.469      1.340    1.096       0.989
+
+`paired` normalises each arm by its OWN incumbent sample, absorbing host drift. `PT control` is
+PyTorch under both lane names — identical code, so it must come out ~1.0.
+
+**The collapse is worth ~1.08x raw and ~1.10x paired**, replicated across two invocations that
+agree to 1.6%. Run A's PT control sat 3.6% off 1.0 and run B's 1.1%, so B is the better of the two
+and they agree anyway.
+
+This is the first number this campaign has attached to a conv2d change it shipped, rather than to
+a lane's standing.
+
+### 212c. THE STANDING IS NOT BANKED
+
+    conv2d_xl   run A  ratio 1.463 [1.403,1.487]  PT PASS / FT PASS   <- certified
+                run B  ratio 1.469 [1.414,1.529]  PT PASS / FT OFFSET
+
+One of two. The ratios agree to 0.4% and both arms are long, but 1/2 is not a bank and **FT 1.47x
+FASTER is not quoted as a standing.** The paired lever number above is a different claim and does
+not depend on either row certifying — it is FT-vs-FT within one invocation, with the incumbent as
+a drift control rather than as the comparand.
+
+### 212d. THE DETECTOR WAS CRYING WOLF ON EVERY RUN
+
+Item 194's `/proc` scan reported `concurrent_measurements=1 DETECTED` on both smoke runs, and both
+times it was **this run's own invoking shell**: the harness is launched as
+`PYTORCH_PYTHON=/…/torchvenv-…/bin/python …`, so the parent shell's command line names the torch
+venv and matches the `torch-arm` pattern.
+
+The scan excluded children — the incumbent arm we spawn — and not ANCESTORS. Fixed by walking the
+ppid chain once and skipping it, after which the same command prints
+`concurrent_measurements=none`.
+
+**An alarm that is always on is not read.** It fired on the one genuinely contended run in item 211
+and I believed it; it fired identically on three uncontended ones, and the only reason I did not
+discard good measurements is that I had documented the false-positive mode when writing it. A
+detector needs its false positives designed out, not annotated.
+
+### 212e. OWED
+
+A second certified `conv2d_xl` row. Then the same paired treatment for items 176/187/201, none of
+which has a number either.
