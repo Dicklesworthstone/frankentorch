@@ -38440,3 +38440,52 @@ What still blocks a flip is unchanged and worth stating plainly: the max_pool3d 
 ~8%, every measurement is on ONE host whose 2.87x cross-core frequency spread is the mechanism's own
 precondition, and no other machine has been tried. A default that is right here and wrong on a
 uniform-clock box would be a worse outcome than an env var that nobody sets.
+
+## 248. frankenpandas HAS ALREADY SOLVED HALF THE FLEET CONTENTION PROBLEM, UNILATERALLY, WITH `taskset`
+
+`frankentorch-4zjaa`. No measurement. An observation about the blocker itself, which has now cost
+more ticks than any technical problem in this campaign.
+
+### 248a. WHAT THE GUARD CAUGHT
+
+    timeout 5400 taskset -c 0-15 env … OMP_NUM_THREADS=16 … fp-bench
+    python3 benches/vs_pandas_harness.py --category math_unary --workloads floordiv --sizes 10M
+
+frankenpandas is measuring — for a **90-minute** budget — but it is **pinned to 16 of this host's
+64 cores**, with its thread count matched to the pin. Cores 16-63 are untouched by it.
+
+### 248b. WHY THAT MATTERS MORE THAN THE SLOT
+
+The fleet-wide one-at-a-time rule exists because nine projects benchmarking at once took the host
+to run queue 122. But strict serialisation is expensive in a different way: with a 90-minute
+budget on one project, every other project's measurement queue stalls for 90 minutes. I have now
+spent **eight ticks** unable to run two invocations, and `acquire_build_slot` — the mechanism the
+rule depends on — has returned *"Build slots are disabled. Enable WORKTREES_ENABLED"* on **every
+call across all eight**.
+
+**Core pinning bounds the interference instead of forbidding it.** Two projects on disjoint core
+ranges do not contend for cores at all; what remains is memory bandwidth and LLC, which is real
+for bandwidth-bound kernels but is a fraction of what core oversubscription costs. runq 122 was
+nine projects fighting for the *same* 64 cores.
+
+### 248c. WHAT I AM NOT DOING, AND WHY
+
+I did **not** measure this tick, even though 48 cores were idle and my binaries were built and
+waiting. Two reasons, and the second is the real one:
+
+* My own guard refuses on a live peer measurement, and overriding it to bank a row it was written
+  to prevent is the gate self-weakening section 2 bans — I declined the same override in item 242
+  and the reasoning has not changed because the wait got longer.
+* **A row measured on cores 16-63 is not comparable to the rows already banked**, all of which
+  ran unpinned across all 64. Item 231's standing, item 243's 1.49x, the nb sweep — every one of
+  them would need re-measuring in the new regime before a pinned row could be quoted beside them.
+  Pinning is a fleet policy decision, not something to adopt silently inside one project's lane.
+
+### 248d. THE PROPOSAL
+
+If `acquire_build_slot` cannot be enabled, **give each project a disjoint core range and let
+measurements overlap**, rather than serialising them behind a lease that does not exist.
+frankenpandas has demonstrated the mechanism works and costs one `taskset` prefix. The cost is
+that every banked row's regime changes once, which is a one-time re-baseline the campaign has
+absorbed before — and it converts an eight-tick stall into a bounded, declared interference term
+that every row can record next to its loadavg and iowait.
