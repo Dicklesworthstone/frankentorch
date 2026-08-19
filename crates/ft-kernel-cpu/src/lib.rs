@@ -32441,21 +32441,61 @@ fn svd_blocked_bidiag_prologue(
     // measured 31.6% of a square SVD, rising with n (NEGATIVE_EVIDENCE item 36),
     // next to a reduction that is already GEMM-bound.
     //
-    // THRESHOLD IS 160, MEASURED, NOT INHERITED. I first wired this at n >= 64 to
-    // match `svd_use_blocked_bidiag`'s gate, and the A/B says that was wrong --
-    // blocking LOSES below the crossover:
+    // THRESHOLD IS 130, AND THE 160 IT REPLACES RESTED ON A BROKEN ARM.
+    // NEGATIVE_EVIDENCE item 229.
     //
-    //   n=64   unblocked    47590 ns   blocked    50496 ns   0.94x
-    //   n=128  unblocked   335175 ns   blocked   384359 ns   0.87x
-    //   n=160  unblocked  5889192 ns   blocked   646525 ns   9.11x
-    //   n=192  unblocked  9732548 ns   blocked  1043859 ns   9.32x
-    //   n=256  unblocked 17723374 ns   blocked  1939236 ns   9.14x
+    // The history: first wired at n >= 64 (inherited from `svd_use_blocked_bidiag`),
+    // corrected to 160 by an A/B whose unblocked arm "fell off a cliff" between 128
+    // and 160 -- a 17.6x jump for a 1.25x size increase, against the ~1.95x an O(n^3)
+    // expansion predicts. That cliff was never explained, only routed around.
     //
-    // Note the unblocked path's 17x jump between 128 and 160 for a 1.25x size
-    // increase -- it falls off a cliff there, which is what makes the crossover so
-    // sharp. Below 160 the unblocked form is kept, so smaller shapes retain their
-    // CURRENT output bit-for-bit. Panel width is the same `svd_bidiag_block_size()`
-    // already tuned for the reduction.
+    // It is `PARALLEL_GATE`. Work per reflector in `bidiag_form_p_f64` is
+    // `(n-1) * (n-1)`, which crosses `1 << 14` between n=128 (127^2 = 16129) and
+    // n=130 (129^2 = 16641). Above it, `reduce_scaled_rows_f64` forks into
+    // `nrows / REDUCE_CHUNK_ROWS` tasks -- two or three at these sizes -- and
+    // `apply_scaled_rank1_f64` forks one task PER ROW, both once per reflector. The
+    // fork/joins buy almost no width and cost more than the sweep.
+    //
+    // MEASURED, running the same A/B with `FT_LINALG_PARALLEL_GATE` raised past the
+    // crossing so the helpers stay serial (RAYON_NUM_THREADS=8, one process each):
+    //
+    //          unblocked        unblocked
+    //   n      default gate     gate raised     blocked
+    //   128      393 us           350-407 us     387-399 us
+    //   136     1357-3199 us      416-508 us     546-550 us
+    //   144     1441-10154 us     506-596 us     601-627 us
+    //   160     2130-11483 us     798-827 us     761-818 us
+    //   256    22326-37289 us    3296-3416 us   2311-2591 us
+    //
+    // With the gate raised the unblocked arm is a smooth curve and n=160 costs ~800 us,
+    // not 5.9 ms -- so the old table's "9.11x at n=160" was measured against a
+    // thrashing arm, and blocking is worth ~1.0x there, not 9x. The lever is real but
+    // an order of magnitude smaller than banked.
+    //
+    // WHERE THE CROSSOVER ACTUALLY IS, three replications, every n agreeing on order:
+    //
+    //   n=128  unblocked 268-340 us   blocked 317-384 us   0.85-0.89x   unblocked wins
+    //   n=129  unblocked 427-440 us   blocked 426-443 us   0.98-1.00x   tie
+    //   n=130  unblocked 449-517 us   blocked 418-444 us   1.07-1.16x   blocked wins
+    //   n=131                                              1.19-1.36x
+    //   n=136  unblocked 697-781 us   blocked 462-586 us   1.33-1.51x
+    //
+    // The flip lands exactly where the gate arithmetic says it must. So 130 is the
+    // measured crossover and the shipped 160 left n in [130,160) on the thrashing
+    // path -- worth 1.33-1.51x at n=136 in a quiet window and up to 5.8x in a loaded
+    // one, because what the gate buys is VARIANCE as much as time (the unblocked arm
+    // read 697 us and 3199 us for the same n in two windows; the blocked arm did not
+    // move).
+    //
+    // Below 130 the unblocked form is kept, so smaller shapes retain their CURRENT
+    // output bit-for-bit. Panel width is the same `svd_bidiag_block_size()` already
+    // tuned for the reduction.
+    //
+    // NOT FIXED HERE, deliberately: raising `PARALLEL_GATE` itself would make the
+    // unblocked path fast at every n and is worth more than this threshold, but the
+    // gate is shared by every caller of `reduce_scaled_rows_f64` /
+    // `apply_scaled_rank1_f64` and moving it changes their result bits too. Filed
+    // rather than smuggled in behind an SVD dispatch change.
     //
     // NOT bit-identical above the threshold — blocking reassociates the same
     // arithmetic — so it is admissible only under the ratified eig/SVD tolerance
@@ -32467,7 +32507,7 @@ fn svd_blocked_bidiag_prologue(
     // Per section 1 of the standing orders this is landed, not won, until a
     // post-fix ratio is taken in a quiet window.
     let t_formp = std::time::Instant::now();
-    let v = if n >= 160 {
+    let v = if n >= 130 {
         bidiag::bidiag_form_p_blocked_f64(a, n, &taup, svd_bidiag_block_size())
     } else {
         bidiag::bidiag_form_p_f64(a, n, &taup)
@@ -65036,6 +65076,74 @@ mod tests {
         }
     }
 
+    /// The `form_p` blocked/unblocked threshold, pinned FROM OUTSIDE by the dispatch's
+    /// own discontinuity — `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 229.
+    ///
+    /// WHY NOT JUST READ THE CONSTANT. A threshold is only known where it is observed to
+    /// act. `frankentorch-conv3d-direct-gate-misset` is the standing lesson: a fast path
+    /// validated at one shape and gated on an open-ended `>=` pessimised every shape above
+    /// it, and nothing noticed because the gate had been read rather than exercised. This
+    /// asserts the ROUTE, from a caller, and needs no poison return to do it.
+    ///
+    /// It works because the two expansions are NOT bit-identical — blocking reassociates
+    /// the same arithmetic, which is why they are compared at 1e-11 elsewhere and why the
+    /// substitution needs the ratified eig/SVD tolerance policy. That inexactness is
+    /// exactly what makes the route observable: the prologue's `v` matches one of them
+    /// bit-for-bit and not the other, so a single `==` says which branch ran.
+    ///
+    /// n=128 must take the unblocked path and n=136 the blocked one. If the constant moves,
+    /// or a neighbouring gate is reinherited as this call site has now done twice, this
+    /// test fails and names the size it failed at.
+    #[test]
+    fn svd_prologue_routes_form_p_across_the_measured_threshold() {
+        for &(n, want_blocked) in &[(128usize, false), (136usize, true)] {
+            // Reproduce the reduction the prologue performs, so both reference expansions
+            // are built from the SAME packed reflectors it will use.
+            let mut packed = bidiag_test_matrix(n, n, 0x42F00D ^ n as u64);
+            let (_d, _e, _tauq, taup) = super::bidiag::bidiag_blocked_f64(
+                &mut packed,
+                n,
+                n,
+                super::svd_bidiag_block_size(),
+            );
+            let unblocked = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+            let blocked = super::bidiag::bidiag_form_p_blocked_f64(
+                &packed,
+                n,
+                &taup,
+                super::svd_bidiag_block_size(),
+            );
+
+            // The premise: the two expansions must actually differ, or the assertion below
+            // proves nothing. If blocking ever became bit-exact this test would silently
+            // stop testing, so the premise is asserted rather than assumed.
+            assert_ne!(
+                unblocked, blocked,
+                "n={n}: the two expansions agree bit-for-bit, so this test cannot \
+                 distinguish the routes and its verdict below is vacuous"
+            );
+
+            let mut fresh = bidiag_test_matrix(n, n, 0x42F00D ^ n as u64);
+            let (_w, _rv1, v, _anorm) = super::svd_blocked_bidiag_prologue(&mut fresh, n, n, false);
+
+            let took_blocked = v == blocked;
+            let took_unblocked = v == unblocked;
+            assert!(
+                took_blocked || took_unblocked,
+                "n={n}: the prologue's P matched NEITHER expansion — the dispatch now \
+                 reaches a third path this test does not know about"
+            );
+            assert_eq!(
+                took_blocked,
+                want_blocked,
+                "n={n}: expected the {} expansion, got the {} one — the measured crossover \
+                 is 130 (item 229: n=129 ties, n=130 flips)",
+                if want_blocked { "BLOCKED" } else { "unblocked" },
+                if took_blocked { "BLOCKED" } else { "unblocked" }
+            );
+        }
+    }
+
     /// frankentorch-4zjaa: the owed post-fix ratio for the blocked `form_p`.
     ///
     /// FT-vs-FT, so this is MAINTENANCE evidence under section 1, not a win — it
@@ -65043,7 +65151,16 @@ mod tests {
     /// run in ONE process over the SAME packed reflectors, interleaved, min of 3.
     #[test]
     fn bidiag_form_p_blocked_versus_unblocked_ab() {
-        for &n in &[64usize, 128, 160, 192, 224, 256] {
+        // 136/144/152/176 added by item 229. The shipped `n >= 160` threshold was placed
+        // from the ORIGINAL grid, whose only points either side of the crossover were 128
+        // and 160 — so "the crossover is 160" was the coarsest statement the data could
+        // support, not a measurement of where it actually is. Item 65c's own lesson ("a
+        // threshold is a measurement, not a convention") applies to the corrected constant
+        // too. ADDED, never swapped: every original size is still here, so item 65's table
+        // stays reproducible from this test.
+        for &n in &[
+            64usize, 128, 129, 130, 131, 132, 136, 144, 152, 160, 176, 192, 224, 256,
+        ] {
             let mut packed = bidiag_test_matrix(n, n, 0xAB0007 ^ n as u64);
             let (_d, _e, _tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, n, n);
             let nb = super::svd_bidiag_block_size();
