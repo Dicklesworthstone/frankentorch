@@ -2158,6 +2158,23 @@ LANES = {
         }
     };
 
+    // LANE COUNT IN THE PROVENANCE — `frankentorch-vyaia`, acceptance item 3.
+    //
+    // The bead's correction to its own author: frankentorch-5q3io bounded this harness's self-load
+    // at ~+0.62 absolute and used that to argue self-load was under 10% of the signal in every
+    // failing run. The bound rotted silently, because the sweep GAINED LANES and a self-load
+    // figure is a property of the harness AT A LANE COUNT, not a constant. Nothing in the row
+    // format recorded the lane count, so the rot was invisible in the rows themselves and could
+    // only be found by re-measuring.
+    //
+    // Printed unconditionally, including on an UNFILTERED full sweep — which is exactly the case
+    // the `lane_filter=` line above does not cover, and exactly how the stale bound was taken.
+    println!(
+        "lane_count={} rounds={reps} (frankentorch-vyaia: the harness's own load scales with this \
+         product; a self-load bound quoted without it cannot be checked later)",
+        lanes.len()
+    );
+
     // Our side warms here; the incumbent warmed itself before announcing ready.
     //
     // The COUNT must match the incumbent's, which warms `for _ in range(4)` per
@@ -2626,6 +2643,44 @@ LANES = {
             )
         }
     );
+
+    // COLD-START DETECTOR — `frankentorch-vyaia`, acceptance item 1.
+    //
+    // The bead's measurement: five consecutive runs of ONE binary, and the two that passed the
+    // drift gate were the two that STARTED at the level the harness itself sustains. From an idle
+    // box the sweep supplies its own +20 and the RELATIVE gate reads 9 -> 28 as a 3x excursion.
+    // Waiting for a quiet host therefore makes this gate HARDER to pass, which is the reverse of
+    // how every runbook in this repo reads.
+    //
+    // The rise is MEASURED here rather than assumed, because the constant is not a constant:
+    // frankentorch-5q3io banked the self-load at ~+0.62 absolute and that figure is now off by
+    // more than an order of magnitude, purely because the sweep gained lanes underneath it.
+    // Printing the rise every run means the number is re-derived by the instrument instead of
+    // being quoted from a bead that cannot know today's lane count.
+    //
+    // Advisory, never a refusal. A run that trips this is not WRONG, it is the WARM-UP: discard it
+    // unread and measure from the next one. The discard is fixed in advance and unconditional, so
+    // it is a scheduling rule and not a filter on results.
+    //
+    // The rise is a LOWER bound on our own contribution and an UPPER bound on nothing: a peer that
+    // started while we sampled lands in it too. `concurrent_measurements` above is what separates
+    // those two, and it is printed first for that reason.
+    if let Some(start) = load_at_start.filter(|_| peak_load.is_finite()) {
+        let rise = peak_load - start;
+        println!(
+            "self_load rise={rise:+.2} (start {start:.2} -> peak {peak_load:.2}) at lane_count={} \
+             rounds={reps} (frankentorch-vyaia: the harness's own load, measured, not assumed)",
+            lanes.len()
+        );
+        if rise > start {
+            println!(
+                "COLD-START: this invocation supplied MORE load ({rise:.2}) than the host was \
+                 already carrying ({start:.2}), so the drift gate above is largely reading OUR OWN \
+                 ramp rather than the host's. Treat this run as the discarded warm-up and measure \
+                 from the NEXT invocation on this host (frankentorch-vyaia)."
+            );
+        }
+    }
 
     for (index, (name, _)) in lanes.iter().enumerate() {
         let (ratio, ratio_lo, ratio_hi) = median_ratio_ci(&pt_times[index], &ft_times[index]);
