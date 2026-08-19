@@ -38247,3 +38247,83 @@ lane to settle it is the one already built.
 
 The golden now also guards the panel for anyone who touches it next, which is the part that
 survives whatever the ratio turns out to be.
+
+## 247. THE WHOLE BOARD AT 8 vs 16 THREADS: 42 LANES OF 47 GAIN, 5 LOSE, WORST 0.92x — AND THE FIRST PASS OF ANY SWEEP IS WORTH UP TO 8x
+
+`frankentorch-rayon-pool-width-qq8as` has been blocked on one question since it was filed: not
+whether a narrower pool helps the lanes that gain, but **what it costs the lanes that do not**. The
+whole board, both widths, arm-internal, one ELF `bd89b709df35aa8682c15aa6`, palindrome order
+8,16,16,8 in one window.
+
+Each width judged by its BEST pass, which is the conservative reading and not the flattering one:
+
+    lanes compared                 47
+    16t FASTER                     42
+    16t SLOWER                      5
+    median                      1.247x
+    best        forward_f32     1.674x
+    worst   max_pool3d_dense    0.921x
+
+The five that lose, in full, because this is the half the bead asked for:
+
+    max_pool3d_dense          2.711 -> 2.945   0.921x
+    max_pool3d_nopool         1.815 -> 1.839   0.987x
+    max_pool3d                1.788 -> 1.811   0.987x
+    forward_with_indices_f64  0.389 -> 0.393   0.990x
+    linear_wide               1.989 -> 1.993   0.998x
+
+**Four of the five are within 1.3%, and the whole max_pool3d family is the one real objection at
+-8%.** Nothing else on the board regresses. That is a far better answer than the bead's caution
+anticipated, and it is the max_pool3d family — already recorded elsewhere as bandwidth-walled — that
+would have to be accepted or gated around if a default were ever changed.
+
+### 247a. MY OWN FIRST CUT OF THIS TABLE WAS WRONG, AND THE REASON IS THE SECOND FINDING
+
+Taking the median of each width's two passes gives "16t faster on 48/49, median 1.454x, worst
+1.000x" — a much prettier table, and a misleading one. The two 8t passes disagree with each other
+enormously, and always in the same direction:
+
+    lane                pass 1 (8t)   pass 4 (8t)   ratio
+    avg_pool2d              10.34         1.27      8.13x
+    avg_pool2d_dense        19.42         3.02      6.42x
+    avg_pool1d_zeroed       23.57         5.92      3.98x
+    max_pool1d_dense        51.26        15.59      3.29x
+    linear_wide              5.36         1.99      2.69x
+    conv2d_xl               90.39        33.74      2.68x
+    median across 47 lanes                          1.23x
+
+Same binary, same width, same lanes, ~12 minutes apart. **The median lane is 1.23x slower on the
+first pass and the worst is 8.13x.**
+
+**It is not contention.** Pass 1 ran at `load 16.04` and pass 4 at `load 26.51` — the LATER, BUSIER
+pass is the fast one. A contention explanation has the sign backwards.
+
+### 247b. THIS IS THE DISCARD-FIRST RULE, MEASURED DIRECTLY FOR THE FIRST TIME
+
+`frankentorch-vyaia` argued for discarding the first run from LOADAVG behaviour — the harness
+supplies its own +6, so a quiet start fails the drift gate. Item 230 measured that self-load and
+item 240 built the instrument. None of that measured what the first pass COSTS in lane time, and
+item 228's attempt to A/B it failed because the effect was absent from its control.
+
+Here it is present, at pass granularity, on 47 lanes at once, with the confound ruled out by sign.
+Whatever the mechanism — allocator warmth, page-fault first touch, buffer-pool population, CPU
+frequency ramp — **the first pass of a sweep is not comparable to later passes and must be
+discarded, not averaged in.** Every multi-pass comparison in this campaign that used a mean or a
+median of two passes has this bias in it, in favour of whichever width or arm happened to run
+second.
+
+The palindrome design (item 51) is what made this visible: 8,16,16,8 puts both 8t passes at the two
+ENDS, so the first-pass penalty lands on one member of a same-width pair rather than being
+distributed across the widths where it would silently become "the answer".
+
+### 247c. WHAT THIS DOES AND DOES NOT SETTLE
+
+It answers the bead's blocking question on ONE host with one binary and one pass per width per
+direction. It does not license a default flip on its own: the max_pool3d family regresses, two
+passes is thin, and this box's 2.87x cross-core frequency spread is the mechanism's own
+precondition, so a machine without it may show none of this. The vs-PyTorch evidence remains one
+lane (item 244).
+
+What it removes is the reason the bead was stuck: "the lanes that gain nothing might lose
+something" is now measured rather than feared, and the answer is 4 lanes at under 1.3% and one
+family at 8%.
