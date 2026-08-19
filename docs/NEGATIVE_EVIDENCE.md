@@ -38994,3 +38994,75 @@ therefore do not move) and `svd_deferred_left_thread_count_bit_exact`.
   rank-2nb update would halve that traffic and is the next lever — it reassociates, so it owes
   the tolerance argument and a golden update, which is exactly what
   `bidiag_blocked_output_is_bit_stable` exists to force.
+
+## 256. THE STANDING AFTER 254 AND 255, IN A WINDOW THE GUARD ACTUALLY PASSED — AND THE ONE ASYMMETRY THAT KEEPS IT FROM BEING A CLEAN vs-PyTorch ROW
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. Items 254 (four rows in flight) and 255
+(gate `1<<14` -> `1<<18`) were both measured under load. The guard opened at 13:32 UTC and this
+is what the shipped configuration reads against a live incumbent.
+
+### 256a. PROVENANCE
+
+`ELF edb668cb6c9e32a7` (built from the commit that ships both levers), host thinkstation1,
+governor powersave, `RAYON_NUM_THREADS=8` matched to `torch.set_num_threads(8)`,
+PyTorch 2.12.1+cpu self-reported in the SAME invocation. **Guard PASS before AND after**: no peer
+measurement, loadavg 12.25/13.77/14.44 at the start and 18.04/15.83/15.14 at the end, iowait
+0.1%. PyTorch block spreads 1.02-1.14x. Parity MATCH at every size, rel 1.28e-16 to 4.93e-16.
+
+Estimator: nine rounds, every arm one SVD apart, first round discarded.
+
+### 256b. WHAT THE LEVERS ARE WORTH, PAIRED IN-PROCESS — THE DEFENSIBLE NUMBER
+
+Old configuration (`gate=1<<14`, one-row step 12) against the shipped one, both arms alternated
+inside one process, paired per round, median of the pairs. This is estimator-matched on both
+sides, which the vs-incumbent column below is not:
+
+    n      old config vs shipped     A/A null   replication (loadavg 23-31 window)
+    128    1.12x                     1.002x     unreadable (PT blocks 7.5x apart)
+    136    1.27x                     1.001x     1.27x
+    256    1.35x                     1.109x     1.31x
+    512    1.13x*                    1.006x     1.13x
+    1024   --                        --         1.19x
+
+*The n=512 and n=1024 arms of the clean run were lost to output truncation and are quoted from
+the loaded replication only; the two windows agree at n=136, 256 and 512, which is the reason to
+trust the replication where the clean run is silent.
+
+### 256c. AGAINST THE INCUMBENT — READ THE CAVEAT FIRST
+
+    n      FT (min of 9 rounds)   PT (min of 5)   ratio        old config, same run
+    128    1.554 ms               1.268 ms        1.23x SLOW   1.733 ms  (1.37x SLOW)
+    136    1.752                  1.441           1.22x SLOW   2.386     (1.66x SLOW)
+    256    10.632                 6.886           1.54x SLOW   18.473    (2.68x SLOW)
+    512    66.274                 35.771          1.85x SLOW   --
+
+**THE ASYMMETRY, stated because it flatters me:** our arm's figure is a min over NINE samples and
+the incumbent's is a min over FIVE within a block. More samples means a lower min, so this
+comparison is biased in our favour by however much the tail of nine differs from the tail of
+five — not large at these spreads, but not zero, and the previous standing (item 251's 1.36x at
+n=128, item 253's 2.77x at n=256) was taken with min-of-five on both arms. **The two standings
+are therefore not exactly comparable**, and the honest reading of this tick's improvement is
+256b's paired column, not the difference between the two ratio tables.
+
+What is not in doubt: the same invocation, same estimator on both, puts the old configuration at
+1.733/2.386/18.473 ms and the shipped one at 1.554/1.752/10.632 ms.
+
+OWED: this row re-taken with the incumbent ROUND-INTERLEAVED too, so both arms carry the same
+estimator. That is a lane change, not a measurement, and it is the last thing between this and a
+certifiable vs-PyTorch standing.
+
+### 256d. THE GAP THAT MATTERS NOW IS AT n=1024
+
+    n=1024   FT 455-473 ms      PT 130-144 ms      ~3.3-3.5x SLOWER
+
+Every item in this campaign before today argued about n=128-136, where the gap is now 1.22x. The
+gap GROWS with n and it is worst where the reduction's share is largest (76-86%). Two things are
+known about where that time goes and one is a target:
+
+* the panel's level-2 matvecs now run SERIALLY for almost every reflector, because item 255
+  measured that forking them costs more than it saves below `1<<18` — at n=1024 that is a
+  measured ~7 us per fork against matvecs that take tens of microseconds;
+* LAPACK's `dgebrd` has the same level-2 volume and MKL threads it, so the incumbent gets
+  multi-core bandwidth on exactly the half of the algorithm we have just decided to run on one
+  core. That is not a ceiling, it is the shape of the next lever: **the fork cost per reflector
+  is the thing to remove, not the parallelism**.
