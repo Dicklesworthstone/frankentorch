@@ -35513,3 +35513,50 @@ This time the threshold — our own arm's stability against its duration — has
 Three invocations were run and all three are above. The third was run specifically because the
 first two disagreed about `conv2d_big`, and it did not rescue it. Reporting only the runs that
 certified would have turned three attempts into one clean row and a silence.
+
+## 206. THE HARNESS NOW TELLS YOU WHEN ROUNDS WOULD CLEAR A NULL — ENCODING ITEM 193c SO NOBODY REPEATS THE THREE-RUN WALK
+
+`frankentorch-hi9r6`. **UNBUILT**: absolute throttle, `/data` 37-39G, no cargo, no artifact written,
+no new file. `rustfmt --edition 2024 --check` exits 0.
+
+### 206a. THE FINDING THIS PUTS IN THE OUTPUT
+
+Item 193c measured, rather than assumed, that the round count is a lever on the A/A nulls. Same ELF,
+same lane, loadavg 22-35 throughout:
+
+    16 rounds   PT 1.050 FAIL   FT 1.003
+    32 rounds   PT 0.985 PASS   FT 0.977   (short by 0.003)
+    64 rounds   PT PASS         FT PASS
+
+The null is a ratio of per-round medians, so its variance falls with the round count: **the gate can
+be bought with TIME instead of with a quiet host.** Every attempt before that had waited for a calm
+window that never arrived.
+
+That finding lived only in the ledger, where it helps whoever reads item 193 and nobody else. The
+`NULL-FAILED` line now carries it, with the concrete `FT_H2H_REPS` value to try next.
+
+### 206b. WHY IT IS CONDITIONAL, WHICH IS THE WHOLE DESIGN
+
+The suggestion appears only when BOTH nulls are already within 4x the band — sampling noise
+territory. It stays silent otherwise, because **rounds cannot rescue a row that is failing for a
+reason other than noise.** A drifting or oversubscribed host (item 194) moves the arms themselves,
+and more rounds then average a different quantity more precisely; a lane whose incumbent arm is too
+short to null at all (item 144a) is not helped either.
+
+An unconditional "try more rounds" would be advice that is wrong more often than right, and it would
+be read as the harness endorsing a re-run in exactly the cases where the answer is to stop.
+
+### 206c. A PEER BANKED THE ROW THIS WAS CHASING
+
+Their item 205 banked `conv2d_big_masked` at 2.42-2.54x SLOWER, 3/3 — the certification items 193
+and 187e were aimed at. That closes the question of whether the standing was stale: it was, badly,
+against the certified 3.64x.
+
+Which makes this item's value entirely forward-looking: the walk is now documented in the tool that
+produces the failing rows, so the next lane blocked on a near-miss null costs one re-run instead of
+three plus a hypothesis.
+
+NOT VERIFIED: compilation. `reps` was checked by reading (`fn reps() -> usize` at line 76, bound in
+`main` at 1116, no function boundary between there and the reporting loop), and
+`BALANCED_NULL_MAX_DEVIATION` is the `f64` the same line already formats — but item 186's lesson
+stands: `rustfmt` proves only that it parses.

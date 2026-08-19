@@ -2504,6 +2504,33 @@ LANES = {
             println!(
                 "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must be within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0 and carry a calm CI; do not quote this row"
             );
+            // ROUNDS ARE A LEVER ON THE NULL — `frankentorch-hi9r6`, item 206.
+            //
+            // Item 193c measured this rather than assuming it: on `conv2d_big_masked`, at loadavg
+            // 22-35 throughout, the same ELF walked
+            //
+            //     16 rounds   PT 1.050 FAIL   FT 1.003
+            //     32 rounds   PT 0.985 PASS   FT 0.977   (short by 0.003)
+            //     64 rounds   PT PASS         FT PASS
+            //
+            // The A/A null is a ratio of per-round medians, so its variance falls with the round
+            // count: the gate can be bought with TIME instead of with a quiet host. Every earlier
+            // attempt that session waited for a calm window that never came.
+            //
+            // Suggested only when BOTH nulls are already close, because rounds cannot rescue a row
+            // that is failing for a reason other than sampling noise — a genuinely drifting or
+            // oversubscribed host (item 194) moves the arms themselves, and more of it just
+            // averages a different quantity more precisely.
+            let worst = (pt_null_ratio - 1.0).abs().max((ft_null_ratio - 1.0).abs());
+            if worst < 4.0 * BALANCED_NULL_MAX_DEVIATION {
+                println!(
+                    "      ROUNDS MAY CLEAR IT: worst null is {worst:.3} off 1.0 against a \
+                     +/-{BALANCED_NULL_MAX_DEVIATION:.2} band, which is sampling noise rather than \
+                     a moving host. The null is a ratio of per-round medians, so try \
+                     FT_H2H_REPS={} (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).",
+                    reps.saturating_mul(2).max(32)
+                );
+            }
         }
         // item 169: print the slot-0 ratio on EVERY row, passing or failing, next to the null it
         // is meant to explain. Printed unconditionally on purpose — item 149 went wrong by
