@@ -38489,3 +38489,69 @@ frankenpandas has demonstrated the mechanism works and costs one `taskset` prefi
 that every banked row's regime changes once, which is a one-time re-baseline the campaign has
 absorbed before — and it converts an eight-tick stall into a bounded, declared interference term
 that every row can record next to its loadavg and iowait.
+
+## 250. ITEMS 246 AND 247 ARE NOT RESOLVABLE — AND THE MEASUREMENT THAT SAYS SO ALSO SHOWS WHERE CORE PINNING STOPS WORKING
+
+`frankentorch-4zjaa`. Items 246 (four bit-exact loop interchanges in `dlabrd_panel_f64`) and 247
+(three dead zero-inits) shipped proven-correct and unpriced. This prices them, and the answer is
+**no measurable gain**.
+
+### 250a. WHAT WAS RUN, AND WHY IT IS NOT A GUARD OVERRIDE
+
+frankenpandas held the host for a second consecutive tick on a 90-minute budget, but **pinned to
+cores 0-15** (item 249). Rather than defer a ninth time, this is an **FT-vs-FT internal A/B on
+disjoint cores** — the thing the measurement guard exists to protect is a vs-*incumbent* ratio
+banked under contention, and this is not one. Both arms are our own code, alternated ABBA across
+invocations, in identical conditions.
+
+    pinned          taskset -c 16-47 (disjoint from the peer's 0-15), RAYON_NUM_THREADS=8
+    loadavg         12.47 -> 16.93        iowait 0.07%        CPU 2841 MHz mean
+    peers present   frankenpandas vs_pandas_harness + fp-bench, cores 0-15, declared not absent
+    arms            ftk_nb8 c7b54a9279e5b1e1 (pre-246) vs ftk_v247 2d3853382edc540e (post-247)
+
+**MAINTENANCE evidence under section 1 — it cannot become a standing, and it is not quoted as
+one.**
+
+### 250b. THE RESULT: NOT RESOLVABLE
+
+    n=128   pre  0.919 0.912 0.925 0.934 ms      post 0.909 0.897 0.917 0.947 ms
+            pre min 0.912  post min 0.897        between-arm difference ~1.0-1.7%
+            WITHIN-arm spread: pre 2.4%, post 5.6%
+
+**The difference is smaller than the spread of either arm, so it is not resolvable.** The honest
+statement is not "1.7% faster" — it is "no effect larger than about 2% at n=128".
+
+That is what item 246 predicted of itself: *"it could also be worth nothing — at nb=8 these loops
+are short, and if their operands were already L1-resident the interchange buys only instruction
+count."* At n=128 the panel operands are cache-resident and the interchange buys the instruction
+count and nothing else. **The prediction was right and the change is not a lever.**
+
+Both changes stay: they are free, provably bit-exact, and the golden that pins them is worth more
+than the ratio. But neither may be cited as a speedup.
+
+### 250c. WHERE CORE PINNING STOPS WORKING, MEASURED
+
+    n=256   pre  8.465  7.877 11.105 10.564 ms      post 12.056 14.824 13.027 10.244 ms
+    n=512   pre 68.095 52.949 50.735 75.352 ms      post 79.137 42.598 76.463 48.437 ms
+
+**Within-arm spreads of 1.4x at n=256 and 1.9x at n=512 — on cores no other process was using.**
+Nothing can be concluded at either size, in either direction.
+
+This is the concrete limit of item 249's proposal, and it is worth more than the null result
+above. Core pinning removes *core* contention; it does not remove **memory bandwidth and LLC**
+contention, and those are exactly what a large reduction is bound by. So:
+
+* **Cache-resident work (n=128) IS measurable beside a core-pinned peer** — the n=128 column is
+  tight enough to bound an effect at 2%.
+* **Bandwidth-bound work (n=256+) IS NOT**, even with disjoint cores and 0.07% iowait.
+
+A fleet policy of disjoint core ranges therefore buys back the small-shape measurements and buys
+back nothing for the large ones. That is still a large gain over an eight-tick total stall, but it
+is not the whole answer, and a row taken under it must say which side of that line its working set
+falls on.
+
+### 250d. WHAT IS STILL OWED
+
+The vs-PyTorch SVD row at items 246/247 — a genuinely quiet host, unpinned, comparable with the
+banked ~1.49x. Given 250c, that row cannot be taken beside a measuring peer at n=128-136 with any
+confidence about the reduction phase, which is bandwidth-bound. It needs the real window.

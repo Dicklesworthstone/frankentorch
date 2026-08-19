@@ -56,6 +56,11 @@ mapfile -t HITS < <(
             args = $0; sub(/^[ \t]*[0-9]+[ \t]+[^ \t]+[ \t]+/, "", args);
             if (pid == self || pid == parent) next;
             if (args ~ /measurement_window_guard/) next;
+            # The tick-delivery script carries the tick TEXT as its argv, and that text
+            # contains the word "benchmarking" -- so it matched `bench` and the guard
+            # reported the very thing that had just told it to measure. Excluded by name.
+            # (No apostrophes in this block: it lives inside a single-quoted awk program.)
+            if (args ~ /franken_feed[.]sh/) next;
             if (comm ~ excl) next;
             # REMOTE WORK DOES NOT CONTEND HERE. On this host `cargo` on PATH is an rch
             # offload shim, so a plain `cargo test`/`cargo bench` — and anything spawned
