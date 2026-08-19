@@ -32460,10 +32460,17 @@ mod bidiag {
 /// several plainly serial loops, so fewer columns per panel moves more work into the two
 /// trailing accumulate-GEMMs.
 ///
-/// KNOWN LIMIT, stated because this constant has now been wrong twice for exactly this reason:
-/// the sweep covers n = 128 to 256. `N = 512` is UNTESTED at nb=8 — the grid above adds 384 and
-/// 512 so the next measured window closes it. If 8 loses there, this wants a size-dependent
-/// rule and not a different single number.
+/// THE LIMIT IS NOW CLOSED (item 243). The grid was extended to 384 and 512 and measured:
+///
+///     n=256   nb=8  1.02  0.97  0.95 x      n=384   nb=8  1.20  1.04  1.24 x
+///     n=512   nb=8  1.02  1.00  1.00 x
+///
+/// `nb=8` is a clear win at n=128-160 and 384 and **parity** at 256 and 512 — never a meaningful
+/// loss anywhere measured (worst cell 0.95x). So a single constant is right and no size-dependent
+/// rule is needed. That same run CORRECTED item 241's own n=256 figure: it had reported
+/// 1.05-1.21x from a window whose absolute times scattered 10.8/33.8/14.6/14.8 ms, and the
+/// quieter re-measurement reads 0.95-1.02 ms-for-ms. The cell was noise; the decision stood
+/// anyway on 15 of 16 cells and the monotone trend.
 ///
 /// Changing this moves result bits by reassociation, admissible only under the ratified
 /// eig/SVD tolerance policy (`frankentorch-qgce4`);
