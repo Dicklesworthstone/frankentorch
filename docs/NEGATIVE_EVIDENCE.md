@@ -37174,19 +37174,35 @@ row it owed was a live vs-incumbent arm. Here it is, and it says we are **behind
 
 ### 231a. THE ROW
 
-`crates/ft-api/examples/svd_square_threshold_h2h.rs`, local build, ELF `7700295329a4f612`.
+`crates/ft-api/examples/svd_square_threshold_h2h.rs`, local build.
 SVD FORWARD ONLY (full U, S, Vʰ). `RAYON_NUM_THREADS=8`, `torch.set_num_threads(8)` — matched.
 Incumbent PyTorch 2.12.1+cpu, self-reported in the SAME invocation. Host thinkstation1,
 5975WX, governor powersave. Estimator: min of 5 per block, blocks ABBA-balanced
 (FT, PT, PT, FT), min over each arm's two blocks. iowait 0, D-state 0 at launch.
 
-    run   n=128                    n=136                    loadavg     MHz (FT/PT)
-    1     FT 2.052  PT 1.312       FT 2.377  PT 1.446       17.7-18.1   3254-3414 / 3264-3434
-    2     FT 2.479  PT 1.256       FT 2.446  PT 1.519       17.3-17.5   3142-3431 / 2771-3290
-    3     FT 2.141  PT 1.341       FT 2.434  PT 1.448       17.2-17.4   3296-3335 / 3274-3414
+**SIX invocations across TWO binaries.** The second ELF exists only because `rustfmt`
+reformatted the source after the first three runs; rather than bank a number whose ELF no
+longer matched the committed code, the lane was rebuilt and re-run. The two binaries differ by
+whitespace alone, and they agree — which is a small free replication rather than a finding.
 
-    n=128   FT 1.56x, 1.97x, 1.60x SLOWER
-    n=136   FT 1.64x, 1.61x, 1.68x SLOWER      <- 1.04x spread across three invocations
+    ELF                n=128  FT / PT (ms)      n=136  FT / PT (ms)     loadavg
+    7700295329a4f612   2.052 / 1.312           2.377 / 1.446           17.7-18.1
+    7700295329a4f612   2.479 / 1.256           2.446 / 1.519           17.3-17.5
+    7700295329a4f612   2.141 / 1.341           2.434 / 1.448           17.2-17.4
+    84205f28c9e60be1   2.029 / 1.243           2.746 / 1.524           17.7-18.1
+    84205f28c9e60be1   2.429 / 1.369           2.784 / 1.366           17.7-18.1
+    84205f28c9e60be1   2.238 / 1.312           2.446 / 1.494           17.4-17.7
+
+    n=128   1.56x  1.97x  1.60x  1.63x  1.77x  1.71x  SLOWER   median ~1.67x
+    n=136   1.64x  1.61x  1.68x  1.80x  2.04x  1.64x  SLOWER   median ~1.66x
+
+**Every one of the twelve rows is a LOSS**, and no invocation of either binary put us ahead at
+either size.
+
+CPU MHz was recorded per arm per block and the cross-core spread on this host is live in the
+numbers — individual blocks sampled anywhere from 1429 to 4291 MHz. That spread is why the
+per-invocation ratios scatter by ~25% while their median is stable across six invocations, and
+it is the reason the standing is quoted as a range rather than a point.
 
 **Parity MATCH in all six rows** — the singular-value sums agree to rel 1.28e-16 (n=128) and
 2.40e-16 (n=136). U and Vʰ are deliberately NOT compared: they are determined only up to
@@ -37200,8 +37216,8 @@ two sizes. n=128 is noisier (1.56-1.97x) and its spread is ours, not the host's 
 
 **The threshold fix is not visible in this row, and the arithmetic says it should not be.**
 Item 229 priced the blocked expansion at 462-586 µs against 697-781 µs unblocked at n=136 — a
-saving of ~0.15-0.25 ms. This lane's whole forward is ~2.4 ms, so the fix is worth ~6-8% of it,
-which is under the 4% inter-run spread at n=136 and well under the 26% spread at n=128.
+saving of ~0.15-0.25 ms. This lane's whole forward is ~2.4-2.8 ms, so the fix is worth ~6-9% of
+it, which is well under the ~25% inter-invocation spread at either size.
 
 So: **item 229's 1.33-1.51x is a real number about a component that is roughly a fifth of the
 forward, and anyone quoting it as an SVD speedup would be overstating it by about 5x.** The
@@ -37211,12 +37227,12 @@ an op win is exactly what item 229 caught item 65 doing at a larger scale.
 
 ### 231c. THE INCUMBENT'S ARM IS STEADIER THAN OURS, AGAIN
 
-    block spread (max/min of an arm's two blocks)
-    n=128   FT 1.069x  1.147x  1.212x        PT 1.016x  1.155x  1.002x
-    n=136   FT 1.162x  1.031x  1.169x        PT 1.003x  1.011x  1.009x
+    block spread (max/min of an arm's two blocks), all six invocations
+    n=128   FT 1.069 1.147 1.212 1.135 1.139 1.057   PT 1.016 1.155 1.002 1.060 1.092 1.267
+    n=136   FT 1.162 1.031 1.169 1.116 1.026 1.316   PT 1.003 1.011 1.009 1.050 1.085 1.108
 
-At n=136 PyTorch's two blocks agree to **0.3-1.1%** across every invocation while ours differ by
-up to **17%**. That is the same signature item 229 found in the `form_p` expansion — our path's
+At n=136 PyTorch's blocks agree to within **11%** and usually **1%**, while ours differ by up to
+**32%**; our worst block spread exceeds the incumbent's in nine of the twelve cells. That is the same signature item 229 found in the `form_p` expansion — our path's
 cost moves with the host in a way the incumbent's does not — and it is now visible at the whole-op
 level, on a lane where the thrashing gate has already been routed around. **So routing around the
 gate for `n >= 130` did not remove the variance from the SVD forward; something else in this path
