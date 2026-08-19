@@ -1321,6 +1321,9 @@ LANES = {
     "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     # item 209: the summed route, long enough on BOTH arms to null.
     "conv2d_xl":         (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
+    # item 212: same incumbent code under a second name -- PT(legacy)/PT(xl) is a free ~1.0
+    # control. The FrankenTorch side of this name runs the pre-item-174 scatter.
+    "conv2d_xl_legacy":  (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     "conv2d_big_masked": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
     # item 190: byte-identical twin of conv2d_masked, so the warm/cold A/B is one invocation.
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
@@ -1914,6 +1917,24 @@ LANES = {
             // property that separates certifying lanes from non-certifying ones on this board.
             "conv2d_xl",
             Box::new(|| timed_conv2d(&c2xlx, &c2w, None, C2XL_N, false)),
+        ),
+        (
+            // item 212: the SAME lane with items 174/177's scatter collapse toggled OFF, so the
+            // pair differs in exactly one thing and both halves sample the same host minute.
+            // Item 25's rule is why this is a toggle and not a second binary: a cross-invocation
+            // comparison cannot attribute a few percent to any one change.
+            //
+            // The two paths are BIT-IDENTICAL (`conv2d_ones_scatter_toggle_selects_a_bit_identical
+            // _path`), so this pair can move time and cannot move a number — and PyTorch runs the
+            // SAME code under both names, making PT(legacy)/PT(xl) a free control that must come
+            // out ~1.0. If it does not, the host moved and neither half is readable.
+            "conv2d_xl_legacy",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_ones_scatter_legacy(true);
+                let sample = timed_conv2d(&c2xlx, &c2w, None, C2XL_N, false);
+                ft_kernel_cpu::set_conv2d_ones_scatter_legacy(previous);
+                sample
+            }),
         ),
         (
             // item 190: the SAME lane as conv2d_masked, registered under a second name so one

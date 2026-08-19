@@ -2792,6 +2792,36 @@ fn pool_output_zeroed() -> bool {
     POOL_OUTPUT_ZEROED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Selects the PRE-item-174 accumulate-scatter in the f64 all-ones conv2d adjoint.
+///
+/// `frankentorch-hi9r6`, item 212. Items 174 and 177 replaced a per-position accumulate-scatter
+/// with a tap-mask table built once per channel and broadcast, and four turns of measurement have
+/// not been able to say what that is worth: the lane reaching it certified 1 of 4, and a new lane
+/// sized to null has no BEFORE value to difference against.
+///
+/// A two-ELF A/B would answer it and answer it badly. Item 25's rule, and the reason
+/// `set_pool_output_zeroed` and `set_gemm_tile_col_floor_adaptive` exist: a cross-binary or
+/// cross-invocation comparison cannot attribute a few percent to any one change, because the two
+/// halves never sample the same host minute. An in-process toggle lets both arms run inside ONE
+/// invocation, interleaved, against ONE incumbent.
+///
+/// The two paths are BIT-IDENTICAL — that is not an aspiration, it is what
+/// `conv2d_ones_dout_scatter_matches_the_accumulate_scatter_bitwise` asserts of both states — so
+/// the toggle can move time and cannot move a number.
+static CONV2D_ONES_SCATTER_LEGACY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is the pre-item-174 accumulate-scatter selected?
+#[must_use]
+pub fn conv2d_ones_scatter_legacy() -> bool {
+    CONV2D_ONES_SCATTER_LEGACY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Select the legacy scatter, returning the previous setting so a paired lane can restore it.
+pub fn set_conv2d_ones_scatter_legacy(legacy: bool) -> bool {
+    CONV2D_ONES_SCATTER_LEGACY.swap(legacy, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Select the pre-lever zeroed-allocation path; returns the previous setting so a
 /// harness can restore it. Measurement-only — production never calls this and the
 /// default is the uninit path.
@@ -10131,6 +10161,32 @@ fn conv2d_ones_dout_scatter_dpadded_f64(
     let plane_len = ph * pw;
     if plane_len == 0 || in_ch == 0 || batch == 0 {
         return Vec::new();
+    }
+    if conv2d_ones_scatter_legacy() {
+        // The pass items 174 and 177 replaced, kept verbatim so the pair differs in ONE thing.
+        // Zero-filled and accumulated into, which is exactly what made the collapse possible and
+        // is why this branch cannot share the uninitialised buffer below.
+        let patch_count = oh * ow;
+        let mut dpadded = vec![0.0f64; batch * in_ch * plane_len];
+        dpadded
+            .par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, dp)| {
+                let c = plane % in_ch;
+                let pch = c * KH * KW;
+                for pc in 0..patch_count {
+                    let base_h = pc / ow;
+                    let base_w = pc % ow;
+                    for kr in 0..KH {
+                        let irow = (base_h + kr) * pw + base_w;
+                        let prow_off = pch + kr * KW;
+                        for kc in 0..KW {
+                            dp[irow + kc] += dpanel_row[prow_off + kc];
+                        }
+                    }
+                }
+            });
+        return dpadded;
     }
     // Depend only on the geometry, so every channel and every plane shares them.
     let rmasks: Vec<usize> = (0..ph)
@@ -66560,5 +66616,71 @@ mod tests {
             1,
             "the dweight sentinel never fires, so the zeros above prove nothing"
         );
+    }
+
+    /// The item 212 toggle must select between two BIT-IDENTICAL paths. That is the whole contract:
+    /// a paired lane built on it measures time and cannot measure a difference in the answer.
+    ///
+    /// It also makes the toggle safe to race. It is a process-global `AtomicBool` and cargo runs
+    /// tests in parallel threads, so another test calling the scatter while this one has flipped it
+    /// WILL take the other path — and cannot notice, because the bytes are the same. If that ever
+    /// stops being true this test fails first, which is the right order.
+    #[test]
+    fn conv2d_ones_scatter_toggle_selects_a_bit_identical_path() {
+        for &(batch, in_ch, ph, pw, oh, ow) in &[
+            (2usize, 3usize, 8usize, 8usize, 6usize, 6usize),
+            (1, 2, 5, 7, 3, 5),
+            (2, 2, 9, 9, 4, 4),
+            (1, 1, 3, 3, 1, 1),
+            (2, 2, 34, 34, 32, 32),
+        ] {
+            // Signed zeros included: the accumulate path starts from 0.0 and adds, the table path
+            // reproduces that order, and a divergence would show up here first.
+            let dpanel_row: Vec<f64> = (0..in_ch * 9)
+                .map(|i| {
+                    if i % 7 == 0 {
+                        -0.0
+                    } else {
+                        ((i % 17) as f64) * 0.125 - 1.0
+                    }
+                })
+                .collect();
+
+            let previous = super::set_conv2d_ones_scatter_legacy(false);
+            let modern = super::conv2d_ones_dout_scatter_dpadded_f64(
+                &dpanel_row,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                oh,
+                ow,
+            );
+            super::set_conv2d_ones_scatter_legacy(true);
+            let legacy = super::conv2d_ones_dout_scatter_dpadded_f64(
+                &dpanel_row,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                oh,
+                ow,
+            );
+            super::set_conv2d_ones_scatter_legacy(previous);
+
+            assert_eq!(modern.len(), legacy.len(), "length at {ph}x{pw}");
+            for (i, (m, l)) in modern.iter().zip(&legacy).enumerate() {
+                assert_eq!(
+                    m.to_bits(),
+                    l.to_bits(),
+                    "element {i} differs between the toggle's two paths at batch={batch} \
+                     in_ch={in_ch} {ph}x{pw} oh={oh} ow={ow}: modern {m} legacy {l}"
+                );
+            }
+            assert!(
+                !super::conv2d_ones_scatter_legacy(),
+                "the toggle must be restored to its previous state"
+            );
+        }
     }
 }
