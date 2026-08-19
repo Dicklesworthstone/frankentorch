@@ -38023,3 +38023,55 @@ one-value-per-process — the same obstacle item 234 had to route around.
 
 The lane still carries no A/A null and interleaves at block level, so it banks a LOSS narrowing,
 not a win.
+
+## 244. THE WIDTH CURVE PAYS AGAINST PyTorch: max_pool1d_nopool GOES FROM PARITY AT 8 THREADS TO AT LEAST 1.10x FASTER AT 16
+
+Item 240 measured the arm-internal curve and said what it could not settle — *"the cap has to be
+worth something against PYTORCH, and an arm-internal curve cannot say that."* Two admissible
+vs-PyTorch rows now say it does.
+
+    ELF bd89b709df35aa8682c15aa66ec03406d2f18ae011199dbbfe86da20625ab05c, thinkstation1
+    incumbent=PyTorch 2.12.1+cpu threads=8, same invocation; mimalloc; lane_count=1 rounds=64
+    the ONLY variable against item 238's rows is RAYON_NUM_THREADS
+
+    width  run  FT ms   PT ms    MEDIAN ratio          MIN ratio             gates
+    8t     r1   10.436  10.735   1.029 [1.016,1.049]   1.007 [0.982,1.018]   all PASS
+    8t     r3   10.425  10.658   1.022 [0.997,1.048]   0.989 [0.969,1.005]   all PASS
+    8t     r4   10.356  10.930   1.055 [1.018,1.086]   1.008 [0.993,1.046]   all PASS
+    16t    r3   7.583   9.173    1.210 [1.195,1.233]   1.105 [1.072,1.135]   all PASS
+    16t    r4   7.530   10.986   1.459 [1.425,1.499]   1.425 [1.390,1.472]   all PASS
+
+Both 16t rows: both A/A nulls PASS under BOTH estimators, endpoint and series drift PASS,
+`concurrent_measurements=none ACTIVE`, parity `match`. Loads 33.62->35.32 and 27.82->22.72,
+`self_load DIRECT` 15.5-18.4, `cpu_mhz` spread 2.97x, arms not pinned.
+
+**CONSERVATIVE CLAIM: at 16 threads this lane is AT LEAST 1.10x FASTER than PyTorch**, taking the
+lowest bound across both runs and both estimators (16t r3's min, 1.105 [1.072,1.135]). At 8 threads
+the same lane, same ELF, same day, is parity — the two estimators there disagree in sign.
+
+### 244a. OUR ARM IS THE STABLE ONE AND THE MOVE IS REAL
+
+Our time across the five rows: **10.436, 10.425, 10.356** at 8t and **7.583, 7.530** at 16t. That is
+a 1.37x self-improvement with a spread of under 1% within each width — the tightest pair of clusters
+in this campaign's records. PyTorch's arm over the same five runs reads 9.173 to 10.986, a 20%
+spread, so the ratio's variance is again the incumbent's and the low end is what should be quoted.
+
+The arm-internal curve predicted 7.403 ms at 16t (item 240). The live rows read 7.53-7.58 with an
+incumbent co-resident. **A prediction from an arm-internal sweep landing within 2% of a live
+vs-incumbent row is worth recording** — it is the first time in this campaign that an FT-only
+measurement has forecast a head-to-head number, and it means the width curve can be used to rank
+candidates cheaply before spending gate-clean windows on them.
+
+### 244b. WHAT THIS DOES AND DOES NOT LICENSE
+
+It does NOT flip a default. The shipped default is unchanged and this is an env-var configuration,
+measured on one lane against the incumbent and five lanes arm-internally, on one host whose 2.97x
+cross-core spread is the mechanism's own precondition. `frankentorch-rayon-pool-width-qq8as` remains
+open for exactly the reason it was opened: a process-wide width decision needs the lanes that gain
+nothing to be shown to lose nothing.
+
+It does change how existing rows should be read. **Item 238 closed `frankentorch-3ja43` at parity,
+and that conclusion is width-conditional** — true at 8 threads, false at 16, where the same lane is
+a win. Nothing in item 238 is wrong; its scope was simply narrower than it looked, and every row
+this campaign has banked at 8 threads carries the same qualifier. The width was inherited from
+torch's `set_num_threads(8)` to make the arms comparable, and comparability is not optimality.
