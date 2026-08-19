@@ -2,6 +2,15 @@
 
 All notable changes to [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) are documented in this file.
 
+Scope window: project inception on 2026-02-13 through HEAD on 2026-08-19.
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| Unreleased | commits on `main` | 2026-03-15 → 2026-08-19 | Measurement integrity, Metal kernels, `ft-api` expansion, janitor docs-reorg |
+| [`ft2-snapshot`](https://github.com/Dicklesworthstone/frankentorch/tree/ft2-snapshot) | Tag (not a GitHub Release) | 2026-06-27 | Snapshot tag only |
+
 FrankenTorch is a clean-room Rust reimplementation of PyTorch targeting complete drop-in replacement with semantic fidelity, mathematical rigor, operational safety, and profile-proven performance. The workspace enforces `unsafe_code = "forbid"` globally. There are no formal releases or tags yet; this changelog tracks development by capability milestones derived from the commit history.
 
 Repository: <https://github.com/Dicklesworthstone/frankentorch>
@@ -23,6 +32,10 @@ Latest commit: [`cb836c76cc`](https://github.com/Dicklesworthstone/frankentorch/
 (2026-08-19). Do not dump the 5,453-commit window as a diff list; the
 waves below are capability clusters. Historical crate-line counts in
 "Crate Inventory" are the 2026-03-14 snapshot.
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankentorch/blob/main/.beads/issues.jsonl).
 
 ### 2026-08-19 — Repo-janitor docs-reorg
 
