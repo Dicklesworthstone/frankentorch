@@ -35560,3 +35560,84 @@ NOT VERIFIED: compilation. `reps` was checked by reading (`fn reps() -> usize` a
 `main` at 1116, no function boundary between there and the reporting loop), and
 `BALANCED_NULL_MAX_DEVIATION` is the `f64` the same line already formats — but item 186's lesson
 stands: `rustfmt` proves only that it parses.
+
+## 207. ITEM 205's DIAGNOSIS WAS WRONG, THE HARNESS ALREADY KNEW WHY, AND THE FIX GIVES 1 CERTIFIED ROW IN 3 — WHICH IS NOT A STANDING
+
+`frankentorch-hi9r6`. MEASURED, four further invocations, all reported. No cargo ran (disk 37-39G,
+below the brake); no run wrote a file.
+
+### 207a. WITHDRAWING ITEM 205c
+
+Item 205c said `conv2d_big`'s A/A nulls fail because "the unstable arm is OURS", citing an FT arm
+swing of 1.41x against the incumbent's 1.04x. **That inference does not hold.**
+
+The 1.41x is carried almost entirely by run 1, which item 205 itself identified as the post-idle
+outlier with boosted cores. Across the two back-to-back runs:
+
+    FT arm swing, runs 2-3 only     conv2d_big 1.027x     conv2d_big_masked 1.013x
+
+Our arm is as stable as the lane that certifies 3/3. More importantly the inference was invalid in
+KIND, not just in magnitude: **an A/A null is a WITHIN-run comparison of slot positions, and I
+argued about it from an ACROSS-run swing.** Those are different quantities, and no amount of the
+second explains the first.
+
+### 207b. THE HARNESS HAD THE ANSWER WRITTEN DOWN
+
+Line ~2178 of the sweep, which I had not read before diagnosing:
+
+> `FT_H2H_WARMUP` runs ONCE per lane before any round begins and the other lanes run in between, so
+> a lane's first sample each round arrives cold. The null is first-half/second-half and slot 0 sits
+> in the first half, so it fails while the 4-sample-median ratio barely moves.
+
+That is a within-round slot asymmetry — exactly what an A/A null is built to catch — and item 147
+measured it at +20-30% specifically on the SUMMED conv2d lanes. It predicts precisely the pattern
+observed: `conv2d_big` (summed) fails its null, `conv2d_big_masked` (generic) does not.
+
+**The mechanism was documented in the file I was measuring with.** Reading it first would have
+saved a wrong diagnosis and a ledger item.
+
+### 207c. THE FIX, TESTED PROPERLY
+
+Item 190 gave the round warm-up PER-LANE names with EXACT matching, so one sweep can warm one lane
+and leave another at the board's default. That allows the clean form of the experiment: warm
+`conv2d_big` only, leaving `conv2d_big_masked` unwarmed in the same run as a control whose three
+banked values are known.
+
+    conv2d_big, round_warmup=1     ratio    FT ms    PT ms   nulls
+      invocation A                 1.187    8.783   10.424   PT PASS / FT PASS   <- certifies
+      invocation B                 1.135    8.909   10.114   PT PASS / FT OFFSET
+      invocation C                 1.421    8.633   12.266   PT WIDE / FT OFFSET
+
+    control, unwarmed, same runs   conv2d_big_masked ratio 0.397 — matches its banked 0.393-0.413
+
+The warm-up did what the mechanism predicts: the FT null moved from OFFSET to PASS in A, and the
+lane produced its first certified row ever — **FT 1.19x FASTER, ratio 1.187 [1.155,1.230], both
+nulls PASS, parity match**.
+
+### 207d. AND IT IS NOT BANKED
+
+One of three is not a standing. `feedback_aa_null_is_the_noisy_part` budgets six invocations per
+banked row for exactly this reason, and the spread says why:
+
+    conv2d_big  (warmed)   FT arm 1.032x   PT arm 1.213x   ratio 1.252x   certified 1/3
+    conv2d_big_masked      FT arm 1.028x   PT arm 1.070x   ratio 1.051x   certified 3/3
+
+With our arm steady at 1.032x, the noise is now the INCUMBENT's, and invocation C's PT null came
+back WIDE at [0.247, 7.070] — undecidable, not merely offset. A lane whose incumbent arm is 10-12 ms
+is at the edge in both directions: item 203 measured that 11 ms is where PT *starts* to null.
+
+So: **no standing is claimed for `conv2d_big`, and 1.19x FASTER is not quoted as one.** What is
+established is the mechanism and that the lane is reachable — one clean row exists, and three more
+clean ones would bank it.
+
+Nor could that row be attributed to items 174/176/177 even if it were banked: the lane has never
+had a certified BEFORE value, so there is nothing to difference against. Attribution needs a
+two-ELF A/B, which needs a build.
+
+### 207e. WHAT WOULD ACTUALLY FIX IT
+
+Both arms longer. `conv2d_big_masked` certifies 3/3 with a 28 ms FT arm and an 11 ms PT arm; the
+summed lane has 8.8 and 10.4. A summed lane at batch 48-64 would put both arms in the range that
+demonstrably nulls. That is a new lane, it needs a compiler, and item 203 is a fresh reminder of
+what happens when a lane is sized against a threshold nobody measured — so it waits for the build,
+with three data points now in hand rather than folklore.
