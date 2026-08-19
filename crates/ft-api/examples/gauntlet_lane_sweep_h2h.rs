@@ -975,6 +975,66 @@ fn timed_conv2d(
 /// `weight_grad` mirrors `timed_conv2d`'s parameter for the same reason item 182 added it: a
 /// frozen weight and a training weight exercise different halves, and item 187 gave f32 the
 /// `needs_input_grad` skip whose whole effect is on the frozen one.
+/// conv2d f32 with NO session and NO tape — the kernels-only twin of `conv2d_f32`.
+///
+/// `frankentorch-qif1n`. Two certified rows say our f32 conv2d is **1.28x SLOWER per sample than
+/// our own f64** (`conv2d_f32` 3.07x slower than torch; `conv2d_xl`, f64, 1.72x FASTER). A probe on
+/// the raw kernels says the opposite: `conv2d_forward_f32` and `conv2d_backward_f32` each beat
+/// their f64 twins by 1.53-1.55x, stable across a 2.5x batch change. Both cannot be true of the
+/// same code path, so roughly 2x of f32-specific cost sits OUTSIDE those two kernels — and this
+/// lane is the subtraction that prices it.
+///
+/// Follows the `group_norm_f32_kernels` precedent exactly: same shape, same dtype, same incumbent
+/// op under a second name, but our arm calls `ft_kernel_cpu` directly. `conv2d_f32` minus this lane
+/// IS the session and tape cost, measured inside one invocation against one live incumbent, with
+/// PT(kernels)/PT(f32) as a free ~1.0 control.
+///
+/// WHAT IS DELIBERATELY INSIDE THE TIMER: the pad, and the crop of `dpadded` back to the input
+/// extent. The session pays both inside its own timed region, so charging them here keeps the
+/// subtraction honest — leaving them out would move cost into the very residue being measured.
+///
+/// The all-ones `dout` mirrors the summed loss the paired lane uses. `conv2d_backward_f32` picks
+/// its route from `conv2d_ones_dout_route`, so passing ones takes the same route the session's
+/// backward takes rather than a different one.
+fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f64, f64) {
+    let ph = C2_H + 2;
+    let pw = C2_W + 2;
+    let started = Instant::now();
+    // Pad [batch, CI, H, W] -> [batch, CI, H+2, W+2] with a one-pixel zero border.
+    let mut padded = vec![0.0f32; batch * C2_CI * ph * pw];
+    for bc in 0..batch * C2_CI {
+        let src = bc * C2_H * C2_W;
+        let dst = bc * ph * pw;
+        for row in 0..C2_H {
+            let from = src + row * C2_W;
+            let to = dst + (row + 1) * pw + 1;
+            padded[to..to + C2_W].copy_from_slice(&values[from..from + C2_W]);
+        }
+    }
+    let _out = ft_kernel_cpu::conv2d_forward_f32(
+        &padded, weights, None, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO,
+    );
+    let dout = vec![1.0f32; batch * C2_CO * C2_H * C2_W];
+    let (dpadded, _dweight, _dbias) = ft_kernel_cpu::conv2d_backward_f32(
+        &dout, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO, false,
+    );
+    // Crop back to the input extent, which is what the session hands back as the leaf gradient.
+    // f64 accumulator per the `timed_group_norm_f32` precedent: summing this many f32 magnitudes in
+    // f32 carries enough error to swamp the agreement being checked.
+    let mut checksum = 0.0f64;
+    for bc in 0..batch * C2_CI {
+        let dst = bc * ph * pw;
+        for row in 0..C2_H {
+            let to = dst + (row + 1) * pw + 1;
+            for value in &dpadded[to..to + C2_W] {
+                checksum += f64::from(value.abs());
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    (elapsed, checksum)
+}
+
 fn timed_conv2d_f32(
     values: &[f32],
     weights: &[f32],
@@ -1435,6 +1495,10 @@ LANES = {
     # item 191: f32 conv2d, both loss routes. The summed one is the only lane that reaches the
     # f32 all-ones adjoints; the masked one is its control on the generic route.
     "conv2d_f32":        (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
+    # frankentorch-qif1n: the same torch op again for the kernels-only pair. Our arm calls
+    # ft_kernel_cpu directly with no session or tape, so conv2d_f32 minus conv2d_f32_kernels is the
+    # session cost. PT(kernels)/PT(f32) is a free control that must land near 1.0.
+    "conv2d_f32_kernels": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
     "conv2d_f32_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
@@ -2175,6 +2239,10 @@ LANES = {
             // none of which any board row has ever priced, because f32 conv2d had no lane.
             "conv2d_f32",
             Box::new(|| timed_conv2d_f32(&c2x32, &c2w32, None, C2F32_N, false)),
+        ),
+        (
+            "conv2d_f32_kernels",
+            Box::new(|| timed_conv2d_f32_kernels(&c2x32, &c2w32, C2F32_N)),
         ),
         (
             // The f32 GENERIC route, and the control for the row above: it shares every code path
