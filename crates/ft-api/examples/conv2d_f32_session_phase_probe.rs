@@ -1,0 +1,196 @@
+//! Where do the 47 ms of session cost go? — `frankentorch-qif1n`.
+//!
+//! # What is already known
+//!
+//! A kernels-only twin priced the surround exactly. Both lanes in one h2h invocation, all gates
+//! PASS, parity match, `PT(kernels)/PT(session) = 1.012`:
+//!
+//! ```text
+//! conv2d_f32          FT 77.487 ms   PT 25.570 ms   3.03x SLOWER
+//! conv2d_f32_kernels  FT 30.428 ms   PT 25.874 ms   1.18x SLOWER
+//! session overhead  = 47.06 ms = 60.7% of the lane, 1.55x the kernel time itself
+//! ```
+//!
+//! So our f32 conv2d KERNELS are 1.18x behind PyTorch's whole op, and the session and tape layer
+//! adds more than the kernels cost. This probe splits that 47 ms.
+//!
+//! # What it measures
+//!
+//! The h2h lane times `forward + loss_sum + backward` as ONE region, which is the right contract
+//! against an incumbent but useless for attribution. Here the same three calls are timed separately,
+//! plus the two the lane keeps outside its timer (leaf construction, gradient read-back) so nothing
+//! is hidden by the choice of region.
+//!
+//! Both dtypes run the same decomposition at the same batch: the f64 side is the control, because
+//! the standing being explained is "our f32 is 1.28x SLOWER per sample than our own f64" and a phase
+//! that is slow in BOTH dtypes cannot be what makes f32 the worse of the two.
+//!
+//! # Honesty about what this is
+//!
+//! Arm-internal. There is no incumbent and no ratio against PyTorch — this answers "which phase" and
+//! nothing about "are we fast". A fresh session per repetition, because the tape is per-session and
+//! reusing one would let node accumulation leak across measurements (`project_gmuml_tape_retention`
+//! records a session tape that never frees, degrading later ops).
+//!
+//! MIN over repetitions, per this campaign's estimator convention on a shared host, with one untimed
+//! warm-up repetition first (NEGATIVE_EVIDENCE item 247: a first pass can run up to 8x slow).
+
+use std::time::Instant;
+
+use ft_api::FrankenTorchSession;
+use ft_core::ExecutionMode;
+
+const CI: usize = 32;
+const CO: usize = 32;
+const H: usize = 32;
+const W: usize = 32;
+const K: usize = 3;
+
+#[derive(Default, Clone, Copy)]
+struct Phases {
+    leaf: f64,
+    forward: f64,
+    sum: f64,
+    backward: f64,
+    grad_read: f64,
+}
+
+fn main() {
+    let batch: usize = std::env::var("PROBE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(160);
+    let reps: usize = std::env::var("PROBE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+
+    let x64: Vec<f64> = (0..batch * CI * H * W)
+        .map(|i| ((i % 97) as f64) * 0.01 - 0.5)
+        .collect();
+    let w64: Vec<f64> = (0..CO * CI * K * K)
+        .map(|i| ((i % 89) as f64) * 0.01 - 0.4)
+        .collect();
+    let x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
+    let w32: Vec<f32> = w64.iter().map(|&v| v as f32).collect();
+
+    println!(
+        "conv2d SESSION phase split, f32 vs f64 (frankentorch-qif1n)\n  \
+         batch={batch} CI={CI} CO={CO} H={H} W={W} K={K}  rayon_threads={}  reps={reps}\n  \
+         arm-internal: no incumbent, no ratio against PyTorch. MIN over reps, fresh session each.",
+        rayon::current_num_threads()
+    );
+
+    let _ = run_f32(batch, &x32, &w32);
+    let _ = run_f64(batch, &x64, &w64);
+
+    let mut p32: Vec<Phases> = Vec::with_capacity(reps);
+    let mut p64: Vec<Phases> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        p32.push(run_f32(batch, &x32, &w32));
+        p64.push(run_f64(batch, &x64, &w64));
+        p64.push(run_f64(batch, &x64, &w64));
+        p32.push(run_f32(batch, &x32, &w32));
+    }
+
+    let min_of = |v: &[Phases], pick: fn(&Phases) -> f64| -> f64 {
+        v.iter().map(pick).fold(f64::INFINITY, f64::min)
+    };
+    let rows: [(&str, fn(&Phases) -> f64); 5] = [
+        ("leaf build", |p| p.leaf),
+        ("forward", |p| p.forward),
+        ("loss sum", |p| p.sum),
+        ("backward", |p| p.backward),
+        ("grad read", |p| p.grad_read),
+    ];
+
+    println!(
+        "\n  {:<12}{:>12}{:>12}{:>12}",
+        "phase", "f32 ms", "f64 ms", "f64/f32"
+    );
+    let (mut timed32, mut timed64) = (0.0, 0.0);
+    for (label, pick) in rows {
+        let a = min_of(&p32, pick);
+        let b = min_of(&p64, pick);
+        println!("  {label:<12}{a:>12.3}{b:>12.3}{:>12.2}", b / a);
+        // The h2h lane's timed region is forward + loss sum + backward, and only those.
+        if matches!(label, "forward" | "loss sum" | "backward") {
+            timed32 += a;
+            timed64 += b;
+        }
+    }
+    println!(
+        "  {:<12}{timed32:>12.3}{timed64:>12.3}{:>12.2}   <- the h2h lane's timed region",
+        "LANE TOTAL",
+        timed64 / timed32
+    );
+    println!(
+        "\n  Read the f64/f32 column: a phase below 1.0 is one where f32 is SLOWER than f64, which \
+         is the direction that has to be explained. A phase near or above 1.5 is behaving as f32 \
+         should (the raw kernels measure 1.53-1.55x)."
+    );
+}
+
+fn run_f32(batch: usize, values: &[f32], weights: &[f32]) -> Phases {
+    let mut p = Phases::default();
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let t = Instant::now();
+    let x = session
+        .tensor_variable_f32(values.to_vec(), vec![batch, CI, H, W], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable_f32(weights.to_vec(), vec![CO, CI, K, K], false)
+        .expect("weight");
+    p.leaf = ms(t);
+    let t = Instant::now();
+    let out = session
+        .functional_conv2d(x, w, None, (1, 1), (1, 1))
+        .expect("conv2d");
+    p.forward = ms(t);
+    let t = Instant::now();
+    let loss = session.tensor_sum(out).expect("sum");
+    p.sum = ms(t);
+    let t = Instant::now();
+    let report = session.tensor_backward(loss).expect("backward");
+    p.backward = ms(t);
+    let t = Instant::now();
+    let g = report.gradient(x).expect("grad");
+    let checksum: f64 = g.iter().map(|v| v.abs()).sum();
+    p.grad_read = ms(t);
+    std::hint::black_box(checksum);
+    p
+}
+
+fn run_f64(batch: usize, values: &[f64], weights: &[f64]) -> Phases {
+    let mut p = Phases::default();
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let t = Instant::now();
+    let x = session
+        .tensor_variable(values.to_vec(), vec![batch, CI, H, W], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable(weights.to_vec(), vec![CO, CI, K, K], false)
+        .expect("weight");
+    p.leaf = ms(t);
+    let t = Instant::now();
+    let out = session
+        .functional_conv2d(x, w, None, (1, 1), (1, 1))
+        .expect("conv2d");
+    p.forward = ms(t);
+    let t = Instant::now();
+    let loss = session.tensor_sum(out).expect("sum");
+    p.sum = ms(t);
+    let t = Instant::now();
+    let report = session.tensor_backward(loss).expect("backward");
+    p.backward = ms(t);
+    let t = Instant::now();
+    let g = report.gradient(x).expect("grad");
+    let checksum: f64 = g.iter().map(|v| v.abs()).sum();
+    p.grad_read = ms(t);
+    std::hint::black_box(checksum);
+    p
+}
+
+fn ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1_000.0
+}
