@@ -83,7 +83,7 @@ Maintain deterministic gradient accumulation, alias/versioning rules, and backwa
 ## Key Documents
 
 - AGENTS.md
-- COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md
+- docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md
 
 ## Conformance + E2E Forensics
 
@@ -136,9 +136,9 @@ For agent-heavy or shared-host workflows, prefer offloading these commands with 
 
 ## Porting Artifact Set
 
-- PLAN_TO_PORT_PYTORCH_TO_RUST.md
+- docs/planning/PLAN_TO_PORT_PYTORCH_TO_RUST.md
 - EXISTING_PYTORCH_STRUCTURE.md
-- PROPOSED_ARCHITECTURE.md
+- docs/planning/PROPOSED_ARCHITECTURE.md
 - FEATURE_PARITY.md
 
 These four docs are now the canonical porting-to-rust workflow for this repo.

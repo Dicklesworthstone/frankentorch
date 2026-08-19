@@ -22,10 +22,10 @@ Legacy corpus:
 - Upstream oracle: `pytorch/pytorch`
 
 Project contracts:
-- `/data/projects/frankentorch/COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md` (sections 14-21)
+- `/data/projects/frankentorch/docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md` (sections 14-21)
 - `/data/projects/frankentorch/EXISTING_PYTORCH_STRUCTURE.md`
-- `/data/projects/frankentorch/PLAN_TO_PORT_PYTORCH_TO_RUST.md`
-- `/data/projects/frankentorch/PROPOSED_ARCHITECTURE.md`
+- `/data/projects/frankentorch/docs/planning/PLAN_TO_PORT_PYTORCH_TO_RUST.md`
+- `/data/projects/frankentorch/docs/planning/PROPOSED_ARCHITECTURE.md`
 - `/data/projects/frankentorch/FEATURE_PARITY.md`
 
 ## 2. Quantitative Legacy Inventory (Measured)
@@ -175,7 +175,7 @@ Definition of done for Phase-2:
 
 ## 11. Residual Gaps and Risks
 
-- `PROPOSED_ARCHITECTURE.md` crate map formatting contains literal `\n`; normalize before tooling automation.
+- `docs/planning/PROPOSED_ARCHITECTURE.md` crate map formatting contains literal `\n`; normalize before tooling automation.
 - native boundary breadth is very large; avoid false confidence from tiny fixture subsets.
 - autograd and device semantics are critical and must block release on unresolved drift.
 

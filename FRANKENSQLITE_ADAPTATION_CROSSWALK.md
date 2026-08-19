@@ -1,7 +1,7 @@
 # FrankenSQLite-to-FrankenTorch Adaptation Crosswalk
 
 Normative exemplar copied into this repository:
-- `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1_REFERENCE.md` (846,244 bytes)
+- `docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1_REFERENCE.md` (846,244 bytes)
 
 This document maps proven FrankenSQLite patterns onto FrankenTorch's deterministic autograd mission.
 
