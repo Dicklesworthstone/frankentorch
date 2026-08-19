@@ -32018,16 +32018,28 @@ mod bidiag {
             if m2 > 0 && n2 > 0 {
                 // U = A[i+nb.., i..i+nb] (strided) and V = A[i..i+nb, i+nb..]
                 // (strided) both need contiguous copies for the GEMM calls.
-                let mut u = vec![0.0f64; m2 * nb];
-                for r in 0..m2 {
-                    let src = (i + nb + r) * lda + i;
-                    u[r * nb..r * nb + nb].copy_from_slice(&a[src..src + nb]);
-                }
-                let mut v = vec![0.0f64; nb * n2];
-                for p in 0..nb {
-                    let src = (i + p) * lda + i + nb;
-                    v[p * n2..p * n2 + n2].copy_from_slice(&a[src..src + n2]);
-                }
+                //
+                // frankentorch-4zjaa item 247: built UNINITIALIZED, because the copy below
+                // covers every element and the zero-fill `vec![0.0; ..]` performs is therefore
+                // dead — `m2` rows of exactly `nb`, and `nb` rows of exactly `n2`, tile the
+                // whole buffer with no remainder. This is the pattern
+                // `project_expand_uninit_firsttouch` names: a zero-init followed by a full
+                // overwrite pays a write pass and, on fresh pages, the first-touch faults too.
+                // Bit-exactness is not at stake — no arithmetic changes — and
+                // `bidiag_blocked_output_is_bit_stable` pins it regardless.
+                let a_ro: &[f64] = a;
+                let u = crate::build_uninit(m2 * nb, |dst: &mut [f64]| {
+                    for (r, row) in dst.chunks_exact_mut(nb).enumerate() {
+                        let src = (i + nb + r) * lda + i;
+                        row.copy_from_slice(&a_ro[src..src + nb]);
+                    }
+                });
+                let v = crate::build_uninit(nb * n2, |dst: &mut [f64]| {
+                    for (p, row) in dst.chunks_exact_mut(n2).enumerate() {
+                        let src = (i + p) * lda + i + nb;
+                        row.copy_from_slice(&a_ro[src..src + n2]);
+                    }
+                });
 
                 let off22 = (i + nb) * lda + (i + nb);
                 // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
@@ -32052,11 +32064,15 @@ mod bidiag {
         if i < n {
             let m_sub = m - i;
             let n_sub = n - i;
-            let mut tail = vec![0.0f64; m_sub * n_sub];
-            for r in 0..m_sub {
-                let src = (i + r) * lda + i;
-                tail[r * n_sub..r * n_sub + n_sub].copy_from_slice(&a[src..src + n_sub]);
-            }
+            // Same full-overwrite argument as the GEMM operands above (item 247): `m_sub`
+            // rows of exactly `n_sub` tile the buffer with no remainder.
+            let a_ro: &[f64] = a;
+            let mut tail = crate::build_uninit(m_sub * n_sub, |dst: &mut [f64]| {
+                for (r, row) in dst.chunks_exact_mut(n_sub).enumerate() {
+                    let src = (i + r) * lda + i;
+                    row.copy_from_slice(&a_ro[src..src + n_sub]);
+                }
+            });
             let (td, te, ttauq, ttaup) = bidiag_unblocked_f64(&mut tail, m_sub, n_sub);
             for r in 0..m_sub {
                 let dst = (i + r) * lda + i;

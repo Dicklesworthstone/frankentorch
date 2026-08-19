@@ -38327,3 +38327,52 @@ lane (item 244).
 What it removes is the reason the bead was stuck: "the lanes that gain nothing might lose
 something" is now measured rather than feared, and the answer is 4 lanes at under 1.3% and one
 family at 8%.
+
+## 247. THREE DEAD ZERO-INITS IN THE BLOCKED REDUCTION, AND THE ONE LEVER I DECLINED TO WRITE BLIND
+
+`frankentorch-4zjaa`. Source work; timed runs were off (host reported disk-bound). **No ratio.**
+
+### 247a. WHAT SHIPPED
+
+`bidiag_blocked_f64` built three buffers with `vec![0.0; n]` and then overwrote **every element**
+of each by `copy_from_slice`: the GEMM operands `u` (`m2` rows of exactly `nb`) and `v` (`nb` rows
+of exactly `n2`), and the `tail` copy (`m_sub` rows of exactly `n_sub`). In each case the rows
+tile the buffer with no remainder, so the zero-fill is provably dead — the pattern
+`project_expand_uninit_firsttouch` records, where the cost is a write pass plus first-touch faults
+on fresh pages.
+
+Now built with `build_uninit`. No arithmetic changes, and the golden from item 246 pins it:
+14 bidiag, 40 svd tests pass, clippy and fmt clean.
+
+Small — `u` and `v` are ~32 KB each at n=512, against an O(n³) reduction — and it is the honest
+size of it. It is banked as free and provable, not as a lever.
+
+### 247b. THE LEVER I DID NOT WRITE, AND WHY THAT IS THE FINDING
+
+The real target in this function is the trailing update, which makes **two separate passes over
+the same `A22` tile**:
+
+    dgemm_bt_sub_into(m2, nb, n2, &u, &y[nb*nb..], a, off22, lda)   // A22 -= U * Y2^T
+    dgemm_sub_into   (m2, nb, n2, &x[nb*nb..], &v, a, off22, lda)   // A22 -= X2 * V
+
+`A22` is the dominant memory object — `(n-i-nb)²` — and it is read and written twice. A fused
+kernel would touch it once, halving that traffic, and **the fusion is bit-exact in principle**:
+each element's updates are independent of other elements, so doing `(a - s1) - s2` per element
+rather than in two sweeps preserves every rounding.
+
+**In principle.** In practice the two callees are tuned GEMMs with their own internal blocking,
+and a hand-written fused triple loop would reproduce their k-accumulation order only by luck. If
+it does not, the change stops being an interchange and becomes a reassociation — admissible under
+`qgce4` (item 234 measured this code's branch deviation at 9.3e-13 against the ratified 1e-11),
+but no longer free, and its payoff is a memory-traffic argument that **only a measurement can
+settle**.
+
+So it is not written. Writing a GEMM kernel blind, on a tick with no timed runs, to chase a win I
+could not size and could not verify, is how the last four items' worth of mis-aimed effort
+started — item 237 found four items aimed at a phase worth a fifth of the op, and item 241 found
+my own hypothesis about *why* a constant was wrong to be wrong. **The queue of things I can
+measure is the constraint, not the queue of things I can think of.**
+
+Recorded here so the next agent with a quiet window has the lever pre-specified: fuse the two
+`sub_into` calls into one pass over `A22`, expect the golden to move, and price it against the
+tolerance argument rather than assuming bit-exactness.
