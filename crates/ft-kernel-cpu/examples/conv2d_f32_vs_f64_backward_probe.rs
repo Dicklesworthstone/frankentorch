@@ -99,11 +99,21 @@ fn main() {
     let _ = run_f32(n, &dout32, &padded32, &weight32, ph, pw, oh, ow);
     let _ = run_f64(n, &dout64, &padded64, &weight64, ph, pw, oh, ow);
 
+    let mut f32_fwd: Vec<f64> = Vec::with_capacity(reps * 2);
+    let mut f64_fwd: Vec<f64> = Vec::with_capacity(reps * 2);
+    let _ = run_fwd_f32(n, &padded32, &weight32, ph, pw, oh, ow);
+    let _ = run_fwd_f64(n, &padded64, &weight64, ph, pw, oh, ow);
+
     for _ in 0..reps {
         t32.push(run_f32(n, &dout32, &padded32, &weight32, ph, pw, oh, ow));
         t64.push(run_f64(n, &dout64, &padded64, &weight64, ph, pw, oh, ow));
         t64.push(run_f64(n, &dout64, &padded64, &weight64, ph, pw, oh, ow));
         t32.push(run_f32(n, &dout32, &padded32, &weight32, ph, pw, oh, ow));
+
+        f32_fwd.push(run_fwd_f32(n, &padded32, &weight32, ph, pw, oh, ow));
+        f64_fwd.push(run_fwd_f64(n, &padded64, &weight64, ph, pw, oh, ow));
+        f64_fwd.push(run_fwd_f64(n, &padded64, &weight64, ph, pw, oh, ow));
+        f32_fwd.push(run_fwd_f32(n, &padded32, &weight32, ph, pw, oh, ow));
     }
 
     let report = |label: &str, mut v: Vec<f64>| -> (f64, f64) {
@@ -116,8 +126,16 @@ fn main() {
         );
         (min, med)
     };
+    println!("  -- BACKWARD --");
     let (min32, med32) = report("f32", t32);
     let (min64, med64) = report("f64", t64);
+    println!("  -- FORWARD --");
+    let (fmin32, _) = report("f32", f32_fwd);
+    let (fmin64, _) = report("f64", f64_fwd);
+    println!(
+        "  forward f64/f32 by MIN {:.2}x   (>1 means f32 is faster)",
+        fmin64 / fmin32
+    );
 
     println!(
         "\n  f64/f32 by MIN    {:.2}x   (>1 means f32 is faster, which is what half the bytes \
@@ -138,6 +156,48 @@ fn main() {
              probe cannot attribute one, only say the hypothesis survives."
         );
     }
+}
+
+/// FORWARD arm, added after the backward result came back the wrong way for the hypothesis.
+///
+/// The backward probe said f32 is 1.62x FASTER than f64, yet the board's f32 conv2d LANE is 1.28x
+/// slower per sample than the f64 lane (both certified). Those two facts can only be reconciled if
+/// the f32 cost sits outside the backward, and the forward is the first place to look because it is
+/// the other half of the same kernel pair and is equally reachable from here.
+fn run_fwd_f32(
+    n: usize,
+    padded: &[f32],
+    weight: &[f32],
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+) -> f64 {
+    let started = Instant::now();
+    let out = ft_kernel_cpu::conv2d_forward_f32(
+        padded, weight, None, n, CI, ph, pw, K, K, oh, ow, 1, 1, CO,
+    );
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    std::hint::black_box(&out);
+    elapsed
+}
+
+fn run_fwd_f64(
+    n: usize,
+    padded: &[f64],
+    weight: &[f64],
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+) -> f64 {
+    let started = Instant::now();
+    let out = ft_kernel_cpu::conv2d_forward_f64(
+        padded, weight, None, n, CI, ph, pw, K, K, oh, ow, 1, 1, CO,
+    );
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    std::hint::black_box(&out);
+    elapsed
 }
 
 fn run_f32(
