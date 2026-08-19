@@ -37841,3 +37841,70 @@ That lead is worth stating precisely because it is checkable: **item 238 closed 
 at parity measured entirely at 8 threads.** If 16t holds up, that lane is a win rather than a draw,
 and the same question applies to every row this campaign has banked at 8 — the width was a free
 parameter set to match the incumbent, not one that was optimised.
+
+## 241. THE PANEL WIDTH WAS NEVER COMPARED AGAINST 8 — nb=8 WINS 15 OF 16 CELLS, AND MY OWN HYPOTHESIS WAS WRONG ABOUT WHY
+
+`frankentorch-4zjaa`. Item 239 built the sweep and could not run it. This is the run, and it
+**refutes the hypothesis that motivated it** while finding a larger defect underneath.
+
+### 241a. WHAT I EXPECTED AND WHAT HAPPENED
+
+Item 239's hypothesis: `svd_bidiag_block_size()` is a hardcoded 16 tuned at `N = 256` and
+`N = 512`, so it should be wrong at n=128-160 where item 231's standing lives, and right at 256.
+
+**Wrong.** `nb=8` beats 16 at n=256 too. The defect is not that the constant was tuned at the
+wrong SIZE — it is that the tuning **grid never contained 8**. Its own comment says so plainly:
+*"16 beat 32 and 64 at both sizes"*. That is true, and it is not the same claim as 16 being best.
+
+    against the shipped nb=16, four invocations, loadavg 20-31, nothing else measuring
+    n=128   nb=8  1.23 1.24 1.24 1.22 x
+    n=136   nb=8  0.97 1.17 1.15 1.00 x
+    n=160   nb=8  1.22 1.07 1.08 1.09 x
+    n=256   nb=8  1.21 1.07 1.05 1.11 x
+
+`nb=8` was fastest in **15 of 16 cells** (the exception is run 2's n=256, where nb=24 edged it),
+and every width above 16 is monotonically worse — nb=64 reads 0.45-0.64x. The direction matches
+the code: `dlabrd_panel_f64` is BLAS-2 with several plainly serial loops, so fewer columns per
+panel moves more work into the two trailing accumulate-GEMMs.
+
+### 241b. SHIPPED, WITH ITS LIMIT STATED
+
+`svd_bidiag_block_size()` → **8**, and the sweep grid gains 384 and 512.
+
+**n=512 is UNTESTED at nb=8 and that is the one risk**, recorded in the constant's own comment
+because this value has now been wrong twice for exactly the reason of an incomplete grid. If 8
+loses at 512 this wants a size-dependent rule, not a different single number. Correctness gates
+green on the new value: 13 bidiag + 40 svd tests pass. The change moves bits by reassociation,
+which item 234 already measured for this code at 9.3e-13 against the ratified 1e-11.
+
+**Expected whole-op effect, stated so nobody quotes the component figure as an op figure:** the
+reduction is 70-74% of the SVD forward (item 237), so ~1.2x on it is ~12% off the total — the
+1.6-1.7x standing would move to roughly 1.5x, not to parity. That is worth having and is not a
+headline.
+
+### 241c. A VOID RUN, AND A BUG IN MY OWN GUARD
+
+I also re-ran the vs-PyTorch SVD lane in what I announced as a clear window. **It was not clear**,
+and the reason is a defect in my own check: the script grepped `/proc` for peer measurements and
+then printed `(clear)` **unconditionally**, on a line that ran whether or not the grep matched. A
+peer's `h2h_det.bin` and the full torch board arm were listed in that very output and I read past
+the label.
+
+The data says the same thing without needing the confession: FT block spread reached **5.3x**
+(3.039 vs 16.213 ms), and the phase shares came back **30-37% reduction / 53-61% QR sweep**
+against the 70-72% / 11-12% that three earlier invocations agreed on to within two points. Those
+rows are discarded and nothing is quoted from them.
+
+**The guard now has to fail loudly rather than print a reassuring constant.** A check whose
+output does not depend on what it checked is not a check, and this one had been giving me
+confidence for two ticks. `acquire_build_slot` — which would make the manual guard unnecessary —
+has returned *"Build slots are disabled. Enable WORKTREES_ENABLED"* on every attempt across four
+ticks.
+
+### 241d. THE SEQUENCING THAT MADE THIS TICK WORK
+
+Item 239 recorded that a local `ft-kernel-cpu` release build (8m15s, host to loadavg 140) and a
+measurement cannot share a tick. This tick spent the build's cost in the previous one and opened
+with the binary already on disk, so the sweep cost **0.93 seconds** in a window that was still
+clean. That is the whole difference between item 239 producing nothing and item 241 producing a
+shipped constant.

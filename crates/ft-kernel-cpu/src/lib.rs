@@ -32380,12 +32380,38 @@ mod bidiag {
     }
 } // mod bidiag
 
-/// Panel width for the blocked bidiagonalization. Measured on the shared
-/// workers at `N = 256` and `N = 512`: 16 beat 32 and 64 at both sizes once the
-/// panel's two matvecs were parallelized, because a narrower panel keeps the
-/// deferred `X`/`Y` blocks in cache and hands more of the flops to the GEMM.
+/// Panel width for the blocked bidiagonalization.
+///
+/// **8, not 16 — NEGATIVE_EVIDENCE item 241.** The previous value's own justification read
+/// "Measured on the shared workers at `N = 256` and `N = 512`: 16 beat 32 and 64 at both
+/// sizes". That is true and it is not the same as 16 being best: **the grid was {16, 32, 64}
+/// and never contained 8.** Item 237 then measured this reduction at 70-74% of the SVD
+/// forward, so the constant governs three quarters of the op.
+///
+/// Swept directly (`bidiag_blocked_panel_width_sweep`; `bidiag_blocked_f64` takes `nb` as a
+/// parameter, so no dispatch change and no env knob were needed), four invocations at loadavg
+/// 20-31 with no other measurement on the host, each width against the shipped 16:
+///
+///     n=128   nb=8  1.22-1.24x     n=160   nb=8  1.07-1.22x
+///     n=136   nb=8  0.97-1.17x     n=256   nb=8  1.05-1.21x
+///
+/// `nb=8` was fastest in 15 of 16 cells, and every width ABOVE 16 is monotonically worse
+/// (nb=64 reads 0.45-0.64x). The direction is what the code predicts: our panel is BLAS-2 with
+/// several plainly serial loops, so fewer columns per panel moves more work into the two
+/// trailing accumulate-GEMMs.
+///
+/// KNOWN LIMIT, stated because this constant has now been wrong twice for exactly this reason:
+/// the sweep covers n = 128 to 256. `N = 512` is UNTESTED at nb=8 — the grid above adds 384 and
+/// 512 so the next measured window closes it. If 8 loses there, this wants a size-dependent
+/// rule and not a different single number.
+///
+/// Changing this moves result bits by reassociation, admissible only under the ratified
+/// eig/SVD tolerance policy (`frankentorch-qgce4`);
+/// `bidiag_blocked_matches_unblocked_oracle` pins the output against the unblocked expansion
+/// across several widths, and item 234 measured the reduction's own branch deviation at
+/// 9.3e-13, inside the ratified 1e-11.
 fn svd_bidiag_block_size() -> usize {
-    16
+    8
 }
 
 /// Whether to reduce via the blocked (`dgebrd`) path rather than the in-place
@@ -65288,7 +65314,7 @@ mod tests {
             "panel-width sweep, rayon_threads={} (FT-vs-FT: MAINTENANCE, not a win)",
             rayon::current_num_threads()
         );
-        for &n in &[128usize, 136, 160, 256] {
+        for &n in &[128usize, 136, 160, 256, 384, 512] {
             let base = bidiag_test_matrix(n, n, 0x8ADE ^ n as u64);
             let mut best = [u128::MAX; WIDTHS.len()];
 
