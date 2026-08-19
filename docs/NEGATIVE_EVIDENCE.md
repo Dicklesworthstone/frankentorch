@@ -36588,3 +36588,71 @@ Two things follow, neither of them a new framework:
 1.62-1.73x, uncertified — but the 2.5x it has been trying to certify for two sessions is not
 currently there to certify, and ten more invocations will not find it. The open question is now
 whether the lever should stop depending on a contended global cache at all.
+
+## 222. THE TILE TOGGLE IS A CERTIFIED REGRESSION ON THE LANE — ITEM 217's ARM-INTERNAL 1.223x DOES NOT TRANSFER, AND THE TOGGLE STAYS OFF
+
+`frankentorch-hi9r6` (P0). **Two certified rows**, both gates PASS, parity `match`, taken in ONE
+invocation against the same incumbent.
+
+    lane                     FT(ms)   PT(ms)   standing        PT null            FT null
+    conv2d_big_masked        29.759   12.513   2.38x SLOWER    PASS 0.988-1.058   PASS 0.977-1.027
+    conv2d_big_masked_tile   31.597   12.095   2.61x SLOWER    PASS 0.964-1.018   PASS 0.959-1.031
+
+Host `thinkstation1`, AMD Ryzen Threadripper PRO 5975WX, x86_64+avx2, governor powersave,
+`RAYON_NUM_THREADS=8`, online_cpus 64. Incumbent PyTorch 2.12.1+cpu self-reported in the SAME
+invocation, torch threads 8. `allocator=mimalloc (--features fair-alloc)`, ELF
+`6fbba18a3287216459e5bc8578e9e30efb36cdb9e9c4981a500f17e7206517f7`, 32 rounds ABBAABBA.
+`concurrent_measurements=none`. load_1m 39.32 -> 36.73, load_series n=34 worst_drift 1.071x, both
+gates PASS. cpu_mhz min 1429 median 3957 max 4045, spread 2.830x. slot0/median 1.024 and 1.015.
+
+### 222a. THE ANSWER
+
+The two lanes are byte-identical work differing only in OUR arm's tile floor. Comparing the arms
+the toggle actually moves:
+
+    toggle OFF   29.759 ms
+    toggle ON    31.597 ms      -> 1.062x SLOWER with the adaptive floor
+
+**Item 217's arm-internal 1.223x FASTER at 8 threads does not transfer to the lane. The sign flips.**
+The standing moves the wrong way, 2.38x -> 2.61x SLOWER, and both rows certify, so this is not a
+noise artefact: it is the measurement item 220d was built to take, and it came back against the
+lever.
+
+### 222b. WHY THE SIGN FLIPPED, WHICH IS THE USEFUL PART
+
+Item 217's probe measured `conv2d_backward_f64` in isolation at **batch 8**; this lane is
+**batch 16**. The tiling arithmetic is identical at both — `n = patch_width = 288` regardless of
+batch, so `tile_grid(8)` gives the same 6 -> 8 strips — but the BUFFERS double.
+
+Every extra column strip re-reads the whole `A` panel, so **the traffic penalty scales with the data
+while the scheduling benefit is fixed at "8 tiles instead of 6"**. At batch 8 the fixed benefit wins;
+at batch 16 the scaling penalty does. `project_gemm_bandwidth_vein`'s prior was right about the
+mechanism even where item 217's measurement pointed the other way.
+
+That is the shape of `project_conv3d_direct_gate_misset` again — a fast path validated at ONE shape
+is known good only at that shape — arriving this time before anything shipped, because the default
+was never changed.
+
+### 222c. WHAT THIS VINDICATES, AND WHAT IT COSTS
+
+Item 170b refused to edit `MIN_BLOCK_COLS` directly and shipped a default-off toggle instead, citing
+two agents whose granularity changes had been reverted for reasoning without measuring. **Had I
+edited the constant on item 217's evidence, this run would have been the regression report rather
+than the refutation.** The toggle stays off; no default changes.
+
+It also cost something worth naming: items 170, 172, 217 and 220 are four items and two probes
+spent on a lever that is now measured to be worthless on the lane. The honest accounting is that
+the toggle's value was never the speed-up — it was that the question could be settled at all, in one
+process, against a live incumbent.
+
+### 222d. NOT DELETED, AND WHY
+
+Item 172d said an adaptive-slower outcome means the toggle "should be deleted rather than defaulted".
+I am leaving it, default-off, because item 217 measured it FASTER at the batch-8 backward in
+isolation and that measurement stands on its own arm-internal terms. A knob that helps one shape and
+hurts another is a knob, not a mistake — provided nobody defaults it. The evidence for both signs is
+now in the ledger beside it.
+
+Third row in the same invocation, unrelated to the toggle but certified and worth banking:
+`conv2d_big_masked_train` at **1.95x SLOWER** (PT PASS 0.960-1.028, FT PASS 0.972-1.041, parity
+match), replicating item 219c's 1.89-1.96x on a different ELF.
