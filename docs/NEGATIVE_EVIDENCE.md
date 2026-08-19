@@ -37908,3 +37908,49 @@ measurement cannot share a tick. This tick spent the build's cost in the previou
 with the binary already on disk, so the sweep cost **0.93 seconds** in a window that was still
 clean. That is the whole difference between item 239 producing nothing and item 241 producing a
 shipped constant.
+
+## 242. TWO SHORT NOTES: md74s's CLONE IS ALREADY GONE, AND THE WINDOW GUARD NOW REFUSES INSTEAD OF REASSURING
+
+### 242a. `frankentorch-md74s` is STALE — do not re-do it
+
+The bead describes `functional_max_pool1d`'s grad forward cloning its whole argmax sidecar
+(`batch*ch*output_len` f64, 16.8 MB at the h2h shape) purely to feed the sum-shortcut registry,
+and proposes sharing one buffer via `Rc`/`Arc`.
+
+**That fix landed in `e116110b`**, and it landed at BOTH sites — `max_pool1d` and the
+`max_pool3d` fused path. Both now hold `Arc<OnceLock<Vec<f64>>>` and **move** into it; there is
+no surviving `arg_offsets.clone()` in either. The bead's own candidate fix is what is in the
+tree.
+
+What the bead still legitimately owes is its MEASUREMENT — a forward-phase attribution on the
+max_pool1d lane separating kernel, clone and allocation. **The code half is done and the bead
+does not say so**, which is worth one line here because the next agent to pick it up would
+otherwise re-read a 66,000-line file to discover it.
+
+### 242b. The guard from item 241c is shipped
+
+`scripts/measurement_window_guard.sh`. It **exits non-zero** on a live peer measurement or on
+1-minute loadavg above 35, which is the whole difference from the check it replaces: that one
+listed the offending processes and then printed `(clear)` on a line that ran unconditionally.
+
+It also had to be taught not to cry wolf — the first version flagged `rustc` compiling any crate
+that merely DEPENDS on criterion, plus shell wrappers quoting the words, four false positives on
+its first run. Matching is now on the process's own `comm`, compilers and shells excluded by
+name, `cargo` counted only when running a bench. Self-tested three ways: refuses under load,
+refuses with a real `torchvenv` python live (true positive, no false ones), passes with the
+ceiling lifted and nothing measuring.
+
+**Its deletion condition is in the file**: delete it when `acquire_build_slot` works.
+That tool — which the fleet's one-at-a-time measurement rule depends on — has returned *"Build
+slots are disabled. Enable WORKTREES_ENABLED"* on every call across **five ticks**.
+
+### 242c. The guard refused this tick, and I did not override it
+
+Both measurement binaries were rebuilt against the new `nb=8` (`ftk_nb8` `c7b54a9279e5b1e1`,
+`svd_nb8` `4b4de406e1d5daf7`) and are on disk ready to run. The guard then refused at loadavg
+38.9 and again at 40.0 — load raised by my own build, with no peer measuring.
+
+**Overriding a gate on the day it ships, to bank a row it was written to prevent, is the
+self-weakening section 2 bans.** The owed rows — the whole-op SVD standing at nb=8, and the
+n=512 panel-width point that item 241 flagged as its one untested risk — carry over with their
+binaries already built, which is exactly the sequencing item 239 prescribed.
