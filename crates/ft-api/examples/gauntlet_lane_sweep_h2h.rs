@@ -48,6 +48,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
+/// Threads the incumbent arm runs with, reported in the provenance block and used as half of the
+/// self-load ceiling in `frankentorch-vyaia`'s EXTERNAL LOAD check. It was a bare `8` in the
+/// provenance call; the ceiling needs the same number, and two literals that must agree is how
+/// a constant stops being one.
+const INCUMBENT_THREADS: usize = 8;
+
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
     BALANCED_SQUARE, MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS,
@@ -1506,7 +1512,7 @@ LANES = {
     );
     println!(
         "{}",
-        ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
+        ft_api::harness_provenance::incumbent_provenance_block(torch_version, INCUMBENT_THREADS)
     );
     // Names the machine this row was measured on. Both arms are sampled in this
     // one invocation on this one host, so the row is internally comparable; the
@@ -2702,12 +2708,36 @@ LANES = {
                 }
             );
         }
-        if rise > start {
+        // WHOSE LOAD IS IT — a correction to the line above, forced by its own first full run.
+        //
+        // That run printed `rise=+50.18` and fired COLD-START, which as first worded claimed
+        // "this invocation supplied MORE load than the host was already carrying". It did not.
+        // The sweep ran at `rayon_threads=8` against an 8-thread incumbent, and a process cannot
+        // make more tasks runnable than it has threads: our structural ceiling was 16, so at least
+        // 34 of that 50 came from the peers compiling on the box. The rise is OURS PLUS THEIRS and
+        // attributing it to us is exactly the over-claim this bead exists to correct upstream.
+        //
+        // The ceiling is a hard bound rather than an estimate, which is why it is worth printing:
+        // anything above it is external BY CONSTRUCTION, with no assumption about the peers at all.
+        let self_ceiling = (rayon::current_num_threads() + INCUMBENT_THREADS) as f64;
+        let ours = rise.min(self_ceiling);
+        if rise > self_ceiling {
             println!(
-                "COLD-START: this invocation supplied MORE load ({rise:.2}) than the host was \
-                 already carrying ({start:.2}), so the drift gate above is largely reading OUR OWN \
-                 ramp rather than the host's. Treat this run as the discarded warm-up and measure \
-                 from the NEXT invocation on this host (frankentorch-vyaia)."
+                "EXTERNAL LOAD: the rise ({rise:.2}) exceeds our structural ceiling \
+                 ({self_ceiling:.0} = {} rayon + {INCUMBENT_THREADS} incumbent threads), so at \
+                 least {:.2} of it came from OTHER processes. This window mixes our ramp with the \
+                 host's and its rise cannot be read as self-load (frankentorch-vyaia).",
+                rayon::current_num_threads(),
+                rise - self_ceiling
+            );
+        }
+        if ours > start {
+            println!(
+                "COLD-START: the part of the rise that CAN be ours ({ours:.2}, capped at the \
+                 {self_ceiling:.0}-thread ceiling) already exceeds what the host was carrying when \
+                 we started ({start:.2}), so the drift gate above is largely reading OUR OWN ramp \
+                 rather than the host's. Treat this run as the discarded warm-up and measure from \
+                 the NEXT invocation on this host (frankentorch-vyaia)."
             );
         }
     }
