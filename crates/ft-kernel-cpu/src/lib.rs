@@ -31758,6 +31758,18 @@ mod bidiag {
         // (12). Every other step in the panel is O(m_sub * nb) and stays serial.
         let mut u = vec![0.0f64; m_sub];
         let mut acc = vec![0.0f64; n_sub];
+        // frankentorch-4zjaa item 246. Accumulators for the four loops below that used to walk
+        // a COLUMN down the rows — striding by `lda` (or `ldx`/`ldy`) on every read of a
+        // row-major matrix, which is the exact access pattern step (3)'s comment records as
+        // having been fixed there and which was left in place in the smaller loops.
+        //
+        // Interchanging those loops needs somewhere to keep one accumulator per output index
+        // instead of one scalar, which is what makes the rewrite BIT-EXACT: each accumulator
+        // still sums its own terms in the original order, only the traversal order of the two
+        // nested loops changes. `pacc` is indexed by panel column (at most `nb`), `cacc` by
+        // trailing column. Allocated once per call, outside the `i` loop.
+        let mut pacc = vec![0.0f64; nb];
+        let mut cacc = vec![0.0f64; n_sub];
 
         for i in 0..nb {
             // (1) Apply the accumulated updates to column i before reducing it.
@@ -31804,13 +31816,22 @@ mod bidiag {
                 for (t, &value) in acc[..ncols].iter().enumerate() {
                     y[(i + 1 + t) * ldy + i] = value;
                 }
-                // (4) stash A[i.., 0..i]^T * u in the unused head of column i
-                for p in 0..i {
-                    let mut s = 0.0;
-                    for r in i..m_sub {
-                        s += a[at(r, p)] * a[at(r, i)];
+                // (4) stash A[i.., 0..i]^T * u in the unused head of column i.
+                //
+                // `r` outer, `p` inner: `a[at(r, 0..i)]` is CONTIGUOUS, where the original
+                // `p` outer form re-walked column `p` down the rows at stride `lda`. Each
+                // `pacc[p]` still accumulates over ascending `r`, exactly as before, so the
+                // result is bit-identical — pinned by `bidiag_blocked_output_is_bit_stable`.
+                pacc[..i].fill(0.0);
+                for r in i..m_sub {
+                    let ari = a[at(r, i)];
+                    let row = at(r, 0);
+                    for (p, slot) in pacc[..i].iter_mut().enumerate() {
+                        *slot += a[row + p] * ari;
                     }
-                    y[p * ldy + i] = s;
+                }
+                for p in 0..i {
+                    y[p * ldy + i] = pacc[p];
                 }
                 // (5) y[i+1.., i] -= y[i+1.., 0..i] * stash
                 for c in (i + 1)..n_sub {
@@ -31820,21 +31841,34 @@ mod bidiag {
                     }
                     y[c * ldy + i] -= s;
                 }
-                // (6) restash with X^T * u
-                for p in 0..i {
-                    let mut s = 0.0;
-                    for r in i..m_sub {
-                        s += x[r * ldx + p] * a[at(r, i)];
+                // (6) restash with X^T * u. Same interchange as (4): `x[r*ldx + 0..i]` is
+                // contiguous, the original walked `x` at stride `ldx`.
+                pacc[..i].fill(0.0);
+                for r in i..m_sub {
+                    let ari = a[at(r, i)];
+                    let xrow = r * ldx;
+                    for (p, slot) in pacc[..i].iter_mut().enumerate() {
+                        *slot += x[xrow + p] * ari;
                     }
-                    y[p * ldy + i] = s;
                 }
-                // (7) y[i+1.., i] -= A[0..i, i+1..]^T * stash
-                for c in (i + 1)..n_sub {
-                    let mut s = 0.0;
-                    for p in 0..i {
-                        s += a[at(p, c)] * y[p * ldy + i];
+                for p in 0..i {
+                    y[p * ldy + i] = pacc[p];
+                }
+                // (7) y[i+1.., i] -= A[0..i, i+1..]^T * stash.
+                //
+                // `p` outer, `c` inner: `a[at(p, i+1..n_sub)]` is CONTIGUOUS, where the
+                // original walked column `c` at stride `lda` for every `c`. Each `cacc[c]`
+                // accumulates over ascending `p` exactly as the original scalar did.
+                cacc[(i + 1)..n_sub].fill(0.0);
+                for p in 0..i {
+                    let ypi = y[p * ldy + i];
+                    let prow = at(p, 0);
+                    for (c, slot) in cacc.iter_mut().enumerate().take(n_sub).skip(i + 1) {
+                        *slot += a[prow + c] * ypi;
                     }
-                    y[c * ldy + i] -= s;
+                }
+                for c in (i + 1)..n_sub {
+                    y[c * ldy + i] -= cacc[c];
                 }
                 // (8) scale
                 for c in (i + 1)..n_sub {
@@ -31894,13 +31928,21 @@ mod bidiag {
                         x[r * ldx + i] = s;
                     }
                 }
-                // (13) stash y[i+1.., 0..=i]^T * v
-                for p in 0..=i {
-                    let mut s = 0.0;
-                    for c in (i + 1)..n_sub {
-                        s += y[c * ldy + p] * a[at(i, c)];
+                // (13) stash y[i+1.., 0..=i]^T * v.
+                //
+                // `c` outer, `p` inner: `y[c*ldy + 0..=i]` is CONTIGUOUS, where the original
+                // walked `y` at stride `ldy` for every `p`. Each `pacc[p]` accumulates over
+                // ascending `c` exactly as before.
+                pacc[..=i].fill(0.0);
+                for c in (i + 1)..n_sub {
+                    let aic = a[at(i, c)];
+                    let yrow = c * ldy;
+                    for (p, slot) in pacc[..=i].iter_mut().enumerate() {
+                        *slot += y[yrow + p] * aic;
                     }
-                    x[p * ldx + i] = s;
+                }
+                for p in 0..=i {
+                    x[p * ldx + i] = pacc[p];
                 }
                 // (14) x[i+1.., i] -= A[i+1.., 0..=i] * stash
                 for r in (i + 1)..m_sub {
@@ -65355,6 +65397,64 @@ mod tests {
         println!(
             "READ: the ratio is against the SHIPPED nb=16, so >1.00x means that width beats what \
              we ship. A width that wins at 256 and loses at 136 is the whole question."
+        );
+    }
+
+    /// Shapes for [`bidiag_blocked_output_is_bit_stable`]: square and rectangular, panel
+    /// widths either side of the shipped 8, and one shape whose `n` is not a multiple of `nb`
+    /// so the trailing partial panel is exercised.
+    const BIDIAG_BLOCKED_GOLDEN: [(usize, usize, usize, u64); 5] = [
+        (48, 48, 8, 0xa83a_fb2c_cde7_d811),
+        (64, 40, 8, 0x2a47_d378_94ed_5144),
+        (40, 33, 4, 0x3833_06da_7555_81c0),
+        (72, 72, 16, 0x5281_cfae_33d5_581c),
+        (96, 50, 8, 0x3c31_08b5_9704_dfb6),
+    ];
+
+    /// Bit-level golden for `bidiag_blocked_f64` — `frankentorch-4zjaa`,
+    /// NEGATIVE_EVIDENCE item 246.
+    ///
+    /// WHY A GOLDEN AND NOT THE ORACLE. `bidiag_blocked_matches_unblocked_oracle` compares the
+    /// blocked reduction against a DIFFERENT algorithm at 1e-11, which is the right tolerance
+    /// for that comparison and useless for this one. The panel rewrite this pins is a pure loop
+    /// INTERCHANGE — same operands, same per-accumulator summation order, only the traversal
+    /// order of the two nested loops swapped so the inner one runs along a row instead of down
+    /// a column. That transformation is exactly bit-preserving, so the honest gate is
+    /// `assert_eq!` on the bits, not a tolerance that would hide a real reassociation.
+    ///
+    /// The values below were captured from the tree BEFORE the interchange and must not move.
+    /// If a future change to `dlabrd_panel_f64` legitimately reassociates, this test fails and
+    /// whoever changes it owes the tolerance argument under `frankentorch-qgce4` — which is the
+    /// point: it converts "I believe this is bit-exact" into something the compiler checks.
+    ///
+    /// Bits, not floats: `to_bits` so a NaN or a signed zero cannot slip through an `==`.
+    #[test]
+    fn bidiag_blocked_output_is_bit_stable() {
+        let mut mismatches: Vec<String> = Vec::new();
+        for &(m, n, nb, want) in &BIDIAG_BLOCKED_GOLDEN {
+            let mut packed = bidiag_test_matrix(m, n, 0xB17E ^ (m * 71 + n) as u64);
+            let (d, e, tauq, taup) = super::bidiag::bidiag_blocked_f64(&mut packed, m, n, nb);
+
+            // One order-sensitive mix over every output the reduction produces, so a change
+            // anywhere in the panel moves it. Wrapping arithmetic on the raw bits: no float
+            // addition, so the checksum itself cannot reassociate.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for slice in [&packed[..], &d[..], &e[..], &tauq[..], &taup[..]] {
+                for value in slice {
+                    h ^= value.to_bits();
+                    h = h.wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+            if h != want {
+                mismatches.push(format!(
+                    "m={m} n={n} nb={nb}: {h:#018x} (golden {want:#018x})"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "bidiag_blocked_f64 output moved:\n  {}",
+            mismatches.join("\n  ")
         );
     }
 

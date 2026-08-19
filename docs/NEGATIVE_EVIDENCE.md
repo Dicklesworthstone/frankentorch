@@ -38182,3 +38182,68 @@ prevent the fourth.
 Both binaries are built and on disk (`ftk_nb8` `c7b54a9279e5b1e1`, `svd_nb8` `4b4de406e1d5daf7`).
 The SVD standing is ~1.49x SLOWER with the reduction at 70-73% as the named target. The next
 genuine window costs one invocation.
+
+## 246. FOUR PANEL LOOPS STILL WALKED COLUMNS DOWN A ROW-MAJOR MATRIX — INTERCHANGED, AND THE BIT-EXACTNESS IS PROVEN RATHER THAN ASSERTED
+
+`frankentorch-4zjaa`. Source work only: the host was at runq 99 / 2% idle and timed runs were
+explicitly off. **No ratio is claimed and the speedup is unmeasured.**
+
+### 246a. THE DEFECT, AND WHERE IT WAS HIDING
+
+Item 237 put the reduction at 70-74% of the SVD forward, so `dlabrd_panel_f64` is the code that
+matters. Step (3) of that panel carries this comment:
+
+> The naive form walks column `c` down the rows, striding by `lda` on every read; folding it into
+> a row-contiguous accumulation is what lets this — the panel's dominant term — run in parallel.
+
+**Four other loops in the same function still do exactly that**, and the comment above them says
+nothing about it. Steps (4) and (6) walk column `p` at stride `lda`/`ldx` for every `p`; step (7)
+walks column `c` at stride `lda` for every `c`; step (13) walks `y` at stride `ldy` for every `p`.
+The fix was applied to the dominant term and stopped there.
+
+They are lower-order in FLOPs — roughly `nb·n²/4` against the panel's `n³/3` — which is presumably
+why they were skipped. **FLOP share is not time share when every read is a separate cache line.**
+
+### 246b. THE REWRITE IS AN INTERCHANGE, NOT A REASSOCIATION
+
+Each loop swaps its two nested traversals so the inner one runs along a row, and keeps **one
+accumulator per output index** instead of one scalar. That is what makes it exactly
+bit-preserving: `pacc[p]` still sums its own terms over ascending `r` in the original order; only
+the order in which different accumulators are *visited* changes.
+
+    (4)  p-outer, r-inner  ->  r-outer, p-inner   a[at(r, 0..i)]        contiguous
+    (6)  p-outer, r-inner  ->  r-outer, p-inner   x[r*ldx + 0..i]       contiguous
+    (7)  c-outer, p-inner  ->  p-outer, c-inner   a[at(p, i+1..n_sub)]  contiguous
+    (13) p-outer, c-inner  ->  c-outer, p-inner   y[c*ldy + 0..=i]      contiguous
+
+**Steps (9)/(10) were left alone deliberately.** They accumulate two different sums into ONE
+scalar sequentially, so splitting them to fix the strided half would compute
+`(s1 + p2_0) + p2_1 + …` as `s1 + (Σp2)` — a genuine reassociation, not an interchange. The
+transformation that is free here is not free there, and the difference is worth naming because
+it is the whole reason this change needs no tolerance argument.
+
+### 246c. PROVEN, NOT ASSERTED
+
+`bidiag_blocked_output_is_bit_stable` hashes every output of `bidiag_blocked_f64` — the packed
+matrix, `d`, `e`, `tauq`, `taup` — with a wrapping integer mix over `to_bits`, so no float
+addition appears in the checksum and a NaN or signed zero cannot slip through an `==`. Five
+shapes: square, rectangular, `nb` either side of the shipped 8, and one whose `n` is not a
+multiple of `nb` so the trailing partial panel runs.
+
+**The goldens were captured from the tree BEFORE the interchange**, pinned, and the rewrite
+then had to reproduce them. It does, at all five. `assert_eq!` on bits is the honest gate here —
+the existing `bidiag_blocked_matches_unblocked_oracle` compares against a *different algorithm* at
+1e-11, a tolerance that would have hidden a real reassociation completely.
+
+Gates: 14 bidiag, 40 svd, 42 eig tests pass; clippy clean in the changed ranges; fmt clean.
+
+### 246d. WHAT IS OWED
+
+**The speedup.** This is an access-pattern change with a proof of correctness and no measurement
+behind it, and it must not be quoted as a win until a window exists. It could also be worth
+nothing: at `nb=8` these loops are short, and if their operands were already L1-resident the
+interchange buys only instruction count. The honest prediction is *small and positive*, and the
+lane to settle it is the one already built.
+
+The golden now also guards the panel for anyone who touches it next, which is the part that
+survives whatever the ratio turns out to be.
