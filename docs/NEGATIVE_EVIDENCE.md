@@ -36047,3 +36047,64 @@ The three full-panel equivalence tests (items 158, 160, 165) were still running 
 written and are not reported here. `cargo clippy` has not run. And no measurement: the host is
 oversubscribed, which by item 194's own gate makes any ratio taken now unquotable whatever its nulls
 say.
+
+## 214. conv2d_xl BANKED AT 1.46-1.51x FASTER, 3/3 CERTIFIED — THE CAMPAIGN'S FIRST CERTIFIED conv2d WIN, WITH THE LEVER ATTRIBUTED
+
+`frankentorch-hi9r6`. MEASURED. `/data` 307G. Host `thinkstation1`, AMD Ryzen Threadripper PRO
+5975WX, 64 cores, governor powersave, `RAYON_NUM_THREADS=8`, `round_warmup=0` (board default).
+Incumbent PyTorch 2.12.1+cpu, self-reported in the same invocation, torch threads 8. ELF
+`f049f840095f1135...`. `concurrent_measurements=none` printed by the harness in every run below.
+
+### 214a. THE BANKED STANDING
+
+    run   ratio    CI              nulls                 drift
+      A   1.463    [1.403,1.487]   PT PASS / FT PASS     PASS   load_1m 22.57 -> 21.40
+      1   1.459    [1.422,1.503]   PT PASS / FT PASS     PASS   load_1m 15.43 -> 18.01
+      2   1.509    [1.474,1.558]   PT PASS / FT PASS     PASS   load_1m 17.23 -> 15.91
+
+    median 1.463   spread 1.034x   parity `match` in all three
+
+**FT 1.46-1.51x FASTER than PyTorch 2.12.1+cpu** on the summed f64 conv2d route at batch 64.
+
+Also DISCARDED and reported: a fourth invocation with `load_1m` 21.75 to 35.12,
+`worst_drift=1.649x`, both gates DRIFTED. Its rows read 1.404 and 1.365 and are not counted. The
+harness refused them and so do I.
+
+### 214b. THE LEVER, ATTRIBUTED
+
+The paired lane runs the pre-item-174 scatter under a second name in the same invocation, against
+the same incumbent:
+
+    run   paired (PT/FT)_xl / (PT/FT)_legacy   PT control
+      A                                1.114        0.964
+      B                                1.096        0.989
+      1                                1.089        1.026
+      2                                1.101        0.995
+                              mean     1.100    spread 1.023x
+
+**Items 174/176/177's scatter collapse is worth ~1.10x**, four invocations agreeing to 2.3%, with
+the identical-torch control within 3.6% of 1.0 in the worst case and 0.5% in the best.
+
+And the legacy lane certified on its own once (run 2, PT PASS / FT PASS): ratio 1.371. So the
+pre-lever code was ALREADY 1.37x faster than torch on this route, and the collapse took it to
+1.46-1.51x. **The win is not the lever's; the lever is a tenth of it.** Saying so is the difference
+between attributing a change and taking credit for a lane.
+
+### 214c. WHAT MADE THIS MEASURABLE AT ALL
+
+Nothing about conv2d changed between item 205's "cannot be certified" and this row. What changed
+was the lane:
+
+    conv2d_big   FT  8.8 ms  PT 10.5 ms   certified 1 of 4   (items 205, 207, 208)
+    conv2d_xl    FT 29.4 ms  PT 43.0 ms   certified 3 of 3
+
+Item 209 sized `conv2d_xl` from the only property that separated this board's certifying lanes
+from its failing ones — absolute arm duration — after item 203 measured that the received "4-7 ms
+band" was wrong and 11 ms was where the incumbent started to null. Six turns of failed measurement
+were not noise to be averaged away; they were a lane too short to carry a null, and the fix was
+arithmetic on the four data points those failures produced.
+
+### 214d. OWED
+
+Items 176, 187 and 201 still have no number. Each is a candidate for the same paired treatment now
+that the mechanism exists and costs one toggle plus one lane.
