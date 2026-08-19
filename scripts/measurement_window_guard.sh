@@ -45,7 +45,7 @@ done
 # that always fires is a guard that gets ignored. `torchvenv` is the incumbent arm's actual
 # signature.
 readonly ARGS_PATTERN='torchvenv|bench|h2h|criterion|rayon_width|pytorch_gauntlet'
-readonly COMM_EXCLUDE='^(rustc|cc1|cc1plus|ld|lld|ld[.]lld|collect2|as|zsh|bash|sh|dash|ps|grep|awk|sed|tee)$'
+readonly COMM_EXCLUDE='^(rustc|rustfmt|clippy-driver|cc1|cc1plus|ld|lld|ld[.]lld|collect2|as|zsh|bash|sh|dash|ps|grep|awk|sed|tee)$'
 
 mapfile -t HITS < <(
     ps -eo pid=,comm=,args= 2>/dev/null | awk \
@@ -56,8 +56,20 @@ mapfile -t HITS < <(
             if (pid == self || pid == parent) next;
             if (args ~ /measurement_window_guard/) next;
             if (comm ~ excl) next;
-            # `cargo` is a compiler driver except when it is running a bench.
-            if (comm == "cargo" && args !~ /bench/) next;
+            # REMOTE WORK DOES NOT CONTEND HERE. On this host `cargo` on PATH is an rch
+            # offload shim, so a plain `cargo test`/`cargo bench` — and anything spawned
+            # through `rch exec` — executes on a remote worker and costs this box only the
+            # ssh client. Observed: a peer running
+            # `rch exec -- cargo test -p ffs-harness --bin ffs-mounted-kernel-bench` while
+            # this host sat at loadavg 12.6 and 78% idle. Flagging those tripped the guard
+            # on work that could not affect a measurement here.
+            #
+            # What DOES contend is a directly executed binary — `fp-bench`, an h2h binary, a
+            # torchvenv python. Those are what item 244 caught at 935% CPU.
+            if (comm == "cargo" || comm == "rch") next;
+            if (args ~ /(^|[ \/])rch( |$)/) next;
+            # ...including a `timeout N cargo ...` wrapper, whose own comm is `timeout`.
+            if (args ~ /(^|[ \/])cargo( |$)/) next;
             if (args ~ pat) printf "%s  %s\n", pid, substr(args, 1, 100);
         }'
 )

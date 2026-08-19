@@ -38129,3 +38129,56 @@ every call across **six ticks**. A local `ps` guard cannot serialise a fleet —
 on this side. frankenpandas cannot see my intent to measure and I cannot see theirs except by
 scanning `/proc`, which is why we have now collided three times in five ticks. The slot is the
 fix; the guard is a splint.
+
+## 245. THE GUARD NOW EXCLUDES REMOTE WORK — AND IN DOING SO PROVED A ps-SCAN CANNOT SERIALISE A FLEET
+
+`frankentorch-4zjaa`. No measurement. Two guard defects fixed, and one structural limit
+demonstrated rather than argued.
+
+### 245a. IT WAS REFUSING ON WORK THAT CANNOT CONTEND
+
+Item 244 unanchored `bench` to stop missing hyphenated names. That over-reached in a way this
+tick made visible: the guard refused while flagging
+
+    timeout 2400 cargo test -p ffs-harness --bin ffs-mounted-kernel-bench
+    rch exec -- cargo test -p ffs-harness --bin ffs-mounted-kernel-bench
+
+with the host at **loadavg 12.6 and 78% idle**. On this host `cargo` on PATH is an **rch offload
+shim**, so a plain `cargo test`/`cargo bench` and anything under `rch exec` executes on a REMOTE
+worker and costs this box only an ssh client. Also flagged: `rustfmt` formatting a file whose
+path happened to contain `benches/`.
+
+Excluded now: `comm` of `cargo`/`rch`/`rustfmt`/`clippy-driver`, and any argv containing `rch` or
+`cargo` — which also covers a `timeout N cargo …` wrapper whose own `comm` is `timeout`.
+
+**What still counts is a directly executed binary** — `fp-bench`, an h2h binary, a `torchvenv`
+python. Those are what actually contend, and what item 244 caught at 935% CPU.
+
+Re-verified both directions after loosening, because loosening a gate is how gates die: it exits
+1 with a live `torchvenv` python and 0 with nothing running.
+
+### 245b. THE STRUCTURAL LIMIT, DEMONSTRATED IN 27 SECONDS
+
+    07:52:18   guard PASS — loadavg 16.04, nothing measuring
+    07:52:45   guard REFUSE — FOUR live: a peer FrankenTorch h2h binary, its torchvenv arm,
+               and frankenpandas' vs_pandas_harness with its fp-bench
+
+**A window opened and closed inside half a minute.** Had I measured on the PASS, I would have
+been mid-run when the peer's harness started, and the row would have looked clean — the guard
+runs once, at the start.
+
+That is not a defect I can fix by improving the scan. **A point-in-time `ps` check cannot
+serialise a fleet**: it reports the past, and it has no way to announce intent, so two agents can
+both see "clear" and both start. Only a lease — one holder, held for the duration — closes it.
+`acquire_build_slot` is that lease and has returned *"Build slots are disabled. Enable
+WORKTREES_ENABLED"* on every call across **seven ticks**.
+
+Three collisions in six ticks, each caught only by scanning: frankenpandas twice, a peer
+FrankenTorch session once. The guard has now paid for itself three times and still cannot
+prevent the fourth.
+
+### 245c. WHAT IS STILL READY TO RUN
+
+Both binaries are built and on disk (`ftk_nb8` `c7b54a9279e5b1e1`, `svd_nb8` `4b4de406e1d5daf7`).
+The SVD standing is ~1.49x SLOWER with the reduction at 70-73% as the named target. The next
+genuine window costs one invocation.
