@@ -37954,3 +37954,72 @@ Both measurement binaries were rebuilt against the new `nb=8` (`ftk_nb8` `c7b54a
 self-weakening section 2 bans.** The owed rows — the whole-op SVD standing at nb=8, and the
 n=512 panel-width point that item 241 flagged as its one untested risk — carry over with their
 binaries already built, which is exactly the sequencing item 239 prescribed.
+
+## 243. nb=8 MOVES THE SVD STANDING 1.66x -> 1.49x SLOWER, EXACTLY AS PREDICTED — AND CLOSES ITS OWN FLAGGED RISK, AT THE COST OF CORRECTING ONE OF MY NUMBERS
+
+`frankentorch-4zjaa`. Both rows item 241 owed, taken in the first window the new guard passed
+(`scripts/measurement_window_guard.sh`: no peer measurement, loadavg 20-29).
+
+### 243a. THE RISK ITEM 241 FLAGGED DID NOT MATERIALISE — AND ONE OF ITS CELLS WAS NOISE
+
+Item 241 shipped `nb=8` on a sweep covering n=128-256 and named **n=512 as its one untested
+risk**, saying that if 8 lost there the constant wanted a size-dependent rule. Three invocations,
+each width against the shipped 16:
+
+    n=256   nb=8  1.02  0.97  0.95 x        <- PARITY, not the 1.05-1.21x item 241 reported
+    n=384   nb=8  1.20  1.04  1.24 x
+    n=512   nb=8  1.02  1.00  1.00 x        <- PARITY. The risk is closed.
+
+**`nb=8` is never a meaningful loss anywhere measured** (worst cell 0.95x), a clear win at
+n=128-160 and n=384, and parity at 256 and 512. The shipped constant stands and needs no
+size-dependent rule.
+
+**CORRECTION, against my own item:** item 241 reported n=256 at **1.05-1.21x** for nb=8. In this
+quieter window it reads **0.95-1.02x**. The earlier window's n=256 absolute times were wildly
+scattered — 10.8, 33.8, 14.6, 14.8 ms — against 12.2, 13.2, 14.5 ms now. **That cell was noise
+and I read a win in it.** It did not change the decision, because 15 of 16 cells and the
+monotone trend carried it, but the number as published was wrong and is corrected here.
+
+### 243b. THE WHOLE-OP ROW, AND THE PREDICTION IT TESTS
+
+`svd_square_threshold_h2h`, ELF `4b4de406e1d5daf7`, SVD forward only, `RAYON_NUM_THREADS=8` and
+`torch.set_num_threads(8)` matched, PyTorch 2.12.1+cpu self-reported in the SAME invocation,
+iowait 0 on every FT block.
+
+    n      standing at nb=16 (item 231)      standing now at nb=8
+    128    1.56 1.97 1.60 1.63 1.77 1.71     1.57  1.37  1.48
+    136    1.64 1.61 1.68 1.80 2.04 1.64     1.49  1.50  1.59
+
+Parity MATCH in all six rows (1.28e-16 and 2.40e-16).
+
+**Item 241 predicted this number before it was measured:** "the reduction is 70-74% of the SVD
+forward, so ~1.2x on it is ~12% off the total — the 1.6-1.7x standing would move to roughly 1.5x,
+not to parity." Measured: **~1.49x**. A component measurement correctly predicting an op-level
+move is the check that the phase split of item 237 was real rather than an artefact of its own
+instrument.
+
+**STANDING: square SVD forward is now ~1.49x SLOWER than PyTorch**, from ~1.66x.
+
+### 243c. WHAT MOVED UNDERNEATH
+
+    n=136   reduction, absolute      at nb=16   1.926 - 2.037 ms
+                                     at nb=8    1.369 - 1.649 ms
+            PyTorch's WHOLE forward             1.446 - 1.522 ms
+
+Item 237's headline — *our reduction alone costs more than PyTorch's entire forward* — **is no
+longer true**. At nb=8 the two are roughly equal. The phase shares barely moved (reduction 70-73%
+at n=136, 65% at n=128 against 70-72% before), so the reduction is still the phase to attack;
+it is simply no longer absurd.
+
+### 243d. WHAT THIS ROW IS NOT
+
+**The op-level improvement is a CROSS-WINDOW comparison, not a paired toggle.** The nb=8 vs nb=16
+A/B was done at the component level, in one process; at the op level I have item 231's rows from
+one window and these from another, with the incumbent arm as the control (PyTorch reads 1.24-1.54
+ms across both, so the arms are comparable). That is weaker than a same-invocation toggle and is
+why the movement is quoted as ~1.66x -> ~1.49x rather than as a certified delta. A toggle would
+need `svd_bidiag_block_size` to become a runtime knob, which is a `OnceLock` and therefore
+one-value-per-process — the same obstacle item 234 had to route around.
+
+The lane still carries no A/A null and interleaves at block level, so it banks a LOSS narrowing,
+not a win.
