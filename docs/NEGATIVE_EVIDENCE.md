@@ -38845,3 +38845,63 @@ Two things follow that matter more than the reconciliation:
 * Item 236 is still right about what it actually tested, and its lesson stands verbatim: it caught
   a 1.17x "effect" that was entirely the incumbent wandering while both FT arms sat still. Reading
   the FT column rather than the ratio column is what saved it, and is why this lane prints both.
+
+## 254. THE REDUCTION'S SECOND MATVEC IS A DEPENDENCY CHAIN, NOT A BANDWIDTH PROBLEM — FOUR ROWS IN FLIGHT, BIT-EXACT, PRICE NOT YET TAKEN
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. Item 253's counter says the two
+participants in a square SVD reduction are `reduce_scaled_rows_f64` (56 forks at n=136) and
+`dlabrd_panel_f64` step (12) (56), and that the rank-1 apply never runs parallel at all. This is
+about the second of those, and it is not about the gate.
+
+### 254a. THE DEFECT
+
+Step (12) computes `x[r] = A[r, i+1..] · v`, one row per iteration, as
+
+    let mut s = 0.0;
+    for c in 0..vlen { s += arow[c] * vrow[c]; }
+
+That is a **reduction**: each FMA depends on the previous one's result, so the loop runs at one
+FMA per FMA-latency (~4 cycles) regardless of how many multiply-add units the core has, and LLVM
+may not fix it — reassociating a float sum changes the result, so it is not allowed to without
+being told. Step (3), the panel's *other* matvec, has the opposite shape (`acc[c] += vr * seg[c]`,
+independent per `c`) and vectorises fine. Two matvecs per reflector, one of them running at
+roughly a quarter to an eighth of the machine's width, is a much better explanation for a
+reduction phase at 84% of an n=512 forward than anything about fork/join.
+
+### 254b. THE FIX, AND WHY IT IS BIT-EXACT
+
+Four rows at a time, four independent accumulators, one pass over `v`. Each accumulator still
+sums **its own row's** terms in ascending `c` — the summation order within every output element
+is untouched, only four independent chains are interleaved. The obvious alternative, unrolling
+the `c` loop into partial sums, would have reassociated and owed the tolerance argument under
+`frankentorch-qgce4`; this owes nothing.
+
+It is not asserted, it is **pinned**: `bidiag_blocked_output_is_bit_stable` hashes `packed`, `d`,
+`e`, `tauq` and `taup` across five shapes and PASSES unchanged. That golden was added in item 246
+for exactly this class of rewrite and this is the second lever it has now proven rather than
+argued.
+
+Both arms of step (12) use the kernel, and the parallel arm's chunking changed with it: it had
+been `par_chunks_mut(ldx)` — **one row per rayon item**, an 8-element slice carrying a single dot
+product at nb=8 — and is now 32 rows per task, which is also what lets the blocked kernel see four
+rows inside a task. `svd_tall_parallel_bidiag_reconstructs_n384` and
+`gated_helper_branches_agree_within_the_ratified_svd_tolerance` (2.97e-13 at n=136, 2.58e-12 at
+n=192, both inside 1e-11) cover the parallel arm's new index arithmetic, which the golden's small
+shapes do not reach.
+
+### 254c. WHAT IS OWED, STATED AS OWED
+
+**No ratio. This lands proven-correct and unpriced.** Every attempt to measure it this tick met a
+peer measurement or a loadavg above 30 — the guard refused five windows in ninety minutes. Under
+section 1 that means it is not a win yet and it is not quoted as one.
+
+Two predictions, so the next window can falsify rather than confirm:
+
+* n=512, where the reduction is 84% of the forward and step (12) is one of its two matvecs: if the
+  chain was the wall, the forward should fall from 84.3 ms materially — a quarter of the reduction
+  is ~17 ms. If it moves less than the 1.03x A/A null, the chain was not the wall and this is a
+  free correctness-neutral change that buys nothing, which is the honest outcome to record.
+* **The gate crossover MUST move up**, because a faster serial kernel raises the size at which
+  forking pays. Item 253's bracket (above 65536, at or below 262144) was measured against the OLD
+  step (12) and is therefore stale. Any gate constant shipped from item 253's numbers would be
+  fitted to a kernel that no longer exists — which is why item 253 shipped no constant.

@@ -31395,15 +31395,23 @@ mod bidiag {
     /// WHY THIS EXISTS. `4zjaa`'s wiring comment carries an A/B table whose unblocked arm
     /// jumps 17.6x for a 1.25x size increase:
     ///
+    /// ```text
     ///     n=128  unblocked   335175 ns
     ///     n=160  unblocked  5889192 ns
+    /// ```
     ///
     /// An O(n^3) expansion predicts ~1.95x. The cliff coincides EXACTLY with this gate: in
     /// `bidiag_form_p_f64` the work per reflector is `nrows * nrows`, so it stays under
     /// `1 << 14` for every reflector at n=128 (127^2 = 16129) and crosses it at n=160. Above
     /// the gate, `reduce_scaled_rows_f64` forks into `nrows / REDUCE_CHUNK_ROWS` tasks — just
-    /// THREE at nrows=159 — and `apply_scaled_rank1_f64` forks one task PER ROW, and both run
-    /// once per reflector, so ~320 fork/joins buy almost no width.
+    /// THREE at nrows=159 — and both run once per reflector, so the fork/joins buy almost no
+    /// width.
+    ///
+    /// CORRECTED BY MEASUREMENT (item 253): the original of this paragraph also named
+    /// `apply_scaled_rank1_f64` as forking one task per row. The per-call-site counter says it
+    /// **never forks at all** during a square SVD at n=136 — the counts are 56 for
+    /// `reduce_scaled_rows_f64`, 56 for `dlabrd_panel_f64` step (12), and ZERO for the rank-1
+    /// apply. The two participants are the reduction's own pair of matvecs.
     ///
     /// FALSIFIABLE PREDICTION: with the gate raised past 159^2, the n=160 unblocked arm should
     /// fall from 5.889 ms to roughly 650 us — the O(n^3) continuation of n=128's 335 us. If it
@@ -31582,6 +31590,71 @@ mod bidiag {
                     seg[c] -= vr * acc[c];
                 }
             });
+    }
+
+    /// Rows per rayon task in `dlabrd_panel_f64` step (12). Fixed, and much larger than one:
+    /// the previous code handed rayon ONE ROW per item.
+    const X_ROW_CHUNK: usize = 32;
+
+    /// `dst[k * dst_stride] = Σ_c a[first + k*row_stride + c] * v[c]` for `k in 0..nrows` —
+    /// FOUR ROWS AT A TIME.
+    ///
+    /// `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. This is the shape the reduction's
+    /// step (12) needs and the one a naive row loop cannot get. Each output is a dot product,
+    /// i.e. a REDUCTION, and `s += row[c] * v[c]` is a serial dependency chain: the next FMA
+    /// cannot start until the previous one retires, so a loop written one row at a time runs at
+    /// one FMA per ~4 cycles no matter how wide the machine is, and LLVM may not reassociate it
+    /// because that would change the result. Four rows in flight gives four INDEPENDENT chains
+    /// and the latency is covered by the other three.
+    ///
+    /// IT IS BIT-EXACT, and that is the whole point of blocking by ROW rather than unrolling the
+    /// `c` loop. Each accumulator still sums its own row's terms in ascending `c`, exactly as the
+    /// one-row-at-a-time form did; only the interleaving of four independent sums changes.
+    /// Unrolling `c` into partial sums would have been the obvious move and it reassociates —
+    /// that one owes the tolerance argument, this one does not, and
+    /// `bidiag_blocked_output_is_bit_stable` is the test that says so.
+    #[inline]
+    fn dot_rows_into_f64(
+        a: &[f64],
+        row_stride: usize,
+        first: usize,
+        nrows: usize,
+        vlen: usize,
+        v: &[f64],
+        dst: &mut [f64],
+        dst_stride: usize,
+    ) {
+        let mut k = 0usize;
+        while k + 4 <= nrows {
+            let b0 = first + k * row_stride;
+            let r0 = &a[b0..b0 + vlen];
+            let r1 = &a[b0 + row_stride..b0 + row_stride + vlen];
+            let r2 = &a[b0 + 2 * row_stride..b0 + 2 * row_stride + vlen];
+            let r3 = &a[b0 + 3 * row_stride..b0 + 3 * row_stride + vlen];
+            let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for c in 0..vlen {
+                let vc = v[c];
+                s0 += r0[c] * vc;
+                s1 += r1[c] * vc;
+                s2 += r2[c] * vc;
+                s3 += r3[c] * vc;
+            }
+            dst[k * dst_stride] = s0;
+            dst[(k + 1) * dst_stride] = s1;
+            dst[(k + 2) * dst_stride] = s2;
+            dst[(k + 3) * dst_stride] = s3;
+            k += 4;
+        }
+        while k < nrows {
+            let b = first + k * row_stride;
+            let row = &a[b..b + vlen];
+            let mut s = 0.0f64;
+            for c in 0..vlen {
+                s += row[c] * v[c];
+            }
+            dst[k * dst_stride] = s;
+            k += 1;
+        }
     }
 
     /// Sign convention matching LAPACK `dlarfg`: treats `+0.0` as positive.
@@ -31970,29 +32043,33 @@ mod bidiag {
                     && rayon::current_num_threads() > 1
                 {
                     note_parallel_branch(2);
-                    x.par_chunks_mut(ldx)
+                    // `X_ROW_CHUNK` rows per task, not one. The previous form handed rayon one
+                    // row per item, so at nb=8 each item was an 8-element slice carrying a
+                    // single dot product; the chunking is what lets the blocked kernel see four
+                    // rows at once inside a task.
+                    let base = (i + 1) * ldx;
+                    let first_row = i + 1;
+                    x[base..]
+                        .par_chunks_mut(ldx * X_ROW_CHUNK)
                         .enumerate()
-                        .skip(i + 1)
-                        .take(xrows)
-                        .for_each(|(r, xrow)| {
-                            let start = at(r, i + 1);
-                            let arow = &a_ro[start..start + vlen];
-                            let mut s = 0.0;
-                            for c in 0..vlen {
-                                s += arow[c] * vrow[c];
-                            }
-                            xrow[i] = s;
+                        .for_each(|(t, chunk)| {
+                            let rows = chunk.len() / ldx;
+                            let start = at(first_row + t * X_ROW_CHUNK, i + 1);
+                            dot_rows_into_f64(
+                                a_ro,
+                                lda,
+                                start,
+                                rows,
+                                vlen,
+                                vrow,
+                                &mut chunk[i..],
+                                ldx,
+                            );
                         });
                 } else {
-                    for r in (i + 1)..m_sub {
-                        let start = at(r, i + 1);
-                        let arow = &a_ro[start..start + vlen];
-                        let mut s = 0.0;
-                        for c in 0..vlen {
-                            s += arow[c] * vrow[c];
-                        }
-                        x[r * ldx + i] = s;
-                    }
+                    let base = (i + 1) * ldx;
+                    let start = at(i + 1, i + 1);
+                    dot_rows_into_f64(a_ro, lda, start, xrows, vlen, vrow, &mut x[base + i..], ldx);
                 }
                 // (13) stash y[i+1.., 0..=i]^T * v.
                 //
