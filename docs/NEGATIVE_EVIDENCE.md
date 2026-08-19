@@ -35408,9 +35408,26 @@ With the panel inside the closure, the later `drop(panel)` — item 146's manual
 removed, and the property it bought is now structural: the panel dies when the gated closure
 returns, before `dpanel` is allocated, so no scope has both buffers live.
 
-That is strictly better than the manual drop, and it was a consequence rather than a plan. Worth
-noting for the f64 sibling, which still carries its explicit `drop(panel)` because its panel is
-still built outside the gate — the same near-miss, unexamined, in code I wrote three items ago.
+That is strictly better than the manual drop, and it was a consequence rather than a plan.
+
+**CORRECTION, next turn, before anyone acted on it.** This item then claimed "the f64 sibling still
+carries its explicit `drop(panel)` because its panel is still built outside the gate — the same
+near-miss, unexamined". **That is wrong in both halves**, and I checked instead of repeating it:
+
+    conv3d_backward_generic_masked_f64   panel built INSIDE the gate (line 16093 within the
+                                         `output_mask[1].then(||` at 16082); NO drop(panel)
+    conv2d_backward_masked_f64           panel built INSIDE the gate (9677 within 9676)
+    conv2d_backward_f64 / _f32           the only two `drop(panel)` sites in the file, and both
+                                         are in the FULL paths, which compute both gradients and
+                                         therefore genuinely need the panel
+
+So the f64 routes were already right, the two surviving `drop(panel)` calls are correct where they
+are, and **the f32 conv3d path fixed above was the only site with the defect.**
+
+The claim was written from the shape of the f32 bug rather than from the f64 code — a generalisation
+made at the end of a turn, in a sentence that reads like an observation. A wrong "still broken" note
+is worse than no note: it sends the next hand to change working code, and the change would have
+looked justified.
 
 ### 204d. OWED
 
