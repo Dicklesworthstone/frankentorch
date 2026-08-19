@@ -35993,3 +35993,57 @@ detector needs its false positives designed out, not annotated.
 
 A second certified `conv2d_xl` row. Then the same paired treatment for items 176/187/201, none of
 which has a number either.
+
+## 213. THE UNBUILT STACK IS NOW COMPILED AND FOUR OF ITS TESTS HAVE RUN — INCLUDING BOTH MASKED-GRADIENT GUARDS
+
+`frankentorch-l2zki` / `frankentorch-hi9r6`. Compiled and run through `rch` on a REMOTE worker, so
+none of this touched the local run queue — which mattered, because the host was at runq 84 with CPU
+idle 0. `df` 320-327G throughout. **No ratio was measured and none is claimed**: the orchestrator's
+instruction not to certify in this window is unaffected, because nothing below is a timing.
+
+### 213a. THE RISK ITEM 210c NAMED DID NOT MATERIALISE
+
+Item 210 ended by flagging one specific hazard: `ft-api`'s conv3d f32 closure calls
+`conv3d_backward_masked_f32`, whose parameter list had just lost `has_bias`, and `ft-api` had not
+been re-checked since. **`cargo check -p frankentorch-api --lib` exits 0 with no warnings.**
+
+The reason it was already correct is worth recording: when item 204 wired that closure it replaced
+the `has_bias,` argument line with the mask rather than adding the mask beside it, so the call never
+passed both. The flag was still right to raise — I could not know that without checking, and the
+alternative was to leave a signature change unverified against its only caller.
+
+### 213b. EVERYTHING COMPILES, INCLUDING WHAT HAD NEVER BEEN COMPILED
+
+    cargo check -p frankentorch-kernel-cpu --lib            exit 0, no warnings
+    cargo check -p frankentorch-api --lib                    exit 0, no warnings
+    cargo check -p frankentorch-kernel-cpu --lib --tests     exit 0   <- the test module
+    cargo check ... -p both --examples                       exit 0   <- harness + probes
+
+That covers items 151-212's Rust: the masked gradients for conv2d/conv3d in f64 and f32, the
+`build_uninit` conversions, the blocked transposes, the GEMM tile toggle, the harness's round-warmup,
+slot-0 field, oversubscription banner and rounds hint, and the two probes.
+
+### 213c. FOUR TESTS RAN, AND ALL FOUR PASS
+
+    conv2d_backward_masked_matches_the_unmasked_path_on_every_mask   ok
+    conv3d_backward_masked_matches_the_unmasked_path_on_every_mask   ok
+    conv2d_f64_results_do_not_depend_on_rayon_pool_width             ok
+    conv3d_and_f32_forwards_do_not_depend_on_rayon_pool_width        ok
+
+The first two are the ones that mattered. Items 180a and 196a argued that a wrong
+`needs_input_grad` read would **silently drop a real gradient** with no perf row able to show it,
+because the lanes that exercise those paths freeze their weight and never read `dweight`. Both
+guards assert presence AND bitwise equality on every mask, over all-ones and non-uniform `dout`, and
+both pass — so items 178, 195 and 204 produce identical gradients to the unmasked path and skip
+exactly what was asked.
+
+The determinism pair closes item 175a's separate worry: conv2d and conv3d, forward and backward, f64
+and f32, are bit-identical across pool widths 1, 3 and 8 — a property the h2h board structurally
+cannot see, since its parity column compares against PyTorch within one run at one width.
+
+### 213d. STILL OUTSTANDING
+
+The three full-panel equivalence tests (items 158, 160, 165) were still running when this was
+written and are not reported here. `cargo clippy` has not run. And no measurement: the host is
+oversubscribed, which by item 194's own gate makes any ratio taken now unquotable whatever its nulls
+say.
