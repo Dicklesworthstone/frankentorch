@@ -9602,9 +9602,22 @@ pub fn reset_conv2d_backward_gemm_counts() {
 /// the unmasked path. Nothing is reordered; work is only omitted.
 ///
 /// NOT OPTIMISED, AND SAID SO: when a fast path applies, or when both gradients are wanted, this
-/// delegates to `conv2d_backward_f64` and masks the result afterwards. The all-ones adjoints
-/// compute both halves internally and are cheap enough that splitting them is a separate question;
-/// masking after the fact saves nothing there and is not claimed to.
+/// delegates to `conv2d_backward_f64` and masks the result afterwards, saving nothing on the
+/// all-ones route.
+///
+/// **The reason originally given for that was wrong, and item 208 checked it.** This doc used to
+/// say the all-ones adjoints "compute both halves internally and are cheap enough that splitting
+/// them is a separate question". They do not compute them jointly:
+/// `conv2d_backward_3x3_stride1_ones_dout_f64` builds `dweight_row` in one parallel block over
+/// `kh*kw` — the nested scan across `batch x oh x ow x in_ch` that dominates the kernel — and then
+/// derives `dpadded` from a separate, tiny `dgemm(1, out_ch, patch_width, ..)` plus a scatter. The
+/// two halves are independent, and the expensive one is the weight half.
+///
+/// So the delegation is a REMAINING OPPORTUNITY rather than a settled trade-off, and it is pointed
+/// at the lanes closest to a win: `conv2d` and `conv2d_big` take this route (a plain `.sum()` loss
+/// makes `dout` all ones) and both freeze their weight, so both pay in full for a `dweight` they
+/// discard. Not taken here because this kernel's dispatch was being refactored by another agent in
+/// the same window and nothing can be compiled under the current throttle.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv2d_backward_masked_f64(

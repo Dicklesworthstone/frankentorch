@@ -35642,6 +35642,59 @@ demonstrably nulls. That is a new lane, it needs a compiler, and item 203 is a f
 what happens when a lane is sized against a threshold nobody measured — so it waits for the build,
 with three data points now in hand rather than folklore.
 
+## 208. ITEM 178's REASON FOR NOT MASKING THE ALL-ONES ROUTE IS FALSE — THE HALVES ARE SEPARABLE, AND THE LANES THAT PAY ARE THE ONES CLOSEST TO A WIN
+
+`frankentorch-hi9r6`. **UNBUILT**: absolute throttle, `/data` 38G, no cargo, no artifact written, no
+new file. `rustfmt --edition 2024 --check` exits 0.
+
+### 208a. THE CLAIM, AND WHAT THE CODE ACTUALLY DOES
+
+Item 178 masked conv2d's generic backward and deliberately left the all-ones route delegating,
+giving this reason in the shipped doc comment:
+
+> The all-ones adjoints compute both halves internally and are cheap enough that splitting them is
+> a separate question; masking after the fact saves nothing there and is not claimed to.
+
+Read rather than assumed, `conv2d_backward_3x3_stride1_ones_dout_f64` does no such thing:
+
+    dweight  `dweight_row` built by one `par_chunks_mut(kh*kw)` block whose body is the nested
+             scan over `batch x oh x ow` for every `(c, kr, kc)` — the dominant cost — then
+             broadcast across `out_ch` rows by `copy_from_slice`
+    dinput   a separate `dgemm(1, out_ch, patch_width, ..)` against a `vec![1.0; out_ch]`,
+             producing one `dpanel_row`, then a scatter
+
+Two independent halves, and **the expensive one is the weight half**. The deferral was reasonable
+when written and its stated reason is simply not true of the code.
+
+### 208b. WHY IT MATTERS MORE THAN THE GENERIC ROUTE DID
+
+The lanes that take this route are `conv2d` and `conv2d_big` — a plain `.sum()` loss makes `dout`
+all ones — and **both freeze their weight** (`timed_conv2d(.., weight_grad = false)`). So both pay
+in full, every round, for a `dweight` that is discarded on return.
+
+Those are also the lanes reading closest to a win: item 144's table has `conv2d_big` at 1.15-1.25x
+FASTER, uncertified only because our own null failed. This is the one masking opportunity left that
+lands on a lane that could flip rather than merely narrow.
+
+### 208c. NOT TAKEN, AND WHY THAT IS NOT THE USUAL EXCUSE
+
+Another agent was refactoring this exact dispatch in the same window — they introduced
+`ConvOnesRoute` and `conv2d_ones_dout_route()`, and in doing so **already removed the duplicated
+route predicate that item 180c flagged in my masked function**, which is why that hazard is gone
+without my touching it.
+
+Restructuring the kernel they are mid-refactor on, with no compiler, would risk their work for a
+change I cannot verify. The doc comment now records the corrected reason at the point of decision,
+so the next hand sees "remaining opportunity" rather than "settled trade-off" — which is what the
+old text said.
+
+### 208d. WHAT WOULD DO IT
+
+The same shape as items 195 and 204: `output_mask` on the adjoint, old name kept as a thin wrapper
+for its two callers, and `conv2d_backward_masked_f64` routing ones+partial to it instead of
+delegating wholesale. Gate the weight half; leave the `dgemm`-and-scatter half alone. Then the
+paired run on `conv2d`/`conv2d_big`, which per item 193b needs a `--features fair-alloc` binary.
+
 ## 208. FOURTH REPLICATION OF THE BANKED ROW; DOUBLING THE ROUNDS DOES NOT RESCUE THE SUMMED LANE; AND THE SLOT DIAGNOSTIC POINTS THE OTHER WAY
 
 `frankentorch-hi9r6`. MEASURED, one invocation at 32 rounds. No cargo (disk 38G, below the brake);
