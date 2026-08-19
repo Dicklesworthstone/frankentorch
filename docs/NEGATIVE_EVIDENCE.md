@@ -37372,3 +37372,57 @@ is the instrument, not the constant: **the DIRECT figure is printed per run**, w
 resolution at which it is true. Item 230f's threshold table should be read per sweep shape, not as
 two universal numbers — and it holds up when it is: at `DIRECT=17.37` over a 16 s window the formula
 demands a starting load of ~16, the run started at 23.21, and its drift gate PASSED.
+
+## 232. ALL THREE GATED CALLERS ENUMERATED, AND THE GATE'S EXPOSURE GROWS WITH n — PLUS A VOID RUN THE BLOCK-SPREAD COLUMN CAUGHT
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. Enumeration and arithmetic only; **the
+measurement this bead needs did not happen and is not reported as a result.**
+
+### 232a. THE VOID RUN, AND WHAT NOTICED
+
+Item 231's SVD lane was re-run with `FT_LINALG_PARALLEL_GATE` raised, to test whether the gate
+explains that item's unexplained variance residue. Loadavg went 39 → 75 → 102 during the four
+invocations, with four peer local builds live. One PyTorch block read **147 ms** against a normal
+~1.5 ms, producing a nonsense "FT 52.21x FASTER" cell, and PT block spreads of **32.9x and 9.7x**.
+
+**No number from that window is readable and none is quoted.** What is worth recording is that
+the `block spread` column added with the lane in item 231 is what made it obvious: a 32.9x spread
+on the arm that is normally steady to ~1% cannot be read as anything but contention. The ratio
+column alone would have shown a 52x "win" and a plausible-looking 1.58x, and nothing else in the
+lane would have objected. **A cheap per-arm dispersion column caught what the ratio could not**,
+which is the same lesson as item 229's variance finding arriving from the instrument side.
+
+### 232b. THE THREE CALLERS, AND THEIR EXPOSURE
+
+`reduce_scaled_rows_f64` and `apply_scaled_rank1_f64` are called from exactly three places:
+
+    caller                  work per step              parallel when        routed around?
+    bidiag_form_p_f64       (n-1-i) x (n-1-i)          n-1-i >= 128         YES, n >= 130 -> blocked (item 229)
+    bidiag_form_q_f64       (m-i) x (n-i)              n-i   >= 128         NO
+    dlabrd_panel_f64        (m_sub-i) x (n_sub-i-1)    trailing >= ~128²    NO
+
+At square `n` the count of steps landing on the parallel path is roughly:
+
+    form_p   max(0, n-128)     form_q   max(0, n-127)     dlabrd_panel   ~first n-128 panel steps
+
+**Two consequences.**
+
+* **Item 229 fixed one of three call sites.** `form_q` is called unconditionally by
+  `svd_blocked_bidiag_prologue` whenever `track_left` is set, and has no blocked variant at all;
+  `dlabrd_panel_f64` is inside the reduction that item 36 measured at 57.8% of a square SVD.
+  So the SVD forward item 231 measured at 1.6-1.7x SLOWER still runs two thrashing call sites,
+  and **that is the standing hypothesis for its unexplained variance residue** — stated as a
+  hypothesis, because the run that would have tested it is the void one above.
+* **Exposure grows linearly with n.** At n=136 it is ~8-9 steps of ~136; at n=256 it is ~128 of
+  256. Item 229 already measured what that costs on `form_p` at n=256: 22.3-37.3 ms on the
+  default gate against 3.30-3.42 ms with it raised, a **7-11x** penalty. If `form_q` and
+  `dlabrd_panel` behave the same way — untested — the gate is a far larger term at large n than
+  the threshold item 229 moved.
+
+### 232c. WHAT IS OWED BEFORE ANY OF THIS SHIPS
+
+Unchanged from the bead, and none of it is discharged here: the tolerance argument for each
+caller whose bits move (`REDUCE_CHUNK_ROWS` is fixed precisely because the parallel partial-sum
+tree associates differently), a per-call-site A/B across the gate, and a route test pinning the
+outcome from OUTSIDE as `svd_prologue_routes_form_p_across_the_measured_threshold` now does.
+The A/B needs a window this host did not offer today.
