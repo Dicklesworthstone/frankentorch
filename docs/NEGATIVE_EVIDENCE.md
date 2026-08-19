@@ -37165,3 +37165,123 @@ threads they were.
 property of the harness AT A LANE COUNT and AT A POOL WIDTH: 5.59 is this build's, at 8 threads, and
 it will rot exactly as +0.62 did the moment either changes. The difference is that the rows now say
 which.
+
+## 231. THE SVD ROW ITEM 229 OWED: SQUARE SVD FORWARD IS 1.6-1.7x SLOWER THAN PyTorch — A LOSS, AND THE THRESHOLD FIX IS BELOW THIS INSTRUMENT'S RESOLUTION
+
+`frankentorch-4zjaa`. Item 229 moved the `form_p` dispatch to its measured crossover and priced
+the move **FT-vs-FT** at 1.33-1.51x on the expansion. Section 1 calls that MAINTENANCE, and the
+row it owed was a live vs-incumbent arm. Here it is, and it says we are **behind**.
+
+### 231a. THE ROW
+
+`crates/ft-api/examples/svd_square_threshold_h2h.rs`, local build, ELF `7700295329a4f612`.
+SVD FORWARD ONLY (full U, S, Vʰ). `RAYON_NUM_THREADS=8`, `torch.set_num_threads(8)` — matched.
+Incumbent PyTorch 2.12.1+cpu, self-reported in the SAME invocation. Host thinkstation1,
+5975WX, governor powersave. Estimator: min of 5 per block, blocks ABBA-balanced
+(FT, PT, PT, FT), min over each arm's two blocks. iowait 0, D-state 0 at launch.
+
+    run   n=128                    n=136                    loadavg     MHz (FT/PT)
+    1     FT 2.052  PT 1.312       FT 2.377  PT 1.446       17.7-18.1   3254-3414 / 3264-3434
+    2     FT 2.479  PT 1.256       FT 2.446  PT 1.519       17.3-17.5   3142-3431 / 2771-3290
+    3     FT 2.141  PT 1.341       FT 2.434  PT 1.448       17.2-17.4   3296-3335 / 3274-3414
+
+    n=128   FT 1.56x, 1.97x, 1.60x SLOWER
+    n=136   FT 1.64x, 1.61x, 1.68x SLOWER      <- 1.04x spread across three invocations
+
+**Parity MATCH in all six rows** — the singular-value sums agree to rel 1.28e-16 (n=128) and
+2.40e-16 (n=136). U and Vʰ are deliberately NOT compared: they are determined only up to
+sign and up to rotation within equal singular values, so comparing them would fail on a
+correct implementation.
+
+**STANDING: square SVD forward is 1.6-1.7x SLOWER than PyTorch at n=136**, the tightest of the
+two sizes. n=128 is noisier (1.56-1.97x) and its spread is ours, not the host's — see 231c.
+
+### 231b. WHAT IT SAYS ABOUT ITEM 229's FIX, STATED AGAINST MY OWN INTEREST
+
+**The threshold fix is not visible in this row, and the arithmetic says it should not be.**
+Item 229 priced the blocked expansion at 462-586 µs against 697-781 µs unblocked at n=136 — a
+saving of ~0.15-0.25 ms. This lane's whole forward is ~2.4 ms, so the fix is worth ~6-8% of it,
+which is under the 4% inter-run spread at n=136 and well under the 26% spread at n=128.
+
+So: **item 229's 1.33-1.51x is a real number about a component that is roughly a fifth of the
+forward, and anyone quoting it as an SVD speedup would be overstating it by about 5x.** The
+component figure and the whole-op figure are both correct and they are answers to different
+questions. I am recording that here because the temptation to let a component win stand in for
+an op win is exactly what item 229 caught item 65 doing at a larger scale.
+
+### 231c. THE INCUMBENT'S ARM IS STEADIER THAN OURS, AGAIN
+
+    block spread (max/min of an arm's two blocks)
+    n=128   FT 1.069x  1.147x  1.212x        PT 1.016x  1.155x  1.002x
+    n=136   FT 1.162x  1.031x  1.169x        PT 1.003x  1.011x  1.009x
+
+At n=136 PyTorch's two blocks agree to **0.3-1.1%** across every invocation while ours differ by
+up to **17%**. That is the same signature item 229 found in the `form_p` expansion — our path's
+cost moves with the host in a way the incumbent's does not — and it is now visible at the whole-op
+level, on a lane where the thrashing gate has already been routed around. **So routing around the
+gate for `n >= 130` did not remove the variance from the SVD forward; something else in this path
+carries it too.** That is the more interesting residue of this row and it is unexplained.
+
+### 231d. WHAT THIS ROW IS NOT
+
+No A/A null, and the arms interleave at BLOCK level rather than sample level, so this is weaker
+than a certified `gauntlet_lane_sweep_h2h` row and must not be quoted as one. It is ABBA-balanced
+so a monotone ramp lands on both arms equally, both arms ran in one invocation on one host with
+matched thread counts, and the parity column is real — which is enough to bank a LOSS, which is
+what it is. A row this shape would need the full gate treatment before it could bank a WIN.
+
+Also: our own measurement raised the 1-minute loadavg from 8.2 to 18.1 over the three runs. Both
+arms sat in the same window each time, but the *level* is ours, not the host's — the standing
+guidance to seek a quiet window cannot make this lane quiet, because the lane is the load.
+
+### 231e. THE TARGET THIS CREATES
+
+Square SVD forward at n=128-136 is a **1.6-1.7x loss**, measured, parity-clean, with the incumbent
+in the same process. `form_p` is ~20-25% of it and is now dispatched correctly; the reduction
+(`bidiag_blocked_f64`) and the QR sweep are the rest and have no vs-incumbent number at these
+sizes. That is where the remaining 1.6x lives and it is the next thing to phase-split.
+
+### 230e. REPLICATED, AND THE TWO ESTIMATORS AGREE WHEN THE HOST IS QUIET
+
+Second full sweep, same ELF, same window, no peer bench and no concurrent measurement:
+
+    run 1   DIRECT=5.59   rise=+8.22   window=210s   start 16.45 -> peak 24.67
+    run 2   DIRECT=6.36   rise=+5.99   window=162s   start 13.71 -> peak 19.70
+
+The direct figure replicates to within 14%. More usefully, **run 2's loadavg rise (+5.99) lands on
+its direct CPU-time figure (6.36)** — the two instruments, one measuring the machine and one
+measuring us, agree to 6% once no peer is compiling. Run 1's +8.22 against 5.59 is the same
+agreement with a peer's residual on top. That is the cross-validation the direct estimator needed,
+and it comes from a quantity no peer can touch.
+
+### 230f. SO THE DRIFT GATE HAS BEEN MEASURING SWEEP LENGTH
+
+Put the self-load figure into the gate's own arithmetic. The gate refuses at a 1.25x relative move,
+and loadavg responds to a sustained step by `1 - exp(-T/60)` over a window of `T` seconds. A run
+therefore passes only when
+
+    start_load  >=  4 x self_load x (1 - exp(-T/60))
+
+With self-load ~6 at `lane_count=43`:
+
+    full sweep   T=210s   response 0.97   ->  needs start >= ~23
+    two lanes    T=7s     response 0.11   ->  needs start >= ~2.6
+
+**A short sweep passes the drift gate at almost any host load, and the full sweep cannot pass below
+about 23 however quiet the box is.** Both of today's full sweeps failed it — run 1 at start 16.45,
+run 2 at start 13.71 — with no peer bench live in either.
+
+This is not a new gate failure mode; it is the old one with a number on it. `frankentorch-vyaia`
+observed that this session's certifications came at starting loads of **20-38** and its failures
+clustered on quiet starts, and read that as surprising. The arithmetic above puts the boundary at
+~23, inside that band. The gate was never ranking host quality; it was ranking how much room our own
+burst had to look small.
+
+TWO CONSEQUENCES WORTH CARRYING:
+
+- **A narrow-lane run's passing drift gate is close to vacuous.** It passes because a 7-second window
+  cannot show a step, not because the host held still. Item 228's two-lane run read `18.34 -> 18.40`
+  and PASSED, and that pass carries almost no information. Rows from short sweeps need the A/A nulls
+  and `concurrent_measurements` to do the work the drift gate is not doing.
+- **The gate is passable by waiting for load, not for quiet** — which is the reverse of every
+  runbook instruction in this repo, and is worth stating in the one place people read before a run.
