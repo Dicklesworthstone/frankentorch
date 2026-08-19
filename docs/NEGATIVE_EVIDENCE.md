@@ -36763,3 +36763,52 @@ Not a re-run. Item 221 ends by asking whether the lever should stop depending on
 cache at all — that is a design question about `ft-core::buffer_pool`, owned by the item that found
 it, and it is the live work on this bead. I have not started it: it is a peer's finding one item
 old, and duplicating it would be worse than leaving it.
+
+## 225. THE QUIETEST WINDOW OF THE SESSION COLLAPSED MID-RUN — SIX ROWS DISCARDED, INCLUDING ONE WHOSE GATES BOTH PASSED
+
+`frankentorch-hi9r6`. **A void run, recorded because discarding it was the decision.**
+
+The window was the best I had seen: idle 88-89%, runq 6-11, loadavg 12.31 and falling, slot free,
+`concurrent_measurements=none`. I started one invocation meant to do two things at once — certifiable
+rows at batch 16, and the warm/cold A/B that items 147, 149, 167, 169 and 190 have circled for many
+turns without ever measuring it inside a single process.
+
+Its own gate refused it:
+
+    load_1m start=32.93 end=50.13
+    drift_gate=LOAD-DRIFTED — no row from this invocation is quotable, whatever its nulls say
+    load_series n=34 worst_drift=1.811x endpoint_gate=DRIFTED series_gate=DRIFTED
+
+Load was 10.65 when I checked immediately before launching and 50.13 by the end. **A quiet window at
+the start is not a quiet window.**
+
+### 225a. WHAT WAS DISCARDED, AND THE ONE THAT MATTERED
+
+Six rows, one of which — `conv2d_big_masked_tile` — came back with **PT PASS and FT PASS**, no
+NULL-FAILED line, sitting in the output looking exactly like a certifiable row.
+
+It is not one, and quoting it would have been the whole failure mode this ledger exists to prevent.
+The drift gate's wording is deliberate — *whatever its nulls say* — because a null asks whether an
+arm is self-consistent, and both arms can be consistently wrong together while the host moves under
+them. Item 194 made the same point about oversubscription and passing nulls; this is the drift
+version, and it arrived with a genuinely tempting row attached.
+
+### 225b. THE TWO GATES ARE NOT REDUNDANT
+
+Item 194's oversubscription banner did NOT fire on this run — the peak stayed under `online_cpus`
+for long enough — while the drift gate did, at 1.811x. The reverse happened in item 194's own case:
+steady load 79-88, drift gate PASS, every ratio a contention artefact.
+
+**Neither gate subsumes the other.** One asks whether the machine was oversubscribed, the other
+whether it was the same machine at the end as at the start, and a run needs both. Item 49's series
+gate agreed with the endpoint gate here, so the excursion was not a mid-run spike the endpoints
+missed — it was a monotone climb.
+
+### 225c. STILL UNANSWERED
+
+The warm/cold A/B. Item 190 built `conv2d_masked_warm` precisely so the comparison could live inside
+one invocation, and this was its first real attempt. The pair needs a window that stays quiet for
+the length of a 32-round six-lane sweep, which is a stronger requirement than the window looking
+quiet when you press go — and on this host, over roughly fifteen hours, that has held perhaps twice.
+
+No retry: within three minutes of the run finishing, loadavg was 57.89 with runq 81.
