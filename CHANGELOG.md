@@ -6,6 +6,154 @@ FrankenTorch is a clean-room Rust reimplementation of PyTorch targeting complete
 
 Repository: <https://github.com/Dicklesworthstone/frankentorch>
 
+There are **no GitHub Releases**. The only git tag is
+[`ft2-snapshot`](https://github.com/Dicklesworthstone/frankentorch/tree/ft2-snapshot)
+(2026-06-27, a snapshot tag, not a published release). Workspace version
+remains `0.1.0`. Milestones 1–7 below are the original 2026-02-13 ..
+2026-03-14 reconstruction (187 commits, ~98k LOC). The current-window
+update on 2026-08-19 covers **2026-03-15 through HEAD**: **5,453
+non-merge commits**, bringing `main` to **5,653** commits / ~487k lines
+under `crates/`.
+
+---
+
+## [Unreleased] — HEAD on main (workspace version 0.1.0)
+
+Latest commit: [`cb836c76cc`](https://github.com/Dicklesworthstone/frankentorch/commit/cb836c76cc3bcb2562eb6e92bad97df20cef341c)
+(2026-08-19). Do not dump the 5,453-commit window as a diff list; the
+waves below are capability clusters. Historical crate-line counts in
+"Crate Inventory" are the 2026-03-14 snapshot.
+
+### 2026-08-19 — Repo-janitor docs-reorg
+
+Root planning and parity documents moved into [`docs/planning/`](docs/planning/).
+Live janitor commits:
+
+- [`248a73282e`](https://github.com/Dicklesworthstone/frankentorch/commit/248a73282eb08c3cb6b46c2e9a57f5545fd81176)
+  untrack skill-loop scratch; move
+  `COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md`,
+  `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1_REFERENCE.md`,
+  `PLAN_TO_PORT_PYTORCH_TO_RUST.md`, and `PROPOSED_ARCHITECTURE.md`
+  into `docs/planning/`.
+- [`f630043da6`](https://github.com/Dicklesworthstone/frankentorch/commit/f630043da60ab35ba206a67d584df5163bb1a5a3)
+  untrack beads recovery snapshots already gitignored.
+- [`cb836c76cc`](https://github.com/Dicklesworthstone/frankentorch/commit/cb836c76cc3bcb2562eb6e92bad97df20cef341c)
+  move remaining root planning/parity docs:
+  `FEATURE_PARITY.md`, `EXHAUSTIVE_LEGACY_ANALYSIS.md`,
+  `EXISTING_PYTORCH_STRUCTURE.md`, `EXECUTION_TODO_GRANULAR.md`,
+  `FRANKENSQLITE_ADAPTATION_CROSSWALK.md`, `PARITY-COVERAGE.md`,
+  `PHASE2C_EXTRACTION_PACKET.md`, `PROFILING-RESULTS.md`, and
+  `UPGRADE_LOG.md` → `docs/planning/`.
+
+Canonical paths: [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md),
+[`docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md`](docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md),
+[`docs/planning/EXISTING_PYTORCH_STRUCTURE.md`](docs/planning/EXISTING_PYTORCH_STRUCTURE.md).
+
+### 2026-08 — Measurement integrity and vs-PyTorch kernel campaign (909 commits)
+
+August is `chore` (295) + `perf` (170) + `measure` (168). The work is a
+head-to-head vs live PyTorch campaign with an explicit A/A null, a
+measurement-slot so two harnesses cannot silently void each other, and
+a standing rule that a remembered incumbent number is not a result.
+
+**Delivered capability**
+
+- SVD blocked-bidiag / compact-WY `form_p`, panel-width 16→8, parallel
+  gate 1<<14 → 1<<18; square SVD forward still **1.6–1.7× slower** than
+  PyTorch (reported as a loss).
+- conv2d training route banked at **2.19× slower**; `conv2d_xl`
+  **1.46–1.51× faster**; tile toggle on the certified lane is a
+  **regression** (item 217 does not transfer). The f32 conv2d penalty
+  was located **outside** both kernels (session/tape widen).
+- `avg_pool1d` certified **2.70–2.85× faster** than PyTorch; several
+  max-pool specializations; a full-coverage maxpool3d backward rejected
+  at 1.51× slower.
+- Library-level Rayon **width policy** (`qq8as`), default OFF: 42 of 47
+  board lanes gain at 8 vs 16 threads, 5 lose, worst 0.92×.
+- Safe recycle pool for dense f64 backward buffers; Metal crate
+  (`ft-kernel-metal`) continues from the July land.
+
+**Representative commits**
+
+- [`0ce06381`](https://github.com/Dicklesworthstone/frankentorch/commit/0ce06381) `conv2d_xl` 1.46–1.51× faster, 3/3 certified
+- [`31dd7cb9`](https://github.com/Dicklesworthstone/frankentorch/commit/31dd7cb9) conv2d training route 2.19× slower
+- [`25ee311d`](https://github.com/Dicklesworthstone/frankentorch/commit/25ee311d) `avg_pool1d` 2.70–2.85× faster
+- [`af3d96e0`](https://github.com/Dicklesworthstone/frankentorch/commit/af3d96e0) library-level Rayon width policy
+- [`37af93ec`](https://github.com/Dicklesworthstone/frankentorch/commit/37af93ec) SVD blocked compact-WY `form_p`
+- [`c56b338c`](https://github.com/Dicklesworthstone/frankentorch/commit/c56b338c) recycle dense f64 backward buffers
+
+### 2026-06 — 2026-07 — Performance campaign and Metal (2,611 commits)
+
+June is the largest month in the project (2,306 commits: 825 `perf`).
+July continues the same vein (305) and lands `ft-kernel-metal`.
+[`ft2-snapshot`](https://github.com/Dicklesworthstone/frankentorch/tree/ft2-snapshot)
+is a tag on the 2026-06-27 f32 `hardshrink` fast path, not a release.
+
+**Delivered capability**
+
+- f32 no-grad and training fast paths: `softshrink` 8.14× loss → 3.13×
+  faster; `rot90` f32 31× slower → ~8.5×; `diagonal` 2929× slower →
+  2.82× (asymmetric-dtype clone bug, now at torch's view ceiling);
+  interpolate native f32 (was `F32 ERROR`).
+- Fused conv2d training grad via custom autograd + col2im (~12–13×
+  self); SDPA `enable_gqa` for grouped-query attention; differentiable
+  `ifft`; Bessel j/y/k autograd.
+- July fused kernels vs torch: `tensor_gradient_dim` ~6–14× faster;
+  `asinh`/`atanh` flip to faster; RoPE 2.33–3.18×; bitwise family
+  12.6–13.5× vs original; `var_dim`/`std_dim` backward 4.1×/5.2×.
+- **New crate:** `ft-kernel-metal` — Metal GPU GEMM + fused encoder ops
+  ([`bebc446c`](https://github.com/Dicklesworthstone/frankentorch/commit/bebc446c),
+  2026-07-02) plus a generic compute gateway
+  ([`5dbcc1d2`](https://github.com/Dicklesworthstone/frankentorch/commit/5dbcc1d2)).
+
+**Representative commits**
+
+- [`ad7a969f0b`](https://github.com/Dicklesworthstone/frankentorch/commit/ad7a969f0b) `softshrink` 8.14× loss → 3.13× faster
+- [`19a7e0e573`](https://github.com/Dicklesworthstone/frankentorch/commit/19a7e0e573) f32 `diagonal` 2929× → 2.82×
+- [`ab495639fd`](https://github.com/Dicklesworthstone/frankentorch/commit/ab495639fd) fused conv2d training grad
+- [`7839ca1b3a`](https://github.com/Dicklesworthstone/frankentorch/commit/7839ca1b3a) SDPA `enable_gqa`
+- [`7c5fc4543c`](https://github.com/Dicklesworthstone/frankentorch/commit/7c5fc4543c) fused `torch.gradient` last-dim
+- [`bebc446c`](https://github.com/Dicklesworthstone/frankentorch/commit/bebc446c) `ft-kernel-metal` GEMM crate
+- [`79a8c78f3f`](https://github.com/Dicklesworthstone/frankentorch/commit/79a8c78f3f) linalg surface + cummax/cummin
+
+### 2026-05 — `ft-api` surface expansion (1,605 commits)
+
+May is almost a single workstream: **488 `ft-api:` commits** wrapping
+PyTorch-shaped functionals — view/reshape, losses, pooling, tokenizer
+utilities, `soft_nms`, `multi_head_attention_forward`, random
+distributions, `diag_indices`/`gcd`/`lcm`/`as_strided`, linalg aliases
+(`inv`/`solve`/`pinv`), in-place tril/triu/fill_diagonal, special
+functions, bitwise NOT. This is the month the public tensor API stopped
+looking like a vertical slice.
+
+**Representative commits**
+
+- [`a1b5182282`](https://github.com/Dicklesworthstone/frankentorch/commit/a1b5182282) `multi_head_attention_forward`
+- [`30a1ca3800`](https://github.com/Dicklesworthstone/frankentorch/commit/30a1ca3800) functional linalg aliases
+- [`fa455528aa`](https://github.com/Dicklesworthstone/frankentorch/commit/fa455528aa) `soft_nms`
+- [`b99310fab5`](https://github.com/Dicklesworthstone/frankentorch/commit/b99310fab5) SIMD ReLU kernels
+
+### 2026-03-15 — 2026-04 — Review hardening and new ops (328 commits)
+
+April is a correctness/review month (120 `fix`, 26 `[review-fix]`) plus
+the first sparse COO/CSR ops, `conv3d`/`conv_transpose`, STFT/ISTFT,
+`affine_grid`/`grid_sample`, and complex construction.
+
+**Representative commits**
+
+- [`e5d33d2edd`](https://github.com/Dicklesworthstone/frankentorch/commit/e5d33d2edd) sparse COO/CSR tensor operations
+- [`663b8046c2`](https://github.com/Dicklesworthstone/frankentorch/commit/663b8046c2) `conv3d`, `conv_transpose`, adaptive pooling
+- [`69f3bc8768`](https://github.com/Dicklesworthstone/frankentorch/commit/69f3bc8768) complex construction, STFT/ISTFT, `grid_sample`
+- [`d9031ea5d4`](https://github.com/Dicklesworthstone/frankentorch/commit/d9031ea5d4) `baddbmm`/`addbmm`/`scaled_dot_product_attention`
+
+### HEAD crate map (additive since Milestone 7)
+
+| Crate | Notes at HEAD |
+|-------|----------------|
+| `ft-kernel-metal` | **New** (2026-07-02). Metal GEMM + fused encoder ops + compute gateway. |
+| `ft-api` / `ft-nn` / `ft-kernel-cpu` / `ft-autograd` | Primary growth surface; combined crates tree ~487k LOC. |
+| remaining crates from Milestone 7 | Still present: `ft-core`, `ft-dispatch`, `ft-conformance`, `ft-runtime`, `ft-optim`, `ft-data`, `ft-serialize`, `ft-device`. |
+
 ---
 
 ## Milestone 7 -- Dtype Generalization, Data Pipeline, and SafeTensors (2026-03-12 .. 2026-03-14)
