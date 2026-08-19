@@ -36952,3 +36952,59 @@ item 221's table may be a load artifact wearing a mechanism's clothes.
 * The rule I broke is already written down and I am writing it down again because it cost real
   work: **preflight the ledger for the lever you are about to file, not just the one you are
   about to run.** The refutation was in the function I was reading.
+
+## 228. THE WARM/COLD A/B FINALLY RAN AND ANSWERED NOTHING — BECAUSE THE DEFECT IT TESTS WAS NOT PRESENT IN THE CONTROL
+
+`frankentorch-hi9r6`. **Not quotable**, and for a reason I did not put there: a peer's detector fired
+`concurrent_measurements=2 DETECTED: criterion-bench[3605057] criterion-bench[3971008]`. Its own
+message is the ruling — *both runs' arms are contended and NEITHER is quotable however its gates
+read.*
+
+Everything else about the window was the best of the session: `load_1m` 18.34 -> 18.40,
+`worst_drift=1.003x`, both drift gates PASS, iowait 1-4%, runq 7-11, and item 226's exact matching
+kept the sweep to the two lanes intended instead of six.
+
+    lane                 FT(ms)   slot0/med(1..3)   FT null       PT null
+    conv2d_masked         8.219   1.007             0.997 PASS    1.052 FAIL
+    conv2d_masked_warm    8.251   1.023             1.006 PASS    1.053 FAIL
+
+### 228a. THE EXPERIMENT WAS SOUND AND THE ANSWER IS EMPTY
+
+Items 147, 149, 167, 169, 190 and 226 all led here: warm one lane per round, leave its byte-identical
+twin cold, run both in one process against one incumbent. It finally ran that way.
+
+**And there was nothing to fix.** The cold lane's slot-0 ratio was 1.007 — no cold first sample at
+all. Item 147 measured that same quantity at **1.275 and 1.313** on this lane, and 1.305-1.363 on
+`conv2d_big`. The defect the warm-up exists to remove was simply absent from the control arm, so the
+warmed twin's 1.023 says nothing about whether warming works.
+
+That is not a null result about the mechanism. It is a run that could not have produced one.
+
+### 228b. THE DESIGN ERROR, WHICH IS MINE
+
+**An A/B for an INTERMITTENT defect needs a precondition check: confirm the defect is present in the
+control before reading the treatment.** Item 190 built the twin, item 226 shortened the sweep, and
+neither added the one guard that makes the comparison meaningful — a run where the control's slot-0
+sits at 1.007 should be discarded before its treatment arm is even looked at.
+
+Six items of instrument-building went into an experiment that can silently no-op, and the no-op looks
+exactly like "the warm-up didn't help".
+
+### 228c. WHAT IS NOW KNOWN ABOUT THE DEFECT ITSELF
+
+Pooling what the slot-0 field has printed since item 169 made it automatic: **1.275-1.363 in items
+147/149, 1.171 in item 190's run, 1.049 and 1.015 in item 216's, 1.024/0.939/0.979/0.980 in item
+222's, 1.007 and 1.023 here.** It was large early and has been near 1.0 in every recent run.
+
+Something changed, and the honest candidates are ordered by how checkable they are: the board's lanes
+and buffers have moved under items 178-226 (item 221 documents one such shift), the host's
+contention profile has changed, or the early large values were themselves contention artefacts
+measured before item 194's and item 195's gates existed. **The third is not the flattering
+explanation and it is the one I would check first** — items 147 and 149 predate both gates, and item
+149 already withdrew part of its own analysis for cross-run pairing.
+
+### 228d. WHAT NOT TO DO NEXT
+
+Not another A/B. Until a run appears whose CONTROL shows slot-0 materially above 1.0, the warm-up has
+nothing to act on, and re-running the pair is the same mistake item 224 caught on the top bead —
+re-running a lane for a gate whose failure mode has already moved.
