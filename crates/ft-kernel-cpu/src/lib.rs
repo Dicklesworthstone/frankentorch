@@ -31387,7 +31387,34 @@ mod bidiag {
     use rayon::prelude::*;
 
     /// Work (rows x cols) below which rayon dispatch costs more than the sweep.
-    const PARALLEL_GATE: u64 = 1 << 14;
+    ///
+    /// **`1 << 18`, not `1 << 14` — NEGATIVE_EVIDENCE item 255.** The old value was inherited,
+    /// never measured at these call sites, and it made a square SVD fork twice per Householder
+    /// reflector for every reflector above a 128x128 trailing block: 896 forks at n=256, 2688 at
+    /// n=512. Measured with both arms alternated INSIDE one process, one SVD apart, paired per
+    /// round, each row against an A/A null made of two identical arms:
+    ///
+    /// ```text
+    ///     n       1<<18 against the shipped 1<<14      A/A null
+    ///     136     1.10-1.18x                           1.075x
+    ///     256     1.515x                               1.056x
+    ///     1024    1.085x                               1.046x
+    /// ```
+    ///
+    /// n=128 is unaffected and provably so: nothing at that size crosses either value, and the
+    /// branch counter reads `(0, 0, 0)` for both arms.
+    ///
+    /// WHY NOT HIGHER. Always-serial (`u64::MAX`) wins at n=256 and **loses at n=1024** (0.95x
+    /// against the shipped gate, where `1 << 18` reads 1.085x), so the fork does start paying —
+    /// this is a crossover, not a monotone. `1 << 18` is the value that keeps the width where it
+    /// pays and stops buying it where it does not.
+    ///
+    /// This changes result BITS for callers whose reflectors sit between the two values, because
+    /// `reduce_scaled_rows_f64`'s parallel partial-sum tree associates differently from its
+    /// serial sweep. Item 234 priced that deviation at 2.97e-13 (n=136) and 2.58e-12 (n=192),
+    /// inside the ratified 1e-11 of `frankentorch-qgce4`, and the movement is TOWARD the serial
+    /// sweep that the unblocked oracle uses.
+    const PARALLEL_GATE: u64 = 1 << 18;
 
     /// The same gate, overridable at RUNTIME so it can be A/B'd in one process —
     /// `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 156.
@@ -31613,6 +31640,26 @@ mod bidiag {
     /// Unrolling `c` into partial sums would have been the obvious move and it reassociates —
     /// that one owes the tolerance argument, this one does not, and
     /// `bidiag_blocked_output_is_bit_stable` is the test that says so.
+    /// Whether step (12) uses the four-row kernel. Default TRUE; the false arm is the exact
+    /// one-row-at-a-time loop it replaced.
+    ///
+    /// `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`, NEGATIVE_EVIDENCE item 255. This
+    /// exists for one reason: this host refused five measurement windows in ninety minutes, and
+    /// an A/B that needs a quiet host to compare two BINARIES will not get taken. The two arms
+    /// are bit-identical in output, so alternating them inside one process against one incumbent
+    /// arm costs nothing in parity and removes the cross-process launch, the cold allocator and
+    /// the second window that a two-binary A/B carries. One relaxed load per reflector.
+    static ROWDOT_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub(crate) fn rowdot_blocked() -> bool {
+        ROWDOT_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the step-(12) kernel, returning the previous setting.
+    pub(crate) fn set_rowdot_blocked(blocked: bool) -> bool {
+        ROWDOT_BLOCKED.swap(blocked, std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[inline]
     fn dot_rows_into_f64(
         a: &[f64],
@@ -31625,6 +31672,22 @@ mod bidiag {
         dst_stride: usize,
     ) {
         let mut k = 0usize;
+        if !rowdot_blocked() {
+            // The pre-item-254 loop, kept as the measurement arm. Same arithmetic in the same
+            // order, one row at a time, so the two arms differ ONLY in how many dependency
+            // chains are in flight and their outputs are bit-identical.
+            while k < nrows {
+                let b = first + k * row_stride;
+                let row = &a[b..b + vlen];
+                let mut s = 0.0f64;
+                for c in 0..vlen {
+                    s += row[c] * v[c];
+                }
+                dst[k * dst_stride] = s;
+                k += 1;
+            }
+            return;
+        }
         while k + 4 <= nrows {
             let b0 = first + k * row_stride;
             let r0 = &a[b0..b0 + vlen];
@@ -33804,6 +33867,17 @@ pub fn bidiag_parallel_branches_take() -> (u64, u64, u64) {
         bidiag::PARALLEL_BRANCHES[1].swap(0, Relaxed),
         bidiag::PARALLEL_BRANCHES[2].swap(0, Relaxed),
     )
+}
+
+/// Set the reduction's step-(12) row-dot kernel: `true` = four rows in flight (item 254),
+/// `false` = the one-row-at-a-time loop it replaced. Returns the previous setting.
+///
+/// The two arms are BIT-IDENTICAL in output — each accumulator sums its own row in the same
+/// order either way — so this is a pure speed switch, and it exists so the A/B runs inside one
+/// process against one incumbent arm on a host that rarely grants a quiet window.
+#[doc(hidden)]
+pub fn bidiag_rowdot_blocked_set(blocked: bool) -> bool {
+    bidiag::set_rowdot_blocked(blocked)
 }
 
 /// The currently live bidiagonal parallel gate.

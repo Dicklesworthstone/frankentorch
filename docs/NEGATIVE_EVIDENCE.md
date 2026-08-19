@@ -38905,3 +38905,92 @@ Two predictions, so the next window can falsify rather than confirm:
   forking pays. Item 253's bracket (above 65536, at or below 262144) was measured against the OLD
   step (12) and is therefore stale. Any gate constant shipped from item 253's numbers would be
   fitted to a kernel that no longer exists — which is why item 253 shipped no constant.
+
+## 255. THE GATE SHIPS AT 1<<18, ITEM 254 IS PRICED — AND THE ESTIMATOR THAT MADE BOTH READABLE ON A HOST THAT NEVER WENT QUIET
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. Item 253 bracketed the gate and refused
+to ship a constant on a bracket; item 254 landed the four-row step-(12) kernel proven-correct and
+unpriced, and predicted that it would move the bracket. Both are now settled, and the thing that
+settled them was not a quiet window — **the guard refused every window for two and a half hours**
+— it was changing the estimator.
+
+### 255a. THE ESTIMATOR, BECAUSE NOTHING ELSE HERE IS READABLE WITHOUT IT
+
+The lane's original design timed all of arm A, then all of arm B: **block interleaving**. Its A/A
+null — two arms with identical settings, so their difference is pure noise — read **1.02x to
+1.19x across four invocations**, which is the same size as the effects being chased. Three
+separate runs of the same n=512 comparison disagreed on the ordering.
+
+Replaced with **round interleaving**: one SVD per arm per round, arm order reversed on odd
+rounds, first round discarded, and the reported figure is the MEDIAN over rounds of the PAIRED
+per-round ratio. The arms now sit milliseconds apart instead of seconds, so a load excursion
+lands inside a round and cancels in the pair.
+
+    design            A/A null observed        effects it can resolve
+    block-interleave  1.02-1.19x               nothing under ~1.2x
+    round-interleave  1.045-1.075x             everything below
+
+Same host, same loadavg (15-22), same binary, minutes apart. **The window was never the binding
+constraint; the pairing was.** Every number below is quoted only where it clears the null printed
+beside it, and rows whose effect does not clear their null are reported as unresolved rather than
+dropped.
+
+### 255b. ITEM 254 IS A WIN, MEASURED (FT-vs-FT, so MAINTENANCE under section 1)
+
+Four rows in flight against the one-row loop it replaced, both arms in one process, paired by
+round, n=512, `RAYON_NUM_THREADS=8`:
+
+    arm                        paired median vs 16384/4row
+    16384/4row                 1.000  (reference)
+    16384/1row                 0.907        -> the four-row kernel is 1.10x
+    SERIAL/4row                1.218 / 1.165  (A/A pair, null 1.045x)
+    SERIAL/1row                0.986 / 0.939  (A/A pair, null 1.050x)
+
+Serial gate, four-row against one-row: **1.18-1.30x**. Gated, 1.10x. The dependency chain was
+real and it was worth roughly a fifth of an n=512 forward. The two arms' singular-value sums are
+asserted **bit-identical** inside the lane, not merely observed to agree.
+
+### 255c. THE GATE: A CROSSOVER, NOT A MONOTONE, AND 1<<18 IS THE VALUE
+
+Paired-round medians against the shipped `1 << 14`, four-row kernel throughout:
+
+    n      1<<18    1<<20    always-serial    A/A null   branches at 1<<14
+    128    0.965    --       --               1.13x      (0,0,0)  nothing crosses
+    136    1.178 / 1.096     --               1.075x     (8,0,8)
+    256    1.515    1.465    1.602 / 1.517    1.056x     (896,0,896)
+    1024   1.085    0.916    0.950 / 0.994    1.046x     (896,0,896)
+
+**At n=1024 always-serial LOSES** (0.95x) while `1 << 18` wins (1.085x), so the fork does start
+paying and the answer is not "never fork". At n=256 the gain is 1.515x. At n=128 the two arms are
+provably the same code — the branch counter reads `(0, 0, 0)` for both — so that row is an A/A
+null in disguise, and its 1.13x spread is the honest noise figure for a 1.6 ms shape rather than a
+regression.
+
+SHIPPED: `PARALLEL_GATE = 1 << 18`. It is never worse than the old value anywhere measured, and
+`1 << 20` and always-serial both lose at n=1024.
+
+Bits move for reflectors between the two values. Item 234 already priced that deviation at
+2.97e-13 (n=136) and 2.58e-12 (n=192) against the ratified 1e-11, and the movement is TOWARD the
+serial sweep the unblocked oracle uses. All 701 tests in `frankentorch-kernel-cpu` pass on the new
+constant, including `bidiag_blocked_output_is_bit_stable` (whose shapes sit below both values and
+therefore do not move) and `svd_deferred_left_thread_count_bit_exact`.
+
+### 255d. WHAT IS STILL NOT SETTLED, AND THE STANDING
+
+* **n=512 refuses to resolve.** Three round-interleaved invocations put `1 << 18` at 1.005x,
+  1.120x and (block-interleaved) 1.10-1.44x against nulls of 1.04-1.11x. The direction is never
+  negative and the size is never trustworthy. n=256 and n=1024 bracket it and both are clean, so
+  the constant does not rest on it.
+* **No vs-PyTorch row is banked from this tick.** Every invocation ran with the guard REFUSING —
+  three to five peer measurements live, loadavg 15-28 — and section 1's ratio needs a window the
+  guard passes. What the lane did print, for orientation only and not as a standing:
+  PyTorch 2.12.1+cpu reads 6.68-6.84 ms at n=256 and 143.8 ms at n=1024 in the same invocations
+  where our best arm reads 9.41-11.07 ms and 473 ms. **The n=1024 gap (~3.3x) is the worst square
+  SVD ratio this campaign has seen**, and it is a new size — every previous item argued about
+  n=128-136, where the gap is 1.3-1.7x.
+* The reduction is still 76-86% of the forward at n>=256. Items 254 and 255 took the dependency
+  chain and the fork overhead out of it; what remains is the two trailing accumulate-GEMMs, which
+  stream A22 TWICE per panel (`A22 -= U*Y2^T` then `A22 -= X2*V`). Stacking them into one
+  rank-2nb update would halve that traffic and is the next lever — it reassociates, so it owes
+  the tolerance argument and a golden update, which is exactly what
+  `bidiag_blocked_output_is_bit_stable` exists to force.
