@@ -37549,3 +37549,64 @@ Three things changed, and only one of them is the lane:
 
 The lane's own code did not change between the failing nine and these four. **What was blocking this
 bead was the instrument, not the kernel** — and two of the three fixes landed today.
+
+## 236. MY OWN ITEM 232 HYPOTHESIS IS REFUTED — RAISING THE GATE DOES NOT MOVE THE SVD FORWARD AT ALL, SO THE 1.6-1.7x GAP IS STILL UNEXPLAINED
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh` / `frankentorch-4zjaa`. Item 232 proposed,
+as its "standing hypothesis", that the two unrouted gate call sites — `bidiag_form_q_f64` and
+`dlabrd_panel_f64` — explain item 231's 1.6-1.7x SVD loss and its variance residue. **They do
+not.**
+
+### 236a. THE A/B, THE ONE THE VOID RUN OWED
+
+Same lane and ELF as item 231 (`svd_square_threshold_h2h`, `84205f28c9e60be1`), no rebuild.
+`RAYON_NUM_THREADS=8`, torch threads 8, PyTorch 2.12.1+cpu in the SAME invocation. Six
+invocations alternating DEFAULT / RAISED `FT_LINALG_PARALLEL_GATE`, loadavg 29.98 → 43.10.
+Readable this time: PT block spreads 1.00-1.20x, none of the 30x excursions that voided the
+previous attempt.
+
+    FT arm (ms), the only arm our gate can move
+    n      default gate            raised gate            min default / min raised
+    128    2.609  2.557  2.227     2.705  2.113  2.332      2.227  /  2.113
+    136    2.472  2.924  2.883     2.563  2.750  2.526      2.472  /  2.526
+
+**Our arm does not move.** The mins differ by 5% at n=128 and 2% at n=136, in opposite
+directions, against a within-condition spread of 17-18%. The incumbent's arm also does not move,
+which is the free control — our gate cannot touch PyTorch, so any apparent shift there is noise,
+and there is some (median ratio 1.79 default vs 1.53 raised at n=136 comes entirely from the PT
+arm wandering while both FT arms sit still). **Reading the ratio column instead of the FT column
+would have manufactured a 1.17x "effect" out of incumbent noise.**
+
+### 236b. WHY THE HYPOTHESIS WAS WRONG, AND WHY IT LOOKED RIGHT
+
+Item 229 measured the gate costing `form_p` 697-3199 µs against 416-508 µs raised **at n=136** —
+a difference comparable to the whole SVD forward. Item 232 reasoned that `form_q` and
+`dlabrd_panel` have similar per-step exposure at that size (~9 and ~8 steps) and should therefore
+cost similarly.
+
+The step COUNT was right and the conclusion was wrong. What item 232 did not check is that the
+SVD forward at n=136 **no longer routes `form_p` through the gated path at all** — item 229's own
+threshold move sends it to the blocked expansion at n >= 130. So the large effect item 229
+measured was on a path this lane stopped using, and the remaining gated steps in `form_q` and the
+reduction panel are simply cheap. Exposure counted in steps is not exposure counted in time.
+
+`form_q` does execute here: `tensor_linalg_svd` returns U unconditionally, so `track_left` is set
+and the expansion runs. The refutation therefore covers it rather than missing it.
+
+### 236c. WHAT THIS CLOSES AND WHAT IT REOPENS
+
+* **The gate is not worth chasing for square SVD at n=128-136.** That is most of what
+  `…-fork-thrash-mzrnh` was filed to pursue, at the sizes anyone has measured.
+* **Item 229 stands unchanged** — it was about the unblocked `form_p` path, which is real and
+  which the SVD no longer takes above n=130. Both statements are about different code.
+* **Untested, and not claimed either way:** larger n, where exposure grows linearly (~128 of 256
+  steps) and where item 229 measured a 7-11x penalty on `form_p`. The bead should be narrowed to
+  that question rather than closed.
+* **Item 231's 1.6-1.7x loss and its variance residue are now MORE unexplained, not less.** The
+  most plausible mechanism has been eliminated. I am not proposing a replacement in the same
+  breath — that is what produced this item.
+
+Two hypotheses of mine have now been refuted by direct measurement in as many days (item 227 on
+the buffer pool, this one on the gate), both after the correlation looked strong and the
+arithmetic looked supportive. The pattern is the same each time: **a mechanism that is real
+somewhere gets attributed to a lane that does not actually run it.**
