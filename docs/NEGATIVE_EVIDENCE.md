@@ -36862,3 +36862,93 @@ host cooperating.
 That reframes something worth stating plainly: **on a contended box, sweep scope is part of the
 measurement design, not a convenience.** Item 225 discarded six rows partly because four of them
 should never have been in the run.
+
+## 227. ITEM 221's CAUSAL CLAIM IS REFUTED BY DIRECT PROBE — THE POOL HIT IS WORTH ≤1.06x, NOT 1.85x, AND I FILED A BEAD FOR A LEVER THIS FILE HAD ALREADY REJECTED
+
+`frankentorch-372h8` / `frankentorch-buffer-pool-size-class-fairness-2flpl`. **This corrects my
+own item 221, written four hours earlier in this same session.** The observations there stand;
+the mechanism I attributed them to does not.
+
+### 227a. WHAT 221 CLAIMED AND WHY IT WAS NOT ENTITLED TO
+
+Item 221 measured two things and asserted the first caused the second:
+
+    avg_pool1d's uninit lever   2.37x -> 1.28x
+    buffer_pool hit rate         72%  ->  12%
+
+Both figures are correct and reproduce. But the link between them was **correlation across two
+binaries measured a day apart**, and the ledger already contained evidence against it that I did
+not preflight — `recycle()`'s own comment, in the file I had open:
+
+> `frankentorch-7zqbc` — REFUTED LEVER, DO NOT RE-LAND WITHOUT NEW EVIDENCE. […] it raised the
+> hit rate from 45/134 to 82/134 (identical in all five invocations, so the mechanism worked
+> exactly as designed) and **moved NO lane's paired ratio at all** […] 440 MiB of RSS for a
+> measured zero.
+
+I then filed `…-size-class-fairness-2flpl` proposing a pool eviction policy to raise the hit
+rate — which is, to within the eviction key, **the lever 7zqbc had already implemented, measured
+and reverted.** The standing orders say to preflight the ledger before running a lever. I did not,
+on a file I was reading at the time.
+
+### 227b. THE DIRECT PROBE
+
+`crates/ft-api/examples/pool_hit_vs_miss_probe.rs`, built local, `RAYON_NUM_THREADS=8`, shape
+`[8,64,8192]` (33.6 MB per gradient). Three arms interleaved HIT/MISS/CHURN/CHURN/MISS/HIT within
+each round so a load ramp lands on all three equally:
+
+* **HIT** — an exact-size buffer parked first, so `try_take_exact` succeeds.
+* **MISS** — pool cleared, so the lever falls to `build_uninit`.
+* **CHURN** — a miss with the allocator *displaced* first by a buffer of the pooled
+  forward-output size. This arm exists because arm MISS may not model the board: with one size
+  in play the allocator can hand the same warm region back every time. On the board `2ca1e43a`
+  added two dense `avg_pool1d` lanes that allocate a different size in the same sweep.
+
+**Every arm carries a sentinel**: the probe asserts HIT hit the pool 24/24 and that MISS and
+CHURN hit it 0/24, so the arms are *proven* to have differed rather than assumed to.
+
+    run   MISS/HIT min   MISS/HIT med   CHURN/HIT min   CHURN/HIT med   loadavg
+    1        1.045          1.019           1.018           1.010        29.84
+    2        1.039          0.978           0.993           1.012        29.84
+    3        1.009          0.995           1.057           1.026        27.93
+
+**A pool hit on this kernel is worth at most 1.06x, and in half the readings nothing at all.**
+It cannot produce a 1.85x change in the lever. Item 221's causal claim is refuted, by its own
+lane, in its own process, with the confound it would have been easiest to miss (allocator warmth)
+tested separately and also coming out flat.
+
+This also **narrows 7zqbc rather than contradicting it**. I had expected `try_take_exact` lanes to
+behave differently from `take_zeroed` lanes, because for a `take_zeroed` consumer the buffer is
+re-zeroed regardless so most of the work survives a hit, whereas for `try_take_exact` the hit is
+supposedly the whole lever. **That distinction predicted a difference and there is none.** The
+page-fault saving the uninit vein is built on is not being delivered by pool residency here.
+
+### 227c. WHAT IS NOW OPEN, STATED AS OPEN
+
+The lever really did fall from 2.37x to 1.28x, the incumbent arm really did not move, and the
+lever-OFF twin really did not move. **I no longer have a mechanism for it, and I am not
+substituting a second guess for the one just refuted.** What is ruled out:
+
+* pool hit rate (this item, three replications, two confounds)
+* a change to the timed region — `2ca1e43a` *added* `timed_op_sq`; it did not touch `timed_op`,
+  so the `avg_pool1d` lane times exactly what it timed before
+* a code regression in the kernel — `avg_pool1d_backward_scalar_f64`'s guards and structure are
+  unchanged
+
+What is NOT ruled out, and cannot be from data taken at loadavg 30-42 against a lane measured at
+15-19: that some of the 2.37x -> 1.28x is host state rather than either binary. The probe's own
+kernel time (2.5-3.0 ms at load ~30) is already as large as the *entire* old lane (2.504 ms at
+load ~15), which is a warning that these two windows are not comparable at all and that part of
+item 221's table may be a load artifact wearing a mechanism's clothes.
+
+### 227d. CONSEQUENCES
+
+* `…-size-class-fairness-2flpl` is closed as refuted before any code was written for it. Cost:
+  one probe and two local builds.
+* Item 221's §221b (mechanism) and §221d (the "levers compete" generalisation) should be read as
+  **withdrawn**. §221a (the table) and §221c (what is and is not claimed) stand.
+* The instrument is kept, because it is cheap and it answers a question this campaign has been
+  answering by argument: `pool_hit_vs_miss_probe` prices a pool hit for any pooled kernel in one
+  process with a sentinel on each arm.
+* The rule I broke is already written down and I am writing it down again because it cost real
+  work: **preflight the ledger for the lever you are about to file, not just the one you are
+  about to run.** The refutation was in the function I was reading.
