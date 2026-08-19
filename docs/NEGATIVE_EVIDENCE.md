@@ -38376,3 +38376,67 @@ measure is the constraint, not the queue of things I can think of.**
 Recorded here so the next agent with a quiet window has the lever pre-specified: fuse the two
 `sub_into` calls into one pass over `A22`, expect the golden to move, and price it against the
 tolerance argument rather than assuming bit-exactness.
+
+## 248. THREE LANES vs PyTorch AT 8 AND 16 THREADS: group_norm_f32 FLIPS FROM A LOSS TO A WIN ON POOL WIDTH ALONE
+
+Item 244 had the width paying against the incumbent on ONE lane. Two more, each measured as a
+palindrome of live h2h invocations — a DISCARDED warm-up first (item 247), then 16, 8, 8, 16, so
+both widths appear once in each half and a monotone host trend lands symmetrically.
+
+Admissible runs only (both A/A nulls PASS, drift PASS, `concurrent_measurements=none`, parity
+`match`), ELF `bd89b709df35aa8682c15aa6`, incumbent PyTorch 2.12.1+cpu threads=8 in the same
+invocation, `lane_count=1 rounds=64`:
+
+    lane               width  FT ms   PT ms   MEDIAN ratio          MIN ratio   load
+    group_norm_f32      8t    7.167   6.367   0.888 [0.812,0.909]   0.857       32.13 -> 28.77
+    group_norm_f32     16t    4.936   6.454   1.308 [1.281,1.341]   1.254       21.86 -> 19.56
+    group_norm_f32     16t    4.924   6.462   1.313 [1.277,1.344]   1.227       36.89 -> 34.09
+    conv3d              8t    5.009   6.281   1.254 [1.224,1.284]   1.213       30.50 -> 28.77
+    conv3d             16t    4.381   6.479   1.479 [1.444,1.510]   1.446       35.24 -> 34.18
+    max_pool1d_nopool   8t   10.36-10.44      1.02-1.06             0.99-1.01   (item 244)
+    max_pool1d_nopool  16t    7.53-7.58       1.21-1.46             1.105-1.425 (item 244)
+
+**`group_norm_f32` is 1.13x SLOWER than PyTorch at 8 threads and 1.31x FASTER at 16.** Same binary,
+same host, same day; the pool width is the only thing that changed. That is a loss turning into a
+win on a configuration constant, with no kernel work at all.
+
+    lane                8t standing        16t standing        conservative gain
+    group_norm_f32      1.13x SLOWER       >=1.227x FASTER     loss -> win
+    conv3d              1.254x FASTER      >=1.446x FASTER     1.15x better
+    max_pool1d_nopool   parity             >=1.105x FASTER     draw -> win
+
+### 248a. THE INCUMBENT DID NOT MOVE, WHICH IS WHAT MAKES IT ATTRIBUTABLE
+
+PyTorch's arm across all five `group_norm_f32` invocations: **6.367, 6.454, 6.462, 6.657, 6.539 ms**
+— a 4.5% spread. Ours: **7.167 / 7.575** at 8t and **4.925 / 4.936 / 4.924** at 16t. The incumbent
+is flat across the width change (it must be — it runs at its own fixed 8 threads either way), so the
+entire ratio movement is our arm, and our arm's two clusters are each under 1% wide.
+
+Same for conv3d: PyTorch 6.281-6.735 across five runs while ours goes 5.009/5.222 at 8t to 4.381 at
+16t.
+
+This is the cleanest attribution available in this harness: **a variable that provably cannot touch
+the incumbent, and an incumbent that provably did not move.**
+
+### 248b. THE RUNS I AM NOT COUNTING
+
+Of ten invocations, four are excluded and they are listed so the set is not mistaken for a filtered
+one: two warm-ups discarded by design (item 247), and two runs whose PT null FAILED
+(`group_norm_f32` 8t tag c, `conv3d` 16t tag d). Both excluded runs point the same way as their
+admissible twins — 0.879 and 1.120 respectively — so nothing is being hidden by the exclusion, but a
+failed null is a failed null.
+
+Worth noting the conv3d 16t exclusion is the ONE run in the set whose median and min estimators
+disagree badly (1.120 vs 1.423) and it is also the one that failed both nulls. The gates caught the
+run the estimators disagreed about, which is the behaviour they exist for.
+
+### 248c. WHERE THIS LEAVES THE DEFAULT
+
+`frankentorch-rayon-pool-width-qq8as` now has: 42 of 47 board lanes faster at 16t with 5 slower and
+the worst at 0.92x (item 247); three lanes measured against the live incumbent, all better at 16t,
+one flipping from loss to win; and a mechanism shipped default-off (`ft_kernel_cpu::pool`).
+
+What still blocks a flip is unchanged and worth stating plainly: the max_pool3d family regresses
+~8%, every measurement is on ONE host whose 2.87x cross-core frequency spread is the mechanism's own
+precondition, and no other machine has been tried. A default that is right here and wrong on a
+uniform-clock box would be a worse outcome than an env var that nobody sets.
