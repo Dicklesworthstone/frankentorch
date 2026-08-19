@@ -37099,3 +37099,69 @@ path fast at *every* n, and at n=136 the raised-gate unblocked arm (416-508 µs)
 one (546-550 µs). But the gate is shared by every caller of `reduce_scaled_rows_f64` and
 `apply_scaled_rank1_f64`, and moving it changes their result bits. Filed rather than smuggled in
 behind an SVD dispatch change, which is exactly how the 64 got here in the first place.
+
+## 230. THE HARNESS'S OWN LOAD IS 5.59, NOT 0.62 AND NOT 20 — MEASURED ON OUR OWN CPU ACCOUNTING, SO NO QUIET HOST WAS NEEDED
+
+`frankentorch-vyaia`, acceptance item 2. The bead asked for `frankentorch-5q3io`'s ~+0.62 self-load
+bound to be re-derived at the current lane count. It is done, and both prior figures are wrong, in
+opposite directions.
+
+    self_load DIRECT=5.59   both arms burned 1172.9 CPU-seconds over window=210s
+                            at lane_count=43 rounds=16, rayon_threads=8
+    self_load rise=+8.22    loadavg 16.45 -> peak 24.67, same window
+    concurrent_measurements=none        thinkstation1, ELF d8576e0e11c85227d2ce4405
+
+    5q3io banked ~+0.62   ->  9.0x LOW
+    vyaia inferred ~+20   ->  3.6x HIGH (at this pool width)
+
+### 230a. WHY THIS ONE DID NOT NEED A QUIET WINDOW, WHICH IS THE POINT
+
+5q3io closed with an admission: *"NOT DONE: measuring self-load directly on an idle host. That host
+state has not occurred once this session."* Nor has it since. My first attempt at this measurement
+inherited exactly that problem — it read `rise=+50.18` with three peer `rustc` live, and its own
+ceiling check proved at least 34 of the 50 was theirs.
+
+**Mean parallelism is our own CPU time over wall time, and a peer's compile contributes exactly zero
+to our `utime`.** That is the same quantity loadavg approximates — the average number of tasks we
+kept runnable — computed on our accounting rather than the machine's. `cutime`/`cstime` bring in the
+incumbent arm, which is a child and is reaped before the sample, so 5.59 covers BOTH arms.
+
+The class of "waiting for an idle box" measurements this campaign keeps deferring can be taken this
+way. Nothing about the host has to cooperate.
+
+### 230b. THE RUN THAT MEASURED THE SELF-LOAD FAILED THE DRIFT GATE BECAUSE OF IT
+
+`load_1m start=16.45 end=21.01`, `worst_drift=1.576x`, **series and endpoint gates both DRIFTED** —
+in a window with no concurrent measurement and no peer bench live. A rise of 5.59 on a host sitting
+at 16 is a 1.34x relative move, and the gate refuses at 1.25x.
+
+That is vyaia's thesis demonstrated by the instrument built to test it, inside one run: *the drift
+gate is partly measuring the harness*. It also sharpens the bead's rule. Discard-first works not
+because the first run is defective, but because **the second run starts on a host already carrying
+our 5.59**, so the identical burst is a smaller proportional move.
+
+### 230c. WHAT I GOT WRONG BUILDING IT
+
+The first version of the COLD-START banner printed *"this invocation supplied MORE load (50.18) than
+the host was already carrying (36.90)"*. It did not. At `rayon_threads=8` against an 8-thread
+incumbent, **a process cannot make more tasks runnable than it has threads** — the structural
+ceiling was 16, so at least 34 of that rise was the peers'. The banner is now bounded by that
+ceiling, and anything above it is reported as EXTERNAL LOAD by construction.
+
+The version before that printed `rise=+0.00` over a **seven-second** sweep, which reads as "this
+harness self-loads nothing". `loadavg` is a 1-minute EWMA: a 7s window can show at most 11% of any
+sustained step, so a short sweep cannot refute self-load at all. The window length and its response
+factor now print beside the rise.
+
+Two over-claims in one afternoon, both caught by the instrument's own next run rather than by
+review, and both the SAME error 5q3io made: **a number quoted without the precondition that makes it
+readable.** 5q3io's missing precondition was the lane count. Mine were the window length, and whose
+threads they were.
+
+### 230d. WHAT NOW TRAVELS WITH EVERY ROW
+
+`lane_count=43 rounds=16` prints unconditionally, including on unfiltered full sweeps — the case
+`lane_filter=` never covered, and the one the stale bound was taken under. A self-load figure is a
+property of the harness AT A LANE COUNT and AT A POOL WIDTH: 5.59 is this build's, at 8 threads, and
+it will rot exactly as +0.62 did the moment either changes. The difference is that the rows now say
+which.
