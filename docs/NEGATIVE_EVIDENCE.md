@@ -35823,3 +35823,50 @@ one at HEAD — measured in one window. That is now a build away rather than a d
 `/data` read 349G free at the end of this turn, up from 38G — the non-franken rebuild in the shared
 target directory was reclaimed. The throttle was predicated on the brake; the premise has changed
 and the standing rule is to df before a build and decline below 42G. Not resumed unilaterally.
+
+## 210. THE FIRST COMPILE SINCE ITEM 186 — ITEMS 195, 204 AND 208 COMPILE, AND IT FOUND FOUR DEFECTS `rustfmt` COULD NOT
+
+`frankentorch-l2zki` / `frankentorch-hi9r6`. The throttle header read 38G; `df` read **281G**, so
+the stated cause was gone. Compiled through `rch` — a REMOTE worker retrieving ~24 KB — which
+consumes none of the local volume the throttle protects, and no frankentorch build held the slot.
+When the orchestrator confirmed another pane had taken it, I stopped invoking cargo.
+
+### 210a. IT COMPILES, AND FOUR THINGS WERE WRONG
+
+`cargo check -p frankentorch-kernel-cpu --lib` now exits 0. Getting there took three rounds, and
+every defect was in code I wrote blind across items 195-208:
+
+    E0061  a call passing 20 arguments to a 19-argument fn — one of THREE call sites my
+           regex edit missed, and the only one the eye did not catch
+    warn   `has_bias` unused in BOTH masked fns: I replaced `if has_bias` with
+           `if output_mask[2]` and left the parameter, giving two sources of truth for one fact
+    warn   `#[must_use]` specified twice on two functions — my wrapper insertions landed
+           BETWEEN the original doc/attributes and their function
+    (clippy) two masked fns with 18-19 parameters and no `too_many_arguments` allow
+
+None of these is catchable by `rustfmt`, which passed on every one of them across roughly fifteen
+turns. Item 186 said that gate proves only that a file parses; this is the bill for it.
+
+### 210b. THE ONE THAT MATTERED
+
+The unused `has_bias` was not cosmetic. Both masked functions took `has_bias: bool` AND
+`output_mask: [bool; 3]` whose third element *is* `has_bias` — **two parameters encoding one fact,
+with nothing enforcing agreement.** A caller passing `has_bias = true` with `output_mask[2] = false`
+would get no bias gradient and no complaint.
+
+Removing the parameter is the fix, not `_has_bias`: the mask is the single source of truth, and the
+compiler then found the third call site I had missed by hand.
+
+### 210c. WHAT IS AND IS NOT VERIFIED NOW
+
+VERIFIED: the kernel crate compiles with items 195, 204 and 208's changes in it — the conv3d f64
+and f32 masked gradients, the panel moved inside its gate, and the corrected doc.
+
+NOT VERIFIED: `ft-api` has not been re-checked since these signature changes, and **its conv3d f32
+closure passes arguments to `conv3d_backward_masked_f32`, whose parameter list just lost
+`has_bias`** — that call site is the first thing to check when the slot frees. Nor have clippy, any
+test, or any measurement run. The two `#[allow]` attributes added at the end are themselves
+unverified, since the slot was taken before I could re-check.
+
+That last point is the honest shape of this turn: a compiler was available for about ten minutes,
+it found four real defects, and it went away again mid-repair.

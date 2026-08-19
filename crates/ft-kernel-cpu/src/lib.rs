@@ -15415,8 +15415,6 @@ pub fn conv3d_col2im_f32(
 /// f32 mirror of [`conv3d_backward_f64`]. Returns `(dpadded, dweight_flat,
 /// dbias?)`. Same im2col + `sgemm`/`sgemm` adjoint structure as the f64 form,
 /// at f32 precision (matches torch's f32 conv3d backward). frankentorch-lboou.
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 /// Full conv3d f32 backward — every gradient, exactly as before item 203.
 ///
 /// Kept so existing callers need no change; `conv3d_backward_masked_f32` holds the body. Unlike
@@ -15465,7 +15463,6 @@ pub fn conv3d_backward_f32(
         sh,
         sw,
         out_ch,
-        has_bias,
         [true, true, has_bias],
     );
     (
@@ -15482,6 +15479,7 @@ pub fn conv3d_backward_f32(
 /// first-order backwards and item 195 wired only one.
 ///
 /// **UNBUILT**: written under an absolute disk throttle; not compiled, not tested, not measured.
+#[allow(clippy::too_many_arguments)]
 pub fn conv3d_backward_masked_f32(
     dout: &[f32],
     padded: &[f32],
@@ -15501,7 +15499,6 @@ pub fn conv3d_backward_masked_f32(
     sh: usize,
     sw: usize,
     out_ch: usize,
-    has_bias: bool,
     output_mask: [bool; 3],
 ) -> (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>) {
     let patch_width = in_ch * kd * kh * kw;
@@ -15868,8 +15865,6 @@ fn conv3d_backward_ones_dout_f64(
     (dpadded, dweight, dbias)
 }
 
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 /// conv3d backward computing ONLY the gradients asked for — `frankentorch-l2zki`, item 195.
 ///
 /// `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's `convolution_backward`,
@@ -15961,7 +15956,6 @@ pub fn conv3d_backward_masked_f64(
         sh,
         sw,
         out_ch,
-        output_mask[2],
         output_mask,
     )
 }
@@ -16011,7 +16005,6 @@ fn conv3d_backward_generic_f64(
         sh,
         sw,
         out_ch,
-        has_bias,
         [true, true, has_bias],
     );
     (
@@ -16021,6 +16014,7 @@ fn conv3d_backward_generic_f64(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv3d_backward_generic_masked_f64(
     dout: &[f64],
     padded: &[f64],
@@ -16040,7 +16034,6 @@ fn conv3d_backward_generic_masked_f64(
     sh: usize,
     sw: usize,
     out_ch: usize,
-    has_bias: bool,
     output_mask: [bool; 3],
 ) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
     let patch_width = in_ch * kd * kh * kw;
