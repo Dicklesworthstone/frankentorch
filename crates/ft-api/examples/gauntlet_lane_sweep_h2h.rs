@@ -2116,16 +2116,42 @@ LANES = {
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect();
+            // EXACT MATCHING, OPT-IN — `frankentorch-hi9r6`, item 226.
+            //
+            // Substring matching is why item 225's sweep ran SIX lanes when it wanted two:
+            // `conv2d_masked` also selects `conv2d_masked_warm` and `conv2d_masked_train`, and
+            // `conv2d_big_masked` selects its `_tile` and `_train` twins. Every twin added since
+            // item 182 widens the blast radius of an existing filter string.
+            //
+            // That is not a tidiness problem. Item 225's run was voided by LOAD DRIFT after the
+            // quietest window of the session collapsed mid-sweep, and a sweep three times longer
+            // than intended is three times as much window to have to stay quiet. **Sweep length is
+            // a measurement risk, not just a wait.**
+            //
+            // Default is unchanged, deliberately: substring matching is what every banked row and
+            // every peer's invocation was taken under, and silently narrowing it would change what
+            // an existing command means. `FT_H2H_LANES_EXACT=1` opts in.
+            let exact = std::env::var("FT_H2H_LANES_EXACT").is_ok_and(|v| v == "1");
             let kept: Vec<_> = lanes
                 .into_iter()
-                .filter(|(name, _)| wanted.iter().any(|w| name.contains(w.as_str())))
+                .filter(|(name, _)| {
+                    wanted.iter().any(|w| {
+                        if exact {
+                            *name == w.as_str()
+                        } else {
+                            name.contains(w.as_str())
+                        }
+                    })
+                })
                 .collect();
             assert!(
                 !kept.is_empty(),
                 "FT_H2H_LANES={spec:?} matched no lane; refusing to run an empty sweep"
             );
             println!(
-                "lane_filter={spec:?} kept={} of the full set (frankentorch-68pwz item 58)",
+                "lane_filter={spec:?} match={} kept={} of the full set (frankentorch-68pwz \
+                 item 58; item 226: substring is the default, FT_H2H_LANES_EXACT=1 narrows it)",
+                if exact { "exact" } else { "substring" },
                 kept.len()
             );
             kept

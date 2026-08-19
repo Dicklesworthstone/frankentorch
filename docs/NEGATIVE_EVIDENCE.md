@@ -36812,3 +36812,53 @@ the length of a 32-round six-lane sweep, which is a stronger requirement than th
 quiet when you press go — and on this host, over roughly fifteen hours, that has held perhaps twice.
 
 No retry: within three minutes of the run finishing, loadavg was 57.89 with runq 81.
+
+## 226. SWEEP LENGTH IS A MEASUREMENT RISK, NOT A WAIT — AND SUBSTRING LANE MATCHING HAS BEEN QUIETLY TRIPLING IT
+
+`frankentorch-hi9r6`. Source only: `cargo check -p frankentorch-api --example
+gauntlet_lane_sweep_h2h` exits 0, compiled on a REMOTE worker so it added nothing to a host at
+loadavg 72.73. **No measurement** — that load is past `online_cpus` and item 194's gate would refuse.
+
+### 226a. WHAT ITEM 225 ACTUALLY COST
+
+Item 225's run wanted two lanes: `conv2d_masked` and `conv2d_masked_warm`, the warm/cold A/B. It ran
+**six**, because `FT_H2H_LANES` matches by SUBSTRING — `conv2d_masked` also selects
+`conv2d_masked_warm` and `conv2d_masked_train`, and `conv2d_big_masked` selects its `_tile` and
+`_train` twins.
+
+Then it was voided by load drift, `worst_drift=1.811x`, after the quietest window of the session
+collapsed partway through.
+
+Those two facts are connected. **A sweep three times longer than intended is three times as much
+window that has to stay quiet.** Item 225c framed the requirement as "a window that stays quiet for
+the length of a 32-round six-lane sweep" and treated the length as fixed; two-thirds of it was an
+accident of string matching.
+
+### 226b. THE TWIN LANES MADE THIS WORSE, AND THEY ARE MINE
+
+Every twin added this session widens the blast radius of a filter string that already existed:
+item 182's `_train`, item 190's `_warm`, item 220's `_tile`. Someone typing `FT_H2H_LANES=conv2d_masked`
+in a script written weeks ago now gets three lanes, and will get four when the next twin lands.
+
+The instrument for pricing one component (item 223d's pair trick) and the instrument for scoping a
+run are the same string, pulling in opposite directions.
+
+### 226c. THE CHANGE, AND WHY THE DEFAULT DOES NOT MOVE
+
+`FT_H2H_LANES_EXACT=1` selects exact-name matching. Default remains substring.
+
+Not narrowing the default is the whole care here: substring matching is what **every banked row and
+every peer's invocation** was taken under, and silently changing what an existing command selects
+would quietly alter what a re-run measures — the same class of harm as item 167's warm-up default,
+resolved the same way.
+
+### 226d. WHAT IT BUYS
+
+The warm/cold A/B becomes a two-lane sweep instead of six, roughly a third of the wall-clock and so
+roughly a third of the drift exposure. On a host where a genuinely quiet window has held perhaps
+twice in fifteen hours, shortening the run is the only lever available that does not depend on the
+host cooperating.
+
+That reframes something worth stating plainly: **on a contended box, sweep scope is part of the
+measurement design, not a convenience.** Item 225 discarded six rows partly because four of them
+should never have been in the run.
