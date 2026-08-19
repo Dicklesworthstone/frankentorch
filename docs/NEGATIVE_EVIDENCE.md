@@ -35418,3 +35418,81 @@ Compilation above all: three edits in this file were applied by line index with 
 technique is sound but unverified. Then the masked-vs-unmasked bitwise test for f32, which does not
 exist — item 196's conv3d test covers f64 only. And no f32 conv lane exists to measure any of it, so
 per item 152 this is coverage, not a certifiable win.
+
+## 205. conv2d_big_masked BANKED AT 2.42-2.54x SLOWER, 3/3 — AND THE SUMMED LANE CANNOT BE CERTIFIED BECAUSE OUR OWN ARM IS THE UNSTABLE ONE
+
+`frankentorch-hi9r6`. MEASURED, three invocations, all reported. No cargo ran (disk 37G, below the
+brake); the snapshot ELF needed no rebuild and no run wrote a file.
+
+### 205a. PROVENANCE
+
+    host thinkstation1  AMD Ryzen Threadripper PRO 5975WX 32-Cores  x86_64+avx2
+    governor powersave  online_cpus 64  rayon_threads 8  round_warmup 0 (board default)
+    elf sha256 2462293598f10e7721efe49ac9786c3bf5edda7b1a700608bfa4df5200805e67
+    incumbent PyTorch 2.12.1+cpu, self-reported, SAME invocation, torch threads 8
+    FT_H2H_LANES=conv2d_big   concurrent measurements none   rustc 0
+
+    run  loadavg before     load_1m start/end   worst_drift  gates   cross-core spread
+      1  9.64/10.27/12.58     17.89 / 17.77       1.013x     PASS    3.004x median
+      2  7.99/ 7.19/ 9.77      9.81 / 10.39       1.059x     PASS    3.004x median
+      3  (immediately after)  12.36 / 12.81       1.036x     PASS    3.004x median
+
+### 205b. THE BANKED ROW
+
+    conv2d_big_masked      FT ms    PT ms    ratio      nulls              parity
+      run 1               28.339   11.590    0.409   PT PASS / FT PASS     match
+      run 2               27.936   11.546    0.413   PT PASS / FT PASS     match
+      run 3               27.576   10.837    0.393   PT PASS / FT PASS     match
+
+**FT 2.42-2.54x SLOWER than PyTorch**, median ratio 0.409, all three CIs overlapping and all six
+A/A nulls PASS with parity `match`. Our arm varied 1.03x across the three. This is a measured LOSS
+and it is the first replicated conv2d standing this campaign has had.
+
+Caveat, unchanged and unfixable from here: the cross-core clock spread while sampling was 3.004x
+against a comparable idle spread, so the arms are not known to have run at the same frequencies.
+Every gate in this harness is blind to that.
+
+**The row does not price anything I shipped.** It is the generic route; items 174/176/177 rewrote
+the all-ones adjoints, which it never reaches.
+
+### 205c. WHY THE SUMMED LANE STILL CANNOT BE QUOTED — AND IT IS US, NOT THE INCUMBENT
+
+    conv2d_big             FT ms    PT ms    ratio      nulls
+      run 1                6.458   11.019    1.706   PT PASS   / FT OFFSET
+      run 2                8.851   10.903    1.232   PT OFFSET / FT PASS
+      run 3                9.093   10.585    1.164   PT FAIL   / FT OFFSET
+
+Three invocations, three different ways of missing, never both. It would be easy to read that as
+bad luck at the gate boundary. The arms say otherwise:
+
+    FT arm swing across the three runs   1.41x
+    PT arm swing across the three runs   1.04x
+
+**The unstable arm is ours.** Item 137c's duration story explained the incumbent's nulls, and item
+203 confirmed it; this is the other half, and it points the opposite way. A lane needs BOTH arms
+stable, and conv2d_big's FT arm at ~9 ms is not — while the same binary's 28 ms arm on the masked
+lane holds to 1.03x.
+
+Run 1 is the outlier that carries most of that swing (6.458 against 8.851 and 9.093 back to back),
+and its cause is visible in the header: the idle `cpu_mhz` median was **2454 MHz** for run 1 and
+**1429 MHz** for runs 2 and 3. Run 1 followed ten minutes of quiet and got boosted cores; the
+others ran on a host whose cores had parked. That is `frankentorch-vyaia` — "discard the first run
+after idle" — reproduced independently here on a lane it was not written about.
+
+### 205d. WHAT THIS MEANS FOR THE BEAD
+
+Items 174/176/177 collapsed the summed route's scatter, and the only lane that reaches that route
+cannot be certified because our own arm on it is too short to be stable. The fix is the same shape
+as item 203's for the incumbent: **size the FT arm too.** `conv2d_big` at batch 16 gives us ~9 ms;
+the masked twin at 28 ms is rock steady. A summed lane at batch 48-64 would put our arm near 28 ms
+and is the missing piece.
+
+I did not add it this turn: it is a new lane, it cannot be compiled under the throttle, and item
+203 is one turn old and already a lesson in sizing a lane against a threshold nobody measured.
+This time the threshold — our own arm's stability against its duration — has exactly three points.
+
+### 205e. HONESTY NOTE
+
+Three invocations were run and all three are above. The third was run specifically because the
+first two disagreed about `conv2d_big`, and it did not rescue it. Reporting only the runs that
+certified would have turned three attempts into one clean row and a silence.
