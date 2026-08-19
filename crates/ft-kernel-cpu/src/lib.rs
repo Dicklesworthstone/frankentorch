@@ -31418,16 +31418,75 @@ mod bidiag {
     /// under the ratified eig/SVD policy (`frankentorch-qgce4`), exactly as the blocked
     /// `form_p` itself did.
     ///
-    /// Read once into a `OnceLock`, so steady-state cost is a load — the same shape
-    /// `svd_use_blocked_bidiag` already uses for `FT_SVD_FORCE_NR`.
-    fn parallel_gate() -> u64 {
-        static GATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *GATE.get_or_init(|| {
-            std::env::var("FT_LINALG_PARALLEL_GATE")
-                .ok()
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .unwrap_or(PARALLEL_GATE)
-        })
+    /// Held in an ATOMIC, not a `OnceLock`, so one process can alternate gate values —
+    /// `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`.
+    ///
+    /// WHY IT MOVED OUT OF THE `OnceLock`. A `OnceLock` fixes the value for the life of the
+    /// process, so the only A/B it permits is one process per arm. That is exactly the shape
+    /// `project_tuning_grid_missing_the_winner` names as the reason the panel width sat at 16
+    /// for a campaign: a cross-process A/B cannot alternate, so every comparison carries a
+    /// whole process launch, a cold allocator and a different window between its arms. With
+    /// the value in an atomic the sweep runs ABBA inside ONE invocation against ONE incumbent
+    /// arm, which is what section 1 of the standing orders asks for.
+    ///
+    /// Zero is reserved as "not yet initialised" and is never a live value (a caller passing
+    /// 0 gets 1, i.e. always-parallel). `u64::MAX` means always-serial. The steady-state cost
+    /// is one relaxed load per call against a matvec of at least `nrows * ncols` flops.
+    static GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// How many times a gated call site has taken its PARALLEL branch, since the last read.
+    ///
+    /// `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`, NEGATIVE_EVIDENCE item 253. This
+    /// is the route proof for the gate, and it exists because the obvious substitute is wrong:
+    /// the first cut of the sweep lane inferred the route from whether two gate arms produced
+    /// bit-identical singular values, and that inference FAILED silently at n=256 -- the arms
+    /// were timed 1.32x apart, so they demonstrably ran different code, while the sums agreed
+    /// to the last bit because the QR sweep converges to the same rounded values from slightly
+    /// different bidiagonal input. Equal output is a necessary condition for the same route,
+    /// not a sufficient one, so it cannot be used as one. This counts the branch itself.
+    ///
+    /// PER CALL SITE, because the aggregate cannot answer the question the counter was added
+    /// for. `FT_LINALG_PARALLEL_GATE` reached `reduce_scaled_rows_f64` and
+    /// `apply_scaled_rank1_f64` but not step (12) of `dlabrd_panel_f64`, so a run that raised
+    /// the knob still forked once per reflector inside the reduction. Item 236 concluded from
+    /// exactly such a run that raising the gate does not move the SVD forward. Splitting the
+    /// count by site is what lets a later run say whether that is why.
+    ///
+    /// `[0]` = `reduce_scaled_rows_f64`, `[1]` = `apply_scaled_rank1_f64`, `[2]` = `dlabrd`
+    /// step (12). One relaxed increment per fork/join, not per element.
+    pub(crate) static PARALLEL_BRANCHES: [std::sync::atomic::AtomicU64; 3] = [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ];
+
+    #[inline]
+    fn note_parallel_branch(site: usize) {
+        PARALLEL_BRANCHES[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn parallel_gate() -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let live = GATE.load(Relaxed);
+        if live != 0 {
+            return live;
+        }
+        let init = std::env::var("FT_LINALG_PARALLEL_GATE")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(PARALLEL_GATE)
+            .max(1);
+        GATE.store(init, Relaxed);
+        init
+    }
+
+    /// Set the gate and return the value that was live before. For measurement harnesses:
+    /// a sweep sets it, times a block, and restores it.
+    pub(crate) fn set_parallel_gate(gate: u64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prev = parallel_gate();
+        GATE.store(gate.max(1), Relaxed);
+        prev
     }
 
     /// Rows per task in [`reduce_scaled_rows_f64`]. Fixed (not derived from the
@@ -31467,6 +31526,7 @@ mod bidiag {
             }
             return;
         }
+        note_parallel_branch(0);
         let partials: Vec<Vec<f64>> = block
             .par_chunks(REDUCE_CHUNK_ROWS * lda)
             .zip(v.par_chunks(REDUCE_CHUNK_ROWS))
@@ -31512,6 +31572,7 @@ mod bidiag {
             }
             return;
         }
+        note_parallel_branch(1);
         block
             .par_chunks_mut(lda)
             .zip(v.par_iter())
@@ -31901,9 +31962,14 @@ mod bidiag {
                 let a_ro: &[f64] = a;
                 let vstart = at(i, i + 1);
                 let vrow = &a_ro[vstart..vstart + vlen];
-                if (xrows as u64) * (vlen as u64) >= PARALLEL_GATE
+                // `parallel_gate()`, not the bare `PARALLEL_GATE` constant this read until
+                // item 253: the knob was documented as THE gate for this family and did not
+                // in fact govern the reduction's own matvec, so every "gate raised" run so far
+                // left step (12) forking exactly as before. Default value is unchanged.
+                if (xrows as u64) * (vlen as u64) >= parallel_gate()
                     && rayon::current_num_threads() > 1
                 {
+                    note_parallel_branch(2);
                     x.par_chunks_mut(ldx)
                         .enumerate()
                         .skip(i + 1)
@@ -32452,8 +32518,10 @@ mod bidiag {
 /// parameter, so no dispatch change and no env knob were needed), four invocations at loadavg
 /// 20-31 with no other measurement on the host, each width against the shipped 16:
 ///
+/// ```text
 ///     n=128   nb=8  1.22-1.24x     n=160   nb=8  1.07-1.22x
 ///     n=136   nb=8  0.97-1.17x     n=256   nb=8  1.05-1.21x
+/// ```
 ///
 /// `nb=8` was fastest in 15 of 16 cells, and every width ABOVE 16 is monotonically worse
 /// (nb=64 reads 0.45-0.64x). The direction is what the code predicts: our panel is BLAS-2 with
@@ -32462,8 +32530,10 @@ mod bidiag {
 ///
 /// THE LIMIT IS NOW CLOSED (item 243). The grid was extended to 384 and 512 and measured:
 ///
+/// ```text
 ///     n=256   nb=8  1.02  0.97  0.95 x      n=384   nb=8  1.20  1.04  1.24 x
 ///     n=512   nb=8  1.02  1.00  1.00 x
+/// ```
 ///
 /// `nb=8` is a clear win at n=128-160 and 384 and **parity** at 256 and 512 — never a meaningful
 /// loss anywhere measured (worst cell 0.95x). So a single constant is right and no size-dependent
@@ -33624,6 +33694,45 @@ pub fn svd_prologue_p_orthogonality() -> Option<f64> {
     } else {
         Some(f64::from_bits(bits))
     }
+}
+
+/// Set the bidiagonal-reduction parallel gate, returning the previously live value.
+///
+/// `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. The gate decides, per Householder
+/// reflector, whether the two O(rows x cols) matvecs fork across rayon or run serially. It
+/// governs three call sites -- `bidiag_form_p_f64`, `bidiag_form_q_f64` and the reduction's
+/// own `dlabrd_panel_f64` -- and this setter exists so a harness can alternate values inside
+/// ONE process against ONE incumbent arm rather than one process per arm.
+///
+/// `u64::MAX` forces the serial arm everywhere; `1` forces the parallel arm. Note that only
+/// `reduce_scaled_rows_f64` changes result BITS with the branch (its parallel partial-sum
+/// tree associates differently); the rank-1 apply and the reduction's step (12) are
+/// bit-identical either way.
+#[doc(hidden)]
+pub fn bidiag_parallel_gate_set(gate: u64) -> u64 {
+    bidiag::set_parallel_gate(gate)
+}
+
+/// Read and reset the count of PARALLEL branches taken by the gated bidiagonal helpers.
+///
+/// The route proof for `bidiag_parallel_gate_set`, as
+/// `(reduce_scaled_rows, apply_scaled_rank1, dlabrd_step_12)`: a harness that raises the gate
+/// and sees these fall to zero has observed the branch change from outside the kernel, rather
+/// than inferring it from output bits that can agree across routes.
+#[doc(hidden)]
+pub fn bidiag_parallel_branches_take() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        bidiag::PARALLEL_BRANCHES[0].swap(0, Relaxed),
+        bidiag::PARALLEL_BRANCHES[1].swap(0, Relaxed),
+        bidiag::PARALLEL_BRANCHES[2].swap(0, Relaxed),
+    )
+}
+
+/// The currently live bidiagonal parallel gate.
+#[doc(hidden)]
+pub fn bidiag_parallel_gate() -> u64 {
+    bidiag::parallel_gate()
 }
 
 /// Read and reset the split as `(reduction_ns, form_pq_ns, sweep_ns)`.

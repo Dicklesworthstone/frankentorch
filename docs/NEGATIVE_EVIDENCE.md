@@ -38616,3 +38616,232 @@ OWED, and specifically: the pre-246 binary against the post-247 binary **at n=13
 stable window. Both binaries are on disk (`ftk_nb8`, `ftk_v247`); it costs one invocation. If the
 interchanges did cost ~6% at that size the honest response is to revert them, since item 250
 already showed they buy nothing measurable anywhere else.
+
+## 252. THE SECOND MACHINE SAYS 8, NOT 16 — THE WIDTH OPTIMUM IS A PROPERTY OF THE HOST, AND MY OWN `auto` CONSTANT PICKED THE WORST WIDTH THERE
+
+`frankentorch-rayon-pool-width-qq8as`'s last blocker was never more lanes: it was *"a second
+machine, not more lanes here"*. Every width result in items 240/244/247/248 comes from
+`thinkstation1`, whose **2.87x cross-core frequency spread IS the proposed mechanism** — a wide join
+waits on whichever core is parked at the floor. A box without that spread is the falsification test.
+
+`fixmydocuments` (AMD Ryzen 7 5800X, **8 physical / 16 logical**), arm-internal, min-of-passes:
+
+    lane                    4t       8t      16t    best   16t vs 8t
+    prelu_noshortcut    19.395   13.373   14.378     8t      0.93x
+    avg_pool2d           2.355    1.624    1.902     8t      0.85x
+    max_pool3d           0.593    0.665    0.880     4t      0.76x
+    conv3d               3.901    2.688    3.946     8t      0.68x
+    max_pool1d_nopool   14.386   11.160   12.112     8t      0.92x
+
+**16 loses to 8 on five lanes out of five.** On `thinkstation1` 16 beat 8 on 5/5 and beat every
+other width on the whole 47-lane board. The optimum is not a constant — it is a property of the
+machine.
+
+### 252a. IT REFUTES CODE I SHIPPED THIS MORNING
+
+`ft_kernel_cpu::pool::auto_width` shipped as `min(16, LOGICAL cores)`. On this second host that
+evaluates to **16, the worst of the three widths measured there**. A default-on version of that
+would have been a regression on the first machine that adopted it.
+
+    host             CPU                    phys/logical   measured best   min(16,logical) picks
+    thinkstation1    Threadripper 5975WX        32 / 64          16t        16  correct
+    fixmydocuments   Ryzen 7 5800X               8 / 16           8t        16  WORST of 4/8/16
+
+Refitted to `min(16, PHYSICAL)`, the simplest rule consistent with both: 32 physical caps to 16, 8
+physical caps to 8, each landing on that host's measured optimum. **Two points do not make a law**,
+and the doc comment says so — which is the whole argument for having shipped it OFF by default. The
+bead's refusal to flip a default on one host's evidence was correct, and this is what it was
+protecting against.
+
+### 252b. THE MEASUREMENT NEEDED TWO FIXES BEFORE IT COULD BE TRUSTED
+
+**Isolation mode required torch, so it could not visit a second machine at all.** With
+`FT_H2H_NO_INCUMBENT` the driver never sends a SAMPLE request, but the child was still the full
+torch program — it imported torch, built every lane, and ran 32 warm-ups PER LANE before
+`PT_READY`. So an "isolated" run was preceded by minutes of torch work on the same box, warming the
+same caches it then measured, while the mode's banner claimed the co-process was the only variable.
+A stub that speaks the protocol and imports nothing fixes both problems at once.
+
+**And the remote sweep silently spanned two machines.** `rch` schedules each invocation
+independently, so a six-pass palindrome is not a same-machine A/B: pass 3 landed on `vmi1152480` (10
+CPUs) and returned `max_pool1d_nopool` at **6376 ms** against 12 ms elsewhere. Aggregating the six
+would have produced a confident, meaningless table.
+
+What caught it was the harness printing `measurement_host=` on every run — the rule from
+`feedback_measurement_host_identity`, which exists because the same cell once read 1.2693x and
+0.0093x on two workers with both A/A nulls passing. It earned its keep here: my first table was
+already computed and cross-machine before the host line was checked.
+
+Also worth carrying: `rch` does **not** forward the ambient environment. `RAYON_NUM_THREADS=8 rch
+exec -- cargo run` arrives with the variable dropped — the first attempt asked for isolation mode
+and got the torch program. Config has to travel inside the command, via `cargo --config env.*`.
+
+### 252c. WHERE THE BEAD STANDS
+
+- The cap is worth 1.10x-1.46x against PyTorch on three lanes **on thinkstation1** (items 244, 248).
+- It costs at most 8% on that host's whole board, on one family (item 247).
+- **It is the wrong cap on a second machine**, where 8 wins and the shipped constant chose 16.
+- The mechanism survives the test that could have killed it: the machine WITH the frequency spread
+  wants a narrow pool relative to its size (16 of 64 logical), and the machine without it does not
+  benefit from going below its physical count (8 of 8 physical).
+
+A process-wide default still should not flip. What has changed is that the reason is now measured
+rather than suspected: the optimum tracks the hardware, so the shipped answer must be a rule over
+hardware, not a number — and two hosts is exactly enough to know the constant was wrong and not
+nearly enough to trust its replacement.
+
+## 253. THE BIDIAG PARALLEL GATE HAS A CROSSOVER, IT IS NOT WHERE THE CONSTANT SITS, AND THE ROUTE PROOF I FIRST WROTE WAS UNSOUND
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. That bead asks for a per-call-site A/B
+across `PARALLEL_GATE` and a route test pinning the outcome from outside. This is the A/B, and
+it moves the question: the gate is not simply too low, it has a **crossover between n=256 and
+n=512**, and the shipped value is on the wrong side of it for every size below that.
+
+### 253a. THREE THINGS SHIPPED BEFORE THE MEASUREMENT COULD BE TAKEN
+
+1. **The gate moved from a `OnceLock` to an atomic** (`bidiag_parallel_gate_set`). It had been
+   read once per process, so the only A/B it permitted was one process per arm — a whole launch,
+   a cold allocator, and a different window between the two numbers being compared. It now
+   alternates block by block inside ONE invocation against ONE incumbent arm.
+
+2. **`FT_LINALG_PARALLEL_GATE` did not govern the reduction.** Step (12) of `dlabrd_panel_f64`
+   tested the bare `PARALLEL_GATE` constant, not the overridable gate, so every "gate raised" run
+   taken before today left the reduction's own matvec forking exactly as before — including the
+   run item 232 recorded as void. The knob was documented as THE gate for this family and covered
+   two of its three call sites. Default value unchanged; only the coverage changed.
+
+3. **A parallel-branch counter** (`bidiag_parallel_branches_take`), because the route proof this
+   lane first used was unsound — 253d.
+
+### 253b. THE MEASUREMENT
+
+`crates/ft-api/examples/bidiag_gate_sweep_h2h.rs`, ELF `a92aa7011b0207c0`, SVD forward only
+(full U,S,Vh), `RAYON_NUM_THREADS=8` matched to `torch.set_num_threads(8)`, PyTorch 2.12.1+cpu
+self-reported in the SAME invocation, host thinkstation1, governor powersave. Guard PASS
+immediately before the run: no peer measurement, loadavg 8.41/8.83/7.02 (1/5/15 within 4x —
+a stable window, not merely a quiet one), iowait 0.1%. Estimator: min of 5 per block, palindrome
+blocks (arms forward, PT, PT, arms reversed), min over each arm's two blocks. Parity MATCH in
+all twelve rows (singular-value sums, rel 1.2e-16 to 4.9e-16).
+
+    n      PT ms    gate=16384 (shipped)   gate=262144        gate=SERIAL
+    128    1.291    2.007  1.555x SLOWER   1.714  1.328x      1.756  1.360x
+    136    1.430    2.429  1.698x SLOWER   1.933  1.352x      1.932  1.351x
+    256    6.508   18.025  2.770x SLOWER  13.647  2.097x     13.997  2.151x
+    512   30.198   84.280  2.791x SLOWER  94.981  3.145x     98.106  3.249x
+
+    within-arm block spread: 1.02-1.26x at n=128-136, 1.00-1.06x at n=256-512
+
+**The gate is worth 1.25-1.32x at n=136 and n=256 and it is worth -1.16x at n=512.** Raising it
+takes our standing at n=256 from 2.770x SLOWER to 2.097x, and at n=136 from 1.698x to 1.352x;
+lowering the exposure at n=512 makes that size WORSE, because there the matvecs are 2 MB and the
+fork finally buys more than it costs.
+
+Mechanically that brackets the crossover. At n=256 the largest per-reflector work is 65536, so
+`gate=262144` makes that size entirely serial and it WINS. At n=512 the largest is 262144, so
+`gate=262144` makes it nearly entirely serial and it LOSES. **The right constant is therefore
+above 65536 and at or below 262144** — the shipped 16384 is nearly four binary octaves low.
+
+### 253c. WHAT THIS TABLE DOES NOT SETTLE, STATED BEFORE THE PART THAT LOOKS GOOD
+
+* **The n=128 and n=136 rows carry a known bias, in my favour.** This ELF ran no discarded block
+  before the palindrome, so the first-pass penalty item 247 measured (1.23x median, 8.13x worst)
+  landed on whichever arm ran first at each size — always the SHIPPED gate. At n=136 the shipped
+  arm's two blocks read 3.065/2.429 ms while both raised arms sat at 1.93-1.97, so the effect is
+  visible in the data and larger than a first-pass artefact can explain, but the two small sizes
+  should be re-read from the successor binary before either is quoted. n=256 and n=512 are not
+  exposed: every arm's own two blocks agree to 1.00-1.06x there.
+* **Block-level rather than sample-level interleaving.** This is weaker than a certified board
+  row and is quoted as such. It does, however, carry an A/A null I did not realise I had built —
+  253f.
+* **The optimum is not measured, only bracketed.** No value between 65536 and 262144 was run.
+  Falsifiable prediction for the next invocation: `gate = 131072` should hold n=136/256 at the
+  raised arms' times AND beat 84.3 ms at n=512, because it lets only the first ~150 of 512
+  reflectors fork. If n=512 does not improve, the crossover is sharper than a single constant can
+  express and the honest fix is a size-aware rule, not a bigger number.
+* **The default is NOT changed in this commit.** Shipping a constant on a bracket rather than a
+  measurement is the exact error item 241 recorded against the panel width.
+
+### 253d. THE ROUTE PROOF I FIRST WROTE WAS UNSOUND, AND THE DATA CAUGHT IT
+
+The lane's first cut inferred the route from output bits: `reduce_scaled_rows_f64` is the only
+gated branch that reassociates, so two gate arms that produce bit-identical singular values were
+taken to have run the same route. At n=256 that inference printed **"no reflector at this size
+crossed any gate"** for two arms timed **1.32x apart**. They had demonstrably run different code;
+the singular-value sums agreed to the last bit anyway, because the QR sweep converges to the same
+rounded values from slightly different bidiagonal input.
+
+Equal output is a NECESSARY condition for an identical route, never a sufficient one, and I used
+it as one. The replacement counts the branch itself: one relaxed increment per fork/join at each
+of the three call sites, read per block. It cannot agree by coincidence.
+
+The same trap is what `svd_prologue_routes_form_p_across_the_measured_threshold` avoids by
+ASSERTING its premise (that the two expansions differ) before reading the comparison. That test
+was right to do it; this lane had the premise backwards and only a timing gap 1.32x wide made it
+visible.
+
+### 253e. WHERE THIS LEAVES THE STANDING
+
+    square SVD forward vs PyTorch, same invocation, RAYON_NUM_THREADS=8
+
+    n=128   1.56x SLOWER shipped   ->  1.33x with the gate raised
+    n=136   1.70x SLOWER shipped   ->  1.35x
+    n=256   2.77x SLOWER shipped   ->  2.10x
+    n=512   2.79x SLOWER shipped   ->  2.79x (raising it here is a LOSS)
+
+n=256 and n=512 are the worst square-SVD ratios this campaign has measured, and both are worse
+than the n=128/136 pair every previous item argued about. The reduction is 76-86% of the forward
+at those sizes against 64-70% at n=128-136, so the size that matters most is the one the phase
+split had already named and no lane had been pointed at.
+
+### 253f. THE GRID CONTAINS ITS OWN A/A NULL, AND THAT IS WHAT MAKES THE TABLE READABLE
+
+Two arms whose gate values both sit above every per-reflector work term at a given size take
+**provably identical routes** — the branch counter reads `(0, 0, 0)` for both — so any difference
+between them is the lane's own noise and nothing else. The grid has such a pair at every size,
+which means each row prices its own effect against its own null:
+
+    n      effect (shipped gate vs best raised)     A/A null (two route-identical arms)
+    128    1.17x                                    1.025x   (262144 vs SERIAL)
+    136    1.26x                                    1.0005x  (262144 vs SERIAL)
+    256    1.32x                                    1.026x   (262144 vs SERIAL)
+    512    1.13x the OTHER way                      1.033x   (262144 vs SERIAL, near-identical)
+
+Every effect clears its null by an order of magnitude. This is a better null than the usual A/A:
+it is not two positions inside one arm, it is two DIFFERENT gate settings that provably compile
+to the same execution, so it also catches an arm-ordering bias that a positional null cannot.
+
+**And it immediately voided a run.** A follow-up invocation taken beside frankenpandas's
+core-pinned harness (this arm on `taskset -c 16-47`, disjoint from its 0-15) caught the host at
+loadavg 42.7, and its n=136 null read **1.28x** — the two route-identical arms came out 1.950 and
+2.500 ms. Nothing in that window is resolvable, including its apparent 1.39x gate effect, and
+none of it is quoted. Item 250 had bounded a *cache-resident* n=128 shape at 2% beside a pinned
+peer; that held at loadavg 12-17 and does not hold at 42.
+
+### 253g. WHY THIS DOES NOT CONTRADICT ITEM 236, WHICH IS MINE AND SAID THE OPPOSITE
+
+Item 236 raised `FT_LINALG_PARALLEL_GATE` across six invocations and concluded, against my own
+hypothesis, that **the gate does not move the SVD forward at n=128-136**. Today's table says it
+moves it 1.26x at n=136. The counter says why, and I would not have been able to argue it without
+the split by call site.
+
+At n=136, `gate=16384`, per SVD forward:
+
+    reduce_scaled_rows_f64   56 parallel branches
+    apply_scaled_rank1_f64    0
+    dlabrd_panel_f64 (12)    56 parallel branches
+
+The env knob reached the first of those and **not the third**, which tested the bare constant. So
+item 236's "raised" arm still forked 56 times per forward inside the reduction — it removed one of
+the two per-reflector fork/joins and kept the other. The residue it was left measuring is roughly
+half of today's 0.5 ms, against a within-condition spread it reported as 17-18% of a 2.4 ms
+forward. **Item 236's null is consistent with half an effect hidden under its own noise**, not
+with the absence of one.
+
+Two things follow that matter more than the reconciliation:
+
+* `apply_scaled_rank1_f64` **never forks at this size at all**. The bead's framing — and item
+  156's comment — treated it as one of the two hot gated helpers, and at n=136 it is not a
+  participant. The cost is the reduction's two matvecs, one of which was invisible to the knob.
+* Item 236 is still right about what it actually tested, and its lesson stands verbatim: it caught
+  a 1.17x "effect" that was entirely the incumbent wandering while both FT arms sat still. Reading
+  the FT column rather than the ratio column is what saved it, and is why this lane prints both.
