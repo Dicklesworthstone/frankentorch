@@ -375,23 +375,45 @@ fn slot_holder_is_live(pid: u32) -> bool {
 #[must_use]
 pub fn concurrent_measurement_block() -> String {
     let others = concurrent_measurement_processes();
-    if others.is_empty() {
-        return "concurrent_measurements=none (scanned /proc for other h2h harnesses, criterion \
-                benches and torch processes; this run's own incumbent child is excluded)"
-            .to_owned();
-    }
-    let mut listed: Vec<String> = others
+    let (active, idle): (Vec<_>, Vec<_>) = others
         .iter()
-        .map(|(pid, kind)| format!("{kind}[{pid}]"))
-        .collect();
-    listed.sort();
+        .partition(|(_, _, share)| *share >= CONTENTION_ACTIVE_FLOOR);
+    let render = |set: &[&(u32, &'static str, f64)]| {
+        let mut listed: Vec<String> = set
+            .iter()
+            .map(|(pid, kind, share)| format!("{kind}[{pid}] {:.0}%", share * 100.0))
+            .collect();
+        listed.sort();
+        listed.join(" ")
+    };
+    // Named but not burning CPU: reported, never voiding. These are overwhelmingly shell wrappers
+    // and rch clients whose work is on another machine, and treating them as contention voided
+    // real runs.
+    let idle_note = if idle.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nconcurrent_measurements_idle={} (matched by name, burning no local CPU — shell \
+             wrappers, and rch clients whose bench runs on a remote worker; reported, not \
+             voiding): {}",
+            idle.len(),
+            render(&idle.iter().collect::<Vec<_>>())
+        )
+    };
+    if active.is_empty() {
+        return format!(
+            "concurrent_measurements=none ACTIVE (scanned /proc for other h2h harnesses, criterion \
+             benches and torch processes, then measured each candidate's local CPU over 300ms; \
+             this run's own incumbent child is excluded){idle_note}"
+        );
+    }
     format!(
         "concurrent_measurements={} DETECTED: {} — another process was sampling inside this \
-         window, so BOTH runs' arms are contended and NEITHER is quotable however its gates read. \
-         The drift gate cannot see this: it measures stability, and a uniformly overloaded host is \
-         stable.",
-        others.len(),
-        listed.join(" ")
+         window AND burning local CPU, so BOTH runs' arms are contended and NEITHER is quotable \
+         however its gates read. The drift gate cannot see this: it measures stability, and a \
+         uniformly overloaded host is stable.{idle_note}",
+        active.len(),
+        render(&active.iter().collect::<Vec<_>>())
     )
 }
 
@@ -408,7 +430,49 @@ fn parent_of(pid: u32) -> Option<u32> {
         .and_then(|field| field.parse::<u32>().ok())
 }
 
-fn concurrent_measurement_processes() -> Vec<(u32, &'static str)> {
+/// CPU ticks (`utime + stime`) burned by `pid`, or `None` if it is gone.
+///
+/// `comm` can contain spaces and parentheses, so fields are taken from after the LAST `)`:
+/// `utime` is field 14 and `stime` field 15, which land at indices 11 and 12 of that tail.
+fn cpu_ticks_of(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some(utime + stime)
+}
+
+/// Fraction of one core each candidate is burning, sampled over `SAMPLE`.
+///
+/// # Why a name match is not enough
+///
+/// Item 213 removed the detector's self-detection; this removes the other half of the same bug.
+/// A run of mine was voided by `concurrent_measurements=3 DETECTED: criterion-bench[90285]
+/// criterion-bench[90321] criterion-bench[90322]`, and the three processes were:
+///
+/// - `rch exec -- cargo bench --profile release-perf -p fnp-python --bench …` — an rch CLIENT,
+///   whose bench runs on a REMOTE worker and burns nothing on this host;
+/// - two `zsh -c …` wrappers whose command lines merely CONTAIN that text.
+///
+/// So one logical job, running on another machine, counted three times and voided the run. The
+/// same shape voids any run taken while a peer's shell mentions `--bench`, including a peer's
+/// `pgrep`, and it is not rare: it is how agents on this box launch everything.
+///
+/// Naming is not evidence of sampling. **Burning CPU is**, and it is measurable in 300 ms, so the
+/// detector measures it rather than inferring it from a string. A process below the floor is still
+/// PRINTED — the doc above promises visibility — but it no longer voids the run.
+const CONTENTION_SAMPLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Floor for calling a named process an ACTIVE measurement, as a fraction of one core.
+///
+/// A criterion bench or a peer harness that is actually sampling runs at 100% of a core or far
+/// more; a shell wrapper or an rch client sits at nought. Anything in between is reported and left
+/// to the reader. 10% over a 300 ms window is three `utime` ticks, which is above the 10 ms tick
+/// resolution rather than at it.
+const CONTENTION_ACTIVE_FLOOR: f64 = 0.10;
+
+fn concurrent_measurement_processes() -> Vec<(u32, &'static str, f64)> {
     let me = std::process::id();
     // Our ancestor chain, walked once. Bounded because a pid cannot be its own ancestor and pid 1
     // has no parent; the explicit cap is belt-and-braces against a malformed `/proc`.
@@ -423,9 +487,11 @@ fn concurrent_measurement_processes() -> Vec<(u32, &'static str)> {
             _ => break,
         }
     }
-    let mut found = Vec::new();
+    // Candidates matched by NAME. The measured set returned below carries a third field, so this
+    // is annotated rather than inferred from the return type.
+    let mut found: Vec<(u32, &'static str)> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return found;
+        return Vec::new();
     };
     for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -462,7 +528,25 @@ fn concurrent_measurement_processes() -> Vec<(u32, &'static str)> {
         };
         found.push((pid, kind));
     }
+    // Second pass: how much local CPU is each of them ACTUALLY burning. Sampled once for the whole
+    // candidate set rather than per process, so the wall cost is one 300 ms sleep however many
+    // matched.
+    let before: Vec<Option<u64>> = found.iter().map(|(pid, _)| cpu_ticks_of(*pid)).collect();
+    std::thread::sleep(CONTENTION_SAMPLE);
+    let window = CONTENTION_SAMPLE.as_secs_f64();
     found
+        .into_iter()
+        .zip(before)
+        .map(|((pid, kind), start)| {
+            // USER_HZ is 100 for /proc regardless of CONFIG_HZ. A process that exited during the
+            // sample reads as 0.0, which is the right answer: it is not contending with us now.
+            let share = match (start, cpu_ticks_of(pid)) {
+                (Some(a), Some(b)) => (b.saturating_sub(a) as f64 / 100.0) / window,
+                _ => 0.0,
+            };
+            (pid, kind, share)
+        })
+        .collect()
 }
 
 /// Render the rows that identify the MACHINE a row was measured on.
