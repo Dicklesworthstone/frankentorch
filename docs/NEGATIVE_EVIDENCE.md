@@ -37676,3 +37676,57 @@ reduction and re-measure the whole-op row, not to assert that the reduction is "
 The instrument also now records **iowait jiffies per arm** alongside loadavg and MHz. It read 0
 on every FT block and 1-12 on the PyTorch blocks in these runs, which is the process-launch cost
 of the incumbent arm rather than host I/O pressure.
+
+## 238. THE max_pool1d_nopool TARGET IS REFUTED: THE LANE IS AT PARITY, NOT 1.76x SLOWER — AND NOT THE 1.06-1.17x FASTER ITS TEN UNBANKED RUNS SUGGESTED
+
+`frankentorch-3ja43` was the campaign's first optimization target anchored to a REPLICATED standing
+rather than a scorecard row: two invocations at `MIN 0.535/0.539` = **FT 1.87x SLOWER**, both nulls
+passing, conservative claim "at least 1.76x SLOWER". Its own notes then recorded ten later runs
+reading 1.064-1.167x FASTER, **none admissible**, and refused to bank them — "that is exactly the
+argument that would justify lowering the bar".
+
+Three admissible runs now say the answer is neither.
+
+    ELF bd89b709df35aa8682c15aa66ec03406d2f18ae011199dbbfe86da20625ab05c
+    thinkstation1, Threadripper PRO 5975WX, governor=powersave, online_cpus=64, rayon_threads=8
+    incumbent=PyTorch 2.12.1+cpu threads=8, same invocation; mimalloc; lane_count=1 rounds=64
+
+    run  FT ms   PT ms   MEDIAN ratio          MIN ratio             nulls  drift  contention
+    r1   10.436  10.735  1.029 [1.016,1.049]   1.007 [0.982,1.018]   PASS   PASS   none ACTIVE
+    r3   10.425  10.658  1.022 [0.997,1.048]   0.989 [0.969,1.005]   PASS   PASS   none ACTIVE
+    r4   10.356  10.930  1.055 [1.018,1.086]   1.008 [0.993,1.046]   PASS   PASS   none ACTIVE
+    r2   10.137  10.266  1.013 [0.995,1.035]   0.977 [0.964,0.996]   PASS   PASS   VOID — a real
+                                                                     criterion-bench at 100%
+
+    load: r1 30.20->25.08, r3 21.90->19.98, r4 19.16->17.53; self_load DIRECT 14.2-16.9
+    cpu_mhz spread 2.78-2.82x, arms NOT pinned; parity `match` on all four
+
+**The two estimators disagree in SIGN and both sit within 3% of parity**: the median says FT 1.02x
+to 1.06x faster, the min says 0.989x to 1.008x — a coin flip. Per this bead's own rule 3 (quote the
+conservative bound, not the best point estimate), the honest standing is **parity: no measurable gap
+in either direction**, and certainly not the 1.76x loss the bead was opened to attack.
+
+### 238a. THE TARGET DID NOT MOVE — IT WAS ALREADY GONE
+
+Nothing was optimised here. The bead is closed because its premise no longer holds at HEAD: the
+banked 1.87x was measured on ELF `1fa33e62b39e125e`, and this campaign has landed max_pool1d work
+since (`md74s`'s lazy sum-shortcut is the most recent, and the buffer-pool vein touched the same
+route). I am NOT claiming those commits closed the gap — I did not bisect, and attributing a 1.87x
+move to a named commit without one is the error this file exists to record. What is established is
+the standing at this ELF, on this host, against this incumbent.
+
+**A gated target is a perishable good.** This one carried two passing-null invocations and an
+explicit conservative bound, which is why it was chosen over three scorecard-sourced beads whose
+numbers had already rotted — and it rotted anyway, in the interval between filing and taking it. The
+lesson is not to distrust gated targets; it is that RE-MEASURING THE TARGET IS THE FIRST STEP OF
+TAKING ONE, before any profiling.
+
+### 238b. THE VOIDED RUN IS THE DETECTOR EARNING ITS KEEP IN BOTH DIRECTIONS
+
+r2 was thrown out on `criterion-bench[2100519] 100%` — a peer's bench genuinely burning a core. r1
+was KEPT despite `concurrent_measurements_idle=2 (h2h-harness ...)`, name matches burning nothing.
+
+Under the pre-today detector (item 233) those two idle matches would have voided r1, which is the
+run that first cleared every gate on this lane. Ten prior runs failed to be admissible; part of what
+made three of four admissible today is that the instrument stopped refusing runs for the wrong
+reason.
