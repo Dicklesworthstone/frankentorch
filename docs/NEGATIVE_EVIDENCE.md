@@ -38075,3 +38075,57 @@ and that conclusion is width-conditional** — true at 8 threads, false at 16, w
 a win. Nothing in item 238 is wrong; its scope was simply narrower than it looked, and every row
 this campaign has banked at 8 threads carries the same qualifier. The width was inherited from
 torch's `set_num_threads(8)` to make the arms comparable, and comparability is not optimality.
+
+## 244. THE "QUIETEST WINDOW IN MANY TICKS" HAD A PEER BENCHMARK AT 935% CPU, AND MY GUARD WOULD HAVE MISSED IT
+
+`frankentorch-4zjaa`. No measurement. A guard defect found and fixed, and the reason it matters
+more than it sounds.
+
+### 244a. THE WINDOW WAS NOT THE WINDOW
+
+The tick opened described as *"CPU idle 88, runq 5, no local builds — the quietest window in many
+ticks, ideal for a slotted measurement"*, load 29.37. Checked directly, as the standing orders
+require:
+
+    loadavg 47.61 / 33.98 / 46.73     — 1-minute ABOVE the 5-minute, i.e. RISING
+    top CPU: python3 3297%, fp-bench 935%
+
+`fp-bench` is **frankenpandas' benchmark harness**, mid-run, with its `vs_pandas_harness.py`
+driver. The orchestrator's figures are stale by the time they arrive — its own standing orders
+say so — and this is the sharpest instance yet: not merely a busier host, but a **peer
+measurement in flight** during a window advertised as ideal for measuring.
+
+### 244b. MY GUARD WOULD HAVE MISSED IT
+
+`scripts/measurement_window_guard.sh` refused this tick — **on the load ceiling only**. Its
+process pattern was `torchvenv|pytorch_gauntlet|h2h|criterion|_bench|rayon_width`, and:
+
+* `fp-bench` is **hyphenated**, so `_bench` did not match it;
+* `python3 benches/vs_pandas_harness.py` carries the word in a **path**, so it did not match
+  either.
+
+**A guard shipped one tick ago to stop exactly this failed to see it, and only a second,
+unrelated check saved the tick.** Had load been 30 instead of 48, the guard would have printed
+PASS with a 935%-CPU benchmark running.
+
+Fixed: `bench` is now unanchored. The corrected guard names all three peer processes.
+
+### 244c. THE OVER-CORRECTION, CAUGHT IN ONE RUN
+
+The first fix also added a bare `torch` to catch an incumbent arm launched through any
+interpreter. That matches **"franken*torch*"** — so every process in this repo tripped it,
+including the orchestrator's own `ntm internal-monitor frankentorch`. **A guard that always
+fires is a guard that gets ignored**, which is the same end state as no guard at all, reached
+from the opposite direction. Reverted to `torchvenv`, the incumbent arm's actual signature.
+
+Both halves of this item are the same lesson in opposite directions: **the failure modes of a
+gate are asymmetric in cost but symmetric in effect.** A false negative banks a contended ratio;
+a false positive gets the gate switched off; both end with unguarded measurement.
+
+### 244d. WHAT THIS DOES NOT SETTLE
+
+`acquire_build_slot` has now returned *"Build slots are disabled. Enable WORKTREES_ENABLED"* on
+every call across **six ticks**. A local `ps` guard cannot serialise a fleet — it can only refuse
+on this side. frankenpandas cannot see my intent to measure and I cannot see theirs except by
+scanning `/proc`, which is why we have now collided three times in five ticks. The slot is the
+fix; the guard is a splint.

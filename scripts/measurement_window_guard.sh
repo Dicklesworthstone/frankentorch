@@ -34,7 +34,17 @@ done
 
 # A measurement is: a torch interpreter, a bench/h2h binary, or `cargo bench`. It is NOT a
 # compiler, and not a shell that happens to mention one of these words on its command line.
-readonly ARGS_PATTERN='torchvenv|pytorch_gauntlet|h2h|criterion|_bench|rayon_width'
+# `bench` UNANCHORED, not `_bench`: the first version missed a peer's `fp-bench` at 935% CPU
+# because the name is hyphenated, and missed `python3 benches/vs_pandas_harness.py` because the
+# word sits in a path. Only the load ceiling saved that tick. Over-matching is the safe
+# direction — a false positive costs a deferred tick, a false negative costs a banked ratio
+# that is a contention artefact.
+#
+# But NOT a bare `torch`: it matches "frankentorch", so every process in this repo — including
+# the orchestrator's own `ntm internal-monitor frankentorch` — would trip the guard, and a guard
+# that always fires is a guard that gets ignored. `torchvenv` is the incumbent arm's actual
+# signature.
+readonly ARGS_PATTERN='torchvenv|bench|h2h|criterion|rayon_width|pytorch_gauntlet'
 readonly COMM_EXCLUDE='^(rustc|cc1|cc1plus|ld|lld|ld[.]lld|collect2|as|zsh|bash|sh|dash|ps|grep|awk|sed|tee)$'
 
 mapfile -t HITS < <(
