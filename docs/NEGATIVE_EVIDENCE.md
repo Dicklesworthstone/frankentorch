@@ -35641,3 +35641,67 @@ summed lane has 8.8 and 10.4. A summed lane at batch 48-64 would put both arms i
 demonstrably nulls. That is a new lane, it needs a compiler, and item 203 is a fresh reminder of
 what happens when a lane is sized against a threshold nobody measured — so it waits for the build,
 with three data points now in hand rather than folklore.
+
+## 208. FOURTH REPLICATION OF THE BANKED ROW; DOUBLING THE ROUNDS DOES NOT RESCUE THE SUMMED LANE; AND THE SLOT DIAGNOSTIC POINTS THE OTHER WAY
+
+`frankentorch-hi9r6`. MEASURED, one invocation at 32 rounds. No cargo (disk 38G, below the brake);
+no file written. Host `thinkstation1`, loadavg before 6.03/7.24/8.80, `load_1m` 8.05 to 8.66,
+`worst_drift` 1.076x, both gates PASS, cross-core spread ~3.0x, concurrent measurements none,
+rustc 0. PyTorch 2.12.1+cpu, same invocation, 8 threads. ELF `2462293598f10e77...`.
+
+### 208a. THE BANK HOLDS AT 4/4
+
+    conv2d_big_masked   ratios 0.409, 0.413, 0.393, 0.396   median 0.396   spread 1.051x
+                        every gate PASS in every run, parity match throughout
+                        = FT 2.42-2.54x SLOWER than PyTorch 2.12.1+cpu
+
+The fourth run was taken at 32 rounds rather than 16 and landed inside the spread of the first
+three, which is a small piece of evidence that the estimator is not sensitive to the round count.
+
+### 208b. THE ROUNDS LEVER FAILED, CLEANLY
+
+`conv2d_big` at 32 rounds: `PT OFFSET [0.942,1.016]  FT PASS [0.960,1.015]  ratio 1.264`.
+
+    conv2d_big, warmed   1.187  PT PASS  / FT PASS      <- the only certified one
+                         1.135  PT PASS  / FT OFFSET
+                         1.421  PT WIDE  / FT OFFSET
+                         1.264  PT OFFSET/ FT PASS      <- 32 rounds
+                         certified 1 of 4;  ratio spread 1.252x
+
+Doubling the rounds did tighten the FT null (width 0.070 to 0.055) and it passed — but the
+INCUMBENT's null then came back offset low. Four invocations, four different combinations of which
+gate misses, and no two agree on the ratio to better than 25%.
+
+**More rounds narrows a confidence interval; it does not move a point estimate that is biased.**
+The lane is not failing for want of samples, and this is a clean negative on the cheapest available
+lever.
+
+### 208c. AN OBSERVATION THAT DOES NOT FIT MY OWN ITEM 207
+
+This run printed a per-lane diagnostic I had not used:
+
+    slot0 / median(slot1..3)   0.976  (conv2d_big, WARMED)
+                               0.975  (conv2d_big_masked, UNWARMED)
+
+Slot 0 is about 2.5% **faster** than the rest, on both lanes, including the one with no warm-up at
+all. Item 207 explained `conv2d_big`'s null failures by item 147's cold slot-0, measured at +20-30%
+**slower**. At these batch-16 twins the sign is opposite and the magnitude is an order out.
+
+Item 147 measured the SMALL summed lanes; these are the `_big` ones. So the two need not contradict
+— but item 207's explanation was written for a lane whose slot asymmetry it had not looked at, and
+the number now available points the other way. **Recorded against the explanation rather than
+quietly dropped**: the warm-up did move the FT null from OFFSET to PASS twice, so something about
+slot 0 matters here, but "item 147's cold start" is no longer supported as the reason.
+
+I am not offering a replacement mechanism. Two diagnoses in two turns have now been withdrawn or
+weakened by evidence available before they were written, and the honest state is: the summed lane's
+nulls are unstable, warming helps the FT side, and why is open.
+
+### 208d. WHAT STANDS
+
+    conv2d_big_masked   FT 2.42-2.54x SLOWER    BANKED, 4/4, generic route
+    conv2d_big          no standing             1/4 certified, ratios 1.135-1.421
+
+Neither prices items 174/176/177: the banked lane never reaches the all-ones adjoints, and the
+lane that does has no certified BEFORE value to difference against. That remains a two-ELF A/B and
+a build.
