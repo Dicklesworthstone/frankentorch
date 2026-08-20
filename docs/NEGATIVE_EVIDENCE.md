@@ -39066,3 +39066,76 @@ known about where that time goes and one is a target:
   multi-core bandwidth on exactly the half of the algorithm we have just decided to run on one
   core. That is not a ceiling, it is the shape of the next lever: **the fork cost per reflector
   is the thing to remove, not the parallelism**.
+
+## 257. THE SVD STANDING, WITH THE INCUMBENT INTERLEAVED — AND THE SECOND INSTRUMENT BIAS, WHICH WAS MINE AND WHICH BRIEFLY SHOWED A WIN THAT WAS NOT THERE
+
+`frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. Item 256 banked a row and said in its own
+text what was wrong with it: our figure was a min over nine rounds, the incumbent's a min over
+five samples taken in one block seconds away. This is that row re-taken with the incumbent driven
+as a **co-process** (`ft_api::harness_interleave`), sampled inside the same rounds, with the same
+warmup count, and it took two corrections to become honest.
+
+### 257a. THE FIRST FIX, AND THE WIN IT MANUFACTURED
+
+Making the incumbent a co-process removed the estimator asymmetry. The first version sampled it
+**once per round** while our six arms each ran once, so between two consecutive incumbent samples
+the caches were disturbed by six of our SVDs and by one of its own. That reading:
+
+    n=136   262144/4row   paired-vs-PT  1.048x FASTER and 1.175x FASTER
+
+**That was our first square-SVD win against PyTorch at any size, and it was an artefact of my own
+instrument.** With one incumbent sample paired to EACH arm — the same adjacency for every sample
+on both sides — the same configuration in the same window reads:
+
+    n=136   262144/4row   paired-vs-PT  1.291x SLOWER and 1.203x SLOWER
+
+A measuring instrument whose reading depends on how many of OUR configurations happen to be in
+the grid is not measuring the incumbent. The bias grows with arm count, so it was invisible in
+the two-arm sweeps that preceded it and appeared exactly when the grid widened to six.
+
+### 257b. THE STANDING
+
+`ELF e91ac9a960cae7d2`, host thinkstation1, governor powersave, `RAYON_NUM_THREADS=8` matched to
+`torch.set_num_threads(8)`, PyTorch 2.12.1+cpu self-reported in the SAME invocation as a
+co-process. **Guard PASS before AND after**; loadavg 22.94 -> 23.50 -> 19.30 across the run, CPU
+3.2-4.1 GHz, iowait 0-51 jiffies except n=1024 (367). Nine rounds, first discarded, arm order
+reversed on odd rounds, every ratio the median of the paired per-round ratio. Parity MATCH at
+every size (rel 6.1e-14 to 1.9e-12 on the singular-value sum).
+
+    n      shipped config      old config          A/A null   PT min
+           (1<<18 / 4row)      (1<<14 / 1row)
+    128    1.34x, 1.38x SLOW   1.62x SLOW          1.017x     1.289 ms
+    136    1.29x, 1.20x SLOW   1.42x SLOW          0.970x     1.515 ms
+    256    1.85x, 1.82x SLOW   2.22x SLOW          1.075x     6.407 ms
+    512    2.39x, 2.38x SLOW   3.05x SLOW          1.026x    26.964 ms
+    1024   3.94x, 3.43x SLOW   3.70x SLOW          1.005x   122.604 ms
+
+Two numbers per cell for the shipped config because the grid carried it TWICE, as its own null.
+
+What items 254 and 255 bought, paired in-process against the old configuration: **1.07x (n=128),
+1.21x (136), 1.17x (256), 1.34x (512), 1.04x (1024)**. The n=512 figure is the one to quote; the
+n=128 and n=1024 figures sit close to their nulls.
+
+### 257c. WHAT THIS SAYS ABOUT THE EARLIER STANDINGS, INCLUDING MY OWN
+
+Item 256's table read 1.23x/1.22x/1.54x/1.85x at n=128/136/256/512. This one reads
+1.34x/1.29x/1.85x/2.39x on the SAME code. **The difference is entirely instrument**: item 256's
+incumbent was sampled in a block with five samples against our nine, and the gap it left in time
+was unbounded. The earlier number was too kind to us by 10-30%, and it is the more recent, worse
+number that is correct.
+
+That direction is worth stating plainly, because it is the third time this tick that a change to
+the instrument moved a ratio more than any change to the code did:
+
+    block-interleaved arms          A/A null 1.02-1.19x
+    round-interleaved arms          A/A null 1.001-1.075x   (item 255)
+    incumbent in a block            standing too kind by 10-30%
+    incumbent paired per arm        the numbers above
+
+### 257d. THE STANDING IS WORST WHERE THE REDUCTION IS BIGGEST, AND THAT IS THE TARGET
+
+n=1024 is 3.4-3.9x slower and n=512 is 2.4x. `frankentorch-75e38` is filed for it: item 255's gate
+leaves the reduction's level-2 half — half of `dgebrd`'s flops — running on ONE core, because
+forking it per reflector costs ~7 us and the matvec does not pay for that. MKL threads the same
+matvecs. The lever is the dispatch cost, not the parallelism, and the lane that would price it now
+exists and carries its own null.
