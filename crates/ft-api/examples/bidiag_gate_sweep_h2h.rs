@@ -348,12 +348,17 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             }
         }
         let pt_all: Vec<f64> = pt_ms.iter().flatten().copied().collect();
-        // One extra call per arm, untimed, with the counters cleared: the route.
+        // One extra call per arm, untimed, with the counters cleared: the route AND the phase
+        // split. Deliberately NOT part of the estimator — mixing an instrumented call into the
+        // timed rounds would report a number nothing else in this campaign is comparable to.
         let mut branches = vec![(0u64, 0u64, 0u64); arms.len()];
+        let mut phases = vec![(0u64, 0u64, 0u64); arms.len()];
         for (idx, &arm) in arms.iter().enumerate() {
             let _ = ft_kernel_cpu::bidiag_parallel_branches_take();
+            let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
             let _ = ft_one(n, &data, arm);
             branches[idx] = ft_kernel_cpu::bidiag_parallel_branches_take();
+            phases[idx] = ft_kernel_cpu::svd_reduction_sweep_ns_take();
         }
 
         let (load_after, mhz_after) = provenance();
@@ -392,6 +397,18 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 median(&mut vs_arm0),
                 branches[idx],
                 if rel < 1e-9 { "MATCH" } else { "MISMATCH" }
+            );
+            let (reduction, form_pq, sweep) = phases[idx];
+            let total = (reduction + form_pq + sweep).max(1) as f64;
+            println!(
+                "                     phases (ours only, one instrumented call): reduction \
+                 {:.3} ms {:.0}%  form_p/q {:.3} ms {:.0}%  QR sweep {:.3} ms {:.0}%",
+                reduction as f64 / 1e6,
+                100.0 * reduction as f64 / total,
+                form_pq as f64 / 1e6,
+                100.0 * form_pq as f64 / total,
+                sweep as f64 / 1e6,
+                100.0 * sweep as f64 / total
             );
         }
         // Same gate, different step-(12) kernel, MUST agree bit-for-bit: the four-row kernel

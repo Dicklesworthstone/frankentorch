@@ -39139,3 +39139,61 @@ leaves the reduction's level-2 half — half of `dgebrd`'s flops — running on 
 forking it per reflector costs ~7 us and the matvec does not pay for that. MKL threads the same
 matvecs. The lever is the dispatch cost, not the parallelism, and the lane that would price it now
 exists and carries its own null.
+
+## 258. THE n=1024 GAP IS NOT THE DISPATCH — I FILED A BEAD ON THAT PREMISE THIS MORNING AND ITS OWN LANE NARROWS IT
+
+`frankentorch-75e38`, filed hours ago on the reasoning that item 255's gate leaves the
+reduction's level-2 matvecs running on one core while MKL threads them, and that the ~7 us fork
+cost is therefore the thing to remove. The lane that would price that lever now exists, and the
+first thing it says is that the premise is too broad.
+
+### 258a. WHAT THE GATE IS WORTH, BY SIZE
+
+Paired per-round, same process, A/A null beside each row:
+
+    n       gate 1<<18 against 1<<14      what that says
+    256     1.515x                        the dispatch is a LARGE term
+    1024    1.085x (item 255)             a small one
+    1024    1.002x (today, 5 rounds)      indistinguishable from its 1.005x null
+
+At n=256 the gated arm forks 896 times and the raised arm not at all, and the difference is half
+again. At n=1024 the gated arm forks 896 times, the raised arm 512, and **the two are the same
+speed to within the null**. Whatever costs us 3.4-3.9x against PyTorch at n=1024, it is not the
+fork.
+
+### 258b. THE ARITHMETIC THAT MAKES THAT UNSURPRISING, STATED AS A HYPOTHESIS
+
+This box is a Threadripper PRO 5975WX with a **128 MB last-level cache**. The reduction's working
+set at n=1024 is the trailing submatrix — 8 MB at the first reflector and shrinking — so it is
+LLC-resident for the whole reduction. One core pulling from LLC gets a large fraction of the
+bandwidth that eight cores would, which is exactly the condition under which forking a matvec
+buys nothing. At n=256 the same reasoning predicts the gate should matter LESS, not more, so this
+hypothesis does not explain the 1.515x there and is not offered as a complete account. It is a
+reason to measure the loops rather than the dispatch.
+
+### 258c. WHERE THE TIME IS INSTEAD, AND ONE INSTRUMENT CAVEAT
+
+One instrumented call at n=1024, gate `1<<14` (the arm whose phase total is self-consistent with
+its wall time):
+
+    reduction 321.5 ms (71%)   form_p/q 128.0 ms (28%)   QR sweep 0.4 ms (0%)   whole SVD ~454 ms
+
+**`form_p/q` is 28% at n=1024** against the 11-16% every earlier item measured at n=128-256. Our
+expansion phase alone (128 ms) is very nearly PyTorch's ENTIRE SVD (131.7 ms in the same
+invocation). That is a second target and nothing has been pointed at it.
+
+CAVEAT, because the same print is not trustworthy on the other arm: at gate `1<<18` the counters
+summed to 1058 ms against a measured median of 464 ms. A single untimed call can be slow, but
+2.3x is not explained by that, and the phase counters may double-count on the serial path. **No
+phase percentage should be quoted from a single call until that is resolved** — including the
+"reduction is 84%" figures in items 253 and 256, which came from the same instrument.
+
+### 258d. WHAT 75e38 SHOULD ACTUALLY ASK
+
+Narrowed, in its own bead: not "make the dispatch cheap" but "make the per-core matvec faster".
+Step (12) is now four independent dependency chains (item 254), which is four scalar FMAs per
+iteration where the machine can retire eight or sixteen — and it cannot be vectorised the obvious
+way, because summing a row in a different order changes its bits. The bit-exact form is SIMD
+ACROSS ROWS: four rows' element `c` in four lanes of one vector, each lane accumulating its own
+row in the original order. Whether LLVM already forms that from the current code is the first
+thing to find out, and it is a question for a disassembly, not a stopwatch.
