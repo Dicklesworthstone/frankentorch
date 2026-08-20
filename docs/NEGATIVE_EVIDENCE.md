@@ -39267,3 +39267,66 @@ better answer and it collides with a rule this project holds:
 `unsafe`. **That collision is the actual decision to put to the user**, and it is worth putting
 precisely because the widening is bit-exact — this is a free 128-bit-to-256-bit doubling of every
 vectorised loop in the port, gated on a build-policy call rather than on any numerical risk.
+
+## 260. AVX2 IS WORTH 1.14-1.24x ON THE SVD FORWARD, BIT-EXACT — AND THE PORTABLE FORM OF THE FLAG IS NOT PROVEN, SO NOTHING SHIPS
+
+`frankentorch-1wglf`. Item 259 established that every binary in this campaign targets baseline
+x86-64 while the host has AVX2, and that widening is bit-exact (701/701, every golden). This
+prices it, and the second half of the answer is a refusal.
+
+### 260a. THE CLEAN WINDOW: `-C target-cpu=znver3`
+
+Four invocations, ABBA (`base, avx, avx, base`), same source and commit, each binary carrying its
+OWN live PyTorch co-process as the drift control. Guard PASS before each. loadavg 21.6 -> 19.6
+falling and steady, iowait 1-29 jiffies, CPU 3.1-3.3 GHz. Within-binary A/A null (the shipped
+configuration carried twice in every invocation): **1.01-1.05x**. Parity MATCH on every row.
+
+    n=256   baseline  11.898  11.525 | 12.419  12.140 ms      best 11.525
+            znver3     9.289   9.472 |  9.624   9.657          best  9.289     1.24x
+    n=512   baseline  81.392  80.663 | 73.500  68.837          best 68.837
+            znver3    61.225  60.287 | 61.870  61.248          best 60.287     1.14x
+
+Normalising to the incumbent instead, which cancels window drift (mean of the paired-vs-PT
+medians across all four invocations):
+
+    n=256   baseline 1.74x SLOWER   znver3 1.54x SLOWER    1.13x
+    n=512   baseline 2.52x SLOWER   znver3 2.03x SLOWER    1.24x
+
+**Item 259d's prediction holds**: the gain is materially less than 2x, because only the
+elementwise loops widen and step (12)'s four dependency chains cannot.
+
+### 260b. THE PORTABLE FLAG DID NOT REPRODUCE IT, AND I AM NOT SHIPPING ON ONE WINDOW
+
+`-C target-cpu=x86-64-v3` is the flag one would actually ship — it is the AVX2 feature level
+without the Zen-3-specific tuning, portable to anything since Haswell, which matters because
+`rch` compiles on a heterogeneous worker fleet and a `native`/`znver3` binary can SIGILL
+elsewhere. It passes the same 701 tests. Its speed did **not** reproduce:
+
+    ABBA base/v3/v3/base, n=512, paired-vs-PT
+      baseline  2.887  2.987 | 2.300  2.444    mean 2.65
+      v3        2.546  2.442 | 2.845  2.565    mean 2.60      1.02x — nothing
+
+A three-ISA palindrome (`base, znver3, v3, v3, znver3, base`) then resolved nothing at all: every
+arm read 2.58-3.24x with complete overlap, on a window whose PyTorch spread hit **2.29x** and
+whose iowait hit 187 jiffies. That window is unusable and none of it is quoted.
+
+Two readings survive and I cannot separate them: `x86-64-v3` genuinely codegens worse than
+`znver3` on this machine, or the v3 windows were bad. **Either way the shipping candidate is
+unmeasured**, and shipping a global build flag on a single clean window for a DIFFERENT flag is
+the exact error item 241 recorded against the panel width.
+
+### 260c. SO NOTHING SHIPS, AND WHAT IS OWED
+
+`.cargo/config.toml` is untouched. What is owed before it changes:
+
+* `x86-64-v3` against baseline in a window whose A/A null is under 1.05x and whose incumbent
+  spread is under 1.2x, replicated twice;
+* if it does not reproduce znver3's gain, a disassembly diff between the two to say WHY, because
+  "AVX2 helps but only with Zen-3 tuning" is a claim that needs a mechanism, not two stopwatches;
+* the deployment call in item 259e, which is the user's: a pinned ISA floor changes who can run
+  the binary, and the alternative — runtime dispatch — needs `#[target_feature]`, which is
+  `unsafe` to call and which these crates forbid.
+
+**The measured fact stands on its own and is the useful output here**: our port has been leaving a
+1.14-1.24x bit-exact factor on the table on this host, on one op, for the entire campaign, and the
+same flag applies to every other kernel in the tree.
