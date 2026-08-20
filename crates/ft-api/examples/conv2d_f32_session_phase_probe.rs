@@ -86,14 +86,40 @@ fn main() {
     sentinel(batch, &x32, &w32, &x64, &w64);
     sentinel(batch, &x32, &w32, &x64, &w64);
 
+    // POOLED-vs-UNPOOLED A/B — `frankentorch-ymhld`, and it must be PAIRED inside one process.
+    //
+    // The first attempt to price the pool hook compared two separate runs and the host moved 20%
+    // between them (load 21 -> 41), which swamps anything a buffer recycle can be worth
+    // (`project_buffer_pool_contention`: a pool HIT is worth <=1.06x). Toggling inside one process
+    // in palindrome order ON/OFF/OFF/ON makes host drift common-mode and lands it symmetrically on
+    // both arms, per item 51.
     let mut p32: Vec<Phases> = Vec::with_capacity(reps);
     let mut p64: Vec<Phases> = Vec::with_capacity(reps);
+    let mut pooled: Vec<f64> = Vec::with_capacity(reps * 2);
+    let mut unpooled: Vec<f64> = Vec::with_capacity(reps * 2);
     for _ in 0..reps {
         p32.push(run_f32(batch, &x32, &w32));
         p64.push(run_f64(batch, &x64, &w64));
         p64.push(run_f64(batch, &x64, &w64));
         p32.push(run_f32(batch, &x32, &w32));
+
+        ft_core::buffer_pool::set_enabled(true);
+        pooled.push(run_f32(batch, &x32, &w32).backward);
+        ft_core::buffer_pool::set_enabled(false);
+        unpooled.push(run_f32(batch, &x32, &w32).backward);
+        unpooled.push(run_f32(batch, &x32, &w32).backward);
+        ft_core::buffer_pool::set_enabled(true);
+        pooled.push(run_f32(batch, &x32, &w32).backward);
     }
+    ft_core::buffer_pool::set_enabled(true);
+    let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    println!(
+        "\n  BUFFER-POOL A/B on the f32 BACKWARD (paired, palindrome ON/OFF/OFF/ON in ONE process)\n             pooled   min {:8.3} ms\n    unpooled min {:8.3} ms\n             unpooled/pooled {:.3}x   (>1 = the pool helps; a HIT is worth <=1.06x per\n             project_buffer_pool_contention, so treat anything under that as noise)\n             pool stats: {:?}",
+        min(&pooled),
+        min(&unpooled),
+        min(&unpooled) / min(&pooled),
+        ft_core::buffer_pool::stats()
+    );
 
     let min_of = |v: &[Phases], pick: fn(&Phases) -> f64| -> f64 {
         v.iter().map(pick).fold(f64::INFINITY, f64::min)

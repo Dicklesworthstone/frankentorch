@@ -28518,6 +28518,24 @@ impl FrankenTorchSession {
     /// a rayon fork costs more than the work.
     fn widen_grad_f32_to_f64(values: &[f32]) -> Vec<f64> {
         use rayon::prelude::*;
+        // POOL HOOK TRIED AND REVERTED — `frankentorch-ymhld`, measured 2026-08-20.
+        //
+        // This `collect` allocates ~47 MiB per backward, and a phase split named that allocation
+        // as a suspect in the ~30 ms of non-kernel backward cost. Routing it through
+        // `ft_core::buffer_pool::try_take_exact` (the `Option` form, keeping this cheaper
+        // non-zeroing miss path, per that module's own warning) was tried and MEASURED, paired
+        // ON/OFF/OFF/ON inside one process so host drift is common-mode:
+        //
+        //     pooled 41.440 ms   unpooled 41.360 ms   unpooled/pooled 0.998x
+        //     pool stats: hits 12, misses 1, parked_bytes 524,943,360
+        //
+        // The pool WAS serving (12 hits of 13) and bought nothing — 0.2% the wrong way, inside
+        // noise — while parking 525 MiB. `project_buffer_pool_contention` already recorded that a
+        // pool hit is worth <=1.06x and that an eviction-tuning attempt moved no ratio while
+        // costing 440 MiB; this is the same result on a much larger buffer. Reverted rather than
+        // shipped, and recorded here so the next person does not re-file it.
+        //
+        // The PARALLEL widen below stays: that one is measured at -22.9 ms on this phase.
         values.par_iter().map(|&v| f64::from(v)).collect()
     }
 
