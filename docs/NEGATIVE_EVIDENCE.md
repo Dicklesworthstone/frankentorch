@@ -39197,3 +39197,73 @@ way, because summing a row in a different order changes its bits. The bit-exact 
 ACROSS ROWS: four rows' element `c` in four lanes of one vector, each lane accumulating its own
 row in the original order. Whether LLVM already forms that from the current code is the first
 thing to find out, and it is a question for a disassembly, not a stopwatch.
+
+## 259. WE HAVE BEEN COMPILING TO SSE2 AND COMPARING IT TO MKL's AVX2 — THE WIDENING IS BIT-EXACT, AND IT IS NOT YET PRICED
+
+`frankentorch-75e38` / `frankentorch-bidiag-parallel-gate-fork-thrash-mzrnh`. Item 258 said the
+next question was for a disassembly rather than a stopwatch. It was, and the answer is not about
+step (12) at all.
+
+### 259a. THE OBSERVATION
+
+`bidiag_blocked_f64` in the shipped binary, disassembled:
+
+    mulsd / addsd / movsd    scalar
+    mulpd / addpd            SSE2, 128-bit, TWO doubles
+    ymm registers            0
+    vfmadd                   0
+
+`.cargo/config.toml` sets `rustflags = ["-Z", "threads=4"]` and **no `target-cpu`**, so every
+build in this campaign has targeted baseline x86-64. This host is a Threadripper PRO 5975WX and
+`/proc/cpuinfo` reports `avx2` and `fma`. Rebuilt with `-C target-cpu=znver3`, the same function
+contains **52 `ymm` instructions** and still zero `vfmadd`.
+
+Two earlier items recorded "`.cargo/config.toml` carries no `target-cpu`" as a provenance line,
+which is how it should be recorded; nobody had asked what it costs.
+
+### 259b. IT IS BIT-EXACT, WHICH IS THE PART THAT MATTERS
+
+Whole `frankentorch-kernel-cpu` suite under `-C target-cpu=znver3`: **701 passed, 0 failed**,
+including every bit-exactness golden this campaign has accumulated —
+`bidiag_blocked_output_is_bit_stable`, `svd_deferred_left_thread_count_bit_exact`,
+`svdvals_is_bit_identical_to_svd_on_the_blocked_path`, the basis-completion bitwise pair, and the
+`svd_square_full_matrices_matches_reduced_bitwise_across_the_fast_path_gate` row.
+
+The mechanism is why, and it is worth stating so nobody assumes SIMD implies rounding change:
+widening an ELEMENTWISE loop from two lanes to four changes which lane an operation lands in, not
+the operation. Rust does not enable FP contraction, so `a*b + c` stays a multiply and an add
+rather than becoming an FMA with one rounding — the disassembly confirms it (`vmulpd` + `vaddpd`,
+no `vfmadd`). And a REDUCTION cannot be widened at all without reassociation, which LLVM will not
+do without fast-math. So the loops that were already vectorised get wider, and the loops that
+carry a dependency chain are untouched.
+
+### 259c. WHAT IT DOES TO EVERY RATIO IN THIS LEDGER
+
+PyTorch's LAPACK/MKL **runtime-dispatches** to the host's widest ISA. So every vs-incumbent ratio
+banked in this campaign has compared **our SSE2 build against their AVX2 code**, and that is a
+property of the comparison that no row records. It does not invalidate the rows — the arms are
+what they are, and the deployment we ship is what we ship — but a reader is entitled to know that
+the gap includes a build-flag term of unknown size.
+
+### 259d. NOT PRICED, AND WHY NOT TONIGHT
+
+The host went from loadavg 13 to **152** while this was being checked, with eight peer
+measurements live, and the guard refused. Both binaries are on disk and ready
+(`lane_phase` baseline, `lane_znver3` AVX2, same source, same commit), each carrying its own live
+PyTorch arm as the drift control. **No speed number is claimed here.** The prediction, so the next
+window falsifies rather than confirms: the reduction's step-(3) matvec and the trailing GEMMs are
+elementwise-vectorisable and should gain toward 2x; step (12) is four dependency chains and should
+gain nothing; so the SVD forward should improve by materially less than 2x, and if it improves by
+MORE than 2x something other than width is going on and the measurement is wrong.
+
+### 259e. THE DEPLOYMENT QUESTION IS REAL AND IS NOT `native`
+
+`-C target-cpu=native` would be wrong for this project specifically: `rch` compiles on a
+heterogeneous worker fleet, so a `native` build on an AVX-512 worker produces a binary that
+SIGILLs on this host. The two honest options are a PINNED floor (`x86-64-v3` is the AVX2 level and
+is portable across anything since Haswell/Excavator) or runtime dispatch. Runtime dispatch is the
+better answer and it collides with a rule this project holds:
+`#[target_feature(enable = "avx2")]` functions are `unsafe` to call, and these crates forbid
+`unsafe`. **That collision is the actual decision to put to the user**, and it is worth putting
+precisely because the widening is bit-exact — this is a free 128-bit-to-256-bit doubling of every
+vectorised loop in the port, gated on a build-policy call rather than on any numerical risk.
