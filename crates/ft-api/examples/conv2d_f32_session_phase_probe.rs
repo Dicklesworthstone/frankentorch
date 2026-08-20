@@ -85,6 +85,7 @@ fn main() {
     let _ = run_f64(batch, &x64, &w64);
     sentinel(batch, &x32, &w32, &x64, &w64);
     sentinel(batch, &x32, &w32, &x64, &w64);
+    pad_gate_ab(batch, &x32, reps);
 
     // POOLED-vs-UNPOOLED A/B — `frankentorch-ymhld`, and it must be PAIRED inside one process.
     //
@@ -225,6 +226,57 @@ fn sentinel(batch: usize, x32: &[f32], w32: &[f32], x64: &[f64], w64: &[f64]) {
     println!(
         "\n  SENTINEL (what ft-api actually calls, all-ones adjoint, same shape):\n             f32 ones-entry  {f32_ms:8.3} ms   {verdict}\n             f64 masked-entry{f64_ms:8.3} ms   (dispatches to its adjoint internally)\n             f64/f32 {:.2}x   (>1 = f32 faster; the raw generic kernels measure 1.5x)",
         f64_ms / f32_ms
+    );
+}
+
+/// PRICE THE `tensor_pad` GRAD GATE — `frankentorch-wb7vt`.
+///
+/// `tensor_pad`'s block-copy fast path is gated on `!tensor_requires_grad(input)`, so an inference
+/// pad gets a memset-plus-row-copy while a TRAINING pad falls through to a per-output-element
+/// O(ndim) coordinate decode — which that function's own comment measures at 3.7x slower than
+/// torch. Every conv2d on the board's training route pads an input that requires grad.
+///
+/// That is a mechanism from READING, and on `frankentorch-qif1n` five such mechanisms produced four
+/// refutations. So it gets priced before anyone acts on it: same tensor, same shape, same padding,
+/// same process, `requires_grad` the ONLY difference, palindrome GRAD/NOGRAD/NOGRAD/GRAD so host
+/// drift is common-mode (item 51).
+///
+/// The pad is timed alone rather than inside conv2d, because conv2d's grad and no-grad routes
+/// differ in more than the pad and the comparison would not isolate the gate.
+fn pad_gate_ab(batch: usize, values: &[f32], reps: usize) {
+    let shape = vec![batch, CI, H, W];
+    let pad = [1usize, 1, 1, 1];
+    let mut grad_ms: Vec<f64> = Vec::new();
+    let mut nograd_ms: Vec<f64> = Vec::new();
+    let once = |requires_grad: bool| -> f64 {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(values.to_vec(), shape.clone(), requires_grad)
+            .expect("pad leaf");
+        let t = Instant::now();
+        let padded = session.tensor_pad(x, &pad, 0.0).expect("pad");
+        let elapsed = ms(t);
+        std::hint::black_box(padded);
+        elapsed
+    };
+    let _ = once(true);
+    let _ = once(false);
+    for _ in 0..reps {
+        grad_ms.push(once(true));
+        nograd_ms.push(once(false));
+        nograd_ms.push(once(false));
+        grad_ms.push(once(true));
+    }
+    let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    println!(
+        "\n  tensor_pad GRAD-GATE A/B (frankentorch-wb7vt), [{batch},{CI},{H},{W}] pad 1 on each \
+         spatial side\n    \
+         requires_grad=true   min {:8.3} ms   <- per-element O(ndim) decode\n    \
+         requires_grad=false  min {:8.3} ms   <- block-copy fast path\n    \
+         grad/nograd {:.2}x   (1.0 = the gate costs nothing; >1 = training pays for it)",
+        min(&grad_ms),
+        min(&nograd_ms),
+        min(&grad_ms) / min(&nograd_ms)
     );
 }
 
