@@ -351,14 +351,34 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // One extra call per arm, untimed, with the counters cleared: the route AND the phase
         // split. Deliberately NOT part of the estimator — mixing an instrumented call into the
         // timed rounds would report a number nothing else in this campaign is comparable to.
+        // THREE instrumented calls per arm, and the phase split is the per-component MEDIAN.
+        // NEGATIVE_EVIDENCE item 258c read a single call whose components summed to 1058 ms
+        // against a 464 ms median and suspected the counters of double-counting. They do not —
+        // the blocked and NR prologues are mutually exclusive and each records once — it was one
+        // contended sample. A single sample of anything on this host is not a measurement.
+        const PHASE_CALLS: usize = 3;
         let mut branches = vec![(0u64, 0u64, 0u64); arms.len()];
         let mut phases = vec![(0u64, 0u64, 0u64); arms.len()];
         for (idx, &arm) in arms.iter().enumerate() {
-            let _ = ft_kernel_cpu::bidiag_parallel_branches_take();
-            let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
-            let _ = ft_one(n, &data, arm);
-            branches[idx] = ft_kernel_cpu::bidiag_parallel_branches_take();
-            phases[idx] = ft_kernel_cpu::svd_reduction_sweep_ns_take();
+            let mut samples: Vec<(u64, u64, u64)> = Vec::with_capacity(PHASE_CALLS);
+            for _ in 0..PHASE_CALLS {
+                let _ = ft_kernel_cpu::bidiag_parallel_branches_take();
+                let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
+                let _ = ft_one(n, &data, arm);
+                branches[idx] = ft_kernel_cpu::bidiag_parallel_branches_take();
+                samples.push(ft_kernel_cpu::svd_reduction_sweep_ns_take());
+            }
+            let mut reduction: Vec<u64> = samples.iter().map(|s| s.0).collect();
+            let mut form_pq: Vec<u64> = samples.iter().map(|s| s.1).collect();
+            let mut sweep: Vec<u64> = samples.iter().map(|s| s.2).collect();
+            reduction.sort_unstable();
+            form_pq.sort_unstable();
+            sweep.sort_unstable();
+            phases[idx] = (
+                reduction[PHASE_CALLS / 2],
+                form_pq[PHASE_CALLS / 2],
+                sweep[PHASE_CALLS / 2],
+            );
         }
 
         let (load_after, mhz_after) = provenance();
@@ -401,7 +421,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             let (reduction, form_pq, sweep) = phases[idx];
             let total = (reduction + form_pq + sweep).max(1) as f64;
             println!(
-                "                     phases (ours only, one instrumented call): reduction \
+                "                     phases (ours only, median of 3 instrumented calls): reduction \
                  {:.3} ms {:.0}%  form_p/q {:.3} ms {:.0}%  QR sweep {:.3} ms {:.0}%",
                 reduction as f64 / 1e6,
                 100.0 * reduction as f64 / total,
