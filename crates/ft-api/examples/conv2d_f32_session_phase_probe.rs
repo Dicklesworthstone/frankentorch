@@ -86,6 +86,7 @@ fn main() {
     sentinel(batch, &x32, &w32, &x64, &w64);
     sentinel(batch, &x32, &w32, &x64, &w64);
     pad_gate_ab(batch, &x32, reps);
+    pad_backward_probe(batch, &x32, reps);
 
     // POOLED-vs-UNPOOLED A/B — `frankentorch-ymhld`, and it must be PAIRED inside one process.
     //
@@ -277,6 +278,49 @@ fn pad_gate_ab(batch: usize, values: &[f32], reps: usize) {
         min(&grad_ms),
         min(&nograd_ms),
         min(&grad_ms) / min(&nograd_ms)
+    );
+}
+
+/// ISOLATE THE PAD'S BACKWARD — `frankentorch-ymhld`.
+///
+/// The backward residue (backward phase minus the kernel entry) is ~30 ms at batch 160 in BOTH
+/// dtypes, and a batch sweep showed it scales 2.90x for a 2.50x batch increase — so it is
+/// per-element data movement, not per-call bookkeeping. The crop is the named suspect: conv2d's
+/// input is padded on the tape, so the backward must crop `dpadded` (5.9M elements) back to the
+/// input extent.
+///
+/// This times a pad-only tape: leaf -> pad -> sum -> backward. Nothing else is in that backward, so
+/// whatever it costs IS the crop plus the sum's adjoint, and the sum's adjoint is a fill.
+///
+/// Reported beside the conv2d backward residue from the same run, because the question is not "is
+/// the crop slow" in the abstract but "is the crop the 30 ms". Two batches, so it can be checked
+/// against the same 2.5x scaling the residue showed.
+fn pad_backward_probe(batch: usize, values: &[f32], reps: usize) {
+    let shape = vec![batch, CI, H, W];
+    let pad = [1usize, 1, 1, 1];
+    let once = || -> f64 {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(values.to_vec(), shape.clone(), true)
+            .expect("pad leaf");
+        let padded = session.tensor_pad(x, &pad, 0.0).expect("pad");
+        let loss = session.tensor_sum(padded).expect("sum");
+        let t = Instant::now();
+        let report = session.tensor_backward(loss).expect("backward");
+        let elapsed = ms(t);
+        std::hint::black_box(report.gradient(x).map(<[f64]>::len));
+        elapsed
+    };
+    let _ = once();
+    let mut v: Vec<f64> = (0..reps).map(|_| once()).collect();
+    v.sort_by(f64::total_cmp);
+    println!(
+        "\n  PAD-ONLY BACKWARD (frankentorch-ymhld), [{batch},{CI},{H},{W}] pad 1 each spatial \
+         side\n    leaf -> pad -> sum -> backward, backward timed alone: min {:8.3} ms (n={})\n    \
+         Compare against the conv2d backward RESIDUE at this batch. If the crop is the residue \
+         these are the same order; if it is a fraction, the residue is elsewhere.",
+        v[0],
+        v.len()
     );
 }
 
