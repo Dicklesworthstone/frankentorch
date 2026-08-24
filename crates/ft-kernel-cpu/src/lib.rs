@@ -8508,6 +8508,13 @@ fn conv2d_backward_dinput_blocked_rows_f64(
     if batch == 0 || in_ch == 0 || out_ch == 0 || patch_count == 0 || patch_width == 0 {
         return dpadded;
     }
+    // Every image visits the same output-window geometry.  Build it once rather than paying the
+    // `pc / ow` and `pc % ow` coordinate recovery inside each image's serial scatter.  This only
+    // replaces address arithmetic: blocks still arrive and scatter in ascending `pc`, so each
+    // `dpadded` element receives the exact same additions in the exact same order.
+    let patch_origins: Vec<(usize, usize)> = (0..patch_count)
+        .map(|pc| ((pc / ow) * sh, (pc % ow) * sw))
+        .collect();
     dpadded
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
@@ -8515,8 +8522,7 @@ fn conv2d_backward_dinput_blocked_rows_f64(
             let scatter = |block: &[f64], start: usize, rows: usize, dpb: &mut [f64]| {
                 for r in 0..rows {
                     let pc = start + r;
-                    let base_h = (pc / ow) * sh;
-                    let base_w = (pc % ow) * sw;
+                    let (base_h, base_w) = patch_origins[pc];
                     let prow = r * patch_width;
                     for c in 0..in_ch {
                         let ch_off = c * ph * pw;
@@ -44863,7 +44869,7 @@ mod tests {
         // Each row is [batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]. An array rather than a
         // 9-tuple so it destructures in the loop pattern and still fits one line per case.
         //              batch in_ch out_ch  ph  pw  kh  kw  sh  sw
-        let shapes: [[usize; 9]; 10] = [
+        let shapes: [[usize; 9]; 11] = [
             // The two that exercise BLOCKING itself. Everything below them has a patch_count
             // under `DPANEL_BLOCK_ROWS` and so runs as a single partial block, which would leave
             // a dropped or double-counted tail — the most plausible failure of an m-split —
@@ -44877,6 +44883,7 @@ mod tests {
             [3, 4, 1, 8, 6, 2, 3, 1, 1],   // asymmetric kernel, out_ch == 1
             [2, 3, 33, 6, 6, 1, 1, 1, 1],  // 1x1 kernel, odd out_ch across a SIMD width
             [1, 1, 5, 10, 7, 3, 2, 1, 2],  // in_ch == 1, mixed stride, ragged width
+            [2, 2, 7, 15, 17, 4, 3, 2, 3], // both patch-origin divisions have ragged tails
             [4, 2, 2, 5, 5, 5, 5, 1, 1],   // kernel == plane: exactly one patch, well under a block
         ];
         for (case, &[batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]) in shapes.iter().enumerate() {
