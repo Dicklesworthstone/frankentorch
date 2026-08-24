@@ -8482,6 +8482,157 @@ fn conv2d_dinput_block_rows(patch_width: usize) -> usize {
 /// [`conv2d_backward_dinput_direct_f64`] with the block width supplied, so a test can drive it.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
+/// f32 sibling of [`conv2d_backward_dinput_direct_f64`] — `frankentorch-hi9r6`.
+///
+/// WHY THIS EXISTS, measured rather than assumed. `conv2d_f32_masked` is the worst conv2d
+/// standing on the board: **114.667 ms against PyTorch's 25.178 ms, 4.55x SLOWER** (5.05x min),
+/// while `conv2d_f32` at the same shape is at parity. The whole difference is the summed route
+/// taking the all-ones adjoint and the masked route falling onto the GENERIC backward — and the
+/// generic f32 backward still built `dpanel` the pre-blocking way, `flat x patch_width` written
+/// by `sgemm` and read back by `conv2d_col2im_f32`.
+///
+/// At that lane's shape (batch 160, in_ch 32, 32x32, k=3) `flat` is 163,840 and `patch_width`
+/// 288, so `dpanel` is 47.2M f32 = **189 MB**, written once and read once: a ~378 MB DRAM round
+/// trip per call, to produce a `dpadded` of 24 MB. The arithmetic says that is the +90 ms, and
+/// the mask multiply this lane also pays is only ~8 MB x 3 passes by comparison. f64 stopped
+/// paying it at 4b157b3e; f32 never did.
+///
+/// Same decomposition, same gate, same bit-exactness argument as the f64 original, which see:
+/// the product splits on `m` because `C[i][:]` depends solely on `A[i][:]` and the reduction is
+/// over `out_ch` and never divided; the scatter keeps `pc` ascending so every `dpadded` element
+/// receives the identical sequence of `+=`. Gated on `batch >= current_num_threads()` for item
+/// 117's reason — below that the image axis cannot fill the pool and blocking would trade
+/// parallel width for working set, which is what cost that item 1.7x.
+///
+/// `conv2d_dinput_direct_f32_matches_panel_col2im_bitwise` asserts it against the panel route at
+/// every block width, so the byte budget can be retuned without re-proving parity.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_backward_dinput_direct_f32(
+    dout_flat: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kh * kw;
+    conv2d_backward_dinput_blocked_rows_f32(
+        dout_flat,
+        weight_flat,
+        batch,
+        in_ch,
+        ph,
+        pw,
+        kh,
+        kw,
+        oh,
+        ow,
+        sh,
+        sw,
+        out_ch,
+        conv2d_dinput_block_rows_f32(patch_width),
+    )
+}
+
+/// Patch rows per `sgemm` call, from the same BYTE budget as the f64 path.
+///
+/// 576 KiB, so the block stays L2-resident; at f32's 4 bytes that is twice the rows the f64 path
+/// gets for the same footprint, which is the point of budgeting bytes rather than rows.
+#[must_use]
+fn conv2d_dinput_block_rows_f32(patch_width: usize) -> usize {
+    const BUDGET_BYTES: usize = 576 * 1024;
+    if patch_width == 0 {
+        return 1;
+    }
+    (BUDGET_BYTES / (patch_width * size_of::<f32>())).max(1)
+}
+
+/// [`conv2d_backward_dinput_direct_f32`] with the block width supplied, so a test can drive it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_dinput_blocked_rows_f32(
+    dout_flat: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let block_rows = block_rows.max(1);
+    // Positions no window reaches must stay `+0.0`: this accumulates, so it cannot be built
+    // uninitialised (item 165d).
+    let mut dpadded = vec![0.0f32; batch * in_ch * ph * pw];
+    if batch == 0 || in_ch == 0 || out_ch == 0 || patch_count == 0 || patch_width == 0 {
+        return dpadded;
+    }
+    let patch_origins: Vec<(usize, usize)> = (0..patch_count)
+        .map(|pc| ((pc / ow) * sh, (pc % ow) * sw))
+        .collect();
+    dpadded
+        .par_chunks_mut(in_ch * ph * pw)
+        .enumerate()
+        .for_each(|(b, dpb)| {
+            let scatter = |block: &[f32], start: usize, rows: usize, dpb: &mut [f32]| {
+                for r in 0..rows {
+                    let pc = start + r;
+                    let (base_h, base_w) = patch_origins[pc];
+                    let prow = r * patch_width;
+                    for c in 0..in_ch {
+                        let ch_off = c * ph * pw;
+                        let pch = c * kh * kw;
+                        for kr in 0..kh {
+                            let irow = ch_off + (base_h + kr) * pw + base_w;
+                            let prow_off = prow + pch + kr * kw;
+                            for kc in 0..kw {
+                                dpb[irow + kc] += block[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            };
+            // `sgemm` overwrites every scratch element with beta=0 before this loop reads it, so
+            // the first block covers the allocation in full and later short tails only read
+            // their written prefix.
+            let first_rows = block_rows.min(patch_count);
+            let first =
+                &dout_flat[(b * patch_count) * out_ch..(b * patch_count + first_rows) * out_ch];
+            let mut block = build_uninit(first_rows * patch_width, |block| {
+                gemm::sgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
+            });
+            scatter(&block, 0, first_rows, dpb);
+            let mut start = first_rows;
+            while start < patch_count {
+                let rows = block_rows.min(patch_count - start);
+                let a = &dout_flat
+                    [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
+                let dp = &mut block[..rows * patch_width];
+                gemm::sgemm(rows, out_ch, patch_width, a, weight_flat, dp);
+                scatter(dp, start, rows, dpb);
+                start += rows;
+            }
+        });
+    dpadded
+}
+
 fn conv2d_backward_dinput_blocked_rows_f64(
     dout_flat: &[f64],
     weight_flat: &[f64],
@@ -8543,8 +8694,8 @@ fn conv2d_backward_dinput_blocked_rows_f64(
             // read their written prefix. The zero-filled `dpadded` remains an accumulator, so
             // untouched padded positions preserve the col2im route's signed-zero contract.
             let first_rows = block_rows.min(patch_count);
-            let first = &dout_flat[(b * patch_count) * out_ch
-                ..(b * patch_count + first_rows) * out_ch];
+            let first =
+                &dout_flat[(b * patch_count) * out_ch..(b * patch_count + first_rows) * out_ch];
             let mut block = build_uninit(first_rows * patch_width, |block| {
                 gemm::dgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
             });
@@ -8753,6 +8904,27 @@ pub fn conv2d_backward_masked_f32(
     });
 
     let dpadded = output_mask[0].then(|| {
+        // Blocked, image-parallel dinput — `frankentorch-hi9r6`. The panel below is 189 MB at the
+        // conv2d_f32_masked shape and is written once and read once; this keeps it L2-resident.
+        // Bit-identical (m-split plus ascending-pc scatter); see
+        // `conv2d_backward_dinput_direct_f32`. Same gate as f64 for item 117's reason.
+        if conv2d_dinput_blocked_selected(batch) {
+            return conv2d_backward_dinput_direct_f32(
+                &dout_flat,
+                weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+            );
+        }
         let dpanel = build_pool_output(flat * patch_width, |dp: &mut [f32]| {
             CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
             gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
@@ -11766,7 +11938,6 @@ pub fn max_pool3d_forward_with_indices_f64(
                     let mut loc111 = loc110 + 1;
                     let mut oidx = (oz * oh + oy) * ow;
                     for _ in 0..ow {
-
                         let mut max_value = f64::NEG_INFINITY;
                         // The window's FIRST element, which is what torch reports
                         // when nothing displaces the seed (an all -inf window):
@@ -44961,6 +45132,104 @@ mod tests {
     }
 
     #[test]
+    fn conv2d_dinput_direct_f32_matches_panel_col2im_bitwise() {
+        // `frankentorch-hi9r6`. The f32 sibling of the f64 assertion above, and it earns its own
+        // test rather than riding that one: it is a DIFFERENT gemm (`sgemm`), a different
+        // `col2im`, and f32's narrower mantissa makes a reassociation easier to hit, not harder.
+        //
+        // Shapes are the f64 set's reasoning applied to f32's block width. The byte budget gives
+        // twice the rows at the same footprint, so the boundary cases have to move with it: block
+        // widths are driven explicitly below instead of trusting the policy to straddle anything.
+        let cases: [[usize; 9]; 8] = [
+            [2, 5, 3, 40, 40, 3, 3, 1, 1], // many blocks, ragged tail
+            [2, 3, 2, 34, 18, 3, 3, 1, 1], // exact block multiple at width 256
+            [2, 5, 3, 9, 8, 3, 3, 1, 1],   // below one block
+            [9, 3, 4, 7, 7, 3, 3, 1, 1],   // above COL2IM_PLANE_MAX_BATCH
+            [1, 2, 3, 11, 11, 3, 3, 2, 2], // strided: interior gaps stay +0.0
+            [2, 3, 2, 12, 12, 2, 2, 3, 3], // sw > kw: windows do not tile
+            [3, 4, 1, 8, 6, 2, 3, 1, 1],   // asymmetric kernel, out_ch == 1
+            [1, 1, 5, 10, 7, 3, 2, 1, 2],  // in_ch == 1, mixed stride
+        ];
+        for (case, &[batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]) in cases.iter().enumerate() {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_count = oh * ow;
+            let patch_width = in_ch * kh * kw;
+            let flat = batch * patch_count;
+            let dout_flat: Vec<f32> = (0..flat * out_ch)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        -0.0
+                    } else {
+                        ((i % 23) as f32) * 0.037 - 0.4
+                    }
+                })
+                .collect();
+            let weight_flat: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| ((i % 19) as f32) * 0.0625 - 0.5)
+                .collect();
+
+            let mut dpanel = vec![0.0f32; flat * patch_width];
+            super::gemm::sgemm(
+                flat,
+                out_ch,
+                patch_width,
+                &dout_flat,
+                &weight_flat,
+                &mut dpanel,
+            );
+            let want =
+                super::conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+
+            for block_rows in [1usize, 2, 7, 256, patch_count + 5] {
+                let got = super::conv2d_backward_dinput_blocked_rows_f32(
+                    &dout_flat,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    block_rows,
+                );
+                assert_eq!(got.len(), want.len(), "case {case}: dpadded length");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "case {case} element {i} at block_rows={block_rows}: direct {g} != \
+                         panel+col2im {w} (batch={batch} in_ch={in_ch} out_ch={out_ch} \
+                         {ph}x{pw} k={kh}x{kw} s={sh}x{sw})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conv2d_dinput_block_rows_f32_budgets_bytes_not_rows() {
+        // f32 is 4 bytes, so the same 576 KiB budget must yield twice the rows f64 gets.
+        assert_eq!(super::conv2d_dinput_block_rows_f32(288), 512);
+        assert_eq!(super::conv2d_dinput_block_rows(288), 256);
+        for patch_width in [1usize, 9, 45, 288, 4608, 65536] {
+            let rows = super::conv2d_dinput_block_rows_f32(patch_width);
+            assert!(rows >= 1);
+            let bytes = rows * patch_width * size_of::<f32>();
+            assert!(
+                bytes <= 576 * 1024 || rows == 1,
+                "patch_width {patch_width}: {rows} rows is {bytes} B, over budget"
+            );
+        }
+        assert_eq!(super::conv2d_dinput_block_rows_f32(0), 1);
+    }
+
+    #[test]
     fn conv2d_dinput_block_rows_budgets_bytes_not_rows() {
         // The whole point of the byte budget is that per-task scratch does NOT grow with
         // `patch_width`. Assert the invariant, and pin the one value a measurement depends on.
@@ -50398,7 +50667,10 @@ mod tests {
         }
 
         assert_eq!(
-            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
             expected_values
                 .iter()
                 .map(|value| value.to_bits())
@@ -67200,11 +67472,22 @@ mod tests {
             ("packed", scalar.as_slice(), blocked.as_slice()),
             ("d", scalar_result.0.as_slice(), blocked_result.0.as_slice()),
             ("e", scalar_result.1.as_slice(), blocked_result.1.as_slice()),
-            ("tauq", scalar_result.2.as_slice(), blocked_result.2.as_slice()),
-            ("taup", scalar_result.3.as_slice(), blocked_result.3.as_slice()),
+            (
+                "tauq",
+                scalar_result.2.as_slice(),
+                blocked_result.2.as_slice(),
+            ),
+            (
+                "taup",
+                scalar_result.3.as_slice(),
+                blocked_result.3.as_slice(),
+            ),
         ] {
             assert!(
-                scalar.iter().zip(blocked).all(|(left, right)| left.to_bits() == right.to_bits()),
+                scalar
+                    .iter()
+                    .zip(blocked)
+                    .all(|(left, right)| left.to_bits() == right.to_bits()),
                 "outer-output blocked form changed {name} bits"
             );
         }
