@@ -32262,7 +32262,12 @@ mod bidiag {
     }
 
     #[inline]
-    fn dot_rows_into_f64(
+    // `pub(crate)` so `bidiag_rowdot_four_row_and_one_row_arms_are_bit_identical` can drive both
+    // arms directly. Reaching it only through `bidiag_blocked_f64` would test the two arms
+    // through the whole reduction, where a per-lane reassociation could be masked by the QR
+    // sweep converging to the same rounded singular values from different bidiagonal input —
+    // the precise unsoundness NEGATIVE_EVIDENCE item 253 found in an earlier route proof.
+    pub(crate) fn dot_rows_into_f64(
         a: &[f64],
         row_stride: usize,
         first: usize,
@@ -32295,18 +32300,47 @@ mod bidiag {
             let r1 = &a[b0 + row_stride..b0 + row_stride + vlen];
             let r2 = &a[b0 + 2 * row_stride..b0 + 2 * row_stride + vlen];
             let r3 = &a[b0 + 3 * row_stride..b0 + 3 * row_stride + vlen];
-            let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            // SIMD ACROSS ROWS — `frankentorch-4zjaa`, the form NEGATIVE_EVIDENCE item 258d
+            // specified and asked someone to check for: "four rows' element `c` in four lanes of
+            // one vector, each lane accumulating its own row in the original order. Whether LLVM
+            // already forms that from the current code is the first thing to find out, and it is
+            // a question for a disassembly, not a stopwatch."
+            //
+            // IT DID NOT. `objdump` of `dot_rows_into_f64` in a built ELF gave **10 `mulsd` +
+            // 10 `addsd` against 2 `mulpd` + 2 `addpd`, and no `vfmadd` at all** — four scalar
+            // dependency chains, exactly as item 254 left them. So the four accumulators were
+            // buying instruction-level parallelism and nothing wider.
+            //
+            // BIT-EXACT, and for a stronger reason than "the same operations happen". Lane `j`
+            // holds row `j`'s accumulator and only ever adds row `j`'s products, in ascending
+            // `c`, from the same `0.0` — it is the identical f64 reduction the scalar `s0..s3`
+            // performed, moved into a lane. NOTHING is summed across lanes. That is the
+            // distinction that makes this legal where vectorising a SINGLE row's dot product
+            // would not be: summing one row in a different order changes its bits, and item 258d
+            // says so explicitly.
+            //
+            // NO FMA CONTRACTION, which would change the rounding: the product is formed into a
+            // temporary and added as a separate operation, and Rust does not contract `a * b + c`
+            // without explicit fast-math. The scalar form it replaces had the same property, as
+            // its `mulsd`/`addsd` pairs show.
+            //
+            // `f64x4` is two `__m128d` on this SSE2 baseline, so this is 2 `mulpd` + 2 `addpd`
+            // per element against the scalar form's 4 + 4 — half the FP uops, the same loads,
+            // and the same numbers. Whether that converts into wall time is NOT claimed here:
+            // this lane's A/A null measured 1.049-1.203x on this host, so an effect of this size
+            // is below what the instrument can resolve. The evidence offered for this change is
+            // the bitwise test and the instruction count, not a stopwatch.
+            let mut acc = wide::f64x4::ZERO;
             for c in 0..vlen {
-                let vc = v[c];
-                s0 += r0[c] * vc;
-                s1 += r1[c] * vc;
-                s2 += r2[c] * vc;
-                s3 += r3[c] * vc;
+                let col = wide::f64x4::from([r0[c], r1[c], r2[c], r3[c]]);
+                let prod = col * wide::f64x4::splat(v[c]);
+                acc += prod;
             }
-            dst[k * dst_stride] = s0;
-            dst[(k + 1) * dst_stride] = s1;
-            dst[(k + 2) * dst_stride] = s2;
-            dst[(k + 3) * dst_stride] = s3;
+            let s = acc.to_array();
+            dst[k * dst_stride] = s[0];
+            dst[(k + 1) * dst_stride] = s[1];
+            dst[(k + 2) * dst_stride] = s[2];
+            dst[(k + 3) * dst_stride] = s[3];
             k += 4;
         }
         while k < nrows {
@@ -66971,6 +67005,91 @@ mod tests {
     /// point: it converts "I believe this is bit-exact" into something the compiler checks.
     ///
     /// Bits, not floats: `to_bits` so a NaN or a signed zero cannot slip through an `==`.
+    /// The step-(12) four-row kernel and the one-row loop it replaced must agree BIT FOR BIT.
+    ///
+    /// `frankentorch-4zjaa`. Item 254 introduced the four-accumulator form and item 255 shipped
+    /// the toggle for measuring it, both asserting bit-identity — but nothing compared the two
+    /// arms directly, so the claim rested on reading. It now rests on `to_bits`.
+    ///
+    /// This matters more since the four-row arm became SIMD ACROSS ROWS (`wide::f64x4`, one lane
+    /// per row): the legality argument is that lane `j` accumulates row `j`'s products in
+    /// ascending `c` and nothing is ever summed ACROSS lanes. If a future edit vectorises the
+    /// wrong axis — summing one row's elements in a different order — that is a reassociation,
+    /// and this test is what catches it rather than a reviewer.
+    ///
+    /// Shapes straddle the `k + 4 <= nrows` boundary so the ragged scalar tail is exercised at
+    /// every residue (nrows 4,5,6,7 give tails of 0,1,2,3), and `vlen` is varied so the vector
+    /// loop runs both a handful and hundreds of iterations. `row_stride > vlen` throughout,
+    /// because the real caller hands this a STRIDED window of `a` and a kernel that assumed
+    /// contiguity would pass on a packed fixture.
+    #[test]
+    fn bidiag_rowdot_four_row_and_one_row_arms_are_bit_identical() {
+        //                nrows vlen row_stride first dst_stride
+        let cases: [[usize; 5]; 9] = [
+            [4, 8, 11, 3, 1],     // exactly one block, no tail
+            [5, 8, 11, 3, 1],     // tail of 1
+            [6, 8, 11, 3, 1],     // tail of 2
+            [7, 8, 11, 3, 1],     // tail of 3
+            [3, 8, 11, 3, 1],     // fewer rows than one block: scalar path only
+            [16, 257, 300, 7, 1], // several blocks, long vectors
+            [9, 1, 4, 2, 1],      // vlen 1: a single product per row
+            [8, 64, 64, 0, 5],    // strided destination, first == 0
+            [12, 33, 40, 5, 3],   // odd vlen and stride, strided destination
+        ];
+        for (case, &[nrows, vlen, row_stride, first, dst_stride]) in cases.iter().enumerate() {
+            let need = first + (nrows - 1) * row_stride + vlen + 4;
+            let a: Vec<f64> = (0..need)
+                .map(|i| {
+                    if i % 13 == 0 {
+                        -0.0
+                    } else {
+                        ((i % 41) as f64) * 0.017 - 0.33
+                    }
+                })
+                .collect();
+            let v: Vec<f64> = (0..vlen)
+                .map(|i| ((i % 29) as f64) * 0.011 - 0.15)
+                .collect();
+            let dlen = (nrows.max(1) - 1) * dst_stride + 1;
+
+            let previous = super::bidiag::set_rowdot_blocked(true);
+            let mut blocked = vec![0.0f64; dlen];
+            super::bidiag::dot_rows_into_f64(
+                &a,
+                row_stride,
+                first,
+                nrows,
+                vlen,
+                &v,
+                &mut blocked,
+                dst_stride,
+            );
+            super::bidiag::set_rowdot_blocked(false);
+            let mut one_row = vec![0.0f64; dlen];
+            super::bidiag::dot_rows_into_f64(
+                &a,
+                row_stride,
+                first,
+                nrows,
+                vlen,
+                &v,
+                &mut one_row,
+                dst_stride,
+            );
+            super::bidiag::set_rowdot_blocked(previous);
+
+            for (i, (b, o)) in blocked.iter().zip(one_row.iter()).enumerate() {
+                assert_eq!(
+                    b.to_bits(),
+                    o.to_bits(),
+                    "case {case} element {i}: four-row {b} != one-row {o} \
+                     (nrows={nrows} vlen={vlen} row_stride={row_stride} first={first} \
+                     dst_stride={dst_stride})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bidiag_blocked_output_is_bit_stable() {
         let mut mismatches: Vec<String> = Vec::new();
