@@ -1,15 +1,21 @@
 // The aarch64 NEON dot-product intrinsics used below are stable on the pinned
 // toolchain; the architecture-specific implementations remain cfg-gated.
 #![deny(unsafe_code)]
+#![feature(portable_simd)]
 
 use std::fmt;
+use std::simd::Simd;
 
 pub mod pool;
+mod masked_conv2d;
+
+pub use masked_conv2d::conv2d_backward_mask_fused_f64;
 
 use rayon::prelude::*;
 use wide::{f32x8, f64x4};
 
 const BATCH_NORM_MIN_PAR_ROWS: usize = 8;
+const AVG_POOL2D_BACKWARD_SIMD_LANES: usize = 4;
 
 type BatchedLuPartsF64 = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
 type SvdTripleF64 = (Vec<f64>, Vec<f64>, Vec<f64>);
@@ -542,6 +548,112 @@ mod gemm {
                     k as isize,
                     1,
                     b.as_ptr().add(n0),
+                    n as isize,
+                    1,
+                    1.0,
+                    cp.0.add(c_off + n0),
+                    ldc as isize,
+                    1,
+                );
+            }
+        });
+    }
+
+    /// BOTH trailing updates of a blocked bidiagonal reduction in ONE pass over `C_sub`:
+    /// `C_sub -= A1 · B1^T` followed by `C_sub -= A2 · B2`.
+    ///
+    /// `frankentorch-4zjaa`, the lever NEGATIVE_EVIDENCE item 247b pre-specified and declined to
+    /// write blind. `bidiag_blocked_f64` calls `dgemm_bt_sub_into` and then `dgemm_sub_into` on
+    /// the SAME `A22` tile, so the dominant memory object of the reduction — `(n-i-nb)²`, summing
+    /// to ~180 MB of traffic at n=512 — is read and written TWICE per panel. This touches it once.
+    ///
+    /// # Why this is bit-exact where item 247b's version was not
+    ///
+    /// 247b proposed a hand-written fused triple loop and correctly refused to trust it: "the two
+    /// callees are tuned GEMMs with their own internal blocking, and a hand-written fused triple
+    /// loop would reproduce their k-accumulation order only by luck." That is now settled rather
+    /// than suspected, and the answer is that it would NOT: `matrixmultiply` selects
+    /// `KernelFmaAvx2` at runtime (`dgemm_kernel.rs`, `#[target_feature(enable="fma")]`), so its
+    /// micro-kernel contracts `ab += a * b` into a fused multiply-add and never rounds the
+    /// product. A scalar loop rounds twice and lands 1-2 ULP away — measured this session on the
+    /// conv2d dinput path, where exactly that assumption failed its own bitwise test.
+    ///
+    /// So the k-reductions stay inside `matrixmultiply` and NOTHING about the arithmetic moves.
+    /// This is the two existing loop bodies merged: the same `dgemm_mm` calls, on the same
+    /// pointers, with the same `(m, k, bw)` and the same strides, in the same order per element.
+    /// Only the INTERLEAVING changes — block `blk`'s second update now runs before block `blk+1`'s
+    /// first, and the column blocks are disjoint, so no element's sequence of operations differs.
+    /// Both callees derive their blocking from `block_cols(n)` with the same `n` in the same
+    /// invocation, so the two loops being merged were already walking identical block boundaries.
+    ///
+    /// That makes bit-exactness structural, not empirical — but it is asserted anyway, because a
+    /// structural argument that nobody executed is how item 114 shipped a "FREE" constant:
+    /// `bidiag_fused_trailing_update_matches_two_passes_bitwise` compares `to_bits()` against the
+    /// two-call sequence at eleven shapes, and carries a planted negative proving it can fail.
+    ///
+    /// A SECOND, FREE EFFECT: this is one parallel region where there were two, halving the
+    /// fork/join count of the trailing update. `frankentorch-75e38` candidate 2 asks for exactly
+    /// that ("reduce the number of synchronisation points rather than their cost"), and item 255
+    /// priced a rayon fork on this host at ~7 us.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dgemm_bt_then_nt_sub_into(
+        m: usize,
+        k: usize,
+        n: usize,
+        a_bt: &[f64],
+        b_bt: &[f64],
+        a_nt: &[f64],
+        b_nt: &[f64],
+        c: &mut [f64],
+        c_off: usize,
+        ldc: usize,
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a_bt = &a_bt[..m * k];
+        let b_bt = &b_bt[..n * k];
+        let a_nt = &a_nt[..m * k];
+        let b_nt = &b_nt[..k * n];
+        let nb = block_cols(n);
+        let cp = TilePtr(c.as_mut_ptr());
+        (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+            let cp = &cp;
+            let n0 = blk * nb;
+            let bw = (n0 + nb).min(n) - n0;
+            // SAFETY: identical to the two callees this merges, block for block. `a_bt` and
+            // `a_nt` are m*k; `b_bt[n0*k..]` holds bw rows of k (B^T via rsb=1, csb=k) and
+            // `b_nt.add(n0)` is the [k×n] matrix's column window (rsb=n, csb=1). The output
+            // window row i col (n0+j) is c_off + i*ldc + n0 + j, and column windows are disjoint
+            // across blocks, so writes never race. beta=1 accumulates into the existing C and
+            // alpha=-1 subtracts, so the second call reads what the first wrote — which is the
+            // point, and is why they must stay in this order.
+            unsafe {
+                dgemm_mm(
+                    m,
+                    k,
+                    bw,
+                    -1.0,
+                    a_bt.as_ptr(),
+                    k as isize,
+                    1,
+                    b_bt.as_ptr().add(n0 * k),
+                    1,
+                    k as isize,
+                    1.0,
+                    cp.0.add(c_off + n0),
+                    ldc as isize,
+                    1,
+                );
+                dgemm_mm(
+                    m,
+                    k,
+                    bw,
+                    -1.0,
+                    a_nt.as_ptr(),
+                    k as isize,
+                    1,
+                    b_nt.as_ptr().add(n0),
                     n as isize,
                     1,
                     1.0,
@@ -2657,8 +2769,7 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
 /// This is the CHUNK-SIZE shape of the fix rather than a global pool cap — it groups
 /// planes so the split creates about this many chunks, leaving `rayon`'s pool untouched
 /// so nothing else in the process changes width underneath it.
-/// frankentorch-rayon-pool-width-qq8as: a NARROW rayon pool that a kernel can run its
-/// parallel region on, leaving the process-wide pool alone.
+/// frankentorch-rayon-pool-width-qq8as: MaxPool3d's dedicated narrow Rayon pool.
 ///
 /// This is the shape item 52 pointed at. Three candidates were on the table -- global pool
 /// cap, per-op width cap, chunk-size change -- and the chunk-size one is REFUTED (0.922x,
@@ -2671,54 +2782,51 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
 /// right for some ops and wrong for others -- the bead's own data shows gains from 1.01x
 /// to 1.94x across lanes, so one number cannot be correct everywhere.
 ///
-/// UNMEASURED AS OF THIS COMMIT. `install` has its own cost, and whether a persistent
-/// narrow pool beats the ambient one in situ is exactly the question item 52's failure
-/// says to answer by measuring rather than by reasoning.
-static NARROW_POOL_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The global physical-core policy chooses 16 workers on the scorecard host, but its
+/// MaxPool3d family loses up to 8% at that width (item 247). The independent width curve
+/// turns at eight workers, so this op keeps its own fixed eight-worker pool.
+const MAX_POOL3D_POOL_WIDTH: usize = 8;
 
-/// Enable or disable the narrow pool, returning the previous setting.
+/// Production uses the MaxPool3d pool by default. The switch exists only for paired tests
+/// that establish bit identity against the ambient pool.
+static MAX_POOL3D_POOL_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Enable or disable MaxPool3d's dedicated pool, returning the previous setting.
 ///
 /// An `AtomicBool` so a paired lane can flip it inside ONE process. The pool's WIDTH is
-/// fixed at first use and cannot be flipped, so an A/B varies only whether the narrow pool
+/// fixed at first use and cannot be flipped, so an A/B varies only whether this pool
 /// is used -- which is the comparison that matters.
-pub fn set_narrow_pool_enabled(enabled: bool) -> bool {
-    NARROW_POOL_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed)
+pub fn set_max_pool3d_pool_enabled(enabled: bool) -> bool {
+    MAX_POOL3D_POOL_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The narrow pool, built once. Width comes from `FT_NARROW_POOL_WIDTH`, defaulting to 8
-/// because that is where item 51's measured curve turns: 64 -> 1.904 ms, 32 -> 1.623,
-/// 16 -> 1.291, **8 -> 1.145**, 4 -> 1.195.
+/// MaxPool3d's pool is built once at its measured eight-worker width. This is code policy,
+/// not an environment override, so every process gets the same per-op guard.
 ///
 /// `None` if the pool cannot be built, in which case callers fall back to the ambient
-/// pool rather than failing -- a measurement knob must not be able to break a kernel.
-fn narrow_pool() -> Option<&'static rayon::ThreadPool> {
+/// pool rather than failing.
+fn max_pool3d_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let width = std::env::var("FT_NARROW_POOL_WIDTH")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|w| *w > 0)
-            .unwrap_or(8);
         rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
-            .thread_name(|i| format!("ft-narrow-{i}"))
+            .num_threads(MAX_POOL3D_POOL_WIDTH)
+            .thread_name(|i| format!("ft-maxpool3d-{i}"))
             .build()
             .ok()
     })
     .as_ref()
 }
 
-/// Run a parallel region on the narrow pool when it is enabled, otherwise inline on the
-/// ambient pool.
+/// Run a MaxPool3d parallel region on its dedicated pool, otherwise inline on the ambient pool.
 ///
 /// The PARTITION is untouched -- callers keep their existing `par_chunks_mut` split -- so
 /// this changes only how many workers execute it. That is what makes the bit-exactness
 /// argument trivial: the same chunks do the same writes in the same order within a chunk,
 /// and chunks were already independent.
-fn with_narrow_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if NARROW_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-        && let Some(pool) = narrow_pool()
+fn with_max_pool3d_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if MAX_POOL3D_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(pool) = max_pool3d_pool()
     {
         return pool.install(f);
     }
@@ -12286,7 +12394,7 @@ pub fn max_pool3d_forward_with_indices_and_sum_f64(
         // `par_chunks_mut` split. The result is independent of worker count because the
         // recursion splits at a fixed `mid` and each half writes its own slice, so the
         // pairwise sum tree is the same shape whoever executes it.
-        with_narrow_pool(|| {
+        with_max_pool3d_pool(|| {
             max_pool3d_sum_pairwise_range_with_indices_f64_par(
                 input,
                 Some(&mut out),
@@ -12605,7 +12713,7 @@ pub fn max_pool3d_backward_from_indices_nonoverlapping_f64(
     let group = planes_per_chunk(batch * ch);
     // frankentorch-rayon-pool-width-qq8as: the partition is unchanged; only the pool that
     // executes it changes when the narrow pool is enabled.
-    with_narrow_pool(|| {
+    with_max_pool3d_pool(|| {
         din.par_chunks_mut(plane_len * group)
             .enumerate()
             .for_each(|(chunk_index, chunk)| {
@@ -13223,6 +13331,8 @@ fn avg_pool2d_backward_2x2s2_f64(
         // help: a hit skips the zero pass and the faults, a miss is exactly the
         // code that was here before.
         let fill = |dp: &mut [f64]| {
+            let zero = Simd::<f64, AVG_POOL2D_BACKWARD_SIMD_LANES>::splat(0.0);
+            let quarter = Simd::<f64, AVG_POOL2D_BACKWARD_SIMD_LANES>::splat(0.25);
             dp.par_chunks_mut(ih * iw)
                 .enumerate()
                 .for_each(|(plane, drow)| {
@@ -13230,7 +13340,37 @@ fn avg_pool2d_backward_2x2s2_f64(
                     for oy in 0..oh {
                         let row0 = (oy * 2) * iw;
                         let row1 = row0 + iw;
-                        for ox in 0..ow {
+                        let vectorized_ow =
+                            ow / AVG_POOL2D_BACKWARD_SIMD_LANES * AVG_POOL2D_BACKWARD_SIMD_LANES;
+                        for ox in (0..vectorized_ow).step_by(AVG_POOL2D_BACKWARD_SIMD_LANES) {
+                            // Exact per-lane transcription of `0.0 + dout[...] / 4.0`.
+                            // The zero add is deliberately retained for -0.0 parity; each
+                            // lane is independent, so this changes no accumulation order.
+                            let g = zero
+                                + Simd::from_slice(
+                                    &dout[dbase + oy * ow + ox
+                                        ..dbase + oy * ow + ox + AVG_POOL2D_BACKWARD_SIMD_LANES],
+                                ) * quarter;
+                            let (first_pair, second_pair) = g.interleave(g);
+                            let col0 = ox * 2;
+                            first_pair.copy_to_slice(
+                                &mut drow
+                                    [row0 + col0..row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                            second_pair.copy_to_slice(
+                                &mut drow[row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
+                                    ..row0 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                            first_pair.copy_to_slice(
+                                &mut drow
+                                    [row1 + col0..row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                            second_pair.copy_to_slice(
+                                &mut drow[row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
+                                    ..row1 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                        }
+                        for ox in vectorized_ow..ow {
                             let col0 = ox * 2;
                             let g = dout[dbase + oy * ow + ox] / 4.0;
                             // `0.0 + g`, not a bare `g`: bit-exact with the
@@ -31997,6 +32137,44 @@ mod bidiag {
     /// the previous code handed rayon ONE ROW per item.
     const X_ROW_CHUNK: usize = 32;
 
+    /// Independent panel outputs kept in flight by the serial reflector-update
+    /// steps.  This blocks only the outer output dimension; every output still
+    /// accumulates its reflector terms in the original order.
+    const PANEL_OUTPUT_BLOCK: usize = 4;
+
+    /// Whether the serial panel's independent row/column outputs are kept in
+    /// groups of four. The false arm is the exact scalar sweep it replaced.
+    static PANEL_OUTPUT_BLOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    #[inline]
+    fn panel_output_blocked() -> bool {
+        PANEL_OUTPUT_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the exact-order panel-output form, returning the previous setting
+    /// so a paired measurement lane can restore it.
+    pub(crate) fn set_panel_output_blocked(blocked: bool) -> bool {
+        PANEL_OUTPUT_BLOCKED.swap(blocked, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    static PANEL_OUTPUT_BLOCK_TAKES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[inline]
+    fn note_panel_output_block() {
+        #[cfg(test)]
+        {
+            PANEL_OUTPUT_BLOCK_TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panel_output_blocks_take() -> usize {
+        PANEL_OUTPUT_BLOCK_TAKES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `dst[k * dst_stride] = Σ_c a[first + k*row_stride + c] * v[c]` for `k in 0..nrows` —
     /// FOUR ROWS AT A TIME.
     ///
@@ -32032,6 +32210,28 @@ mod bidiag {
     /// Set the step-(12) kernel, returning the previous setting.
     pub(crate) fn set_rowdot_blocked(blocked: bool) -> bool {
         ROWDOT_BLOCKED.swap(blocked, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the panel's two trailing updates run as ONE pass over `A22`. Default TRUE; the
+    /// false arm is the two-call sequence it replaced.
+    ///
+    /// `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b. Same reasoning as `ROWDOT_BLOCKED`
+    /// directly above, and for the same host: the two arms are BIT-IDENTICAL in output
+    /// (`bidiag_fused_trailing_update_matches_two_passes_bitwise`), so alternating them inside
+    /// ONE process against ONE live incumbent costs nothing in parity and avoids a two-binary
+    /// A/B that needs a second quiet window this machine does not reliably grant. It also dodges
+    /// `frankentorch-75e38`'s stated obstacle with `svd_bidiag_block_size`, which is a `OnceLock`
+    /// and therefore one-value-per-process and untoggleable.
+    static FUSED_TRAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub(crate) fn fused_trailing_enabled() -> bool {
+        FUSED_TRAILING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the trailing-update form, returning the previous setting so a paired lane can restore
+    /// it.
+    pub(crate) fn set_fused_trailing(fused: bool) -> bool {
+        FUSED_TRAILING.swap(fused, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[inline]
@@ -32294,6 +32494,30 @@ mod bidiag {
         (d, e, tauq, taup)
     }
 
+    /// Reusable storage for a blocked bidiagonal panel.
+    ///
+    /// The panel walks the same fixed-width work arrays once for every `nb`
+    /// reflectors.  Keeping those buffers for the whole reduction removes the
+    /// allocator and zero-fill work from every panel without changing a single
+    /// floating-point operation or the packed panel layout.
+    struct BidiagPanelWorkspace {
+        u: Vec<f64>,
+        acc: Vec<f64>,
+        pacc: Vec<f64>,
+        cacc: Vec<f64>,
+    }
+
+    impl BidiagPanelWorkspace {
+        fn new(m: usize, n: usize, nb: usize) -> Self {
+            Self {
+                u: vec![0.0; m],
+                acc: vec![0.0; n],
+                pacc: vec![0.0; nb],
+                cacc: vec![0.0; n],
+            }
+        }
+    }
+
     /// `dlabrd`: reduce the leading `nb` columns and rows of the trailing
     /// submatrix `a[off.., off..]` to bidiagonal form, accumulating the
     /// deferred updates into `x` (`m_sub x nb`) and `y` (`n_sub x nb`).
@@ -32320,6 +32544,7 @@ mod bidiag {
         e: &mut [f64],
         tauq: &mut [f64],
         taup: &mut [f64],
+        workspace: &mut BidiagPanelWorkspace,
     ) {
         let ldx = nb;
         let ldy = nb;
@@ -32327,8 +32552,8 @@ mod bidiag {
         let at = |r: usize, c: usize| (off + r) * lda + (off + c);
         // Reflector scratch for the two O(m_sub * n_sub) matvecs, steps (3) and
         // (12). Every other step in the panel is O(m_sub * nb) and stays serial.
-        let mut u = vec![0.0f64; m_sub];
-        let mut acc = vec![0.0f64; n_sub];
+        let u = &mut workspace.u[..m_sub];
+        let acc = &mut workspace.acc[..n_sub];
         // frankentorch-4zjaa item 246. Accumulators for the four loops below that used to walk
         // a COLUMN down the rows — striding by `lda` (or `ldx`/`ldy`) on every read of a
         // row-major matrix, which is the exact access pattern step (3)'s comment records as
@@ -32339,12 +32564,37 @@ mod bidiag {
         // still sums its own terms in the original order, only the traversal order of the two
         // nested loops changes. `pacc` is indexed by panel column (at most `nb`), `cacc` by
         // trailing column. Allocated once per call, outside the `i` loop.
-        let mut pacc = vec![0.0f64; nb];
-        let mut cacc = vec![0.0f64; n_sub];
+        let pacc = &mut workspace.pacc[..nb];
+        let cacc = &mut workspace.cacc[..n_sub];
 
         for i in 0..nb {
             // (1) Apply the accumulated updates to column i before reducing it.
-            for r in i..m_sub {
+            let output_blocked = panel_output_blocked();
+            let mut r = i;
+            while output_blocked && r + PANEL_OUTPUT_BLOCK <= m_sub {
+                note_panel_output_block();
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for p in 0..i {
+                    let yp = y[i * ldy + p];
+                    s0 += a[at(r, p)] * yp;
+                    s1 += a[at(r + 1, p)] * yp;
+                    s2 += a[at(r + 2, p)] * yp;
+                    s3 += a[at(r + 3, p)] * yp;
+                }
+                for p in 0..i {
+                    let api = a[at(p, i)];
+                    s0 += x[r * ldx + p] * api;
+                    s1 += x[(r + 1) * ldx + p] * api;
+                    s2 += x[(r + 2) * ldx + p] * api;
+                    s3 += x[(r + 3) * ldx + p] * api;
+                }
+                a[at(r, i)] -= s0;
+                a[at(r + 1, i)] -= s1;
+                a[at(r + 2, i)] -= s2;
+                a[at(r + 3, i)] -= s3;
+                r += PANEL_OUTPUT_BLOCK;
+            }
+            while r < m_sub {
                 let mut s = 0.0;
                 for p in 0..i {
                     s += a[at(r, p)] * y[i * ldy + p];
@@ -32353,6 +32603,7 @@ mod bidiag {
                     s += x[r * ldx + p] * a[at(p, i)];
                 }
                 a[at(r, i)] -= s;
+                r += 1;
             }
 
             // (2) Column reflector over a[i.., i].
@@ -32447,7 +32698,31 @@ mod bidiag {
                 }
 
                 // (9)+(10) apply the accumulated updates to row i.
-                for c in (i + 1)..n_sub {
+                let mut c = i + 1;
+                while output_blocked && c + PANEL_OUTPUT_BLOCK <= n_sub {
+                    note_panel_output_block();
+                    let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                    for p in 0..=i {
+                        let aip = a[at(i, p)];
+                        s0 += y[c * ldy + p] * aip;
+                        s1 += y[(c + 1) * ldy + p] * aip;
+                        s2 += y[(c + 2) * ldy + p] * aip;
+                        s3 += y[(c + 3) * ldy + p] * aip;
+                    }
+                    for p in 0..i {
+                        let xip = x[i * ldx + p];
+                        s0 += a[at(p, c)] * xip;
+                        s1 += a[at(p, c + 1)] * xip;
+                        s2 += a[at(p, c + 2)] * xip;
+                        s3 += a[at(p, c + 3)] * xip;
+                    }
+                    a[at(i, c)] -= s0;
+                    a[at(i, c + 1)] -= s1;
+                    a[at(i, c + 2)] -= s2;
+                    a[at(i, c + 3)] -= s3;
+                    c += PANEL_OUTPUT_BLOCK;
+                }
+                while c < n_sub {
                     let mut s = 0.0;
                     for p in 0..=i {
                         s += y[c * ldy + p] * a[at(i, p)];
@@ -32456,6 +32731,7 @@ mod bidiag {
                         s += a[at(p, c)] * x[i * ldx + p];
                     }
                     a[at(i, c)] -= s;
+                    c += 1;
                 }
 
                 // (11) Row reflector over a[i, i+1..].
@@ -32582,15 +32858,40 @@ mod bidiag {
         }
 
         let lda = n;
+        // These panel-local buffers shrink monotonically as the reduction moves
+        // down the diagonal.  Allocate the maximum extent once and take the
+        // live prefix for each panel: every value read by `dlabrd_panel_f64` is
+        // written in that panel before its first read, so retaining the unused
+        // tail cannot affect its arithmetic or packed output.
+        let mut x_workspace = vec![0.0f64; m * nb];
+        let mut y_workspace = vec![0.0f64; n * nb];
+        let mut panel_workspace = BidiagPanelWorkspace::new(m, n, nb);
+        // The packed GEMM operands are fully overwritten after each panel.  As
+        // above, keeping their maximum storage eliminates repeated allocation
+        // without changing either trailing update or its reduction order.
+        let mut u_workspace = vec![0.0f64; m * nb];
+        let mut v_workspace = vec![0.0f64; nb * n];
         let mut i = 0usize;
         while n - i > nb && m - i > nb {
             let m_sub = m - i;
             let n_sub = n - i;
-            let mut x = vec![0.0f64; m_sub * nb];
-            let mut y = vec![0.0f64; n_sub * nb];
+            let x = &mut x_workspace[..m_sub * nb];
+            let y = &mut y_workspace[..n_sub * nb];
 
             dlabrd_panel_f64(
-                a, lda, i, m_sub, n_sub, nb, &mut x, &mut y, &mut d, &mut e, &mut tauq, &mut taup,
+                a,
+                lda,
+                i,
+                m_sub,
+                n_sub,
+                nb,
+                x,
+                y,
+                &mut d,
+                &mut e,
+                &mut tauq,
+                &mut taup,
+                &mut panel_workspace,
             );
 
             let m2 = m_sub - nb;
@@ -32599,33 +32900,48 @@ mod bidiag {
                 // U = A[i+nb.., i..i+nb] (strided) and V = A[i..i+nb, i+nb..]
                 // (strided) both need contiguous copies for the GEMM calls.
                 //
-                // frankentorch-4zjaa item 247: built UNINITIALIZED, because the copy below
-                // covers every element and the zero-fill `vec![0.0; ..]` performs is therefore
-                // dead — `m2` rows of exactly `nb`, and `nb` rows of exactly `n2`, tile the
-                // whole buffer with no remainder. This is the pattern
-                // `project_expand_uninit_firsttouch` names: a zero-init followed by a full
-                // overwrite pays a write pass and, on fresh pages, the first-touch faults too.
-                // Bit-exactness is not at stake — no arithmetic changes — and
+                // The copy below covers every element of each live prefix: `m2` rows of exactly
+                // `nb`, and `nb` rows of exactly `n2`, tile the buffers with no remainder. The
+                // retained capacity therefore avoids both a fresh allocation and a dead zero-fill
+                // per panel. Bit-exactness is not at stake — no arithmetic changes — and
                 // `bidiag_blocked_output_is_bit_stable` pins it regardless.
                 let a_ro: &[f64] = a;
-                let u = crate::build_uninit(m2 * nb, |dst: &mut [f64]| {
-                    for (r, row) in dst.chunks_exact_mut(nb).enumerate() {
-                        let src = (i + nb + r) * lda + i;
-                        row.copy_from_slice(&a_ro[src..src + nb]);
-                    }
-                });
-                let v = crate::build_uninit(nb * n2, |dst: &mut [f64]| {
-                    for (p, row) in dst.chunks_exact_mut(n2).enumerate() {
-                        let src = (i + p) * lda + i + nb;
-                        row.copy_from_slice(&a_ro[src..src + n2]);
-                    }
-                });
+                let u = &mut u_workspace[..m2 * nb];
+                for (r, row) in u.chunks_exact_mut(nb).enumerate() {
+                    let src = (i + nb + r) * lda + i;
+                    row.copy_from_slice(&a_ro[src..src + nb]);
+                }
+                let v = &mut v_workspace[..nb * n2];
+                for (p, row) in v.chunks_exact_mut(n2).enumerate() {
+                    let src = (i + p) * lda + i + nb;
+                    row.copy_from_slice(&a_ro[src..src + n2]);
+                }
 
                 let off22 = (i + nb) * lda + (i + nb);
-                // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
-                super::gemm::dgemm_bt_sub_into(m2, nb, n2, &u, &y[nb * nb..], a, off22, lda);
-                // A22 -= X2 * V     (X2 = rows nb.. of x, already contiguous)
-                super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], &v, a, off22, lda);
+                if fused_trailing_enabled() {
+                    // ONE pass over A22 for both updates — item 247b's pre-specified lever.
+                    // Bit-exact by construction (same calls, same order per element); see
+                    // `gemm::dgemm_bt_then_nt_sub_into` for why the fused TRIPLE LOOP that item
+                    // proposed would not have been, and `set_bidiag_fused_trailing` for why the
+                    // two-pass form is still reachable.
+                    super::gemm::dgemm_bt_then_nt_sub_into(
+                        m2,
+                        nb,
+                        n2,
+                        u,
+                        &y[nb * nb..],
+                        &x[nb * nb..],
+                        v,
+                        a,
+                        off22,
+                        lda,
+                    );
+                } else {
+                    // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
+                    super::gemm::dgemm_bt_sub_into(m2, nb, n2, u, &y[nb * nb..], a, off22, lda);
+                    // A22 -= X2 * V     (X2 = rows nb.. of x, already contiguous)
+                    super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], v, a, off22, lda);
+                }
             }
 
             // Restore the true diagonal/superdiagonal over the unit entries the
@@ -34252,6 +34568,27 @@ pub fn bidiag_parallel_branches_take() -> (u64, u64, u64) {
 #[doc(hidden)]
 pub fn bidiag_rowdot_blocked_set(blocked: bool) -> bool {
     bidiag::set_rowdot_blocked(blocked)
+}
+
+/// Set the serial panel's exact-order outer-output form: `true` keeps four
+/// independent outputs in flight, `false` uses the original scalar sweep.
+/// Returns the previous setting so a paired live lane can restore it.
+#[doc(hidden)]
+pub fn bidiag_panel_output_blocked_set(blocked: bool) -> bool {
+    bidiag::set_panel_output_blocked(blocked)
+}
+
+/// Set the panel's trailing-update form: `true` = ONE pass over `A22` applying both updates
+/// (`frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b), `false` = the two-call sequence it
+/// replaced. Returns the previous setting.
+///
+/// The two arms are BIT-IDENTICAL in output — the same `dgemm_mm` calls on the same column
+/// blocks in the same per-element order, only interleaved — so this is a pure speed switch, and
+/// it exists for the same reason `bidiag_rowdot_blocked_set` does: the A/B has to run inside one
+/// process against one incumbent arm on a host that rarely grants a quiet window.
+#[doc(hidden)]
+pub fn bidiag_fused_trailing_set(fused: bool) -> bool {
+    bidiag::set_fused_trailing(fused)
 }
 
 /// The currently live bidiagonal parallel gate.
@@ -44284,6 +44621,126 @@ mod tests {
         assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
     }
 
+    /// Build the four operands and the C tile for a fused-trailing-update case.
+    ///
+    /// `c` is oversized and the update targets a STRIDED window at `c_off` with row stride
+    /// `ldc`, exactly as `bidiag_blocked_f64` uses it — a fused kernel that quietly assumed a
+    /// contiguous `m x n` C would pass on a flat fixture and corrupt the real one.
+    fn fused_trailing_fixture(
+        m: usize,
+        k: usize,
+        n: usize,
+        ldc: usize,
+        c_off: usize,
+        c_len: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let f = |i: usize, a: f64, b: f64| ((i % 23) as f64).mul_add(a, b);
+        let u: Vec<f64> = (0..m * k).map(|i| f(i, 0.031, -0.37)).collect();
+        let y2: Vec<f64> = (0..n * k).map(|i| f(i, -0.017, 0.21)).collect();
+        let x2: Vec<f64> = (0..m * k).map(|i| f(i, 0.013, 0.09)).collect();
+        let v: Vec<f64> = (0..k * n).map(|i| f(i, 0.041, -0.11)).collect();
+        // Includes a negative zero so a kernel that canonicalised signs would show up.
+        let c: Vec<f64> = (0..c_len)
+            .map(|i| if i % 37 == 0 { -0.0 } else { f(i, 0.007, -0.5) })
+            .collect();
+        let _ = (ldc, c_off);
+        (u, y2, x2, v, c)
+    }
+
+    #[test]
+    fn bidiag_fused_trailing_update_matches_two_passes_bitwise() {
+        // `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b. `dgemm_bt_then_nt_sub_into` claims
+        // to be the two `sub_into` calls merged into one pass over A22, with the arithmetic
+        // untouched. The claim is structural — same `dgemm_mm` calls, same column blocks, same
+        // per-element order — but item 114 shipped a "FREE" constant on a structural argument
+        // nobody executed, so this executes it.
+        //
+        // Shapes are chosen for the ways a merged loop breaks rather than for coverage: `n`
+        // straddling MIN_BLOCK_COLS (128) so the fused loop runs one block, exactly one, and
+        // several; a `k` of 8 (the shipped panel width) and 16 (the previous one); non-square
+        // and skinny tiles; and every case driven through a STRIDED C window.
+        //                m    k    n   ldc  c_off
+        let cases: [[usize; 5]; 11] = [
+            [8, 8, 8, 40, 41],        // far below one block
+            [64, 8, 127, 200, 173],   // one block, just under MIN_BLOCK_COLS
+            [64, 8, 128, 200, 173],   // exactly MIN_BLOCK_COLS
+            [64, 8, 129, 200, 173],   // just over: the first two-block case
+            [96, 8, 300, 400, 401],   // several blocks, ragged last
+            [96, 8, 384, 400, 401],   // several blocks, exact multiple
+            [200, 16, 512, 600, 601], // k = the previous panel width
+            [1, 8, 300, 320, 7],      // single row
+            [64, 1, 300, 320, 7],     // rank-1 update: k = 1
+            [7, 3, 5, 11, 13],        // all tiny and coprime-ish
+            [130, 8, 130, 137, 139],  // ldc barely exceeds n, offset unaligned
+        ];
+        for (case, &[m, k, n, ldc, c_off]) in cases.iter().enumerate() {
+            let c_len = c_off + m * ldc + n + 8;
+            let (u, y2, x2, v, c0) = fused_trailing_fixture(m, k, n, ldc, c_off, c_len);
+
+            // Reference: the two calls, in the order `bidiag_blocked_f64` makes them.
+            let mut want = c0.clone();
+            super::gemm::dgemm_bt_sub_into(m, k, n, &u, &y2, &mut want, c_off, ldc);
+            super::gemm::dgemm_sub_into(m, k, n, &x2, &v, &mut want, c_off, ldc);
+
+            let mut got = c0.clone();
+            super::gemm::dgemm_bt_then_nt_sub_into(m, k, n, &u, &y2, &x2, &v, &mut got, c_off, ldc);
+
+            assert_eq!(got.len(), want.len(), "case {case}: C length");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "case {case} element {i}: fused {g} != two-pass {w} \
+                     (m={m} k={k} n={n} ldc={ldc} c_off={c_off})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bidiag_fused_trailing_update_bitwise_test_can_actually_fail() {
+        // PLANTED NEGATIVE. The test above asserts an equality that is TRUE BY CONSTRUCTION, and
+        // an equality that cannot fail is not evidence. This plants the most plausible mutation a
+        // "fusion" invites -- applying the two updates in the other order -- and asserts the
+        // comparison CATCHES it. `(a - s1) - s2` and `(a - s2) - s1` are the same real number and
+        // different f64s, so if this ever starts passing, the harness has stopped comparing bits
+        // and the test above is worthless.
+        //
+        // Deliberately NOT a test of the shipping kernel: it mutates the REFERENCE, so it keeps
+        // proving the comparison is sensitive even if the kernel is later rewritten.
+        let (m, k, n, ldc, c_off) = (96usize, 8usize, 300usize, 400usize, 401usize);
+        let c_len = c_off + m * ldc + n + 8;
+        let (u, y2, x2, v, c0) = fused_trailing_fixture(m, k, n, ldc, c_off, c_len);
+
+        let mut correct = c0.clone();
+        super::gemm::dgemm_bt_sub_into(m, k, n, &u, &y2, &mut correct, c_off, ldc);
+        super::gemm::dgemm_sub_into(m, k, n, &x2, &v, &mut correct, c_off, ldc);
+
+        let mut swapped = c0.clone();
+        super::gemm::dgemm_sub_into(m, k, n, &x2, &v, &mut swapped, c_off, ldc);
+        super::gemm::dgemm_bt_sub_into(m, k, n, &u, &y2, &mut swapped, c_off, ldc);
+
+        let differing = correct
+            .iter()
+            .zip(swapped.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differing > 0,
+            "swapping the two updates must change some bits, or the bitwise comparison in \
+             bidiag_fused_trailing_update_matches_two_passes_bitwise proves nothing"
+        );
+
+        // And the two orders must still agree to roundoff -- if they did not, the "fusion" would
+        // be hiding a real algebraic error rather than a rounding difference.
+        for (a, b) in correct.iter().zip(swapped.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0),
+                "the two orders must differ only in rounding: {a} vs {b}"
+            );
+        }
+    }
+
     #[test]
     fn sgemm_tb_matches_materialized_transpose_bit_exact() {
         // conv2d/3d_backward_f32 now compute dweight = dout_flat^T @ panel via
@@ -47303,6 +47760,17 @@ mod tests {
         }
     }
 
+    static MAX_POOL3D_POOL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn max_pool3d_pool_policy_defaults_to_eight_workers() {
+        let _guard = MAX_POOL3D_POOL_SWITCH_TEST_LOCK
+            .lock()
+            .expect("max-pool3d pool test lock");
+        assert_eq!(super::MAX_POOL3D_POOL_WIDTH, 8);
+        assert!(super::MAX_POOL3D_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// frankentorch-rayon-pool-width-qq8as: the FORWARD the lane executes must also be
     /// bit-identical on the narrow pool.
     ///
@@ -47312,6 +47780,9 @@ mod tests {
     /// the last bits, so this checks the value AND the argmax sidecar AND the fused sum.
     #[test]
     fn max_pool3d_fused_forward_narrow_pool_is_bit_identical() {
+        let _guard = MAX_POOL3D_POOL_SWITCH_TEST_LOCK
+            .lock()
+            .expect("max-pool3d pool test lock");
         // Large enough to cross FUSED_POOL_SUM_PARALLEL_THRESHOLD (1 << 13) so the
         // parallel recursion is the arm under test, not the serial fallback.
         let (batch, ch, id, ih, iw) = (2usize, 32usize, 16usize, 16usize, 16usize);
@@ -47328,15 +47799,15 @@ mod tests {
             })
             .collect();
 
-        let previous = super::set_narrow_pool_enabled(false);
+        let previous = super::set_max_pool3d_pool_enabled(false);
         let (out_a, arg_a, sum_a) = super::max_pool3d_forward_with_indices_and_sum_f64(
             &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
         );
-        super::set_narrow_pool_enabled(true);
+        super::set_max_pool3d_pool_enabled(true);
         let (out_b, arg_b, sum_b) = super::max_pool3d_forward_with_indices_and_sum_f64(
             &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
         );
-        super::set_narrow_pool_enabled(previous);
+        super::set_max_pool3d_pool_enabled(previous);
 
         assert_eq!(
             sum_a.to_bits(),
@@ -47365,6 +47836,9 @@ mod tests {
     /// pool has more workers than chunks.
     #[test]
     fn max_pool3d_backward_narrow_pool_is_bit_identical() {
+        let _guard = MAX_POOL3D_POOL_SWITCH_TEST_LOCK
+            .lock()
+            .expect("max-pool3d pool test lock");
         for &(batch, ch, id, ih, iw) in
             &[(2usize, 32usize, 8usize, 8usize, 8usize), (1, 4, 8, 8, 8)]
         {
@@ -47394,15 +47868,15 @@ mod tests {
                 })
                 .collect();
 
-            let previous = super::set_narrow_pool_enabled(false);
+            let previous = super::set_max_pool3d_pool_enabled(false);
             let ambient = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
                 &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
             );
-            super::set_narrow_pool_enabled(true);
+            super::set_max_pool3d_pool_enabled(true);
             let narrow = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
                 &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
             );
-            super::set_narrow_pool_enabled(previous);
+            super::set_max_pool3d_pool_enabled(previous);
 
             assert_eq!(ambient.len(), narrow.len());
             for (i, (a, b)) in ambient.iter().zip(narrow.iter()).enumerate() {
@@ -66435,6 +66909,102 @@ mod tests {
             "bidiag_blocked_f64 output moved:\n  {}",
             mismatches.join("\n  ")
         );
+    }
+
+    /// A seeded negative case for panel-workspace reuse: many panels, a
+    /// rank-deficient input, and a negative tiny scale.  A stale entry from an
+    /// earlier panel cannot hide behind the usual dense unit-scale golden here.
+    #[test]
+    fn bidiag_blocked_reused_workspace_matches_negative_rank_deficient_oracle() {
+        let (m, n, nb, rank, scale) = (48usize, 40usize, 4usize, 3usize, -1e-20f64);
+        let original = bidiag_test_matrix_rank_scaled(m, n, 0x75E3_8u64, rank, scale);
+        assert!(
+            original.iter().any(|&value| value.is_sign_negative()),
+            "seeded negative input unexpectedly has no negative entries"
+        );
+
+        let mut reference = original.clone();
+        let (d_ref, e_ref, _, _) = super::bidiag::bidiag_unblocked_f64(&mut reference, m, n);
+        let mut blocked = original;
+        let (d, e, _, _) = super::bidiag::bidiag_blocked_f64(&mut blocked, m, n, nb);
+
+        for i in 0..n {
+            let d_tol = 1e-9 * d_ref[i].abs().max(1.0);
+            assert!(
+                (d[i] - d_ref[i]).abs() <= d_tol,
+                "d[{i}] diverged with reused panel workspace: {} vs {}",
+                d[i],
+                d_ref[i]
+            );
+            if i + 1 < n {
+                let e_tol = 1e-9 * e_ref[i].abs().max(1.0);
+                assert!(
+                    (e[i] - e_ref[i]).abs() <= e_tol,
+                    "e[{i}] diverged with reused panel workspace: {} vs {}",
+                    e[i],
+                    e_ref[i]
+                );
+            }
+        }
+    }
+
+    /// Proves the exact-order outer-output block is live on a negative input
+    /// with both full blocks and short tails.  The five raw-bit goldens above
+    /// enforce identity; the unblocked oracle below catches a missed panel
+    /// update on this separate seeded shape.
+    #[test]
+    fn bidiag_blocked_outer_output_block_is_live_on_negative_tails() {
+        let (m, n, nb, rank, scale) = (47usize, 41usize, 4usize, 3usize, -1e-20f64);
+        let original = bidiag_test_matrix_rank_scaled(m, n, 0x75E3_8B10_u64, rank, scale);
+        assert!(
+            original.iter().any(|&value| value.is_sign_negative()),
+            "seeded negative input unexpectedly has no negative entries"
+        );
+
+        let mut reference = original.clone();
+        let (d_ref, e_ref, _, _) = super::bidiag::bidiag_unblocked_f64(&mut reference, m, n);
+
+        let previous = super::bidiag::set_panel_output_blocked(false);
+        let mut scalar = original.clone();
+        let scalar_result = super::bidiag::bidiag_blocked_f64(&mut scalar, m, n, nb);
+        assert!(
+            !super::bidiag::set_panel_output_blocked(true),
+            "scalar control was not installed"
+        );
+        let _ = super::bidiag::panel_output_blocks_take();
+        let mut blocked = original;
+        let blocked_result = super::bidiag::bidiag_blocked_f64(&mut blocked, m, n, nb);
+        super::bidiag::set_panel_output_blocked(previous);
+        assert!(
+            super::bidiag::panel_output_blocks_take() > 0,
+            "test did not reach the outer-output blocked panel path"
+        );
+
+        for (name, scalar, blocked) in [
+            ("packed", scalar.as_slice(), blocked.as_slice()),
+            ("d", scalar_result.0.as_slice(), blocked_result.0.as_slice()),
+            ("e", scalar_result.1.as_slice(), blocked_result.1.as_slice()),
+            ("tauq", scalar_result.2.as_slice(), blocked_result.2.as_slice()),
+            ("taup", scalar_result.3.as_slice(), blocked_result.3.as_slice()),
+        ] {
+            assert!(
+                scalar.iter().zip(blocked).all(|(left, right)| left.to_bits() == right.to_bits()),
+                "outer-output blocked form changed {name} bits"
+            );
+        }
+
+        for i in 0..n {
+            assert!(
+                (blocked_result.0[i] - d_ref[i]).abs() <= 1e-9 * d_ref[i].abs().max(1.0),
+                "d[{i}] diverged on a blocked outer-output tail"
+            );
+            if i + 1 < n {
+                assert!(
+                    (blocked_result.1[i] - e_ref[i]).abs() <= 1e-9 * e_ref[i].abs().max(1.0),
+                    "e[{i}] diverged on a blocked outer-output tail"
+                );
+            }
+        }
     }
 
     /// frankentorch-4zjaa: the owed post-fix ratio for the blocked `form_p`.
