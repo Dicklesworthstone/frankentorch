@@ -1604,6 +1604,9 @@ LANES = {
     # session cost. PT(kernels)/PT(f32) is a free control that must land near 1.0.
     "conv2d_f32_kernels": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
     "conv2d_f32_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
+    # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
+    # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-88d36e2f dpanel + col2im dinput.
+    "conv2d_f32_masked_panel": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
     "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
     "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
     # frankentorch-58zjz: the query is the timed leaf; K and V require grad too, so the backward
@@ -2496,6 +2499,31 @@ LANES = {
             // weight being frozen here exactly as it is on the f64 masked lane.
             "conv2d_f32_masked",
             Box::new(|| timed_conv2d_f32(&c2x32, &c2w32, Some(&c2m32), C2F32_N, false)),
+        ),
+        (
+            // `frankentorch-hi9r6`: the lane above with 88d36e2f's blocked image-parallel dinput
+            // toggled OFF, so the pair differs in exactly one thing and both halves sample the
+            // same host minute.
+            //
+            // WHY THIS LANE HAD TO EXIST. 88d36e2f took our arm on `conv2d_f32_masked` from
+            // 114.667 ms to a stable 69.7-73.0 ms by removing a 189 MB `dpanel` round trip. That
+            // is a SELF-SPEEDUP measured across invocations, which is maintenance, not a win --
+            // and it could not be converted into one, because PyTorch's arm on this lane swung
+            // 18.2 to 27.0 ms (48%) across four runs, so the vs-incumbent delta was not separable
+            // from the incumbent's own movement. Item 25's rule is the fix: both arms in ONE
+            // invocation against ONE live incumbent, with PT(panel)/PT(base) as a free ~1.0
+            // control that says whether the window held still.
+            //
+            // The two paths are BIT-IDENTICAL — `conv2d_dinput_direct_f32_matches_panel_col2im
+            // _bitwise` asserts that at eight shapes by five block widths — so this pair can move
+            // time and cannot move a number.
+            "conv2d_f32_masked_panel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+                let sample = timed_conv2d_f32(&c2x32, &c2w32, Some(&c2m32), C2F32_N, false);
+                ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous);
+                sample
+            }),
         ),
         (
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate
