@@ -220,21 +220,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         !sizes.is_empty() && !gate_values.is_empty() && !rowdots.is_empty() && !fuseds.is_empty(),
         "empty grid"
     );
-    let arms: Vec<Arm> = gate_values
-        .iter()
-        .flat_map(|&gate| {
-            rowdots.iter().flat_map(move |&blocked| {
-                fuseds
-                    .iter()
-                    .map(move |&fused| Arm {
-                        gate,
-                        blocked,
-                        fused,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        })
-        .collect();
+    // Plain loops rather than nested flat_map: the three-way product needs `fuseds` borrowed by
+    // every iteration of the outer two, and the closure form moved it (E0507).
+    let mut arms: Vec<Arm> = Vec::with_capacity(gate_values.len() * rowdots.len() * fuseds.len());
+    for &gate in &gate_values {
+        for &blocked in &rowdots {
+            for &fused in &fuseds {
+                arms.push(Arm {
+                    gate,
+                    blocked,
+                    fused,
+                });
+            }
+        }
+    }
     let rounds: usize = std::env::var("FT_ROUNDS")
         .ok()
         .and_then(|t| t.trim().parse().ok())
