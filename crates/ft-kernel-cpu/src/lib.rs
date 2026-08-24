@@ -8323,9 +8323,77 @@ pub fn conv2d_backward_dinput_direct_f64(
     sw: usize,
     out_ch: usize,
 ) -> Vec<f64> {
+    let patch_width = in_ch * kh * kw;
+    conv2d_backward_dinput_blocked_rows_f64(
+        dout_flat,
+        weight_flat,
+        batch,
+        in_ch,
+        ph,
+        pw,
+        kh,
+        kw,
+        oh,
+        ow,
+        sh,
+        sw,
+        out_ch,
+        conv2d_dinput_block_rows(patch_width),
+    )
+}
+
+/// Patch rows per `dgemm` call, from a BYTE budget rather than a fixed row count.
+///
+/// `frankentorch-hi9r6`. A fixed 256 rows is a fixed row count but not a fixed footprint: the
+/// block is `rows * patch_width` f64 PER TASK, and the tasks are concurrent. At the conv2d shapes
+/// this campaign measures (`patch_width` 288) that is 590 KB each; at `in_ch = 512, k = 3`
+/// (`patch_width` 4608) it would be 9.4 MB each, and the gate admits this route only when
+/// `batch >= current_num_threads()`, so a 64-wide pool would hold ~604 MB of scratch. Budgeting
+/// bytes bounds that at any shape.
+///
+/// The budget is 576 KiB because that is exactly 256 rows at `patch_width = 288` — the
+/// configuration every row on this bead was measured under. Sizing it to preserve the measured
+/// blocking is deliberate: a policy that quietly re-blocked the lane would invalidate those rows.
+///
+/// ANY value here is bit-identical (the `m`-split argument in
+/// `conv2d_backward_dinput_direct_f64`), which is exactly why this must not be trusted to
+/// judgement alone — item 117c's warning about item 114's identical constant is that a constant
+/// which changes only performance is not free, it is untested.
+/// `conv2d_dinput_blocking_is_bit_identical_at_every_block_size` drives the blocked kernel at
+/// block sizes 1, 2, 7, 256 and one larger than `patch_count` and asserts all of them agree with
+/// the panel route bit for bit, so the policy can be retuned without re-proving parity.
+#[must_use]
+fn conv2d_dinput_block_rows(patch_width: usize) -> usize {
+    const BUDGET_BYTES: usize = 576 * 1024;
+    if patch_width == 0 {
+        return 1;
+    }
+    (BUDGET_BYTES / (patch_width * size_of::<f64>())).max(1)
+}
+
+/// [`conv2d_backward_dinput_direct_f64`] with the block width supplied, so a test can drive it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_dinput_blocked_rows_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+) -> Vec<f64> {
     use rayon::prelude::*;
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
+    let block_rows = block_rows.max(1);
     // Positions no window reaches must stay `+0.0`, exactly as in `conv2d_col2im_f64` — this
     // accumulates and so cannot be built uninitialised (item 165d).
     let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
@@ -8336,10 +8404,10 @@ pub fn conv2d_backward_dinput_direct_f64(
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
         .for_each(|(b, dpb)| {
-            let mut block = vec![0.0f64; DPANEL_BLOCK_ROWS.min(patch_count) * patch_width];
+            let mut block = vec![0.0f64; block_rows.min(patch_count) * patch_width];
             let mut start = 0usize;
             while start < patch_count {
-                let rows = DPANEL_BLOCK_ROWS.min(patch_count - start);
+                let rows = block_rows.min(patch_count - start);
                 let a = &dout_flat
                     [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
                 let dp = &mut block[..rows * patch_width];
@@ -8367,16 +8435,8 @@ pub fn conv2d_backward_dinput_direct_f64(
     dpadded
 }
 
-/// Patch rows per `dgemm` call in [`conv2d_backward_dinput_direct_f64`].
-///
-/// Sized so one block's `rows x patch_width` f64 buffer stays L2-resident at the conv2d shapes
-/// this campaign measures: 256 x 288 x 8 B = 590 KB. Item 117c's warning about item 114's
-/// identical constant is honoured rather than repeated — it is FREE numerically (any value gives
-/// bit-identical results, which is what the `m`-split argument buys and what the ragged-tail
-/// cases in the bitwise test check), and it is NOT free in time, so it is a named constant with
-/// a stated basis rather than a magic number, and the paired lane behind
-/// `set_conv2d_dinput_panel_legacy` is what prices it.
-const DPANEL_BLOCK_ROWS: usize = 256;
+// The block width now comes from `conv2d_dinput_block_rows`, a byte budget, rather than from a
+// fixed row constant — see that function for why a fixed row count is not a fixed footprint.
 
 /// f32 mirror of [`conv2d_col2im_f64`].
 #[allow(clippy::too_many_arguments)]
@@ -44334,36 +44394,73 @@ mod tests {
             let want =
                 super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
 
+            // Every block width, not just the one the byte budget happens to pick. The `m`-split
+            // argument says ANY blocking is bit-identical; that is the claim, so it is what gets
+            // asserted, and it is what lets `conv2d_dinput_block_rows` be retuned later without
+            // re-proving parity. 1 and 2 force a block per row or two; 7 gives ragged tails on
+            // every shape; `patch_count + 5` is a single oversized block with no tail at all.
+            //
             // Called DIRECTLY, not through `conv2d_dinput_blocked_selected`: the gate is a
             // scheduling decision about pool width and would make this assertion vacuous on any
             // host whose thread count exceeds these small batches.
-            let got = super::conv2d_backward_dinput_direct_f64(
-                &dout_flat,
-                &weight_flat,
-                batch,
-                in_ch,
-                ph,
-                pw,
-                kh,
-                kw,
-                oh,
-                ow,
-                sh,
-                sw,
-                out_ch,
-            );
-
-            assert_eq!(got.len(), want.len(), "case {case}: dpadded length");
-            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-                assert_eq!(
-                    g.to_bits(),
-                    w.to_bits(),
-                    "case {case} element {i}: direct dinput {g} != panel+col2im {w} \
-                     (shape batch={batch} in_ch={in_ch} out_ch={out_ch} {ph}x{pw} \
-                     k={kh}x{kw} s={sh}x{sw})"
+            for block_rows in [1usize, 2, 7, 256, patch_count + 5] {
+                let got = super::conv2d_backward_dinput_blocked_rows_f64(
+                    &dout_flat,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    block_rows,
                 );
+
+                assert_eq!(got.len(), want.len(), "case {case}: dpadded length");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "case {case} element {i} at block_rows={block_rows}: direct dinput {g} \
+                         != panel+col2im {w} (shape batch={batch} in_ch={in_ch} out_ch={out_ch} \
+                         {ph}x{pw} k={kh}x{kw} s={sh}x{sw})"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn conv2d_dinput_block_rows_budgets_bytes_not_rows() {
+        // The whole point of the byte budget is that per-task scratch does NOT grow with
+        // `patch_width`. Assert the invariant, and pin the one value a measurement depends on.
+        assert_eq!(
+            super::conv2d_dinput_block_rows(288),
+            256,
+            "patch_width 288 must still block at 256 rows -- every conv2d row on \
+             frankentorch-hi9r6 was measured at that blocking, and a policy change that \
+             silently re-blocks the lane would invalidate them"
+        );
+        for patch_width in [1usize, 9, 45, 288, 4608, 65536] {
+            let rows = super::conv2d_dinput_block_rows(patch_width);
+            assert!(
+                rows >= 1,
+                "patch_width {patch_width}: block must have a row"
+            );
+            let bytes = rows * patch_width * size_of::<f64>();
+            assert!(
+                bytes <= 576 * 1024 || rows == 1,
+                "patch_width {patch_width}: {rows} rows is {bytes} B, over the budget; only a \
+                 single row may exceed it (a block cannot be narrower than one patch)"
+            );
+        }
+        // Degenerate input must not divide by zero.
+        assert_eq!(super::conv2d_dinput_block_rows(0), 1);
     }
 
     #[test]
