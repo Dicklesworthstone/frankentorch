@@ -8512,14 +8512,7 @@ fn conv2d_backward_dinput_blocked_rows_f64(
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
         .for_each(|(b, dpb)| {
-            let mut block = vec![0.0f64; block_rows.min(patch_count) * patch_width];
-            let mut start = 0usize;
-            while start < patch_count {
-                let rows = block_rows.min(patch_count - start);
-                let a = &dout_flat
-                    [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
-                let dp = &mut block[..rows * patch_width];
-                gemm::dgemm(rows, out_ch, patch_width, a, weight_flat, dp);
+            let scatter = |block: &[f64], start: usize, rows: usize, dpb: &mut [f64]| {
                 for r in 0..rows {
                     let pc = start + r;
                     let base_h = (pc / ow) * sh;
@@ -8532,11 +8525,32 @@ fn conv2d_backward_dinput_blocked_rows_f64(
                             let irow = ch_off + (base_h + kr) * pw + base_w;
                             let prow_off = prow + pch + kr * kw;
                             for kc in 0..kw {
-                                dpb[irow + kc] += dp[prow_off + kc];
+                                dpb[irow + kc] += block[prow_off + kc];
                             }
                         }
                     }
                 }
+            };
+            // `dgemm` overwrites every scratch element with beta=0 before this loop reads it.
+            // Avoid zeroing up to 576 KiB per image only to overwrite it in the first GEMM.
+            // The first iteration always covers this allocation in full; later short tails only
+            // read their written prefix. The zero-filled `dpadded` remains an accumulator, so
+            // untouched padded positions preserve the col2im route's signed-zero contract.
+            let first_rows = block_rows.min(patch_count);
+            let first = &dout_flat[(b * patch_count) * out_ch
+                ..(b * patch_count + first_rows) * out_ch];
+            let mut block = build_uninit(first_rows * patch_width, |block| {
+                gemm::dgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
+            });
+            scatter(&block, 0, first_rows, dpb);
+            let mut start = first_rows;
+            while start < patch_count {
+                let rows = block_rows.min(patch_count - start);
+                let a = &dout_flat
+                    [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
+                let dp = &mut block[..rows * patch_width];
+                gemm::dgemm(rows, out_ch, patch_width, a, weight_flat, dp);
+                scatter(dp, start, rows, dpb);
                 start += rows;
             }
         });
