@@ -32421,6 +32421,30 @@ mod bidiag {
         (d, e, tauq, taup)
     }
 
+    /// Reusable storage for a blocked bidiagonal panel.
+    ///
+    /// The panel walks the same fixed-width work arrays once for every `nb`
+    /// reflectors.  Keeping those buffers for the whole reduction removes the
+    /// allocator and zero-fill work from every panel without changing a single
+    /// floating-point operation or the packed panel layout.
+    struct BidiagPanelWorkspace {
+        u: Vec<f64>,
+        acc: Vec<f64>,
+        pacc: Vec<f64>,
+        cacc: Vec<f64>,
+    }
+
+    impl BidiagPanelWorkspace {
+        fn new(m: usize, n: usize, nb: usize) -> Self {
+            Self {
+                u: vec![0.0; m],
+                acc: vec![0.0; n],
+                pacc: vec![0.0; nb],
+                cacc: vec![0.0; n],
+            }
+        }
+    }
+
     /// `dlabrd`: reduce the leading `nb` columns and rows of the trailing
     /// submatrix `a[off.., off..]` to bidiagonal form, accumulating the
     /// deferred updates into `x` (`m_sub x nb`) and `y` (`n_sub x nb`).
@@ -32447,6 +32471,7 @@ mod bidiag {
         e: &mut [f64],
         tauq: &mut [f64],
         taup: &mut [f64],
+        workspace: &mut BidiagPanelWorkspace,
     ) {
         let ldx = nb;
         let ldy = nb;
@@ -32454,8 +32479,8 @@ mod bidiag {
         let at = |r: usize, c: usize| (off + r) * lda + (off + c);
         // Reflector scratch for the two O(m_sub * n_sub) matvecs, steps (3) and
         // (12). Every other step in the panel is O(m_sub * nb) and stays serial.
-        let mut u = vec![0.0f64; m_sub];
-        let mut acc = vec![0.0f64; n_sub];
+        let u = &mut workspace.u[..m_sub];
+        let acc = &mut workspace.acc[..n_sub];
         // frankentorch-4zjaa item 246. Accumulators for the four loops below that used to walk
         // a COLUMN down the rows — striding by `lda` (or `ldx`/`ldy`) on every read of a
         // row-major matrix, which is the exact access pattern step (3)'s comment records as
@@ -32466,8 +32491,8 @@ mod bidiag {
         // still sums its own terms in the original order, only the traversal order of the two
         // nested loops changes. `pacc` is indexed by panel column (at most `nb`), `cacc` by
         // trailing column. Allocated once per call, outside the `i` loop.
-        let mut pacc = vec![0.0f64; nb];
-        let mut cacc = vec![0.0f64; n_sub];
+        let pacc = &mut workspace.pacc[..nb];
+        let cacc = &mut workspace.cacc[..n_sub];
 
         for i in 0..nb {
             // (1) Apply the accumulated updates to column i before reducing it.
@@ -32709,15 +32734,40 @@ mod bidiag {
         }
 
         let lda = n;
+        // These panel-local buffers shrink monotonically as the reduction moves
+        // down the diagonal.  Allocate the maximum extent once and take the
+        // live prefix for each panel: every value read by `dlabrd_panel_f64` is
+        // written in that panel before its first read, so retaining the unused
+        // tail cannot affect its arithmetic or packed output.
+        let mut x_workspace = vec![0.0f64; m * nb];
+        let mut y_workspace = vec![0.0f64; n * nb];
+        let mut panel_workspace = BidiagPanelWorkspace::new(m, n, nb);
+        // The packed GEMM operands are fully overwritten after each panel.  As
+        // above, keeping their maximum storage eliminates repeated allocation
+        // without changing either trailing update or its reduction order.
+        let mut u_workspace = vec![0.0f64; m * nb];
+        let mut v_workspace = vec![0.0f64; nb * n];
         let mut i = 0usize;
         while n - i > nb && m - i > nb {
             let m_sub = m - i;
             let n_sub = n - i;
-            let mut x = vec![0.0f64; m_sub * nb];
-            let mut y = vec![0.0f64; n_sub * nb];
+            let x = &mut x_workspace[..m_sub * nb];
+            let y = &mut y_workspace[..n_sub * nb];
 
             dlabrd_panel_f64(
-                a, lda, i, m_sub, n_sub, nb, &mut x, &mut y, &mut d, &mut e, &mut tauq, &mut taup,
+                a,
+                lda,
+                i,
+                m_sub,
+                n_sub,
+                nb,
+                x,
+                y,
+                &mut d,
+                &mut e,
+                &mut tauq,
+                &mut taup,
+                &mut panel_workspace,
             );
 
             let m2 = m_sub - nb;
@@ -32726,27 +32776,22 @@ mod bidiag {
                 // U = A[i+nb.., i..i+nb] (strided) and V = A[i..i+nb, i+nb..]
                 // (strided) both need contiguous copies for the GEMM calls.
                 //
-                // frankentorch-4zjaa item 247: built UNINITIALIZED, because the copy below
-                // covers every element and the zero-fill `vec![0.0; ..]` performs is therefore
-                // dead — `m2` rows of exactly `nb`, and `nb` rows of exactly `n2`, tile the
-                // whole buffer with no remainder. This is the pattern
-                // `project_expand_uninit_firsttouch` names: a zero-init followed by a full
-                // overwrite pays a write pass and, on fresh pages, the first-touch faults too.
-                // Bit-exactness is not at stake — no arithmetic changes — and
+                // The copy below covers every element of each live prefix: `m2` rows of exactly
+                // `nb`, and `nb` rows of exactly `n2`, tile the buffers with no remainder. The
+                // retained capacity therefore avoids both a fresh allocation and a dead zero-fill
+                // per panel. Bit-exactness is not at stake — no arithmetic changes — and
                 // `bidiag_blocked_output_is_bit_stable` pins it regardless.
                 let a_ro: &[f64] = a;
-                let u = crate::build_uninit(m2 * nb, |dst: &mut [f64]| {
-                    for (r, row) in dst.chunks_exact_mut(nb).enumerate() {
-                        let src = (i + nb + r) * lda + i;
-                        row.copy_from_slice(&a_ro[src..src + nb]);
-                    }
-                });
-                let v = crate::build_uninit(nb * n2, |dst: &mut [f64]| {
-                    for (p, row) in dst.chunks_exact_mut(n2).enumerate() {
-                        let src = (i + p) * lda + i + nb;
-                        row.copy_from_slice(&a_ro[src..src + n2]);
-                    }
-                });
+                let u = &mut u_workspace[..m2 * nb];
+                for (r, row) in u.chunks_exact_mut(nb).enumerate() {
+                    let src = (i + nb + r) * lda + i;
+                    row.copy_from_slice(&a_ro[src..src + nb]);
+                }
+                let v = &mut v_workspace[..nb * n2];
+                for (p, row) in v.chunks_exact_mut(n2).enumerate() {
+                    let src = (i + p) * lda + i + nb;
+                    row.copy_from_slice(&a_ro[src..src + n2]);
+                }
 
                 let off22 = (i + nb) * lda + (i + nb);
                 if fused_trailing_enabled() {
@@ -32759,19 +32804,19 @@ mod bidiag {
                         m2,
                         nb,
                         n2,
-                        &u,
+                        u,
                         &y[nb * nb..],
                         &x[nb * nb..],
-                        &v,
+                        v,
                         a,
                         off22,
                         lda,
                     );
                 } else {
                     // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
-                    super::gemm::dgemm_bt_sub_into(m2, nb, n2, &u, &y[nb * nb..], a, off22, lda);
+                    super::gemm::dgemm_bt_sub_into(m2, nb, n2, u, &y[nb * nb..], a, off22, lda);
                     // A22 -= X2 * V     (X2 = rows nb.. of x, already contiguous)
-                    super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], &v, a, off22, lda);
+                    super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], v, a, off22, lda);
                 }
             }
 
@@ -66732,6 +66777,43 @@ mod tests {
             "bidiag_blocked_f64 output moved:\n  {}",
             mismatches.join("\n  ")
         );
+    }
+
+    /// A seeded negative case for panel-workspace reuse: many panels, a
+    /// rank-deficient input, and a negative tiny scale.  A stale entry from an
+    /// earlier panel cannot hide behind the usual dense unit-scale golden here.
+    #[test]
+    fn bidiag_blocked_reused_workspace_matches_negative_rank_deficient_oracle() {
+        let (m, n, nb, rank, scale) = (48usize, 40usize, 4usize, 3usize, -1e-20f64);
+        let original = bidiag_test_matrix_rank_scaled(m, n, 0x75E3_8u64, rank, scale);
+        assert!(
+            original.iter().any(|&value| value.is_sign_negative()),
+            "seeded negative input unexpectedly has no negative entries"
+        );
+
+        let mut reference = original.clone();
+        let (d_ref, e_ref, _, _) = super::bidiag::bidiag_unblocked_f64(&mut reference, m, n);
+        let mut blocked = original;
+        let (d, e, _, _) = super::bidiag::bidiag_blocked_f64(&mut blocked, m, n, nb);
+
+        for i in 0..n {
+            let d_tol = 1e-9 * d_ref[i].abs().max(1.0);
+            assert!(
+                (d[i] - d_ref[i]).abs() <= d_tol,
+                "d[{i}] diverged with reused panel workspace: {} vs {}",
+                d[i],
+                d_ref[i]
+            );
+            if i + 1 < n {
+                let e_tol = 1e-9 * e_ref[i].abs().max(1.0);
+                assert!(
+                    (e[i] - e_ref[i]).abs() <= e_tol,
+                    "e[{i}] diverged with reused panel workspace: {} vs {}",
+                    e[i],
+                    e_ref[i]
+                );
+            }
+        }
     }
 
     /// frankentorch-4zjaa: the owed post-fix ratio for the blocked `form_p`.
