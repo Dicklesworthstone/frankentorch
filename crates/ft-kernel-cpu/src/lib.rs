@@ -32137,6 +32137,44 @@ mod bidiag {
     /// the previous code handed rayon ONE ROW per item.
     const X_ROW_CHUNK: usize = 32;
 
+    /// Independent panel outputs kept in flight by the serial reflector-update
+    /// steps.  This blocks only the outer output dimension; every output still
+    /// accumulates its reflector terms in the original order.
+    const PANEL_OUTPUT_BLOCK: usize = 4;
+
+    /// Whether the serial panel's independent row/column outputs are kept in
+    /// groups of four. The false arm is the exact scalar sweep it replaced.
+    static PANEL_OUTPUT_BLOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    #[inline]
+    fn panel_output_blocked() -> bool {
+        PANEL_OUTPUT_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the exact-order panel-output form, returning the previous setting
+    /// so a paired measurement lane can restore it.
+    pub(crate) fn set_panel_output_blocked(blocked: bool) -> bool {
+        PANEL_OUTPUT_BLOCKED.swap(blocked, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    static PANEL_OUTPUT_BLOCK_TAKES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[inline]
+    fn note_panel_output_block() {
+        #[cfg(test)]
+        {
+            PANEL_OUTPUT_BLOCK_TAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panel_output_blocks_take() -> usize {
+        PANEL_OUTPUT_BLOCK_TAKES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `dst[k * dst_stride] = Σ_c a[first + k*row_stride + c] * v[c]` for `k in 0..nrows` —
     /// FOUR ROWS AT A TIME.
     ///
@@ -32531,7 +32569,32 @@ mod bidiag {
 
         for i in 0..nb {
             // (1) Apply the accumulated updates to column i before reducing it.
-            for r in i..m_sub {
+            let output_blocked = panel_output_blocked();
+            let mut r = i;
+            while output_blocked && r + PANEL_OUTPUT_BLOCK <= m_sub {
+                note_panel_output_block();
+                let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for p in 0..i {
+                    let yp = y[i * ldy + p];
+                    s0 += a[at(r, p)] * yp;
+                    s1 += a[at(r + 1, p)] * yp;
+                    s2 += a[at(r + 2, p)] * yp;
+                    s3 += a[at(r + 3, p)] * yp;
+                }
+                for p in 0..i {
+                    let api = a[at(p, i)];
+                    s0 += x[r * ldx + p] * api;
+                    s1 += x[(r + 1) * ldx + p] * api;
+                    s2 += x[(r + 2) * ldx + p] * api;
+                    s3 += x[(r + 3) * ldx + p] * api;
+                }
+                a[at(r, i)] -= s0;
+                a[at(r + 1, i)] -= s1;
+                a[at(r + 2, i)] -= s2;
+                a[at(r + 3, i)] -= s3;
+                r += PANEL_OUTPUT_BLOCK;
+            }
+            while r < m_sub {
                 let mut s = 0.0;
                 for p in 0..i {
                     s += a[at(r, p)] * y[i * ldy + p];
@@ -32540,6 +32603,7 @@ mod bidiag {
                     s += x[r * ldx + p] * a[at(p, i)];
                 }
                 a[at(r, i)] -= s;
+                r += 1;
             }
 
             // (2) Column reflector over a[i.., i].
@@ -32634,7 +32698,31 @@ mod bidiag {
                 }
 
                 // (9)+(10) apply the accumulated updates to row i.
-                for c in (i + 1)..n_sub {
+                let mut c = i + 1;
+                while output_blocked && c + PANEL_OUTPUT_BLOCK <= n_sub {
+                    note_panel_output_block();
+                    let (mut s0, mut s1, mut s2, mut s3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                    for p in 0..=i {
+                        let aip = a[at(i, p)];
+                        s0 += y[c * ldy + p] * aip;
+                        s1 += y[(c + 1) * ldy + p] * aip;
+                        s2 += y[(c + 2) * ldy + p] * aip;
+                        s3 += y[(c + 3) * ldy + p] * aip;
+                    }
+                    for p in 0..i {
+                        let xip = x[i * ldx + p];
+                        s0 += a[at(p, c)] * xip;
+                        s1 += a[at(p, c + 1)] * xip;
+                        s2 += a[at(p, c + 2)] * xip;
+                        s3 += a[at(p, c + 3)] * xip;
+                    }
+                    a[at(i, c)] -= s0;
+                    a[at(i, c + 1)] -= s1;
+                    a[at(i, c + 2)] -= s2;
+                    a[at(i, c + 3)] -= s3;
+                    c += PANEL_OUTPUT_BLOCK;
+                }
+                while c < n_sub {
                     let mut s = 0.0;
                     for p in 0..=i {
                         s += y[c * ldy + p] * a[at(i, p)];
@@ -32643,6 +32731,7 @@ mod bidiag {
                         s += a[at(p, c)] * x[i * ldx + p];
                     }
                     a[at(i, c)] -= s;
+                    c += 1;
                 }
 
                 // (11) Row reflector over a[i, i+1..].
@@ -34479,6 +34568,14 @@ pub fn bidiag_parallel_branches_take() -> (u64, u64, u64) {
 #[doc(hidden)]
 pub fn bidiag_rowdot_blocked_set(blocked: bool) -> bool {
     bidiag::set_rowdot_blocked(blocked)
+}
+
+/// Set the serial panel's exact-order outer-output form: `true` keeps four
+/// independent outputs in flight, `false` uses the original scalar sweep.
+/// Returns the previous setting so a paired live lane can restore it.
+#[doc(hidden)]
+pub fn bidiag_panel_output_blocked_set(blocked: bool) -> bool {
+    bidiag::set_panel_output_blocked(blocked)
 }
 
 /// Set the panel's trailing-update form: `true` = ONE pass over `A22` applying both updates
@@ -66846,6 +66943,65 @@ mod tests {
                     "e[{i}] diverged with reused panel workspace: {} vs {}",
                     e[i],
                     e_ref[i]
+                );
+            }
+        }
+    }
+
+    /// Proves the exact-order outer-output block is live on a negative input
+    /// with both full blocks and short tails.  The five raw-bit goldens above
+    /// enforce identity; the unblocked oracle below catches a missed panel
+    /// update on this separate seeded shape.
+    #[test]
+    fn bidiag_blocked_outer_output_block_is_live_on_negative_tails() {
+        let (m, n, nb, rank, scale) = (47usize, 41usize, 4usize, 3usize, -1e-20f64);
+        let original = bidiag_test_matrix_rank_scaled(m, n, 0x75E3_8B10_u64, rank, scale);
+        assert!(
+            original.iter().any(|&value| value.is_sign_negative()),
+            "seeded negative input unexpectedly has no negative entries"
+        );
+
+        let mut reference = original.clone();
+        let (d_ref, e_ref, _, _) = super::bidiag::bidiag_unblocked_f64(&mut reference, m, n);
+
+        let previous = super::bidiag::set_panel_output_blocked(false);
+        let mut scalar = original.clone();
+        let scalar_result = super::bidiag::bidiag_blocked_f64(&mut scalar, m, n, nb);
+        assert!(
+            !super::bidiag::set_panel_output_blocked(true),
+            "scalar control was not installed"
+        );
+        let _ = super::bidiag::panel_output_blocks_take();
+        let mut blocked = original;
+        let blocked_result = super::bidiag::bidiag_blocked_f64(&mut blocked, m, n, nb);
+        super::bidiag::set_panel_output_blocked(previous);
+        assert!(
+            super::bidiag::panel_output_blocks_take() > 0,
+            "test did not reach the outer-output blocked panel path"
+        );
+
+        for (name, scalar, blocked) in [
+            ("packed", scalar.as_slice(), blocked.as_slice()),
+            ("d", scalar_result.0.as_slice(), blocked_result.0.as_slice()),
+            ("e", scalar_result.1.as_slice(), blocked_result.1.as_slice()),
+            ("tauq", scalar_result.2.as_slice(), blocked_result.2.as_slice()),
+            ("taup", scalar_result.3.as_slice(), blocked_result.3.as_slice()),
+        ] {
+            assert!(
+                scalar.iter().zip(blocked).all(|(left, right)| left.to_bits() == right.to_bits()),
+                "outer-output blocked form changed {name} bits"
+            );
+        }
+
+        for i in 0..n {
+            assert!(
+                (blocked_result.0[i] - d_ref[i]).abs() <= 1e-9 * d_ref[i].abs().max(1.0),
+                "d[{i}] diverged on a blocked outer-output tail"
+            );
+            if i + 1 < n {
+                assert!(
+                    (blocked_result.1[i] - e_ref[i]).abs() <= 1e-9 * e_ref[i].abs().max(1.0),
+                    "e[{i}] diverged on a blocked outer-output tail"
                 );
             }
         }
