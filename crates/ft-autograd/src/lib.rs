@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod masked_conv2d;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt;
