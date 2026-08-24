@@ -1493,6 +1493,11 @@ LANES = {
     # item 216: the train twin of the line above -- c2w_train, so BOTH arms compute dweight.
     # Sized at batch 16 because that is the one masked conv2d lane measured certifying 4 of 4.
     "conv2d_big_masked_train": (c2bx, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2bm),
+    # hi9r6 dinput-blocking: same incumbent code under two more names, so PT(panel)/PT(base) is a
+    # free ~1.0 control on each pair. Only OUR arm differs -- the `_panel` names run the
+    # pre-blocking dpanel + col2im dinput route.
+    "conv2d_big_masked_panel": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
+    "conv2d_big_masked_train_panel": (c2bx, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2bm),
     # item 190: byte-identical twin of conv2d_masked, so the warm/cold A/B is one invocation.
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
@@ -2210,6 +2215,40 @@ LANES = {
             // GEMM is a disproportionate offender and items 170/172 should aim there.
             "conv2d_big_masked_train",
             Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, true)),
+        ),
+        (
+            // `frankentorch-hi9r6`: the two lanes above with the dinput BLOCKING toggled OFF, so
+            // each pair differs in exactly one thing and both halves sample the same host minute.
+            //
+            // The lever: the generic backward's `dpadded` was `dgemm(flat, out_ch, patch_width)`
+            // into a `flat x patch_width` panel — 37.7 MB here — that `conv2d_col2im_f64` read
+            // once and dropped. It is now blocked on `m` into an L2-resident buffer and scattered
+            // per block, inside ONE parallel region over the batch image. NEGATIVE_EVIDENCE item
+            // 117 reverted the conv3d version of this at 1.7x SLOWER because it fragmented the
+            // fork/join; 117c's retry predicate — "a design that keeps ONE wide parallel region" —
+            // is what the image-parallel form and its `batch >= current_num_threads()` gate are
+            // for, and this pair is what says whether it worked.
+            //
+            // Item 25's rule is why this is a toggle and not a second binary. The two paths are
+            // BIT-IDENTICAL (`conv2d_dinput_panel_legacy_toggle_selects_a_bit_identical_path`),
+            // so the pair can move time and cannot move a number — and PyTorch runs the SAME code
+            // under both names, making PT(panel)/PT(base) a free control that must come out ~1.0.
+            "conv2d_big_masked_panel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+                let sample = timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false);
+                ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous);
+                sample
+            }),
+        ),
+        (
+            "conv2d_big_masked_train_panel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+                let sample = timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, true);
+                ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous);
+                sample
+            }),
         ),
         (
             // item 209: the SUMMED route, sized so our arm lands near 35 ms. `conv2d_big` reaches

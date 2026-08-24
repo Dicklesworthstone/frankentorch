@@ -305,20 +305,44 @@ mod tests {
         );
     }
 
-    /// The entry point must be safe to call repeatedly and after rayon is already running. This
-    /// test binary uses rayon elsewhere, so in practice it exercises the losing-the-race path.
+    /// The entry point must be safe to call repeatedly and after rayon is already running.
+    ///
+    /// THIS TEST USED TO DEPEND ON LOSING A RACE, AND WAS FIXED — `frankentorch-hi9r6`. It
+    /// asserted `discriminant(first) == discriminant(second)`, and its own doc comment explained
+    /// why that held: "this test binary uses rayon elsewhere, so in practice it exercises the
+    /// losing-the-race path". That is the defect, not the justification. `build_global` may be
+    /// called once per process, so the FIRST call returns `Configured` when it wins that race and
+    /// `AlreadyInitialized` when some other test touched rayon first; the second call always
+    /// returns `AlreadyInitialized`. The two discriminants therefore agree **only when the first
+    /// call also lost** — which is decided by libtest's scheduling, not by anything in
+    /// `configure_global_pool`.
+    ///
+    /// DEMONSTRATED, not argued: adding two unrelated `conv2d` tests to this crate turned it red
+    /// with `configure_global_pool` untouched — 704 passed with them filtered out, 705 passed and
+    /// this one failed with them present, reproducibly across three runs on two rch workers. A
+    /// verdict that moves while the code under test does not is a broken gate.
+    ///
+    /// WHAT IT ASSERTS NOW is the invariant that is actually true and is what the name promises:
+    /// whoever won, the pool is running by the time the second call returns, so the second call
+    /// must be a NO-OP. That is strictly stronger where it matters — a `configure_global_pool`
+    /// that rebuilt or reconfigured an existing pool would fail this and passed the old form —
+    /// and it no longer has an opinion about who initialised rayon first.
     #[test]
     fn configure_is_idempotent_and_never_panics() {
         let first = configure_global_pool();
         let second = configure_global_pool();
-        assert_eq!(
-            std::mem::discriminant(&first),
-            std::mem::discriminant(&second),
-            "two calls with the same environment must agree on what happened"
+        assert!(
+            !matches!(second, PoolOutcome::Configured(_)),
+            "the pool is running after the first call, so the second must not build one: \
+             first {first:?}, second {second:?}"
         );
         assert!(
             !matches!(first, PoolOutcome::Invalid(_)),
             "the test environment sets no width, so nothing should be invalid: {first:?}"
+        );
+        assert!(
+            !matches!(second, PoolOutcome::Invalid(_)),
+            "the test environment sets no width, so nothing should be invalid: {second:?}"
         );
     }
 }
