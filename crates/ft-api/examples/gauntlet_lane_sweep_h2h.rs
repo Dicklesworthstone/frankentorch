@@ -1553,6 +1553,10 @@ LANES = {
     # control that prices the squaring itself.
     "avg_pool2d_dense": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))**2),
     "max_pool3d_dense": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))**2),
+    # frankentorch-mdsmm: this is the buffer-pool-off control on the SAME non-uniform
+    # loss route as max_pool3d_dense. Keep the square in the Python callable because
+    # the shared loop only adds the final sum().backward().
+    "max_pool3d_nopool_dense": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))**2),
     "max_pool1d_dense": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # frankentorch-68pwz item 103c: the DENSE-route twin. The board's other group_norm
@@ -1980,6 +1984,23 @@ LANES = {
                     s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
                         .expect("max_pool3d")
                 })
+            }),
+        ),
+        (
+            // `max_pool3d_nopool` above only prices the buffer pool under the scalar
+            // sum-shortcut. This twin uses `sum(out*out)`, so `try_max_pool3d_sum_shortcut`
+            // declines and the buffer-pool control is visible on the backward route training
+            // actually reaches. The Python registration squares too, keeping both arms on the
+            // same loss and making PT(nopool_dense)/PT(dense) the incumbent control.
+            "max_pool3d_nopool_dense",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op_sq(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
+                    s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+                        .expect("max_pool3d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
             }),
         ),
         (
