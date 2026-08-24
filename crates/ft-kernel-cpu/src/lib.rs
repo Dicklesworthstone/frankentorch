@@ -2816,6 +2816,52 @@ fn pool_output_zeroed() -> bool {
 static CONV2D_ONES_SCATTER_LEGACY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Select the pre-direct-dinput `dpanel` + `col2im` route for the GENERIC conv2d backward.
+///
+/// `frankentorch-hi9r6`. The generic (non-all-ones) `dpadded` used to be built as
+/// `dgemm(flat, out_ch, patch_width)` into a `flat x patch_width` panel — **37.7 MB at the
+/// `conv2d_big_masked` shape** — which `conv2d_col2im_f64` then read once and dropped.
+/// `conv2d_backward_dinput_direct_f64` computes the same values with no panel at all.
+///
+/// The toggle exists for the same reason `set_conv2d_ones_scatter_legacy` and
+/// `set_pool_output_zeroed` do — item 25's rule: a cross-binary comparison cannot attribute a
+/// few percent to any one change, because the two halves never sample the same host minute.
+/// Both arms run inside ONE invocation, interleaved, against ONE live incumbent.
+///
+/// The two paths are BIT-IDENTICAL, asserted by
+/// `conv2d_dinput_direct_matches_panel_col2im_bitwise` over eight shapes, so the toggle can move
+/// time and cannot move a number.
+static CONV2D_DINPUT_PANEL_LEGACY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is the pre-direct `dpanel` + `col2im` dinput route selected?
+#[must_use]
+pub fn conv2d_dinput_panel_legacy() -> bool {
+    CONV2D_DINPUT_PANEL_LEGACY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Select the legacy panel dinput route, returning the previous setting so a paired lane can
+/// restore it.
+pub fn set_conv2d_dinput_panel_legacy(legacy: bool) -> bool {
+    CONV2D_DINPUT_PANEL_LEGACY.swap(legacy, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Does the blocked, image-parallel dinput route run at this `batch`?
+///
+/// `frankentorch-hi9r6`. The blocked route's ONLY parallel axis is the batch image, so below
+/// `batch == current_num_threads()` it cannot fill the pool while the legacy route's GEMM splits
+/// `flat` rows across all of it. NEGATIVE_EVIDENCE item 117 is the measured record of what
+/// happens when that trade is made blind: 1.7x SLOWER on conv3d, from "trading parallel width
+/// for working-set size on a machine with 64 cores". The gate is that trade refused wherever it
+/// is not free, and it is a property of the decomposition rather than a shape fitted to a lane.
+///
+/// Reads the pool width at CALL time, not once: `RAYON_NUM_THREADS` decides it and this
+/// campaign's own board runs the same binary at 8, 16 and 64.
+#[must_use]
+fn conv2d_dinput_blocked_selected(batch: usize) -> bool {
+    !conv2d_dinput_panel_legacy() && batch >= rayon::current_num_threads()
+}
+
 /// Is the pre-item-174 accumulate-scatter selected?
 #[must_use]
 pub fn conv2d_ones_scatter_legacy() -> bool {
@@ -8182,6 +8228,219 @@ pub fn conv2d_col2im_f64(
     dpadded
 }
 
+/// `dpadded` for the GENERIC conv2d backward, built straight from `dout` with NO `dpanel`.
+///
+/// `frankentorch-hi9r6`. The route this replaces is
+/// `dgemm(flat, out_ch, patch_width) -> dpanel -> conv2d_col2im_f64(dpanel)`. At the
+/// `conv2d_big_masked` shape (`batch` 16, `in_ch` = `out_ch` = 32, 32x32, k=3, pad 1) `dpanel` is
+/// `16384 x 288` f64 = **37.7 MB**, written once by the GEMM and read once by the scatter, to
+/// produce a `dpadded` of 4.7 MB. That is a ~75 MB DRAM round trip carrying an intermediate 8x
+/// larger than the result.
+///
+/// WHY THIS SHAPE OF LEVER, AND WHY IT IS NOT ITEM 114. NEGATIVE_EVIDENCE item 117 reverted a
+/// conv3d fusion that *blocked* the same GEMM and interleaved it with the scatter: it cost 1.7x
+/// because sixteen narrow `dgemm` calls plus a `in_ch`-wide scatter replaced one wide parallel
+/// region, and item 117b's diagnosis is that it **moved** work rather than removing it. Its
+/// retry predicate is stated there: "do not re-fuse this without a design that keeps ONE wide
+/// parallel region".
+///
+/// This keeps one region and removes work. The parallel axis is the `(batch, in_ch)` PLANE —
+/// `batch * in_ch` tasks, 512 at the scored shape, against `col2im`'s 16 batch chunks at
+/// `batch >= COL2IM_PLANE_MAX_BATCH` — and there is no `dpanel` to lose locality on, which is
+/// what made a per-plane `col2im` lose at `batch >= 8` (`kgs4-col2im-plane`). The MAC count is
+/// unchanged: `patch_count * out_ch * kh * kw` per plane is exactly the GEMM's share of that
+/// plane. What disappears is the 37.7 MB write, the 37.7 MB read, and — on a dinput-only
+/// backward — the `dout_flat` gather that fed the GEMM.
+///
+/// # The fully-direct form was tried first and is REFUTED on parity, not on speed
+///
+/// The obvious version of this — drop the GEMM entirely and accumulate
+/// `sum_co dout[co,pc] * w[co,c,kr,kc]` in a scalar loop — is **not bit-exact**, and the test
+/// below is what said so: it disagreed with the panel route by 1-2 ULP at the very first shape.
+/// The cause is not reassociation. `matrixmultiply` selects `KernelFmaAvx2` at RUNTIME on this
+/// CPU (`dgemm_kernel.rs`: `kernel_target_fma`, `#[target_feature(enable="fma")]`), so every
+/// `ab += a * b` in its micro-kernel contracts to a fused multiply-add and never rounds the
+/// product. A scalar `*acc += d * w` rounds twice and cannot match it. Reaching FMA from this
+/// crate needs `#[target_feature]`, whose call sites are `unsafe`, and this crate is
+/// `#![forbid(unsafe_code)]`; `f64::mul_add` without the feature lowers to a libm call per MAC,
+/// which is not a kernel. The FMA route is also the *more* accurate one, so the difference moves
+/// us away from PyTorch (which is likewise FMA), not toward it.
+///
+/// **So the `out_ch` reduction stays inside `dgemm`.** What this changes is only where its
+/// output goes.
+///
+/// # The design, and why it is not item 114
+///
+/// Split the GEMM on `m` — `DPANEL_BLOCK_ROWS` patch rows at a time into a small reusable
+/// buffer — and scatter each block before computing the next. Peak buffer per task drops from
+/// `flat x patch_width` (37.7 MB) to `DPANEL_BLOCK_ROWS x patch_width` (590 KB, L2-resident).
+///
+/// Item 117 reverted exactly this decomposition on conv3d at a cost of 1.7x, and its diagnosis
+/// is the design constraint here: "One `dgemm(flat=4096, ..)` is a single wide parallel region.
+/// Sixteen sequential `dgemm(256, ..)` calls are sixteen narrow ones, and between them the
+/// scatter runs with only `in_ch = 32` tasks... **I traded parallel width for working-set size**".
+/// Its retry predicate is stated in 117c: "do not re-fuse this without a design that keeps ONE
+/// wide parallel region".
+///
+/// This keeps one. The parallel axis is the BATCH IMAGE and nothing inside it forks: each task
+/// owns `dpadded`'s `b`-th chunk, runs its own SERIAL `dgemm` per block (`m * k * n` per call is
+/// below every `gemm` parallel gate by construction, so no nested region opens), and scatters
+/// into memory no other task touches. There is one fork/join for the whole kernel, where item
+/// 114 had `batch * blocks + 1`.
+///
+/// It is gated on `batch >= rayon::current_num_threads()` for the same reason. Below that the
+/// image axis cannot fill the pool and this would repeat item 117's mistake exactly, so the
+/// legacy route — whose GEMM splits rows across the whole pool — stays selected. That gate is a
+/// property of the decomposition, not a shape fitted to one lane.
+///
+/// # Bit-exactness, on both axes, and both are item 114's arguments
+///
+/// **The product splits on `m`.** `C[i][:]` depends solely on `A[i][:]`, so computing rows
+/// `[t, t+B)` in their own call is the same arithmetic however the rows are grouped; the
+/// reduction is over `out_ch` and is never divided. Item 114c proved this for conv3d with a
+/// bitwise test that passed at four shapes — the part of item 114 that was correct, and the
+/// reason item 117 reverted it for being SLOW rather than for being wrong.
+///
+/// **The scatter keeps `pc` ascending.** The loop nest below is `conv2d_col2im_f64`'s per-batch
+/// path restricted to one image and to one `pc` range; blocks run in ascending `pc` and the
+/// `(c, kr, kc)` order inside a patch is copied unchanged, so every output element receives the
+/// identical sequence of `+=`.
+///
+/// `conv2d_dinput_direct_matches_panel_col2im_bitwise` asserts both with `to_bits()` at eight
+/// shapes, including a ragged tail, a range smaller than one block, strides that leave interior
+/// gaps unwritten, and both sides of `COL2IM_PLANE_MAX_BATCH`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_backward_dinput_direct_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f64> {
+    let patch_width = in_ch * kh * kw;
+    conv2d_backward_dinput_blocked_rows_f64(
+        dout_flat,
+        weight_flat,
+        batch,
+        in_ch,
+        ph,
+        pw,
+        kh,
+        kw,
+        oh,
+        ow,
+        sh,
+        sw,
+        out_ch,
+        conv2d_dinput_block_rows(patch_width),
+    )
+}
+
+/// Patch rows per `dgemm` call, from a BYTE budget rather than a fixed row count.
+///
+/// `frankentorch-hi9r6`. A fixed 256 rows is a fixed row count but not a fixed footprint: the
+/// block is `rows * patch_width` f64 PER TASK, and the tasks are concurrent. At the conv2d shapes
+/// this campaign measures (`patch_width` 288) that is 590 KB each; at `in_ch = 512, k = 3`
+/// (`patch_width` 4608) it would be 9.4 MB each, and the gate admits this route only when
+/// `batch >= current_num_threads()`, so a 64-wide pool would hold ~604 MB of scratch. Budgeting
+/// bytes bounds that at any shape.
+///
+/// The budget is 576 KiB because that is exactly 256 rows at `patch_width = 288` — the
+/// configuration every row on this bead was measured under. Sizing it to preserve the measured
+/// blocking is deliberate: a policy that quietly re-blocked the lane would invalidate those rows.
+///
+/// ANY value here is bit-identical (the `m`-split argument in
+/// `conv2d_backward_dinput_direct_f64`), which is exactly why this must not be trusted to
+/// judgement alone — item 117c's warning about item 114's identical constant is that a constant
+/// which changes only performance is not free, it is untested.
+/// `conv2d_dinput_blocking_is_bit_identical_at_every_block_size` drives the blocked kernel at
+/// block sizes 1, 2, 7, 256 and one larger than `patch_count` and asserts all of them agree with
+/// the panel route bit for bit, so the policy can be retuned without re-proving parity.
+#[must_use]
+fn conv2d_dinput_block_rows(patch_width: usize) -> usize {
+    const BUDGET_BYTES: usize = 576 * 1024;
+    if patch_width == 0 {
+        return 1;
+    }
+    (BUDGET_BYTES / (patch_width * size_of::<f64>())).max(1)
+}
+
+/// [`conv2d_backward_dinput_direct_f64`] with the block width supplied, so a test can drive it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_dinput_blocked_rows_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let block_rows = block_rows.max(1);
+    // Positions no window reaches must stay `+0.0`, exactly as in `conv2d_col2im_f64` — this
+    // accumulates and so cannot be built uninitialised (item 165d).
+    let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
+    if batch == 0 || in_ch == 0 || out_ch == 0 || patch_count == 0 || patch_width == 0 {
+        return dpadded;
+    }
+    dpadded
+        .par_chunks_mut(in_ch * ph * pw)
+        .enumerate()
+        .for_each(|(b, dpb)| {
+            let mut block = vec![0.0f64; block_rows.min(patch_count) * patch_width];
+            let mut start = 0usize;
+            while start < patch_count {
+                let rows = block_rows.min(patch_count - start);
+                let a = &dout_flat
+                    [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
+                let dp = &mut block[..rows * patch_width];
+                gemm::dgemm(rows, out_ch, patch_width, a, weight_flat, dp);
+                for r in 0..rows {
+                    let pc = start + r;
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let prow = r * patch_width;
+                    for c in 0..in_ch {
+                        let ch_off = c * ph * pw;
+                        let pch = c * kh * kw;
+                        for kr in 0..kh {
+                            let irow = ch_off + (base_h + kr) * pw + base_w;
+                            let prow_off = prow + pch + kr * kw;
+                            for kc in 0..kw {
+                                dpb[irow + kc] += dp[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+                start += rows;
+            }
+        });
+    dpadded
+}
+
+// The block width now comes from `conv2d_dinput_block_rows`, a byte budget, rather than from a
+// fixed row constant — see that function for why a fixed row count is not a fixed footprint.
+
 /// f32 mirror of [`conv2d_col2im_f64`].
 #[allow(clippy::too_many_arguments)]
 #[must_use]
@@ -9578,6 +9837,21 @@ thread_local! {
     static CONV2D_DPANEL_GEMMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONV2D_ONES_DWEIGHT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn conv2d_ones_dweight_scan_count() -> usize {
+    CONV2D_ONES_DWEIGHT_SCANS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_conv2d_ones_dweight_scan_count() {
+    CONV2D_ONES_DWEIGHT_SCANS.with(|count| count.set(0));
+}
+
 /// `(dweight GEMMs, dpanel GEMMs)` executed by the MASKED conv2d backwards on THIS THREAD since
 /// the last reset.
 ///
@@ -9681,12 +9955,32 @@ pub fn conv2d_backward_masked_f64(
     // `conv2d_ones_dout_route`, not a local copy of the guards — item 200. The comment this
     // replaces said the two functions "cannot disagree" while they each carried their own copy,
     // which is the assurance a second copy is least able to give.
-    let ones_route = !dout.is_empty()
-        && conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw).is_some()
-        && dout_is_all_ones_f64(dout);
+    let ones_route = (!dout.is_empty() && dout_is_all_ones_f64(dout))
+        .then(|| conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw))
+        .flatten();
     let both = output_mask[0] && output_mask[1];
 
-    if ones_route || both {
+    // Unlike the generic route, the 3x3 all-ones adjoint has no shared panel: its dweight scan
+    // and dpadded GEMM/scatter are independent. Preserve the existing full adjoint for callers
+    // requesting both, but do not compute a frozen weight's discarded scan on the summed route.
+    if let Some(ConvOnesRoute::ThreeByThreeStride1) = ones_route
+        && !both
+    {
+        return conv2d_backward_3x3_stride1_ones_dout_masked_f64(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            oh,
+            ow,
+            out_ch,
+            output_mask,
+        );
+    }
+
+    if ones_route.is_some() || both {
         let (dpadded, dweight, dbias) = conv2d_backward_f64(
             dout,
             padded,
@@ -9733,6 +10027,26 @@ pub fn conv2d_backward_masked_f64(
     });
 
     let dpadded = output_mask[0].then(|| {
+        // Blocked, image-parallel dinput — `frankentorch-hi9r6`. See
+        // `conv2d_backward_dinput_direct_f64` for why this is not item 114's reverted fusion,
+        // for the `m`-split and scatter-order bit-exactness arguments, and for the gate.
+        if conv2d_dinput_blocked_selected(batch) {
+            return conv2d_backward_dinput_direct_f64(
+                &dout_flat,
+                weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+            );
+        }
         let dpanel = build_pool_output(flat * patch_width, |dp: &mut [f64]| {
             CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
             gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
@@ -9922,11 +10236,32 @@ pub fn conv2d_backward_f64(
     // fully overwritten (every chunk is exactly `out_ch` long and the inner loop writes all of
     // them), so it carries the same dead zeroing. It is ~9x smaller than `dpanel` and folding it
     // in would blur which buffer paid, so this change moves ONE buffer and item 151 prices it.
-    let dpanel = build_pool_output(flat * patch_width, |dp| {
-        CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
-        gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
-    });
-    let dpadded = conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    // Blocked, image-parallel dinput — `frankentorch-hi9r6`. This entry is the `both` route
+    // (dinput AND dweight), so `dout_flat` and `panel` are still built for `dweight` above; what
+    // goes away here is the SECOND panel-shaped buffer and its DRAM round trip.
+    let dpadded = if conv2d_dinput_blocked_selected(batch) {
+        conv2d_backward_dinput_direct_f64(
+            &dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
+        )
+    } else {
+        let dpanel = build_pool_output(flat * patch_width, |dp| {
+            CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
+            gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dp);
+        });
+        conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
+    };
     let dbias = if has_bias {
         // Parallel over out_ch: each channel's bias gradient is an independent
         // reduction with the same (n outer, p inner) summation order, so the
@@ -10689,92 +11024,131 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let (dpadded, dweight, dbias) = conv2d_backward_3x3_stride1_ones_dout_masked_f64(
+        padded,
+        weight_flat,
+        batch,
+        in_ch,
+        ph,
+        pw,
+        oh,
+        ow,
+        out_ch,
+        [true, true, has_bias],
+    );
+    match (dpadded, dweight) {
+        (Some(dpadded), Some(dweight)) => (dpadded, dweight, dbias),
+        _ => unreachable!("the full 3x3 all-ones adjoint requests both gradients"),
+    }
+}
+
+/// Mask-aware 3x3 all-ones conv2d adjoint.
+///
+/// The weight scan and input-gradient GEMM/scatter are independent, so a frozen weight must not
+/// make the summed route compute and discard `dweight`. Each selected half preserves the exact
+/// operation order of [`conv2d_backward_3x3_stride1_ones_dout_f64`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_3x3_stride1_ones_dout_masked_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
     let kh = 3usize;
     let kw = 3usize;
     let patch_width = in_ch * kh * kw;
     let flat = batch * oh * ow;
 
-    let mut dweight_row = vec![0.0f64; patch_width];
-    dweight_row
-        .par_chunks_mut(kh * kw)
-        .enumerate()
-        .for_each(|(c, dwc)| {
-            for kr in 0..kh {
-                for kc in 0..kw {
-                    // FOLD ON THE GEMM's OWN BOUNDARIES (frankentorch-ikw6q). This
-                    // reduction replaces `dgemm(1, flat, patch_width, ones, panel)`, and
-                    // `dgemm` delegates to matrixmultiply, which BLOCKS k at `DGEMM_KC`.
-                    // A single ascending chain over `flat` is a DIFFERENT summation order
-                    // and diverges from the panel route once `flat > DGEMM_KC` — 104 of
-                    // 108 dweight entries differed at oh=ow=64. Blocking here reproduces
-                    // the GEMM's order exactly, so the "bit-exact vs panel+GEMM" claim
-                    // this path shipped with in 2026-07-05 becomes true rather than being
-                    // downgraded to a tolerance. `folded` keeps the FIRST block assigned
-                    // rather than added into 0.0, so a `-0.0` first block is not
-                    // canonicalised to `+0.0` (frankentorch-dtyiz).
-                    let mut total = 0.0f64;
-                    let mut block = 0.0f64;
-                    let mut in_block = 0usize;
-                    let mut folded = false;
-                    for n in 0..batch {
-                        let ch_off = (n * in_ch + c) * ph * pw;
-                        for oy in 0..oh {
-                            let irow = ch_off + (oy + kr) * pw + kc;
-                            for ox in 0..ow {
-                                block += padded[irow + ox];
-                                in_block += 1;
-                                if in_block == DGEMM_KC {
-                                    if folded {
-                                        total += block;
-                                    } else {
-                                        total = block;
-                                        folded = true;
+    let dweight = output_mask[1].then(|| {
+        #[cfg(test)]
+        CONV2D_ONES_DWEIGHT_SCANS.with(|count| count.set(count.get() + 1));
+        let mut dweight_row = vec![0.0f64; patch_width];
+        dweight_row
+            .par_chunks_mut(kh * kw)
+            .enumerate()
+            .for_each(|(c, dwc)| {
+                for kr in 0..kh {
+                    for kc in 0..kw {
+                        // FOLD ON THE GEMM's OWN BOUNDARIES (frankentorch-ikw6q). This
+                        // reduction replaces `dgemm(1, flat, patch_width, ones, panel)`, and
+                        // `dgemm` delegates to matrixmultiply, which BLOCKS k at `DGEMM_KC`.
+                        // A single ascending chain over `flat` is a DIFFERENT summation order
+                        // and diverges from the panel route once `flat > DGEMM_KC` — 104 of
+                        // 108 dweight entries differed at oh=ow=64. Blocking here reproduces
+                        // the GEMM's order exactly, so the "bit-exact vs panel+GEMM" claim
+                        // this path shipped with in 2026-07-05 becomes true rather than being
+                        // downgraded to a tolerance. `folded` keeps the FIRST block assigned
+                        // rather than added into 0.0, so a `-0.0` first block is not
+                        // canonicalised to `+0.0` (frankentorch-dtyiz).
+                        let mut total = 0.0f64;
+                        let mut block = 0.0f64;
+                        let mut in_block = 0usize;
+                        let mut folded = false;
+                        for n in 0..batch {
+                            let ch_off = (n * in_ch + c) * ph * pw;
+                            for oy in 0..oh {
+                                let irow = ch_off + (oy + kr) * pw + kc;
+                                for ox in 0..ow {
+                                    block += padded[irow + ox];
+                                    in_block += 1;
+                                    if in_block == DGEMM_KC {
+                                        if folded {
+                                            total += block;
+                                        } else {
+                                            total = block;
+                                            folded = true;
+                                        }
+                                        block = 0.0;
+                                        in_block = 0;
                                     }
-                                    block = 0.0;
-                                    in_block = 0;
                                 }
                             }
                         }
-                    }
-                    if in_block > 0 {
-                        if folded {
-                            total += block;
-                        } else {
-                            total = block;
+                        if in_block > 0 {
+                            if folded {
+                                total += block;
+                            } else {
+                                total = block;
+                            }
                         }
+                        dwc[kr * kw + kc] = total;
                     }
-                    dwc[kr * kw + kc] = total;
                 }
-            }
-        });
+            });
 
-    let mut dweight = vec![0.0f64; out_ch * patch_width];
-    dweight
-        .par_chunks_mut(patch_width)
-        .for_each(|row| row.copy_from_slice(&dweight_row));
+        let mut dweight = vec![0.0f64; out_ch * patch_width];
+        dweight
+            .par_chunks_mut(patch_width)
+            .for_each(|row| row.copy_from_slice(&dweight_row));
+        dweight
+    });
 
     // frankentorch-ikw6q, SECOND defect — see the height-1 path for the full reasoning.
     // The dpanel GEMM's k is `out_ch`, not `flat`, and a hand-rolled chain over `oc`
     // diverged from it above 256 channels. One `dgemm` row is bit-identical to every row
     // the generic route produces when dout is all ones.
-    let ones_out = vec![1.0f64; out_ch];
-    let mut dpanel_row = vec![0.0f64; patch_width];
-    gemm::dgemm(
-        1,
-        out_ch,
-        patch_width,
-        &ones_out,
-        weight_flat,
-        &mut dpanel_row,
-    );
+    let dpadded = output_mask[0].then(|| {
+        let ones_out = vec![1.0f64; out_ch];
+        let mut dpanel_row = vec![0.0f64; patch_width];
+        gemm::dgemm(
+            1,
+            out_ch,
+            patch_width,
+            &ones_out,
+            weight_flat,
+            &mut dpanel_row,
+        );
+        conv2d_ones_dout_scatter_dpadded_f64(&dpanel_row, batch, in_ch, ph, pw, oh, ow)
+    });
 
-    let dpadded = conv2d_ones_dout_scatter_dpadded_f64(&dpanel_row, batch, in_ch, ph, pw, oh, ow);
-
-    let dbias = if has_bias {
-        Some(vec![flat as f64; out_ch])
-    } else {
-        None
-    };
+    let dbias = output_mask[2].then(|| vec![flat as f64; out_ch]);
     (dpadded, dweight, dbias)
 }
 
@@ -43949,6 +44323,253 @@ mod tests {
     }
 
     #[test]
+    fn conv2d_dinput_direct_matches_panel_col2im_bitwise() {
+        // `frankentorch-hi9r6`. `conv2d_backward_dinput_direct_f64` claims to produce the SAME
+        // BITS as `dgemm -> dpanel -> conv2d_col2im_f64` while never building the panel. Two
+        // independent things have to hold for that: the scatter must add in the same order (it
+        // is col2im's plane loop, copied), and the `out_ch` reduction must associate the same
+        // way as a single-k-block `dgemm` micro-kernel (ascending `co`, one accumulator per
+        // tap). Neither is asserted by reading — this compares `to_bits()`.
+        //
+        // The shape list is chosen for the ways this can break rather than for coverage:
+        //   * both sides of `COL2IM_PLANE_MAX_BATCH`, because `conv2d_col2im_f64` runs two
+        //     different loop nests either side of it and the direct route must match BOTH;
+        //   * `sh`/`sw` > 1, where windows stop tiling the plane and interior positions are
+        //     never written — those must stay `+0.0`, which is why `dpadded` is zero-filled;
+        //   * `sw > kw`, which leaves gaps a fully-overwriting kernel would corrupt;
+        //   * an asymmetric kernel and a `kh == kw == 1` degenerate, where `tap_count` is 1 and
+        //     the accumulator vector has no width to hide a mis-indexed tap;
+        //   * `out_ch == 1`, a rank-1 reduction where any reassociation is invisible, paired
+        //     with `out_ch == 33` — an odd count that straddles a SIMD width, where it is not.
+        //
+        // Values include a negative zero and both signs, so a reduction that canonicalised
+        // `-0.0` (the defect `frankentorch-dtyiz` found in the gradient accumulators) would
+        // show up here as a bit mismatch rather than as an equal-valued pass.
+        // Each row is [batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]. An array rather than a
+        // 9-tuple so it destructures in the loop pattern and still fits one line per case.
+        //              batch in_ch out_ch  ph  pw  kh  kw  sh  sw
+        let shapes: [[usize; 9]; 10] = [
+            // The two that exercise BLOCKING itself. Everything below them has a patch_count
+            // under `DPANEL_BLOCK_ROWS` and so runs as a single partial block, which would leave
+            // a dropped or double-counted tail — the most plausible failure of an m-split —
+            // completely untested. patch_count 1444 = 5 full blocks + 164; 512 = exactly 2.
+            [2, 5, 3, 40, 40, 3, 3, 1, 1], // 6 blocks, ragged tail
+            [2, 3, 2, 34, 18, 3, 3, 1, 1], // 512 rows: exact block multiple, no tail
+            [2, 5, 3, 9, 8, 3, 3, 1, 1],   // below the plane gate, overlapping windows
+            [9, 3, 4, 7, 7, 3, 3, 1, 1],   // above the plane gate: col2im's other loop nest
+            [1, 2, 3, 11, 11, 3, 3, 2, 2], // strided: interior gaps stay +0.0
+            [2, 3, 2, 12, 12, 2, 2, 3, 3], // sw > kw: windows do not tile, tail unwritten
+            [3, 4, 1, 8, 6, 2, 3, 1, 1],   // asymmetric kernel, out_ch == 1
+            [2, 3, 33, 6, 6, 1, 1, 1, 1],  // 1x1 kernel, odd out_ch across a SIMD width
+            [1, 1, 5, 10, 7, 3, 2, 1, 2],  // in_ch == 1, mixed stride, ragged width
+            [4, 2, 2, 5, 5, 5, 5, 1, 1],   // kernel == plane: exactly one patch, well under a block
+        ];
+        for (case, &[batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]) in shapes.iter().enumerate() {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_count = oh * ow;
+            let patch_width = in_ch * kh * kw;
+            let flat = batch * patch_count;
+            let dout: Vec<f64> = (0..batch * out_ch * patch_count)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        -0.0
+                    } else {
+                        ((i % 23) as f64) * 0.037 - 0.4
+                    }
+                })
+                .collect();
+            let weight_flat: Vec<f64> = (0..out_ch * patch_width)
+                .map(|i| ((i % 19) as f64) * 0.0625 - 0.5)
+                .collect();
+
+            // Reference: the route this replaces, run end to end.
+            let dout_flat = super::conv2d_dout_flat_f64(&dout, batch, out_ch, patch_count);
+            let mut dpanel = vec![0.0f64; flat * patch_width];
+            super::gemm::dgemm(
+                flat,
+                out_ch,
+                patch_width,
+                &dout_flat,
+                &weight_flat,
+                &mut dpanel,
+            );
+            let want =
+                super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+
+            // Every block width, not just the one the byte budget happens to pick. The `m`-split
+            // argument says ANY blocking is bit-identical; that is the claim, so it is what gets
+            // asserted, and it is what lets `conv2d_dinput_block_rows` be retuned later without
+            // re-proving parity. 1 and 2 force a block per row or two; 7 gives ragged tails on
+            // every shape; `patch_count + 5` is a single oversized block with no tail at all.
+            //
+            // Called DIRECTLY, not through `conv2d_dinput_blocked_selected`: the gate is a
+            // scheduling decision about pool width and would make this assertion vacuous on any
+            // host whose thread count exceeds these small batches.
+            for block_rows in [1usize, 2, 7, 256, patch_count + 5] {
+                let got = super::conv2d_backward_dinput_blocked_rows_f64(
+                    &dout_flat,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    block_rows,
+                );
+
+                assert_eq!(got.len(), want.len(), "case {case}: dpadded length");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "case {case} element {i} at block_rows={block_rows}: direct dinput {g} \
+                         != panel+col2im {w} (shape batch={batch} in_ch={in_ch} out_ch={out_ch} \
+                         {ph}x{pw} k={kh}x{kw} s={sh}x{sw})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conv2d_dinput_block_rows_budgets_bytes_not_rows() {
+        // The whole point of the byte budget is that per-task scratch does NOT grow with
+        // `patch_width`. Assert the invariant, and pin the one value a measurement depends on.
+        assert_eq!(
+            super::conv2d_dinput_block_rows(288),
+            256,
+            "patch_width 288 must still block at 256 rows -- every conv2d row on \
+             frankentorch-hi9r6 was measured at that blocking, and a policy change that \
+             silently re-blocks the lane would invalidate them"
+        );
+        for patch_width in [1usize, 9, 45, 288, 4608, 65536] {
+            let rows = super::conv2d_dinput_block_rows(patch_width);
+            assert!(
+                rows >= 1,
+                "patch_width {patch_width}: block must have a row"
+            );
+            let bytes = rows * patch_width * size_of::<f64>();
+            assert!(
+                bytes <= 576 * 1024 || rows == 1,
+                "patch_width {patch_width}: {rows} rows is {bytes} B, over the budget; only a \
+                 single row may exceed it (a block cannot be narrower than one patch)"
+            );
+        }
+        // Degenerate input must not divide by zero.
+        assert_eq!(super::conv2d_dinput_block_rows(0), 1);
+    }
+
+    #[test]
+    fn conv2d_dinput_panel_legacy_toggle_selects_a_bit_identical_path() {
+        // The toggle is a MEASUREMENT instrument: it must move time and never a number, which is
+        // the property that lets a paired lane attribute a ratio to it. Drive the real kernel
+        // entry both ways in one process and compare bits — the same contract
+        // `conv2d_ones_dout_scatter_matches_the_accumulate_scatter_bitwise` holds for item 174's
+        // toggle. Runs the dinput-only mask (where the legacy route also builds `dout_flat`) and
+        // the both-mask (where it does not), since the two take different branches.
+        // `batch` is 128 so the `batch >= current_num_threads()` gate is open on any worker in
+        // this fleet without pinning a pool. An earlier draft pinned a one-thread
+        // `ThreadPoolBuilder` instead; that perturbed the initialisation race
+        // `pool::tests::configure_is_idempotent_and_never_panics` depends on (it passes only
+        // when it LOSES that race, as its own doc comment says) and turned that test red. The
+        // fixture is deliberately tiny in every other dimension so 128 images cost nothing.
+        let (batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw) = (128, 2, 3, 7, 6, 3, 3, 1, 1);
+        let (oh, ow) = ((ph - kh) / sh + 1, (pw - kw) / sw + 1);
+        let dout: Vec<f64> = (0..batch * out_ch * oh * ow)
+            .map(|i| ((i % 29) as f64) * 0.017 - 0.25)
+            .collect();
+        let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i % 31) as f64) * 0.011 - 0.17)
+            .collect();
+        let weight_flat: Vec<f64> = (0..out_ch * in_ch * kh * kw)
+            .map(|i| ((i % 13) as f64) * 0.125 - 0.75)
+            .collect();
+
+        // The blocked route is gated on `batch >= rayon::current_num_threads()`. If that gate is
+        // shut, both arms below take the LEGACY path and this test compares the legacy route
+        // with itself and can never fail. Assert it is open rather than assume it — a toggle
+        // test that cannot fail is worse than no test.
+        assert!(
+            super::conv2d_dinput_blocked_selected(batch),
+            "the blocked route must be selected here or this test asserts nothing \
+             (batch {batch} vs {} rayon threads)",
+            rayon::current_num_threads()
+        );
+        for mask in [[true, false, false], [true, true, false]] {
+            let previous = super::set_conv2d_dinput_panel_legacy(false);
+            let (direct, direct_w, _) = super::conv2d_backward_masked_f64(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                mask,
+            );
+            super::set_conv2d_dinput_panel_legacy(true);
+            let (legacy, legacy_w, _) = super::conv2d_backward_masked_f64(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                mask,
+            );
+            super::set_conv2d_dinput_panel_legacy(previous);
+
+            let direct = direct.expect("dinput requested");
+            let legacy = legacy.expect("dinput requested");
+            assert_eq!(direct.len(), legacy.len(), "mask {mask:?}: dinput length");
+            for (i, (d, l)) in direct.iter().zip(legacy.iter()).enumerate() {
+                assert_eq!(
+                    d.to_bits(),
+                    l.to_bits(),
+                    "mask {mask:?} dinput element {i}: direct {d} != legacy {l}"
+                );
+            }
+            // The weight gradient must be untouched by a dinput-route toggle — if it moves, the
+            // two arms are not measuring one change.
+            match (direct_w, legacy_w) {
+                (Some(d), Some(l)) => {
+                    for (i, (d, l)) in d.iter().zip(l.iter()).enumerate() {
+                        assert_eq!(
+                            d.to_bits(),
+                            l.to_bits(),
+                            "mask {mask:?} dweight element {i}: the dinput toggle moved dweight"
+                        );
+                    }
+                }
+                (None, None) => {}
+                _ => panic!("mask {mask:?}: dweight presence disagreed across the toggle"),
+            }
+        }
+    }
+
+    #[test]
     fn conv2d_col2im_small_batch_per_plane_matches_per_batch_bit_exact() {
         // batch=2 < COL2IM_PLANE_MAX_BATCH -> the per-(batch,channel)-plane path
         // fires. Lock it byte-for-byte against a serial per-batch reference (the
@@ -47315,6 +47936,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The all-ones 3x3 route must honor the mask before starting its independent dweight scan.
+    ///
+    /// The ordinary masked-gradient test above establishes values and `None` presence, but an old
+    /// implementation could still compute then discard dweight. This test makes that production
+    /// cost observable: the frozen-weight summed route reaches the specialisation without scanning
+    /// dweight, while requesting dweight performs exactly one scan.
+    #[test]
+    fn conv2d_all_ones_mask_skips_the_discarded_dweight_scan() {
+        let (batch, in_ch, ph, pw) = (2usize, 3usize, 9usize, 10usize);
+        let (oh, ow, out_ch) = (7usize, 8usize, 4usize);
+        let patch_width = in_ch * 3 * 3;
+        let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i * 17 % 31) as f64 - 15.0) / 1024.0)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 37) as f64 - 18.0) / 2048.0)
+            .collect();
+        let dout = vec![1.0f64; batch * out_ch * oh * ow];
+
+        super::reset_conv2d_ones_dweight_scan_count();
+        let (dpadded, dweight, dbias) = super::conv2d_backward_masked_f64(
+            &dout,
+            &padded,
+            &weight,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            3,
+            3,
+            oh,
+            ow,
+            1,
+            1,
+            out_ch,
+            [true, false, false],
+        );
+        assert!(dpadded.is_some(), "the requested input gradient is present");
+        assert!(dweight.is_none(), "the frozen weight has no gradient");
+        assert!(dbias.is_none(), "no bias gradient was requested");
+        assert_eq!(
+            super::conv2d_ones_dweight_scan_count(),
+            0,
+            "the frozen-weight all-ones route scanned dweight before discarding it"
+        );
+
+        super::reset_conv2d_ones_dweight_scan_count();
+        let (_, dweight, _) = super::conv2d_backward_masked_f64(
+            &dout,
+            &padded,
+            &weight,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            3,
+            3,
+            oh,
+            ow,
+            1,
+            1,
+            out_ch,
+            [false, true, false],
+        );
+        assert!(
+            dweight.is_some(),
+            "the requested weight gradient is present"
+        );
+        assert_eq!(
+            super::conv2d_ones_dweight_scan_count(),
+            1,
+            "the requested all-ones dweight scan did not execute exactly once"
+        );
     }
 
     /// frankentorch-hi9r6 item 175: conv2d's forward and backward must return BIT-IDENTICAL

@@ -16,7 +16,7 @@
 //!
 //! # What it measures
 //!
-//! The h2h lane times `forward + loss_sum + backward` as ONE region, which is the right contract
+//! The h2h lane times `forward + mask_and_sum + backward` as ONE region, which is the right contract
 //! against an incumbent but useless for attribution. Here the same three calls are timed separately,
 //! plus the two the lane keeps outside its timer (leaf construction, gradient read-back) so nothing
 //! is hidden by the choice of region.
@@ -73,6 +73,14 @@ fn main() {
         .collect();
     let x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
     let w32: Vec<f32> = w64.iter().map(|&v| v as f32).collect();
+    // A plain sum supplies an all-ones adjoint and selects conv2d's shortcut.
+    // The board's real training route is `sum(conv(x, w) * mask)`, whose
+    // elementwise, non-uniform mask forces the generic backward.  Build it once
+    // outside every timed phase, exactly like the H2H lane does.
+    let mask64: Vec<f64> = (0..batch * CO * H * W)
+        .map(|i| 0.125 + (i % 29) as f64 / 29.0)
+        .collect();
+    let mask32: Vec<f32> = mask64.iter().map(|&v| v as f32).collect();
 
     println!(
         "conv2d SESSION phase split, f32 vs f64 (frankentorch-qif1n)\n  \
@@ -81,8 +89,8 @@ fn main() {
         rayon::current_num_threads()
     );
 
-    let _ = run_f32(batch, &x32, &w32);
-    let _ = run_f64(batch, &x64, &w64);
+    let _ = run_f32(batch, &x32, &w32, &mask32);
+    let _ = run_f64(batch, &x64, &w64, &mask64);
     sentinel(batch, &x32, &w32, &x64, &w64);
     sentinel(batch, &x32, &w32, &x64, &w64);
     pad_gate_ab(batch, &x32, reps);
@@ -100,18 +108,18 @@ fn main() {
     let mut pooled: Vec<f64> = Vec::with_capacity(reps * 2);
     let mut unpooled: Vec<f64> = Vec::with_capacity(reps * 2);
     for _ in 0..reps {
-        p32.push(run_f32(batch, &x32, &w32));
-        p64.push(run_f64(batch, &x64, &w64));
-        p64.push(run_f64(batch, &x64, &w64));
-        p32.push(run_f32(batch, &x32, &w32));
+        p32.push(run_f32(batch, &x32, &w32, &mask32));
+        p64.push(run_f64(batch, &x64, &w64, &mask64));
+        p64.push(run_f64(batch, &x64, &w64, &mask64));
+        p32.push(run_f32(batch, &x32, &w32, &mask32));
 
         ft_core::buffer_pool::set_enabled(true);
-        pooled.push(run_f32(batch, &x32, &w32).backward);
+        pooled.push(run_f32(batch, &x32, &w32, &mask32).backward);
         ft_core::buffer_pool::set_enabled(false);
-        unpooled.push(run_f32(batch, &x32, &w32).backward);
-        unpooled.push(run_f32(batch, &x32, &w32).backward);
+        unpooled.push(run_f32(batch, &x32, &w32, &mask32).backward);
+        unpooled.push(run_f32(batch, &x32, &w32, &mask32).backward);
         ft_core::buffer_pool::set_enabled(true);
-        pooled.push(run_f32(batch, &x32, &w32).backward);
+        pooled.push(run_f32(batch, &x32, &w32, &mask32).backward);
     }
     ft_core::buffer_pool::set_enabled(true);
     let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
@@ -129,7 +137,7 @@ fn main() {
     let rows: [(&str, fn(&Phases) -> f64); 5] = [
         ("leaf build", |p| p.leaf),
         ("forward", |p| p.forward),
-        ("loss sum", |p| p.sum),
+        ("mask + sum", |p| p.sum),
         ("backward", |p| p.backward),
         ("grad read", |p| p.grad_read),
     ];
@@ -143,8 +151,8 @@ fn main() {
         let a = min_of(&p32, pick);
         let b = min_of(&p64, pick);
         println!("  {label:<12}{a:>12.3}{b:>12.3}{:>12.2}", b / a);
-        // The h2h lane's timed region is forward + loss sum + backward, and only those.
-        if matches!(label, "forward" | "loss sum" | "backward") {
+        // The h2h lane's timed region is forward + mask-and-sum + backward, and only those.
+        if matches!(label, "forward" | "mask + sum" | "backward") {
             timed32 += a;
             timed64 += b;
         }
@@ -324,7 +332,7 @@ fn pad_backward_probe(batch: usize, values: &[f32], reps: usize) {
     );
 }
 
-fn run_f32(batch: usize, values: &[f32], weights: &[f32]) -> Phases {
+fn run_f32(batch: usize, values: &[f32], weights: &[f32], mask: &[f32]) -> Phases {
     let mut p = Phases::default();
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let t = Instant::now();
@@ -334,6 +342,9 @@ fn run_f32(batch: usize, values: &[f32], weights: &[f32]) -> Phases {
     let w = session
         .tensor_variable_f32(weights.to_vec(), vec![CO, CI, K, K], false)
         .expect("weight");
+    let mask = session
+        .tensor_variable_f32(mask.to_vec(), vec![batch, CO, H, W], false)
+        .expect("mask");
     p.leaf = ms(t);
     let t = Instant::now();
     let out = session
@@ -341,7 +352,8 @@ fn run_f32(batch: usize, values: &[f32], weights: &[f32]) -> Phases {
         .expect("conv2d");
     p.forward = ms(t);
     let t = Instant::now();
-    let loss = session.tensor_sum(out).expect("sum");
+    let scored = session.tensor_mul(out, mask).expect("non-uniform mask");
+    let loss = session.tensor_sum(scored).expect("sum");
     p.sum = ms(t);
     let t = Instant::now();
     let report = session.tensor_backward(loss).expect("backward");
@@ -354,7 +366,7 @@ fn run_f32(batch: usize, values: &[f32], weights: &[f32]) -> Phases {
     p
 }
 
-fn run_f64(batch: usize, values: &[f64], weights: &[f64]) -> Phases {
+fn run_f64(batch: usize, values: &[f64], weights: &[f64], mask: &[f64]) -> Phases {
     let mut p = Phases::default();
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let t = Instant::now();
@@ -364,6 +376,9 @@ fn run_f64(batch: usize, values: &[f64], weights: &[f64]) -> Phases {
     let w = session
         .tensor_variable(weights.to_vec(), vec![CO, CI, K, K], false)
         .expect("weight");
+    let mask = session
+        .tensor_variable(mask.to_vec(), vec![batch, CO, H, W], false)
+        .expect("mask");
     p.leaf = ms(t);
     let t = Instant::now();
     let out = session
@@ -371,7 +386,8 @@ fn run_f64(batch: usize, values: &[f64], weights: &[f64]) -> Phases {
         .expect("conv2d");
     p.forward = ms(t);
     let t = Instant::now();
-    let loss = session.tensor_sum(out).expect("sum");
+    let scored = session.tensor_mul(out, mask).expect("non-uniform mask");
+    let loss = session.tensor_sum(scored).expect("sum");
     p.sum = ms(t);
     let t = Instant::now();
     let report = session.tensor_backward(loss).expect("backward");
