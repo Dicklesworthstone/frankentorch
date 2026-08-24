@@ -125,4 +125,61 @@ mod tests {
         assert_eq!(probe_output.len(), 4 * 16 * 64 * 64);
         assert!(probe_output.iter().all(|value| *value == 0.25));
     }
+
+    #[test]
+    fn exact_tiled_fast_path_matches_scalar_reference_bits_across_a_simd_tail() {
+        // `ow == 7` exercises one four-lane vector group and three scalar tail windows.
+        let (batch, channels, height, width) = (2, 3, 10, 14);
+        let (pooled_height, pooled_width) = (height / 2, width / 2);
+        let dout: Vec<f64> = (0..batch * channels * pooled_height * pooled_width)
+            .map(|index| match index % 17 {
+                0 => -0.0,
+                1 => f64::NAN,
+                _ => (index as f64 - 51.0) * 0.03125,
+            })
+            .collect();
+        let got = ft_kernel_cpu::avg_pool2d_backward_f64(
+            &dout,
+            batch,
+            channels,
+            height,
+            width,
+            2,
+            2,
+            pooled_height,
+            pooled_width,
+            2,
+            2,
+            0,
+            0,
+            height,
+            width,
+            true,
+        );
+
+        let mut expected = vec![0.0; batch * channels * height * width];
+        for plane in 0..batch * channels {
+            for oy in 0..pooled_height {
+                for ox in 0..pooled_width {
+                    let g = 0.0
+                        + dout[plane * pooled_height * pooled_width + oy * pooled_width + ox] / 4.0;
+                    let row0 = plane * height * width + (oy * 2) * width;
+                    let row1 = row0 + width;
+                    let col0 = ox * 2;
+                    expected[row0 + col0] = g;
+                    expected[row0 + col0 + 1] = g;
+                    expected[row1 + col0] = g;
+                    expected[row1 + col0 + 1] = g;
+                }
+            }
+        }
+
+        assert_eq!(
+            got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+    }
 }
