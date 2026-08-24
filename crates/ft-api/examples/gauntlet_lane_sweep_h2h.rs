@@ -2774,7 +2774,10 @@ LANES = {
     // curve turns); this only selects whether kernels use it.
     if let Ok(raw) = std::env::var("FT_NARROW_POOL") {
         let on = raw == "1";
-        let previous = ft_kernel_cpu::set_narrow_pool_enabled(on);
+        // Renamed to `set_max_pool3d_pool_enabled` by 9075bcdb when the narrow pool became
+        // MaxPool3d's own; this call site was the one the rename missed, and it left the whole
+        // gauntlet board unbuildable. Same semantics, same bool, same previous-value return.
+        let previous = ft_kernel_cpu::set_max_pool3d_pool_enabled(on);
         println!("narrow_pool={on} (was {previous})");
     }
     // Same flag, read once above so the co-process choice could be made before the spawn.
