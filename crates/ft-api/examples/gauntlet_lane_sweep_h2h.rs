@@ -344,7 +344,9 @@ fn balanced_null_is_centered(point: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_null_is_centered, median, paired_slot_median, timed_conv3d};
+    use super::{
+        balanced_null_is_centered, group_norm_dense_dy, median, paired_slot_median, timed_conv3d,
+    };
 
     #[test]
     fn balanced_square_overall_median_matches_python_statistics_median() {
@@ -375,6 +377,16 @@ mod tests {
             timed_conv3d(&[1.5], vec![1, 1, 1, 1, 1], &[2.0], vec![1, 1, 1, 1, 1]);
         assert!(milliseconds.is_finite() && milliseconds >= 0.0);
         assert_eq!(checksum.to_bits(), 2.0_f64.to_bits());
+    }
+
+    #[test]
+    fn group_norm_dense_loss_derivative_cannot_take_the_scalar_backward() {
+        // `sum(out*out)` supplies `2*out`, not the all-ones upstream that the scalar
+        // GroupNorm backward specializes. This is the route contract for mdsmm's direct-kernel
+        // twins; keeping it as a small pure test avoids conflating that contract with timing.
+        let dy = group_norm_dense_dy(&[-0.75, 0.0, 0.25, 1.5]);
+        assert_eq!(dy, vec![-1.5, 0.0, 0.5, 3.0]);
+        assert!(dy.iter().any(|value| value.to_bits() != 1.0_f32.to_bits()));
     }
 }
 
@@ -697,6 +709,88 @@ fn timed_group_norm_f32_kernels(
     parallel_forward: bool,
 ) -> (f64, f64) {
     timed_group_norm_f32_kernels_inner(values, weight, bias, parallel_forward, false)
+}
+
+/// Derivative of `sum(out*out)` with respect to `out`.
+///
+/// This deliberately stays separate from the scalar-loss kernel helpers below. The kernel
+/// families they invoke take a scalar upstream by construction; the dense H2H twins must pass
+/// this full `dy` through `group_norm_backward_f32` so the all-ones branch cannot hide the route
+/// the session's dense loss uses.
+fn group_norm_dense_dy(out: &[f32]) -> Vec<f32> {
+    out.iter().map(|value| 2.0 * value).collect()
+}
+
+/// Direct-kernel counterpart of the GroupNorm dense session lane.
+///
+/// `reuse_stats` preserves the forward configuration of the existing scalar kernel lanes. There
+/// is intentionally no claim that the scalar-only stats-reuse backward is exercised here: the
+/// dense backward has no such entry point, so it recomputes its statistics through the real
+/// generic kernel. These rows make that absence visible instead of mislabeling a scalar route as
+/// a dense kernels-vs-engine split.
+fn timed_group_norm_f32_kernels_dense_inner(
+    values: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    parallel_forward: bool,
+    reuse_stats: bool,
+) -> (f64, f64) {
+    let spatial = GN_H * GN_W;
+    let channels_per_group = GN_C / GN_GROUPS;
+    let out_meta = TensorMeta::from_shape(
+        vec![GN_N, GN_C, GN_H, GN_W],
+        DType::F32,
+        ft_core::Device::Cpu,
+    );
+    let started = Instant::now();
+    let out = if reuse_stats {
+        let (out, _stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            spatial,
+            1e-5,
+        );
+        out
+    } else {
+        ft_kernel_cpu::group_norm_forward_f32_scheduled(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+            parallel_forward,
+        )
+    };
+    let squared: Vec<f32> = out.iter().map(|value| value * value).collect();
+    let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&squared, &out_meta).expect("sum");
+    let dy = group_norm_dense_dy(&out);
+    assert!(
+        dy.iter().any(|value| value.to_bits() != 1.0_f32.to_bits()),
+        "dense loss must not enter GroupNorm's all-ones scalar backward"
+    );
+    let (dx, _, _) = ft_kernel_cpu::group_norm_backward_f32(
+        &dy,
+        values,
+        Some(weight),
+        GN_N,
+        GN_GROUPS,
+        channels_per_group,
+        spatial,
+        1e-5,
+    );
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    assert!(loss.is_finite(), "group_norm f32 dense loss must be finite");
+    let checksum = dx
+        .iter()
+        .map(|gradient| f64::from(gradient.abs()))
+        .sum::<f64>();
+    (elapsed, checksum)
 }
 
 /// `reuse_stats` selects the `frankentorch-qkwsy` lever: the forward emits the
@@ -1284,6 +1378,11 @@ fn incumbent_sample(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Establish FrankenTorch's hardware-aware global pool before this harness asks rayon for
+    // provenance. `rayon::current_num_threads()` lazily creates the default 64-thread pool, so
+    // doing the query first would hide the library's no-environment policy from every lane.
+    // `RAYON_NUM_THREADS`, when explicitly set by a caller, still wins in `configure_global_pool`.
+    let _ = ft_kernel_cpu::pool::configure_global_pool();
     // frankentorch-yu1zm: THE A/A CONTROL FOR THE UNINIT PAIR. With
     // `FT_POOL_ZEROED_OUTPUT=1` the global default becomes the zeroed path, and the
     // `max_pool1d_zeroed` lane — which sets the toggle and then RESTORES the previous
@@ -1488,6 +1587,11 @@ LANES = {
     # item 216: the train twin of the line above -- c2w_train, so BOTH arms compute dweight.
     # Sized at batch 16 because that is the one masked conv2d lane measured certifying 4 of 4.
     "conv2d_big_masked_train": (c2bx, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2bm),
+    # hi9r6 dinput-blocking: same incumbent code under two more names, so PT(panel)/PT(base) is a
+    # free ~1.0 control on each pair. Only OUR arm differs -- the `_panel` names run the
+    # pre-blocking dpanel + col2im dinput route.
+    "conv2d_big_masked_panel": (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2bm),
+    "conv2d_big_masked_train_panel": (c2bx, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2bm),
     # item 190: byte-identical twin of conv2d_masked, so the warm/cold A/B is one invocation.
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
@@ -1547,8 +1651,17 @@ LANES = {
     # byte-identical code under the plain and dense names, so PT(dense)/PT(plain) is a free
     # control that prices the squaring itself.
     "avg_pool2d_dense": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))**2),
+    # frankentorch-mdsmm: the buffer-pool and zeroed-output controls must be
+    # priced on this same dense route, rather than only behind the sum shortcut.
+    "avg_pool2d_nopool_dense": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))**2),
+    "avg_pool2d_dense_zeroed": (ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))**2),
     "max_pool3d_dense": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))**2),
+    # frankentorch-mdsmm: this is the buffer-pool-off control on the SAME non-uniform
+    # loss route as max_pool3d_dense. Keep the square in the Python callable because
+    # the shared loop only adds the final sum().backward().
+    "max_pool3d_nopool_dense": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))**2),
     "max_pool1d_dense": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
+    "max_pool1d_nopool_dense": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # frankentorch-68pwz item 103c: the DENSE-route twin. The board's other group_norm
     # lanes all end in a plain sum, which fires the sum-shortcut whose backward never
@@ -1577,20 +1690,28 @@ LANES = {
     "batch_norm2d_f64_dense": (bnx, lambda x: Fn.batch_norm(x,None,None,bnw,bnb,True,0.1,1e-5)**2),
     # frankentorch-jlcmi: incumbent twin for the group_norm uninit A/B.
     "group_norm_f32_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "group_norm_f32_dense_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     # The FrankenTorch side of this second name calls the two f32 kernels
     # DIRECTLY, with no session and no tape, to price the engine and the f64
     # grad-space conversions separately from the kernel. The incumbent is the
     # same op under both names, so PT(kernels)/PT(f32) is a free ~1.0 control.
     "group_norm_f32_kernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # frankentorch-mdsmm: direct-kernel dense twins. The four scalar kernel lanes below call
+    # group_norm_backward_scalar_f32 directly, so their historical kernels-vs-engine split never
+    # built a dense dy. Squaring makes run's shared sum produce sum(out*out) on BOTH arms.
+    "group_norm_f32_kernels_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     # frankentorch-dmpho: the same torch op under a third name. The FrankenTorch
     # side runs this one with the group-norm forward forced onto the old serial
     # schedule, so the pair prices the parallel gate against one live incumbent
     # inside one invocation. PT(serialfwd)/PT(kernels) is a free ~1.0 control.
     "group_norm_f32_kernels_serialfwd": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "group_norm_f32_kernels_serialfwd_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     # frankentorch-qkwsy: the same torch op again for the forward-statistics-reuse
     # pair. PT(statskernels_recompute)/PT(statskernels) is a free ~1.0 control.
     "group_norm_f32_statskernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     "group_norm_f32_statskernels_recompute": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "group_norm_f32_statskernels_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
+    "group_norm_f32_statskernels_recompute_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     "prelu": (prx, lambda x: Fn.prelu(x,prw)),
     # frankentorch-k1hto: the same torch op under a second name, exactly as the
     # `_nopool` lanes do. The FrankenTorch side runs this one with an
@@ -1969,6 +2090,34 @@ LANES = {
             }),
         ),
         (
+            // The buffer-pool control must be visible behind the non-uniform loss too:
+            // `functional_avg_pool2d_sum` would keep the sum shortcut live, whereas this
+            // returns a tensor whose `sum(out*out)` loss materializes the dense backward.
+            "avg_pool2d_nopool_dense",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op_sq(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
+                    s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                        .expect("avg_pool2d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
+            }),
+        ),
+        (
+            // Same dense route as `avg_pool2d_dense`; only its allocation policy differs.
+            "avg_pool2d_dense_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_op_sq(&ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s, x| {
+                    s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                        .expect("avg_pool2d")
+                });
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
+            }),
+        ),
+        (
             "max_pool3d_dense",
             Box::new(|| {
                 timed_op_sq(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
@@ -1978,11 +2127,41 @@ LANES = {
             }),
         ),
         (
+            // `max_pool3d_nopool` above only prices the buffer pool under the scalar
+            // sum-shortcut. This twin uses `sum(out*out)`, so `try_max_pool3d_sum_shortcut`
+            // declines and the buffer-pool control is visible on the backward route training
+            // actually reaches. The Python registration squares too, keeping both arms on the
+            // same loss and making PT(nopool_dense)/PT(dense) the incumbent control.
+            "max_pool3d_nopool_dense",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op_sq(&mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s, x| {
+                    s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+                        .expect("max_pool3d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
+            }),
+        ),
+        (
             "max_pool1d_dense",
             Box::new(|| {
                 timed_op_sq(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
                     s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
                 })
+            }),
+        ),
+        (
+            // As for max_pool3d, the buffer-pool control needs the real dense route rather
+            // than the all-ones scalar shortcut timed by `max_pool1d_nopool`.
+            "max_pool1d_nopool_dense",
+            Box::new(|| {
+                ft_core::buffer_pool::set_enabled(false);
+                let sample = timed_op_sq(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+                });
+                ft_core::buffer_pool::set_enabled(true);
+                sample
             }),
         ),
         (
@@ -2045,6 +2224,17 @@ LANES = {
             }),
         ),
         (
+            // Pair the uninitialized-output control with the route that actually materializes
+            // the f32 per-element gradient, not the scalar sum-shortcut route above.
+            "group_norm_f32_dense_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_group_norm_f32_dense(&gnx, &gnw, &gnb);
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
+            }),
+        ),
+        (
             // frankentorch-68pwz item 103c: the dense route, where the f32 engine's
             // per-element dy/dx conversions actually execute. Not a twin of
             // `group_norm_f32` — it is a DIFFERENT backward, so it carries its own
@@ -2073,10 +2263,20 @@ LANES = {
             Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, true)),
         ),
         (
+            // mdsmm: the route-matched kernels-vs-engine split. Unlike the scalar sibling,
+            // this builds dy = 2*out and enters group_norm_backward_f32's generic path.
+            "group_norm_f32_kernels_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, true, false)),
+        ),
+        (
             // frankentorch-dmpho: the lever-off twin. Same kernels, same shape,
             // same binary; only the forward's schedule differs.
             "group_norm_f32_kernels_serialfwd",
             Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, false)),
+        ),
+        (
+            "group_norm_f32_kernels_serialfwd_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, false, false)),
         ),
         (
             // frankentorch-qkwsy: lever ON — the forward emits its statistics and
@@ -2091,6 +2291,17 @@ LANES = {
             // Lever OFF: identical work, statistics rebuilt in the backward.
             "group_norm_f32_statskernels_recompute",
             Box::new(|| timed_group_norm_f32_kernels_inner(&gnx, &gnw, &gnb, true, false)),
+        ),
+        (
+            // The scalar-only stats-reuse backward has no dense analogue. These two rows retain
+            // the corresponding forward forms but use generic backward, making that boundary
+            // explicit rather than presenting the scalar A/B as a dense-route result.
+            "group_norm_f32_statskernels_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, true, true)),
+        ),
+        (
+            "group_norm_f32_statskernels_recompute_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, true, false)),
         ),
         ("prelu", Box::new(|| timed_prelu(&prx, &prw, false, false))),
         (
@@ -2184,6 +2395,40 @@ LANES = {
             // GEMM is a disproportionate offender and items 170/172 should aim there.
             "conv2d_big_masked_train",
             Box::new(|| timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, true)),
+        ),
+        (
+            // `frankentorch-hi9r6`: the two lanes above with the dinput BLOCKING toggled OFF, so
+            // each pair differs in exactly one thing and both halves sample the same host minute.
+            //
+            // The lever: the generic backward's `dpadded` was `dgemm(flat, out_ch, patch_width)`
+            // into a `flat x patch_width` panel — 37.7 MB here — that `conv2d_col2im_f64` read
+            // once and dropped. It is now blocked on `m` into an L2-resident buffer and scattered
+            // per block, inside ONE parallel region over the batch image. NEGATIVE_EVIDENCE item
+            // 117 reverted the conv3d version of this at 1.7x SLOWER because it fragmented the
+            // fork/join; 117c's retry predicate — "a design that keeps ONE wide parallel region" —
+            // is what the image-parallel form and its `batch >= current_num_threads()` gate are
+            // for, and this pair is what says whether it worked.
+            //
+            // Item 25's rule is why this is a toggle and not a second binary. The two paths are
+            // BIT-IDENTICAL (`conv2d_dinput_panel_legacy_toggle_selects_a_bit_identical_path`),
+            // so the pair can move time and cannot move a number — and PyTorch runs the SAME code
+            // under both names, making PT(panel)/PT(base) a free control that must come out ~1.0.
+            "conv2d_big_masked_panel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+                let sample = timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, false);
+                ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous);
+                sample
+            }),
+        ),
+        (
+            "conv2d_big_masked_train_panel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+                let sample = timed_conv2d(&c2bx, &c2w, Some(&c2bm), C2B_N, true);
+                ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous);
+                sample
+            }),
         ),
         (
             // item 209: the SUMMED route, sized so our arm lands near 35 ms. `conv2d_big` reaches
@@ -3135,37 +3380,42 @@ LANES = {
     // rows carry their own control: PT is byte-identical code under both names,
     // so PT(off)/PT(on) must land near 1.0 or the run is not readable at all.
     //
-    // Three suffixes name a lever-off twin. `_nopool` is `ft_core::buffer_pool`
-    // switched off (frankentorch-v92uh, -9pafs, -7zqbc); `_noshortcut` is the
+    // Four suffixes name a lever-off twin. `_nopool` and `_nopool_dense` are
+    // `ft_core::buffer_pool` switched off (the latter pairs to the dense base);
+    // `_noshortcut` is the
     // PReLU+sum deforest declined through its hook exit (frankentorch-k1hto);
     // `_serialfwd` is the group-norm forward forced onto the pre-`group_norm_parallel_pays`
     // serial schedule (frankentorch-dmpho).
     for (index, (name, _)) in lanes.iter().enumerate() {
         let Some((base, lever)) = name
-            .strip_suffix("_nopool")
-            .map(|base| (base, "buffer pool"))
+            .strip_suffix("_nopool_dense")
+            .map(|base| (format!("{base}_dense"), "buffer pool"))
+            .or_else(|| {
+                name.strip_suffix("_nopool")
+                    .map(|base| (base.to_owned(), "buffer pool"))
+            })
             .or_else(|| {
                 name.strip_suffix("_noshortcut")
-                    .map(|base| (base, "sum shortcut"))
+                    .map(|base| (base.to_owned(), "sum shortcut"))
             })
             .or_else(|| {
                 name.strip_suffix("_serialfwd")
-                    .map(|base| (base, "parallel forward gate"))
+                    .map(|base| (base.to_owned(), "parallel forward gate"))
             })
             .or_else(|| {
                 name.strip_suffix("_recompute")
-                    .map(|base| (base, "forward-statistics reuse"))
+                    .map(|base| (base.to_owned(), "forward-statistics reuse"))
             })
             .or_else(|| {
                 // frankentorch-yu1zm: the pooling forwards' UNINIT output vs the
                 // pre-lever zeroed allocation, flipped per arm inside one process.
                 name.strip_suffix("_zeroed")
-                    .map(|base| (base, "uninit output"))
+                    .map(|base| (base.to_owned(), "uninit output"))
             })
         else {
             continue;
         };
-        let Some(base_index) = lanes.iter().position(|(other, _)| *other == base) else {
+        let Some(base_index) = lanes.iter().position(|(other, _)| *other == base.as_str()) else {
             continue;
         };
         let rounds = ft_times[index].len().min(ft_times[base_index].len());
