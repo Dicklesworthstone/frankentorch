@@ -8519,9 +8519,6 @@ fn conv2d_dinput_block_rows(patch_width: usize) -> usize {
     (BUDGET_BYTES / (patch_width * size_of::<f64>())).max(1)
 }
 
-/// [`conv2d_backward_dinput_direct_f64`] with the block width supplied, so a test can drive it.
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 /// f32 sibling of [`conv2d_backward_dinput_direct_f64`] — `frankentorch-hi9r6`.
 ///
 /// WHY THIS EXISTS, measured rather than assumed. `conv2d_f32_masked` is the worst conv2d
@@ -8833,6 +8830,9 @@ fn conv2d_backward_dinput_grouped_f64(
     dpadded
 }
 
+/// [`conv2d_backward_dinput_direct_f64`] with the block width supplied, so a test can drive it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
 fn conv2d_backward_dinput_blocked_rows_f64(
     dout_flat: &[f64],
     weight_flat: &[f64],

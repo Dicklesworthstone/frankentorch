@@ -1596,6 +1596,10 @@ LANES = {
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
     "conv2d_masked_train": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
+    # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
+    # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-164e159d dpanel + col2im dinput,
+    # which is what this batch-8 lane took before the channel-group route opened the gate.
+    "conv2d_masked_train_panel": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
     # item 191: f32 conv2d, both loss routes. The summed one is the only lane that reaches the
     # f32 all-ones adjoints; the masked one is its control on the generic route.
     "conv2d_f32":        (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
@@ -2480,6 +2484,30 @@ LANES = {
             // computing a discarded gradient" from "conv2d got faster".
             "conv2d_masked_train",
             Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true)),
+        ),
+        (
+            // `frankentorch-hi9r6`: the lane above with the blocked dinput toggled OFF, so the
+            // pair differs in exactly one thing and both halves sample the same host minute.
+            //
+            // WHY IT EXISTS. This lane is batch 8. Until 164e159d the blocked dinput was gated on
+            // `batch >= current_num_threads()` and switched OFF here, leaving it on the old
+            // `dpanel` + `col2im` round trip at 2.24x SLOWER while its batch-16 twin ran 1.10x
+            // FASTER. The channel-group route opened that gate. Measuring what that is worth
+            // ACROSS invocations does not work on this host: the last attempt moved our arm
+            // 10.666 -> 9.259 ms but every PyTorch null failed, and a cross-run delta is not
+            // separable from the incumbent's own movement. Item 25's rule is the fix.
+            //
+            // The two paths are BIT-IDENTICAL — `conv2d_dinput_grouped_matches_panel_col2im
+            // _bitwise` asserts that at seven shapes by every divisor of `in_ch` by four block
+            // widths — so this pair can move time and cannot move a number, and PyTorch runs the
+            // SAME code under both names as a free ~1.0 control.
+            "conv2d_masked_train_panel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+                let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
+                ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous);
+                sample
+            }),
         ),
         (
             // item 191: the f32 SUMMED route. This is the only lane that reaches the all-ones
