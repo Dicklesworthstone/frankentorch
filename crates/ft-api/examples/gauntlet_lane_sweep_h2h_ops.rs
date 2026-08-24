@@ -94,7 +94,11 @@ fn null_passes(point: f64, low: f64, high: f64) -> bool {
         && (point - 1.0).abs() <= NULL_CENTER_TOLERANCE
 }
 
-fn gradient_l1(report: &ft_autograd::BackwardReport, node: ft_autograd::TensorNodeId) -> f64 {
+// `tensor_backward` returns a `TensorBackwardReport`, not the scalar-graph `BackwardReport`, and
+// its `gradient` takes a `TensorNodeId`. Typed against the scalar pair this example never
+// compiled, which took `cargo check --workspace --all-targets` -- AGENTS.md's stated gate -- down
+// with it for the whole workspace. `frankentorch-hi9r6`.
+fn gradient_l1(report: &ft_autograd::TensorBackwardReport, node: ft_autograd::TensorNodeId) -> f64 {
     report
         .gradient(node)
         .expect("gradient")
