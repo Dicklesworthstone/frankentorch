@@ -344,7 +344,9 @@ fn balanced_null_is_centered(point: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_null_is_centered, median, paired_slot_median, timed_conv3d};
+    use super::{
+        balanced_null_is_centered, group_norm_dense_dy, median, paired_slot_median, timed_conv3d,
+    };
 
     #[test]
     fn balanced_square_overall_median_matches_python_statistics_median() {
@@ -375,6 +377,16 @@ mod tests {
             timed_conv3d(&[1.5], vec![1, 1, 1, 1, 1], &[2.0], vec![1, 1, 1, 1, 1]);
         assert!(milliseconds.is_finite() && milliseconds >= 0.0);
         assert_eq!(checksum.to_bits(), 2.0_f64.to_bits());
+    }
+
+    #[test]
+    fn group_norm_dense_loss_derivative_cannot_take_the_scalar_backward() {
+        // `sum(out*out)` supplies `2*out`, not the all-ones upstream that the scalar
+        // GroupNorm backward specializes. This is the route contract for mdsmm's direct-kernel
+        // twins; keeping it as a small pure test avoids conflating that contract with timing.
+        let dy = group_norm_dense_dy(&[-0.75, 0.0, 0.25, 1.5]);
+        assert_eq!(dy, vec![-1.5, 0.0, 0.5, 3.0]);
+        assert!(dy.iter().any(|value| value.to_bits() != 1.0_f32.to_bits()));
     }
 }
 
@@ -697,6 +709,88 @@ fn timed_group_norm_f32_kernels(
     parallel_forward: bool,
 ) -> (f64, f64) {
     timed_group_norm_f32_kernels_inner(values, weight, bias, parallel_forward, false)
+}
+
+/// Derivative of `sum(out*out)` with respect to `out`.
+///
+/// This deliberately stays separate from the scalar-loss kernel helpers below. The kernel
+/// families they invoke take a scalar upstream by construction; the dense H2H twins must pass
+/// this full `dy` through `group_norm_backward_f32` so the all-ones branch cannot hide the route
+/// the session's dense loss uses.
+fn group_norm_dense_dy(out: &[f32]) -> Vec<f32> {
+    out.iter().map(|value| 2.0 * value).collect()
+}
+
+/// Direct-kernel counterpart of the GroupNorm dense session lane.
+///
+/// `reuse_stats` preserves the forward configuration of the existing scalar kernel lanes. There
+/// is intentionally no claim that the scalar-only stats-reuse backward is exercised here: the
+/// dense backward has no such entry point, so it recomputes its statistics through the real
+/// generic kernel. These rows make that absence visible instead of mislabeling a scalar route as
+/// a dense kernels-vs-engine split.
+fn timed_group_norm_f32_kernels_dense_inner(
+    values: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    parallel_forward: bool,
+    reuse_stats: bool,
+) -> (f64, f64) {
+    let spatial = GN_H * GN_W;
+    let channels_per_group = GN_C / GN_GROUPS;
+    let out_meta = TensorMeta::from_shape(
+        vec![GN_N, GN_C, GN_H, GN_W],
+        DType::F32,
+        ft_core::Device::Cpu,
+    );
+    let started = Instant::now();
+    let out = if reuse_stats {
+        let (out, _stats) = ft_kernel_cpu::group_norm_forward_f32_with_cpg2_stats(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            spatial,
+            1e-5,
+        );
+        out
+    } else {
+        ft_kernel_cpu::group_norm_forward_f32_scheduled(
+            values,
+            Some(weight),
+            Some(bias),
+            GN_N,
+            GN_GROUPS,
+            channels_per_group,
+            spatial,
+            1e-5,
+            parallel_forward,
+        )
+    };
+    let squared: Vec<f32> = out.iter().map(|value| value * value).collect();
+    let loss = ft_kernel_cpu::sum_tensor_contiguous_f32(&squared, &out_meta).expect("sum");
+    let dy = group_norm_dense_dy(&out);
+    assert!(
+        dy.iter().any(|value| value.to_bits() != 1.0_f32.to_bits()),
+        "dense loss must not enter GroupNorm's all-ones scalar backward"
+    );
+    let (dx, _, _) = ft_kernel_cpu::group_norm_backward_f32(
+        &dy,
+        values,
+        Some(weight),
+        GN_N,
+        GN_GROUPS,
+        channels_per_group,
+        spatial,
+        1e-5,
+    );
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    assert!(loss.is_finite(), "group_norm f32 dense loss must be finite");
+    let checksum = dx
+        .iter()
+        .map(|gradient| f64::from(gradient.abs()))
+        .sum::<f64>();
+    (elapsed, checksum)
 }
 
 /// `reuse_stats` selects the `frankentorch-qkwsy` lever: the forward emits the
@@ -1602,15 +1696,22 @@ LANES = {
     # grad-space conversions separately from the kernel. The incumbent is the
     # same op under both names, so PT(kernels)/PT(f32) is a free ~1.0 control.
     "group_norm_f32_kernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    # frankentorch-mdsmm: direct-kernel dense twins. The four scalar kernel lanes below call
+    # group_norm_backward_scalar_f32 directly, so their historical kernels-vs-engine split never
+    # built a dense dy. Squaring makes run's shared sum produce sum(out*out) on BOTH arms.
+    "group_norm_f32_kernels_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     # frankentorch-dmpho: the same torch op under a third name. The FrankenTorch
     # side runs this one with the group-norm forward forced onto the old serial
     # schedule, so the pair prices the parallel gate against one live incumbent
     # inside one invocation. PT(serialfwd)/PT(kernels) is a free ~1.0 control.
     "group_norm_f32_kernels_serialfwd": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "group_norm_f32_kernels_serialfwd_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     # frankentorch-qkwsy: the same torch op again for the forward-statistics-reuse
     # pair. PT(statskernels_recompute)/PT(statskernels) is a free ~1.0 control.
     "group_norm_f32_statskernels": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     "group_norm_f32_statskernels_recompute": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
+    "group_norm_f32_statskernels_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
+    "group_norm_f32_statskernels_recompute_dense": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
     "prelu": (prx, lambda x: Fn.prelu(x,prw)),
     # frankentorch-k1hto: the same torch op under a second name, exactly as the
     # `_nopool` lanes do. The FrankenTorch side runs this one with an
@@ -2162,10 +2263,20 @@ LANES = {
             Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, true)),
         ),
         (
+            // mdsmm: the route-matched kernels-vs-engine split. Unlike the scalar sibling,
+            // this builds dy = 2*out and enters group_norm_backward_f32's generic path.
+            "group_norm_f32_kernels_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, true, false)),
+        ),
+        (
             // frankentorch-dmpho: the lever-off twin. Same kernels, same shape,
             // same binary; only the forward's schedule differs.
             "group_norm_f32_kernels_serialfwd",
             Box::new(|| timed_group_norm_f32_kernels(&gnx, &gnw, &gnb, false)),
+        ),
+        (
+            "group_norm_f32_kernels_serialfwd_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, false, false)),
         ),
         (
             // frankentorch-qkwsy: lever ON — the forward emits its statistics and
@@ -2180,6 +2291,17 @@ LANES = {
             // Lever OFF: identical work, statistics rebuilt in the backward.
             "group_norm_f32_statskernels_recompute",
             Box::new(|| timed_group_norm_f32_kernels_inner(&gnx, &gnw, &gnb, true, false)),
+        ),
+        (
+            // The scalar-only stats-reuse backward has no dense analogue. These two rows retain
+            // the corresponding forward forms but use generic backward, making that boundary
+            // explicit rather than presenting the scalar A/B as a dense-route result.
+            "group_norm_f32_statskernels_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, true, true)),
+        ),
+        (
+            "group_norm_f32_statskernels_recompute_dense",
+            Box::new(|| timed_group_norm_f32_kernels_dense_inner(&gnx, &gnw, &gnb, true, false)),
         ),
         ("prelu", Box::new(|| timed_prelu(&prx, &prw, false, false))),
         (
