@@ -8,9 +8,6 @@ use std::simd::Simd;
 
 mod masked_conv2d;
 pub mod pool;
-mod masked_conv2d;
-
-pub use masked_conv2d::conv2d_backward_mask_fused_f64;
 
 pub use masked_conv2d::conv2d_backward_mask_fused_f64;
 
