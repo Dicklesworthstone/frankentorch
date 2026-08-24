@@ -3,12 +3,14 @@
 //!
 //! WHAT IS MEASURED. `linalg.svd` forward only (full U, S, Vh) on a square matrix, ours against
 //! PyTorch, plus as many of our own configurations as the caller asks for. A configuration is a
-//! pair: the bidiagonal PARALLEL GATE, and which step-(12) kernel the reduction uses.
+//! tuple: the bidiagonal PARALLEL GATE, the step-(12) kernel, the trailing-update form, and
+//! whether the serial panel keeps four independent outputs in flight.
 //!
 //! WHY EVERY ARM IS IN ONE PROCESS. The gate used to live in a `OnceLock` and the step-(12)
 //! kernel was a compile-time choice, so an A/B needed one process per arm — a whole launch, a
 //! cold allocator, and a different window between the two numbers being compared. Both are now
-//! runtime switches (`bidiag_parallel_gate_set`, `bidiag_rowdot_blocked_set`).
+//! runtime switches (`bidiag_parallel_gate_set`, `bidiag_rowdot_blocked_set`, and
+//! `bidiag_panel_output_blocked_set`).
 //!
 //! THE ESTIMATOR IS THE INSTRUMENT (NEGATIVE_EVIDENCE item 255). The first version of this lane
 //! timed all of arm A, then all of arm B. Its A/A null — two arms with identical settings, whose
@@ -43,7 +45,8 @@
 //! ```
 //! `FT_GATE_SIZES` (default `128,136,256,512`), `FT_GATE_VALUES` (default the shipped gate and
 //! always-serial), `FT_ROWDOT` (`1` = the four-row step-(12) kernel, `0` = the one-row loop it
-//! replaced), `FT_ROUNDS` (default 9) and `FT_H2H_WARMUP` (default 8, read by BOTH arms).
+//! replaced), `FT_PANEL_OUTPUT` (`1` = four exact-order panel outputs, `0` = scalar),
+//! `FT_ROUNDS` (default 9) and `FT_H2H_WARMUP` (default 8, read by BOTH arms).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
@@ -65,6 +68,9 @@ struct Arm {
     /// pair can move time and cannot move a number — `FT_FUSED=1,0` puts both halves in one
     /// invocation against one live incumbent.
     fused: bool,
+    /// The serial dlabrd steps keep four independent outputs in flight. This
+    /// preserves each output's reduction order exactly (`frankentorch-75e38`).
+    panel_output_blocked: bool,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -74,9 +80,14 @@ fn arm_label(arm: Arm) -> String {
         format!("{}", arm.gate)
     };
     format!(
-        "{gate}/{}/{}",
+        "{gate}/{}/{}/{}",
         if arm.blocked { "4row" } else { "1row" },
-        if arm.fused { "fused" } else { "2pass" }
+        if arm.fused { "fused" } else { "2pass" },
+        if arm.panel_output_blocked {
+            "4output"
+        } else {
+            "1output"
+        }
     )
 }
 
@@ -119,6 +130,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
     let previous_gate = ft_kernel_cpu::bidiag_parallel_gate_set(arm.gate);
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
+    let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -134,6 +146,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
     ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
+    ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     (ms, sum)
 }
 
@@ -216,21 +229,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .collect();
+    let panel_outputs: Vec<bool> = std::env::var("FT_PANEL_OUTPUT")
+        .unwrap_or_else(|_| "1".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     assert!(
-        !sizes.is_empty() && !gate_values.is_empty() && !rowdots.is_empty() && !fuseds.is_empty(),
+        !sizes.is_empty()
+            && !gate_values.is_empty()
+            && !rowdots.is_empty()
+            && !fuseds.is_empty()
+            && !panel_outputs.is_empty(),
         "empty grid"
     );
-    // Plain loops rather than nested flat_map: the three-way product needs `fuseds` borrowed by
-    // every iteration of the outer two, and the closure form moved it (E0507).
-    let mut arms: Vec<Arm> = Vec::with_capacity(gate_values.len() * rowdots.len() * fuseds.len());
+    let mut arms: Vec<Arm> =
+        Vec::with_capacity(gate_values.len() * rowdots.len() * fuseds.len() * panel_outputs.len());
     for &gate in &gate_values {
         for &blocked in &rowdots {
             for &fused in &fuseds {
-                arms.push(Arm {
-                    gate,
-                    blocked,
-                    fused,
-                });
+                for &panel_output_blocked in &panel_outputs {
+                    arms.push(Arm {
+                        gate,
+                        blocked,
+                        fused,
+                        panel_output_blocked,
+                    });
+                }
             }
         }
     }
@@ -294,7 +322,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         ft_kernel_cpu::bidiag_parallel_gate()
     );
     println!(
-        "arms (gate/step-12 kernel; u64::MAX = always serial, 4row = item 254): {:?}",
+        "arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): {:?}",
         arms.iter().map(|a| arm_label(*a)).collect::<Vec<_>>()
     );
     println!(
