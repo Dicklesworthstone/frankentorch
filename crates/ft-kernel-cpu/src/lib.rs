@@ -8340,8 +8340,8 @@ pub fn conv2d_backward_dinput_direct_f64(
             let mut start = 0usize;
             while start < patch_count {
                 let rows = DPANEL_BLOCK_ROWS.min(patch_count - start);
-                let a = &dout_flat[(b * patch_count + start) * out_ch
-                    ..(b * patch_count + start + rows) * out_ch];
+                let a = &dout_flat
+                    [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
                 let dp = &mut block[..rows * patch_width];
                 gemm::dgemm(rows, out_ch, patch_width, a, weight_flat, dp);
                 for r in 0..rows {
@@ -44282,24 +44282,26 @@ mod tests {
         // Values include a negative zero and both signs, so a reduction that canonicalised
         // `-0.0` (the defect `frankentorch-dtyiz` found in the gradient accumulators) would
         // show up here as a bit mismatch rather than as an equal-valued pass.
-        //                 batch in_ch out_ch  ph  pw  kh  kw  sh  sw
-        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 10] = [
+        // Each row is [batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]. An array rather than a
+        // 9-tuple so it destructures in the loop pattern and still fits one line per case.
+        //              batch in_ch out_ch  ph  pw  kh  kw  sh  sw
+        let shapes: [[usize; 9]; 10] = [
             // The two that exercise BLOCKING itself. Everything below them has a patch_count
             // under `DPANEL_BLOCK_ROWS` and so runs as a single partial block, which would leave
             // a dropped or double-counted tail — the most plausible failure of an m-split —
             // completely untested. patch_count 1444 = 5 full blocks + 164; 512 = exactly 2.
-            (2, 5, 3, 40, 40, 3, 3, 1, 1), // 6 blocks, ragged tail
-            (2, 3, 2, 34, 18, 3, 3, 1, 1), // 512 rows: exact block multiple, no tail
-            (2, 5, 3, 9, 8, 3, 3, 1, 1),   // below the plane gate, overlapping windows
-            (9, 3, 4, 7, 7, 3, 3, 1, 1),   // above the plane gate: col2im's other loop nest
-            (1, 2, 3, 11, 11, 3, 3, 2, 2), // strided: interior gaps stay +0.0
-            (2, 3, 2, 12, 12, 2, 2, 3, 3), // sw > kw: windows do not tile, tail unwritten
-            (3, 4, 1, 8, 6, 2, 3, 1, 1),   // asymmetric kernel, out_ch == 1
-            (2, 3, 33, 6, 6, 1, 1, 1, 1),  // 1x1 kernel, odd out_ch across a SIMD width
-            (1, 1, 5, 10, 7, 3, 2, 1, 2),  // in_ch == 1, mixed stride, ragged width
-            (4, 2, 2, 5, 5, 5, 5, 1, 1),   // kernel == plane: exactly one patch, well under a block
+            [2, 5, 3, 40, 40, 3, 3, 1, 1], // 6 blocks, ragged tail
+            [2, 3, 2, 34, 18, 3, 3, 1, 1], // 512 rows: exact block multiple, no tail
+            [2, 5, 3, 9, 8, 3, 3, 1, 1],   // below the plane gate, overlapping windows
+            [9, 3, 4, 7, 7, 3, 3, 1, 1],   // above the plane gate: col2im's other loop nest
+            [1, 2, 3, 11, 11, 3, 3, 2, 2], // strided: interior gaps stay +0.0
+            [2, 3, 2, 12, 12, 2, 2, 3, 3], // sw > kw: windows do not tile, tail unwritten
+            [3, 4, 1, 8, 6, 2, 3, 1, 1],   // asymmetric kernel, out_ch == 1
+            [2, 3, 33, 6, 6, 1, 1, 1, 1],  // 1x1 kernel, odd out_ch across a SIMD width
+            [1, 1, 5, 10, 7, 3, 2, 1, 2],  // in_ch == 1, mixed stride, ragged width
+            [4, 2, 2, 5, 5, 5, 5, 1, 1],   // kernel == plane: exactly one patch, well under a block
         ];
-        for (case, &(batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw)) in shapes.iter().enumerate() {
+        for (case, &[batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]) in shapes.iter().enumerate() {
             let oh = (ph - kh) / sh + 1;
             let ow = (pw - kw) / sw + 1;
             let patch_count = oh * ow;
