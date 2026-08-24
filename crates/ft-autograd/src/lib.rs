@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod masked_conv2d;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt;
@@ -4314,6 +4316,21 @@ impl TensorGradientSlot {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PAD_BACKWARD_OWNED_SLOT_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_pad_backward_owned_slot_moves() {
+    PAD_BACKWARD_OWNED_SLOT_MOVES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn pad_backward_owned_slot_moves() -> usize {
+    PAD_BACKWARD_OWNED_SLOT_MOVES.with(std::cell::Cell::get)
+}
+
 impl Default for TensorTape {
     fn default() -> Self {
         Self {
@@ -4331,6 +4348,21 @@ impl Default for TensorTape {
             detect_anomaly: false,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static F32_BACKWARD_OPERAND_WIDENS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn reset_f32_backward_operand_widens() {
+    F32_BACKWARD_OPERAND_WIDENS.with(|count| count.set((0, 0)));
+}
+
+#[cfg(test)]
+fn f32_backward_operand_widens() -> (usize, usize) {
+    F32_BACKWARD_OPERAND_WIDENS.with(std::cell::Cell::get)
 }
 
 impl TensorTape {
@@ -12002,27 +12034,35 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Mul { lhs, rhs } => {
-                    let lhs_values = Self::operand_values_cow(&self.nodes[lhs.0].tensor)?;
-                    let rhs_values = Self::operand_values_cow(&self.nodes[rhs.0].tensor)?;
-                    Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
-                    Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
+                    let lhs_requires_grad = self.nodes[lhs.0].requires_grad;
+                    let rhs_requires_grad = self.nodes[rhs.0].requires_grad;
 
-                    // d(a*b)/da = b ; d(a*b)/db = a. Same per-element f64 products
-                    // and ascending order as before, accumulated inline (no lhs/rhs
-                    // contrib Vecs; operands borrowed zero-copy for f64) and fanned over
-                    // Rayon (bit-identical). frankentorch-binop-bwd-par.
-                    Self::accumulate_tensor_gradient_par_with(
-                        lhs,
-                        &mut grads[lhs.0],
-                        incoming.len(),
-                        |index| incoming[index] * rhs_values[index],
-                    )?;
-                    Self::accumulate_tensor_gradient_par_with(
-                        rhs,
-                        &mut grads[rhs.0],
-                        incoming.len(),
-                        |index| incoming[index] * lhs_values[index],
-                    )?;
+                    // d(a*b)/da = b ; d(a*b)/db = a.  A non-grad operand cannot
+                    // receive a gradient, so do not materialize its counterpart merely
+                    // to compute and discard that absent gradient. This matters for f32:
+                    // each operand otherwise widens into the tape's f64 grad-space.
+                    if lhs_requires_grad {
+                        let rhs_values = Self::operand_values_cow(&self.nodes[rhs.0].tensor)?;
+                        Self::ensure_tensor_len(lhs, incoming.len(), incoming.len())?;
+                        Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
+                        Self::accumulate_tensor_gradient_par_with(
+                            lhs,
+                            &mut grads[lhs.0],
+                            incoming.len(),
+                            |index| incoming[index] * rhs_values[index],
+                        )?;
+                    }
+                    if rhs_requires_grad {
+                        let lhs_values = Self::operand_values_cow(&self.nodes[lhs.0].tensor)?;
+                        Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
+                        Self::ensure_tensor_len(rhs, incoming.len(), incoming.len())?;
+                        Self::accumulate_tensor_gradient_par_with(
+                            rhs,
+                            &mut grads[rhs.0],
+                            incoming.len(),
+                            |index| incoming[index] * lhs_values[index],
+                        )?;
+                    }
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
                     Self::complete_dependency(&mut pending, rhs, &mut queue)?;
@@ -15354,7 +15394,14 @@ impl TensorTape {
                         }
                     }
 
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // `contrib` is this Pad node's sole contribution to its input on
+                    // the ordinary first-order route. Move the freshly gathered crop
+                    // into its still-empty gradient slot instead of copying the whole
+                    // buffer once more. If another path already populated the slot,
+                    // the owned accumulator preserves the ordinary elementwise add.
+                    #[cfg(test)]
+                    PAD_BACKWARD_OWNED_SLOT_MOVES.with(|count| count.set(count.get() + 1));
+                    Self::accumulate_tensor_gradient_owned(input, &mut grads[input.0], contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -21163,6 +21210,11 @@ impl TensorTape {
             && tensor.meta().numel() >= Self::OPERAND_WIDEN_PARALLEL_MIN
             && let Ok(values) = tensor.contiguous_values_f32()
         {
+            #[cfg(test)]
+            F32_BACKWARD_OPERAND_WIDENS.with(|count| {
+                let (calls, elements) = count.get();
+                count.set((calls + 1, elements + values.len()));
+            });
             use rayon::prelude::*;
             return Ok(std::borrow::Cow::Owned(
                 values.par_iter().map(|&v| f64::from(v)).collect(),
@@ -22381,6 +22433,43 @@ mod tests {
         assert_eq!(
             tape.values_f32(out).expect("values should resolve"),
             vec![0.25f32, 0.5]
+        );
+    }
+
+    #[test]
+    fn tensor_mul_f32_non_grad_rhs_widens_only_the_required_operand() {
+        let len = TensorTape::OPERAND_WIDEN_PARALLEL_MIN;
+        let mut tape = TensorTape::new();
+        let lhs = tape
+            .leaf_f32(vec![2.0; len], vec![len], true)
+            .expect("differentiable f32 lhs");
+        let rhs = tape
+            .leaf_f32(
+                (0..len).map(|index| (index % 29) as f32 / 29.0).collect(),
+                vec![len],
+                false,
+            )
+            .expect("non-grad f32 rhs");
+        let (out, _) = tape
+            .mul(lhs, rhs, ExecutionMode::Strict)
+            .expect("f32 multiply");
+
+        super::reset_f32_backward_operand_widens();
+        let report = tape.backward(out).expect("backward");
+        assert_eq!(
+            super::f32_backward_operand_widens(),
+            (1, len),
+            "only rhs is needed for d(lhs * rhs)/d(lhs)"
+        );
+        assert!(report.gradient(rhs).is_none(), "non-grad rhs must stay absent");
+        assert_eq!(
+            report.gradient(lhs).expect("lhs grad"),
+            tape.values_f32(rhs)
+                .expect("rhs values")
+                .iter()
+                .map(|&value| f64::from(value))
+                .collect::<Vec<_>>()
+                .as_slice()
         );
     }
 
@@ -29881,6 +29970,7 @@ mod tests {
         // offset cannot coincide with the right answer.
         let mask: Vec<f64> = (0..padded_numel).map(|i| i as f64 + 0.25).collect();
 
+        super::reset_pad_backward_owned_slot_moves();
         let mut tape = TensorTape::new();
         let x = tape.leaf(values, SHAPE.to_vec(), true).expect("leaf");
         let padded = tape.pad(x, &PADDING, 0.0).expect("pad");
@@ -29895,6 +29985,11 @@ mod tests {
         let expected = unpad_gather_reference_4d(&mask, SHAPE, PAD_BEFORE, PADDED_SHAPE);
         assert_eq!(grad.len(), expected.len());
         assert_eq!(grad, expected, "pad backward gathered the wrong positions");
+        assert_eq!(
+            super::pad_backward_owned_slot_moves(),
+            1,
+            "the non-uniform Pad backward must move its gathered crop into the empty gradient slot"
+        );
     }
 
     /// The pad backward's PRE-ROW-COPY formula, reimplemented here verbatim, still agrees
