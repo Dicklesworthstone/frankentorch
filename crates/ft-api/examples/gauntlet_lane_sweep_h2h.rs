@@ -1284,6 +1284,11 @@ fn incumbent_sample(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Establish FrankenTorch's hardware-aware global pool before this harness asks rayon for
+    // provenance. `rayon::current_num_threads()` lazily creates the default 64-thread pool, so
+    // doing the query first would hide the library's no-environment policy from every lane.
+    // `RAYON_NUM_THREADS`, when explicitly set by a caller, still wins in `configure_global_pool`.
+    let _ = ft_kernel_cpu::pool::configure_global_pool();
     // frankentorch-yu1zm: THE A/A CONTROL FOR THE UNINIT PAIR. With
     // `FT_POOL_ZEROED_OUTPUT=1` the global default becomes the zeroed path, and the
     // `max_pool1d_zeroed` lane — which sets the toggle and then RESTORES the previous
