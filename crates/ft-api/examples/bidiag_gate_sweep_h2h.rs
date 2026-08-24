@@ -60,11 +60,6 @@ use ft_core::ExecutionMode;
 struct Arm {
     gate: u64,
     blocked: bool,
-    /// Whether the panel's two trailing updates run as ONE pass over `A22`
-    /// (`frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b). Bit-identical either way, so this
-    /// pair can move time and cannot move a number — `FT_FUSED=1,0` puts both halves in one
-    /// invocation against one live incumbent.
-    fused: bool,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -73,11 +68,7 @@ fn arm_label(arm: Arm) -> String {
     } else {
         format!("{}", arm.gate)
     };
-    format!(
-        "{gate}/{}/{}",
-        if arm.blocked { "4row" } else { "1row" },
-        if arm.fused { "fused" } else { "2pass" }
-    )
+    format!("{gate}/{}", if arm.blocked { "4row" } else { "1row" })
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -118,7 +109,6 @@ fn provenance() -> (f64, f64) {
 fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
     let previous_gate = ft_kernel_cpu::bidiag_parallel_gate_set(arm.gate);
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
-    let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -133,7 +123,6 @@ fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
         .sum();
     ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
-    ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
     (ms, sum)
 }
 
@@ -204,36 +193,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .collect();
-    // `frankentorch-4zjaa` item 247b's lever, as a paired arm. Default "1" so an existing command
-    // keeps measuring exactly what it measured before; `FT_FUSED=1,0` runs both halves in ONE
-    // invocation against ONE live incumbent, which is the only form item 25 admits.
-    let fuseds: Vec<bool> = std::env::var("FT_FUSED")
-        .unwrap_or_else(|_| "1".to_string())
-        .split(',')
-        .filter_map(|t| match t.trim() {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        })
-        .collect();
     assert!(
-        !sizes.is_empty() && !gate_values.is_empty() && !rowdots.is_empty() && !fuseds.is_empty(),
+        !sizes.is_empty() && !gate_values.is_empty() && !rowdots.is_empty(),
         "empty grid"
     );
     let arms: Vec<Arm> = gate_values
         .iter()
-        .flat_map(|&gate| {
-            rowdots.iter().flat_map(move |&blocked| {
-                fuseds
-                    .iter()
-                    .map(move |&fused| Arm {
-                        gate,
-                        blocked,
-                        fused,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        })
+        .flat_map(|&gate| rowdots.iter().map(move |&blocked| Arm { gate, blocked }))
         .collect();
     let rounds: usize = std::env::var("FT_ROUNDS")
         .ok()
