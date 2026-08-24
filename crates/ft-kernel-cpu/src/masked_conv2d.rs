@@ -92,16 +92,19 @@ pub fn conv2d_backward_mask_fused_f64(
 
     let dbias = output_mask[2].then(|| {
         let mut dbias = vec![0.0f64; out_ch];
-        dbias.par_iter_mut().enumerate().for_each(|(out_channel, slot)| {
-            let mut sum = 0.0;
-            for n in 0..batch {
-                let base = (n * out_ch + out_channel) * patch_count;
-                for patch in 0..patch_count {
-                    sum += incoming[base + patch] * mask[base + patch];
+        dbias
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(out_channel, slot)| {
+                let mut sum = 0.0;
+                for n in 0..batch {
+                    let base = (n * out_ch + out_channel) * patch_count;
+                    for patch in 0..patch_count {
+                        sum += incoming[base + patch] * mask[base + patch];
+                    }
                 }
-            }
-            *slot = sum;
-        });
+                *slot = sum;
+            });
         dbias
     });
 
@@ -115,10 +118,12 @@ mod tests {
     fn assert_option_bits(actual: Option<Vec<f64>>, expected: Option<Vec<f64>>) {
         assert_eq!(actual.is_some(), expected.is_some());
         if let (Some(actual), Some(expected)) = (actual, expected) {
-            assert!(actual
-                .iter()
-                .zip(expected)
-                .all(|(&a, b)| a.to_bits() == b.to_bits()));
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(&a, b)| a.to_bits() == b.to_bits())
+            );
         }
     }
 
@@ -127,8 +132,8 @@ mod tests {
         let padded: Vec<f64> = (0..50).map(|i| (i as f64 - 19.0) * -0.0625).collect();
         let weight: Vec<f64> = (0..18).map(|i| (i as f64 - 7.0) * 0.03125).collect();
         let mask = vec![
-            -1.0, 0.0, 0.5, -0.25, 1.0, -0.75, 0.125, 0.0, -1.5, 0.25, -0.5, 1.0,
-            0.75, -0.125, 0.0, -1.0, 0.5, -0.25, 1.0, 0.0, -0.5, 0.25, -0.75, 0.125,
+            -1.0, 0.0, 0.5, -0.25, 1.0, -0.75, 0.125, 0.0, -1.5, 0.25, -0.5, 1.0, 0.75, -0.125,
+            0.0, -1.0, 0.5, -0.25, 1.0, 0.0, -0.5, 0.25, -0.75, 0.125,
         ];
         (incoming, mask, padded, weight)
     }
@@ -138,11 +143,38 @@ mod tests {
         let (incoming, mask, padded, weight) = fixture();
         let materialized: Vec<f64> = incoming.iter().zip(&mask).map(|(&g, &m)| g * m).collect();
         let expected = super::super::conv2d_backward_masked_f64(
-            &materialized, &padded, &weight, 2, 1, 5, 5, 3, 3, 3, 2, 1, 1, 2,
+            &materialized,
+            &padded,
+            &weight,
+            2,
+            1,
+            5,
+            5,
+            3,
+            3,
+            3,
+            2,
+            1,
+            1,
+            2,
             [true, true, true],
         );
         let actual = conv2d_backward_mask_fused_f64(
-            &incoming, &mask, &padded, &weight, 2, 1, 5, 5, 3, 3, 3, 2, 1, 1, 2,
+            &incoming,
+            &mask,
+            &padded,
+            &weight,
+            2,
+            1,
+            5,
+            5,
+            3,
+            3,
+            3,
+            2,
+            1,
+            1,
+            2,
             [true, true, true],
         );
         assert_option_bits(actual.0, expected.0);
@@ -155,11 +187,38 @@ mod tests {
         let (incoming, _, padded, weight) = fixture();
         let mask = vec![0.0; incoming.len()];
         let expected = super::super::conv2d_backward_masked_f64(
-            &mask, &padded, &weight, 2, 1, 5, 5, 3, 3, 3, 2, 1, 1, 2,
+            &mask,
+            &padded,
+            &weight,
+            2,
+            1,
+            5,
+            5,
+            3,
+            3,
+            3,
+            2,
+            1,
+            1,
+            2,
             [true, true, true],
         );
         let actual = conv2d_backward_mask_fused_f64(
-            &incoming, &mask, &padded, &weight, 2, 1, 5, 5, 3, 3, 3, 2, 1, 1, 2,
+            &incoming,
+            &mask,
+            &padded,
+            &weight,
+            2,
+            1,
+            5,
+            5,
+            3,
+            3,
+            3,
+            2,
+            1,
+            1,
+            2,
             [true, true, true],
         );
         assert_option_bits(actual.0, expected.0);

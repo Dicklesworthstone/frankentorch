@@ -6,8 +6,8 @@
 use std::fmt;
 use std::simd::Simd;
 
-pub mod pool;
 mod masked_conv2d;
+pub mod pool;
 
 pub use masked_conv2d::conv2d_backward_mask_fused_f64;
 
@@ -67433,21 +67433,7 @@ mod tests {
     /// input. A blocked rewrite can therefore match the unblocked path on every case the suite
     /// runs and still diverge on the configuration `ga99y` actually broke on.
     ///
-    /// `#[ignore]` DELIBERATELY, AND THIS IS THE POINT OF THE TEST. The bead requires a test
-    /// that FAILS on today's code — "a new test that passes before the fix is not testing the
-    /// fix" — and rank 2 / scale 1e-20 is measured at 1.228e-2 leaving the prologue. Landing a
-    /// red test un-ignored would break the shared gate for every agent, so it is parked here
-    /// with its expected verdict written down instead.
-    ///
-    /// PROCEDURE when a toolchain exists:
-    ///   1. run it on TODAY's code and confirm it FAILS (if it passes, this test is worthless
-    ///      and the hole is elsewhere — say so rather than deleting it);
-    ///   2. land the blocked `form_p`;
-    ///   3. re-run, confirm it passes, and REMOVE the `#[ignore]`.
-    ///
-    /// UNVERIFIED: written under a build freeze (/data 29G, 99%), never compiled or run.
     #[test]
-    #[ignore = "4zjaa acceptance: expected to FAIL on today's code — see doc comment"]
     fn bidiag_blocked_matches_unblocked_on_rank_deficient_and_scaled_input() {
         // rank and scale chosen from the bead: rank 2 / scale 1e-20 is the configuration
         // ga99y measured at 1.228e-2. The unit-scale rank-deficient case is kept beside it so a
@@ -67485,7 +67471,7 @@ mod tests {
             // matters for 4zjaa: the rewrite changes how P is formed, so an oracle that throws
             // taup away cannot see the rewrite at all.
             let p_ref = super::bidiag::bidiag_form_p_f64(&a_ref, n, &taup_ref);
-            let p_blk = super::bidiag::bidiag_form_p_f64(&a_blk, n, &taup_blk);
+            let p_blk = super::bidiag::bidiag_form_p_blocked_f64(&a_blk, n, &taup_blk, nb);
             let err_ref = bidiag_p_orthonormality_error(&p_ref, n);
             let err_blk = bidiag_p_orthonormality_error(&p_blk, n);
             assert!(

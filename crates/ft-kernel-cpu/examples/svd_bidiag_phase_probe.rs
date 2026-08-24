@@ -77,45 +77,6 @@ fn measure() {
             "{arm:<16} t={threads:<3} N={n:<4} reduced {aa1:8.2} ms (A/A {aa2:8.2}, skew \
              {skew:4.1}%)  full {full:8.2} ms  svdvals {vals:8.2} ms"
         );
-
-        // FUSED-TRAILING A/B — `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b.
-        //
-        // ARM-INTERNAL, AND THEREFORE MAINTENANCE, NOT A WIN. There is no incumbent in this
-        // process and no ratio against PyTorch; a self-speedup does not certify anything. What
-        // this is for is SIZING: item 247b says the lever's "payoff is a memory-traffic argument
-        // that only a measurement can settle", and knowing whether it is worth 2% or 20% decides
-        // whether it deserves one of this host's rare quiet windows for a paired vs-incumbent
-        // row. Cheap to take, and it needs only `ft-kernel-cpu`, which matters because every h2h
-        // harness lives in `ft-api`.
-        //
-        // ONE PROCESS, palindrome ON/OFF/OFF/ON (item 51): the toggle is an `AtomicBool`, not the
-        // `OnceLock` that forces the NR/blocked arms above to re-exec, so host drift lands
-        // symmetrically on both arms instead of between two child processes. Min of the two
-        // placements per arm, per this campaign's estimator convention on a shared host.
-        //
-        // The A/A skew printed above is the noise floor this ratio has to clear: two timings of
-        // the IDENTICAL arm, so any fused/2pass difference smaller than that skew is not a
-        // finding.
-        let one = |fused: bool| -> f64 {
-            let previous = ft_kernel_cpu::bidiag_fused_trailing_set(fused);
-            let ms = time(reps, || {
-                std::hint::black_box(ft_kernel_cpu::svdvals_contiguous_f64(&a, &meta).unwrap());
-            });
-            ft_kernel_cpu::bidiag_fused_trailing_set(previous);
-            ms
-        };
-        let f1 = one(true);
-        let p1 = one(false);
-        let p2 = one(false);
-        let f2 = one(true);
-        let fused_ms = f1.min(f2);
-        let twopass_ms = p1.min(p2);
-        println!(
-            "{arm:<16} t={threads:<3} N={n:<4} TRAILING svdvals: fused {fused_ms:8.2} ms  \
-             2pass {twopass_ms:8.2} ms  2pass/fused {:.3}x  (>1 = the fusion helps; \
-             arm-internal, NOT a vs-incumbent claim; A/A skew {skew:4.1}% is the floor)",
-            twopass_ms / fused_ms
-        );
     }
 }
 
