@@ -46,7 +46,7 @@ mod tests {
         let output = [2.0, -3.0, 4.5, -7.0];
         let mask = [-1.0, 0.0, 0.25, -0.5];
         let fused = multiply_forward_f64(&output, &mask);
-        let expected: Vec<f64> = output.iter().zip(mask).map(|(&a, &b)| a * b).collect();
+        let expected: Vec<f64> = output.iter().zip(mask).map(|(&a, b)| a * b).collect();
         assert!(
             fused
                 .iter()
