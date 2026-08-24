@@ -11354,6 +11354,107 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// Records a constant-pad node using already materialized contiguous f64 output.
+    ///
+    /// This preserves constant pad's crop backward while allowing callers that have a
+    /// bit-identical block-copy value to avoid rebuilding it through the generic
+    /// coordinate-decoding implementation.
+    pub fn pad_with_precomputed_f64(
+        &mut self,
+        input: TensorNodeId,
+        padding: &[usize],
+        values: Vec<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.pad_with_precomputed_storage(input, padding, TensorStorage::F64(Arc::new(values)))
+    }
+
+    /// Records a constant-pad node using already materialized contiguous f32 output.
+    ///
+    /// Gradients remain represented in f64 by the existing [`TensorNodeOp::Pad`]
+    /// backward, exactly as they are for [`Self::pad`].
+    pub fn pad_with_precomputed_f32(
+        &mut self,
+        input: TensorNodeId,
+        padding: &[usize],
+        values: Vec<f32>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.pad_with_precomputed_storage(input, padding, TensorStorage::F32(Arc::new(values)))
+    }
+
+    fn pad_with_precomputed_storage(
+        &mut self,
+        input: TensorNodeId,
+        padding: &[usize],
+        storage: TensorStorage,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !padding.len().is_multiple_of(2) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "padding must have even number of elements",
+                },
+            )));
+        }
+
+        let (requires_grad, shape, device, dtype) = {
+            let node = self.node(input)?;
+            (
+                node.requires_grad,
+                node.tensor.meta().shape().to_vec(),
+                node.tensor.meta().device(),
+                node.tensor.meta().dtype(),
+            )
+        };
+        if storage.dtype() != dtype {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "precomputed pad storage dtype must match input",
+                },
+            )));
+        }
+
+        let ndim = shape.len();
+        let num_pad_dims = padding.len() / 2;
+        if num_pad_dims > ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "padding specifies more dimensions than input has",
+                },
+            )));
+        }
+
+        let mut out_shape = shape.clone();
+        for i in 0..num_pad_dims {
+            let dim = ndim - 1 - i;
+            let padded =
+                Self::checked_add_usize(shape[dim], padding[i * 2], "pad output shape overflow")?;
+            out_shape[dim] =
+                Self::checked_add_usize(padded, padding[i * 2 + 1], "pad output shape overflow")?;
+        }
+        let expected_len = Self::checked_shape_numel(&out_shape, "pad output shape overflow")?;
+        if storage.len() != expected_len {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "precomputed pad storage length must match padded shape",
+                },
+            )));
+        }
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_typed_storage(
+                TensorMeta::from_shape(out_shape, dtype, device),
+                storage,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Pad {
+                input,
+                padding: padding.to_vec(),
+                original_shape: shape,
+            },
+        });
+        Ok(out)
+    }
+
     pub fn lerp(
         &mut self,
         start: TensorNodeId,
@@ -29672,6 +29773,50 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn precomputed_pad_keeps_the_pad_gradient_for_f64_and_f32() {
+        let mut f64_tape = TensorTape::new();
+        let f64_input = f64_tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("f64 input");
+        let f64_padded = f64_tape
+            .pad_with_precomputed_f64(
+                f64_input,
+                &[1, 1, 1, 0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0],
+            )
+            .expect("precomputed f64 pad");
+        let (f64_loss, _) = f64_tape
+            .sum(f64_padded, ExecutionMode::Strict)
+            .expect("f64 sum");
+        let f64_report = f64_tape.backward(f64_loss).expect("f64 backward");
+        assert_eq!(
+            f64_report.gradient(f64_input),
+            Some(&[1.0, 1.0, 1.0, 1.0][..])
+        );
+
+        let mut f32_tape = TensorTape::new();
+        let f32_input = f32_tape
+            .leaf_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("f32 input");
+        let f32_padded = f32_tape
+            .pad_with_precomputed_f32(
+                f32_input,
+                &[1, 1, 1, 0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0],
+            )
+            .expect("precomputed f32 pad");
+        assert_eq!(f32_tape.dtype(f32_padded).expect("f32 dtype"), DType::F32);
+        let (f32_loss, _) = f32_tape
+            .sum(f32_padded, ExecutionMode::Strict)
+            .expect("f32 sum");
+        let f32_report = f32_tape.backward(f32_loss).expect("f32 backward");
+        assert_eq!(
+            f32_report.gradient(f32_input),
+            Some(&[1.0, 1.0, 1.0, 1.0][..])
+        );
     }
 
     /// Independent reference for constant-pad backward: for every element of the
