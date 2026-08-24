@@ -1,8 +1,10 @@
 // The aarch64 NEON dot-product intrinsics used below are stable on the pinned
 // toolchain; the architecture-specific implementations remain cfg-gated.
 #![deny(unsafe_code)]
+#![feature(portable_simd)]
 
 use std::fmt;
+use std::simd::Simd;
 
 mod masked_conv2d;
 pub mod pool;
@@ -13,6 +15,7 @@ use rayon::prelude::*;
 use wide::{f32x8, f64x4};
 
 const BATCH_NORM_MIN_PAR_ROWS: usize = 8;
+const AVG_POOL2D_BACKWARD_SIMD_LANES: usize = 4;
 
 type BatchedLuPartsF64 = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
 type SvdTripleF64 = (Vec<f64>, Vec<f64>, Vec<f64>);
@@ -13222,6 +13225,8 @@ fn avg_pool2d_backward_2x2s2_f64(
         // help: a hit skips the zero pass and the faults, a miss is exactly the
         // code that was here before.
         let fill = |dp: &mut [f64]| {
+            let zero = Simd::<f64, AVG_POOL2D_BACKWARD_SIMD_LANES>::splat(0.0);
+            let quarter = Simd::<f64, AVG_POOL2D_BACKWARD_SIMD_LANES>::splat(0.25);
             dp.par_chunks_mut(ih * iw)
                 .enumerate()
                 .for_each(|(plane, drow)| {
@@ -13229,7 +13234,37 @@ fn avg_pool2d_backward_2x2s2_f64(
                     for oy in 0..oh {
                         let row0 = (oy * 2) * iw;
                         let row1 = row0 + iw;
-                        for ox in 0..ow {
+                        let vectorized_ow =
+                            ow / AVG_POOL2D_BACKWARD_SIMD_LANES * AVG_POOL2D_BACKWARD_SIMD_LANES;
+                        for ox in (0..vectorized_ow).step_by(AVG_POOL2D_BACKWARD_SIMD_LANES) {
+                            // Exact per-lane transcription of `0.0 + dout[...] / 4.0`.
+                            // The zero add is deliberately retained for -0.0 parity; each
+                            // lane is independent, so this changes no accumulation order.
+                            let g = zero
+                                + Simd::from_slice(
+                                    &dout[dbase + oy * ow + ox
+                                        ..dbase + oy * ow + ox + AVG_POOL2D_BACKWARD_SIMD_LANES],
+                                ) * quarter;
+                            let (first_pair, second_pair) = g.interleave(g);
+                            let col0 = ox * 2;
+                            first_pair.copy_to_slice(
+                                &mut drow
+                                    [row0 + col0..row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                            second_pair.copy_to_slice(
+                                &mut drow[row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
+                                    ..row0 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                            first_pair.copy_to_slice(
+                                &mut drow
+                                    [row1 + col0..row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                            second_pair.copy_to_slice(
+                                &mut drow[row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
+                                    ..row1 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES],
+                            );
+                        }
+                        for ox in vectorized_ow..ow {
                             let col0 = ox * 2;
                             let g = dout[dbase + oy * ow + ox] / 4.0;
                             // `0.0 + g`, not a bare `g`: bit-exact with the
