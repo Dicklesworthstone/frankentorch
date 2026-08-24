@@ -11745,16 +11745,21 @@ pub fn max_pool3d_forward_with_indices_f64(
                     let row01 = row00 + iw;
                     let row10 = z1 + (oy * 2) * iw;
                     let row11 = row10 + iw;
-                    for ox in 0..ow {
-                        let x0 = ox * 2;
-                        let loc000 = row00 + x0;
-                        let loc001 = loc000 + 1;
-                        let loc010 = row01 + x0;
-                        let loc011 = loc010 + 1;
-                        let loc100 = row10 + x0;
-                        let loc101 = loc100 + 1;
-                        let loc110 = row11 + x0;
-                        let loc111 = loc110 + 1;
+                    // Adjacent stride-two windows are contiguous in x. Keep the
+                    // exact eight-element scan below, but advance its precomputed
+                    // addresses instead of recomputing `ox * 2` and every row
+                    // offset for each output. The 2x2x2 specialization owns this
+                    // route, so all eight input visits retain their prior order.
+                    let mut loc000 = row00;
+                    let mut loc001 = loc000 + 1;
+                    let mut loc010 = row01;
+                    let mut loc011 = loc010 + 1;
+                    let mut loc100 = row10;
+                    let mut loc101 = loc100 + 1;
+                    let mut loc110 = row11;
+                    let mut loc111 = loc110 + 1;
+                    let mut oidx = (oz * oh + oy) * ow;
+                    for _ in 0..ow {
 
                         let mut max_value = f64::NEG_INFINITY;
                         // The window's FIRST element, which is what torch reports
@@ -11805,9 +11810,17 @@ pub fn max_pool3d_forward_with_indices_f64(
                                 }
                             }
                         }
-                        let oidx = (oz * oh + oy) * ow + ox;
                         orow[oidx] = max_value;
                         arow[oidx] = arg as f64;
+                        loc000 += 2;
+                        loc001 += 2;
+                        loc010 += 2;
+                        loc011 += 2;
+                        loc100 += 2;
+                        loc101 += 2;
+                        loc110 += 2;
+                        loc111 += 2;
+                        oidx += 1;
                     }
                 }
             }
@@ -50288,6 +50301,69 @@ mod tests {
             values[1]
         );
         assert_eq!(offsets, vec![0.0, 15.0]);
+    }
+
+    #[test]
+    fn max_pool3d_indexed_2x2s2_address_walk_matches_padded_volume_reference_bits() {
+        // This is a materialized padded 4x4x4 volume: its low faces carry the
+        // max-pool padding value (-inf), while the interior includes both a
+        // signed-zero tie and a NaN. It deliberately needs every z/y/x address
+        // increment in the contiguous 2x2x2 path; an off-by-two walk selects a
+        // padding sentinel or the wrong first argmax.
+        let (id, ih, iw) = (4usize, 4usize, 4usize);
+        let mut padded = vec![f64::NEG_INFINITY; id * ih * iw];
+        let at = |z: usize, y: usize, x: usize| (z * ih + y) * iw + x;
+        padded[at(0, 0, 1)] = -0.0;
+        padded[at(0, 1, 0)] = 0.0;
+        padded[at(1, 1, 1)] = 3.5;
+        padded[at(0, 2, 2)] = 5.0;
+        padded[at(1, 3, 3)] = 6.0;
+        padded[at(2, 0, 0)] = 7.0;
+        padded[at(3, 1, 1)] = 8.0;
+        padded[at(2, 2, 2)] = 9.0;
+        padded[at(3, 3, 3)] = f64::NAN;
+
+        let (values, offsets) = super::max_pool3d_forward_with_indices_f64(
+            &padded, 1, 1, id, ih, iw, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        );
+
+        // Independent scalar transcription of the public 3-D pool contract.
+        // Keep its coordinate construction nested rather than borrowing the
+        // specialization's rolling-address implementation under test.
+        let mut expected_values = Vec::with_capacity(8);
+        let mut expected_offsets = Vec::with_capacity(8);
+        for oz in 0..2 {
+            for oy in 0..2 {
+                for ox in 0..2 {
+                    let mut maximum = f64::NEG_INFINITY;
+                    let mut offset = (oz * 2 * ih + oy * 2) * iw + ox * 2;
+                    for kd in 0..2 {
+                        for kh in 0..2 {
+                            for kw in 0..2 {
+                                let candidate_offset =
+                                    ((oz * 2 + kd) * ih + oy * 2 + kh) * iw + ox * 2 + kw;
+                                let candidate = padded[candidate_offset];
+                                if super::pool_max_beats(candidate, maximum) {
+                                    maximum = candidate;
+                                    offset = candidate_offset;
+                                }
+                            }
+                        }
+                    }
+                    expected_values.push(maximum);
+                    expected_offsets.push(offset as f64);
+                }
+            }
+        }
+
+        assert_eq!(
+            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected_values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(offsets, expected_offsets);
     }
 
     #[test]
