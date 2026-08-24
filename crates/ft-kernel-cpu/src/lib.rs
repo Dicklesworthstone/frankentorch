@@ -2660,8 +2660,7 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
 /// This is the CHUNK-SIZE shape of the fix rather than a global pool cap — it groups
 /// planes so the split creates about this many chunks, leaving `rayon`'s pool untouched
 /// so nothing else in the process changes width underneath it.
-/// frankentorch-rayon-pool-width-qq8as: a NARROW rayon pool that a kernel can run its
-/// parallel region on, leaving the process-wide pool alone.
+/// frankentorch-rayon-pool-width-qq8as: MaxPool3d's dedicated narrow Rayon pool.
 ///
 /// This is the shape item 52 pointed at. Three candidates were on the table -- global pool
 /// cap, per-op width cap, chunk-size change -- and the chunk-size one is REFUTED (0.922x,
@@ -2674,54 +2673,51 @@ pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<
 /// right for some ops and wrong for others -- the bead's own data shows gains from 1.01x
 /// to 1.94x across lanes, so one number cannot be correct everywhere.
 ///
-/// UNMEASURED AS OF THIS COMMIT. `install` has its own cost, and whether a persistent
-/// narrow pool beats the ambient one in situ is exactly the question item 52's failure
-/// says to answer by measuring rather than by reasoning.
-static NARROW_POOL_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The global physical-core policy chooses 16 workers on the scorecard host, but its
+/// MaxPool3d family loses up to 8% at that width (item 247). The independent width curve
+/// turns at eight workers, so this op keeps its own fixed eight-worker pool.
+const MAX_POOL3D_POOL_WIDTH: usize = 8;
 
-/// Enable or disable the narrow pool, returning the previous setting.
+/// Production uses the MaxPool3d pool by default. The switch exists only for paired tests
+/// that establish bit identity against the ambient pool.
+static MAX_POOL3D_POOL_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Enable or disable MaxPool3d's dedicated pool, returning the previous setting.
 ///
 /// An `AtomicBool` so a paired lane can flip it inside ONE process. The pool's WIDTH is
-/// fixed at first use and cannot be flipped, so an A/B varies only whether the narrow pool
+/// fixed at first use and cannot be flipped, so an A/B varies only whether this pool
 /// is used -- which is the comparison that matters.
-pub fn set_narrow_pool_enabled(enabled: bool) -> bool {
-    NARROW_POOL_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed)
+pub fn set_max_pool3d_pool_enabled(enabled: bool) -> bool {
+    MAX_POOL3D_POOL_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The narrow pool, built once. Width comes from `FT_NARROW_POOL_WIDTH`, defaulting to 8
-/// because that is where item 51's measured curve turns: 64 -> 1.904 ms, 32 -> 1.623,
-/// 16 -> 1.291, **8 -> 1.145**, 4 -> 1.195.
+/// MaxPool3d's pool is built once at its measured eight-worker width. This is code policy,
+/// not an environment override, so every process gets the same per-op guard.
 ///
 /// `None` if the pool cannot be built, in which case callers fall back to the ambient
-/// pool rather than failing -- a measurement knob must not be able to break a kernel.
-fn narrow_pool() -> Option<&'static rayon::ThreadPool> {
+/// pool rather than failing.
+fn max_pool3d_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let width = std::env::var("FT_NARROW_POOL_WIDTH")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|w| *w > 0)
-            .unwrap_or(8);
         rayon::ThreadPoolBuilder::new()
-            .num_threads(width)
-            .thread_name(|i| format!("ft-narrow-{i}"))
+            .num_threads(MAX_POOL3D_POOL_WIDTH)
+            .thread_name(|i| format!("ft-maxpool3d-{i}"))
             .build()
             .ok()
     })
     .as_ref()
 }
 
-/// Run a parallel region on the narrow pool when it is enabled, otherwise inline on the
-/// ambient pool.
+/// Run a MaxPool3d parallel region on its dedicated pool, otherwise inline on the ambient pool.
 ///
 /// The PARTITION is untouched -- callers keep their existing `par_chunks_mut` split -- so
 /// this changes only how many workers execute it. That is what makes the bit-exactness
 /// argument trivial: the same chunks do the same writes in the same order within a chunk,
 /// and chunks were already independent.
-fn with_narrow_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if NARROW_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-        && let Some(pool) = narrow_pool()
+fn with_max_pool3d_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if MAX_POOL3D_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(pool) = max_pool3d_pool()
     {
         return pool.install(f);
     }
@@ -12289,7 +12285,7 @@ pub fn max_pool3d_forward_with_indices_and_sum_f64(
         // `par_chunks_mut` split. The result is independent of worker count because the
         // recursion splits at a fixed `mid` and each half writes its own slice, so the
         // pairwise sum tree is the same shape whoever executes it.
-        with_narrow_pool(|| {
+        with_max_pool3d_pool(|| {
             max_pool3d_sum_pairwise_range_with_indices_f64_par(
                 input,
                 Some(&mut out),
@@ -12608,7 +12604,7 @@ pub fn max_pool3d_backward_from_indices_nonoverlapping_f64(
     let group = planes_per_chunk(batch * ch);
     // frankentorch-rayon-pool-width-qq8as: the partition is unchanged; only the pool that
     // executes it changes when the narrow pool is enabled.
-    with_narrow_pool(|| {
+    with_max_pool3d_pool(|| {
         din.par_chunks_mut(plane_len * group)
             .enumerate()
             .for_each(|(chunk_index, chunk)| {
@@ -47306,6 +47302,17 @@ mod tests {
         }
     }
 
+    static MAX_POOL3D_POOL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn max_pool3d_pool_policy_defaults_to_eight_workers() {
+        let _guard = MAX_POOL3D_POOL_SWITCH_TEST_LOCK
+            .lock()
+            .expect("max-pool3d pool test lock");
+        assert_eq!(super::MAX_POOL3D_POOL_WIDTH, 8);
+        assert!(super::MAX_POOL3D_POOL_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// frankentorch-rayon-pool-width-qq8as: the FORWARD the lane executes must also be
     /// bit-identical on the narrow pool.
     ///
@@ -47315,6 +47322,9 @@ mod tests {
     /// the last bits, so this checks the value AND the argmax sidecar AND the fused sum.
     #[test]
     fn max_pool3d_fused_forward_narrow_pool_is_bit_identical() {
+        let _guard = MAX_POOL3D_POOL_SWITCH_TEST_LOCK
+            .lock()
+            .expect("max-pool3d pool test lock");
         // Large enough to cross FUSED_POOL_SUM_PARALLEL_THRESHOLD (1 << 13) so the
         // parallel recursion is the arm under test, not the serial fallback.
         let (batch, ch, id, ih, iw) = (2usize, 32usize, 16usize, 16usize, 16usize);
@@ -47331,15 +47341,15 @@ mod tests {
             })
             .collect();
 
-        let previous = super::set_narrow_pool_enabled(false);
+        let previous = super::set_max_pool3d_pool_enabled(false);
         let (out_a, arg_a, sum_a) = super::max_pool3d_forward_with_indices_and_sum_f64(
             &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
         );
-        super::set_narrow_pool_enabled(true);
+        super::set_max_pool3d_pool_enabled(true);
         let (out_b, arg_b, sum_b) = super::max_pool3d_forward_with_indices_and_sum_f64(
             &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
         );
-        super::set_narrow_pool_enabled(previous);
+        super::set_max_pool3d_pool_enabled(previous);
 
         assert_eq!(
             sum_a.to_bits(),
@@ -47368,6 +47378,9 @@ mod tests {
     /// pool has more workers than chunks.
     #[test]
     fn max_pool3d_backward_narrow_pool_is_bit_identical() {
+        let _guard = MAX_POOL3D_POOL_SWITCH_TEST_LOCK
+            .lock()
+            .expect("max-pool3d pool test lock");
         for &(batch, ch, id, ih, iw) in
             &[(2usize, 32usize, 8usize, 8usize, 8usize), (1, 4, 8, 8, 8)]
         {
@@ -47397,15 +47410,15 @@ mod tests {
                 })
                 .collect();
 
-            let previous = super::set_narrow_pool_enabled(false);
+            let previous = super::set_max_pool3d_pool_enabled(false);
             let ambient = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
                 &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
             );
-            super::set_narrow_pool_enabled(true);
+            super::set_max_pool3d_pool_enabled(true);
             let narrow = super::max_pool3d_backward_from_indices_nonoverlapping_f64(
                 &dout, &offsets, batch, ch, id, ih, iw, od, oh, ow,
             );
-            super::set_narrow_pool_enabled(previous);
+            super::set_max_pool3d_pool_enabled(previous);
 
             assert_eq!(ambient.len(), narrow.len());
             for (i, (a, b)) in ambient.iter().zip(narrow.iter()).enumerate() {
