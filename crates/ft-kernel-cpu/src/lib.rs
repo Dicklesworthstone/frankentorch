@@ -553,6 +553,112 @@ mod gemm {
         });
     }
 
+    /// BOTH trailing updates of a blocked bidiagonal reduction in ONE pass over `C_sub`:
+    /// `C_sub -= A1 · B1^T` followed by `C_sub -= A2 · B2`.
+    ///
+    /// `frankentorch-4zjaa`, the lever NEGATIVE_EVIDENCE item 247b pre-specified and declined to
+    /// write blind. `bidiag_blocked_f64` calls `dgemm_bt_sub_into` and then `dgemm_sub_into` on
+    /// the SAME `A22` tile, so the dominant memory object of the reduction — `(n-i-nb)²`, summing
+    /// to ~180 MB of traffic at n=512 — is read and written TWICE per panel. This touches it once.
+    ///
+    /// # Why this is bit-exact where item 247b's version was not
+    ///
+    /// 247b proposed a hand-written fused triple loop and correctly refused to trust it: "the two
+    /// callees are tuned GEMMs with their own internal blocking, and a hand-written fused triple
+    /// loop would reproduce their k-accumulation order only by luck." That is now settled rather
+    /// than suspected, and the answer is that it would NOT: `matrixmultiply` selects
+    /// `KernelFmaAvx2` at runtime (`dgemm_kernel.rs`, `#[target_feature(enable="fma")]`), so its
+    /// micro-kernel contracts `ab += a * b` into a fused multiply-add and never rounds the
+    /// product. A scalar loop rounds twice and lands 1-2 ULP away — measured this session on the
+    /// conv2d dinput path, where exactly that assumption failed its own bitwise test.
+    ///
+    /// So the k-reductions stay inside `matrixmultiply` and NOTHING about the arithmetic moves.
+    /// This is the two existing loop bodies merged: the same `dgemm_mm` calls, on the same
+    /// pointers, with the same `(m, k, bw)` and the same strides, in the same order per element.
+    /// Only the INTERLEAVING changes — block `blk`'s second update now runs before block `blk+1`'s
+    /// first, and the column blocks are disjoint, so no element's sequence of operations differs.
+    /// Both callees derive their blocking from `block_cols(n)` with the same `n` in the same
+    /// invocation, so the two loops being merged were already walking identical block boundaries.
+    ///
+    /// That makes bit-exactness structural, not empirical — but it is asserted anyway, because a
+    /// structural argument that nobody executed is how item 114 shipped a "FREE" constant:
+    /// `bidiag_fused_trailing_update_matches_two_passes_bitwise` compares `to_bits()` against the
+    /// two-call sequence at eleven shapes, and carries a planted negative proving it can fail.
+    ///
+    /// A SECOND, FREE EFFECT: this is one parallel region where there were two, halving the
+    /// fork/join count of the trailing update. `frankentorch-75e38` candidate 2 asks for exactly
+    /// that ("reduce the number of synchronisation points rather than their cost"), and item 255
+    /// priced a rayon fork on this host at ~7 us.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dgemm_bt_then_nt_sub_into(
+        m: usize,
+        k: usize,
+        n: usize,
+        a_bt: &[f64],
+        b_bt: &[f64],
+        a_nt: &[f64],
+        b_nt: &[f64],
+        c: &mut [f64],
+        c_off: usize,
+        ldc: usize,
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a_bt = &a_bt[..m * k];
+        let b_bt = &b_bt[..n * k];
+        let a_nt = &a_nt[..m * k];
+        let b_nt = &b_nt[..k * n];
+        let nb = block_cols(n);
+        let cp = TilePtr(c.as_mut_ptr());
+        (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+            let cp = &cp;
+            let n0 = blk * nb;
+            let bw = (n0 + nb).min(n) - n0;
+            // SAFETY: identical to the two callees this merges, block for block. `a_bt` and
+            // `a_nt` are m*k; `b_bt[n0*k..]` holds bw rows of k (B^T via rsb=1, csb=k) and
+            // `b_nt.add(n0)` is the [k×n] matrix's column window (rsb=n, csb=1). The output
+            // window row i col (n0+j) is c_off + i*ldc + n0 + j, and column windows are disjoint
+            // across blocks, so writes never race. beta=1 accumulates into the existing C and
+            // alpha=-1 subtracts, so the second call reads what the first wrote — which is the
+            // point, and is why they must stay in this order.
+            unsafe {
+                dgemm_mm(
+                    m,
+                    k,
+                    bw,
+                    -1.0,
+                    a_bt.as_ptr(),
+                    k as isize,
+                    1,
+                    b_bt.as_ptr().add(n0 * k),
+                    1,
+                    k as isize,
+                    1.0,
+                    cp.0.add(c_off + n0),
+                    ldc as isize,
+                    1,
+                );
+                dgemm_mm(
+                    m,
+                    k,
+                    bw,
+                    -1.0,
+                    a_nt.as_ptr(),
+                    k as isize,
+                    1,
+                    b_nt.as_ptr().add(n0),
+                    n as isize,
+                    1,
+                    1.0,
+                    cp.0.add(c_off + n0),
+                    ldc as isize,
+                    1,
+                );
+            }
+        });
+    }
+
     /// f32 analogue of `dgemm_sub_into`: `C_sub -= A · B` (B contiguous [k×n]).
     /// frankentorch-kgs4.62.
     #[allow(clippy::too_many_arguments)]
@@ -32034,6 +32140,28 @@ mod bidiag {
         ROWDOT_BLOCKED.swap(blocked, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the panel's two trailing updates run as ONE pass over `A22`. Default TRUE; the
+    /// false arm is the two-call sequence it replaced.
+    ///
+    /// `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b. Same reasoning as `ROWDOT_BLOCKED`
+    /// directly above, and for the same host: the two arms are BIT-IDENTICAL in output
+    /// (`bidiag_fused_trailing_update_matches_two_passes_bitwise`), so alternating them inside
+    /// ONE process against ONE live incumbent costs nothing in parity and avoids a two-binary
+    /// A/B that needs a second quiet window this machine does not reliably grant. It also dodges
+    /// `frankentorch-75e38`'s stated obstacle with `svd_bidiag_block_size`, which is a `OnceLock`
+    /// and therefore one-value-per-process and untoggleable.
+    static FUSED_TRAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub(crate) fn fused_trailing_enabled() -> bool {
+        FUSED_TRAILING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the trailing-update form, returning the previous setting so a paired lane can restore
+    /// it.
+    pub(crate) fn set_fused_trailing(fused: bool) -> bool {
+        FUSED_TRAILING.swap(fused, std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[inline]
     fn dot_rows_into_f64(
         a: &[f64],
@@ -32622,10 +32750,30 @@ mod bidiag {
                 });
 
                 let off22 = (i + nb) * lda + (i + nb);
-                // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
-                super::gemm::dgemm_bt_sub_into(m2, nb, n2, &u, &y[nb * nb..], a, off22, lda);
-                // A22 -= X2 * V     (X2 = rows nb.. of x, already contiguous)
-                super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], &v, a, off22, lda);
+                if fused_trailing_enabled() {
+                    // ONE pass over A22 for both updates — item 247b's pre-specified lever.
+                    // Bit-exact by construction (same calls, same order per element); see
+                    // `gemm::dgemm_bt_then_nt_sub_into` for why the fused TRIPLE LOOP that item
+                    // proposed would not have been, and `set_bidiag_fused_trailing` for why the
+                    // two-pass form is still reachable.
+                    super::gemm::dgemm_bt_then_nt_sub_into(
+                        m2,
+                        nb,
+                        n2,
+                        &u,
+                        &y[nb * nb..],
+                        &x[nb * nb..],
+                        &v,
+                        a,
+                        off22,
+                        lda,
+                    );
+                } else {
+                    // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
+                    super::gemm::dgemm_bt_sub_into(m2, nb, n2, &u, &y[nb * nb..], a, off22, lda);
+                    // A22 -= X2 * V     (X2 = rows nb.. of x, already contiguous)
+                    super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], &v, a, off22, lda);
+                }
             }
 
             // Restore the true diagonal/superdiagonal over the unit entries the
@@ -34252,6 +34400,19 @@ pub fn bidiag_parallel_branches_take() -> (u64, u64, u64) {
 #[doc(hidden)]
 pub fn bidiag_rowdot_blocked_set(blocked: bool) -> bool {
     bidiag::set_rowdot_blocked(blocked)
+}
+
+/// Set the panel's trailing-update form: `true` = ONE pass over `A22` applying both updates
+/// (`frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b), `false` = the two-call sequence it
+/// replaced. Returns the previous setting.
+///
+/// The two arms are BIT-IDENTICAL in output — the same `dgemm_mm` calls on the same column
+/// blocks in the same per-element order, only interleaved — so this is a pure speed switch, and
+/// it exists for the same reason `bidiag_rowdot_blocked_set` does: the A/B has to run inside one
+/// process against one incumbent arm on a host that rarely grants a quiet window.
+#[doc(hidden)]
+pub fn bidiag_fused_trailing_set(fused: bool) -> bool {
+    bidiag::set_fused_trailing(fused)
 }
 
 /// The currently live bidiagonal parallel gate.
@@ -44282,6 +44443,126 @@ mod tests {
             }
         }
         assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
+    }
+
+    /// Build the four operands and the C tile for a fused-trailing-update case.
+    ///
+    /// `c` is oversized and the update targets a STRIDED window at `c_off` with row stride
+    /// `ldc`, exactly as `bidiag_blocked_f64` uses it — a fused kernel that quietly assumed a
+    /// contiguous `m x n` C would pass on a flat fixture and corrupt the real one.
+    fn fused_trailing_fixture(
+        m: usize,
+        k: usize,
+        n: usize,
+        ldc: usize,
+        c_off: usize,
+        c_len: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let f = |i: usize, a: f64, b: f64| ((i % 23) as f64).mul_add(a, b);
+        let u: Vec<f64> = (0..m * k).map(|i| f(i, 0.031, -0.37)).collect();
+        let y2: Vec<f64> = (0..n * k).map(|i| f(i, -0.017, 0.21)).collect();
+        let x2: Vec<f64> = (0..m * k).map(|i| f(i, 0.013, 0.09)).collect();
+        let v: Vec<f64> = (0..k * n).map(|i| f(i, 0.041, -0.11)).collect();
+        // Includes a negative zero so a kernel that canonicalised signs would show up.
+        let c: Vec<f64> = (0..c_len)
+            .map(|i| if i % 37 == 0 { -0.0 } else { f(i, 0.007, -0.5) })
+            .collect();
+        let _ = (ldc, c_off);
+        (u, y2, x2, v, c)
+    }
+
+    #[test]
+    fn bidiag_fused_trailing_update_matches_two_passes_bitwise() {
+        // `frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b. `dgemm_bt_then_nt_sub_into` claims
+        // to be the two `sub_into` calls merged into one pass over A22, with the arithmetic
+        // untouched. The claim is structural — same `dgemm_mm` calls, same column blocks, same
+        // per-element order — but item 114 shipped a "FREE" constant on a structural argument
+        // nobody executed, so this executes it.
+        //
+        // Shapes are chosen for the ways a merged loop breaks rather than for coverage: `n`
+        // straddling MIN_BLOCK_COLS (128) so the fused loop runs one block, exactly one, and
+        // several; a `k` of 8 (the shipped panel width) and 16 (the previous one); non-square
+        // and skinny tiles; and every case driven through a STRIDED C window.
+        //                m    k    n   ldc  c_off
+        let cases: [[usize; 5]; 11] = [
+            [8, 8, 8, 40, 41],        // far below one block
+            [64, 8, 127, 200, 173],   // one block, just under MIN_BLOCK_COLS
+            [64, 8, 128, 200, 173],   // exactly MIN_BLOCK_COLS
+            [64, 8, 129, 200, 173],   // just over: the first two-block case
+            [96, 8, 300, 400, 401],   // several blocks, ragged last
+            [96, 8, 384, 400, 401],   // several blocks, exact multiple
+            [200, 16, 512, 600, 601], // k = the previous panel width
+            [1, 8, 300, 320, 7],      // single row
+            [64, 1, 300, 320, 7],     // rank-1 update: k = 1
+            [7, 3, 5, 11, 13],        // all tiny and coprime-ish
+            [130, 8, 130, 137, 139],  // ldc barely exceeds n, offset unaligned
+        ];
+        for (case, &[m, k, n, ldc, c_off]) in cases.iter().enumerate() {
+            let c_len = c_off + m * ldc + n + 8;
+            let (u, y2, x2, v, c0) = fused_trailing_fixture(m, k, n, ldc, c_off, c_len);
+
+            // Reference: the two calls, in the order `bidiag_blocked_f64` makes them.
+            let mut want = c0.clone();
+            super::gemm::dgemm_bt_sub_into(m, k, n, &u, &y2, &mut want, c_off, ldc);
+            super::gemm::dgemm_sub_into(m, k, n, &x2, &v, &mut want, c_off, ldc);
+
+            let mut got = c0.clone();
+            super::gemm::dgemm_bt_then_nt_sub_into(m, k, n, &u, &y2, &x2, &v, &mut got, c_off, ldc);
+
+            assert_eq!(got.len(), want.len(), "case {case}: C length");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "case {case} element {i}: fused {g} != two-pass {w} \
+                     (m={m} k={k} n={n} ldc={ldc} c_off={c_off})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bidiag_fused_trailing_update_bitwise_test_can_actually_fail() {
+        // PLANTED NEGATIVE. The test above asserts an equality that is TRUE BY CONSTRUCTION, and
+        // an equality that cannot fail is not evidence. This plants the most plausible mutation a
+        // "fusion" invites -- applying the two updates in the other order -- and asserts the
+        // comparison CATCHES it. `(a - s1) - s2` and `(a - s2) - s1` are the same real number and
+        // different f64s, so if this ever starts passing, the harness has stopped comparing bits
+        // and the test above is worthless.
+        //
+        // Deliberately NOT a test of the shipping kernel: it mutates the REFERENCE, so it keeps
+        // proving the comparison is sensitive even if the kernel is later rewritten.
+        let (m, k, n, ldc, c_off) = (96usize, 8usize, 300usize, 400usize, 401usize);
+        let c_len = c_off + m * ldc + n + 8;
+        let (u, y2, x2, v, c0) = fused_trailing_fixture(m, k, n, ldc, c_off, c_len);
+
+        let mut correct = c0.clone();
+        super::gemm::dgemm_bt_sub_into(m, k, n, &u, &y2, &mut correct, c_off, ldc);
+        super::gemm::dgemm_sub_into(m, k, n, &x2, &v, &mut correct, c_off, ldc);
+
+        let mut swapped = c0.clone();
+        super::gemm::dgemm_sub_into(m, k, n, &x2, &v, &mut swapped, c_off, ldc);
+        super::gemm::dgemm_bt_sub_into(m, k, n, &u, &y2, &mut swapped, c_off, ldc);
+
+        let differing = correct
+            .iter()
+            .zip(swapped.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            differing > 0,
+            "swapping the two updates must change some bits, or the bitwise comparison in \
+             bidiag_fused_trailing_update_matches_two_passes_bitwise proves nothing"
+        );
+
+        // And the two orders must still agree to roundoff -- if they did not, the "fusion" would
+        // be hiding a real algebraic error rather than a rounding difference.
+        for (a, b) in correct.iter().zip(swapped.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0),
+                "the two orders must differ only in rounding: {a} vs {b}"
+            );
+        }
     }
 
     #[test]
