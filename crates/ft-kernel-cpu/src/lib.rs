@@ -9575,6 +9575,21 @@ thread_local! {
     static CONV2D_DPANEL_GEMMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONV2D_ONES_DWEIGHT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn conv2d_ones_dweight_scan_count() -> usize {
+    CONV2D_ONES_DWEIGHT_SCANS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_conv2d_ones_dweight_scan_count() {
+    CONV2D_ONES_DWEIGHT_SCANS.with(|count| count.set(0));
+}
+
 /// `(dweight GEMMs, dpanel GEMMs)` executed by the MASKED conv2d backwards on THIS THREAD since
 /// the last reset.
 ///
@@ -9678,12 +9693,32 @@ pub fn conv2d_backward_masked_f64(
     // `conv2d_ones_dout_route`, not a local copy of the guards — item 200. The comment this
     // replaces said the two functions "cannot disagree" while they each carried their own copy,
     // which is the assurance a second copy is least able to give.
-    let ones_route = !dout.is_empty()
-        && conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw).is_some()
-        && dout_is_all_ones_f64(dout);
+    let ones_route = (!dout.is_empty() && dout_is_all_ones_f64(dout))
+        .then(|| conv2d_ones_dout_route(ph, kh, kw, oh, sh, sw))
+        .flatten();
     let both = output_mask[0] && output_mask[1];
 
-    if ones_route || both {
+    // Unlike the generic route, the 3x3 all-ones adjoint has no shared panel: its dweight scan
+    // and dpadded GEMM/scatter are independent. Preserve the existing full adjoint for callers
+    // requesting both, but do not compute a frozen weight's discarded scan on the summed route.
+    if let Some(ConvOnesRoute::ThreeByThreeStride1) = ones_route
+        && !both
+    {
+        return conv2d_backward_3x3_stride1_ones_dout_masked_f64(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            oh,
+            ow,
+            out_ch,
+            output_mask,
+        );
+    }
+
+    if ones_route.is_some() || both {
         let (dpadded, dweight, dbias) = conv2d_backward_f64(
             dout,
             padded,
@@ -10686,92 +10721,131 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let (dpadded, dweight, dbias) = conv2d_backward_3x3_stride1_ones_dout_masked_f64(
+        padded,
+        weight_flat,
+        batch,
+        in_ch,
+        ph,
+        pw,
+        oh,
+        ow,
+        out_ch,
+        [true, true, has_bias],
+    );
+    match (dpadded, dweight) {
+        (Some(dpadded), Some(dweight)) => (dpadded, dweight, dbias),
+        _ => unreachable!("the full 3x3 all-ones adjoint requests both gradients"),
+    }
+}
+
+/// Mask-aware 3x3 all-ones conv2d adjoint.
+///
+/// The weight scan and input-gradient GEMM/scatter are independent, so a frozen weight must not
+/// make the summed route compute and discard `dweight`. Each selected half preserves the exact
+/// operation order of [`conv2d_backward_3x3_stride1_ones_dout_f64`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_3x3_stride1_ones_dout_masked_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+    output_mask: [bool; 3],
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
     let kh = 3usize;
     let kw = 3usize;
     let patch_width = in_ch * kh * kw;
     let flat = batch * oh * ow;
 
-    let mut dweight_row = vec![0.0f64; patch_width];
-    dweight_row
-        .par_chunks_mut(kh * kw)
-        .enumerate()
-        .for_each(|(c, dwc)| {
-            for kr in 0..kh {
-                for kc in 0..kw {
-                    // FOLD ON THE GEMM's OWN BOUNDARIES (frankentorch-ikw6q). This
-                    // reduction replaces `dgemm(1, flat, patch_width, ones, panel)`, and
-                    // `dgemm` delegates to matrixmultiply, which BLOCKS k at `DGEMM_KC`.
-                    // A single ascending chain over `flat` is a DIFFERENT summation order
-                    // and diverges from the panel route once `flat > DGEMM_KC` — 104 of
-                    // 108 dweight entries differed at oh=ow=64. Blocking here reproduces
-                    // the GEMM's order exactly, so the "bit-exact vs panel+GEMM" claim
-                    // this path shipped with in 2026-07-05 becomes true rather than being
-                    // downgraded to a tolerance. `folded` keeps the FIRST block assigned
-                    // rather than added into 0.0, so a `-0.0` first block is not
-                    // canonicalised to `+0.0` (frankentorch-dtyiz).
-                    let mut total = 0.0f64;
-                    let mut block = 0.0f64;
-                    let mut in_block = 0usize;
-                    let mut folded = false;
-                    for n in 0..batch {
-                        let ch_off = (n * in_ch + c) * ph * pw;
-                        for oy in 0..oh {
-                            let irow = ch_off + (oy + kr) * pw + kc;
-                            for ox in 0..ow {
-                                block += padded[irow + ox];
-                                in_block += 1;
-                                if in_block == DGEMM_KC {
-                                    if folded {
-                                        total += block;
-                                    } else {
-                                        total = block;
-                                        folded = true;
+    let dweight = output_mask[1].then(|| {
+        #[cfg(test)]
+        CONV2D_ONES_DWEIGHT_SCANS.with(|count| count.set(count.get() + 1));
+        let mut dweight_row = vec![0.0f64; patch_width];
+        dweight_row
+            .par_chunks_mut(kh * kw)
+            .enumerate()
+            .for_each(|(c, dwc)| {
+                for kr in 0..kh {
+                    for kc in 0..kw {
+                        // FOLD ON THE GEMM's OWN BOUNDARIES (frankentorch-ikw6q). This
+                        // reduction replaces `dgemm(1, flat, patch_width, ones, panel)`, and
+                        // `dgemm` delegates to matrixmultiply, which BLOCKS k at `DGEMM_KC`.
+                        // A single ascending chain over `flat` is a DIFFERENT summation order
+                        // and diverges from the panel route once `flat > DGEMM_KC` — 104 of
+                        // 108 dweight entries differed at oh=ow=64. Blocking here reproduces
+                        // the GEMM's order exactly, so the "bit-exact vs panel+GEMM" claim
+                        // this path shipped with in 2026-07-05 becomes true rather than being
+                        // downgraded to a tolerance. `folded` keeps the FIRST block assigned
+                        // rather than added into 0.0, so a `-0.0` first block is not
+                        // canonicalised to `+0.0` (frankentorch-dtyiz).
+                        let mut total = 0.0f64;
+                        let mut block = 0.0f64;
+                        let mut in_block = 0usize;
+                        let mut folded = false;
+                        for n in 0..batch {
+                            let ch_off = (n * in_ch + c) * ph * pw;
+                            for oy in 0..oh {
+                                let irow = ch_off + (oy + kr) * pw + kc;
+                                for ox in 0..ow {
+                                    block += padded[irow + ox];
+                                    in_block += 1;
+                                    if in_block == DGEMM_KC {
+                                        if folded {
+                                            total += block;
+                                        } else {
+                                            total = block;
+                                            folded = true;
+                                        }
+                                        block = 0.0;
+                                        in_block = 0;
                                     }
-                                    block = 0.0;
-                                    in_block = 0;
                                 }
                             }
                         }
-                    }
-                    if in_block > 0 {
-                        if folded {
-                            total += block;
-                        } else {
-                            total = block;
+                        if in_block > 0 {
+                            if folded {
+                                total += block;
+                            } else {
+                                total = block;
+                            }
                         }
+                        dwc[kr * kw + kc] = total;
                     }
-                    dwc[kr * kw + kc] = total;
                 }
-            }
-        });
+            });
 
-    let mut dweight = vec![0.0f64; out_ch * patch_width];
-    dweight
-        .par_chunks_mut(patch_width)
-        .for_each(|row| row.copy_from_slice(&dweight_row));
+        let mut dweight = vec![0.0f64; out_ch * patch_width];
+        dweight
+            .par_chunks_mut(patch_width)
+            .for_each(|row| row.copy_from_slice(&dweight_row));
+        dweight
+    });
 
     // frankentorch-ikw6q, SECOND defect — see the height-1 path for the full reasoning.
     // The dpanel GEMM's k is `out_ch`, not `flat`, and a hand-rolled chain over `oc`
     // diverged from it above 256 channels. One `dgemm` row is bit-identical to every row
     // the generic route produces when dout is all ones.
-    let ones_out = vec![1.0f64; out_ch];
-    let mut dpanel_row = vec![0.0f64; patch_width];
-    gemm::dgemm(
-        1,
-        out_ch,
-        patch_width,
-        &ones_out,
-        weight_flat,
-        &mut dpanel_row,
-    );
+    let dpadded = output_mask[0].then(|| {
+        let ones_out = vec![1.0f64; out_ch];
+        let mut dpanel_row = vec![0.0f64; patch_width];
+        gemm::dgemm(
+            1,
+            out_ch,
+            patch_width,
+            &ones_out,
+            weight_flat,
+            &mut dpanel_row,
+        );
+        conv2d_ones_dout_scatter_dpadded_f64(&dpanel_row, batch, in_ch, ph, pw, oh, ow)
+    });
 
-    let dpadded = conv2d_ones_dout_scatter_dpadded_f64(&dpanel_row, batch, in_ch, ph, pw, oh, ow);
-
-    let dbias = if has_bias {
-        Some(vec![flat as f64; out_ch])
-    } else {
-        None
-    };
+    let dbias = output_mask[2].then(|| vec![flat as f64; out_ch]);
     (dpadded, dweight, dbias)
 }
 
@@ -47312,6 +47386,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The all-ones 3x3 route must honor the mask before starting its independent dweight scan.
+    ///
+    /// The ordinary masked-gradient test above establishes values and `None` presence, but an old
+    /// implementation could still compute then discard dweight. This test makes that production
+    /// cost observable: the frozen-weight summed route reaches the specialisation without scanning
+    /// dweight, while requesting dweight performs exactly one scan.
+    #[test]
+    fn conv2d_all_ones_mask_skips_the_discarded_dweight_scan() {
+        let (batch, in_ch, ph, pw) = (2usize, 3usize, 9usize, 10usize);
+        let (oh, ow, out_ch) = (7usize, 8usize, 4usize);
+        let patch_width = in_ch * 3 * 3;
+        let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i * 17 % 31) as f64 - 15.0) / 1024.0)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 37) as f64 - 18.0) / 2048.0)
+            .collect();
+        let dout = vec![1.0f64; batch * out_ch * oh * ow];
+
+        super::reset_conv2d_ones_dweight_scan_count();
+        let (dpadded, dweight, dbias) = super::conv2d_backward_masked_f64(
+            &dout,
+            &padded,
+            &weight,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            3,
+            3,
+            oh,
+            ow,
+            1,
+            1,
+            out_ch,
+            [true, false, false],
+        );
+        assert!(dpadded.is_some(), "the requested input gradient is present");
+        assert!(dweight.is_none(), "the frozen weight has no gradient");
+        assert!(dbias.is_none(), "no bias gradient was requested");
+        assert_eq!(
+            super::conv2d_ones_dweight_scan_count(),
+            0,
+            "the frozen-weight all-ones route scanned dweight before discarding it"
+        );
+
+        super::reset_conv2d_ones_dweight_scan_count();
+        let (_, dweight, _) = super::conv2d_backward_masked_f64(
+            &dout,
+            &padded,
+            &weight,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            3,
+            3,
+            oh,
+            ow,
+            1,
+            1,
+            out_ch,
+            [false, true, false],
+        );
+        assert!(
+            dweight.is_some(),
+            "the requested weight gradient is present"
+        );
+        assert_eq!(
+            super::conv2d_ones_dweight_scan_count(),
+            1,
+            "the requested all-ones dweight scan did not execute exactly once"
+        );
     }
 
     /// frankentorch-hi9r6 item 175: conv2d's forward and backward must return BIT-IDENTICAL
