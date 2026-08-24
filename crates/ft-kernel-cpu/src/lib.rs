@@ -5,6 +5,9 @@
 use std::fmt;
 
 pub mod pool;
+mod masked_conv2d;
+
+pub use masked_conv2d::conv2d_backward_mask_fused_f64;
 
 use rayon::prelude::*;
 use wide::{f32x8, f64x4};
