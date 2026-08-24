@@ -32731,6 +32731,7 @@ mod bidiag {
                         s += a[at(p, c)] * x[i * ldx + p];
                     }
                     a[at(i, c)] -= s;
+                    c += 1;
                 }
 
                 // (11) Row reflector over a[i, i+1..].
