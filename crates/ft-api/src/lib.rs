@@ -67296,20 +67296,18 @@ impl FrankenTorchSession {
         padding: &[usize],
         value: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        // No-grad block-copy fast path. The tape pad clones the input and builds the output
+        // Block-copy value fast path. The tape pad builds the output
         // by a per-OUTPUT-ELEMENT O(ndim) coordinate decode (~16M divides for a 4k×4k pad,
         // measured 3.7x SLOWER than torch). But constant padding is pure contiguous data
         // movement: each input row maps to exactly one contiguous run in the output (offset
         // by the last-dim pad), every other output element is `value`. Memset the border
         // value once (calloc-fast for the common value==0.0 case), then block-copy each input
         // row into its run — ~out_outer ROW decodes instead of out_numel ELEMENT decodes.
-        // Bit-identical to the tape pad (same values, each output written once). f64/f32
-        // contiguous no-grad only; other dtypes / non-contiguous / grad / empty fall through.
+        // Bit-identical to the tape pad (same values, each output written once). The precomputed
+        // value still records the usual Pad node, so a grad-requiring input keeps its crop
+        // backward. f64/f32 contiguous only; other dtypes / non-contiguous / empty fall through.
         let dtype = self.tensor_dtype(input)?;
-        if padding.len().is_multiple_of(2)
-            && !self.tensor_requires_grad(input)?
-            && matches!(dtype, DType::F64 | DType::F32)
-        {
+        if padding.len().is_multiple_of(2) && matches!(dtype, DType::F64 | DType::F32) {
             let shape = self.tensor_shape(input)?;
             let ndim = shape.len();
             let num_pad_dims = padding.len() / 2;
@@ -67450,10 +67448,14 @@ impl FrankenTorchSession {
                             }
                         }
                         if let Some(out) = out_f64 {
-                            return self.tensor_variable(out, out_shape, false);
+                            return self
+                                .tensor_tape
+                                .pad_with_precomputed_f64(input, padding, out);
                         }
                         if let Some(out) = out_f32 {
-                            return self.tensor_variable_f32(out, out_shape, false);
+                            return self
+                                .tensor_tape
+                                .pad_with_precomputed_f32(input, padding, out);
                         }
                     }
                 }
@@ -119726,6 +119728,53 @@ mod tests {
                 1.0, 2.0, 9.0, // row 0 + right pad
                 3.0, 4.0, 9.0, // row 1 + right pad
             ]
+        );
+    }
+
+    #[test]
+    fn session_pad_block_copy_preserves_the_grad_path_for_f64_and_f32() {
+        let mut f64_session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let f64_input = f64_session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("f64 input");
+        let f64_padded = f64_session
+            .tensor_pad(f64_input, &[1, 1, 1, 0], 0.0)
+            .expect("f64 pad");
+        assert_eq!(
+            f64_session.tensor_values(f64_padded).expect("f64 values"),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0]
+        );
+        let f64_loss = f64_session.tensor_sum(f64_padded).expect("f64 sum");
+        let f64_report = f64_session.tensor_backward(f64_loss).expect("f64 backward");
+        assert_eq!(
+            f64_session
+                .tensor_gradient(&f64_report, f64_input)
+                .expect("f64 input grad"),
+            &[1.0, 1.0, 1.0, 1.0]
+        );
+
+        let mut f32_session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let f32_input = f32_session
+            .tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("f32 input");
+        let f32_padded = f32_session
+            .tensor_pad(f32_input, &[1, 1, 1, 0], 0.0)
+            .expect("f32 pad");
+        assert_eq!(
+            f32_session
+                .tensor_values_f32(f32_padded)
+                .expect("f32 values"),
+            vec![
+                0.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0
+            ]
+        );
+        let f32_loss = f32_session.tensor_sum(f32_padded).expect("f32 sum");
+        let f32_report = f32_session.tensor_backward(f32_loss).expect("f32 backward");
+        assert_eq!(
+            f32_session
+                .tensor_gradient(&f32_report, f32_input)
+                .expect("f32 input grad"),
+            &[1.0, 1.0, 1.0, 1.0]
         );
     }
 
