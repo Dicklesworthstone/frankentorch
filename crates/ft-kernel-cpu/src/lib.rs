@@ -2967,6 +2967,23 @@ fn conv2d_dinput_blocked_selected(batch: usize) -> bool {
     !conv2d_dinput_panel_legacy() && batch >= rayon::current_num_threads()
 }
 
+/// Can the blocked dinput fill the pool at this shape, by images alone OR by channel groups?
+///
+/// `frankentorch-hi9r6`. The image-only gate above switches the blocked route OFF below
+/// `batch >= threads`, which left `conv2d_masked_train` at batch 8 on the old panel round trip and
+/// 2.24x SLOWER while its batch-16 twin ran 1.10x FASTER. Splitting channels as well as images
+/// reaches the same task count without giving up the working-set win, so the gate can open where
+/// it previously had to shut. Still refuses when NEITHER axis can fill the pool — item 117's trade
+/// is declined, not re-taken.
+#[must_use]
+fn conv2d_dinput_blocked_any(batch: usize, in_ch: usize) -> bool {
+    if conv2d_dinput_panel_legacy() {
+        return false;
+    }
+    let want = rayon::current_num_threads().max(1);
+    batch >= want || batch * (in_ch / conv2d_dinput_group_channels(in_ch, batch).max(1)) >= want
+}
+
 /// Is the pre-item-174 accumulate-scatter selected?
 #[must_use]
 pub fn conv2d_ones_scatter_legacy() -> bool {
@@ -8432,7 +8449,29 @@ pub fn conv2d_backward_dinput_direct_f64(
     out_ch: usize,
 ) -> Vec<f64> {
     let patch_width = in_ch * kh * kw;
-    conv2d_backward_dinput_blocked_rows_f64(
+    let block_rows = conv2d_dinput_block_rows(patch_width);
+    // Images alone fill the pool: one task per image, the widest GEMM and no weight gather.
+    // Otherwise split channels too, which reaches the same task count without giving up the
+    // working set. Both are bit-identical to the panel route and to each other.
+    if batch >= rayon::current_num_threads().max(1) {
+        return conv2d_backward_dinput_blocked_rows_f64(
+            dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
+            block_rows,
+        );
+    }
+    conv2d_backward_dinput_grouped_f64(
         dout_flat,
         weight_flat,
         batch,
@@ -8446,7 +8485,8 @@ pub fn conv2d_backward_dinput_direct_f64(
         sh,
         sw,
         out_ch,
-        conv2d_dinput_block_rows(patch_width),
+        block_rows,
+        conv2d_dinput_group_channels(in_ch, batch),
     )
 }
 
@@ -8627,6 +8667,166 @@ fn conv2d_backward_dinput_blocked_rows_f32(
                 let dp = &mut block[..rows * patch_width];
                 gemm::sgemm(rows, out_ch, patch_width, a, weight_flat, dp);
                 scatter(dp, start, rows, dpb);
+                start += rows;
+            }
+        });
+    dpadded
+}
+
+/// Channels per task for the small-batch dinput route, chosen to fill the pool.
+///
+/// `frankentorch-hi9r6`. Must DIVIDE `in_ch`, because the tasks are handed out by
+/// `par_chunks_mut` and a ragged last group would misalign every chunk boundary after it. Picks
+/// the largest divisor that still reaches `current_num_threads()` tasks, so groups stay as wide
+/// as the pool allows and the GEMM's `n` stays as long as possible.
+#[must_use]
+fn conv2d_dinput_group_channels(in_ch: usize, batch: usize) -> usize {
+    if in_ch == 0 || batch == 0 {
+        return 1;
+    }
+    let want = rayon::current_num_threads().max(1);
+    let mut best = 1;
+    for cpg in 1..=in_ch {
+        if !in_ch.is_multiple_of(cpg) {
+            continue;
+        }
+        if batch * (in_ch / cpg) >= want {
+            best = cpg;
+        }
+    }
+    best
+}
+
+/// Small-batch sibling of [`conv2d_backward_dinput_direct_f64`]: parallelise over
+/// `(image, CHANNEL GROUP)` so the pool fills when `batch` alone cannot fill it.
+///
+/// `frankentorch-hi9r6`. `conv2d_masked_train` at batch 8 measures 2.24x SLOWER while its batch-16
+/// twin is 1.10x FASTER — same code, same per-image shape, opposite verdicts — because the
+/// image-parallel blocked route is gated on `batch >= current_num_threads()` and simply switches
+/// off below it, leaving those lanes on the old `dpanel` + `col2im` round trip (18.9 MB at that
+/// shape). That gate is right (item 117: do not trade parallel width for working set) and this is
+/// the missing half of it rather than a loosening: it keeps the working-set win AND fills the
+/// pool.
+///
+/// # Why channel groups and not the output-row bands I first proposed
+///
+/// I recorded a band design — parallelise over `(image, output-row band)`, disjoint `dpadded`
+/// rows, `kh - 1` rows of overlap. Reading the layout kills it: `dpadded` is
+/// `[batch][in_ch][ph][pw]`, so a row band across all channels is NOT a contiguous slice — the
+/// channel axis sits outside `h`. `par_chunks_mut` cannot hand such a region out, and carving it
+/// in safe Rust means splitting every plane separately, which is the plane decomposition wearing
+/// a disguise. Bands also duplicate GEMM rows at every seam.
+///
+/// Channel groups have neither problem and one extra virtue. Group `g` of image `b` owns
+/// `dpadded` planes `[c0, c1)`, which IS one contiguous chunk of `cpg * ph * pw`. And because
+/// `patch_width = in_ch * kh * kw` is ordered BY CHANNEL, that group's `dpanel` columns are the
+/// contiguous window `[c0 * kh * kw, c1 * kh * kw)` — so restricting the task to its channels is
+/// an `n`-split of the GEMM, and an `n`-split leaves every output element's `k` reduction whole.
+/// No seam, no recompute, and the bit-exactness argument is the one already proven twice here.
+///
+/// # Bit-exactness
+///
+/// Two axes, both already established. The GEMM splits on `n` (and on `m` for the row blocks
+/// within a task), never on `k`, so each element's reduction over `out_ch` is untouched. The
+/// scatter keeps `pc` ascending within each plane, so every `dpadded` element receives the
+/// identical sequence of `+=` it gets from `conv2d_col2im_f64`. `weight_flat` is copied into a
+/// contiguous per-group block first — a copy of values, not a change to them — because the GEMM
+/// wants `B` contiguous and the group's columns are strided across rows.
+///
+/// `conv2d_dinput_grouped_matches_panel_col2im_bitwise` asserts it against the panel route at
+/// every group width and block width.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_dinput_grouped_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+    channels_per_group: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let tap = kh * kw;
+    let block_rows = block_rows.max(1);
+    let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
+    if batch == 0 || in_ch == 0 || out_ch == 0 || patch_count == 0 || patch_width == 0 {
+        return dpadded;
+    }
+    let cpg = channels_per_group.clamp(1, in_ch);
+    if !in_ch.is_multiple_of(cpg) {
+        // Ragged groups would misalign `par_chunks_mut`; the caller picks a divisor, and this is
+        // the guard that says so rather than silently scattering into the wrong plane.
+        return conv2d_backward_dinput_blocked_rows_f64(
+            dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
+            block_rows,
+        );
+    }
+    let groups = in_ch / cpg;
+    let group_width = cpg * tap;
+    let patch_origins: Vec<(usize, usize)> = (0..patch_count)
+        .map(|pc| ((pc / ow) * sh, (pc % ow) * sw))
+        .collect();
+    dpadded
+        .par_chunks_mut(cpg * ph * pw)
+        .enumerate()
+        .for_each(|(task, dst)| {
+            let b = task / groups;
+            let g = task % groups;
+            let c0 = g * cpg;
+            // This group's weight columns, gathered contiguously so the GEMM can read `B`
+            // normally. `out_ch * group_width` doubles, 1152 at the scored shape.
+            let mut wsub = vec![0.0f64; out_ch * group_width];
+            for co in 0..out_ch {
+                let src = co * patch_width + c0 * tap;
+                wsub[co * group_width..(co + 1) * group_width]
+                    .copy_from_slice(&weight_flat[src..src + group_width]);
+            }
+            let mut scratch = vec![0.0f64; block_rows.min(patch_count) * group_width];
+            let mut start = 0usize;
+            while start < patch_count {
+                let rows = block_rows.min(patch_count - start);
+                let a = &dout_flat
+                    [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
+                let sc = &mut scratch[..rows * group_width];
+                gemm::dgemm(rows, out_ch, group_width, a, &wsub, sc);
+                for r in 0..rows {
+                    let (base_h, base_w) = patch_origins[start + r];
+                    let prow = r * group_width;
+                    for lc in 0..cpg {
+                        let ch_off = lc * ph * pw;
+                        let pch = lc * tap;
+                        for kr in 0..kh {
+                            let irow = ch_off + (base_h + kr) * pw + base_w;
+                            let prow_off = prow + pch + kr * kw;
+                            for kc in 0..kw {
+                                dst[irow + kc] += sc[prow_off + kc];
+                            }
+                        }
+                    }
+                }
                 start += rows;
             }
         });
@@ -10324,10 +10524,12 @@ pub fn conv2d_backward_masked_f64(
     });
 
     let dpadded = output_mask[0].then(|| {
-        // Blocked, image-parallel dinput — `frankentorch-hi9r6`. See
-        // `conv2d_backward_dinput_direct_f64` for why this is not item 114's reverted fusion,
-        // for the `m`-split and scatter-order bit-exactness arguments, and for the gate.
-        if conv2d_dinput_blocked_selected(batch) {
+        // Blocked dinput — `frankentorch-hi9r6`. See `conv2d_backward_dinput_direct_f64` for why
+        // this is not item 114's reverted fusion, for the `m`-split and scatter-order
+        // bit-exactness arguments, and for the gate. `_any` because the entry now also fills the
+        // pool by CHANNEL groups when `batch` alone cannot, which is what left the batch-8 lanes
+        // on the panel route at 2.24x SLOWER.
+        if conv2d_dinput_blocked_any(batch, in_ch) {
             return conv2d_backward_dinput_direct_f64(
                 &dout_flat,
                 weight_flat,
@@ -10536,7 +10738,7 @@ pub fn conv2d_backward_f64(
     // Blocked, image-parallel dinput — `frankentorch-hi9r6`. This entry is the `both` route
     // (dinput AND dweight), so `dout_flat` and `panel` are still built for `dweight` above; what
     // goes away here is the SECOND panel-shaped buffer and its DRAM round trip.
-    let dpadded = if conv2d_dinput_blocked_selected(batch) {
+    let dpadded = if conv2d_dinput_blocked_any(batch, in_ch) {
         conv2d_backward_dinput_direct_f64(
             &dout_flat,
             weight_flat,
@@ -45129,6 +45331,116 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn conv2d_dinput_grouped_matches_panel_col2im_bitwise() {
+        // `frankentorch-hi9r6`. The small-batch route splits the GEMM on `n` (channel groups) as
+        // well as `m` (row blocks), and scatters into per-group plane chunks. Three things could
+        // break and only bits will catch them: a group reading the wrong `weight_flat` columns, a
+        // group scattering into the wrong plane, and the `n`-split disturbing a `k` reduction.
+        //
+        // Every case is driven at EVERY divisor of `in_ch`, so the one-channel-per-task extreme
+        // and the all-channels-in-one-task extreme (which must reproduce the image-parallel form)
+        // are both covered, and at several block widths so the two splits interact.
+        //          batch in_ch out_ch ph pw kh kw sh sw
+        let cases: [[usize; 9]; 7] = [
+            [2, 8, 4, 9, 8, 3, 3, 1, 1],   // 8 channels: divisors 1,2,4,8
+            [1, 6, 3, 7, 7, 3, 3, 1, 1],   // batch 1, 6 channels: 1,2,3,6
+            [3, 4, 5, 11, 11, 3, 3, 2, 2], // strided, interior gaps stay +0.0
+            [2, 4, 2, 12, 12, 2, 2, 3, 3], // sw > kw: windows do not tile
+            [2, 3, 1, 8, 6, 2, 3, 1, 1],   // prime channel count, out_ch 1
+            [4, 1, 4, 6, 6, 3, 3, 1, 1],   // in_ch 1: the only group is the whole thing
+            [2, 12, 3, 10, 9, 3, 2, 1, 1], // 12 channels: 1,2,3,4,6,12
+        ];
+        for (case, &[batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw]) in cases.iter().enumerate() {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_count = oh * ow;
+            let patch_width = in_ch * kh * kw;
+            let flat = batch * patch_count;
+            let dout_flat: Vec<f64> = (0..flat * out_ch)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        -0.0
+                    } else {
+                        ((i % 23) as f64) * 0.037 - 0.4
+                    }
+                })
+                .collect();
+            let weight_flat: Vec<f64> = (0..out_ch * patch_width)
+                .map(|i| ((i % 19) as f64) * 0.0625 - 0.5)
+                .collect();
+
+            let mut dpanel = vec![0.0f64; flat * patch_width];
+            super::gemm::dgemm(
+                flat,
+                out_ch,
+                patch_width,
+                &dout_flat,
+                &weight_flat,
+                &mut dpanel,
+            );
+            let want =
+                super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+
+            for cpg in 1..=in_ch {
+                if !in_ch.is_multiple_of(cpg) {
+                    continue;
+                }
+                for block_rows in [1usize, 3, 256, patch_count + 2] {
+                    let got = super::conv2d_backward_dinput_grouped_f64(
+                        &dout_flat,
+                        &weight_flat,
+                        batch,
+                        in_ch,
+                        ph,
+                        pw,
+                        kh,
+                        kw,
+                        oh,
+                        ow,
+                        sh,
+                        sw,
+                        out_ch,
+                        block_rows,
+                        cpg,
+                    );
+                    assert_eq!(got.len(), want.len(), "case {case}: dpadded length");
+                    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            w.to_bits(),
+                            "case {case} element {i} at cpg={cpg} block_rows={block_rows}: \
+                             grouped {g} != panel+col2im {w} (batch={batch} in_ch={in_ch} \
+                             out_ch={out_ch} {ph}x{pw} k={kh}x{kw} s={sh}x{sw})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conv2d_dinput_group_channels_divides_in_ch_and_fills_the_pool() {
+        // A non-divisor would misalign `par_chunks_mut` and scatter into the wrong plane, so the
+        // divisor property is load-bearing rather than tidy. The kernel guards against it too,
+        // but a caller that silently fell back would hide the regression instead of failing.
+        for in_ch in [1usize, 2, 3, 4, 6, 8, 12, 16, 32, 64] {
+            for batch in [1usize, 2, 4, 8, 16, 64] {
+                let cpg = super::conv2d_dinput_group_channels(in_ch, batch);
+                assert!(
+                    cpg >= 1 && cpg <= in_ch,
+                    "in_ch {in_ch} batch {batch}: cpg {cpg}"
+                );
+                assert!(
+                    in_ch.is_multiple_of(cpg),
+                    "in_ch {in_ch} batch {batch}: cpg {cpg} does not divide in_ch"
+                );
+            }
+        }
+        assert_eq!(super::conv2d_dinput_group_channels(0, 4), 1);
+        assert_eq!(super::conv2d_dinput_group_channels(8, 0), 1);
     }
 
     #[test]
