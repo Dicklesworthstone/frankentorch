@@ -818,6 +818,12 @@ struct GridSamplePoint {
 impl FrankenTorchSession {
     #[must_use]
     pub fn new(mode: ExecutionMode) -> Self {
+        // Configure rayon before this session can create an operation that touches the global
+        // pool. The default is `min(16, physical cores)`; an explicit RAYON_NUM_THREADS still
+        // wins inside `configure_global_pool`, so benchmark and application overrides retain
+        // their exact requested width. A competing global-pool initializer is reported there and
+        // deliberately does not make session creation fail.
+        let _ = ft_kernel_cpu::pool::configure_global_pool();
         Self {
             tape: Tape::new(),
             tensor_tape: TensorTape::new(),

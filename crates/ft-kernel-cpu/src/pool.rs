@@ -27,15 +27,13 @@
 //! PARITY with PyTorch at 8 threads and **at least 1.10x FASTER at 16**, on two runs clearing every
 //! gate with the width as the only variable (item 244).
 //!
-//! # Why this is OFF by default
+//! # Default policy
 //!
-//! Because the evidence is one lane against the incumbent, five lanes arm-internal, and ONE host
-//! whose frequency spread is the mechanism's own precondition. `qq8as` refuses to flip a default on
-//! less than "the lanes that gain nothing are shown to lose nothing", and two levers in this
-//! campaign were shipped or nearly shipped on thinner evidence than this and had to be reverted.
-//!
-//! So this module ships the MECHANISM and leaves the POLICY to the caller. Doing nothing is the
-//! default, and it is the exact behaviour of every build before this file existed.
+//! `qq8as` subsequently measured the whole board: 16 workers beat rayon's 64-worker default on
+//! 42 of 47 lanes (median 1.247x), with the max-pool3d family the only material regression
+//! (worst 0.921x). A second host showed that the right width tracks physical, not logical, cores.
+//! The no-environment policy is therefore [`auto_width`]; callers that set `RAYON_NUM_THREADS`
+//! still own the decision.
 
 /// What [`configure_global_pool`] did, or why it did nothing.
 ///
@@ -43,8 +41,6 @@
 /// find out, and a library must not print to a host application's stderr to tell it so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolOutcome {
-    /// No width was requested. Rayon keeps its own default and nothing was touched.
-    Unchanged,
     /// `RAYON_NUM_THREADS` is set, so rayon will honour it and we deliberately stay out of the way.
     DeferredToRayonEnv,
     /// The global pool was built with this many workers.
@@ -122,15 +118,15 @@ pub fn auto_width(logical_cores: usize) -> usize {
     MEASURED_CAP.min(cores)
 }
 
-/// Resolve a requested width from the two environment inputs, without touching any global state.
+/// Resolve the default width and explicit environment overrides without touching global state.
 ///
 /// Split out from [`configure_global_pool`] so the POLICY is testable without mutating a
 /// process-wide pool — a test that calls `build_global` can only ever run once per test binary, and
 /// a policy that can only be tested once is a policy that will not be tested.
 ///
-/// `RAYON_NUM_THREADS` wins outright. An operator who set it has already chosen, every banked row
-/// in this campaign was taken that way, and silently overriding it would make those rows
-/// unreproducible.
+/// With no override, the physical-core policy is the library default. `RAYON_NUM_THREADS` still
+/// wins outright: an operator who set it has already chosen, every banked row in this campaign was
+/// taken that way, and silently overriding it would make those rows unreproducible.
 ///
 /// An unparseable `FT_RAYON_WIDTH` is an ERROR rather than a fallback to the default. This campaign
 /// has repeatedly been misled by knobs that accepted a typo and carried on: a run that believes it
@@ -141,11 +137,11 @@ pub fn resolve_width(ft_width: Option<&str>, rayon_env: Option<&str>, cores: usi
         return PoolOutcome::DeferredToRayonEnv;
     }
     let Some(raw) = ft_width else {
-        return PoolOutcome::Unchanged;
+        return PoolOutcome::Configured(auto_width(cores));
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return PoolOutcome::Unchanged;
+        return PoolOutcome::Configured(auto_width(cores));
     }
     if trimmed.eq_ignore_ascii_case("auto") {
         return PoolOutcome::Configured(auto_width(cores));
@@ -162,7 +158,8 @@ pub fn resolve_width(ft_width: Option<&str>, rayon_env: Option<&str>, cores: usi
 /// that this can only report [`PoolOutcome::AlreadyInitialized`]. It is safe to call more than once
 /// and safe to call after rayon has started — it never panics and never poisons anything.
 ///
-/// Reads `FT_RAYON_WIDTH` (`auto`, or a positive integer) and `RAYON_NUM_THREADS`.
+/// Uses [`auto_width`] by default. `FT_RAYON_WIDTH` may select `auto` or a positive integer, and
+/// `RAYON_NUM_THREADS` remains an explicit opt-out to rayon's own policy.
 pub fn configure_global_pool() -> PoolOutcome {
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let ft_width = std::env::var("FT_RAYON_WIDTH").ok();
@@ -200,16 +197,26 @@ mod tests {
         );
     }
 
-    /// An empty variable is not a request. Shells export empty strings readily and treating one as
-    /// "width zero" or as an error would fire on hosts that never asked for anything.
+    /// An empty override is the same as no override: use the library's hardware-aware default.
     #[test]
     fn empty_values_are_not_requests() {
-        assert_eq!(resolve_width(None, None, 64), PoolOutcome::Unchanged);
-        assert_eq!(resolve_width(Some(""), None, 64), PoolOutcome::Unchanged);
-        assert_eq!(resolve_width(Some("  "), None, 64), PoolOutcome::Unchanged);
+        let automatic = PoolOutcome::Configured(auto_width(64));
+        assert_eq!(resolve_width(None, None, 64), automatic);
+        assert_eq!(resolve_width(Some(""), None, 64), automatic);
+        assert_eq!(resolve_width(Some("  "), None, 64), automatic);
         assert_eq!(
             resolve_width(Some("8"), Some(""), 64),
             PoolOutcome::Configured(8)
+        );
+    }
+
+    /// The shipped policy must be active without an environment knob. A naive implementation
+    /// that only parses `FT_RAYON_WIDTH` regresses to rayon's logical-core default and fails here.
+    #[test]
+    fn no_environment_uses_the_hardware_aware_default() {
+        assert_eq!(
+            resolve_width(None, None, 64),
+            PoolOutcome::Configured(auto_width(64))
         );
     }
 
