@@ -1,8 +1,6 @@
 [package]
 name = "frankentorch-kernel-cpu"
-# 0.1.1: registry 0.1.0 (published 2026-08-20) predates the masked conv2d
-# kernels and panel cleanup; a used version is never republished.
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Portable and SIMD-accelerated CPU kernels for FrankenTorch"
