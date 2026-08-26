@@ -36775,6 +36775,80 @@ pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) 
     (packed, tau_out)
 }
 
+/// LAPACK-convention `orgqr` (`torch.linalg.householder_product`) via compact-WY blocking.
+///
+/// Forms the m x n matrix `Q = H_0 H_1 ... H_{k-1} * I[:, :n]` from the packed reflectors
+/// and `tau` that [`geqrf_blocked_f64`] (or `torch.geqrf`) produces.
+///
+/// The path this replaces applies ONE reflector at a time — a rank-1 update per reflector,
+/// BLAS-2, walking `a[i * n + kk]` with stride n. That is the same shape that made `geqrf`
+/// 227.6x slower than torch before it was re-routed; `orgqr` measured 125-144x at n=512
+/// and 312-317x at n=1024.
+///
+/// Panels of `nb` reflectors are collapsed into a single block reflector `I - V T V^T` and
+/// applied with three GEMMs, so the work becomes BLAS-3. Reflectors are taken in REVERSE
+/// panel order, which reproduces `H_0 (H_1 (... x))` exactly as the per-reflector loop's
+/// `for kk in (0..k).rev()` does.
+///
+/// `qr_build_compact_wy_t_f64` is convention-generic — it uses only the dlarft recurrence
+/// `T[i][c] = -tau_c * (v_i . v_c)` and never assumes `v_j = 1` or `tau = 2/||v||^2` — so
+/// it accepts these LAPACK-convention reflectors directly, with the unit diagonal made
+/// explicit in `vmat`.
+///
+/// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+pub fn orgqr_blocked_f64(packed: &[f64], tau: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
+    // Q starts as the first n columns of the m x m identity.
+    let mut x = vec![0.0f64; m * n];
+    for i in 0..m.min(n) {
+        x[i * n + i] = 1.0;
+    }
+    if k == 0 || m == 0 || n == 0 {
+        return x;
+    }
+
+    let nb_block = 32;
+    let mut panels: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
+    let mut p = 0;
+    while p < k {
+        let pe = (p + nb_block).min(k);
+        let nb = pe - p;
+        // V (m x nb) in LAPACK convention: v_j = 1 at row j, zeros above, the stored
+        // reflector entries below.
+        let mut vmat = vec![0.0f64; m * nb];
+        for c in 0..nb {
+            let j = p + c;
+            vmat[j * nb + c] = 1.0;
+            for i in (j + 1)..m {
+                vmat[i * nb + c] = packed[i * n + j];
+            }
+        }
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb);
+        panels.push((nb, vmat, tmat));
+        p = pe;
+    }
+
+    // Q_block . X = X - V (T (Vᵀ X)), innermost panel first.
+    for (nb, vmat, tmat) in panels.iter().rev() {
+        let nb = *nb;
+        let mut vt = vec![0.0f64; nb * m];
+        for row in 0..m {
+            for c in 0..nb {
+                vt[c * m + row] = vmat[row * nb + c];
+            }
+        }
+        let mut w1 = vec![0.0f64; nb * n];
+        gemm::dgemm(nb, m, n, &vt, &x, &mut w1); // Vᵀ X
+        let mut w2 = vec![0.0f64; nb * n];
+        gemm::dgemm(nb, nb, n, tmat, &w1, &mut w2); // T (Vᵀ X)
+        let mut upd = vec![0.0f64; m * n];
+        gemm::dgemm(m, nb, n, vmat, &w2, &mut upd); // V (...)
+        for t in 0..m * n {
+            x[t] -= upd[t];
+        }
+    }
+    x
+}
+
 /// A/B entry point (NOT production dispatch): runs the blocked compact-WY QR with
 /// a caller-chosen panel width `nb_block`, so a same-worker A/B can find the NB
 /// that best amortizes the skinny-K trailing/reverse GEMMs. frankentorch-ct2yy.
@@ -43916,6 +43990,62 @@ mod tests {
                 let mut acc = 0.0;
                 for t in 0..N {
                     acc += q[i * N + t] * r[t * N + j];
+                }
+                let want = a[i * N + j];
+                assert!(
+                    (acc - want).abs() < 1e-9 * want.abs().max(1.0),
+                    "QR reconstruction failed at [{i}][{j}]: got {acc}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// `orgqr_blocked_f64` must rebuild the SAME Q the per-reflector loop does, checked
+    /// two independent ways: `Qᵀ Q == I` (it is orthonormal) and `Q R == A` (it is the
+    /// right orthogonal factor, not merely some orthonormal basis).
+    ///
+    /// Both are needed. Orthonormality alone would pass for any orthonormal Q — including
+    /// one built from reflectors applied in the WRONG ORDER, which is the specific error
+    /// blocking introduces, since panels must be applied in reverse to reproduce
+    /// `H_0 (H_1 (... x))`. `Q R == A` is what pins the order.
+    #[test]
+    fn orgqr_blocked_f64_rebuilds_q_from_packed_reflectors() {
+        const M: usize = 160;
+        const N: usize = 32;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.29).cos() + (j * 0.17).sin()) * 1.25
+                    + if idx % (N + 1) == 0 { 3.0 } else { 0.0 }
+            })
+            .collect();
+
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+        let q = super::orgqr_blocked_f64(&packed, &tau, M, N, N);
+        assert_eq!(q.len(), M * N);
+
+        // Qᵀ Q == I (N x N).
+        for c1 in 0..N {
+            for c2 in 0..N {
+                let mut dot = 0.0;
+                for i in 0..M {
+                    dot += q[i * N + c1] * q[i * N + c2];
+                }
+                let want = if c1 == c2 { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - want).abs() < 1e-10,
+                    "QtQ[{c1}][{c2}] = {dot}, want {want}"
+                );
+            }
+        }
+
+        // Q R == A, with R the upper triangle of the packed factor.
+        for i in 0..M {
+            for j in 0..N {
+                let mut acc = 0.0;
+                for t in 0..=j.min(N - 1) {
+                    acc += q[i * N + t] * packed[t * N + j];
                 }
                 let want = a[i * N + j];
                 assert!(

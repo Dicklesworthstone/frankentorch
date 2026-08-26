@@ -74741,11 +74741,24 @@ impl FrankenTorchSession {
             // Q starts as the first n columns of the m x m identity; the k
             // reflectors are applied right-to-left so Q = H_0 H_1 ... H_{k-1}.
             let q = &mut q_all[b * m * n..(b + 1) * m * n];
-            for i in 0..m.min(n) {
-                q[i * n + i] = 1.0;
-            }
-            for kk in (0..k).rev() {
-                Self::apply_reflector_left(q, m, n, a_slice, n, kk, tau_slice[kk]);
+            // Above the blocked gate, collapse each panel of reflectors into one
+            // I - V T Vᵀ applied with three GEMMs. The loop below applies ONE reflector
+            // per pass — a rank-1 update walking `a[i * n + kk]` with stride n, i.e. the
+            // same BLAS-2 shape that made `geqrf` 227.6x slower than torch before it was
+            // re-routed. `orgqr` measured 125-144x at n=512 and 312-317x at n=1024.
+            //
+            // Gate matches `qr_contiguous_f64`'s, so batched-tiny stays on the loop.
+            // frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+            if m >= 128 && k >= 16 {
+                let blocked = ft_kernel_cpu::orgqr_blocked_f64(a_slice, tau_slice, m, n, k);
+                q.copy_from_slice(&blocked);
+            } else {
+                for i in 0..m.min(n) {
+                    q[i * n + i] = 1.0;
+                }
+                for kk in (0..k).rev() {
+                    Self::apply_reflector_left(q, m, n, a_slice, n, kk, tau_slice[kk]);
+                }
             }
         }
         self.tensor_variable(q_all, a_shape.to_vec(), false)
