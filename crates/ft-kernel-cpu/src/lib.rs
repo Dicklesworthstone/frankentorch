@@ -36770,12 +36770,31 @@ fn qr_householder_panel_blocked(
 ///
 /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
 pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+    geqrf_blocked_nb_f64(a, m, n, 32, None)
+}
+
+/// `geqrf_blocked_f64` with the panel width exposed and optional stage timings.
+///
+/// Two things the fixed-`nb` entry cannot do:
+///   * sweep `nb` — panel widths in this tree have been mis-tuned HIGH before (the SVD
+///     panel sat at 16 because the grid was {16,32,64} and never held 8; nb=8 then won
+///     15/16 cells), so the shipped 32 needs sweeping BELOW as well as above;
+///   * attribute where the time goes — `geqrf` is 14.743x at n=1024 (130.383 ms vs torch's
+///     9.835 ms, i.e. ~11 GFLOPS against ~143), a gap far too large for panel-width tuning
+///     alone to explain, so the stage split decides what to attack instead of guessing.
+pub fn geqrf_blocked_nb_f64(
+    a: &[f64],
+    m: usize,
+    n: usize,
+    nb_block: usize,
+    timings: Option<&mut QrStageTimings>,
+) -> (Vec<f64>, Vec<f64>) {
     let k = m.min(n);
     let mut packed = a.to_vec();
     if k == 0 {
         return (packed, Vec::new());
     }
-    let panels = qr_blocked_forward_f64(&mut packed, m, n, k, 32, None);
+    let panels = qr_blocked_forward_f64(&mut packed, m, n, k, nb_block.max(1), timings);
 
     // The forward pass leaves R in the upper triangle and ZEROS below it, so scattering
     // the reflectors into the lower triangle overwrites nothing R needs.
@@ -44079,6 +44098,70 @@ unsafe fn transpose_block_8x8_avx2_f32(
 mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
+
+    /// Where does blocked `geqrf` actually spend its time, and does the panel width matter?
+    ///
+    /// Prints rather than asserts — this is an attribution probe, not a gate. `geqrf`
+    /// measures 14.743x vs torch at n=1024 (130.383 ms against 9.835 ms, ~11 GFLOPS vs
+    /// ~143), which is far too large a gap for panel-width tuning alone. The stage split
+    /// says what to attack; the nb ladder says whether 32 was ever the right constant.
+    ///
+    /// Run with: cargo test -p frankentorch-kernel-cpu --lib geqrf_stage_attribution -- --nocapture
+    #[test]
+    fn geqrf_stage_attribution_and_nb_ladder() {
+        const N: usize = 512;
+        let a: Vec<f64> = (0..N * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.37).sin() + (j * 0.11).cos()) * 1.5
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        // Warm up: first call pays allocator and page-fault costs the rest do not.
+        let _ = super::geqrf_blocked_nb_f64(&a, N, N, 32, None);
+
+        // MIN-OF-N, interleaved. A single shot per nb ranked 32 fastest in one run and 8
+        // fastest in the next, and nb=16 moved 1.53x between them - single-shot timings on
+        // a shared worker cannot rank a ~1.1x effect. Rounds are interleaved (nb ladder
+        // inside the round loop) so a drifting machine hits every nb equally rather than
+        // penalising whichever ran last.
+        const REPS: usize = 7;
+        let mut best: std::collections::BTreeMap<usize, (f64, super::QrStageTimings)> =
+            std::collections::BTreeMap::new();
+        for _rep in 0..REPS {
+            for nb in [8usize, 16, 32, 64] {
+                let mut t = super::QrStageTimings::default();
+                let start = std::time::Instant::now();
+                let (_p, _tau) = super::geqrf_blocked_nb_f64(&a, N, N, nb, Some(&mut t));
+                let ms = start.elapsed().as_secs_f64() * 1e3;
+                match best.get(&nb) {
+                    Some((prev, _)) if *prev <= ms => {}
+                    _ => {
+                        best.insert(nb, (ms, t));
+                    }
+                }
+            }
+        }
+        for (nb, (wall_ms, t)) in &best {
+            let nb = *nb;
+            let wall_ms = *wall_ms;
+            // Divide by WALL, not by `total_ns`: the forward helper never populates
+            // `total_ns`, so a `total_ns.max(1)` divisor silently prints raw nanoseconds
+            // as a percentage (it read "panel+T=892978700.0%" before this was fixed).
+            let wall_ns = wall_ms * 1e6;
+            let pct = |v: u128| 100.0 * v as f64 / wall_ns;
+            println!(
+                "GEQRF_NB nb={nb:>3} wall={wall_ms:8.3}ms  panel+T={:5.1}% ({:7.3}ms)  trailing_R={:5.1}% ({:7.3}ms)  reverse_Q={:5.1}%",
+                pct(t.panel_and_t_ns),
+                t.panel_and_t_ns as f64 / 1e6,
+                pct(t.trailing_r_ns),
+                t.trailing_r_ns as f64 / 1e6,
+                pct(t.reverse_q_ns),
+            );
+        }
+    }
 
     /// `geqrf_blocked_f64` must return reflectors and tau in LAPACK's convention, verified
     /// by rebuilding Q from them and checking `Q R == A`.
