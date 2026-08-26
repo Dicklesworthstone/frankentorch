@@ -68,6 +68,8 @@ enum LinalgOp {
     Qr,
     /// Householder QR FACTORISATION only — no Q formed. Isolates panel + trailing GEMM.
     Geqrf,
+    /// FORM Q from packed reflectors. The geqrf producing them runs outside the timer.
+    Orgqr,
 }
 
 /// One measured configuration of our own arm.
@@ -185,6 +187,29 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
         .expect("svd leaf");
+    // ORGQR IS TIMED SEPARATELY, because its input must be produced OUTSIDE the clock.
+    // `tensor_geqrf` is itself a measured 226x defect; timing it here would drown the very
+    // thing this lane exists to isolate. The incumbent does the same -- its geqrf runs at
+    // LANES construction time.
+    if op == LinalgOp::Orgqr {
+        let (packed, tau) = session.tensor_geqrf(x).expect("geqrf for orgqr");
+        let started = Instant::now();
+        let q = session.tensor_orgqr(packed, tau).expect("orgqr");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        // |Q|, matching the incumbent: Q is unique only up to COLUMN SIGNS, so a raw sum
+        // would mismatch on a convention difference rather than on a defect.
+        let sum: f64 = session
+            .tensor_values(q)
+            .expect("q values")
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+        ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
+        ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
+        ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+        return (ms, sum);
+    }
     let started = Instant::now();
     // Both branches time exactly the decomposition and stop before the checksum is read, which
     // is what the incumbent's `run` does too. The values-only branch reaches
@@ -212,6 +237,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 let d = session.tensor_diagonal(r, 0).expect("diag");
                 session.tensor_abs(d).expect("abs")
             }
+            LinalgOp::Orgqr => unreachable!("orgqr is timed in its own branch below"),
             LinalgOp::Geqrf => {
                 // geqrf overwrites the upper triangle with R and the lower with the
                 // packed reflectors; |diag| is R's diagonal, the same quantity the qr
@@ -408,7 +434,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "eigvalsh" => LinalgOp::Eigvalsh,
         "qr" => LinalgOp::Qr,
         "geqrf" => LinalgOp::Geqrf,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf"),
+        "orgqr" => LinalgOp::Orgqr,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -424,14 +451,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // so its diagonal is R's, matching the qr lane's convention and comparable across
         // implementations where the raw reflectors are not.
         "geqrf" => ("torch.geqrf(A)[0].diagonal().abs()", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf"),
+        // orgqr: FORM Q from packed reflectors. The geqrf that produces (A, tau) runs at LANES
+        // construction time, OUTSIDE the timed region, on both arms -- otherwise this would
+        // re-measure geqrf's 226x defect instead of orgqr.
+        //
+        // CHECKSUM IS |Q|, NOT Q. Each arm forms Q from its OWN geqrf output, and the two
+        // factorisations need not agree on reflector sign convention. For a full-rank matrix the
+        // QR factor Q is unique only up to COLUMN SIGNS, so a raw sum would mismatch on a
+        // convention difference rather than on a defect. Summing |Q| is invariant under column
+        // sign flips and still catches a genuinely wrong Q.
+        "orgqr" => ("torch.linalg.householder_product(A[0], A[1]).abs()", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
     let lane_entries: Vec<String> = lanes
         .iter()
         .map(|(n, name)| {
-            format!("    \"{name}\": (_mk({n}, {}), lambda A: {py_fn}),", if sym { "True" } else { "False" })
+            let base = if op == "orgqr" {
+                format!("torch.geqrf(_mk({n}, False))")
+            } else {
+                format!("_mk({n}, {})", if sym { "True" } else { "False" })
+            };
+            format!("    \"{name}\": ({base}, lambda A: {py_fn}),")
         })
         .collect();
     let py_setup = format!(
