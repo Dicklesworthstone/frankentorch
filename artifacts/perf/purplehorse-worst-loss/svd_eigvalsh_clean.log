@@ -1,0 +1,22 @@
+=== eigvalsh_clean attempt=1 utc=2026-08-26T07:14:10Z host=thinkstation1 ===
+idle_before=89.00% then 90.18% (mpstat 5s x2, NOT loadavg)
+loadavg_before=11.80 15.76 28.01 (recorded for provenance; NOT the gate)
+snapshot_sha256=9e98e2eb1f7676c41a5eb40c13f8e05baeceaffbde75aca6a4c92e4c0eede73e
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=512, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 45 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=9e98e2eb1f7676c41a5eb40c13f8e05baeceaffbde75aca6a4c92e4c0eede73e
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=512  PT min 7.282 ms  median 9.882 ms  spread 2.48x  load 11.80->11.41  MHz 2460/1429  iowait 509 jiffies
+  arm=262144/4row/fused/4output min   40.014 ms  median   41.080 ms  PT-beside-it min    7.282 ms  paired-vs-PT FT 4.191x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 6.12e-16 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output min   39.981 ms  median   41.114 ms  PT-beside-it min    7.346 ms  paired-vs-PT FT 4.180x SLOWER  paired-vs-arm0 1.003x  branches (0, 0, 0)  parity rel 6.12e-16 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+idle_after=89.56%
+incumbent_check n=512 PT_min=7.282ms banked~32.075ms -> ok
