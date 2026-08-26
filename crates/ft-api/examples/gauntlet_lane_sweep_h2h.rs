@@ -1090,10 +1090,34 @@ fn timed_conv2d(
 /// The all-ones `dout` mirrors the summed loss the paired lane uses. `conv2d_backward_f32` picks
 /// its route from `conv2d_ones_dout_route`, so passing ones takes the same route the session's
 /// backward takes rather than a different one.
+thread_local! {
+    /// Milliseconds the kernels-only conv2d f32 lane spent on its hand-rolled pad, which is inside
+    /// its timed region but is NOT kernel work. See `timed_conv2d_f32_kernels`.
+    static CONV2D_F32_KERNELS_PAD_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
 fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f64, f64) {
     let ph = C2_H + 2;
     let pw = C2_W + 2;
     let started = Instant::now();
+    // THE PAD IS INSIDE THE TIMER, AND IT IS NOT FREE — read the diagnostic below before using
+    // `conv2d_f32 - conv2d_f32_kernels` as "the session cost".
+    //
+    // That subtraction has been reading NEGATIVE (64 rounds: session 26.260 ms, kernels 29.396 ms
+    // — the kernels-only arm SLOWER than the arm that also carries a session and a tape), which is
+    // not a thing session overhead can do. The cause is here: this arm hand-rolls its padding as a
+    // `vec![0.0f32; ..]` zero-init of 5.92M elements (~23.7 MB at this lane's batch 160) plus a
+    // SERIAL scalar row copy over 5.24M elements, while the session arm reaches the same padded
+    // buffer through `tensor_pad`, a real tape op. Both arms legitimately pay for padding — the
+    // session arm's `let started` sits before `functional_conv2d`, which pads internally — but
+    // they do not pay the SAME pad, and the difference is charged to "session" with the wrong
+    // sign.
+    //
+    // The timed region is deliberately LEFT ALONE so this lane stays byte-comparable with every
+    // banked row. Instead the pad is measured separately and reported, so the correction is
+    // available to anyone doing the subtraction: the session cost is
+    // `conv2d_f32 - (conv2d_f32_kernels - pad_ms)`, not `conv2d_f32 - conv2d_f32_kernels`.
+    let pad_started = Instant::now();
     // Pad [batch, CI, H, W] -> [batch, CI, H+2, W+2] with a one-pixel zero border.
     let mut padded = vec![0.0f32; batch * C2_CI * ph * pw];
     for bc in 0..batch * C2_CI {
@@ -1105,6 +1129,8 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
             padded[to..to + C2_W].copy_from_slice(&values[from..from + C2_W]);
         }
     }
+    let pad_ms = pad_started.elapsed().as_secs_f64() * 1_000.0;
+    CONV2D_F32_KERNELS_PAD_MS.with(|cell| cell.set(pad_ms));
     let _out = ft_kernel_cpu::conv2d_forward_f32(
         &padded, weights, None, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO,
     );
@@ -3353,6 +3379,20 @@ LANES = {
         // pairing a slot profile from one run against a null from another, and a diagnostic that
         // only appears on failing rows would still force that cross-referencing for the passing
         // ones it has to be compared against.
+        // The kernels-only f32 conv2d lane carries a hand-rolled pad inside its timed region that
+        // the session lane does not pay in the same form. Print it beside the row so nobody
+        // computes "session cost" from a subtraction that is contaminated in one direction.
+        if *name == "conv2d_f32_kernels" {
+            let pad = CONV2D_F32_KERNELS_PAD_MS.with(std::cell::Cell::get);
+            if pad > 0.0 {
+                println!(
+                    "    pad_ms = {pad:.3} of this lane's {ft_ms:.3} ms is a hand-rolled \
+                     zero-init + SERIAL scalar copy, not kernel work. The session cost is \
+                     conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected \
+                     subtraction has been reading NEGATIVE."
+                );
+            }
+        }
         if !ft_slot0_ratio[index].is_empty() {
             let slot0 = median(ft_slot0_ratio[index].clone());
             println!(
