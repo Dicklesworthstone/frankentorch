@@ -172,3 +172,59 @@ inferred.
 What does not stand is the causal claim and the "blocked BLAS-3 is the single lever
 under all five" conclusion drawn from it. Scope nothing against that until a common
 cause is actually measured.
+
+---
+
+# The GEMM hypothesis is REFUTED too — our GEMM-bound lanes BEAT torch
+
+I named `gemm::dgemm` being the common floor as "the most testable and most
+consequential" candidate. It is testable because the 58-lane board sweep
+(`73a050af`) already contains four GEMM-bound lanes on the same ELF and the same live
+incumbent. **All four are FASTER than torch.**
+
+| lane | FT ms | PT ms | standing | FT null | PT null |
+|---|---|---|---|---|---|
+| `linear_narrow` | 4.539 | 7.714 | **1.70x FASTER** | OFFSET | FAIL |
+| `attention` (SDPA) | 9.797 | 12.373 | **1.26x FASTER** | **PASS** | OFFSET |
+| `conv2d_f32` (im2col+GEMM) | 22.891 | 24.727 | **1.08x FASTER** | OFFSET | OFFSET |
+| `linear_wide` | 2.461 | 2.610 | **1.06x FASTER** | WIDE | OFFSET |
+
+Only `attention` carries a passing FrankenTorch null, so no single row here is
+bankable. But the *direction* is unanimous across four independent GEMM-bound lanes,
+and the refutation only needs the direction: **if our GEMM were 3–5x behind MKL's,
+`linear` and `attention` could not come out ahead of torch at all.** They do.
+
+## So the loss is around the GEMM, not in it
+
+Three things are now measured rather than assumed:
+
+* **GEMM itself: we win** (1.06–1.70x across four lanes).
+* **Blocked factorisations: we lose** 2.4–5.6x.
+* **Whether blocking is present does not predict the standing** — blocked SVD 2.40x is
+  the best, blocked QR 5.50x the worst, unblocked eigh 5.60x in between.
+
+What remains, and it is consistent with everything I measured on the SVD in detail: the
+loss lives in the **BLAS-2 panel and reduction work that surrounds the GEMM**, not in
+the matrix-matrix product. That is where a blocked factorisation spends its
+non-GEMM time — reflector generation, panel factorisation, the level-2 matvecs — and
+it is exactly the part that is hardest to parallelise and that LAPACK has decades of
+tuning in.
+
+The SVD evidence lines up with this and did not before: the reduction's parallel
+dispatch is worth **<5%** (`95a70cd8`), its row-dot is already hand-vectorised with
+AVX2 halving the packed count as designed (`feb83d5a`), and eigh's `tred2` is
+explicitly **"serial scalar"** with 2.1e9 flops on one core at n=1024 (`127248e4`).
+Those are all BLAS-2 panel observations, and each one individually looked like a dead
+end. Collectively they are the pattern.
+
+**This is a narrowing, not a mechanism.** I am not proposing "BLAS-2 panel work is the
+root cause" as a third tidy story after two were refuted. What is established is
+negative and useful: it is **not** the GEMM, and it is **not** the presence or absence
+of blocking. Anything scoped here must first measure the panel/BLAS-2 phase against
+torch's directly — which no instrument currently does, because the phase counters are
+untrustworthy and the lane-level subtraction only resolves values-vs-vectors, not
+panel-vs-GEMM.
+
+That instrument is the next piece of work, and it is the same shape as the values-only
+arm that settled the SVD expansion phase: find two public entry points that differ by
+exactly the phase in question, and subtract them with one estimator on both sides.

@@ -149,3 +149,48 @@ must produce that outside the timed region.
 The ledger's figures for `orgqr` (~1.8x) and `ormqr` (LOSS) are cross-run at
 batched-tiny shapes and should not be read as bounds on the single-matrix path — the
 same reasoning that made `geqrf`'s 226x a surprise.
+
+## RESOLVED: the packed-V layout question — the fix is a re-route plus an O(n²) scatter
+
+The bead left one thing genuinely open: *"whether the layout matches what our own
+`orgqr`/`ormqr` consumers expect must be verified rather than assumed."* Verified.
+
+`qr_householder_panel_blocked_profiled` accumulates every panel:
+
+```rust
+let mut panels: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();   // (start, vmat, tau)
+...
+let mut vmat = vec![0.0f64; m * nb];
+let mut tau  = vec![0.0f64; nb];
+qr_factor_panel_recursive_f64(r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny);
+```
+
+So **`V` and `tau` for every panel survive the whole forward pass** — they are not
+consumed and dropped panel-by-panel, they are collected. Three consequences:
+
+1. **`tau` needs no conversion at all.** Each panel's `tau` is a flat per-column vector
+   and the panels are processed in column order, so concatenating them is exactly
+   LAPACK's `tau`.
+2. **`V` needs an O(n²) scatter, not a re-derivation.** A panel's `vmat` is `m × nb` with
+   the standard staircase — column `j` zero above row `p+j`, unit at `p+j`, packed below.
+   LAPACK's `geqrf` puts that same reflector in `A[p+j+1.., p+j]`. So the conversion is
+   `a[i*n + (p+j)] = vmat[i*nb + j]` for `i > p+j`, per panel. That is O(n²) work against
+   an O(n³) factorisation — free.
+3. **`R` is already in place.** The forward pass reduces `r_mat` in situ, which is where
+   `geqrf` wants it.
+
+**So `geqrf` = the existing blocked forward pass, minus the Q build, plus an O(n²)
+scatter.** It is strictly *less* work than the blocked `qr` already performs, which is
+consistent with the measurement: our `qr` (40.707 ms at n=512) is 13.7x faster than our
+`geqrf` (559.481 ms) while doing more.
+
+What remains genuinely open is only the **bit-exactness** question, unchanged: the
+blocked compact-WY path is documented as not bit-identical to the unblocked sweep above
+its threshold, and `geqrf`'s outputs feed `orgqr`/`ormqr`, so the change lands under the
+ratified eig/SVD tolerance policy (`frankentorch-qgce4`) and its consumers need checking
+exactly as the QR op's own blocked gate did.
+
+`orgqr` gets the same treatment for free: the blocked path already contains the reverse
+`dorgqr` that builds Q from `(V, T)`, so once `geqrf` returns the packed reflectors, the
+Q-formation side has an existing implementation to call rather than the per-reflector
+loop it uses today.

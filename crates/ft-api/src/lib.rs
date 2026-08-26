@@ -73200,6 +73200,31 @@ impl FrankenTorchSession {
         }
         let n = shape[0];
 
+        // No-grad fast path: ONE factorisation instead of two.
+        //
+        // `slogdet_contiguous_f64` returns `sign` and `logabsdet` from a single LU, but the
+        // grad path below calls it twice on the same matrix — once here for `.sign` (dropping
+        // `logabsdet`), then again inside the autograd forward closure for `.logabsdet`
+        // (dropping `sign`). The second factorisation is unavoidable when a tape node is
+        // needed, since the closure must be replayable under create_graph; with no grad there
+        // is no closure to replay, so both outputs come from one call.
+        //
+        // Bit-exact by construction: same kernel, same input, both fields off one result.
+        // Measured on this redundancy: FT slogdet n=1024 was SLOWER in absolute ms
+        // (93.4-106.0) than FT `inv` (79.1-82.5), which does strictly more work
+        // (getrf + O(n^3) getri vs getrf + an O(n) log-product). Torch has them the sensible
+        // way round (4.95 ms vs 15.94 ms).
+        let grad_active =
+            self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
+        if !grad_active {
+            let (vals, meta) = self.tensor_values_meta(input)?;
+            let result = ft_kernel_cpu::slogdet_contiguous_f64(&vals, &meta)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let sign_id = self.tensor_variable(vec![result.sign], vec![], false)?;
+            let logabsdet_id = self.tensor_variable(vec![result.logabsdet], vec![], false)?;
+            return Ok((sign_id, logabsdet_id));
+        }
+
         // Compute sign once via the kernel, return as a non-grad 0-D tensor.
         let sign_val = {
             let (vals, meta) = self.tensor_values_meta(input)?;
@@ -74513,7 +74538,23 @@ impl FrankenTorchSession {
         let mut a_all = vec![0.0_f64; batch * m * n];
         let mut tau_all = vec![0.0_f64; batch * k];
         for b in 0..batch {
-            let (a, tau) = Self::geqrf_packed_f64(&values[b * m * n..(b + 1) * m * n], m, n);
+            let plane = &values[b * m * n..(b + 1) * m * n];
+            // Above the blocked gate, reach the same compact-WY kernel `tensor_linalg_qr`
+            // already uses. `geqrf_packed_f64` below is a per-reflector BLAS-2 loop walking
+            // `a[i * n + kk]` with stride n — one cache line per useful element, once per
+            // reflector — and it measured 227.6x vs torch at n=512 and 535.2x at n=1024,
+            // scaling at n^3.18 on an algorithm that is exactly n^3. Our own `qr`, which
+            // does strictly MORE work (it also forms Q), was 32.9x FASTER than
+            // `geqrf`+`orgqr` at n=512.
+            //
+            // The gate matches `qr_contiguous_f64`'s, so batched-tiny shapes stay on the
+            // naive path and the existing batched wins are unaffected.
+            // frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+            let (a, tau) = if m >= 128 && k >= 16 {
+                ft_kernel_cpu::geqrf_blocked_f64(plane, m, n)
+            } else {
+                Self::geqrf_packed_f64(plane, m, n)
+            };
             a_all[b * m * n..(b + 1) * m * n].copy_from_slice(&a);
             tau_all[b * k..(b + 1) * k].copy_from_slice(&tau);
         }
@@ -74700,11 +74741,24 @@ impl FrankenTorchSession {
             // Q starts as the first n columns of the m x m identity; the k
             // reflectors are applied right-to-left so Q = H_0 H_1 ... H_{k-1}.
             let q = &mut q_all[b * m * n..(b + 1) * m * n];
-            for i in 0..m.min(n) {
-                q[i * n + i] = 1.0;
-            }
-            for kk in (0..k).rev() {
-                Self::apply_reflector_left(q, m, n, a_slice, n, kk, tau_slice[kk]);
+            // Above the blocked gate, collapse each panel of reflectors into one
+            // I - V T Vᵀ applied with three GEMMs. The loop below applies ONE reflector
+            // per pass — a rank-1 update walking `a[i * n + kk]` with stride n, i.e. the
+            // same BLAS-2 shape that made `geqrf` 227.6x slower than torch before it was
+            // re-routed. `orgqr` measured 125-144x at n=512 and 312-317x at n=1024.
+            //
+            // Gate matches `qr_contiguous_f64`'s, so batched-tiny stays on the loop.
+            // frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+            if m >= 128 && k >= 16 {
+                let blocked = ft_kernel_cpu::orgqr_blocked_f64(a_slice, tau_slice, m, n, k);
+                q.copy_from_slice(&blocked);
+            } else {
+                for i in 0..m.min(n) {
+                    q[i * n + i] = 1.0;
+                }
+                for kk in (0..k).rev() {
+                    Self::apply_reflector_left(q, m, n, a_slice, n, kk, tau_slice[kk]);
+                }
             }
         }
         self.tensor_variable(q_all, a_shape.to_vec(), false)
@@ -74792,11 +74846,27 @@ impl FrankenTorchSession {
             let a_slice = &a_vals[b * m * n..(b + 1) * m * n];
             let tau_slice = &tau_vals[b * k..(b + 1) * k];
             let c_slice = &mut c_vals[b * cr * cc..(b + 1) * cr * cc];
-            for &kk in &forward {
-                if left {
-                    Self::apply_reflector_left(c_slice, m, cc, a_slice, n, kk, tau_slice[kk]);
-                } else {
-                    Self::apply_reflector_right(c_slice, cr, m, a_slice, n, kk, tau_slice[kk]);
+            // Above the blocked gate, collapse each panel of reflectors into one
+            // I - V T Vᵀ applied as three GEMMs. The loop below applies ONE reflector per
+            // pass — the BLAS-2 shape that measured ~253x vs torch at n=512 and 502-507x
+            // at n=1024, the worst of the Householder family. `ormqr_blocked_f64` carries
+            // the same panel-order rule this loop encodes: `forward` here is
+            // `transpose == left`, and the kernel traverses panels in REVERSE exactly when
+            // `left != transpose`, transposing T when `transpose` is set.
+            //
+            // Gate matches `qr_contiguous_f64`'s, so batched-tiny stays on the loop.
+            // frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+            if m >= 128 && k >= 16 {
+                ft_kernel_cpu::ormqr_blocked_f64(
+                    a_slice, tau_slice, m, n, k, c_slice, cr, cc, left, transpose,
+                );
+            } else {
+                for &kk in &forward {
+                    if left {
+                        Self::apply_reflector_left(c_slice, m, cc, a_slice, n, kk, tau_slice[kk]);
+                    } else {
+                        Self::apply_reflector_right(c_slice, cr, m, a_slice, n, kk, tau_slice[kk]);
+                    }
                 }
             }
         }
@@ -121531,6 +121601,341 @@ mod tests {
                 (g - w).abs() < 1e-10,
                 "ormqr right round trip[{i}] = {g}, want {w}"
             );
+        }
+    }
+
+    /// Blocked `ormqr` must equal the per-reflector loop across MULTIPLE PANELS.
+    ///
+    /// The kernel tests for `orgqr`/`ormqr` use N=32 against `nb_block=32`, i.e. exactly
+    /// ONE panel — and with one panel, REVERSE and FORWARD traversal are IDENTICAL. Those
+    /// tests were written to verify panel ordering and could not detect a panel-ordering
+    /// bug. The harness runs k=512, i.e. 16 panels, and caught a 6.13e-4 / 1.53e-3 parity
+    /// MISMATCH where the naive path had been 1.54e-12 MATCH.
+    ///
+    /// N=96 gives 3 panels. The reference is the `apply_reflector_left` sequence this
+    /// replaces, transcribed directly rather than reconstructed from Q, so nothing is
+    /// shared with the code under test.
+    #[test]
+    fn blocked_ormqr_matches_per_reflector_loop_across_panels() {
+        const M: usize = 160;
+        const N: usize = 96; // 3 panels at nb_block = 32
+        const W: usize = 20;
+
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.27).sin() + (j * 0.15).cos()) * 1.3
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+        let (packed, tau) = ft_kernel_cpu::geqrf_blocked_f64(&a, M, N);
+        let k = N;
+
+        let c0: Vec<f64> = (0..M * W)
+            .map(|t| ((t as f64) * 0.031).sin() + 0.6)
+            .collect();
+
+        for &(left, transpose) in &[(true, false), (true, true)] {
+            // Reference: the per-reflector loop, ordered exactly as tensor_ormqr does.
+            let mut want = c0.clone();
+            let order: Vec<usize> = if transpose == left {
+                (0..k).collect()
+            } else {
+                (0..k).rev().collect()
+            };
+            for &kk in &order {
+                FrankenTorchSession::apply_reflector_left(&mut want, M, W, &packed, N, kk, tau[kk]);
+            }
+
+            let mut got = c0.clone();
+            ft_kernel_cpu::ormqr_blocked_f64(
+                &packed, &tau, M, N, k, &mut got, M, W, left, transpose,
+            );
+
+            for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-9 * w.abs().max(1.0),
+                    "ormqr left={left} transpose={transpose} [{idx}]: blocked {g}, loop {w}"
+                );
+            }
+        }
+    }
+
+    /// SQUARE input: the blocked and naive `geqrf` must still agree.
+    ///
+    /// Every other fixture in this file is TALL (M > N), which never exercises a column
+    /// whose below-diagonal part is empty. For a SQUARE matrix the last column (j = m-1)
+    /// has exactly that shape, and the two paths test different things there:
+    ///   naive/LAPACK dlarfg: tests `below_sq == 0` -> tau = 0, NO reflection
+    ///   blocked leaf:        tests `norm_v < tiny` over the WHOLE column including the
+    ///                        diagonal, which is nonzero, so it builds a reflector
+    /// A spurious reflector there negates a row. That is invisible to |diag(R)| and to
+    /// |Q| elementwise, and visible in |Q C| — which is exactly the pattern the harness
+    /// reported (geqrf MATCH, orgqr MATCH, ormqr 6.13e-4 MISMATCH).
+    #[test]
+    fn blocked_geqrf_matches_naive_on_square_input() {
+        const M: usize = 96;
+        const N: usize = 96;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.33).sin() + (j * 0.21).cos()) * 1.4
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let (naive_packed, naive_tau) = FrankenTorchSession::geqrf_packed_f64(&a, M, N);
+        let (blocked_packed, blocked_tau) = ft_kernel_cpu::geqrf_blocked_f64(&a, M, N);
+
+        for (j, (b, w)) in blocked_tau.iter().zip(naive_tau.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "square tau[{j}]: blocked {b}, naive {w}"
+            );
+        }
+        for (idx, (b, w)) in blocked_packed.iter().zip(naive_packed.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "square packed[{idx}] (row {}, col {}): blocked {b}, naive {w}",
+                idx / N,
+                idx % N
+            );
+        }
+    }
+
+    /// The blocked `geqrf` must reproduce the NAIVE `geqrf`'s packed factor and tau
+    /// elementwise — not merely "a valid QR".
+    ///
+    /// WHY THIS EXISTS, having been written after the fact. The kernel test asserts
+    /// `Q R == A`, which ANY valid QR satisfies, including one whose reflectors differ in
+    /// sign from LAPACK's. The harness `geqrf` lane checksums only
+    /// `torch.geqrf(A)[0].diagonal().abs()`, i.e. |diag(R)| — it never compares the
+    /// reflectors below the diagonal or tau against torch at all. And the `orgqr` lane
+    /// takes |Q| elementwise, which is sign-insensitive by design.
+    ///
+    /// So three green checks all shared one blind spot, and the FIRST thing to see through
+    /// it was `ormqr`, whose checksum is |Q C| and therefore sign-sensitive: it came back
+    /// 6.13e-4 / 1.53e-3 MISMATCH. This test compares our own two implementations directly,
+    /// which is the check that can actually fail on a convention or ordering difference.
+    #[test]
+    fn blocked_geqrf_matches_naive_geqrf_elementwise() {
+        // N=96 gives THREE panels at nb_block=32. An earlier version used N=32, i.e.
+        // exactly ONE panel, where the blocked path's multi-panel logic never runs -- the
+        // same blind spot that let an ormqr regression through every green check.
+        const M: usize = 160;
+        const N: usize = 96;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.37).sin() + (j * 0.11).cos()) * 1.5
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let (naive_packed, naive_tau) = FrankenTorchSession::geqrf_packed_f64(&a, M, N);
+        let (blocked_packed, blocked_tau) = ft_kernel_cpu::geqrf_blocked_f64(&a, M, N);
+
+        assert_eq!(naive_tau.len(), blocked_tau.len());
+        for (j, (b, w)) in blocked_tau.iter().zip(naive_tau.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "tau[{j}]: blocked {b}, naive {w}"
+            );
+        }
+        for (idx, (b, w)) in blocked_packed.iter().zip(naive_packed.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "packed[{idx}] (row {}, col {}): blocked {b}, naive {w}",
+                idx / N,
+                idx % N
+            );
+        }
+    }
+
+    /// The ROUTED ormqr must equal an explicit multiply by Q, above the blocked gate, for
+    /// all four `(left, transpose)` combinations.
+    ///
+    /// The existing ormqr goldens are 4x3 — below `m >= 128 && k >= 16` — so they still run
+    /// the per-reflector loop and cover none of the blocked path. The kernel test covers
+    /// the kernel; this covers the ft-api ROUTING, including that `left`/`transpose` are
+    /// forwarded in the right order.
+    ///
+    /// Q is formed here through `householder_product` and multiplied out. An orthogonality
+    /// check would pass for a reversed panel order, so only the explicit product pins it.
+    /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+    #[test]
+    fn routed_ormqr_matches_explicit_q_multiply_above_the_blocked_gate() {
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 20;
+
+        let a_vals: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.31).sin() + (j * 0.23).cos()) * 1.2
+                    + if idx % (N + 1) == 0 { 3.0 } else { 0.0 }
+            })
+            .collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(a_vals, vec![M, N], false).unwrap();
+        let (packed, tau) = s.tensor_geqrf(a).unwrap();
+        // Reduced Q (M x N) — enough to check Qᵀ C and C Q on the reduced factor.
+        let q = s.tensor_householder_product(packed, tau).unwrap();
+        let q_vals = s.tensor_values(q).unwrap();
+
+        // left=true, transpose=true: Qᵀ C, with C being M x W. Result is M x W but only
+        // the first N rows are determined by the reduced Q, so compare those.
+        let c_vals: Vec<f64> = (0..M * W)
+            .map(|t| ((t as f64) * 0.029).sin() + 0.4)
+            .collect();
+        let c = s.tensor_variable(c_vals.clone(), vec![M, W], false).unwrap();
+        let got = s.tensor_ormqr(packed, tau, c, true, true).unwrap();
+        let got_vals = s.tensor_values(got).unwrap();
+
+        for i in 0..N {
+            for j in 0..W {
+                let mut acc = 0.0;
+                for t in 0..M {
+                    acc += q_vals[t * N + i] * c_vals[t * W + j];
+                }
+                let g = got_vals[i * W + j];
+                assert!(
+                    (g - acc).abs() < 1e-9 * acc.abs().max(1.0),
+                    "routed ormqr QtC[{i}][{j}] = {g}, want {acc}"
+                );
+            }
+        }
+
+        // left=false, transpose=false: C Q with C being W x M, result W x N.
+        let d_vals: Vec<f64> = (0..W * M)
+            .map(|t| ((t as f64) * 0.043).cos() - 0.2)
+            .collect();
+        let d = s.tensor_variable(d_vals.clone(), vec![W, M], false).unwrap();
+        let got_r = s.tensor_ormqr(packed, tau, d, false, false).unwrap();
+        let got_r_vals = s.tensor_values(got_r).unwrap();
+
+        for i in 0..W {
+            for j in 0..N {
+                let mut acc = 0.0;
+                for t in 0..M {
+                    acc += d_vals[i * M + t] * q_vals[t * N + j];
+                }
+                let g = got_r_vals[i * M + j];
+                assert!(
+                    (g - acc).abs() < 1e-9 * acc.abs().max(1.0),
+                    "routed ormqr CQ[{i}][{j}] = {g}, want {acc}"
+                );
+            }
+        }
+    }
+
+    /// The ROUTED orgqr must produce the same Q as `linalg_qr`, above the blocked gate.
+    ///
+    /// The two ft-api `householder_product` goldens are 4x3, i.e. BELOW the
+    /// `m >= 128 && k >= 16` gate, so they still exercise the per-reflector loop and cover
+    /// none of the blocked path. The kernel-level test covers the kernel; nothing covered
+    /// the ft-api ROUTING — the gate condition and the copy into the output buffer — until
+    /// this test.
+    ///
+    /// `linalg_qr` reaches Q through the blocked forward+reverse pass directly, while
+    /// `geqrf` + `householder_product` unpacks packed reflectors and rebuilds Q from them,
+    /// so these remain genuinely different code paths and the comparison has content.
+    /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+    #[test]
+    fn routed_orgqr_matches_qr_q_above_the_blocked_gate() {
+        const M: usize = 160;
+        const N: usize = 32;
+        let a_vals: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.41).sin() + (j * 0.13).cos()) * 1.4
+                    + if idx % (N + 1) == 0 { 3.5 } else { 0.0 }
+            })
+            .collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let a1 = s.tensor_variable(a_vals.clone(), vec![M, N], false).unwrap();
+        let (packed, tau) = s.tensor_geqrf(a1).unwrap();
+        let q_orgqr = s.tensor_householder_product(packed, tau).unwrap();
+        let q_orgqr_vals = s.tensor_values(q_orgqr).unwrap();
+
+        let a2 = s.tensor_variable(a_vals, vec![M, N], false).unwrap();
+        let (q_qr, _r) = s.tensor_linalg_qr(a2, true).unwrap();
+        let q_qr_vals = s.tensor_values(q_qr).unwrap();
+
+        assert_eq!(q_orgqr_vals.len(), q_qr_vals.len());
+        for (idx, (g, w)) in q_orgqr_vals.iter().zip(q_qr_vals.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-9,
+                "routed orgqr Q[{idx}] = {g}, linalg_qr Q = {w}"
+            );
+        }
+    }
+
+    /// `geqrf` and `qr` must agree on R for the SAME input, at a size where they take
+    /// DIFFERENT routes.
+    ///
+    /// Every other geqrf test in this file is 4x3. `tensor_linalg_qr` dispatches to the
+    /// blocked compact-WY kernel at `m >= 128 && k >= 16`, so at 4x3 both entry points run
+    /// the same naive path and no existing test can observe a disagreement between them.
+    /// This fixture is 160x32: qr takes the blocked kernel, geqrf takes its private
+    /// per-reflector loop.
+    ///
+    /// Two reasons this test exists:
+    ///   1. It is a correctness claim in its own right — one factorisation reached through
+    ///      two public entry points must not give two answers.
+    ///   2. It is the gate for `frankentorch-geqrf-misses-blocked-kernel-1zp6r`, which
+    ///      re-routes geqrf to the blocked kernel. A re-route gated at `m >= 128` changes
+    ///      NOTHING that the 4x3 goldens can see, so they would stay green while covering
+    ///      none of the new path. This test covers it.
+    ///
+    /// Compared on |R|: QR is unique only up to the sign of each row of R, and asserting
+    /// raw signs would couple this test to a reflector sign convention rather than to the
+    /// factorisation. Magnitudes are the substantive claim.
+    #[test]
+    fn geqrf_and_qr_agree_on_r_above_the_blocked_gate() {
+        const M: usize = 160;
+        const N: usize = 32;
+
+        // Deterministic, no RNG, well-scaled and full rank.
+        let a_vals: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.37).sin() + (j * 0.11).cos()) * 1.5 + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let a_geqrf = s.tensor_variable(a_vals.clone(), vec![M, N], false).unwrap();
+        let (packed, _tau) = s.tensor_geqrf(a_geqrf).unwrap();
+        let packed_vals = s.tensor_values(packed).unwrap();
+
+        let a_qr = s.tensor_variable(a_vals, vec![M, N], false).unwrap();
+        let (_q, r) = s.tensor_linalg_qr(a_qr, true).unwrap();
+        let r_vals = s.tensor_values(r).unwrap();
+        let r_shape = s.tensor_shape(r).unwrap();
+        assert_eq!(r_shape, vec![N, N], "reduced qr should give an N x N R");
+
+        // geqrf packs R into the upper triangle of the MxN result; qr returns R as NxN.
+        for i in 0..N {
+            for j in i..N {
+                let from_geqrf = packed_vals[i * N + j].abs();
+                let from_qr = r_vals[i * N + j].abs();
+                let tol = 1e-9 * from_qr.abs().max(1.0);
+                assert!(
+                    (from_geqrf - from_qr).abs() < tol,
+                    "geqrf and qr disagree on |R[{i}][{j}]|: geqrf {from_geqrf}, qr {from_qr}"
+                );
+            }
         }
     }
 

@@ -66,6 +66,43 @@ enum LinalgOp {
     Eigh,
     Eigvalsh,
     Qr,
+    /// Householder QR FACTORISATION only — no Q formed. Isolates panel + trailing GEMM.
+    Geqrf,
+    /// FORM Q from packed reflectors. The geqrf producing them runs outside the timer.
+    Orgqr,
+    /// APPLY packed reflectors to a matrix (Q^T C). geqrf runs outside the timer.
+    Ormqr,
+    /// Cholesky of an SPD matrix. Unique factorisation, so parity is unambiguous.
+    Cholesky,
+    /// slogdet — computed via LU, so it prices the LU path with a SCALAR checksum that is
+    /// invariant to pivot order. Chosen over plain `det` because the SPD fixture's
+    /// determinant (~n^n) is not representable in f64 at n=512.
+    ///
+    /// This once also said `lu_factor` was unusable here because row permutations can
+    /// legitimately differ between implementations. That is true in general but NOT for
+    /// this fixture: `_spd` is strictly diagonally dominant, so partial pivoting takes the
+    /// diagonal at every step on both sides and no swap ever happens. `LuFactor` below now
+    /// measures the factor directly.
+    Slogdet,
+    /// inv — LU-backed like slogdet, but with an O(n^3) getri tail instead of slogdet's
+    /// O(n) diagonal log-product. Included to separate two readings of slogdet's 21-25x:
+    /// either the whole LU family sits there (getrf is the cost), or slogdet's scalar tail
+    /// is implicated. The SPD fixture is used for CONDITIONING only — torch does not know
+    /// the matrix is SPD and still routes through getrf/getri, so the LU path is preserved.
+    Inv,
+    /// lu_factor — getrf and nothing else, so it measures our LU factorisation against
+    /// torch's with no tail on either side. Included to TEST the claim that post-fix
+    /// slogdet's residual ~10.8x IS our bare getrf gap: if that holds, lu_factor must land
+    /// near 10.8x too. Its no-grad path already takes both outputs off one kernel call, so
+    /// it is uncontaminated by the redundancy just fixed in slogdet.
+    ///
+    /// The SPD fixture is strictly diagonally dominant, so partial pivoting selects the
+    /// diagonal at every step in BOTH implementations — no row swaps, LU is unique, and
+    /// |sum| is directly comparable rather than pivot-order noise.
+    LuFactor,
+    /// matrix_exp — scaling-and-squaring + Pade, so almost entirely GEMM. Included to test
+    /// whether the board's GEMM-bound wins (1.06-1.70x FASTER) carry to a linalg op.
+    MatrixExp,
 }
 
 /// One measured configuration of our own arm.
@@ -183,6 +220,51 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
         .expect("svd leaf");
+    // ORGQR IS TIMED SEPARATELY, because its input must be produced OUTSIDE the clock.
+    // `tensor_geqrf` is itself a measured 226x defect; timing it here would drown the very
+    // thing this lane exists to isolate. The incumbent does the same -- its geqrf runs at
+    // LANES construction time.
+    if op == LinalgOp::Ormqr {
+        let (packed, tau) = session.tensor_geqrf(x).expect("geqrf for ormqr");
+        let c = session
+            .tensor_variable(data.to_vec(), vec![n, n], false)
+            .expect("ormqr C");
+        let started = Instant::now();
+        let out = session
+            .tensor_ormqr(packed, tau, c, true, false)
+            .expect("ormqr");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        let sum: f64 = session
+            .tensor_values(out)
+            .expect("ormqr values")
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+        ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
+        ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
+        ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+        return (ms, sum);
+    }
+    if op == LinalgOp::Orgqr {
+        let (packed, tau) = session.tensor_geqrf(x).expect("geqrf for orgqr");
+        let started = Instant::now();
+        let q = session.tensor_orgqr(packed, tau).expect("orgqr");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        // |Q|, matching the incumbent: Q is unique only up to COLUMN SIGNS, so a raw sum
+        // would mismatch on a convention difference rather than on a defect.
+        let sum: f64 = session
+            .tensor_values(q)
+            .expect("q values")
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+        ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
+        ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
+        ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+        return (ms, sum);
+    }
     let started = Instant::now();
     // Both branches time exactly the decomposition and stop before the checksum is read, which
     // is what the incumbent's `run` does too. The values-only branch reaches
@@ -205,9 +287,45 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 w
             }
             LinalgOp::Eigvalsh => session.tensor_linalg_eigvalsh(x).expect("eigvalsh"),
+            LinalgOp::MatrixExp => {
+                let e = session.tensor_matrix_exp(x).expect("matrix_exp");
+                let a = session.tensor_abs(e).expect("abs");
+                session.tensor_sum(a).expect("sum")
+            }
+            LinalgOp::Slogdet => {
+                let (_sign, logabsdet) = session.tensor_linalg_slogdet(x).expect("slogdet");
+                session.tensor_abs(logabsdet).expect("abs")
+            }
+            LinalgOp::LuFactor => {
+                // Pivots come back as a plain Vec<usize>, so only the LU factor is timed.
+                let (lu, _pivots) = session.tensor_lu_factor(x).expect("lu_factor");
+                let a = session.tensor_abs(lu).expect("abs");
+                session.tensor_sum(a).expect("sum")
+            }
+            LinalgOp::Inv => {
+                // inv's result is unique (no sign, pivot or basis freedom), so |sum|
+                // genuinely discriminates rather than decorating.
+                let a_inv = session.tensor_linalg_inv(x).expect("inv");
+                let a = session.tensor_abs(a_inv).expect("abs");
+                session.tensor_sum(a).expect("sum")
+            }
+            LinalgOp::Cholesky => {
+                let l = session.tensor_linalg_cholesky(x, false).expect("cholesky");
+                let d = session.tensor_diagonal(l, 0).expect("diag");
+                session.tensor_abs(d).expect("abs")
+            }
             LinalgOp::Qr => {
                 let (_q, r) = session.tensor_linalg_qr(x, false).expect("qr");
                 let d = session.tensor_diagonal(r, 0).expect("diag");
+                session.tensor_abs(d).expect("abs")
+            }
+            LinalgOp::Orgqr | LinalgOp::Ormqr => unreachable!("timed in their own branches above"),
+            LinalgOp::Geqrf => {
+                // geqrf overwrites the upper triangle with R and the lower with the
+                // packed reflectors; |diag| is R's diagonal, the same quantity the qr
+                // lane checksums and the only part comparable across implementations.
+                let (a, _tau) = session.tensor_geqrf(x).expect("geqrf");
+                let d = session.tensor_diagonal(a, 0).expect("diag");
                 session.tensor_abs(d).expect("abs")
             }
         }
@@ -397,7 +515,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "eigh" => LinalgOp::Eigh,
         "eigvalsh" => LinalgOp::Eigvalsh,
         "qr" => LinalgOp::Qr,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr"),
+        "geqrf" => LinalgOp::Geqrf,
+        "orgqr" => LinalgOp::Orgqr,
+        "ormqr" => LinalgOp::Ormqr,
+        "cholesky" => LinalgOp::Cholesky,
+        "slogdet" => LinalgOp::Slogdet,
+        "matrix_exp" => LinalgOp::MatrixExp,
+        "inv" => LinalgOp::Inv,
+        "lu_factor" => LinalgOp::LuFactor,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp|inv"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -405,14 +531,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "eigh" => ("torch.linalg.eigh(A)[0]", true),
         "eigvalsh" => ("torch.linalg.eigvalsh(A)", true),
         "qr" => ("torch.linalg.qr(A)[1].diagonal().abs()", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr"),
+        // geqrf is the FACTORISATION ALONE -- panel + trailing GEMM, with NO Q formed.
+        // `qr - geqrf` therefore isolates the Q-formation half, and geqrf on its own
+        // prices the panel/BLAS-2 + GEMM phase that the GEMM refutation (ee024f6e) and the
+        // blocking refutation (318cd457) both pointed at without being able to measure.
+        // Checksum is |diag(A)| on both arms: geqrf overwrites A's upper triangle with R,
+        // so its diagonal is R's, matching the qr lane's convention and comparable across
+        // implementations where the raw reflectors are not.
+        "geqrf" => ("torch.geqrf(A)[0].diagonal().abs()", false),
+        // orgqr: FORM Q from packed reflectors. The geqrf that produces (A, tau) runs at LANES
+        // construction time, OUTSIDE the timed region, on both arms -- otherwise this would
+        // re-measure geqrf's 226x defect instead of orgqr.
+        //
+        // CHECKSUM IS |Q|, NOT Q. Each arm forms Q from its OWN geqrf output, and the two
+        // factorisations need not agree on reflector sign convention. For a full-rank matrix the
+        // QR factor Q is unique only up to COLUMN SIGNS, so a raw sum would mismatch on a
+        // convention difference rather than on a defect. Summing |Q| is invariant under column
+        // sign flips and still catches a genuinely wrong Q.
+        "orgqr" => ("torch.linalg.householder_product(A[0], A[1]).abs()", false),
+        // ormqr: APPLY the packed reflectors to a matrix C (Q^T C, left, no transpose).
+        // Like orgqr, the geqrf producing (A, tau) runs at LANES construction time, OUTSIDE
+        // the timed region, on both arms -- otherwise this re-measures geqrf's 227x defect.
+        // |result| for the same reason orgqr uses |Q|: the two factorisations need not agree
+        // on reflector sign convention, and a sign difference is not a defect.
+        "ormqr" => ("torch.ormqr(A[0], A[1], A[2]).abs()", false),
+        // cholesky: the factorisation is UNIQUE for an SPD matrix, so diag(L) is directly
+        // comparable across implementations -- no sign or pivot freedom to explain away a
+        // mismatch. That is why this op was chosen over ldl_factor, whose Bunch-Kaufman
+        // pivoting may legitimately differ and would make the parity column unreadable.
+        "cholesky" => ("torch.linalg.cholesky(A).diagonal().abs()", false),
+        // slogdet: exercises the LU path with a SCALAR, pivot-order-invariant checksum.
+        // See the Rust arm for why this was chosen over lu_factor and over plain det.
+        "slogdet" => ("torch.linalg.slogdet(A)[1].abs().reshape(1)", false),
+        // inv: LU-backed with an O(n^3) getri tail. See the Rust arm for why the SPD
+        // fixture is used here (conditioning) without diverting off the LU route.
+        "inv" => ("torch.linalg.inv(A).abs().sum().reshape(1)", false),
+        // lu_factor: bare getrf on both sides. SPD fixture is diagonally dominant so
+        // partial pivoting takes the diagonal and LU is unique. See the Rust arm.
+        "lu_factor" => ("torch.linalg.lu_factor(A)[0].abs().sum().reshape(1)", false),
+        // matrix_exp: GEMM-dominated (scaling-squaring + Pade), unique result. See the
+        // Rust arm for why the fixture is scaled by 1/n.
+        "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
     let lane_entries: Vec<String> = lanes
         .iter()
         .map(|(n, name)| {
-            format!("    \"{name}\": (_mk({n}, {}), lambda A: {py_fn}),", if sym { "True" } else { "False" })
+            let base = if op == "orgqr" {
+                format!("torch.geqrf(_mk({n}, False))")
+            } else if op == "cholesky" || op == "slogdet" || op == "inv" || op == "lu_factor" {
+                format!("_spd({n})")
+            } else if op == "matrix_exp" {
+                format!("_expm_fixture({n})")
+            } else if op == "ormqr" {
+                // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
+                format!("(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))")
+            } else {
+                format!("_mk({n}, {})", if sym { "True" } else { "False" })
+            };
+            format!("    \"{name}\": ({base}, lambda A: {py_fn}),")
         })
         .collect();
     let py_setup = format!(
@@ -427,6 +606,15 @@ def _mk(n, sym=False):
     # without this the two arms would be answering different questions and the parity column
     # would be meaningless rather than merely failing.
     return (A + A.T) * 0.5 if sym else A
+def _expm_fixture(n):
+    # Scaled by 1/n so the spectral radius stays O(1): expm of the raw fixture overflows
+    # f64 well before n=512. The Rust arm applies the identical scaling.
+    return _mk(n, False) / float(n)
+def _spd(n):
+    # Symmetric + strictly diagonally dominant => positive definite at every n, so the
+    # Cholesky factor exists and is unique. The Rust arm builds the identical matrix.
+    A = _mk(n, True)
+    return A + torch.eye(n, dtype=torch.float64) * float(n)
 def run(base, fn):
     _t = time.perf_counter()
     _s = fn(base)
@@ -509,7 +697,31 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // Symmetrised for the eig lanes ONLY, matching the incumbent's `_mk(n, sym=True)`
         // exactly. eigh reads one triangle, so an unsymmetrised fixture would have the two arms
         // answering different questions.
-        let data = if sym { symmetrise(&fill(n), n) } else { fill(n) };
+        let data = if ft_op == LinalgOp::MatrixExp {
+            // Identical to the incumbent's `_expm_fixture`: scale by 1/n so the spectral
+            // radius stays O(1). Unscaled, expm overflows f64 long before n=512.
+            let mut d = fill(n);
+            for v in &mut d {
+                *v /= n as f64;
+            }
+            d
+        } else if ft_op == LinalgOp::Cholesky
+            || ft_op == LinalgOp::Slogdet
+            || ft_op == LinalgOp::Inv
+            || ft_op == LinalgOp::LuFactor
+        {
+            // Identical to the incumbent's `_spd`: symmetrise, then add n to the diagonal.
+            // Strictly diagonally dominant => positive definite at every n.
+            let mut d = symmetrise(&fill(n), n);
+            for i in 0..n {
+                d[i * n + i] += n as f64;
+            }
+            d
+        } else if sym {
+            symmetrise(&fill(n), n)
+        } else {
+            fill(n)
+        };
         let iowait_before = iowait_jiffies();
         let (load_before, mhz_before) = provenance();
 
