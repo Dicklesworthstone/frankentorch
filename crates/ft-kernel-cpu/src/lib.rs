@@ -23880,6 +23880,19 @@ pub fn lu_factor_contiguous_f64(
     data: &[f64],
     meta: &TensorMeta,
 ) -> Result<LuFactorResult, KernelError> {
+    lu_factor_contiguous_nb_f64(data, meta, 64)
+}
+
+/// `lu_factor_contiguous_f64` with the blocking factor exposed, for sweeping.
+///
+/// `NB` here has never been swept. It shipped at 64 - higher than the QR path's 32, whose
+/// measured optimum turned out to be 16 - and getrf is the worst remaining single-matrix
+/// loss at 14.715x (n=512) now that the Householder family is closed.
+pub fn lu_factor_contiguous_nb_f64(
+    data: &[f64],
+    meta: &TensorMeta,
+    nb_param: usize,
+) -> Result<LuFactorResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
     if shape.len() != 2 {
@@ -23920,7 +23933,9 @@ pub fn lu_factor_contiguous_f64(
     // identical to the unblocked algorithm; only the trailing arithmetic
     // reassociates (the factorization stays a valid P·L·U = A to working
     // precision, checked by `lu_factor_reconstructs_pa_eq_lu`).
-    const NB: usize = 64;
+    let nb_runtime = nb_param.max(1);
+    #[allow(non_snake_case)]
+    let NB: usize = nb_runtime;
     const LU_PAR_MIN_ROWS: usize = 64;
     let singular_tol = f64::EPSILON * 1e3;
 
@@ -36541,9 +36556,15 @@ fn qr_factor_panel_recursive_f64(
     vmat: &mut [f64],
     tau: &mut [f64],
     tiny: f64,
+    leaf: usize,
 ) {
-    const LEAF: usize = 8;
-    if range_end - range_start <= LEAF {
+    // Where the dgeqrt3 recursion stops and BLAS-2 takes over. This traded off against the
+    // staging cost measured on the trailing update: a SMALLER leaf means more BLAS-3
+    // combines but more gather/transpose staging per combine, a LARGER one means less
+    // staging but more rank-1 BLAS-2 work. The panel is 51.5% of blocked geqrf at nb=32,
+    // so this constant sits on the dominant term and had never been swept.
+    let leaf = leaf.max(1);
+    if range_end - range_start <= leaf {
         qr_factor_panel_leaf_f64(
             r_mat,
             m,
@@ -36571,6 +36592,7 @@ fn qr_factor_panel_recursive_f64(
         vmat,
         tau,
         tiny,
+        leaf,
     );
     qr_apply_panel_block_reflector_f64(
         r_mat,
@@ -36596,6 +36618,7 @@ fn qr_factor_panel_recursive_f64(
         vmat,
         tau,
         tiny,
+        leaf,
     );
 }
 
@@ -36613,6 +36636,7 @@ fn qr_blocked_forward_f64(
     n: usize,
     k: usize,
     nb_block: usize,
+    leaf: usize,
     mut timings: Option<&mut QrStageTimings>,
 ) -> Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> {
     let nb_block = nb_block.max(1);
@@ -36629,7 +36653,7 @@ fn qr_blocked_forward_f64(
         let panel_start = qr_profile_stage_start(profile_enabled);
         let mut vmat = vec![0.0f64; m * nb];
         let mut tau = vec![0.0f64; nb];
-        qr_factor_panel_recursive_f64(r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny);
+        qr_factor_panel_recursive_f64(r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny, leaf);
 
         // --- Compact-WY T (nb×nb upper triangular, LAPACK dlarft forward) so that
         //     H_p H_{p+1} ... H_{pe-1} = I - V T Vᵀ.
@@ -36709,7 +36733,7 @@ fn qr_householder_panel_blocked_profiled(
     // Forward pass reduces R and stores each panel's (V, T); Q is then built
     // (m×qcols) by a reverse dorgqr — so REDUCED tall matrices (qcols=k<m) cost
     // O(m·k²) instead of building the full m×m Q (O(m²·k)). frankentorch-ct2yy.
-    let panels = qr_blocked_forward_f64(r_mat, m, n, k, nb_block, timings.as_deref_mut());
+    let panels = qr_blocked_forward_f64(r_mat, m, n, k, nb_block, 8, timings.as_deref_mut());
 
     // --- Reverse dorgqr: Q (m×qcols) = H_0 H_1 ... H_{k-1} · I[:, :qcols].
     // Start X = I[:, :qcols]; apply blocks innermost-first (reverse panel order),
@@ -36782,7 +36806,28 @@ fn qr_householder_panel_blocked(
 ///
 /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
 pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
-    geqrf_blocked_nb_f64(a, m, n, 32, None)
+    // nb=32 (unchanged), leaf 8 -> 2. Interleaved min-of-7 ladders at BOTH n=512 and
+    // n=1024, because the two constants behave differently:
+    //
+    //                      n=512      n=1024
+    //   nb=32 leaf=8     18.990ms   236.780ms   (original)
+    //   nb=16 leaf=2     15.358ms   227.244ms   (wins at 512, LOSES at 1024)
+    //   nb=32 leaf=2     16.584ms   201.604ms   (wins at BOTH)  <- shipped
+    //
+    // `leaf` sits on the panel term and helps uniformly (1.145x at 512, 1.175x at 1024):
+    // shrinking it pushes panel work out of BLAS-2 rank-1 updates into the BLAS-3
+    // combines. `nb` is SIZE-DEPENDENT and is left alone.
+    //
+    // An earlier version shipped nb=16 from an n=512-only ladder. In situ that gave a
+    // certified 1.223x at n=512 (25.386 -> 20.764 ms) and NOTHING at n=1024
+    // (130.383 -> 131.708 ms against a flat incumbent) - a fast path validated at one
+    // shape is only known at that shape.
+    //
+    // The leaf optimum is INTERIOR, not a grid edge (leaf=1 is worse than 2-3), and
+    // `trailing_R` is invariant across leaf, so the knob moves only the term it should.
+    //
+    // Applied to geqrf ONLY; `tensor_linalg_qr` keeps its own constants.
+    geqrf_blocked_nb_f64(a, m, n, 32, 2, None)
 }
 
 /// `geqrf_blocked_f64` with the panel width exposed and optional stage timings.
@@ -36799,6 +36844,7 @@ pub fn geqrf_blocked_nb_f64(
     m: usize,
     n: usize,
     nb_block: usize,
+    leaf: usize,
     timings: Option<&mut QrStageTimings>,
 ) -> (Vec<f64>, Vec<f64>) {
     let k = m.min(n);
@@ -36806,7 +36852,7 @@ pub fn geqrf_blocked_nb_f64(
     if k == 0 {
         return (packed, Vec::new());
     }
-    let panels = qr_blocked_forward_f64(&mut packed, m, n, k, nb_block.max(1), timings);
+    let panels = qr_blocked_forward_f64(&mut packed, m, n, k, nb_block.max(1), leaf.max(1), timings);
 
     // The forward pass leaves R in the upper triangle and ZEROS below it, so scattering
     // the reflectors into the lower triangle overwrites nothing R needs.
@@ -44111,6 +44157,53 @@ mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
 
+    /// Sweep getrf's blocking factor. It shipped at NB=64 and was never swept.
+    ///
+    /// getrf is the worst remaining single-matrix loss (14.715x at n=512) now that the
+    /// Householder family is closed, and `slogdet` is provably the same op
+    /// (`ratio=0.9892x`), so this one constant sits under both.
+    ///
+    /// NB=64 is higher than the QR path's 32, whose measured optimum turned out to be 16 —
+    /// and panel widths in this tree have been mis-tuned HIGH before. Min-of-N with the
+    /// ladder INTERLEAVED inside the round loop, because single-shot timings on a shared
+    /// worker gave three different winners for the QR sweep.
+    #[test]
+    fn getrf_nb_ladder() {
+        const N: usize = 512;
+        let a: Vec<f64> = (0..N * N)
+            .map(|idx| {
+                let i = idx / N;
+                let j = idx % N;
+                let v = (((i * 7 + j * 13) % 101) as f64 - 50.0) / 25.0;
+                if i == j { v + N as f64 } else { v }
+            })
+            .collect();
+        let meta = TensorMeta::from_shape(vec![N, N], DType::F64, Device::Cpu);
+
+        let _ = super::lu_factor_contiguous_nb_f64(&a, &meta, 64).expect("warmup");
+
+        const REPS: usize = 7;
+        let mut best: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
+        for _ in 0..REPS {
+            for nb in [8usize, 16, 32, 64, 128] {
+                let t0 = std::time::Instant::now();
+                let _ = super::lu_factor_contiguous_nb_f64(&a, &meta, nb).expect("lu");
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let e = best.entry(nb).or_insert(f64::MAX);
+                if ms < *e {
+                    *e = ms;
+                }
+            }
+        }
+        let shipped = best[&64];
+        for (nb, ms) in &best {
+            println!(
+                "GETRF_NB nb={nb:>4} min-of-{REPS} wall={ms:8.3}ms  vs shipped(64)={:6.4}x",
+                shipped / ms
+            );
+        }
+    }
+
     /// Does `slogdet` cost anything above bare `getrf`? Same process, min-of-N, interleaved.
     ///
     /// This settles an attribution that two SEPARATE harness runs could not. `slogdet` and
@@ -44170,7 +44263,11 @@ mod tests {
     /// Run with: cargo test -p frankentorch-kernel-cpu --lib geqrf_stage_attribution -- --nocapture
     #[test]
     fn geqrf_stage_attribution_and_nb_ladder() {
-        const N: usize = 512;
+        // n=1024, NOT 512. The nb=16/leaf=2 constants were swept at n=512, reproduced there
+        // in situ (25.386 -> 20.764 ms, 1.223x, certified) and did NOTHING at n=1024
+        // (130.383 -> 131.708 ms with a flat incumbent). Optimal blocking is size-dependent
+        // and a ladder run at one size says nothing about another.
+        const N: usize = 1024;
         let a: Vec<f64> = (0..N * N)
             .map(|idx| {
                 let i = (idx / N) as f64;
@@ -44181,7 +44278,7 @@ mod tests {
             .collect();
 
         // Warm up: first call pays allocator and page-fault costs the rest do not.
-        let _ = super::geqrf_blocked_nb_f64(&a, N, N, 32, None);
+        let _ = super::geqrf_blocked_nb_f64(&a, N, N, 32, 8, None);
 
         // MIN-OF-N, interleaved. A single shot per nb ranked 32 fastest in one run and 8
         // fastest in the next, and nb=16 moved 1.53x between them - single-shot timings on
@@ -44192,21 +44289,28 @@ mod tests {
         let mut best: std::collections::BTreeMap<usize, (f64, super::QrStageTimings)> =
             std::collections::BTreeMap::new();
         for _rep in 0..REPS {
-            for nb in [8usize, 16, 32, 64] {
-                let mut t = super::QrStageTimings::default();
-                let start = std::time::Instant::now();
-                let (_p, _tau) = super::geqrf_blocked_nb_f64(&a, N, N, nb, Some(&mut t));
-                let ms = start.elapsed().as_secs_f64() * 1e3;
-                match best.get(&nb) {
-                    Some((prev, _)) if *prev <= ms => {}
-                    _ => {
-                        best.insert(nb, (ms, t));
+            // Sweep LEAF at the two best nb values. LEAF is where the dgeqrt3 recursion
+            // stops and BLAS-2 begins, so it sits on the panel term (51.5% of the lane at
+            // nb=32) rather than on staging (11.8%) or the trailing GEMM.
+            for nb in [16usize, 32, 64] {
+                for leaf in [2usize, 4, 8, 16] {
+                    let mut t = super::QrStageTimings::default();
+                    let start = std::time::Instant::now();
+                    let (_p, _tau) =
+                        super::geqrf_blocked_nb_f64(&a, N, N, nb, leaf, Some(&mut t));
+                    let ms = start.elapsed().as_secs_f64() * 1e3;
+                    let key = nb * 100 + leaf;
+                    match best.get(&key) {
+                        Some((prev, _)) if *prev <= ms => {}
+                        _ => {
+                            best.insert(key, (ms, t));
+                        }
                     }
                 }
             }
         }
-        for (nb, (wall_ms, t)) in &best {
-            let nb = *nb;
+        for (key, (wall_ms, t)) in &best {
+            let (nb, leaf) = (key / 100, key % 100);
             let wall_ms = *wall_ms;
             // Divide by WALL, not by `total_ns`: the forward helper never populates
             // `total_ns`, so a `total_ns.max(1)` divisor silently prints raw nanoseconds
@@ -44214,7 +44318,7 @@ mod tests {
             let wall_ns = wall_ms * 1e6;
             let pct = |v: u128| 100.0 * v as f64 / wall_ns;
             println!(
-                "GEQRF_NB nb={nb:>3} wall={wall_ms:8.3}ms  panel+T={:5.1}%  trailing_R={:5.1}% ({:7.3}ms)  of which STAGING={:5.1}% ({:7.3}ms)",
+                "GEQRF_NB nb={nb:>3} leaf={leaf:>2} wall={wall_ms:8.3}ms  panel+T={:5.1}%  trailing_R={:5.1}% ({:7.3}ms)  STAGING={:5.1}% ({:7.3}ms)",
                 pct(t.panel_and_t_ns),
                 pct(t.trailing_r_ns),
                 t.trailing_r_ns as f64 / 1e6,
