@@ -98,3 +98,49 @@ should land near ~17 ms and be a far smaller loss than eigh's 5.6x. If `eigvalsh
 `elf_sha256=9e98e2eb1f7676c41a5eb40c13f8e05baeceaffbde75aca6a4c92e4c0eede73e`
 (commit `1c571aa8`). Bead
 `frankentorch-eigh-single-matrix-worst-loss-vb95f`.
+
+## Bounding lever 1: divide-and-conquer alone CANNOT close this
+
+The `eigh − eigvalsh` split does not need torch, and `linalg_gap_sweep` already
+carries both halves in one invocation. Absolute times below are heavily
+contention-inflated (this host was at **0.04% idle**; eigh n=512 reads 222 ms here
+against 64.3 ms in the certified clean window), so **only the within-invocation ratios
+are used** — and even those are suspect in a knowable direction, since contention hurts
+the parallel replay more than the serial-scalar reduction and therefore *inflates* the
+vector share.
+
+| threads | n | eigh | eigvalsh | vectors | share |
+|---|---|---|---|---|---|
+| 8 (contended) | 256 | 39.20 | 17.97 | 21.23 | 54.2% |
+| 8 (contended) | 512 | 222.30 | 76.45 | 145.85 | 65.6% |
+| 8 (contended) | 1024 | 1292.38 | 570.18 | 722.20 | 55.9% |
+| 64 (lighter load) | 512 | 78.33 | 42.27 | 36.06 | **46.0%** |
+
+So the eigenvector path is **roughly half to two-thirds** of `eigh`, and the share is
+strongly thread- and load-dependent — the replay is `par_chunks_mut` parallel while the
+reduction is documented "serial scalar", so more threads shrink the replay's share.
+
+**That materially qualifies the ledger's 73%.** It was taken at 10 threads; nothing
+here reproduces it, and the honest range is 46–66%. The *direction* stands — vectors
+dominate — the magnitude does not.
+
+### The bound
+
+Applying the range to the certified **5.599–5.628x** at n=512, and assuming
+divide-and-conquer made the eigenvector phase **entirely free** (it would not; it makes
+it cheaper):
+
+| vector share | a FREE eigenvector phase leaves |
+|---|---|
+| 46% (low) | **3.02x SLOWER** |
+| 66% (high) | **1.90x SLOWER** |
+
+**Lever 1 alone cannot close `eigh`.** Even in the impossible best case it lands
+between 1.9x and 3.0x slower — i.e. roughly where the SVD square forward already sits.
+The reduction half must be attacked too, which is lever 2 (`dsytrd` blocked
+tridiagonalisation), the one the source calls "the real lever … a multi-turn rewrite".
+
+This is the same discipline that bounded the SVD expansion phase at 1.734x even if
+wholly removed (`c4d611c4`), and it lands the same way: **the single obvious lever is
+worth having and is not sufficient.** Anyone scoping the D&C rewrite should scope it as
+"5.6x → ~3x", not as "closes eigh".
