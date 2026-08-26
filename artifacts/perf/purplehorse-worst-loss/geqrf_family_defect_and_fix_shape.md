@@ -96,3 +96,56 @@ That suggests a cheap sweep worth doing: for each `ft-api` linalg entry point, c
 whether it calls into `ft-kernel-cpu` or carries a private loop. Any that carry private
 loops are candidates for the same defect, and they can be found by reading rather than
 by measuring.
+
+## The sweep I recommended, run — three ops in the family, two candidates cleared by reading
+
+I suggested checking every `ft-api` linalg entry point for whether it reaches
+`ft-kernel-cpu` or carries a private loop, on the grounds that such defects are findable
+by reading rather than by measuring. Ran it over 62 entry points. Most "no kernel call"
+hits are thin aliases (`tensor_qr` → `tensor_linalg_qr`, `tensor_svd`, `tensor_det`,
+`tensor_eigh`, …) with zero loops — correct as-is. What survives filtering to *no kernel
+call **and** real loops with strided indexing*:
+
+| entry point | verdict |
+|---|---|
+| `tensor_geqrf` | **DEFECT — measured 226x** (`48c0b7b7`), private `geqrf_packed_f64` |
+| `tensor_householder_product` / `tensor_orgqr` | **DEFECT (source)** — per-reflector `apply_reflector_left` |
+| `tensor_ormqr` | **DEFECT (source)** — same `apply_reflector_left` / `apply_reflector_right` |
+| `tensor_linalg_solve_triangular` → `tensor_triangular_solve` | **CLEARED** |
+| `tensor_linalg_lu_factor_ex` | **CLEARED** |
+| `tensor_linalg_ldl_factor` | unresolved, weak signal |
+
+### The two clears matter as much as the hits
+
+`solve_triangular` looked like a strong candidate — no kernel call, loops, strided
+indexing. Reading it showed the flagged loops were O(n) construction of a unit-diagonal
+mask, and the real work delegates to `tensor_triangular_solve`, which **is** properly
+gated:
+
+```rust
+if tri_blocked {
+    x = ft_kernel_cpu::triangular_solve_blocked_contiguous_f64(...)
+} else if tri_par { ... } else { ...scalar... }
+```
+
+Blocked kernel first, scalar only as fallback. Exactly the structure `geqrf` lacks.
+`lu_factor_ex` likewise delegates to `tensor_linalg_lu_factor` (which does call the
+kernel) and its loop is an O(n) `info` scan.
+
+**A heuristic that flags private loops finds real defects and also finds wrappers.**
+Both clears came from reading the code the heuristic pointed at, which is the whole
+argument for this being a cheap sweep: three ops narrowed from 62, at no measurement
+cost and with no window required.
+
+### Scope of the family defect
+
+`geqrf` (produce reflectors), `orgqr` (form Q from them) and `ormqr` (apply them to a
+matrix) are the three LAPACK Householder primitives, and **all three** are private
+per-reflector BLAS-2 loops in `ft-api` that never reach the blocked compact-WY kernel
+already shipping for `tensor_linalg_qr`. Only `geqrf` has a measured number. The other
+two need their own harness arms — both consume `(A, tau)` from a `geqrf`, so the fixture
+must produce that outside the timed region.
+
+The ledger's figures for `orgqr` (~1.8x) and `ormqr` (LOSS) are cross-run at
+batched-tiny shapes and should not be read as bounds on the single-matrix path — the
+same reasoning that made `geqrf`'s 226x a surprise.
