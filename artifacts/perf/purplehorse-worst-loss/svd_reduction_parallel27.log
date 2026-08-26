@@ -1,0 +1,24 @@
+=== reduction_parallel27 attempt=1 utc=2026-08-26T05:49:44Z host=thinkstation1 ===
+idle_before=90.35% then 90.75% (mpstat 5s x2, NOT loadavg)
+loadavg_before=28.49 29.87 25.09 (recorded for provenance; NOT the gate)
+snapshot_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=512, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 27 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output", "SERIAL/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=512  PT min 29.176 ms  median 34.357 ms  spread 1.44x  load 28.49->26.19  MHz 1429/1796  iowait 45 jiffies
+  arm=262144/4row/fused/4output min   63.374 ms  median   83.212 ms  PT-beside-it min   29.731 ms  paired-vs-PT FT 2.442x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 1.90e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 51.269 ms 75%  form_p/q 16.436 ms 24%  QR sweep 0.244 ms 0%
+  arm=262144/4row/fused/4output min   64.297 ms  median   78.101 ms  PT-beside-it min   29.479 ms  paired-vs-PT FT 2.247x SLOWER  paired-vs-arm0 1.052x  branches (0, 0, 0)  parity rel 1.90e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 47.944 ms 76%  form_p/q 15.124 ms 24%  QR sweep 0.216 ms 0%
+  arm=SERIAL/4row/fused/4output min   60.476 ms  median   80.016 ms  PT-beside-it min   29.176 ms  paired-vs-PT FT 2.309x SLOWER  paired-vs-arm0 0.997x  branches (0, 0, 0)  parity rel 1.90e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 41.789 ms 74%  form_p/q 14.514 ms 26%  QR sweep 0.277 ms 0%
+idle_after=92.40%
+incumbent_check n=512 PT_min=29.176ms banked~32.075ms -> ok
