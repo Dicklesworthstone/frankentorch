@@ -66,6 +66,8 @@ enum LinalgOp {
     Eigh,
     Eigvalsh,
     Qr,
+    /// Householder QR FACTORISATION only — no Q formed. Isolates panel + trailing GEMM.
+    Geqrf,
 }
 
 /// One measured configuration of our own arm.
@@ -208,6 +210,14 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
             LinalgOp::Qr => {
                 let (_q, r) = session.tensor_linalg_qr(x, false).expect("qr");
                 let d = session.tensor_diagonal(r, 0).expect("diag");
+                session.tensor_abs(d).expect("abs")
+            }
+            LinalgOp::Geqrf => {
+                // geqrf overwrites the upper triangle with R and the lower with the
+                // packed reflectors; |diag| is R's diagonal, the same quantity the qr
+                // lane checksums and the only part comparable across implementations.
+                let (a, _tau) = session.tensor_geqrf(x).expect("geqrf");
+                let d = session.tensor_diagonal(a, 0).expect("diag");
                 session.tensor_abs(d).expect("abs")
             }
         }
@@ -397,7 +407,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "eigh" => LinalgOp::Eigh,
         "eigvalsh" => LinalgOp::Eigvalsh,
         "qr" => LinalgOp::Qr,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr"),
+        "geqrf" => LinalgOp::Geqrf,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -405,7 +416,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "eigh" => ("torch.linalg.eigh(A)[0]", true),
         "eigvalsh" => ("torch.linalg.eigvalsh(A)", true),
         "qr" => ("torch.linalg.qr(A)[1].diagonal().abs()", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr"),
+        // geqrf is the FACTORISATION ALONE -- panel + trailing GEMM, with NO Q formed.
+        // `qr - geqrf` therefore isolates the Q-formation half, and geqrf on its own
+        // prices the panel/BLAS-2 + GEMM phase that the GEMM refutation (ee024f6e) and the
+        // blocking refutation (318cd457) both pointed at without being able to measure.
+        // Checksum is |diag(A)| on both arms: geqrf overwrites A's upper triangle with R,
+        // so its diagonal is R's, matching the qr lane's convention and comparable across
+        // implementations where the raw reflectors are not.
+        "geqrf" => ("torch.geqrf(A)[0].diagonal().abs()", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
