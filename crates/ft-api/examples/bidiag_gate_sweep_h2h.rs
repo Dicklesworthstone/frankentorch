@@ -708,6 +708,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         } else if ft_op == LinalgOp::Cholesky
             || ft_op == LinalgOp::Slogdet
             || ft_op == LinalgOp::Inv
+            || ft_op == LinalgOp::LuFactor
         {
             // Identical to the incumbent's `_spd`: symmetrise, then add n to the diagonal.
             // Strictly diagonally dominant => positive definite at every n.

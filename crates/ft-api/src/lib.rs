@@ -121559,6 +121559,66 @@ mod tests {
         }
     }
 
+    /// `geqrf` and `qr` must agree on R for the SAME input, at a size where they take
+    /// DIFFERENT routes.
+    ///
+    /// Every other geqrf test in this file is 4x3. `tensor_linalg_qr` dispatches to the
+    /// blocked compact-WY kernel at `m >= 128 && k >= 16`, so at 4x3 both entry points run
+    /// the same naive path and no existing test can observe a disagreement between them.
+    /// This fixture is 160x32: qr takes the blocked kernel, geqrf takes its private
+    /// per-reflector loop.
+    ///
+    /// Two reasons this test exists:
+    ///   1. It is a correctness claim in its own right — one factorisation reached through
+    ///      two public entry points must not give two answers.
+    ///   2. It is the gate for `frankentorch-geqrf-misses-blocked-kernel-1zp6r`, which
+    ///      re-routes geqrf to the blocked kernel. A re-route gated at `m >= 128` changes
+    ///      NOTHING that the 4x3 goldens can see, so they would stay green while covering
+    ///      none of the new path. This test covers it.
+    ///
+    /// Compared on |R|: QR is unique only up to the sign of each row of R, and asserting
+    /// raw signs would couple this test to a reflector sign convention rather than to the
+    /// factorisation. Magnitudes are the substantive claim.
+    #[test]
+    fn geqrf_and_qr_agree_on_r_above_the_blocked_gate() {
+        const M: usize = 160;
+        const N: usize = 32;
+
+        // Deterministic, no RNG, well-scaled and full rank.
+        let a_vals: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.37).sin() + (j * 0.11).cos()) * 1.5 + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let a_geqrf = s.tensor_variable(a_vals.clone(), vec![M, N], false).unwrap();
+        let (packed, _tau) = s.tensor_geqrf(a_geqrf).unwrap();
+        let packed_vals = s.tensor_values(packed).unwrap();
+
+        let a_qr = s.tensor_variable(a_vals, vec![M, N], false).unwrap();
+        let (_q, r) = s.tensor_linalg_qr(a_qr, true).unwrap();
+        let r_vals = s.tensor_values(r).unwrap();
+        let r_shape = s.tensor_shape(r).unwrap();
+        assert_eq!(r_shape, vec![N, N], "reduced qr should give an N x N R");
+
+        // geqrf packs R into the upper triangle of the MxN result; qr returns R as NxN.
+        for i in 0..N {
+            for j in i..N {
+                let from_geqrf = packed_vals[i * N + j].abs();
+                let from_qr = r_vals[i * N + j].abs();
+                let tol = 1e-9 * from_qr.abs().max(1.0);
+                assert!(
+                    (from_geqrf - from_qr).abs() < tol,
+                    "geqrf and qr disagree on |R[{i}][{j}]|: geqrf {from_geqrf}, qr {from_qr}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn linalg_solve_triangular_batched_matches_torch_golden() {
         // torch 2.x: batch of two lower-triangular 3x3, B shape (2, 3, 2), left.
