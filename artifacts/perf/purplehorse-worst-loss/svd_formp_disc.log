@@ -1,0 +1,53 @@
+=== formp_disc attempt=1 utc=2026-08-26T03:28:57Z host=thinkstation1 ===
+idle_before=90.36% then 88.42% (mpstat 5s x2, NOT loadavg)
+loadavg_before=23.51 76.76 83.77 (recorded for provenance; NOT the gate)
+snapshot_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=120,124,128,132,136,140, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 9 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=120  PT min 1.224 ms  median 1.293 ms  spread 1.33x  load 23.51->23.51  MHz 3409/3431  iowait 0 jiffies
+  arm=262144/4row/fused/4output min    1.682 ms  median    1.711 ms  PT-beside-it min    1.245 ms  paired-vs-PT FT 1.369x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 3.97e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.734 ms 60%  form_p/q 0.301 ms 25%  QR sweep 0.179 ms 15%
+  arm=262144/4row/fused/4output min    1.683 ms  median    1.728 ms  PT-beside-it min    1.224 ms  paired-vs-PT FT 1.287x SLOWER  paired-vs-arm0 0.998x  branches (0, 0, 0)  parity rel 3.97e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.728 ms 60%  form_p/q 0.292 ms 24%  QR sweep 0.185 ms 15%
+
+n=124  PT min 1.139 ms  median 1.266 ms  spread 1.19x  load 23.51->23.51  MHz 3403/2392  iowait 0 jiffies
+  arm=262144/4row/fused/4output min    1.325 ms  median    1.607 ms  PT-beside-it min    1.139 ms  paired-vs-PT FT 1.274x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 6.88e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.604 ms 61%  form_p/q 0.229 ms 23%  QR sweep 0.164 ms 16%
+  arm=262144/4row/fused/4output min    1.596 ms  median    1.616 ms  PT-beside-it min    1.228 ms  paired-vs-PT FT 1.283x SLOWER  paired-vs-arm0 0.998x  branches (0, 0, 0)  parity rel 6.88e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.611 ms 61%  form_p/q 0.228 ms 23%  QR sweep 0.170 ms 17%
+
+n=128  PT min 1.281 ms  median 1.373 ms  spread 1.15x  load 23.51->23.51  MHz 2393/1429  iowait 0 jiffies
+  arm=262144/4row/fused/4output min    1.862 ms  median    1.904 ms  PT-beside-it min    1.351 ms  paired-vs-PT FT 1.365x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 4.36e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.846 ms 61%  form_p/q 0.374 ms 27%  QR sweep 0.173 ms 12%
+  arm=262144/4row/fused/4output min    1.868 ms  median    1.892 ms  PT-beside-it min    1.281 ms  paired-vs-PT FT 1.391x SLOWER  paired-vs-arm0 0.997x  branches (0, 0, 0)  parity rel 4.36e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.686 ms 60%  form_p/q 0.297 ms 26%  QR sweep 0.168 ms 15%
+
+n=132  PT min 1.334 ms  median 1.484 ms  spread 1.14x  load 23.51->23.51  MHz 1429/3433  iowait 0 jiffies
+  arm=262144/4row/fused/4output min    1.665 ms  median    2.036 ms  PT-beside-it min    1.334 ms  paired-vs-PT FT 1.373x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 6.77e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.881 ms 56%  form_p/q 0.490 ms 31%  QR sweep 0.209 ms 13%
+  arm=262144/4row/fused/4output min    2.020 ms  median    2.044 ms  PT-beside-it min    1.402 ms  paired-vs-PT FT 1.381x SLOWER  paired-vs-arm0 0.998x  branches (0, 0, 0)  parity rel 6.77e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.707 ms 54%  form_p/q 0.401 ms 31%  QR sweep 0.191 ms 15%
+
+n=136  PT min 1.397 ms  median 1.446 ms  spread 1.21x  load 23.51->23.51  MHz 3432/3432  iowait 2 jiffies
+  arm=262144/4row/fused/4output min    1.657 ms  median    2.066 ms  PT-beside-it min    1.412 ms  paired-vs-PT FT 1.247x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 2.10e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 1.200 ms 65%  form_p/q 0.494 ms 27%  QR sweep 0.159 ms 9%
+  arm=262144/4row/fused/4output min    1.666 ms  median    1.681 ms  PT-beside-it min    1.397 ms  paired-vs-PT FT 1.192x SLOWER  paired-vs-arm0 1.013x  branches (0, 0, 0)  parity rel 2.10e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.755 ms 58%  form_p/q 0.401 ms 31%  QR sweep 0.149 ms 11%
+
+n=140  PT min 1.599 ms  median 1.713 ms  spread 1.56x  load 23.51->23.51  MHz 3432/3432  iowait 0 jiffies
+  arm=262144/4row/fused/4output min    1.944 ms  median    2.328 ms  PT-beside-it min    1.650 ms  paired-vs-PT FT 1.256x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 2.60e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.928 ms 59%  form_p/q 0.447 ms 29%  QR sweep 0.194 ms 12%
+  arm=262144/4row/fused/4output min    2.251 ms  median    2.333 ms  PT-beside-it min    1.599 ms  paired-vs-PT FT 1.368x SLOWER  paired-vs-arm0 1.002x  branches (0, 0, 0)  parity rel 2.60e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.862 ms 57%  form_p/q 0.458 ms 31%  QR sweep 0.181 ms 12%
+idle_after=85.12%
+incumbent_check n=128 PT_min=1.281ms banked~1.289ms -> ok
+incumbent_check n=136 PT_min=1.397ms banked~1.515ms -> ok
