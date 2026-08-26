@@ -115,3 +115,50 @@ Two leads, neither chased here:
    be the cheaper of the two. Its FT null is the one that fails (1.024), and at 16
    rounds it carried a `slot0/median = 1.149` cold-first-sample flag. Possibly an
    instrument artefact, possibly real. Not chased.
+
+## 64-round pass: the pre-fix route is now CERTIFIED, and the lever replicates three times
+
+Re-run at `FT_H2H_REPS=64`, the step item 193c's 16→32→64 walk prescribes. Same ELF,
+same lanes, idle 80.61% then 89.26% before launch.
+
+| lane | FT ms | PT ms | standing | FT null | PT null | verdict |
+|---|---|---|---|---|---|---|
+| `conv2d_f32` | 26.260 | 25.704 | 1.02x SLOWER | 0.989 | 1.021 | not certified |
+| `conv2d_f32_kernels` | 29.396 | 25.317 | 1.16x SLOWER | 1.059 | 0.977 | not certified |
+| `conv2d_f32_masked` (HEAD) | 70.410 | 25.371 | **2.78x SLOWER** | **1.001** | 1.041 | measured, ±4% |
+| **`conv2d_f32_masked_panel`** (pre-fix) | 114.179 | 25.435 | **4.49x SLOWER** | **0.994–1.018 PASS** | **0.949–1.050 PASS** | **CERTIFIED — both nulls pass** |
+
+**`conv2d_f32_masked_panel` at 4.49x SLOWER is a banked row**: it is the only lane of
+the four with no `NULL-FAILED` line at all. That is the pre-fix standing, certified.
+
+### The lever replicates across three independent round counts
+
+| rounds | pre-fix ms | HEAD ms | lever |
+|---|---|---|---|
+| 16 | 111.833 | 71.202 | 1.571x |
+| 32 | 114.172 | 69.783 | 1.636x |
+| 64 | 114.179 | 70.410 | **1.622x** |
+
+Three passes, 1.57–1.64x, with the FrankenTorch null clean on both masked lanes in
+every one. The win is not a window artefact.
+
+### The HEAD lane's incumbent null has PLATEAUED — more rounds will not clear it
+
+`conv2d_f32_masked`'s incumbent null went **1.067 → 1.041 → 1.041** across 16, 32 and
+64 rounds. It stopped improving. The harness's "ROUNDS MAY CLEAR IT" advice applies
+when a null is close *and* the miss is sampling noise; a value that halves once and
+then sits still is **systematic**, not noise, and a 128-round pass would burn an hour
+to land on 1.041 again.
+
+What it is not: torch drifting between lanes. `PT(panel)/PT(masked) = 25.435/25.371 =
+1.0025`, so the incumbent is consistent *across* lanes to 0.25%. The 4.1% offset is
+*within* the masked lane, between its own two incumbent slots — and the neighbouring
+lane, whose FrankenTorch arm is 114 ms rather than 70 ms, does not show it. The
+plausible mechanism is that ABBAABBA places the two incumbent samples adjacent to
+FrankenTorch work of different duration, so they see different cache and turbo state,
+and the effect scales with how much the FT arm differs in length. That is a hypothesis
+about the harness, not a measurement, and it is not chased here.
+
+**So `2.78x SLOWER` is quoted as measured with a stated ±4%, and will not be called
+certified.** The certified numbers on this lane are the pre-fix standing (4.49x) and
+the lever (1.62x).
