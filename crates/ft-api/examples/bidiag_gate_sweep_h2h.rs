@@ -80,6 +80,9 @@ enum LinalgOp {
     /// unreadable, and over plain `det` because the SPD fixture's determinant (~n^n) is not
     /// representable in f64 at n=512.
     Slogdet,
+    /// matrix_exp — scaling-and-squaring + Pade, so almost entirely GEMM. Included to test
+    /// whether the board's GEMM-bound wins (1.06-1.70x FASTER) carry to a linalg op.
+    MatrixExp,
 }
 
 /// One measured configuration of our own arm.
@@ -264,6 +267,11 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 w
             }
             LinalgOp::Eigvalsh => session.tensor_linalg_eigvalsh(x).expect("eigvalsh"),
+            LinalgOp::MatrixExp => {
+                let e = session.tensor_matrix_exp(x).expect("matrix_exp");
+                let a = session.tensor_abs(e).expect("abs");
+                session.tensor_sum(a).expect("sum")
+            }
             LinalgOp::Slogdet => {
                 let (_sign, logabsdet) = session.tensor_linalg_slogdet(x).expect("slogdet");
                 session.tensor_abs(logabsdet).expect("abs")
@@ -479,7 +487,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ormqr" => LinalgOp::Ormqr,
         "cholesky" => LinalgOp::Cholesky,
         "slogdet" => LinalgOp::Slogdet,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet"),
+        "matrix_exp" => LinalgOp::MatrixExp,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -519,7 +528,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // slogdet: exercises the LU path with a SCALAR, pivot-order-invariant checksum.
         // See the Rust arm for why this was chosen over lu_factor and over plain det.
         "slogdet" => ("torch.linalg.slogdet(A)[1].abs().reshape(1)", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet"),
+        // matrix_exp: GEMM-dominated (scaling-squaring + Pade), unique result. See the
+        // Rust arm for why the fixture is scaled by 1/n.
+        "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
@@ -530,6 +542,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("torch.geqrf(_mk({n}, False))")
             } else if op == "cholesky" || op == "slogdet" {
                 format!("_spd({n})")
+            } else if op == "matrix_exp" {
+                format!("_expm_fixture({n})")
             } else if op == "ormqr" {
                 // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
                 format!("(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))")
@@ -551,6 +565,10 @@ def _mk(n, sym=False):
     # without this the two arms would be answering different questions and the parity column
     # would be meaningless rather than merely failing.
     return (A + A.T) * 0.5 if sym else A
+def _expm_fixture(n):
+    # Scaled by 1/n so the spectral radius stays O(1): expm of the raw fixture overflows
+    # f64 well before n=512. The Rust arm applies the identical scaling.
+    return _mk(n, False) / float(n)
 def _spd(n):
     # Symmetric + strictly diagonally dominant => positive definite at every n, so the
     # Cholesky factor exists and is unique. The Rust arm builds the identical matrix.
@@ -638,7 +656,15 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // Symmetrised for the eig lanes ONLY, matching the incumbent's `_mk(n, sym=True)`
         // exactly. eigh reads one triangle, so an unsymmetrised fixture would have the two arms
         // answering different questions.
-        let data = if ft_op == LinalgOp::Cholesky || ft_op == LinalgOp::Slogdet {
+        let data = if ft_op == LinalgOp::MatrixExp {
+            // Identical to the incumbent's `_expm_fixture`: scale by 1/n so the spectral
+            // radius stays O(1). Unscaled, expm overflows f64 long before n=512.
+            let mut d = fill(n);
+            for v in &mut d {
+                *v /= n as f64;
+            }
+            d
+        } else if ft_op == LinalgOp::Cholesky || ft_op == LinalgOp::Slogdet {
             // Identical to the incumbent's `_spd`: symmetrise, then add n to the diagonal.
             // Strictly diagonally dominant => positive definite at every n.
             let mut d = symmetrise(&fill(n), n);
