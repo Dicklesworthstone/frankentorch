@@ -1,0 +1,46 @@
+=== ormqr_live attempt=1 utc=2026-08-26T08:12:59Z host=thinkstation1 ===
+idle_before=82.12% then 82.83% (mpstat 5s x2, NOT loadavg)
+loadavg_before=11.43 14.43 13.57 (recorded for provenance; NOT the gate)
+snapshot_sha256=41ed6159625b914a274a1f44a5d7b285b2c81094f31e39e81c678c555b806090
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=512, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 25 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=41ed6159625b914a274a1f44a5d7b285b2c81094f31e39e81c678c555b806090
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=512  PT min 2.687 ms  median 3.215 ms  spread 3.54x  load 11.43->8.37  MHz 3433/1429  iowait 948 jiffies
+  arm=262144/4row/fused/4output min  786.459 ms  median  823.791 ms  PT-beside-it min    2.687 ms  paired-vs-PT FT 254.829x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 7.20e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output min  795.614 ms  median  824.084 ms  PT-beside-it min    2.912 ms  paired-vs-PT FT 251.555x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 7.20e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+idle_after=96.36%
+incumbent_spread n=512 spread=3.54x -> WILD
+incumbent_check n=512 PT_min=2.687ms banked~32.075ms -> ok
+=== ormqr_live attempt=2 utc=2026-08-26T08:15:33Z host=thinkstation1 ===
+idle_before=93.47% then 93.85% (mpstat 5s x2, NOT loadavg)
+loadavg_before=4.53 11.02 12.47 (recorded for provenance; NOT the gate)
+snapshot_sha256=41ed6159625b914a274a1f44a5d7b285b2c81094f31e39e81c678c555b806090
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=512, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 25 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=41ed6159625b914a274a1f44a5d7b285b2c81094f31e39e81c678c555b806090
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=512  PT min 2.742 ms  median 3.370 ms  spread 20.86x  load 4.53->16.00  MHz 3432/1429  iowait 563 jiffies
+  arm=262144/4row/fused/4output min  796.739 ms  median  856.293 ms  PT-beside-it min    2.868 ms  paired-vs-PT FT 259.169x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 7.20e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output min  793.653 ms  median  853.067 ms  PT-beside-it min    2.742 ms  paired-vs-PT FT 252.830x SLOWER  paired-vs-arm0 1.005x  branches (0, 0, 0)  parity rel 7.20e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+idle_after=88.57%
+incumbent_spread n=512 spread=20.86x -> WILD
+incumbent_check n=512 PT_min=2.742ms banked~32.075ms -> ok
