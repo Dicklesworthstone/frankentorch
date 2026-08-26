@@ -118,3 +118,47 @@ parity and both nulls passing is `conv2d_f32_masked` at 1.87x here (2.78x focuse
 The SVD is not a board lane; it lives in `bidiag_gate_sweep_h2h`. So the standing
 "SVD n=1024 is the worst loss in the tree" is no longer an inference from an old
 ledger — it survives a re-measurement of everything else.
+
+## Follow-up: the pool lanes do NOT beat the SVD, and my composition hypothesis was too broad
+
+I predicted that because our arm ran 1.45x faster with 57 neighbours than with 3, the
+board's high-ranking pool lanes would read WORSE when re-run focused, possibly
+rivalling the SVD. **That prediction was wrong, and the run says so.**
+
+```
+FT_H2H_REPS=32 FT_H2H_LANES_EXACT=1 \
+FT_H2H_LANES="max_pool3d_dense,max_pool3d_nopool_dense,max_pool3d,conv2d_f32_masked" \
+PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python \
+  <board ELF 0df4db54…, --features fair-alloc>
+```
+idle 71.85% then 72.97% before launch.
+
+| lane | full-board (16r) | **focused (32r)** | direction | FT null | PT null |
+|---|---|---|---|---|---|
+| `max_pool3d_dense` | 2.75x | **2.47x** | FASTER focused | 0.924 | 1.020 |
+| `max_pool3d_nopool_dense` | 2.37x | **2.27x** | FASTER focused | 0.967 | 0.954 |
+| `max_pool3d` | 1.75x | **1.76x** | flat | 0.798 | 1.042 |
+| `conv2d_f32_masked` *(control)* | 1.87x | **2.62x** | SLOWER focused | **0.997 PASS** | 1.073 |
+
+**The control reproduced**: `conv2d_f32_masked` reads 2.62x here against 2.78x in the
+earlier focused 64-round run and 1.87x on the full board, with its FrankenTorch null
+passing at [0.978, 1.017]. So the composition effect is real and calibrated for this
+window — focused ≈ 2.6–2.8x, full-board ≈ 1.87x.
+
+**But it does not generalise.** The same change of company that cost `conv2d_f32_masked`
+40% *gained* `max_pool3d_dense` 10%. The effect is **lane-specific, not a global
+factor**, and I should not have implied one lane's 1.45x would carry to others. What
+distinguishes them is plausible enough — conv2d's masked backward allocates and
+streams hundreds of MB, so it benefits from a warm allocator, while max_pool3d is a
+1–3 ms bandwidth-walled lane with little to warm — but that is a hypothesis and is not
+measured here.
+
+**None of the pool rows is quotable.** All four NULL-FAILED; the pool lanes' own nulls
+are 0.798–0.967 against a ±0.02 band. At 1.7–2.8 ms per lane these are simply too
+small for this instrument to resolve at any round count that is worth the wall clock —
+consistent with the standing finding that avg/max pool are bandwidth-walled.
+
+**The ranking is unchanged.** `max_pool3d_dense` at ~2.5x is a genuine loss and
+plausibly the third-worst in the tree, but it is nowhere near the SVD square forward's
+certified 3.10–3.12x, and it cannot be certified at its size. The worst op remains
+SVD n=1024.
