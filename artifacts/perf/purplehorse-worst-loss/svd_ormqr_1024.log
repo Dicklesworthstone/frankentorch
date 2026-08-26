@@ -1,0 +1,25 @@
+attempt 1: incumbent implausible, DISCARDING and retrying
+attempt 2: incumbent implausible, DISCARDING and retrying
+=== ormqr_1024 attempt=3 utc=2026-08-26T08:35:01Z host=thinkstation1 ===
+idle_before=92.20% then 93.02% (mpstat 5s x2, NOT loadavg)
+loadavg_before=11.41 11.57 12.37 (recorded for provenance; NOT the gate)
+snapshot_sha256=41ed6159625b914a274a1f44a5d7b285b2c81094f31e39e81c678c555b806090
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=1024, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 9 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=41ed6159625b914a274a1f44a5d7b285b2c81094f31e39e81c678c555b806090
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=1024  PT min 13.744 ms  median 14.539 ms  spread 1.12x  load 11.41->12.03  MHz 1429/1429  iowait 4041 jiffies
+  arm=262144/4row/fused/4output min 7198.162 ms  median 7288.550 ms  PT-beside-it min   13.744 ms  paired-vs-PT FT 507.454x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 1.54e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output min 7133.800 ms  median 7305.453 ms  PT-beside-it min   13.809 ms  paired-vs-PT FT 502.463x SLOWER  paired-vs-arm0 0.996x  branches (0, 0, 0)  parity rel 1.54e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+idle_after=91.69%
+incumbent_spread n=1024 spread=1.12x -> ok
+incumbent_check n=1024 PT_min=13.744ms banked~122.604ms -> ok
