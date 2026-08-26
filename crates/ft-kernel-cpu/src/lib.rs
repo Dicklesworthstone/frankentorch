@@ -36642,6 +36642,11 @@ fn qr_blocked_forward_f64(
         let nt = n - pe;
         if nt > 0 {
             let trailing_start = qr_profile_stage_start(profile_enabled);
+            // STAGING. `gemm::dgemm` has no leading-dimension parameter, so the strided
+            // trailing submatrix must be GATHERED into `rt` and the reflectors TRANSPOSED
+            // into `vt` before any GEMM can run, then SCATTERED back. This measures that
+            // cost so the missing `ld` argument is a number, not a hypothesis.
+            let stage_start = qr_profile_stage_start(profile_enabled);
             let mut rt = vec![0.0f64; m * nt];
             for i in 0..m {
                 let base = i * n + pe;
@@ -36653,6 +36658,9 @@ fn qr_blocked_forward_f64(
                 for c in 0..nb {
                     vt[c * m + row] = vmat[row * nb + c];
                 }
+            }
+            if let Some(timings) = timings.as_mut() {
+                qr_profile_record_ns(&mut timings.copy_zeroing_ns, stage_start);
             }
             let mut w = vec![0.0f64; nb * nt];
             gemm::dgemm(nb, m, nt, &vt, &rt, &mut w); // Vᵀ R
@@ -36666,12 +36674,16 @@ fn qr_blocked_forward_f64(
             gemm::dgemm(nb, nb, nt, &tt, &w, &mut w2); // Tᵀ (Vᵀ R)
             let mut upd = vec![0.0f64; m * nt];
             gemm::dgemm(m, nb, nt, &vmat, &w2, &mut upd); // V (...)
+            let scatter_start = qr_profile_stage_start(profile_enabled);
             for i in 0..m {
                 let base = i * n + pe;
                 let src = i * nt;
                 for t in 0..nt {
                     r_mat[base + t] -= upd[src + t];
                 }
+            }
+            if let Some(timings) = timings.as_mut() {
+                qr_profile_record_ns(&mut timings.copy_zeroing_ns, scatter_start);
             }
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.trailing_r_ns, trailing_start);
@@ -44202,12 +44214,12 @@ mod tests {
             let wall_ns = wall_ms * 1e6;
             let pct = |v: u128| 100.0 * v as f64 / wall_ns;
             println!(
-                "GEQRF_NB nb={nb:>3} wall={wall_ms:8.3}ms  panel+T={:5.1}% ({:7.3}ms)  trailing_R={:5.1}% ({:7.3}ms)  reverse_Q={:5.1}%",
+                "GEQRF_NB nb={nb:>3} wall={wall_ms:8.3}ms  panel+T={:5.1}%  trailing_R={:5.1}% ({:7.3}ms)  of which STAGING={:5.1}% ({:7.3}ms)",
                 pct(t.panel_and_t_ns),
-                t.panel_and_t_ns as f64 / 1e6,
                 pct(t.trailing_r_ns),
                 t.trailing_r_ns as f64 / 1e6,
-                pct(t.reverse_q_ns),
+                100.0 * t.copy_zeroing_ns as f64 / (t.trailing_r_ns.max(1) as f64),
+                t.copy_zeroing_ns as f64 / 1e6,
             );
         }
     }
