@@ -36576,22 +36576,26 @@ fn qr_factor_panel_recursive_f64(
     );
 }
 
-fn qr_householder_panel_blocked_profiled(
+/// Forward pass of the blocked compact-WY QR: reduces `r_mat` to R IN PLACE and returns
+/// each panel's `(panel_start, nb, V, T, tau)`.
+///
+/// Split out of [`qr_householder_panel_blocked_profiled`] so that `geqrf` can reach the
+/// same factorisation without paying to build Q. Both V and tau are computed here and
+/// were previously thrown away: V survived only inside that function long enough to build
+/// Q, and tau was dropped entirely once the compact-WY T had been formed from it.
+/// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+fn qr_blocked_forward_f64(
     r_mat: &mut [f64],
     m: usize,
     n: usize,
     k: usize,
-    qcols: usize,
     nb_block: usize,
     mut timings: Option<&mut QrStageTimings>,
-) -> Vec<f64> {
+) -> Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> {
     let nb_block = nb_block.max(1);
     let tiny = f64::EPSILON * 1e6;
     let profile_enabled = timings.is_some();
-    // Forward pass reduces R and stores each panel's (V, T); Q is then built
-    // (m×qcols) by a reverse dorgqr — so REDUCED tall matrices (qcols=k<m) cost
-    // O(m·k²) instead of building the full m×m Q (O(m²·k)). frankentorch-ct2yy.
-    let mut panels: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
+    let mut panels: Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::new();
     let mut p = 0;
     while p < k {
         let pe = (p + nb_block).min(k);
@@ -36651,9 +36655,26 @@ fn qr_householder_panel_blocked_profiled(
             }
         }
 
-        panels.push((nb, vmat, tmat));
+        panels.push((p, nb, vmat, tmat, tau));
         p = pe;
     }
+    panels
+}
+
+fn qr_householder_panel_blocked_profiled(
+    r_mat: &mut [f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    qcols: usize,
+    nb_block: usize,
+    mut timings: Option<&mut QrStageTimings>,
+) -> Vec<f64> {
+    let profile_enabled = timings.is_some();
+    // Forward pass reduces R and stores each panel's (V, T); Q is then built
+    // (m×qcols) by a reverse dorgqr — so REDUCED tall matrices (qcols=k<m) cost
+    // O(m·k²) instead of building the full m×m Q (O(m²·k)). frankentorch-ct2yy.
+    let panels = qr_blocked_forward_f64(r_mat, m, n, k, nb_block, timings.as_deref_mut());
 
     // --- Reverse dorgqr: Q (m×qcols) = H_0 H_1 ... H_{k-1} · I[:, :qcols].
     // Start X = I[:, :qcols]; apply blocks innermost-first (reverse panel order),
@@ -36663,7 +36684,7 @@ fn qr_householder_panel_blocked_profiled(
     for i in 0..m.min(qcols) {
         x[i * qcols + i] = 1.0;
     }
-    for (nb, vmat, tmat) in panels.iter().rev() {
+    for (_p, nb, vmat, tmat, _tau) in panels.iter().rev() {
         let nb = *nb;
         let mut vt = vec![0.0f64; nb * m];
         for row in 0..m {
@@ -36695,6 +36716,63 @@ fn qr_householder_panel_blocked(
     qcols: usize,
 ) -> Vec<f64> {
     qr_householder_panel_blocked_profiled(r_mat, m, n, k, qcols, 32, None)
+}
+
+/// LAPACK-convention `geqrf` via the blocked compact-WY kernel.
+///
+/// Returns `(packed, tau)` where `packed` holds R in its upper triangle and the reflector
+/// vectors below the diagonal, and `tau[j]` is reflector `j`'s scalar — i.e. exactly what
+/// `torch.geqrf` returns, and what our `orgqr`/`ormqr` consumers already expect.
+///
+/// WHY A CONVERSION IS NEEDED. The blocked kernel and LAPACK use DIFFERENT Householder
+/// conventions, so this is not a pure re-route:
+///
+/// | | blocked (`qr_factor_panel_leaf_f64`) | LAPACK (`dlarfg`) |
+/// |---|---|---|
+/// | `v_j` | `alpha + s*norm`, stored explicitly | `1`, implicit |
+/// | `v_i` | `a[i][j]` unmodified | `a[i][j] / (alpha - beta)` |
+/// | `tau` | `2 / norm(v)^2` | `(beta - alpha) / beta` |
+///
+/// The two describe the same reflector under `u = v / v_j`, `tau_L = tau_b * v_j^2`:
+/// `H = I - tau_b*v*v^T` and `v = v_j*u` give `H = I - (tau_b*v_j^2)*u*u^T`, and since
+/// `norm(v)^2 = 2*norm(x)*v_j` that scalar is `v_j/norm(x)`, which is `tau_L`. The vectors
+/// coincide term for term, because `v_i/v_j = a[i][j]/(alpha + s*norm) = a[i][j]/(alpha - beta)`
+/// is LAPACK's own expression.
+///
+/// NOT BIT-IDENTICAL to the naive path, for a specific reason: the two accumulate the
+/// column norm in different orders — this one sums `alpha^2` FIRST (`nrm2` runs over the
+/// whole column), `dlarfg` adds it LAST. So `norm(x)` can differ in the last ulp, and with
+/// it `v_j`, `tau` and every `v_i`. The re-route therefore lands under a tolerance, which
+/// is the bar the geqrf goldens already use (1e-11 vs torch).
+///
+/// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
+    let k = m.min(n);
+    let mut packed = a.to_vec();
+    if k == 0 {
+        return (packed, Vec::new());
+    }
+    let panels = qr_blocked_forward_f64(&mut packed, m, n, k, 32, None);
+
+    // The forward pass leaves R in the upper triangle and ZEROS below it, so scattering
+    // the reflectors into the lower triangle overwrites nothing R needs.
+    let mut tau_out = vec![0.0f64; k];
+    for (p, nb, vmat, _tmat, tau) in &panels {
+        for c in 0..*nb {
+            let j = p + c;
+            let vj = vmat[j * nb + c];
+            if vj == 0.0 {
+                // Zero reflector (the panel leaf skipped this column): LAPACK's tau = 0,
+                // and the column below the diagonal is already zero.
+                continue;
+            }
+            tau_out[j] = tau[c] * vj * vj;
+            for i in (j + 1)..m {
+                packed[i * n + j] = vmat[i * nb + c] / vj;
+            }
+        }
+    }
+    (packed, tau_out)
 }
 
 /// A/B entry point (NOT production dispatch): runs the blocked compact-WY QR with
@@ -43770,6 +43848,83 @@ unsafe fn transpose_block_8x8_avx2_f32(
 mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
+
+    /// `geqrf_blocked_f64` must return reflectors and tau in LAPACK's convention, verified
+    /// by rebuilding Q from them and checking `Q R == A`.
+    ///
+    /// This checks TAU AND V, which an R-only comparison cannot: R comes straight out of
+    /// the forward pass and would look correct even if the convention conversion
+    /// (`u = v/v_j`, `tau_L = tau_b * v_j^2`) were wrong. Q is reconstructed the way a
+    /// LAPACK consumer does — `v_j = 1` implied, `v_i` read from below the diagonal —
+    /// so a convention error shows up here and nowhere else.
+    ///
+    /// 160x32 is above the `m >= 128 && k >= 16` blocked gate on purpose: every geqrf
+    /// golden in ft-api is 4x3 and stays on the naive path, so none of them exercises this
+    /// kernel. frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+    #[test]
+    fn geqrf_blocked_f64_reflectors_are_lapack_convention() {
+        const M: usize = 160;
+        const N: usize = 32;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.37).sin() + (j * 0.11).cos()) * 1.5
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+        assert_eq!(tau.len(), N);
+
+        // R = upper triangle of packed, as an M x N matrix.
+        let mut r = vec![0.0f64; M * N];
+        for i in 0..N {
+            for j in i..N {
+                r[i * N + j] = packed[i * N + j];
+            }
+        }
+
+        // Q = H_0 H_1 ... H_{k-1} applied to I(M x N), innermost first.
+        let mut q = vec![0.0f64; M * N];
+        for i in 0..N {
+            q[i * N + i] = 1.0;
+        }
+        for j in (0..N).rev() {
+            // v_j = 1 implied; v_i for i > j read from below the diagonal.
+            let mut v = vec![0.0f64; M];
+            v[j] = 1.0;
+            for (i, slot) in v.iter_mut().enumerate().skip(j + 1) {
+                *slot = packed[i * N + j];
+            }
+            // q <- (I - tau v v^T) q
+            for col in 0..N {
+                let mut dot = 0.0;
+                for i in j..M {
+                    dot += v[i] * q[i * N + col];
+                }
+                let scale = tau[j] * dot;
+                for i in j..M {
+                    q[i * N + col] -= scale * v[i];
+                }
+            }
+        }
+
+        // Q R must reproduce A.
+        for i in 0..M {
+            for j in 0..N {
+                let mut acc = 0.0;
+                for t in 0..N {
+                    acc += q[i * N + t] * r[t * N + j];
+                }
+                let want = a[i * N + j];
+                assert!(
+                    (acc - want).abs() < 1e-9 * want.abs().max(1.0),
+                    "QR reconstruction failed at [{i}][{j}]: got {acc}, want {want}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn group_norm_parallel_gate_counts_groups_not_only_elements() {
