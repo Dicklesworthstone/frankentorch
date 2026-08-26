@@ -104,3 +104,46 @@ afterwards, which is not a reliable detector.
 | kernel | `cholesky` | 4.42–4.48x | 5.70–5.75x |
 | mixed | `eigh` | 5.60x | 8.16–8.23x (15.5x at n=2048) |
 | kernel | SVD | 2.40x | 3.10x |
+
+## The gate fix took two attempts — the first one looked like it worked
+
+Fixing GATE 2b to run outside the reference loop was not enough. The re-run printed:
+
+```
+incumbent_spread n=512 spread=x -> ok
+```
+
+**The gate fired and validated nothing.** My extraction used `grep -oP` with an
+alternation piped through `paste - -`; it emitted the size but an *empty* spread, so
+`awk` compared `""` against 3.0 — false — and every row reported `ok`.
+
+**That is strictly worse than the bug it replaced.** The original failure produced *no*
+line, which is at least silent. This one produced a reassuring one. Had I not read the
+value, I would have recorded "GATE 2b now fires correctly" on the strength of seeing the
+line appear.
+
+Rewritten as a single `sed` capturing both fields from one line, so a parse failure
+yields no row rather than a half-parsed one, plus an explicit guard that treats a missing
+value as a **failure** instead of a pass. Verified two ways rather than by inspection:
+
+* extraction against the real log → `512 3.67` / `1024 1.33`;
+* end-to-end probe on the exact row that slipped through →
+  `n=512 spread=3.67x -> WILD`, `n=1024 spread=1.33x -> ok`, `spread_bad=1`.
+
+That is the fourth instrument defect this session with the same signature, and the
+second where my *fix* had the signature too. The lesson that keeps recurring: **seeing a
+check run is not evidence that it checked anything** — the value it computed has to be
+looked at.
+
+## `slogdet` n=512, re-taken in a clean window
+
+| n | FT min (arm0/arm1) | PT min | standing | A/A null | PT spread | parity |
+|---|---|---|---|---|---|---|
+| 512 | 22.999 / 23.023 ms | 1.073 ms | **24.93x / 24.05x** | **1.000 / 0.980 PASS** | 1.77x | 3.28e-13 MATCH |
+
+Spread 1.77x, inside the ceiling — verified by reading the row, not by trusting the gate
+that was broken at the time. Both arms agree to 0.1%.
+
+**`slogdet`/LU therefore stands at 24.0–24.9x (n=512) and 21.3–21.6x (n=1024)**, both
+with passing nulls — comfortably outside the 4.4–8.3x band and confirming that the band
+was the wrong shape rather than n=512 being an outlier.
