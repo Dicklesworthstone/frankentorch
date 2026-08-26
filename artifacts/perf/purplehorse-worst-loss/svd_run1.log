@@ -1,0 +1,44 @@
+=== tag=run1 utc=2026-08-26T03:00:38Z host=thinkstation1 ===
+guard_clear=yes
+snapshot_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+config: RAYON_NUM_THREADS=8 matched to the harness torch.set_num_threads(8); sizes 256,512,1024
+loadavg_before=11.49 20.72 23.48
+guard PASS: no peer measurement detected, loadavg 11.49/20.72/23.48 (spread <= 4x), iowait 1.3% <= 10%
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 9 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "SERIAL/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=256  PT min 6.762 ms  median 7.518 ms  spread 1.30x  load 11.53->11.53  MHz 3432/3427  iowait 51 jiffies
+  arm=262144/4row/fused/4output min   11.572 ms  median   13.364 ms  PT-beside-it min    6.785 ms  paired-vs-PT FT 1.748x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 3.09e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 8.024 ms 74%  form_p/q 2.642 ms 24%  QR sweep 0.211 ms 2%
+  arm=SERIAL/4row/fused/4output min   12.357 ms  median   14.137 ms  PT-beside-it min    6.762 ms  paired-vs-PT FT 1.851x SLOWER  paired-vs-arm0 0.966x  branches (0, 0, 0)  parity rel 3.09e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 6.757 ms 71%  form_p/q 2.495 ms 26%  QR sweep 0.202 ms 2%
+
+n=512  PT min 32.075 ms  median 33.969 ms  spread 1.14x  load 11.53->12.61  MHz 3432/3089  iowait 305 jiffies
+  arm=262144/4row/fused/4output min   73.993 ms  median   84.065 ms  PT-beside-it min   32.075 ms  paired-vs-PT FT 2.515x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 1.90e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 48.193 ms 71%  form_p/q 18.993 ms 28%  QR sweep 0.294 ms 0%
+  arm=SERIAL/4row/fused/4output min   70.193 ms  median   85.360 ms  PT-beside-it min   32.164 ms  paired-vs-PT FT 2.456x SLOWER  paired-vs-arm0 1.018x  branches (0, 0, 0)  parity rel 1.90e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 49.327 ms 75%  form_p/q 15.954 ms 24%  QR sweep 0.229 ms 0%
+
+n=1024  PT min 133.192 ms  median 160.881 ms  spread 952.35x  load 12.61->124.99  MHz 3144/3817  iowait 4282 jiffies
+  arm=262144/4row/fused/4output min  480.493 ms  median  892.865 ms  PT-beside-it min  139.867 ms  paired-vs-PT FT 5.304x SLOWER  paired-vs-arm0 1.000x  branches (512, 0, 512)  parity rel 6.07e-14 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 488.799 ms 68%  form_p/q 224.439 ms 31%  QR sweep 1.594 ms 0%
+  arm=SERIAL/4row/fused/4output min  478.732 ms  median  606.673 ms  PT-beside-it min  133.192 ms  paired-vs-PT FT 3.789x SLOWER  paired-vs-arm0 1.272x  branches (0, 0, 0)  parity rel 6.10e-14 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 463.139 ms 55%  form_p/q 374.886 ms 45%  QR sweep 0.881 ms 0%
+run_rc=0
+loadavg_after=124.99 94.43 55.92
+REFUSING TO MEASURE: 6 peer measurement process(es) are live.
+    3100674  timeout 1500 target/release/deps/criterion_python_loss_sweep-c7eb437060361b73 --test
+    3100678  target/release/deps/criterion_python_loss_sweep-c7eb437060361b73 --test
+    3207785  sudo -n env -u CARGO_TARGET_DIR FFS_BTRFS_FLOOR_MEMO_SLOTS=4 /data/tmp/claude-1000/-data-projects-fr
+    3207787  /data/tmp/claude-1000/-data-projects-frankenfs/3f130c91-622e-4f0f-88e2-8689bedea041/scratchpad/elf/f
+    3290172  python3 benches/vs_pandas_harness.py --category joins --workloads join_outer --sizes 1M --measuremen
+    3318838  python3 -m pytest -q --tb=long tests/python/conftest.py tests/python/goldens/describe_social_graph.t
+REFUSING TO MEASURE: 1-minute loadavg 124.99 exceeds 35.
+=== end ===
