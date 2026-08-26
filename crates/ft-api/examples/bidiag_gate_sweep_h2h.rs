@@ -75,10 +75,14 @@ enum LinalgOp {
     /// Cholesky of an SPD matrix. Unique factorisation, so parity is unambiguous.
     Cholesky,
     /// slogdet — computed via LU, so it prices the LU path with a SCALAR checksum that is
-    /// invariant to pivot order. Chosen over `lu_factor` because LU's row permutation can
-    /// legitimately differ between implementations and would make a factor-level checksum
-    /// unreadable, and over plain `det` because the SPD fixture's determinant (~n^n) is not
-    /// representable in f64 at n=512.
+    /// invariant to pivot order. Chosen over plain `det` because the SPD fixture's
+    /// determinant (~n^n) is not representable in f64 at n=512.
+    ///
+    /// This once also said `lu_factor` was unusable here because row permutations can
+    /// legitimately differ between implementations. That is true in general but NOT for
+    /// this fixture: `_spd` is strictly diagonally dominant, so partial pivoting takes the
+    /// diagonal at every step on both sides and no swap ever happens. `LuFactor` below now
+    /// measures the factor directly.
     Slogdet,
     /// inv — LU-backed like slogdet, but with an O(n^3) getri tail instead of slogdet's
     /// O(n) diagonal log-product. Included to separate two readings of slogdet's 21-25x:
@@ -86,6 +90,16 @@ enum LinalgOp {
     /// is implicated. The SPD fixture is used for CONDITIONING only — torch does not know
     /// the matrix is SPD and still routes through getrf/getri, so the LU path is preserved.
     Inv,
+    /// lu_factor — getrf and nothing else, so it measures our LU factorisation against
+    /// torch's with no tail on either side. Included to TEST the claim that post-fix
+    /// slogdet's residual ~10.8x IS our bare getrf gap: if that holds, lu_factor must land
+    /// near 10.8x too. Its no-grad path already takes both outputs off one kernel call, so
+    /// it is uncontaminated by the redundancy just fixed in slogdet.
+    ///
+    /// The SPD fixture is strictly diagonally dominant, so partial pivoting selects the
+    /// diagonal at every step in BOTH implementations — no row swaps, LU is unique, and
+    /// |sum| is directly comparable rather than pivot-order noise.
+    LuFactor,
     /// matrix_exp — scaling-and-squaring + Pade, so almost entirely GEMM. Included to test
     /// whether the board's GEMM-bound wins (1.06-1.70x FASTER) carry to a linalg op.
     MatrixExp,
@@ -281,6 +295,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
             LinalgOp::Slogdet => {
                 let (_sign, logabsdet) = session.tensor_linalg_slogdet(x).expect("slogdet");
                 session.tensor_abs(logabsdet).expect("abs")
+            }
+            LinalgOp::LuFactor => {
+                // Pivots come back as a plain Vec<usize>, so only the LU factor is timed.
+                let (lu, _pivots) = session.tensor_lu_factor(x).expect("lu_factor");
+                let a = session.tensor_abs(lu).expect("abs");
+                session.tensor_sum(a).expect("sum")
             }
             LinalgOp::Inv => {
                 // inv's result is unique (no sign, pivot or basis freedom), so |sum|
@@ -502,6 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "slogdet" => LinalgOp::Slogdet,
         "matrix_exp" => LinalgOp::MatrixExp,
         "inv" => LinalgOp::Inv,
+        "lu_factor" => LinalgOp::LuFactor,
         other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp|inv"),
     };
     let (py_fn, sym) = match op.as_str() {
@@ -545,6 +566,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // inv: LU-backed with an O(n^3) getri tail. See the Rust arm for why the SPD
         // fixture is used here (conditioning) without diverting off the LU route.
         "inv" => ("torch.linalg.inv(A).abs().sum().reshape(1)", false),
+        // lu_factor: bare getrf on both sides. SPD fixture is diagonally dominant so
+        // partial pivoting takes the diagonal and LU is unique. See the Rust arm.
+        "lu_factor" => ("torch.linalg.lu_factor(A)[0].abs().sum().reshape(1)", false),
         // matrix_exp: GEMM-dominated (scaling-squaring + Pade), unique result. See the
         // Rust arm for why the fixture is scaled by 1/n.
         "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
@@ -557,7 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(n, name)| {
             let base = if op == "orgqr" {
                 format!("torch.geqrf(_mk({n}, False))")
-            } else if op == "cholesky" || op == "slogdet" || op == "inv" {
+            } else if op == "cholesky" || op == "slogdet" || op == "inv" || op == "lu_factor" {
                 format!("_spd({n})")
             } else if op == "matrix_exp" {
                 format!("_expm_fixture({n})")

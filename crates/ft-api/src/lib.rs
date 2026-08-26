@@ -73200,6 +73200,31 @@ impl FrankenTorchSession {
         }
         let n = shape[0];
 
+        // No-grad fast path: ONE factorisation instead of two.
+        //
+        // `slogdet_contiguous_f64` returns `sign` and `logabsdet` from a single LU, but the
+        // grad path below calls it twice on the same matrix — once here for `.sign` (dropping
+        // `logabsdet`), then again inside the autograd forward closure for `.logabsdet`
+        // (dropping `sign`). The second factorisation is unavoidable when a tape node is
+        // needed, since the closure must be replayable under create_graph; with no grad there
+        // is no closure to replay, so both outputs come from one call.
+        //
+        // Bit-exact by construction: same kernel, same input, both fields off one result.
+        // Measured on this redundancy: FT slogdet n=1024 was SLOWER in absolute ms
+        // (93.4-106.0) than FT `inv` (79.1-82.5), which does strictly more work
+        // (getrf + O(n^3) getri vs getrf + an O(n) log-product). Torch has them the sensible
+        // way round (4.95 ms vs 15.94 ms).
+        let grad_active =
+            self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
+        if !grad_active {
+            let (vals, meta) = self.tensor_values_meta(input)?;
+            let result = ft_kernel_cpu::slogdet_contiguous_f64(&vals, &meta)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let sign_id = self.tensor_variable(vec![result.sign], vec![], false)?;
+            let logabsdet_id = self.tensor_variable(vec![result.logabsdet], vec![], false)?;
+            return Ok((sign_id, logabsdet_id));
+        }
+
         // Compute sign once via the kernel, return as a non-grad 0-D tensor.
         let sign_val = {
             let (vals, meta) = self.tensor_values_meta(input)?;
