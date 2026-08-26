@@ -58,6 +58,16 @@ use ft_api::harness_interleave::{
 };
 use ft_core::ExecutionMode;
 
+/// Which dense-linalg op both arms run — `frankentorch-linalg-live-torch-arm`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinalgOp {
+    Svd,
+    Svdvals,
+    Eigh,
+    Eigvalsh,
+    Qr,
+}
+
 /// One measured configuration of our own arm.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Arm {
@@ -125,6 +135,23 @@ fn fill(n: usize) -> Vec<f64> {
     a
 }
 
+/// `(A + A^T) / 2`, for the eig lanes only — `frankentorch-linalg-live-torch-arm`.
+///
+/// `eigh` reads a single triangle. Handing it the non-symmetric `fill` would make each arm
+/// answer a question about a DIFFERENT matrix, and the parity checksum would then be comparing
+/// two correct answers to two different problems rather than catching a defect. The incumbent's
+/// `_mk(n, sym=True)` performs the identical symmetrisation in the identical order, so both arms
+/// see the same bits.
+fn symmetrise(a: &[f64], n: usize) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            out[r * n + c] = (a[r * n + c] + a[c * n + r]) * 0.5;
+        }
+    }
+    out
+}
+
 /// Cumulative iowait jiffies from `/proc/stat`'s aggregate `cpu` line.
 fn iowait_jiffies() -> u64 {
     std::fs::read_to_string("/proc/stat")
@@ -147,7 +174,7 @@ fn provenance() -> (f64, f64) {
 ///
 /// The timer stops before the checksum is read, exactly as the incumbent's `run` does, so both
 /// arms time the same region.
-fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
+fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_gate = ft_kernel_cpu::bidiag_parallel_gate_set(arm.gate);
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
@@ -164,8 +191,26 @@ fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
     let sv = if arm.values_only {
         session.tensor_linalg_svdvals(x).expect("svdvals")
     } else {
-        let (_u, sv, _vh) = session.tensor_linalg_svd(x, true).expect("svd");
-        sv
+        match op {
+            // Each branch returns the SAME quantity the incumbent's lambda returns, so the parity
+            // checksum compares like with like: eigenvalues for the eig lanes, |diag(R)| for qr
+            // (R's diagonal is sign-ambiguous between implementations, the magnitudes are not).
+            LinalgOp::Svd => {
+                let (_u, sv, _vh) = session.tensor_linalg_svd(x, true).expect("svd");
+                sv
+            }
+            LinalgOp::Svdvals => session.tensor_linalg_svdvals(x).expect("svdvals"),
+            LinalgOp::Eigh => {
+                let (w, _v) = session.tensor_linalg_eigh(x).expect("eigh");
+                w
+            }
+            LinalgOp::Eigvalsh => session.tensor_linalg_eigvalsh(x).expect("eigvalsh"),
+            LinalgOp::Qr => {
+                let (_q, r) = session.tensor_linalg_qr(x, false).expect("qr");
+                let d = session.tensor_diagonal(r, 0).expect("diag");
+                session.tensor_abs(d).expect("abs")
+            }
+        }
     };
     let ms = started.elapsed().as_secs_f64() * 1e3;
     let sum: f64 = session
@@ -327,19 +372,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Command` below rather than through `std::env::set_var` — this crate forbids `unsafe`, and
     // mutating the parent's environment to talk to a child is the wrong mechanism anyway.
 
-    let lanes: Vec<(usize, String)> = sizes.iter().map(|&n| (n, format!("svd_{n}"))).collect();
+    // FT_OP selects WHICH dense-linalg op both arms run — `frankentorch-linalg-live-torch-arm`.
+    //
+    // WHY THIS EXISTS. Every standing this session banked used a torch CO-PROCESS inside the same
+    // invocation, because this host has moved the incumbent 1.94x between two runs of the same
+    // ELF. The eig/qr family had no such harness at all: `linalg_gap_sweep` is FT-INTERNAL and
+    // its own header says torch is run separately, i.e. a cross-run comparison. So "SVD is the
+    // worst op in the tree" could only ever be claimed as "the worst op among ops that HAVE a
+    // live-torch harness". This closes that gap by reusing the machinery already here —
+    // provenance, the A/A null via repeated arms, per-round interleaving, the parity checksum.
+    //
+    // The gate/rowdot/fused/panel arms are SVD-reduction knobs and do nothing for eigh/qr, so on
+    // those ops the arms differ only by position: a repeated arm is then a PURE A/A null, which
+    // is exactly what is wanted for a first standing.
+    let op = std::env::var("FT_OP").unwrap_or_else(|_| "svd".to_owned());
+    // SYMMETRY IS NOT OPTIONAL for the eig lanes. `_mk` builds a NON-symmetric matrix, and
+    // `torch.linalg.eigh` reads only one triangle — it would silently return the spectrum of a
+    // DIFFERENT matrix than our arm sees, and the parity checksum would compare two answers to
+    // two different questions. `(A + A.T) * 0.5` on both sides is what makes the row mean
+    // anything.
+    let ft_op = match op.as_str() {
+        "svd" => LinalgOp::Svd,
+        "svdvals" => LinalgOp::Svdvals,
+        "eigh" => LinalgOp::Eigh,
+        "eigvalsh" => LinalgOp::Eigvalsh,
+        "qr" => LinalgOp::Qr,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr"),
+    };
+    let (py_fn, sym) = match op.as_str() {
+        "svd" => ("torch.linalg.svd(A)[1]", false),
+        "svdvals" => ("torch.linalg.svdvals(A)", false),
+        "eigh" => ("torch.linalg.eigh(A)[0]", true),
+        "eigvalsh" => ("torch.linalg.eigvalsh(A)", true),
+        "qr" => ("torch.linalg.qr(A)[1].diagonal().abs()", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr"),
+    };
+    let lanes: Vec<(usize, String)> =
+        sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
     let lane_entries: Vec<String> = lanes
         .iter()
-        .map(|(n, name)| format!("    \"{name}\": (_mk({n}), lambda A: torch.linalg.svd(A)[1]),"))
+        .map(|(n, name)| {
+            format!("    \"{name}\": (_mk({n}, {}), lambda A: {py_fn}),", if sym { "True" } else { "False" })
+        })
         .collect();
     let py_setup = format!(
         r#"
 import time, torch
 torch.set_num_threads(8)
-def _mk(n):
+def _mk(n, sym=False):
     r = torch.arange(n, dtype=torch.float64).reshape(n, 1)
     c = torch.arange(n, dtype=torch.float64).reshape(1, n)
-    return ((((r + 2) * (c + 3)) % 17) - 8.0) * 0.05 + torch.eye(n, dtype=torch.float64) * 3.0
+    A = ((((r + 2) * (c + 3)) % 17) - 8.0) * 0.05 + torch.eye(n, dtype=torch.float64) * 3.0
+    # Symmetrised for the eig lanes, matching the Rust arm exactly. eigh reads one triangle, so
+    # without this the two arms would be answering different questions and the parity column
+    # would be meaningless rather than merely failing.
+    return (A + A.T) * 0.5 if sym else A
 def run(base, fn):
     _t = time.perf_counter()
     _s = fn(base)
@@ -419,13 +506,16 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
 
     for (n, lane) in &lanes {
         let n = *n;
-        let data = fill(n);
+        // Symmetrised for the eig lanes ONLY, matching the incumbent's `_mk(n, sym=True)`
+        // exactly. eigh reads one triangle, so an unsymmetrised fixture would have the two arms
+        // answering different questions.
+        let data = if sym { symmetrise(&fill(n), n) } else { fill(n) };
         let iowait_before = iowait_jiffies();
         let (load_before, mhz_before) = provenance();
 
         // Matched warmup, ours only: the co-process warmed its lanes before READY.
         for _ in 0..warmup {
-            let _ = ft_one(n, &data, arms[0]);
+            let _ = ft_one(n, &data, arms[0], ft_op);
         }
 
         let mut ft_ms: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); arms.len()];
@@ -446,7 +536,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 (0..arms.len()).rev().collect()
             };
             for &idx in &order {
-                let (ms, sum) = ft_one(n, &data, arms[idx]);
+                let (ms, sum) = ft_one(n, &data, arms[idx], ft_op);
                 let (pt, pt_checksum) = incumbent_sample(&mut stdin, &mut reader, lane)?;
                 if round > 0 {
                     ft_ms[idx].push(ms);
@@ -473,7 +563,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             for _ in 0..PHASE_CALLS {
                 let _ = ft_kernel_cpu::bidiag_parallel_branches_take();
                 let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
-                let _ = ft_one(n, &data, arm);
+                let _ = ft_one(n, &data, arm, ft_op);
                 branches[idx] = ft_kernel_cpu::bidiag_parallel_branches_take();
                 samples.push(ft_kernel_cpu::svd_reduction_sweep_ns_take());
             }
