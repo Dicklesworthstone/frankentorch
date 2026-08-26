@@ -70,6 +70,8 @@ enum LinalgOp {
     Geqrf,
     /// FORM Q from packed reflectors. The geqrf producing them runs outside the timer.
     Orgqr,
+    /// APPLY packed reflectors to a matrix (Q^T C). geqrf runs outside the timer.
+    Ormqr,
 }
 
 /// One measured configuration of our own arm.
@@ -191,6 +193,28 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     // `tensor_geqrf` is itself a measured 226x defect; timing it here would drown the very
     // thing this lane exists to isolate. The incumbent does the same -- its geqrf runs at
     // LANES construction time.
+    if op == LinalgOp::Ormqr {
+        let (packed, tau) = session.tensor_geqrf(x).expect("geqrf for ormqr");
+        let c = session
+            .tensor_variable(data.to_vec(), vec![n, n], false)
+            .expect("ormqr C");
+        let started = Instant::now();
+        let out = session
+            .tensor_ormqr(packed, tau, c, true, false)
+            .expect("ormqr");
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        let sum: f64 = session
+            .tensor_values(out)
+            .expect("ormqr values")
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+        ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
+        ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
+        ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+        return (ms, sum);
+    }
     if op == LinalgOp::Orgqr {
         let (packed, tau) = session.tensor_geqrf(x).expect("geqrf for orgqr");
         let started = Instant::now();
@@ -237,7 +261,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 let d = session.tensor_diagonal(r, 0).expect("diag");
                 session.tensor_abs(d).expect("abs")
             }
-            LinalgOp::Orgqr => unreachable!("orgqr is timed in its own branch below"),
+            LinalgOp::Orgqr | LinalgOp::Ormqr => unreachable!("timed in their own branches above"),
             LinalgOp::Geqrf => {
                 // geqrf overwrites the upper triangle with R and the lower with the
                 // packed reflectors; |diag| is R's diagonal, the same quantity the qr
@@ -435,7 +459,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "qr" => LinalgOp::Qr,
         "geqrf" => LinalgOp::Geqrf,
         "orgqr" => LinalgOp::Orgqr,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr"),
+        "ormqr" => LinalgOp::Ormqr,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -461,7 +486,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // convention difference rather than on a defect. Summing |Q| is invariant under column
         // sign flips and still catches a genuinely wrong Q.
         "orgqr" => ("torch.linalg.householder_product(A[0], A[1]).abs()", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr"),
+        // ormqr: APPLY the packed reflectors to a matrix C (Q^T C, left, no transpose).
+        // Like orgqr, the geqrf producing (A, tau) runs at LANES construction time, OUTSIDE
+        // the timed region, on both arms -- otherwise this re-measures geqrf's 227x defect.
+        // |result| for the same reason orgqr uses |Q|: the two factorisations need not agree
+        // on reflector sign convention, and a sign difference is not a defect.
+        "ormqr" => ("torch.ormqr(A[0], A[1], A[2]).abs()", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
@@ -470,6 +501,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(n, name)| {
             let base = if op == "orgqr" {
                 format!("torch.geqrf(_mk({n}, False))")
+            } else if op == "ormqr" {
+                // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
+                format!("(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))")
             } else {
                 format!("_mk({n}, {})", if sym { "True" } else { "False" })
             };
