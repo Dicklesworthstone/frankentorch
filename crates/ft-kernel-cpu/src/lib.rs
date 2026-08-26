@@ -36795,6 +36795,11 @@ pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) 
 /// it accepts these LAPACK-convention reflectors directly, with the unit diagonal made
 /// explicit in `vmat`.
 ///
+/// `n` SERVES TWO ROLES: it is both the row stride of `packed` and the width of the Q that
+/// is returned. Those coincide for the reduced Q this exists to build, so callers wanting a
+/// FULL m x m Q cannot simply pass `n = m` — that would read `packed` with the wrong
+/// stride. (Reaching for exactly that is what made the first `ormqr` test panic.)
+///
 /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
 pub fn orgqr_blocked_f64(packed: &[f64], tau: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
     // Q starts as the first n columns of the m x m identity.
@@ -36847,6 +36852,135 @@ pub fn orgqr_blocked_f64(packed: &[f64], tau: &[f64], m: usize, n: usize, k: usi
         }
     }
     x
+}
+
+/// Build the `(V, T)` panels a blocked reflector application needs, from LAPACK-convention
+/// packed reflectors. Shared by [`orgqr_blocked_f64`] and [`ormqr_blocked_f64`].
+fn householder_panels_from_packed_f64(
+    packed: &[f64],
+    tau: &[f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    nb_block: usize,
+) -> Vec<(usize, Vec<f64>, Vec<f64>)> {
+    let mut panels = Vec::new();
+    let mut p = 0;
+    while p < k {
+        let pe = (p + nb_block).min(k);
+        let nb = pe - p;
+        let mut vmat = vec![0.0f64; m * nb];
+        for c in 0..nb {
+            let j = p + c;
+            vmat[j * nb + c] = 1.0;
+            for i in (j + 1)..m {
+                vmat[i * nb + c] = packed[i * n + j];
+            }
+        }
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb);
+        panels.push((nb, vmat, tmat));
+        p = pe;
+    }
+    panels
+}
+
+/// LAPACK-convention `ormqr` (`torch.ormqr`) via compact-WY blocking: multiply `c` by Q or
+/// Qᵀ, from the left or the right, WITHOUT forming Q.
+///
+/// Replaces a loop applying ONE reflector per pass (rank-1, BLAS-2, stride-n column walk)
+/// with one `I - V T Vᵀ` per 32-reflector panel applied as three GEMMs. `ormqr` measured
+/// ~253x slower than torch at n=512 and 502-507x at n=1024 — the worst remaining member of
+/// the Householder family after `geqrf` (227.6x -> 10.755x) and `orgqr` (143.9x -> 4.809x).
+///
+/// FOUR CASES. Grouping `Q = P_0 P_1 ... P_L` by panel, where each panel's forward product
+/// is `I - V T Vᵀ` and its reverse product is `I - V Tᵀ Vᵀ`:
+///
+/// | left | transpose | want | panel order | block |
+/// |---|---|---|---|---|
+/// | T | F | `Q C`  | REVERSE | `I - V T Vᵀ`  |
+/// | T | T | `Qᵀ C` | FORWARD | `I - V Tᵀ Vᵀ` |
+/// | F | F | `C Q`  | FORWARD | `I - V T Vᵀ`  |
+/// | F | T | `C Qᵀ` | REVERSE | `I - V Tᵀ Vᵀ` |
+///
+/// The right-hand cases are the ones easily reversed: `C Q = C (P_0 ... P_L)` right-multiplies
+/// by `P_0` FIRST, while `C Qᵀ = C (P_Lᵀ ... P_0ᵀ)` right-multiplies by `P_Lᵀ` first.
+///
+/// So panel order is REVERSE exactly when `left != transpose`, which agrees with the
+/// per-reflector loop this replaces (`forward = (transpose == left)`), and T is transposed
+/// exactly when `transpose` is set.
+///
+/// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+#[allow(clippy::too_many_arguments)]
+pub fn ormqr_blocked_f64(
+    packed: &[f64],
+    tau: &[f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    c: &mut [f64],
+    cr: usize,
+    cc: usize,
+    left: bool,
+    transpose: bool,
+) {
+    if k == 0 || m == 0 || cr == 0 || cc == 0 {
+        return;
+    }
+    let panels = householder_panels_from_packed_f64(packed, tau, m, n, k, 32);
+
+    // REVERSE iff left != transpose; see the table above.
+    let reverse = left != transpose;
+    let ordered: Vec<&(usize, Vec<f64>, Vec<f64>)> = if reverse {
+        panels.iter().rev().collect()
+    } else {
+        panels.iter().collect()
+    };
+
+    for (nb, vmat, tmat) in ordered {
+        let nb = *nb;
+        let mut vt = vec![0.0f64; nb * m];
+        for row in 0..m {
+            for col in 0..nb {
+                vt[col * m + row] = vmat[row * nb + col];
+            }
+        }
+        // Tᵀ when applying the reverse product.
+        let tx = if transpose {
+            let mut tt = vec![0.0f64; nb * nb];
+            for i in 0..nb {
+                for j in 0..nb {
+                    tt[i * nb + j] = tmat[j * nb + i];
+                }
+            }
+            tt
+        } else {
+            tmat.clone()
+        };
+
+        if left {
+            // C <- C - V (T (Vᵀ C)),  C is m x cc.
+            let mut w1 = vec![0.0f64; nb * cc];
+            gemm::dgemm(nb, m, cc, &vt, c, &mut w1); // Vᵀ C
+            let mut w2 = vec![0.0f64; nb * cc];
+            gemm::dgemm(nb, nb, cc, &tx, &w1, &mut w2); // T (Vᵀ C)
+            let mut upd = vec![0.0f64; m * cc];
+            gemm::dgemm(m, nb, cc, vmat, &w2, &mut upd); // V (...)
+            for t in 0..m * cc {
+                c[t] -= upd[t];
+            }
+        } else {
+            // C <- C - ((C V) T) Vᵀ,  C is cr x m.
+            let mut w1 = vec![0.0f64; cr * nb];
+            gemm::dgemm(cr, m, nb, c, vmat, &mut w1); // C V
+            let mut w2 = vec![0.0f64; cr * nb];
+            gemm::dgemm(cr, nb, nb, &w1, &tx, &mut w2); // (C V) T
+            let mut upd = vec![0.0f64; cr * m];
+            gemm::dgemm(cr, nb, m, &w2, &vt, &mut upd); // (...) Vᵀ
+            for t in 0..cr * m {
+                c[t] -= upd[t];
+            }
+        }
+    }
 }
 
 /// A/B entry point (NOT production dispatch): runs the blocked compact-WY QR with
@@ -44008,6 +44142,133 @@ mod tests {
     /// one built from reflectors applied in the WRONG ORDER, which is the specific error
     /// blocking introduces, since panels must be applied in reverse to reproduce
     /// `H_0 (H_1 (... x))`. `Q R == A` is what pins the order.
+    /// `ormqr_blocked_f64` must equal an explicit multiply by Q for ALL FOUR
+    /// `(left, transpose)` combinations.
+    ///
+    /// The reference is Q formed by `orgqr_blocked_f64` and multiplied out by hand. An
+    /// orthogonality-style check would be worthless here: applying the panels in the WRONG
+    /// ORDER produces a different but still perfectly orthogonal result, so three of the
+    /// four cases could be reversed and any "the answer is orthogonal" assertion would
+    /// still pass. Only comparing against the actual product pins the order, and only
+    /// testing all four combinations pins the `left != transpose` rule rather than one
+    /// lucky branch of it.
+    #[test]
+    fn ormqr_blocked_f64_matches_explicit_q_multiply_all_four_cases() {
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 24; // the other matrix's free dimension
+
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.23).sin() + (j * 0.19).cos()) * 1.1
+                    + if idx % (N + 1) == 0 { 3.0 } else { 0.0 }
+            })
+            .collect();
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+
+        // Reference: the FULL M x M Q, built by NAIVE per-reflector application.
+        //
+        // Deliberately not `orgqr_blocked_f64`. That shares `householder_panels_from_packed_f64`
+        // with the code under test, so a bug in the shared panel construction would cancel
+        // out and the test would pass while both were wrong. A naive reference has no such
+        // overlap. (It also cannot be called for a full Q at all: `orgqr_blocked_f64` uses
+        // its `n` for BOTH the packed row stride and the output width, which coincide only
+        // for the reduced case.)
+        let q_full = {
+            let mut q = vec![0.0f64; M * M];
+            for i in 0..M {
+                q[i * M + i] = 1.0;
+            }
+            for j in (0..N).rev() {
+                let mut v = vec![0.0f64; M];
+                v[j] = 1.0;
+                for (i, slot) in v.iter_mut().enumerate().skip(j + 1) {
+                    *slot = packed[i * N + j];
+                }
+                for col in 0..M {
+                    let mut dot = 0.0;
+                    for i in j..M {
+                        dot += v[i] * q[i * M + col];
+                    }
+                    let scale = tau[j] * dot;
+                    for i in j..M {
+                        q[i * M + col] -= scale * v[i];
+                    }
+                }
+            }
+            q
+        };
+
+        for &transpose in &[false, true] {
+            // LEFT: C is M x W. Q is M x N, so Q^T C is N x W and Q C is not conformable
+            // for the reduced Q; ormqr with left=true applies the full Q implicitly, so
+            // compare against the reduced product on the first N rows.
+            let c0: Vec<f64> = (0..M * W)
+                .map(|t| ((t as f64) * 0.037).sin() + 0.5)
+                .collect();
+            let mut c = c0.clone();
+            super::ormqr_blocked_f64(
+                &packed, &tau, M, N, N, &mut c, M, W, true, transpose,
+            );
+
+            let mut want = vec![0.0f64; M * W];
+            for i in 0..M {
+                for j in 0..W {
+                    let mut acc = 0.0;
+                    for t in 0..M {
+                        // Q C uses Q[i][t]; Q^T C uses Q[t][i].
+                        let qv = if transpose {
+                            q_full[t * M + i]
+                        } else {
+                            q_full[i * M + t]
+                        };
+                        acc += qv * c0[t * W + j];
+                    }
+                    want[i * W + j] = acc;
+                }
+            }
+            for (idx, (g, w)) in c.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-9 * w.abs().max(1.0),
+                    "ormqr left transpose={transpose} [{idx}]: got {g}, want {w}"
+                );
+            }
+
+            // RIGHT: C is W x M.
+            let d0: Vec<f64> = (0..W * M)
+                .map(|t| ((t as f64) * 0.041).cos() - 0.25)
+                .collect();
+            let mut d = d0.clone();
+            super::ormqr_blocked_f64(
+                &packed, &tau, M, N, N, &mut d, W, M, false, transpose,
+            );
+            let mut want_r = vec![0.0f64; W * M];
+            for i in 0..W {
+                for j in 0..M {
+                    let mut acc = 0.0;
+                    for t in 0..M {
+                        let qv = if transpose {
+                            q_full[j * M + t]
+                        } else {
+                            q_full[t * M + j]
+                        };
+                        acc += d0[i * M + t] * qv;
+                    }
+                    want_r[i * M + j] = acc;
+                }
+            }
+            for (idx, (g, w)) in d.iter().zip(want_r.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-9 * w.abs().max(1.0),
+                    "ormqr right transpose={transpose} [{idx}]: got {g}, want {w}"
+                );
+            }
+        }
+
+    }
+
     #[test]
     fn orgqr_blocked_f64_rebuilds_q_from_packed_reflectors() {
         const M: usize = 160;

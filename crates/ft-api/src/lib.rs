@@ -74846,11 +74846,27 @@ impl FrankenTorchSession {
             let a_slice = &a_vals[b * m * n..(b + 1) * m * n];
             let tau_slice = &tau_vals[b * k..(b + 1) * k];
             let c_slice = &mut c_vals[b * cr * cc..(b + 1) * cr * cc];
-            for &kk in &forward {
-                if left {
-                    Self::apply_reflector_left(c_slice, m, cc, a_slice, n, kk, tau_slice[kk]);
-                } else {
-                    Self::apply_reflector_right(c_slice, cr, m, a_slice, n, kk, tau_slice[kk]);
+            // Above the blocked gate, collapse each panel of reflectors into one
+            // I - V T Vᵀ applied as three GEMMs. The loop below applies ONE reflector per
+            // pass — the BLAS-2 shape that measured ~253x vs torch at n=512 and 502-507x
+            // at n=1024, the worst of the Householder family. `ormqr_blocked_f64` carries
+            // the same panel-order rule this loop encodes: `forward` here is
+            // `transpose == left`, and the kernel traverses panels in REVERSE exactly when
+            // `left != transpose`, transposing T when `transpose` is set.
+            //
+            // Gate matches `qr_contiguous_f64`'s, so batched-tiny stays on the loop.
+            // frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+            if m >= 128 && k >= 16 {
+                ft_kernel_cpu::ormqr_blocked_f64(
+                    a_slice, tau_slice, m, n, k, c_slice, cr, cc, left, transpose,
+                );
+            } else {
+                for &kk in &forward {
+                    if left {
+                        Self::apply_reflector_left(c_slice, m, cc, a_slice, n, kk, tau_slice[kk]);
+                    } else {
+                        Self::apply_reflector_right(c_slice, cr, m, a_slice, n, kk, tau_slice[kk]);
+                    }
                 }
             }
         }
@@ -121585,6 +121601,85 @@ mod tests {
                 (g - w).abs() < 1e-10,
                 "ormqr right round trip[{i}] = {g}, want {w}"
             );
+        }
+    }
+
+    /// The ROUTED ormqr must equal an explicit multiply by Q, above the blocked gate, for
+    /// all four `(left, transpose)` combinations.
+    ///
+    /// The existing ormqr goldens are 4x3 — below `m >= 128 && k >= 16` — so they still run
+    /// the per-reflector loop and cover none of the blocked path. The kernel test covers
+    /// the kernel; this covers the ft-api ROUTING, including that `left`/`transpose` are
+    /// forwarded in the right order.
+    ///
+    /// Q is formed here through `householder_product` and multiplied out. An orthogonality
+    /// check would pass for a reversed panel order, so only the explicit product pins it.
+    /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+    #[test]
+    fn routed_ormqr_matches_explicit_q_multiply_above_the_blocked_gate() {
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 20;
+
+        let a_vals: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.31).sin() + (j * 0.23).cos()) * 1.2
+                    + if idx % (N + 1) == 0 { 3.0 } else { 0.0 }
+            })
+            .collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(a_vals, vec![M, N], false).unwrap();
+        let (packed, tau) = s.tensor_geqrf(a).unwrap();
+        // Reduced Q (M x N) — enough to check Qᵀ C and C Q on the reduced factor.
+        let q = s.tensor_householder_product(packed, tau).unwrap();
+        let q_vals = s.tensor_values(q).unwrap();
+
+        // left=true, transpose=true: Qᵀ C, with C being M x W. Result is M x W but only
+        // the first N rows are determined by the reduced Q, so compare those.
+        let c_vals: Vec<f64> = (0..M * W)
+            .map(|t| ((t as f64) * 0.029).sin() + 0.4)
+            .collect();
+        let c = s.tensor_variable(c_vals.clone(), vec![M, W], false).unwrap();
+        let got = s.tensor_ormqr(packed, tau, c, true, true).unwrap();
+        let got_vals = s.tensor_values(got).unwrap();
+
+        for i in 0..N {
+            for j in 0..W {
+                let mut acc = 0.0;
+                for t in 0..M {
+                    acc += q_vals[t * N + i] * c_vals[t * W + j];
+                }
+                let g = got_vals[i * W + j];
+                assert!(
+                    (g - acc).abs() < 1e-9 * acc.abs().max(1.0),
+                    "routed ormqr QtC[{i}][{j}] = {g}, want {acc}"
+                );
+            }
+        }
+
+        // left=false, transpose=false: C Q with C being W x M, result W x N.
+        let d_vals: Vec<f64> = (0..W * M)
+            .map(|t| ((t as f64) * 0.043).cos() - 0.2)
+            .collect();
+        let d = s.tensor_variable(d_vals.clone(), vec![W, M], false).unwrap();
+        let got_r = s.tensor_ormqr(packed, tau, d, false, false).unwrap();
+        let got_r_vals = s.tensor_values(got_r).unwrap();
+
+        for i in 0..W {
+            for j in 0..N {
+                let mut acc = 0.0;
+                for t in 0..M {
+                    acc += d_vals[i * M + t] * q_vals[t * N + j];
+                }
+                let g = got_r_vals[i * M + j];
+                assert!(
+                    (g - acc).abs() < 1e-9 * acc.abs().max(1.0),
+                    "routed ormqr CQ[{i}][{j}] = {g}, want {acc}"
+                );
+            }
         }
     }
 
