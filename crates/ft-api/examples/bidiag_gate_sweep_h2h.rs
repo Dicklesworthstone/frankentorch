@@ -74,6 +74,12 @@ enum LinalgOp {
     Ormqr,
     /// Cholesky of an SPD matrix. Unique factorisation, so parity is unambiguous.
     Cholesky,
+    /// slogdet — computed via LU, so it prices the LU path with a SCALAR checksum that is
+    /// invariant to pivot order. Chosen over `lu_factor` because LU's row permutation can
+    /// legitimately differ between implementations and would make a factor-level checksum
+    /// unreadable, and over plain `det` because the SPD fixture's determinant (~n^n) is not
+    /// representable in f64 at n=512.
+    Slogdet,
 }
 
 /// One measured configuration of our own arm.
@@ -258,6 +264,10 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 w
             }
             LinalgOp::Eigvalsh => session.tensor_linalg_eigvalsh(x).expect("eigvalsh"),
+            LinalgOp::Slogdet => {
+                let (_sign, logabsdet) = session.tensor_linalg_slogdet(x).expect("slogdet");
+                session.tensor_abs(logabsdet).expect("abs")
+            }
             LinalgOp::Cholesky => {
                 let l = session.tensor_linalg_cholesky(x, false).expect("cholesky");
                 let d = session.tensor_diagonal(l, 0).expect("diag");
@@ -468,7 +478,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "orgqr" => LinalgOp::Orgqr,
         "ormqr" => LinalgOp::Ormqr,
         "cholesky" => LinalgOp::Cholesky,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky"),
+        "slogdet" => LinalgOp::Slogdet,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -505,7 +516,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // mismatch. That is why this op was chosen over ldl_factor, whose Bunch-Kaufman
         // pivoting may legitimately differ and would make the parity column unreadable.
         "cholesky" => ("torch.linalg.cholesky(A).diagonal().abs()", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky"),
+        // slogdet: exercises the LU path with a SCALAR, pivot-order-invariant checksum.
+        // See the Rust arm for why this was chosen over lu_factor and over plain det.
+        "slogdet" => ("torch.linalg.slogdet(A)[1].abs().reshape(1)", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
@@ -514,7 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(n, name)| {
             let base = if op == "orgqr" {
                 format!("torch.geqrf(_mk({n}, False))")
-            } else if op == "cholesky" {
+            } else if op == "cholesky" || op == "slogdet" {
                 format!("_spd({n})")
             } else if op == "ormqr" {
                 // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
@@ -624,7 +638,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // Symmetrised for the eig lanes ONLY, matching the incumbent's `_mk(n, sym=True)`
         // exactly. eigh reads one triangle, so an unsymmetrised fixture would have the two arms
         // answering different questions.
-        let data = if ft_op == LinalgOp::Cholesky {
+        let data = if ft_op == LinalgOp::Cholesky || ft_op == LinalgOp::Slogdet {
             // Identical to the incumbent's `_spd`: symmetrise, then add n to the diagonal.
             // Strictly diagonally dominant => positive definite at every n.
             let mut d = symmetrise(&fill(n), n);

@@ -1,0 +1,27 @@
+=== slogdet_live attempt=1 utc=2026-08-26T08:59:31Z host=thinkstation1 ===
+idle_before=74.18% then 83.76% (mpstat 5s x2, NOT loadavg)
+loadavg_before=11.97 9.05 9.39 (recorded for provenance; NOT the gate)
+snapshot_sha256=13355d7df8e14debd748b703dc7aa3051872496b11e3a2dc6c5cfe8c2d4e659b
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=512,1024, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 25 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=13355d7df8e14debd748b703dc7aa3051872496b11e3a2dc6c5cfe8c2d4e659b
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=512  PT min 1.333 ms  median 1.577 ms  spread 3.67x  load 11.97->11.97  MHz 1429/2505  iowait 2 jiffies
+  arm=262144/4row/fused/4output min   35.962 ms  median   40.412 ms  PT-beside-it min    1.409 ms  paired-vs-PT FT 26.444x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 3.28e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output min   29.083 ms  median   41.179 ms  PT-beside-it min    1.333 ms  paired-vs-PT FT 25.974x SLOWER  paired-vs-arm0 0.986x  branches (0, 0, 0)  parity rel 3.28e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+
+n=1024  PT min 4.950 ms  median 5.530 ms  spread 1.33x  load 11.97->11.97  MHz 2397/1429  iowait 16 jiffies
+  arm=262144/4row/fused/4output min  106.005 ms  median  118.482 ms  PT-beside-it min    5.075 ms  paired-vs-PT FT 21.314x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 3.75e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output min   93.418 ms  median  118.938 ms  PT-beside-it min    4.950 ms  paired-vs-PT FT 21.626x SLOWER  paired-vs-arm0 1.010x  branches (0, 0, 0)  parity rel 3.75e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+idle_after=81.59%
