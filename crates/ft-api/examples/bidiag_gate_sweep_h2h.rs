@@ -523,7 +523,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "matrix_exp" => LinalgOp::MatrixExp,
         "inv" => LinalgOp::Inv,
         "lu_factor" => LinalgOp::LuFactor,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp|inv"),
+        other => panic!(
+            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp|inv"
+        ),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -572,10 +574,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // matrix_exp: GEMM-dominated (scaling-squaring + Pade), unique result. See the
         // Rust arm for why the fixture is scaled by 1/n.
         "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"),
+        other => panic!(
+            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"
+        ),
     };
-    let lanes: Vec<(usize, String)> =
-        sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
+    let lanes: Vec<(usize, String)> = sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
     let lane_entries: Vec<String> = lanes
         .iter()
         .map(|(n, name)| {
@@ -587,7 +590,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("_expm_fixture({n})")
             } else if op == "ormqr" {
                 // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
-                format!("(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))")
+                format!(
+                    "(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))"
+                )
             } else {
                 format!("_mk({n}, {})", if sym { "True" } else { "False" })
             };

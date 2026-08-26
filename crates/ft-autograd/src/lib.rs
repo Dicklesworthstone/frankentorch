@@ -22461,7 +22461,10 @@ mod tests {
             (1, len),
             "only rhs is needed for d(lhs * rhs)/d(lhs)"
         );
-        assert!(report.gradient(rhs).is_none(), "non-grad rhs must stay absent");
+        assert!(
+            report.gradient(rhs).is_none(),
+            "non-grad rhs must stay absent"
+        );
         assert_eq!(
             report.gradient(lhs).expect("lhs grad"),
             tape.values_f32(rhs)

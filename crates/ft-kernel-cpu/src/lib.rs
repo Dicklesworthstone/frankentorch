@@ -44376,9 +44376,7 @@ mod tests {
                 .map(|t| ((t as f64) * 0.037).sin() + 0.5)
                 .collect();
             let mut c = c0.clone();
-            super::ormqr_blocked_f64(
-                &packed, &tau, M, N, N, &mut c, M, W, true, transpose,
-            );
+            super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut c, M, W, true, transpose);
 
             let mut want = vec![0.0f64; M * W];
             for i in 0..M {
@@ -44408,9 +44406,7 @@ mod tests {
                 .map(|t| ((t as f64) * 0.041).cos() - 0.25)
                 .collect();
             let mut d = d0.clone();
-            super::ormqr_blocked_f64(
-                &packed, &tau, M, N, N, &mut d, W, M, false, transpose,
-            );
+            super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut d, W, M, false, transpose);
             let mut want_r = vec![0.0f64; W * M];
             for i in 0..W {
                 for j in 0..M {
@@ -44433,7 +44429,6 @@ mod tests {
                 );
             }
         }
-
     }
 
     #[test]
