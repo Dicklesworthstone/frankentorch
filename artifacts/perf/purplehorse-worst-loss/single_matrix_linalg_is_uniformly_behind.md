@@ -101,3 +101,74 @@ anything, which is itself the argument for the rewrite.
   arms were, so the comparison is common-mode, but the absolute times are not
   comparable with rows taken at 3.4 GHz.
 * `eigvalsh` remains provisional pending a clean-window re-take.
+
+---
+
+# RETRACTION: the shared cause I proposed above is REFUTED by this tree
+
+**I claimed the five losses share one root cause — "ours are unblocked or partially
+blocked" where LAPACK runs blocked BLAS-3. I checked, and that is false for `qr`. Our
+QR is ALREADY blocked compact-WY BLAS-3, the blocked path is the one that ran at
+n=512, and it still lost 5.50x. The tidy synthesis does not survive its own source
+check.**
+
+## What the source actually says
+
+`qr_contiguous_f64`, at the dispatch:
+
+```rust
+// Blocked compact-WY path (BLAS-3) for sizes where the GEMM trailing update
+// beats the per-reflector BLAS-2 sweep; small matrices stay on the scalar sweep.
+if m >= 128 && k >= 16 {
+    let q = qr_householder_panel_blocked(&mut r_mat, m, n, k, qcols);
+```
+
+n=512 clears `m >= 128 && k >= 16` comfortably. The measured 5.497–5.522x is the
+**blocked** path's standing, not an unblocked one's.
+
+## Which makes the pattern the opposite of tidy
+
+| op | is it blocked? | standing at n=512 |
+|---|---|---|
+| SVD | **yes** — `bidiag_blocked_f64` | **2.40x** (best) |
+| `eigh` | **no** — `tred2`, its own note says "serial scalar" | 5.60x |
+| `qr` | **yes** — compact-WY panel, `m>=128` | **5.50x** (worst) |
+
+**Blocking does not predict the standing.** The blocked SVD is the *best* of the three
+and the blocked QR is the *worst*, with an unblocked eigh between them. Any story of the
+form "we lack blocking" is refuted by the middle row of that table.
+
+## What I should have done, and the general lesson
+
+I had the observation (five ops, narrow 2.3x band, four different algorithms) and I
+reached for a single mechanism that explained it. The mechanism was plausible, it fit
+the eigh evidence I already had, and I committed it — **before checking whether the
+premise held for the other two ops**. One `grep` refuted it.
+
+The narrow band is still a real and striking observation. It still suggests something
+shared. But "unblocked algorithms" is not it, and I do not currently know what is.
+Candidates I have NOT tested and am not asserting:
+
+* panel width / trailing-update efficiency — blocking present but far from MKL's
+  achieved fraction of peak;
+* our `gemm::dgemm` itself being well behind MKL's, which would drag every blocked
+  factorisation down uniformly and would explain a narrow band across algorithms;
+* memory bandwidth per core on this host bounding all of them at a similar level.
+
+The second is the most testable and the most consequential: if our GEMM is the common
+floor, it is one target under all five ops and it is measurable directly rather than
+inferred.
+
+## What stands from the section above, unchanged
+
+* The **`qr` row itself**: 5.497–5.522x SLOWER, A/A null 1.007 PASS, PT spread 1.70x,
+  parity 3.85e-13, idle 90.5%. Measured, and unaffected by my bad synthesis.
+* The **observation** that no single-matrix decomposition is at parity and the band is
+  narrow (2.4–5.6x across five rows).
+* The **batched/single distinction** — batched-tiny wins 4–10x for an orthogonal,
+  structurally proven reason.
+* Every **per-op lever bound**, which was measured individually.
+
+What does not stand is the causal claim and the "blocked BLAS-3 is the single lever
+under all five" conclusion drawn from it. Scope nothing against that until a common
+cause is actually measured.
