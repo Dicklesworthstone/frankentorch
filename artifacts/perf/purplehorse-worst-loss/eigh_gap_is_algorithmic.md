@@ -144,3 +144,68 @@ This is the same discipline that bounded the SVD expansion phase at 1.734x even 
 wholly removed (`c4d611c4`), and it lands the same way: **the single obvious lever is
 worth having and is not sufficient.** Anyone scoping the D&C rewrite should scope it as
 "5.6x → ~3x", not as "closes eigh".
+
+## Correcting my own framing: the 9x flop ratio is real but says little about TIME
+
+I opened this file with "the replay does nine times the reduction's arithmetic" and
+hedged that a flop ratio is not a time ratio. The hedge was right and the reason is now
+quantitative, and it inverts the emphasis:
+
+| n | reduce (SERIAL) | back-transform (SERIAL) | replay (PARALLEL) | serial total, 1 core | replay per core, 8 threads |
+|---|---|---|---|---|---|
+| 512 | 0.179e9 | 0.089e9 | 1.61e9 | **0.268e9** | **0.201e9** |
+| 1024 | 1.432e9 | 0.716e9 | 12.88e9 | **2.147e9** | **1.611e9** |
+
+**Per core the two halves are comparable** — 0.268e9 against 0.201e9 at n=512. That is
+why the measured split is ~50/50 and not the 9:1 the raw flop count suggests, and it
+means I was pointing at the wrong half. The replay has nine times the arithmetic and
+spreads it over every thread; the reduction and back-transform have far less and run
+**entirely on one core**.
+
+`eigh_tred2_backtransform` is fully serial and nothing in the file marks it as a
+target. At n=1024 that is **2.1e9 flops on a single core of a 64-core machine.**
+
+## A bounded, bit-exact lever the "it regressed" note does not cover
+
+The source's PERF NOTE says rayon-parallelising the reduction "was MEASURED and
+REGRESSED (eigh 256 77->85ms): at the benched **n<=256** the per-step work (~i²) is too
+small to amortize the fan-out". That negative result is scoped to n≤256. At n=512 the
+per-step work is 4x larger and at n=1024 16x — the same "validated at one shape" trap
+that made the conv3d direct-kernel gate a 1.5–3.3x pessimisation above its test shape.
+
+Inside `eigh_tred2_backtransform` the two inner loops are **not** equally constrained:
+
+```rust
+for k in 0..i {                                   // PROJECTION — reduction over k
+    let row_factor = row_i[k];
+    for j in 0..i { projections[j] += row_factor * row[j]; }
+}
+for k in 0..i {                                   // UPDATE — independent over k
+    let reflector = previous_rows[k * n + i];
+    let row = &mut previous_rows[k * n..k * n + i];
+    for j in 0..i { row[j] -= projections[j] * reflector; }
+}
+```
+
+* The **projection** loop accumulates into `projections[j]` across `k`. Parallelising it
+  reassociates a reduction and changes bits — the same wall that keeps FMA out of the
+  SVD row-dot. Closed.
+* The **update** loop is embarrassingly parallel over `k` and **bit-exact**: row `k`
+  owns the disjoint slice `[k*n, k*n+i)`, `projections` is read-only, and the read at
+  `previous_rows[k*n + i]` sits outside every mutated slice. No element's arithmetic
+  changes and nothing is reassociated. `par_chunks_mut` over rows is legal here.
+
+That is half of 2n³/3 currently on one core, recoverable bit-exactly.
+
+**NOT implemented, deliberately.** The host has sat at 0.01–0.12% idle throughout, so a
+perf claim cannot be validated right now, and this session's standing rule is that an
+unmeasured change is "landed, not won". The bit-exactness argument is provable and the
+existing eigh tests would catch an error, but shipping a perf edit I cannot measure —
+at the end of a budget, into a crate a peer is mid-publish on, with agent-mail's DB
+corrupt so no reservation can be recorded — is the wrong trade. It is written down
+here in full so it can be picked up and measured rather than rediscovered.
+
+**Size it before building it**: the serial pair is ~50% of `eigh` per the split table,
+the update loop is half of the back-transform, so the ceiling is roughly
+`0.089e9 / 0.268e9 ≈ 33%` of the serial half ≈ **~17% of eigh** — worth ~1.2x, not a
+gap-closer. Consistent with everything else here: real, bounded, insufficient alone.
