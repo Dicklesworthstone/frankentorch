@@ -80,6 +80,12 @@ enum LinalgOp {
     /// unreadable, and over plain `det` because the SPD fixture's determinant (~n^n) is not
     /// representable in f64 at n=512.
     Slogdet,
+    /// inv — LU-backed like slogdet, but with an O(n^3) getri tail instead of slogdet's
+    /// O(n) diagonal log-product. Included to separate two readings of slogdet's 21-25x:
+    /// either the whole LU family sits there (getrf is the cost), or slogdet's scalar tail
+    /// is implicated. The SPD fixture is used for CONDITIONING only — torch does not know
+    /// the matrix is SPD and still routes through getrf/getri, so the LU path is preserved.
+    Inv,
     /// matrix_exp — scaling-and-squaring + Pade, so almost entirely GEMM. Included to test
     /// whether the board's GEMM-bound wins (1.06-1.70x FASTER) carry to a linalg op.
     MatrixExp,
@@ -275,6 +281,13 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
             LinalgOp::Slogdet => {
                 let (_sign, logabsdet) = session.tensor_linalg_slogdet(x).expect("slogdet");
                 session.tensor_abs(logabsdet).expect("abs")
+            }
+            LinalgOp::Inv => {
+                // inv's result is unique (no sign, pivot or basis freedom), so |sum|
+                // genuinely discriminates rather than decorating.
+                let a_inv = session.tensor_linalg_inv(x).expect("inv");
+                let a = session.tensor_abs(a_inv).expect("abs");
+                session.tensor_sum(a).expect("sum")
             }
             LinalgOp::Cholesky => {
                 let l = session.tensor_linalg_cholesky(x, false).expect("cholesky");
@@ -488,7 +501,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cholesky" => LinalgOp::Cholesky,
         "slogdet" => LinalgOp::Slogdet,
         "matrix_exp" => LinalgOp::MatrixExp,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"),
+        "inv" => LinalgOp::Inv,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp|inv"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -528,6 +542,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // slogdet: exercises the LU path with a SCALAR, pivot-order-invariant checksum.
         // See the Rust arm for why this was chosen over lu_factor and over plain det.
         "slogdet" => ("torch.linalg.slogdet(A)[1].abs().reshape(1)", false),
+        // inv: LU-backed with an O(n^3) getri tail. See the Rust arm for why the SPD
+        // fixture is used here (conditioning) without diverting off the LU route.
+        "inv" => ("torch.linalg.inv(A).abs().sum().reshape(1)", false),
         // matrix_exp: GEMM-dominated (scaling-squaring + Pade), unique result. See the
         // Rust arm for why the fixture is scaled by 1/n.
         "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
@@ -540,7 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(n, name)| {
             let base = if op == "orgqr" {
                 format!("torch.geqrf(_mk({n}, False))")
-            } else if op == "cholesky" || op == "slogdet" {
+            } else if op == "cholesky" || op == "slogdet" || op == "inv" {
                 format!("_spd({n})")
             } else if op == "matrix_exp" {
                 format!("_expm_fixture({n})")
@@ -664,7 +681,10 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 *v /= n as f64;
             }
             d
-        } else if ft_op == LinalgOp::Cholesky || ft_op == LinalgOp::Slogdet {
+        } else if ft_op == LinalgOp::Cholesky
+            || ft_op == LinalgOp::Slogdet
+            || ft_op == LinalgOp::Inv
+        {
             // Identical to the incumbent's `_spd`: symmetrise, then add n to the diagonal.
             // Strictly diagonally dominant => positive definite at every n.
             let mut d = symmetrise(&fill(n), n);
