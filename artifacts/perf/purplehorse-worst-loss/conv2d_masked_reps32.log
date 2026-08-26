@@ -1,0 +1,85 @@
+=== conv2d masked lever attempt=1 utc=2026-08-26T03:59:22Z host=thinkstation1 ===
+idle_before=90.23% then 88.45% (mpstat 5s x2, NOT loadavg)
+loadavg_before=30.09 125.11 159.88 (provenance only, NOT the gate)
+snapshot_sha256=0df4db5435ab47d398d06348922b28bf68b17bea37db289dc9422bff87b53b5d  (--features fair-alloc)
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=0df4db5435ab47d398d06348922b28bf68b17bea37db289dc9422bff87b53b5d
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+incumbent_rule=a delta whose incumbent arm moved (version, build, or measured time) is NOT a win
+measurement_host=thinkstation1 cpu="AMD Ryzen Threadripper PRO 5975WX 32-Cores" isa=x86_64+avx2 governor=powersave rayon_threads=16 online_cpus=64
+host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured elsewhere is not comparable to this one, A/A PASS or not
+measurement_slot=held [pid=927076 host=thinkstation1 elf=0df4db5435ab47d3 lanes=conv2d_f32_masked,conv2d_f32_masked_panel,conv2d_f32,conv2d_f32_kernels]; no other live h2h announcement
+concurrent_measurements=none ACTIVE (scanned /proc for other h2h harnesses, criterion benches and torch processes, then measured each candidate's local CPU over 300ms; this run's own incumbent child is excluded)
+concurrent_measurements_idle=2 (matched by name, burning no local CPU — shell wrappers, and rch clients whose bench runs on a remote worker; reported, not voiding): h2h-harness[486690] 0% h2h-harness[692610] 0%
+cpu_mhz min=1429 median=1429 max=4292 spread=3.003x; arms NOT pinned: our 64 rayon threads span every core including any parked at the floor, the incumbent's 8 land wherever the scheduler puts them, so this row's arms are NOT known to have run at comparable clocks
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+sampling=balanced-square ABBAABBA (frankentorch-xdw0h); 32 rounds, four live samples per arm per round, torch threads=8
+round_warmup=0 (FT_H2H_ROUND_WARMUP; discarded samples per lane per round, BOTH arms). 0 = the board's default: each lane's slot 0 each round arrives cold, which NEGATIVE_EVIDENCE item 147 measured at +20-30% on the summed conv2d lanes
+
+lane          FT(ms)    PT(ms)   standing            PT/FT A/A gates and ratio CI                 parity
+lane_filter="conv2d_f32_masked,conv2d_f32_masked_panel,conv2d_f32,conv2d_f32_kernels" match=exact kept=4 of the full set (frankentorch-68pwz item 58; item 226: substring is the default, FT_H2H_LANES_EXACT=1 narrows it)
+lane_count=4 rounds=32 (frankentorch-vyaia: the harness's own load scales with this product; a self-load bound quoted without it cannot be checked later)
+
+CLOCKS DURING SAMPLING (sampled once per lane per round, both arms inside the same round)
+  typical core   min 2522 median 3433 max 4288 MHz   (boost/thermal behaviour over time)
+  CROSS-CORE SPREAD at one instant   min 1.001x median 3.003x max 3.014x   (how far apart two cores were WHILE we sampled)
+  The spread is the number that decides comparability: it is what makes one arm's threads faster than the other's. Compare it against the idle snapshot in the cpu_mhz header line -- if the idle spread is large and this one is small, the cores boosted once work arrived and the clock confound did not bite.
+load_series n=34 worst_drift=1.397x endpoint_gate=DRIFTED series_gate=DRIFTED (frankentorch-68pwz item 49: the endpoint pair cannot see a mid-run excursion; a divergence between these two gates IS the finding)
+load_1m start=28.06 end=20.09 drift_gate=LOAD-DRIFTED — no row from this invocation is quotable, whatever its nulls say (max 1.25x) (frankentorch-2h8vi; the signal is DRIFT in either direction, not level — a steady busy host is measurable, a host that moves under the measurement is not)
+self_load DIRECT=10.39 (both arms burned 761.4 CPU-seconds over window=73s at lane_count=4 rounds=32) — measured on our own /proc accounting, so a peer's compile contributes nothing to it. Compare against frankentorch-5q3io's ~+0.62, which was inferred from loadavg deltas at an unrecorded lane count (frankentorch-vyaia acceptance item 2).
+self_load rise=+0.00 (start 28.06 -> peak 28.06) over window=73s at lane_count=4 rounds=32 — loadavg is a 1-minute EWMA, so this window could show at most 71% of any sustained step (frankentorch-vyaia: measured, not assumed)
+  conv2d_f32     26.136   26.147   FT 1.00x FASTER     PT OFFSET [0.780,1.007] FT PASS [0.968,1.008] ratio 1.000 [0.986,1.035] match
+    NULL-FAILED: incumbent 0.951, FrankenTorch 0.987; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.049 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=64 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.998 (our arm, per-round median over 32 rounds)
+    MIN-ESTIMATOR FT 1.86x SLOWER     ratio 0.536 [0.487,0.919]  PT null 0.903 FAIL  FT null 0.993 PASS  not quotable
+  conv2d_f32_kernels   28.474   26.094   FT 1.09x SLOWER     PT PASS [0.929,1.040] FT FAIL [1.011,1.117] ratio 0.916 [0.871,0.937] match
+    NULL-FAILED: incumbent 0.998, FrankenTorch 1.024; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.024 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=64 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.974 (our arm, per-round median over 32 rounds)
+    MIN-ESTIMATOR FT 1.13x SLOWER     ratio 0.882 [0.510,0.941]  PT null 0.996 PASS  FT null 1.043 FAIL  not quotable
+  conv2d_f32_masked   69.783   25.734   FT 2.71x SLOWER     PT OFFSET [0.968,1.151] FT PASS [0.992,1.024] ratio 0.369 [0.359,0.377] match
+    NULL-FAILED: incumbent 1.041, FrankenTorch 1.006; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.041 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=64 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.986 (our arm, per-round median over 32 rounds)
+    MIN-ESTIMATOR FT 4.50x SLOWER     ratio 0.222 [0.211,0.336]  PT null 1.040 FAIL  FT null 1.007 PASS  not quotable
+  conv2d_f32_masked_panel  114.172   25.106   FT 4.55x SLOWER     PT OFFSET [0.895,1.081] FT PASS [0.984,1.011] ratio 0.220 [0.214,0.228] match
+    NULL-FAILED: incumbent 0.975, FrankenTorch 1.002; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.025 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=64 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.999 (our arm, per-round median over 32 rounds)
+    MIN-ESTIMATOR FT 5.39x SLOWER     ratio 0.186 [0.135,0.201]  PT null 1.005 PASS  FT null 1.004 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+
+Quote a lane only if both A/A gates say PASS, their point estimates are within +/-0.02 of 1.0, and parity is `match`. WIDE means the null's
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+
+buffer_pool: hits=320 misses=0 parked=12 buffers / 500.6 MiB
+
+GROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  numel=6422528  groups=32  cpg=2  spatial=3136  rayon_threads=16
+  forward_f32                 1.162 ms   schedule PARALLEL: 1024 groups; the numel-only gate (6422528 vs NORM_FWD_PARALLEL_MIN 524288) would have said PARALLEL
+  forward_f32 SERIAL         12.671 ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)
+  sum_tensor_contiguous_f32   0.479 ms
+  backward_scalar_f32         2.406 ms   (cpg==2 path, unconditionally parallel)
+  total                       4.047 ms
+  ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----
+  step min of 40               4.351 ms   comparable to the per-kernel figures above
+  step lane estimator         4.921 ms   median of 4 per round, then median over 10 rounds
+  estimator ratio             1.131x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)
+  ---- one group's reduction, sequential vs 8 accumulators (frankentorch-zv1y1) ----
+  reduce sequential           4.458 us   6272 elems, one dependency chain — what every statistic pass costs today
+  reduce 8 accumulators       0.561 us   same data, same rep, chain broken 8 ways
+  reduction headroom          7.947x  (NOT bit-exact: reassociation moves mean/rstd/output by an ULP; this prices the tolerance question, it does not answer it)
+
+MAX_POOL3D KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  input numel=1048576  output numel=131072  kernel 2x2x2 stride 2x2x2  rayon_threads=16
+  forward_with_indices_f64     0.328 ms   reads 1048576 elems, 8 comparisons per output
+  backward NONOVERLAPPING      0.486 ms   the route ft-api actually takes (kernel == stride); scatters 131072 values into a dense 1048576-element buffer
+  backward generic scatter     0.564 ms   same data, same rep, bit-identical output — what the specialisation buys
+  total on the live route      0.814 ms
+run_rc=0
+idle_after=85.21%
+=== end attempt 1 ===

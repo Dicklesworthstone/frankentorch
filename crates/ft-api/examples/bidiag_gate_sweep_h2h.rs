@@ -71,6 +71,26 @@ struct Arm {
     /// The serial dlabrd steps keep four independent outputs in flight. This
     /// preserves each output's reduction order exactly (`frankentorch-75e38`).
     panel_output_blocked: bool,
+    /// Run the VALUES-ONLY entry (`tensor_linalg_svdvals`) instead of the full
+    /// `(U, S, Vh)` decomposition — `frankentorch-bidiag-form-q-unblocked-gl0rj`.
+    ///
+    /// WHY THIS ARM EXISTS. `SVD_FORM_PQ_NS` wraps `form_p` AND `form_q` in one
+    /// counter, so the expansion phase cannot be sized from it — and that counter
+    /// is separately untrustworthy (item 258c had it summing to 2.3x the measured
+    /// wall time; a sweep of n=120..140 showed it non-monotonic, reading LOWER at
+    /// n=124 than at n=120). The n>=130 `form_p` gate turned out to be a no-op, so
+    /// the dispatch discontinuity cannot separate them either.
+    ///
+    /// `svd_blocked_bidiag_values` materialises NO reflectors, so the values-only
+    /// path skips `form_p` and `form_q` entirely. `full - values` is therefore the
+    /// whole expansion phase measured at the LANE level, min-of-N on both sides,
+    /// same estimator — which is exactly what the phase counters are not.
+    ///
+    /// It is an ARM rather than a separate invocation on purpose: a cross-run
+    /// subtraction on this host is worthless (the incumbent has moved 1.94x
+    /// between two runs of the same ELF), so both halves must be interleaved
+    /// round-by-round inside one process against one live incumbent.
+    values_only: bool,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -80,14 +100,15 @@ fn arm_label(arm: Arm) -> String {
         format!("{}", arm.gate)
     };
     format!(
-        "{gate}/{}/{}/{}",
+        "{gate}/{}/{}/{}{}",
         if arm.blocked { "4row" } else { "1row" },
         if arm.fused { "fused" } else { "2pass" },
         if arm.panel_output_blocked {
             "4output"
         } else {
             "1output"
-        }
+        },
+        if arm.values_only { "/VALUES-ONLY" } else { "" }
     )
 }
 
@@ -136,7 +157,16 @@ fn ft_one(n: usize, data: &[f64], arm: Arm) -> (f64, f64) {
         .tensor_variable(data.to_vec(), vec![n, n], false)
         .expect("svd leaf");
     let started = Instant::now();
-    let (_u, sv, _vh) = session.tensor_linalg_svd(x, true).expect("svd");
+    // Both branches time exactly the decomposition and stop before the checksum is read, which
+    // is what the incumbent's `run` does too. The values-only branch reaches
+    // `svd_blocked_bidiag_values`, which materialises NO reflectors -- so `full - values` is the
+    // form_p + form_q expansion phase, at the lane level, same estimator on both sides.
+    let sv = if arm.values_only {
+        session.tensor_linalg_svdvals(x).expect("svdvals")
+    } else {
+        let (_u, sv, _vh) = session.tensor_linalg_svd(x, true).expect("svd");
+        sv
+    };
     let ms = started.elapsed().as_secs_f64() * 1e3;
     let sum: f64 = session
         .tensor_values(sv)
@@ -257,10 +287,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         blocked,
                         fused,
                         panel_output_blocked,
+                        values_only: false,
                     });
                 }
             }
         }
+    }
+    // FT_VALUES_ARM=1 appends ONE extra arm running the values-only entry, with the shipped
+    // configuration otherwise identical to `arms[0]`. `arms[0] - this` is the expansion phase
+    // (form_p + form_q), measured at the lane level rather than read off the untrustworthy
+    // SVD_FORM_PQ_NS counter -- see the `values_only` field for why that counter cannot be used.
+    //
+    // Appended LAST so every existing arm keeps its index, which matters because `paired-vs-arm0`
+    // is reported against `arms[0]` and every banked row in this campaign is indexed that way.
+    //
+    // Its PARITY COLUMN IS THE POINT, not a formality: svdvals and svd must produce the SAME
+    // singular values, so the checksum comparison is a live check that the values-only path is
+    // the same decomposition and not a different (or truncated) one. A MISMATCH here means the
+    // subtraction is comparing two different computations and the phase figure is meaningless.
+    if std::env::var("FT_VALUES_ARM").is_ok_and(|v| v == "1") {
+        let mut values_arm = arms[0];
+        values_arm.values_only = true;
+        arms.push(values_arm);
     }
     let rounds: usize = std::env::var("FT_ROUNDS")
         .ok()
