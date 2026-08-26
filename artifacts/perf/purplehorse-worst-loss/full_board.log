@@ -1,0 +1,468 @@
+=== FULL BOARD attempt=1 utc=2026-08-26T05:14:39Z host=thinkstation1 ===
+idle_before=80.27% then 87.97% (mpstat 5s x2)
+snapshot_sha256=0df4db5435ab47d398d06348922b28bf68b17bea37db289dc9422bff87b53b5d  (--features fair-alloc)
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=0df4db5435ab47d398d06348922b28bf68b17bea37db289dc9422bff87b53b5d
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+incumbent_rule=a delta whose incumbent arm moved (version, build, or measured time) is NOT a win
+measurement_host=thinkstation1 cpu="AMD Ryzen Threadripper PRO 5975WX 32-Cores" isa=x86_64+avx2 governor=powersave rayon_threads=16 online_cpus=64
+host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured elsewhere is not comparable to this one, A/A PASS or not
+measurement_slot=held [pid=2536981 host=thinkstation1 elf=0df4db5435ab47d3 lanes=all]; no other live h2h announcement
+concurrent_measurements=none ACTIVE (scanned /proc for other h2h harnesses, criterion benches and torch processes, then measured each candidate's local CPU over 300ms; this run's own incumbent child is excluded)
+concurrent_measurements_idle=2 (matched by name, burning no local CPU — shell wrappers, and rch clients whose bench runs on a remote worker; reported, not voiding): h2h-harness[2366290] 0% h2h-harness[2366293] 0%
+cpu_mhz min=1429 median=1429 max=4292 spread=3.003x; arms NOT pinned: our 64 rayon threads span every core including any parked at the floor, the incumbent's 8 land wherever the scheduler puts them, so this row's arms are NOT known to have run at comparable clocks
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+sampling=balanced-square ABBAABBA (frankentorch-xdw0h); 16 rounds, four live samples per arm per round, torch threads=8
+round_warmup=0 (FT_H2H_ROUND_WARMUP; discarded samples per lane per round, BOTH arms). 0 = the board's default: each lane's slot 0 each round arrives cold, which NEGATIVE_EVIDENCE item 147 measured at +20-30% on the summed conv2d lanes
+
+lane          FT(ms)    PT(ms)   standing            PT/FT A/A gates and ratio CI                 parity
+lane_count=58 rounds=16 (frankentorch-vyaia: the harness's own load scales with this product; a self-load bound quoted without it cannot be checked later)
+
+CLOCKS DURING SAMPLING (sampled once per lane per round, both arms inside the same round)
+  typical core   min 1429 median 3144 max 4291 MHz   (boost/thermal behaviour over time)
+  CROSS-CORE SPREAD at one instant   min 1.001x median 3.003x max 3.014x   (how far apart two cores were WHILE we sampled)
+  The spread is the number that decides comparability: it is what makes one arm's threads faster than the other's. Compare it against the idle snapshot in the cpu_mhz header line -- if the idle spread is large and this one is small, the cores boosted once work arrived and the clock confound did not bite.
+load_series n=18 worst_drift=1.493x endpoint_gate=PASS series_gate=DRIFTED (frankentorch-68pwz item 49: the endpoint pair cannot see a mid-run excursion; a divergence between these two gates IS the finding)
+load_1m start=14.59 end=16.54 drift_gate=LOAD-DRIFTED — no row from this invocation is quotable, whatever its nulls say (max 1.25x) (frankentorch-2h8vi; the signal is DRIFT in either direction, not level — a steady busy host is measurable, a host that moves under the measurement is not)
+self_load DIRECT=8.33 (both arms burned 1515.6 CPU-seconds over window=182s at lane_count=58 rounds=16) — measured on our own /proc accounting, so a peer's compile contributes nothing to it. Compare against frankentorch-5q3io's ~+0.62, which was inferred from loadavg deltas at an unrecorded lane count (frankentorch-vyaia acceptance item 2).
+self_load rise=+1.95 (start 14.59 -> peak 16.54) over window=182s at lane_count=58 rounds=16 — loadavg is a 1-minute EWMA, so this window could show at most 95% of any sustained step (frankentorch-vyaia: measured, not assumed)
+  max_pool1d      5.416    7.203   FT 1.33x FASTER     PT OFFSET [0.872,1.121] FT PASS [0.886,1.101] ratio 1.330 [1.257,1.420] match
+    NULL-FAILED: incumbent 0.966, FrankenTorch 0.991; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.034 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.993 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.30x FASTER     ratio 1.296 [1.250,1.428]  PT null 1.089 FAIL  FT null 1.028 FAIL  not quotable
+  max_pool1d_zeroed    9.151    7.125   FT 1.28x SLOWER     PT OFFSET [0.921,1.156] FT PASS [0.936,1.054] ratio 0.779 [0.706,0.859] match
+    NULL-FAILED: incumbent 1.054, FrankenTorch 0.998; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.054 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.821 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.28x SLOWER     ratio 0.782 [0.723,0.834]  PT null 1.087 FAIL  FT null 0.994 PASS  not quotable
+  avg_pool1d      2.144    7.253   FT 3.38x FASTER     PT OFFSET [0.947,1.123] FT OFFSET [0.914,1.245] ratio 3.383 [3.045,3.597] match
+    NULL-FAILED: incumbent 0.979, FrankenTorch 1.043; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.043 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.067 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 3.28x FASTER     ratio 3.276 [3.083,3.517]  PT null 0.956 FAIL  FT null 0.956 FAIL  not quotable
+  avg_pool1d_dense    6.966    9.777   FT 1.40x FASTER     PT FAIL [0.855,0.991] FT OFFSET [0.909,1.032] ratio 1.404 [1.356,1.482] match
+    NULL-FAILED: incumbent 0.902, FrankenTorch 0.947; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 0.953 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.32x FASTER     ratio 1.322 [1.273,1.414]  PT null 0.896 FAIL  FT null 0.947 FAIL  not quotable
+  avg_pool1d_dense_zeroed   12.404    9.687   FT 1.28x SLOWER     PT OFFSET [0.949,1.105] FT PASS [0.959,1.049] ratio 0.781 [0.755,0.838] match
+    NULL-FAILED: incumbent 1.045, FrankenTorch 1.000; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.045 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.871 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.22x SLOWER     ratio 0.822 [0.790,0.866]  PT null 1.040 FAIL  FT null 1.018 PASS  not quotable
+  avg_pool1d_zeroed    6.999    7.214   FT 1.03x FASTER     PT OFFSET [0.873,1.129] FT OFFSET [0.993,1.180] ratio 1.031 [0.970,1.135] match
+    NULL-FAILED: incumbent 0.949, FrankenTorch 1.059; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.059 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.882 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.15x FASTER     ratio 1.152 [1.073,1.190]  PT null 0.945 FAIL  FT null 1.095 FAIL  not quotable
+  avg_pool2d      1.070    2.270   FT 2.12x FASTER     PT OFFSET [0.968,1.339] FT OFFSET [0.916,1.178] ratio 2.121 [1.931,2.261] match
+    NULL-FAILED: incumbent 1.147, FrankenTorch 1.054; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.128 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.80x FASTER     ratio 1.800 [1.475,1.944]  PT null 1.154 FAIL  FT null 1.000 PASS  not quotable
+  max_pool3d      1.693    0.968   FT 1.75x SLOWER     PT FAIL [1.143,1.385] FT OFFSET [0.818,1.119] ratio 0.572 [0.490,0.630] match
+    NULL-FAILED: incumbent 1.225, FrankenTorch 0.922; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 0.865 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.68x SLOWER     ratio 0.374 [0.347,0.425]  PT null 1.662 FAIL  FT null 0.932 FAIL  not quotable
+  avg_pool2d_dense    2.951    2.635   FT 1.12x SLOWER     PT FAIL [1.033,1.201] FT OFFSET [0.880,1.051] ratio 0.893 [0.832,0.929] match
+    NULL-FAILED: incumbent 1.131, FrankenTorch 0.936; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 0.896 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.16x SLOWER     ratio 0.862 [0.797,0.918]  PT null 1.024 FAIL  FT null 0.940 FAIL  not quotable
+  avg_pool2d_nopool_dense    3.140    2.428   FT 1.29x SLOWER     PT OFFSET [0.916,1.197] FT OFFSET [0.958,1.123] ratio 0.773 [0.703,0.917] match
+    NULL-FAILED: incumbent 1.092, FrankenTorch 1.040; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.006 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.43x SLOWER     ratio 0.699 [0.614,0.793]  PT null 1.043 FAIL  FT null 0.976 FAIL  not quotable
+  avg_pool2d_dense_zeroed    3.770    2.455   FT 1.54x SLOWER     PT OFFSET [0.884,1.177] FT PASS [0.928,1.117] ratio 0.651 [0.601,0.752] match
+    NULL-FAILED: incumbent 0.970, FrankenTorch 0.993; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.030 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.983 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.60x SLOWER     ratio 0.626 [0.556,0.681]  PT null 1.039 FAIL  FT null 0.986 PASS  not quotable
+  max_pool3d_dense    3.212    1.166   FT 2.75x SLOWER     PT OFFSET [0.896,1.176] FT PASS [0.841,1.245] ratio 0.363 [0.298,0.446] match
+    NULL-FAILED: incumbent 1.056, FrankenTorch 0.997; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.056 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.936 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.82x SLOWER     ratio 0.355 [0.310,0.410]  PT null 1.241 FAIL  FT null 0.988 PASS  not quotable
+  max_pool3d_nopool_dense    2.809    1.184   FT 2.37x SLOWER     PT PASS [0.927,1.206] FT OFFSET [0.824,1.106] ratio 0.421 [0.369,0.446] match
+    NULL-FAILED: incumbent 1.016, FrankenTorch 0.952; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.048 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.055 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 2.73x SLOWER     ratio 0.367 [0.316,0.428]  PT null 1.033 FAIL  FT null 0.881 FAIL  not quotable
+  max_pool1d_dense   10.298   11.563   FT 1.12x FASTER     PT OFFSET [0.971,1.119] FT PASS [0.977,1.033] ratio 1.123 [1.089,1.174] match
+    NULL-FAILED: incumbent 1.025, FrankenTorch 1.006; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.025 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.000 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.07x FASTER     ratio 1.070 [1.026,1.097]  PT null 1.051 FAIL  FT null 1.005 PASS  not quotable
+  max_pool1d_nopool_dense   10.344   11.561   FT 1.12x FASTER     PT OFFSET [0.927,1.059] FT FAIL [0.897,0.999] ratio 1.118 [1.082,1.154] match
+    NULL-FAILED: incumbent 0.969, FrankenTorch 0.977; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.031 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.981 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.07x FASTER     ratio 1.067 [1.039,1.107]  PT null 0.986 PASS  FT null 0.977 FAIL  not quotable
+  max_pool3d_nopool    1.769    0.973   FT 1.82x SLOWER     PT FAIL [1.185,1.394] FT OFFSET [0.677,1.110] ratio 0.550 [0.478,0.600] match
+    NULL-FAILED: incumbent 1.289, FrankenTorch 0.895; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.062 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 2.56x SLOWER     ratio 0.390 [0.333,0.460]  PT null 1.651 FAIL  FT null 1.003 PASS  not quotable
+  avg_pool2d_nopool    1.009    2.193   FT 2.17x FASTER     PT FAIL [1.014,1.239] FT PASS [0.872,1.216] ratio 2.174 [2.002,2.386] match
+    NULL-FAILED: incumbent 1.173, FrankenTorch 1.010; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.068 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.97x FASTER     ratio 1.973 [1.801,2.180]  PT null 1.113 FAIL  FT null 0.983 PASS  not quotable
+  max_pool1d_nopool    4.964    7.402   FT 1.49x FASTER     PT OFFSET [0.979,1.234] FT PASS [0.993,1.080] ratio 1.491 [1.396,1.575] match
+    NULL-FAILED: incumbent 1.119, FrankenTorch 1.013; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.038 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.32x FASTER     ratio 1.321 [1.269,1.424]  PT null 1.146 FAIL  FT null 1.006 PASS  not quotable
+  group_norm_f32    3.408    6.185   FT 1.81x FASTER     PT FAIL [0.887,0.965] FT PASS [0.952,1.045] ratio 1.815 [1.709,1.894] match
+    NULL-FAILED: incumbent 0.931, FrankenTorch 1.006; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.069 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.034 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.60x FASTER     ratio 1.600 [1.533,1.677]  PT null 0.857 FAIL  FT null 0.997 PASS  not quotable
+  group_norm_f32_zeroed    6.160    5.947   FT 1.04x SLOWER     PT PASS [0.949,1.065] FT PASS [0.938,1.053] ratio 0.966 [0.910,1.047] match
+    slot0/median(slot1..3) = 0.882 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.05x FASTER     ratio 1.051 [0.997,1.114]  PT null 0.981 PASS  FT null 0.953 FAIL  not quotable
+  group_norm_f32_dense_zeroed   30.471   19.850   FT 1.54x SLOWER     PT OFFSET [0.949,1.062] FT PASS [0.967,1.022] ratio 0.651 [0.606,0.689] match
+    NULL-FAILED: incumbent 1.029, FrankenTorch 0.994; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.029 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.000 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.67x SLOWER     ratio 0.597 [0.589,0.655]  PT null 1.010 PASS  FT null 0.989 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  group_norm_f32_dense   28.771   19.481   FT 1.48x SLOWER     PT PASS [0.956,1.038] FT PASS [0.974,1.023] ratio 0.677 [0.655,0.712] match
+    slot0/median(slot1..3) = 1.012 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.52x SLOWER     ratio 0.659 [0.630,0.678]  PT null 1.010 PASS  FT null 1.012 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  batch_norm2d_f32_dense   30.341   14.760   FT 2.06x SLOWER     PT PASS [0.966,1.034] FT PASS [0.973,1.020] ratio 0.486 [0.471,0.498] MISMATCH
+    slot0/median(slot1..3) = 0.984 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.14x SLOWER     ratio 0.468 [0.447,0.483]  PT null 0.984 PASS  FT null 0.991 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  batch_norm2d_f64_dense   31.126   56.020   FT 1.80x FASTER     PT PASS [0.970,1.032] FT OFFSET [0.959,1.008] ratio 1.800 [1.717,1.847] match
+    NULL-FAILED: incumbent 0.993, FrankenTorch 0.972; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.028 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.985 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.74x FASTER     ratio 1.735 [1.705,1.794]  PT null 0.985 PASS  FT null 0.999 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  group_norm_f32_kernels    3.566    6.110   FT 1.71x FASTER     PT OFFSET [0.998,1.091] FT PASS [0.944,1.027] ratio 1.713 [1.671,1.805] match
+    NULL-FAILED: incumbent 1.043, FrankenTorch 0.994; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.043 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.016 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.71x FASTER     ratio 1.706 [1.636,1.766]  PT null 1.064 FAIL  FT null 0.993 PASS  not quotable
+  group_norm_f32_kernels_dense   13.803   19.371   FT 1.40x FASTER     PT PASS [0.952,1.020] FT PASS [0.953,1.033] ratio 1.403 [1.328,1.505] match
+    slot0/median(slot1..3) = 0.907 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.45x FASTER     ratio 1.446 [1.391,1.535]  PT null 0.969 FAIL  FT null 1.008 PASS  not quotable
+  group_norm_f32_kernels_serialfwd   13.743    6.411   FT 2.14x SLOWER     PT OFFSET [0.909,1.104] FT PASS [0.952,1.039] ratio 0.466 [0.437,0.482] match
+    NULL-FAILED: incumbent 1.020, FrankenTorch 1.000; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.020 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.948 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.26x SLOWER     ratio 0.443 [0.415,0.462]  PT null 0.993 PASS  FT null 0.989 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  group_norm_f32_kernels_serialfwd_dense   24.506   20.259   FT 1.21x SLOWER     PT PASS [0.946,1.035] FT PASS [0.966,1.049] ratio 0.827 [0.796,0.885] match
+    slot0/median(slot1..3) = 0.952 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.17x SLOWER     ratio 0.857 [0.812,0.884]  PT null 0.990 PASS  FT null 0.969 FAIL  not quotable
+  group_norm_f32_statskernels    2.855    6.297   FT 2.21x FASTER     PT PASS [0.961,1.067] FT PASS [0.875,1.054] ratio 2.206 [2.121,2.286] match
+    slot0/median(slot1..3) = 0.952 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.17x FASTER     ratio 2.167 [2.049,2.267]  PT null 1.039 FAIL  FT null 1.018 PASS  not quotable
+  group_norm_f32_statskernels_recompute    3.444    5.993   FT 1.74x FASTER     PT PASS [0.947,1.081] FT PASS [0.932,1.032] ratio 1.740 [1.672,1.834] match
+    slot0/median(slot1..3) = 1.026 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.69x FASTER     ratio 1.687 [1.646,1.770]  PT null 0.969 FAIL  FT null 1.010 PASS  not quotable
+  group_norm_f32_statskernels_dense   13.736   19.824   FT 1.44x FASTER     PT PASS [0.953,1.052] FT PASS [0.944,1.021] ratio 1.443 [1.375,1.523] match
+    slot0/median(slot1..3) = 0.892 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.48x FASTER     ratio 1.484 [1.402,1.547]  PT null 1.017 PASS  FT null 0.970 FAIL  not quotable
+  group_norm_f32_statskernels_recompute_dense   14.104   19.682   FT 1.40x FASTER     PT PASS [0.964,1.027] FT PASS [0.943,1.075] ratio 1.395 [1.321,1.459] match
+    slot0/median(slot1..3) = 0.903 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.43x FASTER     ratio 1.435 [1.392,1.482]  PT null 1.032 FAIL  FT null 1.010 PASS  not quotable
+  prelu           4.735   16.973   FT 3.58x FASTER     PT PASS [0.949,1.035] FT PASS [0.965,1.058] ratio 3.585 [3.475,3.721] match
+    slot0/median(slot1..3) = 0.974 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 3.54x FASTER     ratio 3.543 [3.380,3.681]  PT null 0.983 PASS  FT null 1.005 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  prelu_dense    15.495   41.362   FT 2.67x FASTER     PT PASS [0.959,1.056] FT PASS [0.945,1.022] ratio 2.669 [2.579,2.798] match
+    slot0/median(slot1..3) = 0.984 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.51x FASTER     ratio 2.511 [2.445,2.607]  PT null 0.988 PASS  FT null 1.006 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  prelu_noshortcut    6.801   16.874   FT 2.48x FASTER     PT PASS [0.976,1.056] FT PASS [0.955,1.023] ratio 2.481 [2.440,2.530] match
+    slot0/median(slot1..3) = 0.979 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.45x FASTER     ratio 2.448 [2.390,2.528]  PT null 1.004 PASS  FT null 0.995 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  avg_pool2d_zeroed    1.045    2.422   FT 2.32x FASTER     PT FAIL [1.164,1.409] FT OFFSET [0.982,1.335] ratio 2.318 [1.993,2.578] match
+    NULL-FAILED: incumbent 1.343, FrankenTorch 1.104; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.070 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.85x FASTER     ratio 1.848 [1.628,2.210]  PT null 1.359 FAIL  FT null 1.003 PASS  not quotable
+  conv2d          2.893    3.305   FT 1.14x FASTER     PT FAIL [1.181,1.344] FT PASS [0.875,1.181] ratio 1.142 [1.080,1.290] match
+    NULL-FAILED: incumbent 1.264, FrankenTorch 0.998; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 0.922 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.28x SLOWER     ratio 0.779 [0.729,0.900]  PT null 1.622 FAIL  FT null 0.999 PASS  not quotable
+  conv2d_masked    4.893    2.993   FT 1.63x SLOWER     PT PASS [0.886,1.044] FT OFFSET [0.923,1.255] ratio 0.612 [0.561,0.658] match
+    NULL-FAILED: incumbent 0.987, FrankenTorch 1.021; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.021 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.029 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 2.05x SLOWER     ratio 0.488 [0.437,0.632]  PT null 1.047 FAIL  FT null 1.040 FAIL  not quotable
+  conv2d_big      4.127   10.564   FT 2.56x FASTER     PT PASS [0.983,1.068] FT OFFSET [0.867,1.113] ratio 2.560 [2.278,2.640] match
+    NULL-FAILED: incumbent 1.008, FrankenTorch 1.037; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.037 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.942 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.53x FASTER     ratio 2.529 [2.417,2.609]  PT null 1.040 FAIL  FT null 0.987 PASS  not quotable
+  conv2d_big_masked    8.360   11.114   FT 1.33x FASTER     PT OFFSET [0.951,1.023] FT OFFSET [0.934,1.076] ratio 1.329 [1.300,1.374] match
+    NULL-FAILED: incumbent 0.972, FrankenTorch 1.028; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.028 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.943 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.33x FASTER     ratio 1.325 [1.251,1.373]  PT null 0.951 FAIL  FT null 1.022 FAIL  not quotable
+  conv2d_big_masked_tile    8.497   10.974   FT 1.29x FASTER     PT PASS [0.956,1.031] FT PASS [0.935,1.084] ratio 1.292 [1.246,1.387] match
+    slot0/median(slot1..3) = 0.940 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.32x FASTER     ratio 1.317 [1.252,1.375]  PT null 1.018 PASS  FT null 0.974 FAIL  not quotable
+  conv2d_big_masked_train   14.304   19.544   FT 1.37x FASTER     PT FAIL [0.927,0.995] FT PASS [0.921,1.050] ratio 1.366 [1.330,1.436] match
+    NULL-FAILED: incumbent 0.958, FrankenTorch 0.983; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.042 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.956 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.41x FASTER     ratio 1.410 [1.351,1.454]  PT null 0.988 PASS  FT null 1.007 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  conv2d_big_masked_panel    9.136   11.090   FT 1.21x FASTER     PT PASS [0.993,1.051] FT OFFSET [0.945,1.081] ratio 1.214 [1.133,1.245] match
+    NULL-FAILED: incumbent 1.019, FrankenTorch 1.021; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.021 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.975 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.23x FASTER     ratio 1.227 [1.178,1.249]  PT null 0.994 PASS  FT null 0.968 FAIL  not quotable
+  conv2d_big_masked_train_panel   14.856   20.310   FT 1.37x FASTER     PT PASS [0.985,1.033] FT OFFSET [0.993,1.072] ratio 1.367 [1.292,1.437] match
+    NULL-FAILED: incumbent 0.995, FrankenTorch 1.033; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.033 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.980 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.40x FASTER     ratio 1.399 [1.332,1.440]  PT null 1.009 PASS  FT null 1.033 FAIL  not quotable
+  conv2d_xl      13.305   40.838   FT 3.07x FASTER     PT PASS [0.959,1.055] FT OFFSET [0.991,1.084] ratio 3.069 [2.912,3.150] match
+    NULL-FAILED: incumbent 0.993, FrankenTorch 1.034; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.034 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.937 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 3.03x FASTER     ratio 3.028 [2.946,3.195]  PT null 0.966 FAIL  FT null 1.038 FAIL  not quotable
+  conv2d_xl_legacy   15.454   40.558   FT 2.62x FASTER     PT PASS [0.974,1.031] FT PASS [0.930,1.024] ratio 2.624 [2.518,2.753] match
+    slot0/median(slot1..3) = 0.911 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.77x FASTER     ratio 2.773 [2.647,2.866]  PT null 0.999 PASS  FT null 0.999 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  conv2d_masked_warm    4.965    3.479   FT 1.43x SLOWER     PT FAIL [1.048,1.333] FT OFFSET [0.876,1.156] ratio 0.701 [0.602,0.741] match
+    NULL-FAILED: incumbent 1.112, FrankenTorch 0.958; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 0.970 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.04x SLOWER     ratio 0.491 [0.414,0.635]  PT null 1.528 FAIL  FT null 0.994 PASS  not quotable
+  conv2d_masked_train    7.957    5.002   FT 1.59x SLOWER     PT OFFSET [0.900,1.029] FT OFFSET [0.895,1.065] ratio 0.629 [0.589,0.663] match
+    NULL-FAILED: incumbent 0.948, FrankenTorch 0.978; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.052 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.985 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.80x SLOWER     ratio 0.556 [0.514,0.600]  PT null 0.952 FAIL  FT null 1.006 PASS  not quotable
+  conv2d_masked_train_panel    8.939    4.972   FT 1.80x SLOWER     PT OFFSET [0.949,1.093] FT PASS [0.911,1.064] ratio 0.556 [0.546,0.584] match
+    NULL-FAILED: incumbent 1.025, FrankenTorch 0.989; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.025 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.038 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.91x SLOWER     ratio 0.524 [0.493,0.565]  PT null 1.050 FAIL  FT null 0.985 PASS  not quotable
+  conv2d_f32     22.891   24.727   FT 1.08x FASTER     PT OFFSET [0.872,1.004] FT OFFSET [0.988,1.078] ratio 1.080 [1.029,1.114] match
+    NULL-FAILED: incumbent 0.936, FrankenTorch 1.037; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.064 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.997 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.03x SLOWER     ratio 0.971 [0.632,1.056]  PT null 0.946 FAIL  FT null 1.023 FAIL  not quotable
+  conv2d_f32_kernels   27.919   25.942   FT 1.08x SLOWER     PT OFFSET [0.839,1.080] FT PASS [0.968,1.017] ratio 0.929 [0.844,0.969] match
+    NULL-FAILED: incumbent 0.978, FrankenTorch 0.996; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.022 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.877 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.12x SLOWER     ratio 0.896 [0.521,0.962]  PT null 0.971 FAIL  FT null 0.985 PASS  not quotable
+  conv2d_f32_masked   48.538   25.989   FT 1.87x SLOWER     PT PASS [0.890,1.135] FT PASS [0.940,1.023] ratio 0.535 [0.480,0.549] match
+    slot0/median(slot1..3) = 0.994 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.35x SLOWER     ratio 0.425 [0.327,0.477]  PT null 1.041 FAIL  FT null 0.982 PASS  not quotable
+  conv2d_f32_masked_panel   93.286   25.345   FT 3.68x SLOWER     PT PASS [0.888,1.187] FT OFFSET [0.957,1.005] ratio 0.272 [0.253,0.286] match
+    NULL-FAILED: incumbent 1.017, FrankenTorch 0.979; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.021 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.998 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 5.20x SLOWER     ratio 0.192 [0.145,0.234]  PT null 1.122 FAIL  FT null 0.977 FAIL  not quotable
+  linear_wide     2.461    2.610   FT 1.06x FASTER     PT OFFSET [0.967,1.231] FT WIDE [0.739,1.559] ratio 1.061 [0.784,1.316] match
+    NULL-FAILED: incumbent 1.076, FrankenTorch 1.213; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 1.123 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.27x FASTER     ratio 1.271 [1.140,1.435]  PT null 1.066 FAIL  FT null 1.063 FAIL  not quotable
+  linear_narrow    4.539    7.714   FT 1.70x FASTER     PT FAIL [1.012,1.132] FT OFFSET [0.841,1.185] ratio 1.700 [1.485,1.909] match
+    NULL-FAILED: incumbent 1.048, FrankenTorch 0.958; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.048 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 1.046 (our arm, per-round median over 16 rounds) <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it
+    MIN-ESTIMATOR FT 1.83x FASTER     ratio 1.833 [1.661,1.986]  PT null 1.094 FAIL  FT null 0.950 FAIL  not quotable
+  attention       9.797   12.373   FT 1.26x FASTER     PT OFFSET [0.978,1.084] FT PASS [0.945,1.039] ratio 1.263 [1.197,1.309] match
+    NULL-FAILED: incumbent 1.041, FrankenTorch 0.992; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.041 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=32 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.970 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.22x FASTER     ratio 1.216 [1.157,1.265]  PT null 1.065 FAIL  FT null 1.014 PASS  not quotable
+  conv3d          3.061    6.773   FT 2.21x FASTER     PT FAIL [1.081,1.253] FT FAIL [0.639,0.930] ratio 2.213 [1.243,2.289] match
+    NULL-FAILED: incumbent 1.155, FrankenTorch 0.782; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    slot0/median(slot1..3) = 0.956 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 2.15x FASTER     ratio 2.150 [1.803,2.190]  PT null 1.111 FAIL  FT null 0.973 FAIL  not quotable
+  conv3d_masked    7.287    6.508   FT 1.12x SLOWER     PT PASS [0.844,1.057] FT PASS [0.872,1.123] ratio 0.893 [0.795,1.004] match
+    slot0/median(slot1..3) = 0.992 (our arm, per-round median over 16 rounds)
+    MIN-ESTIMATOR FT 1.08x SLOWER     ratio 0.929 [0.848,1.024]  PT null 1.026 FAIL  FT null 0.999 PASS  not quotable
+
+Quote a lane only if both A/A gates say PASS, their point estimates are within +/-0.02 of 1.0, and parity is `match`. WIDE means the null's
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+
+buffer_pool: hits=1177 misses=1223 parked=64 buffers / 250.0 MiB
+
+PAIRED max_pool1d: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.690x  95% CI [1.614,1.799]  16/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 0.941 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.577x  95% CI [1.488,1.679]  16/16 rounds faster
+  incumbent control = 0.938
+  verdict: UNREADABLE — the incumbent control moved
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED avg_pool1d_dense: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.781x  95% CI [1.690,1.834]  16/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 0.994 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the uninit output is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.628x  95% CI [1.577,1.692]  16/16 rounds faster
+  incumbent control = 1.015
+  verdict: the uninit output is FASTER by the paired CI
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED avg_pool1d: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 3.264x  95% CI [2.845,3.519]  16/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 1.021 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the uninit output is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 2.921x  95% CI [2.691,3.092]  16/16 rounds faster
+  incumbent control = 0.972
+  verdict: the uninit output is FASTER by the paired CI
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED avg_pool2d_dense: buffer pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.064x  95% CI [1.000,1.121]  12/16 rounds faster with the buffer pool
+  incumbent control PT(off)/PT(on) = 0.982 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.119x  95% CI [1.018,1.193]  13/16 rounds faster
+  incumbent control = 0.879
+  verdict: UNREADABLE — the incumbent control moved
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED avg_pool2d_dense: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.278x  95% CI [1.177,1.335]  16/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 0.965 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the uninit output is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.276x  95% CI [1.202,1.354]  16/16 rounds faster
+  incumbent control = 0.930
+  verdict: UNREADABLE — the incumbent control moved
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED max_pool3d_dense: buffer pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.875x  95% CI [0.751,1.075]  6/16 rounds faster with the buffer pool
+  incumbent control PT(off)/PT(on) = 0.982 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 0.966x  95% CI [0.815,1.151]  6/16 rounds faster
+  incumbent control = 1.015
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED max_pool1d_dense: buffer pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.004x  95% CI [0.970,1.029]  10/16 rounds faster with the buffer pool
+  incumbent control PT(off)/PT(on) = 0.989 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.001x  95% CI [0.967,1.020]  4/16 rounds faster
+  incumbent control = 1.003
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED max_pool3d: buffer pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.045x  95% CI [0.893,1.172]  8/16 rounds faster with the buffer pool
+  incumbent control PT(off)/PT(on) = 0.952 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 0.981x  95% CI [0.849,1.079]  7/16 rounds faster
+  incumbent control = 1.000
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  estimator agreement: WARNING — the two estimators DISAGREE on direction; this row is not usable under either
+
+PAIRED avg_pool2d: buffer pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.942x  95% CI [0.872,1.013]  6/16 rounds faster with the buffer pool
+  incumbent control PT(off)/PT(on) = 1.005 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 0.929x  95% CI [0.842,1.035]  6/16 rounds faster
+  incumbent control = 1.057
+  verdict: UNREADABLE — the incumbent control moved
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED max_pool1d: buffer pool ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.917x  95% CI [0.870,0.972]  4/16 rounds faster with the buffer pool
+  incumbent control PT(off)/PT(on) = 0.968 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the buffer pool is SLOWER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 0.979x  95% CI [0.931,1.006]  4/16 rounds faster
+  incumbent control = 0.986
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED group_norm_f32: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.807x  95% CI [1.692,1.939]  15/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 0.977 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the uninit output is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.681x  95% CI [1.622,1.767]  16/16 rounds faster
+  incumbent control = 1.113
+  verdict: UNREADABLE — the incumbent control moved
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED group_norm_f32_dense: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.059x  95% CI [1.047,1.078]  16/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 1.004 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the uninit output is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.068x  95% CI [1.056,1.075]  16/16 rounds faster
+  incumbent control = 1.004
+  verdict: the uninit output is FASTER by the paired CI
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED group_norm_f32_kernels: parallel forward gate ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 3.854x  95% CI [3.771,4.081]  16/16 rounds faster with the parallel forward gate
+  incumbent control PT(off)/PT(on) = 1.067 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNREADABLE — the incumbent control moved, so the host shifted between the two lanes
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 3.906x  95% CI [3.799,3.962]  16/16 rounds faster
+  incumbent control = 0.997
+  verdict: the parallel forward gate is FASTER by the paired CI
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED group_norm_f32_statskernels: forward-statistics reuse ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.207x  95% CI [1.191,1.254]  16/16 rounds faster with the forward-statistics reuse
+  incumbent control PT(off)/PT(on) = 0.973 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the forward-statistics reuse is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.242x  95% CI [1.183,1.278]  16/16 rounds faster
+  incumbent control = 0.991
+  verdict: the forward-statistics reuse is FASTER by the paired CI
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED prelu: sum shortcut ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 1.436x  95% CI [1.405,1.477]  16/16 rounds faster with the sum shortcut
+  incumbent control PT(off)/PT(on) = 0.994 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: the sum shortcut is FASTER by the paired CI
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 1.445x  95% CI [1.417,1.485]  16/16 rounds faster
+  incumbent control = 1.014
+  verdict: the sum shortcut is FASTER by the paired CI
+  estimator agreement: the two estimators agree on DIRECTION
+
+PAIRED avg_pool2d: uninit output ON vs OFF, one binary, one invocation, per-round square medians
+  ratio (off/on) = 0.976x  95% CI [0.879,1.042]  7/16 rounds faster with the uninit output
+  incumbent control PT(off)/PT(on) = 1.009 (paired by sample index; must be ~1.0, the arm is identical code)
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  --- same rounds, per-round MIN estimator (frankentorch-rled4) ---
+  ratio (off/on) = 0.929x  95% CI [0.813,1.002]  7/16 rounds faster
+  incumbent control = 1.042
+  verdict: UNDECIDED — the paired CI brackets 1.0
+  estimator agreement: the two estimators agree on DIRECTION
+
+GROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  numel=6422528  groups=32  cpg=2  spatial=3136  rayon_threads=16
+  forward_f32                 1.220 ms   schedule PARALLEL: 1024 groups; the numel-only gate (6422528 vs NORM_FWD_PARALLEL_MIN 524288) would have said PARALLEL
+  forward_f32 SERIAL         11.157 ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)
+  sum_tensor_contiguous_f32   1.670 ms
+  backward_scalar_f32         2.090 ms   (cpg==2 path, unconditionally parallel)
+  total                       4.980 ms
+  ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----
+  step min of 40               3.220 ms   comparable to the per-kernel figures above
+  step lane estimator         3.563 ms   median of 4 per round, then median over 10 rounds
+  estimator ratio             1.107x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)
+  ---- one group's reduction, sequential vs 8 accumulators (frankentorch-zv1y1) ----
+  reduce sequential           4.829 us   6272 elems, one dependency chain — what every statistic pass costs today
+  reduce 8 accumulators       0.621 us   same data, same rep, chain broken 8 ways
+  reduction headroom          7.776x  (NOT bit-exact: reassociation moves mean/rstd/output by an ULP; this prices the tolerance question, it does not answer it)
+
+MAX_POOL3D KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  input numel=1048576  output numel=131072  kernel 2x2x2 stride 2x2x2  rayon_threads=16
+  forward_with_indices_f64     0.525 ms   reads 1048576 elems, 8 comparisons per output
+  backward NONOVERLAPPING      0.980 ms   the route ft-api actually takes (kernel == stride); scatters 131072 values into a dense 1048576-element buffer
+  backward generic scatter     0.963 ms   same data, same rep, bit-identical output — what the specialisation buys
+  total on the live route      1.505 ms
+run_rc=0
+idle_after=63.55%
+=== end ===
