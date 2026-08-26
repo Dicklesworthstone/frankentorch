@@ -44099,6 +44099,55 @@ mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
 
+    /// Does `slogdet` cost anything above bare `getrf`? Same process, min-of-N, interleaved.
+    ///
+    /// This settles an attribution that two SEPARATE harness runs could not. `slogdet` and
+    /// `lu_factor` read 8.77x and 8.78x on min/min — indistinguishable — but 11.244x and
+    /// 8.569x on the paired estimator, a 1.3x disagreement. Torch also ran 1.33x slower in
+    /// one of those windows, so the two runs were different machine states and a ~1.2x
+    /// question is simply not answerable across them.
+    ///
+    /// `slogdet_contiguous_f64` calls `lu_factor_contiguous_f64` directly (verified at
+    /// :25211), so structurally slogdet IS bare getrf plus an O(n) diagonal log-product.
+    /// If that holds, the two must be indistinguishable here; a real gap would mean the
+    /// structural reading is wrong.
+    ///
+    /// FT-vs-FT: this gives an attribution, NOT a vs-torch ratio.
+    #[test]
+    fn slogdet_vs_bare_getrf_same_process() {
+        const N: usize = 512;
+        let a: Vec<f64> = (0..N * N)
+            .map(|idx| {
+                let i = idx / N;
+                let j = idx % N;
+                let v = (((i * 7 + j * 13) % 101) as f64 - 50.0) / 25.0;
+                if i == j { v + N as f64 } else { v }
+            })
+            .collect();
+        let meta = TensorMeta::from_shape(vec![N, N], DType::F64, Device::Cpu);
+
+        // Warm up both paths: a first call pays allocator and page-fault costs.
+        let _ = super::lu_factor_contiguous_f64(&a, &meta).expect("lu warmup");
+        let _ = super::slogdet_contiguous_f64(&a, &meta).expect("slogdet warmup");
+
+        const REPS: usize = 9;
+        let (mut best_lu, mut best_sl) = (f64::MAX, f64::MAX);
+        for _ in 0..REPS {
+            // Interleaved so drift hits both equally.
+            let t0 = std::time::Instant::now();
+            let _ = super::lu_factor_contiguous_f64(&a, &meta).expect("lu");
+            best_lu = best_lu.min(t0.elapsed().as_secs_f64() * 1e3);
+
+            let t1 = std::time::Instant::now();
+            let _ = super::slogdet_contiguous_f64(&a, &meta).expect("slogdet");
+            best_sl = best_sl.min(t1.elapsed().as_secs_f64() * 1e3);
+        }
+        println!(
+            "LU_ATTRIB n={N} min-of-{REPS}  lu_factor={best_lu:8.3}ms  slogdet={best_sl:8.3}ms  ratio={:6.4}x",
+            best_sl / best_lu
+        );
+    }
+
     /// Where does blocked `geqrf` actually spend its time, and does the panel width matter?
     ///
     /// Prints rather than asserts — this is an attribution probe, not a gate. `geqrf`
