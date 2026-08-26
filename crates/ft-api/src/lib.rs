@@ -171412,4 +171412,63 @@ mod tests {
         let input_gradient = report.gradient_node(input).expect("connected input gradient");
         assert!(session.tensor_backward(input_gradient).is_ok());
     }
+
+    /// The F32 twin of the test above — `frankentorch-conv2d-mask-fusion-f64-only-iq1j1`.
+    ///
+    /// WHY IT DID NOT EXIST AND WHY IT DOES NOW. `conv2d_masked_loss_fusion_keeps_create_graph_connected`
+    /// builds its leaves with `tensor_variable`, i.e. f64, so it exercises only the F64 fusion's
+    /// create_graph arm. `try_fuse_conv2d_loss_mask` is gated to F64, so the f32 masked route
+    /// takes the GENERIC path — and nothing anywhere asserted that path stays second-order
+    /// differentiable.
+    ///
+    /// That gap is what currently blocks extending the fusion to f32: a fused fast path without a
+    /// create_graph backward silently breaks double-backward, and with no f32 test the breakage
+    /// would land unnoticed. This test is the guard that has to exist FIRST. It is written against
+    /// the route as it stands today, so it pins the CURRENT behaviour; when the f32 fusion is
+    /// wired it must still pass, and it will then be exercising the new arm instead of the
+    /// generic one.
+    ///
+    /// It asserts connectivity and a successful second backward, deliberately not a numeric
+    /// second derivative: the f32 route round-trips gradients through f64 and back, so a value
+    /// assertion here would be pinning the round-trip's rounding rather than the derivative. The
+    /// failure mode being excluded is a DETACHED gradient — `f'' = 0` because the graph was cut,
+    /// which is what a missing create_graph arm produces.
+    #[test]
+    fn conv2d_masked_loss_f32_keeps_create_graph_connected() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable_f32(
+                vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0],
+                vec![1, 1, 3, 3],
+                true,
+            )
+            .unwrap();
+        let weight = session
+            .tensor_variable_f32(vec![0.25, -0.5, 0.75, -1.0], vec![1, 1, 2, 2], true)
+            .unwrap();
+        // The mask straddles positive, negative and EXACT ZERO, the same spread the f64 twin uses
+        // and the same one the kernel's bit-exactness tests use: a zeroed entry is where a fused
+        // path is most tempted to cut the graph.
+        let mask = session
+            .tensor_variable_f32(vec![0.5, -1.0, 0.0, 0.25], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let output = session
+            .functional_conv2d(input, weight, None, (1, 1), (0, 0))
+            .unwrap();
+        let masked = session.tensor_mul(output, mask).unwrap();
+        let loss = session.tensor_sum(masked).unwrap();
+        let report = session
+            .tensor_backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+        let input_gradient = report
+            .gradient_node(input)
+            .expect("connected f32 input gradient");
+        assert!(session.tensor_backward(input_gradient).is_ok());
+    }
 }
