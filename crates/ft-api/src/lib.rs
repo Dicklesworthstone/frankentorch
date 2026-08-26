@@ -121604,6 +121604,157 @@ mod tests {
         }
     }
 
+    /// Blocked `ormqr` must equal the per-reflector loop across MULTIPLE PANELS.
+    ///
+    /// The kernel tests for `orgqr`/`ormqr` use N=32 against `nb_block=32`, i.e. exactly
+    /// ONE panel — and with one panel, REVERSE and FORWARD traversal are IDENTICAL. Those
+    /// tests were written to verify panel ordering and could not detect a panel-ordering
+    /// bug. The harness runs k=512, i.e. 16 panels, and caught a 6.13e-4 / 1.53e-3 parity
+    /// MISMATCH where the naive path had been 1.54e-12 MATCH.
+    ///
+    /// N=96 gives 3 panels. The reference is the `apply_reflector_left` sequence this
+    /// replaces, transcribed directly rather than reconstructed from Q, so nothing is
+    /// shared with the code under test.
+    #[test]
+    fn blocked_ormqr_matches_per_reflector_loop_across_panels() {
+        const M: usize = 160;
+        const N: usize = 96; // 3 panels at nb_block = 32
+        const W: usize = 20;
+
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.27).sin() + (j * 0.15).cos()) * 1.3
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+        let (packed, tau) = ft_kernel_cpu::geqrf_blocked_f64(&a, M, N);
+        let k = N;
+
+        let c0: Vec<f64> = (0..M * W)
+            .map(|t| ((t as f64) * 0.031).sin() + 0.6)
+            .collect();
+
+        for &(left, transpose) in &[(true, false), (true, true)] {
+            // Reference: the per-reflector loop, ordered exactly as tensor_ormqr does.
+            let mut want = c0.clone();
+            let order: Vec<usize> = if transpose == left {
+                (0..k).collect()
+            } else {
+                (0..k).rev().collect()
+            };
+            for &kk in &order {
+                FrankenTorchSession::apply_reflector_left(&mut want, M, W, &packed, N, kk, tau[kk]);
+            }
+
+            let mut got = c0.clone();
+            ft_kernel_cpu::ormqr_blocked_f64(
+                &packed, &tau, M, N, k, &mut got, M, W, left, transpose,
+            );
+
+            for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-9 * w.abs().max(1.0),
+                    "ormqr left={left} transpose={transpose} [{idx}]: blocked {g}, loop {w}"
+                );
+            }
+        }
+    }
+
+    /// SQUARE input: the blocked and naive `geqrf` must still agree.
+    ///
+    /// Every other fixture in this file is TALL (M > N), which never exercises a column
+    /// whose below-diagonal part is empty. For a SQUARE matrix the last column (j = m-1)
+    /// has exactly that shape, and the two paths test different things there:
+    ///   naive/LAPACK dlarfg: tests `below_sq == 0` -> tau = 0, NO reflection
+    ///   blocked leaf:        tests `norm_v < tiny` over the WHOLE column including the
+    ///                        diagonal, which is nonzero, so it builds a reflector
+    /// A spurious reflector there negates a row. That is invisible to |diag(R)| and to
+    /// |Q| elementwise, and visible in |Q C| — which is exactly the pattern the harness
+    /// reported (geqrf MATCH, orgqr MATCH, ormqr 6.13e-4 MISMATCH).
+    #[test]
+    fn blocked_geqrf_matches_naive_on_square_input() {
+        const M: usize = 96;
+        const N: usize = 96;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.33).sin() + (j * 0.21).cos()) * 1.4
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let (naive_packed, naive_tau) = FrankenTorchSession::geqrf_packed_f64(&a, M, N);
+        let (blocked_packed, blocked_tau) = ft_kernel_cpu::geqrf_blocked_f64(&a, M, N);
+
+        for (j, (b, w)) in blocked_tau.iter().zip(naive_tau.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "square tau[{j}]: blocked {b}, naive {w}"
+            );
+        }
+        for (idx, (b, w)) in blocked_packed.iter().zip(naive_packed.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "square packed[{idx}] (row {}, col {}): blocked {b}, naive {w}",
+                idx / N,
+                idx % N
+            );
+        }
+    }
+
+    /// The blocked `geqrf` must reproduce the NAIVE `geqrf`'s packed factor and tau
+    /// elementwise — not merely "a valid QR".
+    ///
+    /// WHY THIS EXISTS, having been written after the fact. The kernel test asserts
+    /// `Q R == A`, which ANY valid QR satisfies, including one whose reflectors differ in
+    /// sign from LAPACK's. The harness `geqrf` lane checksums only
+    /// `torch.geqrf(A)[0].diagonal().abs()`, i.e. |diag(R)| — it never compares the
+    /// reflectors below the diagonal or tau against torch at all. And the `orgqr` lane
+    /// takes |Q| elementwise, which is sign-insensitive by design.
+    ///
+    /// So three green checks all shared one blind spot, and the FIRST thing to see through
+    /// it was `ormqr`, whose checksum is |Q C| and therefore sign-sensitive: it came back
+    /// 6.13e-4 / 1.53e-3 MISMATCH. This test compares our own two implementations directly,
+    /// which is the check that can actually fail on a convention or ordering difference.
+    #[test]
+    fn blocked_geqrf_matches_naive_geqrf_elementwise() {
+        // N=96 gives THREE panels at nb_block=32. An earlier version used N=32, i.e.
+        // exactly ONE panel, where the blocked path's multi-panel logic never runs -- the
+        // same blind spot that let an ormqr regression through every green check.
+        const M: usize = 160;
+        const N: usize = 96;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.37).sin() + (j * 0.11).cos()) * 1.5
+                    + if idx % (N + 1) == 0 { 4.0 } else { 0.0 }
+            })
+            .collect();
+
+        let (naive_packed, naive_tau) = FrankenTorchSession::geqrf_packed_f64(&a, M, N);
+        let (blocked_packed, blocked_tau) = ft_kernel_cpu::geqrf_blocked_f64(&a, M, N);
+
+        assert_eq!(naive_tau.len(), blocked_tau.len());
+        for (j, (b, w)) in blocked_tau.iter().zip(naive_tau.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "tau[{j}]: blocked {b}, naive {w}"
+            );
+        }
+        for (idx, (b, w)) in blocked_packed.iter().zip(naive_packed.iter()).enumerate() {
+            assert!(
+                (b - w).abs() < 1e-9 * w.abs().max(1.0),
+                "packed[{idx}] (row {}, col {}): blocked {b}, naive {w}",
+                idx / N,
+                idx % N
+            );
+        }
+    }
+
     /// The ROUTED ormqr must equal an explicit multiply by Q, above the blocked gate, for
     /// all four `(left, transpose)` combinations.
     ///

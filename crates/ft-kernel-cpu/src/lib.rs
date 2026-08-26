@@ -36466,7 +36466,30 @@ fn qr_factor_panel_leaf_f64(
             nrm2 += x * x;
         }
         let norm_v = nrm2.sqrt();
-        if norm_v < tiny {
+        // LAPACK dlarfg emits NO reflector (tau = 0) when the BELOW-diagonal part of the
+        // column is already zero — the column is upper-triangular, so nothing needs
+        // eliminating — regardless of how large the diagonal is. Testing only the WHOLE
+        // column norm here (`norm_v < tiny`) misses that case and emits a spurious
+        // reflector with tau = 2, i.e. `H = I - 2 e_j e_jᵀ`, which NEGATES row j.
+        //
+        // It is invisible to every sign-blind checksum: |diag(R)| is unchanged, and so is
+        // |Q| elementwise. It shows up in |Q C|, which is how `ormqr` caught it
+        // (6.13e-4 MISMATCH where the per-reflector path was 1.54e-12 MATCH) while `geqrf`
+        // and `orgqr` both read MATCH.
+        //
+        // Only reachable when a column's below-diagonal is empty or exactly zero — the
+        // last column of a SQUARE matrix. Tall fixtures (m > n) never produce one, which
+        // is why it survived until a square lane exercised it.
+        //
+        // `nrm2` above is left exactly as it was (diagonal summed FIRST) so the arithmetic
+        // of every non-skipped column is bit-identical to before this change; the separate
+        // pass below only decides whether to skip.
+        let mut below_sq = 0.0;
+        for t in 1..col_len {
+            let x = r_mat[(j + t) * n + j];
+            below_sq += x * x;
+        }
+        if below_sq == 0.0 || norm_v < tiny {
             continue;
         }
         let v0 = r_mat[j * n + j];
