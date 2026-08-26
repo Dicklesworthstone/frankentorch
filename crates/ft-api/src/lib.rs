@@ -74538,7 +74538,23 @@ impl FrankenTorchSession {
         let mut a_all = vec![0.0_f64; batch * m * n];
         let mut tau_all = vec![0.0_f64; batch * k];
         for b in 0..batch {
-            let (a, tau) = Self::geqrf_packed_f64(&values[b * m * n..(b + 1) * m * n], m, n);
+            let plane = &values[b * m * n..(b + 1) * m * n];
+            // Above the blocked gate, reach the same compact-WY kernel `tensor_linalg_qr`
+            // already uses. `geqrf_packed_f64` below is a per-reflector BLAS-2 loop walking
+            // `a[i * n + kk]` with stride n — one cache line per useful element, once per
+            // reflector — and it measured 227.6x vs torch at n=512 and 535.2x at n=1024,
+            // scaling at n^3.18 on an algorithm that is exactly n^3. Our own `qr`, which
+            // does strictly MORE work (it also forms Q), was 32.9x FASTER than
+            // `geqrf`+`orgqr` at n=512.
+            //
+            // The gate matches `qr_contiguous_f64`'s, so batched-tiny shapes stay on the
+            // naive path and the existing batched wins are unaffected.
+            // frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+            let (a, tau) = if m >= 128 && k >= 16 {
+                ft_kernel_cpu::geqrf_blocked_f64(plane, m, n)
+            } else {
+                Self::geqrf_packed_f64(plane, m, n)
+            };
             a_all[b * m * n..(b + 1) * m * n].copy_from_slice(&a);
             tau_all[b * k..(b + 1) * k].copy_from_slice(&tau);
         }
