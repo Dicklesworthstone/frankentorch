@@ -72,6 +72,8 @@ enum LinalgOp {
     Orgqr,
     /// APPLY packed reflectors to a matrix (Q^T C). geqrf runs outside the timer.
     Ormqr,
+    /// Cholesky of an SPD matrix. Unique factorisation, so parity is unambiguous.
+    Cholesky,
 }
 
 /// One measured configuration of our own arm.
@@ -256,6 +258,11 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 w
             }
             LinalgOp::Eigvalsh => session.tensor_linalg_eigvalsh(x).expect("eigvalsh"),
+            LinalgOp::Cholesky => {
+                let l = session.tensor_linalg_cholesky(x, false).expect("cholesky");
+                let d = session.tensor_diagonal(l, 0).expect("diag");
+                session.tensor_abs(d).expect("abs")
+            }
             LinalgOp::Qr => {
                 let (_q, r) = session.tensor_linalg_qr(x, false).expect("qr");
                 let d = session.tensor_diagonal(r, 0).expect("diag");
@@ -460,7 +467,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "geqrf" => LinalgOp::Geqrf,
         "orgqr" => LinalgOp::Orgqr,
         "ormqr" => LinalgOp::Ormqr,
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr"),
+        "cholesky" => LinalgOp::Cholesky,
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky"),
     };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
@@ -492,7 +500,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // |result| for the same reason orgqr uses |Q|: the two factorisations need not agree
         // on reflector sign convention, and a sign difference is not a defect.
         "ormqr" => ("torch.ormqr(A[0], A[1], A[2]).abs()", false),
-        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr"),
+        // cholesky: the factorisation is UNIQUE for an SPD matrix, so diag(L) is directly
+        // comparable across implementations -- no sign or pivot freedom to explain away a
+        // mismatch. That is why this op was chosen over ldl_factor, whose Bunch-Kaufman
+        // pivoting may legitimately differ and would make the parity column unreadable.
+        "cholesky" => ("torch.linalg.cholesky(A).diagonal().abs()", false),
+        other => panic!("FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky"),
     };
     let lanes: Vec<(usize, String)> =
         sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
@@ -501,6 +514,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(n, name)| {
             let base = if op == "orgqr" {
                 format!("torch.geqrf(_mk({n}, False))")
+            } else if op == "cholesky" {
+                format!("_spd({n})")
             } else if op == "ormqr" {
                 // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
                 format!("(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))")
@@ -522,6 +537,11 @@ def _mk(n, sym=False):
     # without this the two arms would be answering different questions and the parity column
     # would be meaningless rather than merely failing.
     return (A + A.T) * 0.5 if sym else A
+def _spd(n):
+    # Symmetric + strictly diagonally dominant => positive definite at every n, so the
+    # Cholesky factor exists and is unique. The Rust arm builds the identical matrix.
+    A = _mk(n, True)
+    return A + torch.eye(n, dtype=torch.float64) * float(n)
 def run(base, fn):
     _t = time.perf_counter()
     _s = fn(base)
@@ -604,7 +624,19 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // Symmetrised for the eig lanes ONLY, matching the incumbent's `_mk(n, sym=True)`
         // exactly. eigh reads one triangle, so an unsymmetrised fixture would have the two arms
         // answering different questions.
-        let data = if sym { symmetrise(&fill(n), n) } else { fill(n) };
+        let data = if ft_op == LinalgOp::Cholesky {
+            // Identical to the incumbent's `_spd`: symmetrise, then add n to the diagonal.
+            // Strictly diagonally dominant => positive definite at every n.
+            let mut d = symmetrise(&fill(n), n);
+            for i in 0..n {
+                d[i * n + i] += n as f64;
+            }
+            d
+        } else if sym {
+            symmetrise(&fill(n), n)
+        } else {
+            fill(n)
+        };
         let iowait_before = iowait_jiffies();
         let (load_before, mhz_before) = provenance();
 
