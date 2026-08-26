@@ -121588,6 +121588,51 @@ mod tests {
         }
     }
 
+    /// The ROUTED orgqr must produce the same Q as `linalg_qr`, above the blocked gate.
+    ///
+    /// The two ft-api `householder_product` goldens are 4x3, i.e. BELOW the
+    /// `m >= 128 && k >= 16` gate, so they still exercise the per-reflector loop and cover
+    /// none of the blocked path. The kernel-level test covers the kernel; nothing covered
+    /// the ft-api ROUTING — the gate condition and the copy into the output buffer — until
+    /// this test.
+    ///
+    /// `linalg_qr` reaches Q through the blocked forward+reverse pass directly, while
+    /// `geqrf` + `householder_product` unpacks packed reflectors and rebuilds Q from them,
+    /// so these remain genuinely different code paths and the comparison has content.
+    /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+    #[test]
+    fn routed_orgqr_matches_qr_q_above_the_blocked_gate() {
+        const M: usize = 160;
+        const N: usize = 32;
+        let a_vals: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                ((i * 0.41).sin() + (j * 0.13).cos()) * 1.4
+                    + if idx % (N + 1) == 0 { 3.5 } else { 0.0 }
+            })
+            .collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let a1 = s.tensor_variable(a_vals.clone(), vec![M, N], false).unwrap();
+        let (packed, tau) = s.tensor_geqrf(a1).unwrap();
+        let q_orgqr = s.tensor_householder_product(packed, tau).unwrap();
+        let q_orgqr_vals = s.tensor_values(q_orgqr).unwrap();
+
+        let a2 = s.tensor_variable(a_vals, vec![M, N], false).unwrap();
+        let (q_qr, _r) = s.tensor_linalg_qr(a2, true).unwrap();
+        let q_qr_vals = s.tensor_values(q_qr).unwrap();
+
+        assert_eq!(q_orgqr_vals.len(), q_qr_vals.len());
+        for (idx, (g, w)) in q_orgqr_vals.iter().zip(q_qr_vals.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-9,
+                "routed orgqr Q[{idx}] = {g}, linalg_qr Q = {w}"
+            );
+        }
+    }
+
     /// `geqrf` and `qr` must agree on R for the SAME input, at a size where they take
     /// DIFFERENT routes.
     ///
