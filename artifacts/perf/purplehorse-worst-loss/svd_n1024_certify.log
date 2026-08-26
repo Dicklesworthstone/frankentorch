@@ -1,0 +1,22 @@
+=== n1024_certify attempt=1 utc=2026-08-26T05:11:22Z host=thinkstation1 ===
+idle_before=83.32% then 87.99% (mpstat 5s x2, NOT loadavg)
+loadavg_before=7.73 15.86 50.13 (recorded for provenance; NOT the gate)
+snapshot_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+config: unpinned, RAYON_NUM_THREADS=8, FT_GATE_SIZES=1024, FT_GATE_VALUES=262144,262144 (A/A NULL)
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 27 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=323a90cf1804eed18f1f4f62ae8ec4e04357403b4c697981755cd144ecfb8848
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output", "262144/4row/fused/4output"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=1024  PT min 118.918 ms  median 138.387 ms  spread 1.24x  load 7.75->9.45  MHz 3432/3141  iowait 284 jiffies
+  arm=262144/4row/fused/4output min  356.778 ms  median  426.593 ms  PT-beside-it min  118.918 ms  paired-vs-PT FT 3.117x SLOWER  paired-vs-arm0 1.000x  branches (512, 0, 512)  parity rel 6.07e-14 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 250.013 ms 68%  form_p/q 117.678 ms 32%  QR sweep 0.344 ms 0%
+  arm=262144/4row/fused/4output min  322.805 ms  median  437.199 ms  PT-beside-it min  122.920 ms  paired-vs-PT FT 3.102x SLOWER  paired-vs-arm0 0.991x  branches (512, 0, 512)  parity rel 6.07e-14 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 240.407 ms 67%  form_p/q 120.273 ms 33%  QR sweep 0.307 ms 0%
+idle_after=94.36%
+incumbent_check n=1024 PT_min=118.918ms banked~122.604ms -> ok
