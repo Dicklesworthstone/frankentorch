@@ -27737,6 +27737,22 @@ fn eigh_tred2_reduce_packed_full(
     d: &mut [f64],
     e: &mut [f64],
 ) {
+    eigh_tred2_reduce_packed_full_gated(n, lower, scaled_reflectors, d, e, TRED2_PAR_MIN_L_DEFAULT)
+}
+
+/// Shipped gate width. See `eigh_tred2_reduce_packed_full_gated` for the measurements.
+const TRED2_PAR_MIN_L_DEFAULT: usize = 384;
+
+/// The reduction with its parallel gate exposed, so a same-process A/B can measure the
+/// serial and gated-parallel arms at one thread width instead of inferring across runs.
+fn eigh_tred2_reduce_packed_full_gated(
+    n: usize,
+    lower: &mut [f64],
+    scaled_reflectors: &mut [f64],
+    d: &mut [f64],
+    e: &mut [f64],
+    par_min_l: usize,
+) {
     for i in (1..n).rev() {
         let l = i - 1;
         let row_i_start = lower_packed_index(i, 0);
@@ -27773,10 +27789,9 @@ fn eigh_tred2_reduce_packed_full(
                 // This gate also protects a SHIPPED win: batched eigh (B=2000, n=32-96) is
                 // 4.84-7.92x faster than torch precisely because it parallelises ACROSS
                 // planes. Inner parallelism on planes that small would wreck it.
-                const TRED2_PAR_MIN_L: usize = 384;
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
-                let ggs: Vec<f64> = if l < TRED2_PAR_MIN_L {
+                let ggs: Vec<f64> = if l < par_min_l {
                     (0..=l)
                         .map(|j| {
                             let mut gg = 0.0;
@@ -27842,7 +27857,7 @@ fn eigh_tred2_reduce_packed_full(
                         row_j[k] -= fj * e_ro[k] + ggj * row_i_ro[k];
                     }
                 };
-                if l < TRED2_PAR_MIN_L {
+                if l < par_min_l {
                     rows.iter_mut().enumerate().for_each(|(j, r)| update(j, r));
                 } else {
                     rows.par_iter_mut().enumerate().for_each(|(j, r)| update(j, r));
@@ -29240,6 +29255,16 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
 /// dominant phase is targeted. NOT production dispatch.
 #[doc(hidden)]
 pub fn eigh_stage_profile_f64(data: &[f64], n: usize) -> (u128, u128, u128) {
+    eigh_stage_profile_gated_f64(data, n, TRED2_PAR_MIN_L_DEFAULT)
+}
+
+/// `eigh_stage_profile_f64` with the reduction's parallel gate exposed.
+#[doc(hidden)]
+pub fn eigh_stage_profile_gated_f64(
+    data: &[f64],
+    n: usize,
+    par_min_l: usize,
+) -> (u128, u128, u128) {
     let mut lower = vec![0.0f64; n * (n + 1) / 2];
     for i in 0..n {
         let dst = lower_packed_index(i, 0);
@@ -29250,7 +29275,7 @@ pub fn eigh_stage_profile_f64(data: &[f64], n: usize) -> (u128, u128, u128) {
     let mut e = vec![0.0f64; n];
     let mut scaled = vec![0.0f64; lower.len()];
     let t0 = std::time::Instant::now();
-    eigh_tred2_reduce_packed_full(n, &mut lower, &mut scaled, &mut d, &mut e);
+    eigh_tred2_reduce_packed_full_gated(n, &mut lower, &mut scaled, &mut d, &mut e, par_min_l);
     let reduce_ns = t0.elapsed().as_nanos();
     let mut z = vec![0.0f64; n * n];
     for i in 0..n {
@@ -44302,19 +44327,53 @@ mod tests {
         // DECISIVE: same binary, same process, only the rayon width differs. If the
         // 1-thread and wide numbers match, the parallel regions are not delivering and
         // no amount of reasoning about bandwidth or core counts explains it.
+        // FULL LANE at each width, not just the reduce phase. The ~1.4x I projected for
+        // eigh came from Amdahl on a phase split; this measures the whole thing so the
+        // projection is replaced by a number. 8 threads is the production width
+        // (RAYON_NUM_THREADS=8 in the vs-torch harness).
+        // SAME-PROCESS A/B on the gate itself, at the production width. Replaces a
+        // RECONSTRUCTED ~1.20x (pre-change serial reduce from one run + backtransform/tql2
+        // from another) with a measurement. Stitching numbers across runs is what produced
+        // the estimator errors earlier in this campaign.
+        {
+            let pool8 = rayon::ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .expect("pool8");
+            for (label, gate) in [("serial", usize::MAX), ("gated", 384usize)] {
+                let (mut br, mut btot) = (u128::MAX, u128::MAX);
+                for _ in 0..3 {
+                    let (r, b, t) =
+                        pool8.install(|| super::eigh_stage_profile_gated_f64(&a, N, gate));
+                    br = br.min(r);
+                    btot = btot.min(r + b + t);
+                }
+                println!(
+                    "EIGH_GATE_AB n={N:>5} threads=8 {label:>6}  LANE={:8.2}ms  reduce={:8.2}ms",
+                    btot as f64 / 1e6,
+                    br as f64 / 1e6
+                );
+            }
+        }
         for width in [1usize, 8, 64] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(width)
                 .build()
                 .expect("pool");
-            let mut best = u128::MAX;
+            let (mut br, mut bb, mut bt, mut btot) = (u128::MAX, u128::MAX, u128::MAX, u128::MAX);
             for _ in 0..3 {
-                let (r, _b, _t) = pool.install(|| super::eigh_stage_profile_f64(&a, N));
-                best = best.min(r);
+                let (r, b, t) = pool.install(|| super::eigh_stage_profile_f64(&a, N));
+                br = br.min(r);
+                bb = bb.min(b);
+                bt = bt.min(t);
+                btot = btot.min(r + b + t);
             }
             println!(
-                "EIGH_WIDTH n={N:>5} threads={width:>3} reduce={:8.2}ms",
-                best as f64 / 1e6
+                "EIGH_WIDTH n={N:>5} threads={width:>3}  LANE={:8.2}ms   reduce={:8.2}ms  backtransform={:8.2}ms  tql2={:8.2}ms",
+                btot as f64 / 1e6,
+                br as f64 / 1e6,
+                bb as f64 / 1e6,
+                bt as f64 / 1e6
             );
         }
 
