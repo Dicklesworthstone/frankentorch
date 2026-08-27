@@ -6318,6 +6318,372 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// The F32 half of [`Self::try_fuse_conv2d_loss_mask`] — `frankentorch-pj66w`.
+    ///
+    /// Structurally the f64 sibling, with the dtype bridge the f32 conv2d fast path already
+    /// uses: borrowed inputs arrive as `&[f32]`, the incoming gradient arrives from the tape
+    /// as `f64` and is downcast, and the produced gradients are widened back. That asymmetry
+    /// is the tape's, not this function's.
+    ///
+    /// The first-order backward is `conv2d_backward_mask_fused_f32`, which is proven
+    /// BIT-IDENTICAL to materialising `incoming * mask` and calling the generic f32 backward
+    /// on it. So this changes which buffers exist, not which numbers come out.
+    ///
+    /// CREATE_GRAPH ARM, and why it is not optional. An earlier version of this function
+    /// guarded with a `create_graph_enabled()` query and skipped fusing when second order was
+    /// live. No such query can exist: `create_graph` is chosen when `.backward()` is called
+    /// (it is a field on the backward config), long after this forward node is built, so a
+    /// forward-time guard cannot see it. That version did not compile, and merely making it
+    /// compile would have shipped a fused fast path with no second-order arm — exactly the
+    /// double-backward defect this campaign has already paid for once. The arm below is the
+    /// f64 recipe with every nested adjoint node casting to f32 and using the f32 kernels, so
+    /// the second derivative matches torch's f32-precision backward.
+    fn fuse_conv2d_loss_mask_f32(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        plan: Conv2dMaskPlan,
+    ) -> Result<Option<TensorNodeId>, AutogradError> {
+        let output_shape = self.tensor_shape(lhs)?;
+        let mut inputs = vec![plan.padded, plan.weight];
+        if let Some(bias) = plan.bias {
+            inputs.push(bias);
+        }
+        inputs.push(rhs);
+        let has_bias = plan.bias.is_some();
+        let mask_index = if has_bias { 3 } else { 2 };
+        let fused = self
+            .tensor_tape
+            .apply_function_f32_output_with_create_graph_borrowed_inputs(
+                &inputs,
+                move |_ctx, ins| {
+                    let (padded_values, _) = ins[0];
+                    let (weight_values, _) = ins[1];
+                    let bias_values = if has_bias { Some(ins[2].0) } else { None };
+                    let mask_values = ins[mask_index].0;
+                    let out = ft_kernel_cpu::conv2d_forward_f32(
+                        padded_values,
+                        weight_values,
+                        bias_values,
+                        plan.batch,
+                        plan.in_channels,
+                        plan.padded_h,
+                        plan.padded_w,
+                        plan.kernel_h,
+                        plan.kernel_w,
+                        plan.output_h,
+                        plan.output_w,
+                        plan.stride_h,
+                        plan.stride_w,
+                        plan.out_channels,
+                    );
+                    let scored: Vec<f32> =
+                        out.iter().zip(mask_values).map(|(&v, &m)| v * m).collect();
+                    Ok((scored, output_shape.clone()))
+                },
+                move |ctx, grad_outputs, borrowed| {
+                    let need = ctx.needs_input_grad();
+                    let need_input = need.first().copied().unwrap_or(true);
+                    let need_weight = need.get(1).copied().unwrap_or(true);
+                    // The tape carries gradients in f64 even for an f32 op; downcast once,
+                    // here, exactly as the f32 conv2d fast path does.
+                    let incoming: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                    let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                        &incoming,
+                        borrowed[mask_index].0,
+                        borrowed[0].0,
+                        borrowed[1].0,
+                        plan.batch,
+                        plan.in_channels,
+                        plan.padded_h,
+                        plan.padded_w,
+                        plan.kernel_h,
+                        plan.kernel_w,
+                        plan.output_h,
+                        plan.output_w,
+                        plan.stride_h,
+                        plan.stride_w,
+                        plan.out_channels,
+                        [need_input, need_weight, has_bias],
+                    );
+                    // A missing gradient must stay `None`; an empty vector would be read as a
+                    // real gradient of the wrong shape.
+                    let mut gradients = vec![
+                        dpadded.map(|d| Self::widen_grad_f32_to_f64(&d)),
+                        dweight.map(|d| Self::widen_grad_f32_to_f64(&d)),
+                    ];
+                    if has_bias {
+                        gradients
+                            .push(dbias.map(|d| d.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()));
+                    }
+                    // The mask does not require grad — the caller's gate guarantees it — so it
+                    // gets None rather than a computed-and-discarded gradient.
+                    gradients.push(None);
+                    Ok(gradients)
+                },
+                move |ctx, grad_outs, fn_inputs, tape| {
+                    let need = ctx.needs_input_grad().to_vec();
+                    let dout_id = grad_outs[0];
+                    let padded_id = fn_inputs[0];
+                    let weight_id = fn_inputs[1];
+                    let mask_id = fn_inputs[mask_index];
+                    let mut gradients: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
+                    let f32v = |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                    let f64v = |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
+                    // Grad NODES must live in the F64 grad-space (the regular backward and
+                    // tensor_values/autograd_grad are F64). apply_function infers output dtype
+                    // from its inputs, so feeding the F32 nodes directly would make the grad
+                    // node F32 and F64-only readers would then ERR UnsupportedDType. Cast to
+                    // F64 nodes first (differentiable CastF64; grad flows back to the F32
+                    // leaf). The f32 kernel math inside the nested nodes is unchanged.
+                    // frankentorch-gir5b.
+                    let weight64 = tape.to_f64(weight_id)?;
+                    let padded64 = tape.to_f64(padded_id)?;
+                    let mask64 = tape.to_f64(mask_id)?;
+
+                    // The fused first-order backward multiplies the incoming gradient by the
+                    // mask in f32 inside the kernel; do the same here so the second-order
+                    // graph starts from the identical value.
+                    let masked_dout = tape.apply_function(
+                        &[dout_id, mask64],
+                        move |c, ins| {
+                            let (incoming, shape) = ins[0];
+                            let (mask, _) = ins[1];
+                            c.save_for_backward(mask.to_vec(), shape.to_vec());
+                            let prod: Vec<f64> = incoming
+                                .iter()
+                                .zip(mask)
+                                .map(|(&g, &m)| f64::from((g as f32) * (m as f32)))
+                                .collect();
+                            Ok((prod, shape.to_vec()))
+                        },
+                        move |c, incoming| {
+                            let mask = &c.saved_tensors()[0];
+                            Ok(vec![
+                                Some(
+                                    incoming[0]
+                                        .iter()
+                                        .zip(mask)
+                                        .map(|(&g, &m)| f64::from((g as f32) * (m as f32)))
+                                        .collect(),
+                                ),
+                                None,
+                            ])
+                        },
+                    )?;
+
+                    if need.first().copied().unwrap_or(false) {
+                        let dpadded = tape.apply_function(
+                            &[masked_dout, weight64],
+                            move |c, ins| {
+                                let (dv, _) = ins[0];
+                                let (wv, ws) = ins[1];
+                                c.save_for_backward(
+                                    dv.to_vec(),
+                                    vec![plan.batch, plan.out_channels, plan.output_h, plan.output_w],
+                                );
+                                c.save_for_backward(wv.to_vec(), ws.to_vec());
+                                let zp = vec![
+                                    0.0_f32;
+                                    plan.batch * plan.in_channels * plan.padded_h * plan.padded_w
+                                ];
+                                let (dp, _, _) = ft_kernel_cpu::conv2d_backward_f32(
+                                    &f32v(dv),
+                                    &zp,
+                                    &f32v(wv),
+                                    plan.batch,
+                                    plan.in_channels,
+                                    plan.padded_h,
+                                    plan.padded_w,
+                                    plan.kernel_h,
+                                    plan.kernel_w,
+                                    plan.output_h,
+                                    plan.output_w,
+                                    plan.stride_h,
+                                    plan.stride_w,
+                                    plan.out_channels,
+                                    false,
+                                );
+                                Ok((
+                                    f64v(&dp),
+                                    vec![plan.batch, plan.in_channels, plan.padded_h, plan.padded_w],
+                                ))
+                            },
+                            move |c, gouts| {
+                                let saved = c.saved_tensors();
+                                let dv = &saved[0];
+                                let wv = &saved[1];
+                                let grad_dout = ft_kernel_cpu::conv2d_forward_f32(
+                                    &f32v(gouts[0]),
+                                    &f32v(wv),
+                                    None,
+                                    plan.batch,
+                                    plan.in_channels,
+                                    plan.padded_h,
+                                    plan.padded_w,
+                                    plan.kernel_h,
+                                    plan.kernel_w,
+                                    plan.output_h,
+                                    plan.output_w,
+                                    plan.stride_h,
+                                    plan.stride_w,
+                                    plan.out_channels,
+                                );
+                                let zw = vec![0.0_f32; wv.len()];
+                                let (_, grad_weight, _) = ft_kernel_cpu::conv2d_backward_f32(
+                                    &f32v(dv),
+                                    &f32v(gouts[0]),
+                                    &zw,
+                                    plan.batch,
+                                    plan.in_channels,
+                                    plan.padded_h,
+                                    plan.padded_w,
+                                    plan.kernel_h,
+                                    plan.kernel_w,
+                                    plan.output_h,
+                                    plan.output_w,
+                                    plan.stride_h,
+                                    plan.stride_w,
+                                    plan.out_channels,
+                                    false,
+                                );
+                                Ok(vec![Some(f64v(&grad_dout)), Some(f64v(&grad_weight))])
+                            },
+                        )?;
+                        gradients[0] = Some(dpadded);
+                    }
+
+                    if need.get(1).copied().unwrap_or(false) {
+                        let weight_shape = vec![
+                            plan.out_channels,
+                            plan.in_channels,
+                            plan.kernel_h,
+                            plan.kernel_w,
+                        ];
+                        let dweight = tape.apply_function(
+                            &[masked_dout, padded64],
+                            move |c, ins| {
+                                let (dv, _) = ins[0];
+                                let (pv, ps) = ins[1];
+                                c.save_for_backward(
+                                    dv.to_vec(),
+                                    vec![plan.batch, plan.out_channels, plan.output_h, plan.output_w],
+                                );
+                                c.save_for_backward(pv.to_vec(), ps.to_vec());
+                                let zw = vec![0.0_f32; weight_shape.iter().product::<usize>()];
+                                let (_, dw, _) = ft_kernel_cpu::conv2d_backward_f32(
+                                    &f32v(dv),
+                                    &f32v(pv),
+                                    &zw,
+                                    plan.batch,
+                                    plan.in_channels,
+                                    plan.padded_h,
+                                    plan.padded_w,
+                                    plan.kernel_h,
+                                    plan.kernel_w,
+                                    plan.output_h,
+                                    plan.output_w,
+                                    plan.stride_h,
+                                    plan.stride_w,
+                                    plan.out_channels,
+                                    false,
+                                );
+                                Ok((f64v(&dw), weight_shape.clone()))
+                            },
+                            move |c, gouts| {
+                                let saved = c.saved_tensors();
+                                let dv = &saved[0];
+                                let pv = &saved[1];
+                                let grad_dout = ft_kernel_cpu::conv2d_forward_f32(
+                                    &f32v(pv),
+                                    &f32v(gouts[0]),
+                                    None,
+                                    plan.batch,
+                                    plan.in_channels,
+                                    plan.padded_h,
+                                    plan.padded_w,
+                                    plan.kernel_h,
+                                    plan.kernel_w,
+                                    plan.output_h,
+                                    plan.output_w,
+                                    plan.stride_h,
+                                    plan.stride_w,
+                                    plan.out_channels,
+                                );
+                                let zp = vec![
+                                    0.0_f32;
+                                    plan.batch * plan.in_channels * plan.padded_h * plan.padded_w
+                                ];
+                                let (grad_padded, _, _) = ft_kernel_cpu::conv2d_backward_f32(
+                                    &f32v(dv),
+                                    &zp,
+                                    &f32v(gouts[0]),
+                                    plan.batch,
+                                    plan.in_channels,
+                                    plan.padded_h,
+                                    plan.padded_w,
+                                    plan.kernel_h,
+                                    plan.kernel_w,
+                                    plan.output_h,
+                                    plan.output_w,
+                                    plan.stride_h,
+                                    plan.stride_w,
+                                    plan.out_channels,
+                                    false,
+                                );
+                                Ok(vec![Some(f64v(&grad_dout)), Some(f64v(&grad_padded))])
+                            },
+                        )?;
+                        gradients[1] = Some(dweight);
+                    }
+
+                    if has_bias && need.get(2).copied().unwrap_or(false) {
+                        let dbias = tape.apply_function(
+                            &[masked_dout],
+                            // dbias = sum_{n,oh,ow} dout[:,oc,:,:]. Accumulated in f64, matching
+                            // the f32 conv2d fast path's own create_graph arm — the reduction
+                            // is a plain sum of values already produced at f32 precision, and
+                            // narrowing the accumulator here would diverge from the neighbour
+                            // for no reason.
+                            move |_c, ins| {
+                                let dout = ins[0].0;
+                                let plane = plan.output_h * plan.output_w;
+                                let mut db = vec![0.0_f64; plan.out_channels];
+                                for n in 0..plan.batch {
+                                    for channel in 0..plan.out_channels {
+                                        let base = (n * plan.out_channels + channel) * plane;
+                                        let mut acc = 0.0_f64;
+                                        for patch in 0..plane {
+                                            acc += dout[base + patch];
+                                        }
+                                        db[channel] += acc;
+                                    }
+                                }
+                                Ok((db, vec![plan.out_channels]))
+                            },
+                            move |_c, incoming| {
+                                let plane = plan.output_h * plan.output_w;
+                                let mut grad_dout =
+                                    vec![0.0_f64; plan.batch * plan.out_channels * plane];
+                                for n in 0..plan.batch {
+                                    for channel in 0..plan.out_channels {
+                                        let base = (n * plan.out_channels + channel) * plane;
+                                        grad_dout[base..base + plane].fill(incoming[0][channel]);
+                                    }
+                                }
+                                Ok(vec![Some(grad_dout)])
+                            },
+                        )?;
+                        gradients[2] = Some(dbias);
+                    }
+
+                    Ok(gradients)
+                },
+            )?;
+        self.conv2d_mask_plans.remove(&lhs.0);
+        Ok(Some(fused))
+    }
+
     fn try_fuse_conv2d_loss_mask(
         &mut self,
         lhs: TensorNodeId,
@@ -6326,14 +6692,22 @@ impl FrankenTorchSession {
         let Some(plan) = self.conv2d_mask_plans.get(&lhs.0).cloned() else {
             return Ok(None);
         };
-        if self.tensor_dtype(lhs)? != DType::F64
-            || self.tensor_dtype(rhs)? != DType::F64
+        // DTYPE: F64 and F32 both fuse — `frankentorch-pj66w`. The remaining conditions are
+        // CORRECTNESS guards, not dtype policy, and are unchanged: a grad-requiring mask needs
+        // its own gradient, mismatched shapes are a different op, and retains_grad/hooks both
+        // need the unfused intermediate to exist as a real node.
+        let dtype = self.tensor_dtype(lhs)?;
+        if (dtype != DType::F64 && dtype != DType::F32)
+            || self.tensor_dtype(rhs)? != dtype
             || self.tensor_requires_grad(rhs)?
             || self.tensor_shape(lhs)? != self.tensor_shape(rhs)?
             || self.tensor_tape.tensor_retains_grad(lhs)?
             || self.tensor_tape.tensor_has_hooks(lhs)?
         {
             return Ok(None);
+        }
+        if dtype == DType::F32 {
+            return self.fuse_conv2d_loss_mask_f32(lhs, rhs, plan);
         }
 
         let output_shape = self.tensor_shape(lhs)?;
@@ -31383,7 +31757,7 @@ impl FrankenTorchSession {
             if let Some(b) = bias {
                 inputs.push(b);
             }
-            return self
+            let output = self
                 .tensor_tape
                 .apply_function_f32_output_with_create_graph_borrowed_inputs(
                     &inputs,
@@ -31693,7 +32067,36 @@ impl FrankenTorchSession {
 
                         Ok(grads)
                     },
-                );
+                )?;
+            // Register the mask plan for the F32 path too — `frankentorch-pj66w`.
+            //
+            // The f64 branch does this; the f32 branch never did, so
+            // `try_fuse_conv2d_loss_mask`'s `conv2d_mask_plans.get(&lhs.0)` returned None for
+            // every f32 conv2d output and bailed at its FIRST condition, before the dtype gate
+            // it appears to be blocked by was ever reached. Relaxing that gate alone therefore
+            // changes nothing; the plan has to exist first. Conversely, registering without a
+            // consumer would grow this map unboundedly — only the fuse path removes entries —
+            // so the two halves must land together.
+            self.conv2d_mask_plans.insert(
+                output.0,
+                Conv2dMaskPlan {
+                    padded,
+                    weight,
+                    bias,
+                    batch: b_,
+                    in_channels: ic,
+                    padded_h: ph,
+                    padded_w: pw,
+                    kernel_h: kh,
+                    kernel_w: kw,
+                    output_h: oh,
+                    output_w: ow,
+                    stride_h: sh,
+                    stride_w: sw,
+                    out_channels: oc,
+                },
+            );
+            return Ok(output);
         }
 
         // Use unfold to extract all patches in O(1) tensor operations instead
@@ -171988,5 +172391,171 @@ mod tests {
             .gradient_node(input)
             .expect("connected f32 input gradient");
         assert!(session.tensor_backward(input_gradient).is_ok());
+    }
+
+    /// `frankentorch-pj66w`: the f32 masked-conv2d fusion must actually FIRE, and its
+    /// first-order gradients must match the independent masked kernel bitwise.
+    ///
+    /// The firing assertions are the load-bearing half. `try_fuse_conv2d_loss_mask` bails to
+    /// the unfused route on several conditions, and a bail is SILENT — every value stays
+    /// correct. So a test that only compares numbers passes just as happily when the fusion
+    /// never ran, which is precisely how a dtype gate can sit dead for months. Asserting on
+    /// `conv2d_mask_plans` pins both halves of the wiring: the plan must be REGISTERED by the
+    /// f32 conv2d fast path (it was not, before this bead — the fusion bailed at its first
+    /// condition, before the dtype gate it appeared to be blocked by), and it must be REMOVED
+    /// by the fuse path, which only happens if the fused node was actually built.
+    #[test]
+    fn f32_masked_conv2d_fusion_fires_and_matches_masked_kernel_bitwise() {
+        let (n, cin, cout, h, w, k) = (2usize, 1usize, 2usize, 5usize, 5usize, 3usize);
+        let x_values: Vec<f32> = (0..n * cin * h * w)
+            .map(|i| (i as f32 - 21.0) * -0.0625)
+            .collect();
+        let w_values: Vec<f32> = (0..cout * cin * k * k)
+            .map(|i| (i as f32 - 8.0) * 0.03125)
+            .collect();
+        // Straddles positive, negative and EXACT ZERO — a zeroed entry is where a fused path
+        // is most tempted to cut the graph. Powers of two so the f32 products are exact and a
+        // bitwise assertion is meaningful rather than luck.
+        let mask: Vec<f32> = (0..n * cout * 3 * 3)
+            .map(|i| match i % 7 {
+                0 => 0.0,
+                1 => -1.0,
+                2 => 0.5,
+                3 => -0.25,
+                4 => 1.0,
+                5 => -0.75,
+                _ => 0.125,
+            })
+            .collect();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(x_values.clone(), vec![n, cin, h, w], true)
+            .unwrap();
+        let weight = session
+            .tensor_variable_f32(w_values.clone(), vec![cout, cin, k, k], true)
+            .unwrap();
+        let loss_mask = session
+            .tensor_variable_f32(mask.clone(), vec![n, cout, 3, 3], false)
+            .unwrap();
+        let out = session
+            .functional_conv2d(x, weight, None, (1, 1), (0, 0))
+            .unwrap();
+        assert!(
+            session.conv2d_mask_plans.contains_key(&out.0),
+            "the f32 conv2d fast path must register a Conv2dMaskPlan; without it the fusion \
+             bails at its FIRST condition and the dtype gate is never reached"
+        );
+        let scaled = session.tensor_mul(out, loss_mask).unwrap();
+        assert!(
+            !session.conv2d_mask_plans.contains_key(&out.0),
+            "the plan must be consumed by the fuse path — if it is still here the mul fell \
+             back to the unfused route and everything below this line is vacuous"
+        );
+        let loss = session.tensor_sum(scaled).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+
+        let (expected_x, expected_w, _) = ft_kernel_cpu::conv2d_backward_masked_f32(
+            &mask, &x_values, &w_values, n, cin, h, w, k, k, 3, 3, 1, 1, cout,
+            [true, true, false],
+        );
+        let widen = |v: &[f32]| -> Vec<f64> { v.iter().map(|&e| f64::from(e)).collect() };
+        assert_bits_eq(
+            session.tensor_gradient(&report, x).unwrap(),
+            &widen(&expected_x.unwrap()),
+        );
+        assert_bits_eq(
+            session.tensor_gradient(&report, weight).unwrap(),
+            &widen(&expected_w.unwrap()),
+        );
+    }
+
+    /// `frankentorch-pj66w`: the fused f32 path's SECOND derivative must match the unfused
+    /// route's.
+    ///
+    /// This is the defect this bead exists for. An earlier version of the f32 fusion tried to
+    /// skip fusing whenever create_graph was live, via a `create_graph_enabled()` query that
+    /// cannot exist — create_graph is chosen at `.backward()` time, long after the forward node
+    /// is built. Shipping the fusion without a second-order arm would leave double-backward
+    /// silently wrong, so the arm is mandatory and this test is what holds it.
+    ///
+    /// The unfused reference is obtained WITHOUT a test-only hook: `retain_grad` on the conv
+    /// output is one of the fusion's documented bail conditions (the unfused intermediate has
+    /// to exist as a real node), so the second arm runs the composed route over identical
+    /// inputs. The firing assertion on the first arm is what stops this degenerating into
+    /// unfused-vs-unfused.
+    #[test]
+    fn f32_masked_conv2d_fused_second_derivative_matches_unfused_route() {
+        let build = |force_unfused: bool| -> Vec<f64> {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(
+                    vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0],
+                    vec![1, 1, 3, 3],
+                    true,
+                )
+                .unwrap();
+            let weight = session
+                .tensor_variable_f32(vec![0.25, -0.5, 0.75, -1.0], vec![1, 1, 2, 2], true)
+                .unwrap();
+            // A bias is present deliberately: it exercises the dbias create_graph arm and
+            // shifts the mask to index 3, which is a distinct branch in the fused wiring.
+            let bias = session
+                .tensor_variable_f32(vec![0.5], vec![1], true)
+                .unwrap();
+            let mask = session
+                .tensor_variable_f32(vec![0.5, -1.0, 0.0, 0.25], vec![1, 1, 2, 2], false)
+                .unwrap();
+            let out = session
+                .functional_conv2d(x, weight, Some(bias), (1, 1), (0, 0))
+                .unwrap();
+            if force_unfused {
+                session.tensor_retain_grad(out).unwrap();
+            }
+            let masked = session.tensor_mul(out, mask).unwrap();
+            let fused_ran = !session.conv2d_mask_plans.contains_key(&out.0);
+            assert_eq!(
+                fused_ran, !force_unfused,
+                "fusion fired={fused_ran} but force_unfused={force_unfused}; the two arms must \
+                 take DIFFERENT routes or this test compares a path with itself"
+            );
+            let loss = session.tensor_sum(masked).unwrap();
+            let report = session
+                .tensor_backward_with_options(
+                    loss,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .unwrap();
+            let gx = report
+                .gradient_node(x)
+                .expect("connected f32 input gradient");
+            // Reduce the first derivative and differentiate again: this is the value that goes
+            // wrong when a fused fast path has no create_graph arm.
+            let g_sum = session.tensor_sum(gx).unwrap();
+            let second = session.tensor_backward(g_sum).unwrap();
+            session.tensor_gradient(&second, weight).unwrap().to_vec()
+        };
+
+        let fused = build(false);
+        let unfused = build(true);
+        assert_eq!(fused.len(), unfused.len());
+        // Not asserted bitwise: the fused arm forms `incoming * mask` inside the kernel while
+        // the composed arm builds it as a tape node, so the two can round differently even
+        // though both are f32-precision. A wrong-or-missing second-order arm is off by orders
+        // of magnitude (commonly all-zero), not by an ulp.
+        for (a, b) in fused.iter().zip(&unfused) {
+            let scale = a.abs().max(b.abs()).max(1.0);
+            assert!(
+                (a - b).abs() / scale < 1e-6,
+                "fused second derivative {a} diverges from unfused {b}"
+            );
+        }
+        assert!(
+            fused.iter().any(|v| v.abs() > 1e-12),
+            "second derivative is identically zero — that is the create_graph-arm-missing \
+             signature, and it would make the comparison above vacuous"
+        );
     }
 }
