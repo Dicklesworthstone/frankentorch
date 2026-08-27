@@ -32230,6 +32230,42 @@ static SVD_QR_REPLAY_BLOCK_OVERRIDE: std::sync::atomic::AtomicUsize =
 pub fn set_svd_qr_replay_block_override(b: usize) {
     SVD_QR_REPLAY_BLOCK_OVERRIDE.store(b, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Whether the U/V rotation replay transposes its row-block first. Default TRUE; the false
+/// arm is the row-major replay it replaces, kept as the measurement arm.
+///
+/// `frankentorch-i040z`. WHY THE LAYOUT AND NOT THE ARITHMETIC. Measured with retired
+/// instructions (deterministic, and this host has refused wall-clock window after window):
+/// singular-VECTOR accumulation is the ENTIRE SVD loss — values-only is at instruction parity
+/// with LAPACK (1.126x) while the full factorisation is 3.94x, so the gap is 6.35x and lives
+/// here. The row-major form rotates a CONTIGUOUS pair `(j, j+1)` while its row loop strides by
+/// `n`, so LLVM vectorised across the PAIR: `vshufpd`, two `vmulpd`, then `vaddpd` AND
+/// `vsubpd` computed full width and blended with `vmovsd` — four candidate values produced to
+/// keep two, at 128 bits, on a machine with 256-bit vectors. About 0.46 FLOPs per instruction
+/// against LAPACK `gesdd`'s 1.765.
+///
+/// Transposing the block once makes `r` the contiguous axis, so each rotation becomes two
+/// straight vector expressions over `nrows` elements with no shuffle and no discarded lane.
+/// The transpose is O(br·n) per block and runs ONCE, against O(n²·br) of replay, so it is a
+/// vanishing fraction.
+///
+/// IT IS BIT-EXACT, and for the same reason `4zjaa`'s across-rows dot product is: every element
+/// still computes `xv*c + zv*s` and `zv*c - xv*s` from the same inputs in the same order.
+/// NOTHING is reassociated and nothing is summed across lanes; only the memory layout the
+/// arithmetic is read from changes. `svd_replay_transposed_matches_row_major_bitwise` is the
+/// test that says so.
+static SVD_REPLAY_TRANSPOSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+fn svd_replay_transposed() -> bool {
+    SVD_REPLAY_TRANSPOSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Set the replay layout, returning the previous setting. Exists so the two arms can be
+/// alternated INSIDE one process against one incumbent, which is the only kind of A/B this
+/// host reliably grants.
+#[doc(hidden)]
+pub fn set_svd_replay_transposed(t: bool) -> bool {
+    SVD_REPLAY_TRANSPOSED.swap(t, std::sync::atomic::Ordering::Relaxed)
+}
 fn svd_qr_replay_block_rows() -> usize {
     match SVD_QR_REPLAY_BLOCK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => 8,
@@ -34686,24 +34722,69 @@ fn svd_bidiag_qr_f64(
     if !v_ops.is_empty() {
         let ops = &v_ops;
         let br = svd_replay_block;
+        let transposed = svd_replay_transposed();
         v.par_chunks_mut(br * n).for_each(|block| {
             let nrows = block.len() / n;
+            if !transposed {
+                // The pre-i040z row-major replay, kept as the measurement arm. Same arithmetic
+                // in the same order per element; the two arms differ only in memory layout and
+                // their outputs are bit-identical.
+                for &op in ops {
+                    match op {
+                        SvdVOp::Rot(j, c, s) => {
+                            for r in 0..nrows {
+                                let base = r * n;
+                                let xv = block[base + j];
+                                let zv = block[base + j + 1];
+                                block[base + j] = xv * c + zv * s;
+                                block[base + j + 1] = zv * c - xv * s;
+                            }
+                        }
+                        SvdVOp::Neg(k) => {
+                            for r in 0..nrows {
+                                block[r * n + k] = -block[r * n + k];
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            // t[col * nrows + r] = block[r * n + col]: the rotated columns become CONTIGUOUS
+            // runs, so the `r` loop below is a straight vector expression instead of a
+            // stride-`n` walk. Paid once per block against O(n^2) rotations over it.
+            let mut t = vec![0.0f64; nrows * n];
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    t[col * nrows + r] = block[base + col];
+                }
+            }
             for &op in ops {
                 match op {
                     SvdVOp::Rot(j, c, s) => {
+                        // j and j+1 are adjacent columns, so their runs are adjacent in `t`
+                        // and one split yields both disjoint halves.
+                        let (head, tail) = t.split_at_mut((j + 1) * nrows);
+                        let xs = &mut head[j * nrows..];
+                        let zs = &mut tail[..nrows];
                         for r in 0..nrows {
-                            let base = r * n;
-                            let xv = block[base + j];
-                            let zv = block[base + j + 1];
-                            block[base + j] = xv * c + zv * s;
-                            block[base + j + 1] = zv * c - xv * s;
+                            let xv = xs[r];
+                            let zv = zs[r];
+                            xs[r] = xv * c + zv * s;
+                            zs[r] = zv * c - xv * s;
                         }
                     }
                     SvdVOp::Neg(k) => {
-                        for r in 0..nrows {
-                            block[r * n + k] = -block[r * n + k];
+                        for e in &mut t[k * nrows..(k + 1) * nrows] {
+                            *e = -*e;
                         }
                     }
+                }
+            }
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    block[base + col] = t[col * nrows + r];
                 }
             }
         });
@@ -34712,15 +34793,56 @@ fn svd_bidiag_qr_f64(
     if track_left && !u_ops.is_empty() {
         let ops = &u_ops;
         let br = svd_replay_block;
+        let transposed = svd_replay_transposed();
         a.par_chunks_mut(br * n).for_each(|block| {
             let nrows = block.len() / n;
+            if !transposed {
+                for &(c0, c1, c, s) in ops {
+                    for r in 0..nrows {
+                        let base = r * n;
+                        let yu = block[base + c0];
+                        let zu = block[base + c1];
+                        block[base + c0] = yu * c + zu * s;
+                        block[base + c1] = zu * c - yu * s;
+                    }
+                }
+                return;
+            }
+            let mut t = vec![0.0f64; nrows * n];
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    t[col * nrows + r] = block[base + col];
+                }
+            }
             for &(c0, c1, c, s) in ops {
+                // Unlike the V stream, c0 and c1 are NOT adjacent in general, so split at the
+                // larger and index the smaller in the head. c0 == c1 would alias; the stream
+                // never emits it (a rotation acts on two distinct columns) and the branch below
+                // keeps the slicing sound rather than trusting that.
+                if c0 == c1 {
+                    continue;
+                }
+                let (lo, hi) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
+                let (head, tail) = t.split_at_mut(hi * nrows);
+                let lo_run = &mut head[lo * nrows..lo * nrows + nrows];
+                let hi_run = &mut tail[..nrows];
+                let (ys, zs) = if c0 < c1 {
+                    (lo_run, hi_run)
+                } else {
+                    (hi_run, lo_run)
+                };
                 for r in 0..nrows {
-                    let base = r * n;
-                    let yu = block[base + c0];
-                    let zu = block[base + c1];
-                    block[base + c0] = yu * c + zu * s;
-                    block[base + c1] = zu * c - yu * s;
+                    let yu = ys[r];
+                    let zu = zs[r];
+                    ys[r] = yu * c + zu * s;
+                    zs[r] = zu * c - yu * s;
+                }
+            }
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    block[base + col] = t[col * nrows + r];
                 }
             }
         });
@@ -69021,6 +69143,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `frankentorch-i040z`: the transposed U/V rotation replay and the row-major loop it
+    /// replaces must agree BIT FOR BIT, on every output the SVD produces.
+    ///
+    /// The change is a memory LAYOUT change only — each element still computes `xv*c + zv*s`
+    /// and `zv*c - xv*s` from the same inputs in the same order, nothing is reassociated and
+    /// nothing is summed across lanes — so bitwise equality is the correct assertion here, not
+    /// a tolerance. If this ever needs loosening, the layout change has stopped being the only
+    /// difference and the reason must be found, not the bound.
+    ///
+    /// Shapes deliberately straddle the branches: square (V and U streams both long), tall
+    /// (m > n, the U stream dominates), and sizes that are NOT multiples of the replay row
+    /// block (8) so the short trailing block is exercised — that block is where a transpose
+    /// that assumes a full `br` rows would corrupt memory or silently drop rows.
+    ///
+    /// On the global toggle and test parallelism: flipping it can only change WHICH of two
+    /// bit-identical paths a concurrently running test takes, never that test's result. That
+    /// is precisely what this test establishes, so the race is benign by construction.
+    #[test]
+    fn svd_replay_transposed_matches_row_major_bitwise() {
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
+        let mut mismatches: Vec<String> = Vec::new();
+        // (m, n): 64x64 square; 96x48 tall; 33x17 and 70x35 both non-multiples of br=8.
+        for &(m, n) in &[(64usize, 64usize), (96usize, 48usize), (33usize, 17usize), (70usize, 35usize)] {
+            let base = bidiag_test_matrix(m, n, 0x5EED ^ (m * 131 + n) as u64);
+
+            let previous = super::set_svd_replay_transposed(false);
+            let mut a_row = base.clone();
+            let (w_row, v_row) = match super::golub_reinsch_svd(&mut a_row, m, n) {
+                Ok(out) => out,
+                Err(e) => {
+                    super::set_svd_replay_transposed(previous);
+                    panic!("row-major svd failed at m={m} n={n}: {e:?}");
+                }
+            };
+
+            super::set_svd_replay_transposed(true);
+            let mut a_tr = base.clone();
+            let transposed = super::golub_reinsch_svd(&mut a_tr, m, n);
+            super::set_svd_replay_transposed(previous);
+            let (w_tr, v_tr) = transposed.unwrap_or_else(|e| {
+                panic!("transposed svd failed at m={m} n={n}: {e:?}")
+            });
+
+            if bits(&a_row) != bits(&a_tr) {
+                mismatches.push(format!("m={m} n={n}: U differs"));
+            }
+            if bits(&w_row) != bits(&w_tr) {
+                mismatches.push(format!("m={m} n={n}: singular values differ"));
+            }
+            if bits(&v_row) != bits(&v_tr) {
+                mismatches.push(format!("m={m} n={n}: V differs"));
+            }
+            // A run where the vectors came back all-zero would satisfy bitwise equality while
+            // measuring nothing; assert the outputs are actually populated.
+            assert!(
+                a_tr.iter().any(|e| e.abs() > 1e-12) && v_tr.iter().any(|e| e.abs() > 1e-12),
+                "m={m} n={n}: U or V is identically zero, so the comparison above is vacuous"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "transposed replay diverged from row-major: {}",
+            mismatches.join("; ")
+        );
     }
 
     #[test]
