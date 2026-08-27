@@ -36790,6 +36790,20 @@ fn qr_blocked_forward_f64(
                 let dst = i * nt;
                 rt[dst..dst + nt].copy_from_slice(&r_mat[base..base + nt]);
             }
+            // BOTH STAGING BUFFERS STAY, and both are measured, not assumed.
+            //
+            //   `rt` gather     — removing it (r_mat strided as B) was 1.144x SLOWER
+            //   `vt` transpose  — removing it (dgemm_tb, A strided) was 1.079x SLOWER
+            //                     (163.296 -> 176.243 ms at n=1024/nb=32/leaf=2)
+            //
+            // Both are bit-exact alternatives; both lose. A sequential memcpy feeding a
+            // PACKED gemm beats stride-walking an INPUT inside the gemm, which is exactly
+            // why BLIS/Goto pack deliberately.
+            //
+            // Contrast the OUTPUT side, where `dgemm_sub_into` (alpha=-1/beta=1 into
+            // strided C) WON 1.082x by removing the `upd` buffer and its scatter pass. The
+            // asymmetry is the point: strided OUTPUT avoids a materialised buffer for free;
+            // strided INPUT defeats the packing the microkernel depends on.
             let mut vt = vec![0.0f64; nb * m];
             for row in 0..m {
                 for c in 0..nb {
