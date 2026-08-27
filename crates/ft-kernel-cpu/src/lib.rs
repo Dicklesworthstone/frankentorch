@@ -27801,8 +27801,7 @@ fn eigh_tred2_reduce_packed_full_gated(
                                 gg += row_j[k] * row_i_ro[k];
                             }
                             let mut lower_col_offset = lower_packed_index(j + 1, j);
-                            for (k, &row_i_k) in
-                                row_i_ro.iter().enumerate().take(l + 1).skip(j + 1)
+                            for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1)
                             {
                                 gg += prev_ro[lower_col_offset] * row_i_k;
                                 lower_col_offset += k + 1;
@@ -27811,24 +27810,24 @@ fn eigh_tred2_reduce_packed_full_gated(
                         })
                         .collect()
                 } else {
-                (0..=l)
-                    .into_par_iter()
-                    .map(|j| {
-                        let mut gg = 0.0;
-                        let row_j_start = lower_packed_index(j, 0);
-                        let row_j = &prev_ro[row_j_start..=row_j_start + j];
-                        for k in 0..=j {
-                            gg += row_j[k] * row_i_ro[k];
-                        }
-                        let mut lower_col_offset = lower_packed_index(j + 1, j);
-                        for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1)
-                        {
-                            gg += prev_ro[lower_col_offset] * row_i_k;
-                            lower_col_offset += k + 1;
-                        }
-                        gg
-                    })
-                    .collect()
+                    (0..=l)
+                        .into_par_iter()
+                        .map(|j| {
+                            let mut gg = 0.0;
+                            let row_j_start = lower_packed_index(j, 0);
+                            let row_j = &prev_ro[row_j_start..=row_j_start + j];
+                            for k in 0..=j {
+                                gg += row_j[k] * row_i_ro[k];
+                            }
+                            let mut lower_col_offset = lower_packed_index(j + 1, j);
+                            for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1)
+                            {
+                                gg += prev_ro[lower_col_offset] * row_i_k;
+                                lower_col_offset += k + 1;
+                            }
+                            gg
+                        })
+                        .collect()
                 };
                 f = 0.0;
                 for j in 0..=l {
@@ -27860,7 +27859,9 @@ fn eigh_tred2_reduce_packed_full_gated(
                 if l < par_min_l {
                     rows.iter_mut().enumerate().for_each(|(j, r)| update(j, r));
                 } else {
-                    rows.par_iter_mut().enumerate().for_each(|(j, r)| update(j, r));
+                    rows.par_iter_mut()
+                        .enumerate()
+                        .for_each(|(j, r)| update(j, r));
                 }
             }
         } else {
@@ -36990,7 +36991,8 @@ pub fn geqrf_blocked_nb_f64(
     if k == 0 {
         return (packed, Vec::new());
     }
-    let panels = qr_blocked_forward_f64(&mut packed, m, n, k, nb_block.max(1), leaf.max(1), timings);
+    let panels =
+        qr_blocked_forward_f64(&mut packed, m, n, k, nb_block.max(1), leaf.max(1), timings);
 
     // The forward pass leaves R in the upper triangle and ZEROS below it, so scattering
     // the reflectors into the lower triangle overwrites nothing R needs.
@@ -44410,7 +44412,8 @@ mod tests {
         let gbs = (nf * nf * nf / 6.0) * 2.0 * 8.0 / (br as f64);
         println!(
             "EIGH_PHASE n={N:>5} min-of-{REPS}  reduce={:8.2}ms ({:5.1}%)  backtransform={:8.2}ms  tql2={:8.2}ms   reduce_rate: {gflops:6.2} GFLOP/s  {gbs:6.2} GB/s",
-            br as f64 / 1e6, 100.0 * br as f64 / tot,
+            br as f64 / 1e6,
+            100.0 * br as f64 / tot,
             bb as f64 / 1e6,
             bt as f64 / 1e6,
         );
@@ -44571,8 +44574,7 @@ mod tests {
                 for leaf in [2usize, 4] {
                     let mut t = super::QrStageTimings::default();
                     let start = std::time::Instant::now();
-                    let (_p, _tau) =
-                        super::geqrf_blocked_nb_f64(&a, N, N, nb, leaf, Some(&mut t));
+                    let (_p, _tau) = super::geqrf_blocked_nb_f64(&a, N, N, nb, leaf, Some(&mut t));
                     let ms = start.elapsed().as_secs_f64() * 1e3;
                     let key = nb * 100 + leaf;
                     match best.get(&key) {
