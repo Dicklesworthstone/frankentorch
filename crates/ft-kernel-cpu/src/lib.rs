@@ -44773,9 +44773,12 @@ mod tests {
             println!(
                 "GETRF_PHASE n={n:>5} min-of-{REPS} wall={:8.2}ms  panel={:5.1}% ({:7.2}ms)  solve={:5.1}% ({:7.2}ms)  trailing={:5.1}% ({:7.2}ms)",
                 w / 1e6,
-                100.0 * pn as f64 / w, pn as f64 / 1e6,
-                100.0 * sn as f64 / w, sn as f64 / 1e6,
-                100.0 * tn as f64 / w, tn as f64 / 1e6,
+                100.0 * pn as f64 / w,
+                pn as f64 / 1e6,
+                100.0 * sn as f64 / w,
+                sn as f64 / 1e6,
+                100.0 * tn as f64 / w,
+                tn as f64 / 1e6,
             );
         }
     }
@@ -69701,8 +69704,7 @@ mod tests {
                 let mut packed = bidiag_test_matrix(m, n, 0xC0DEC0DE ^ (m * 131 + n) as u64);
                 let (_d, _e, tauq, _taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
                 let reference = super::bidiag::bidiag_form_q_f64(&packed, m, n, &tauq);
-                let blocked =
-                    super::bidiag::bidiag_form_q_blocked_f64(&packed, m, n, &tauq, nb);
+                let blocked = super::bidiag::bidiag_form_q_blocked_f64(&packed, m, n, &tauq, nb);
 
                 let worst = reference
                     .iter()
