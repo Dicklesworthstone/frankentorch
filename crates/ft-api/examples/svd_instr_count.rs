@@ -40,6 +40,35 @@ fn arg(name: &str, default: usize) -> usize {
     default
 }
 
+/// The h2h lane's DEFAULT fixture, `_mk(n, False)` — reproduced here bit-for-bit so the
+/// instruction ratio can be read on the exact matrix the banked wall-clock rows were taken on.
+///
+/// It is `3*I` plus a low-rank modular term: at n=512, 495 of its 512 singular values are
+/// exactly 3.0. `frankentorch-gqmws`.
+fn fixture_mk(n: usize) -> Vec<f64> {
+    let mut a = vec![0.0_f64; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            let v = ((((r + 2) * (c + 3)) % 17) as f64 - 8.0) * 0.05;
+            a[r * n + c] = v + if r == c { 3.0 } else { 0.0 };
+        }
+    }
+    a
+}
+
+/// The h2h lane's `FT_FIXTURE=generic` matrix, reproduced bit-for-bit (integer arithmetic, a
+/// power-of-two scale, exact `+16` diagonal). 512 of 512 distinct singular values, cond 97.4.
+fn fixture_generic(n: usize) -> Vec<f64> {
+    let mut a = vec![0.0_f64; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            let h = (r * 73 + c * 151 + (r * c) % 257) % 2048;
+            a[r * n + c] = (h as f64) / 2048.0 - 1.0 + if r == c { 16.0 } else { 0.0 };
+        }
+    }
+    a
+}
+
 /// Deterministic, well-conditioned-enough fixture. A fixed LCG rather than `rand` so the
 /// values are identical on every run, every host and every build.
 fn fixture_bumped(n: usize, bump: f64) -> Vec<f64> {
@@ -65,8 +94,16 @@ fn main() {
     let iters = arg("--iters", 1);
     let values_only = std::env::var("FT_VALUES_ONLY").is_ok();
 
+    // FT_FIXTURE mirrors the h2h harness's own selector by name, so the two tools cannot drift
+    // apart on which matrix they mean. Default stays the LCG fixture the earlier rows used.
+    let kind = std::env::var("FT_FIXTURE").unwrap_or_else(|_| "lcg".to_owned());
     let bump = arg("--bump", 4) as f64;
-    let data = fixture_bumped(n, bump);
+    let data = match kind.as_str() {
+        "mk" => fixture_mk(n),
+        "generic" => fixture_generic(n),
+        _ => fixture_bumped(n, bump),
+    };
+    eprintln!("fixture={kind}");
     let mut checksum = 0.0f64;
 
     for _ in 0..iters {
