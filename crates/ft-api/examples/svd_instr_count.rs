@@ -87,4 +87,25 @@ fn main() {
     // a factorisation whose output is never read, and that failure mode looks exactly like a
     // fast implementation.
     println!("n={n} iters={iters} checksum={checksum:.12e}");
+
+    // Read the SAME phase counters the h2h harness quotes, on THIS path. The harness reports
+    // the sweep at ~0.26 ms while a perf instruction profile of this driver puts 78% of
+    // retired instructions inside the function that timer wraps; those cannot both describe
+    // the same work, and printing both instruments from one run is what tells them apart.
+    if std::env::var("FT_PHASES").is_ok() {
+        let (reduction, form_pq, sweep) = ft_kernel_cpu::svd_reduction_sweep_ns_take();
+        let (dl_qr, dl_gemm, dl_assemble) = ft_kernel_cpu::svd_deferred_left_phase_ns_take();
+        let hits = ft_kernel_cpu::svd_deferred_left_hits_take();
+        let ms = |v: u64| v as f64 / 1e6;
+        println!(
+            "phases_ms reduction={:.3} form_pq={:.3} sweep={:.3} | deferred_left qr={:.3} \
+             gemm={:.3} assemble={:.3} hits={hits}",
+            ms(reduction),
+            ms(form_pq),
+            ms(sweep),
+            ms(dl_qr),
+            ms(dl_gemm),
+            ms(dl_assemble)
+        );
+    }
 }
