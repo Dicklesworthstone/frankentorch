@@ -23924,6 +23924,77 @@ pub fn lu_stage_take_ns() -> (u64, u64, u64) {
     )
 }
 
+/// Recursive GETRF panel factorization: pivots swap full rows, while each split
+/// turns its internal Schur-complement update into GEMM before recursing right.
+fn lu_factor_panel_recursive_f64(
+    lu: &mut [f64], n: usize, start: usize, end: usize, pivots: &mut [usize],
+    ipiv: &mut [usize], singular_tol: f64,
+) {
+    const LEAF: usize = 16;
+    if end - start <= LEAF {
+        for k in start..end {
+            let mut max_row = k;
+            let mut max_val = lu[k * n + k].abs();
+            for i in (k + 1)..n {
+                let value = lu[i * n + k].abs();
+                if value > max_val { max_val = value; max_row = i; }
+            }
+            ipiv[k] = max_row;
+            if max_row != k {
+                pivots.swap(k, max_row);
+                for j in 0..n { lu.swap(k * n + j, max_row * n + j); }
+            }
+            let diag = lu[k * n + k];
+            if diag.abs() < singular_tol {
+                for i in (k + 1)..n { lu[i * n + k] = 0.0; }
+                continue;
+            }
+            if n - k - 1 >= 64 && rayon::current_num_threads() > 1 {
+                let (head, tail) = lu.split_at_mut((k + 1) * n);
+                let pivot_row = &head[k * n..(k + 1) * n];
+                tail.par_chunks_mut(n).for_each(|row| {
+                    let multiplier = row[k] / diag;
+                    row[k] = multiplier;
+                    for j in (k + 1)..end { row[j] -= multiplier * pivot_row[j]; }
+                });
+            } else {
+                for i in (k + 1)..n {
+                    let multiplier = lu[i * n + k] / diag;
+                    lu[i * n + k] = multiplier;
+                    for j in (k + 1)..end { lu[i * n + j] -= multiplier * lu[k * n + j]; }
+                }
+            }
+        }
+        return;
+    }
+
+    let mid = start + (end - start) / 2;
+    lu_factor_panel_recursive_f64(lu, n, start, mid, pivots, ipiv, singular_tol);
+    // U12 = L11^-1 A12, restricted to this panel; the outer GETRF solves its tail.
+    for i in start..mid {
+        for j in mid..end {
+            let mut value = lu[i * n + j];
+            for h in start..i { value -= lu[i * n + h] * lu[h * n + j]; }
+            lu[i * n + j] = value;
+        }
+    }
+    let rank = mid - start;
+    let rows = n - mid;
+    let cols = end - mid;
+    let mut l21 = vec![0.0; rows * rank];
+    for row in 0..rows {
+        let src = (mid + row) * n + start;
+        l21[row * rank..row * rank + rank].copy_from_slice(&lu[src..src + rank]);
+    }
+    let mut u12 = vec![0.0; rank * cols];
+    for row in 0..rank {
+        let src = (start + row) * n + mid;
+        u12[row * cols..row * cols + cols].copy_from_slice(&lu[src..src + cols]);
+    }
+    gemm::dgemm_sub_into(rows, rank, cols, &l21, &u12, lu, mid * n + mid, n);
+    lu_factor_panel_recursive_f64(lu, n, mid, end, pivots, ipiv, singular_tol);
+}
+
 pub fn lu_factor_contiguous_nb_f64(
     data: &[f64],
     meta: &TensorMeta,
@@ -23972,7 +24043,6 @@ pub fn lu_factor_contiguous_nb_f64(
     let nb_runtime = nb_param.max(1);
     #[allow(non_snake_case)]
     let NB: usize = nb_runtime;
-    const LU_PAR_MIN_ROWS: usize = 64;
     let singular_tol = f64::EPSILON * 1e3;
 
     let mut k0 = 0;
@@ -23980,59 +24050,8 @@ pub fn lu_factor_contiguous_nb_f64(
         let pe = (k0 + NB).min(n); // panel end (exclusive)
 
         let __t_panel = std::time::Instant::now();
-        // --- 1. Factor the column panel [k0, pe), eliminating within the panel ---
-        for k in k0..pe {
-            // Pivot: row with max |lu[i][k]| for i >= k.
-            let mut max_val = lu[k * n + k].abs();
-            let mut max_row = k;
-            for i in (k + 1)..n {
-                let val = lu[i * n + k].abs();
-                if val > max_val {
-                    max_val = val;
-                    max_row = i;
-                }
-            }
-            ipiv[k] = max_row; // LAPACK getrf pivot for this column (0-indexed)
-            if max_row != k {
-                pivots.swap(k, max_row);
-                for j in 0..n {
-                    lu.swap(k * n + j, max_row * n + j); // full-row swap
-                }
-            }
-            let diag = lu[k * n + k];
-            if diag.abs() < singular_tol {
-                // Near-singular: zero the column's multipliers so the trailing
-                // GEMM contributes nothing for it. Downstream (det/inv/solve)
-                // detect singularity via the U diagonal.
-                for i in (k + 1)..n {
-                    lu[i * n + k] = 0.0;
-                }
-                continue;
-            }
-            // Scale L below the pivot and eliminate WITHIN the panel only
-            // (columns k+1..pe); trailing columns are deferred to the GEMM.
-            let rows_below = n - k - 1;
-            if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
-                let (head, tail) = lu.split_at_mut((k + 1) * n);
-                let pivot_row = &head[k * n..(k + 1) * n];
-                tail.par_chunks_mut(n).for_each(|row_i| {
-                    let m = row_i[k] / diag;
-                    row_i[k] = m;
-                    for j in (k + 1)..pe {
-                        row_i[j] -= m * pivot_row[j];
-                    }
-                });
-            } else {
-                for i in (k + 1)..n {
-                    let m = lu[i * n + k] / diag;
-                    lu[i * n + k] = m;
-                    for j in (k + 1)..pe {
-                        lu[i * n + j] -= m * lu[k * n + j];
-                    }
-                }
-            }
-        }
-
+        // --- 1. Factor the column panel [k0, pe) recursively ---
+        lu_factor_panel_recursive_f64(&mut lu, n, k0, pe, &mut pivots, &mut ipiv, singular_tol);
         let kb = pe - k0; // panel width
         let tcols = n - pe; // trailing columns
         if tcols == 0 {
@@ -63133,6 +63152,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn lu_factor_recursive_panel_propagates_right_half_pivot() {
+        // A wrong recursive GETRF that swaps only its right subpanel leaves
+        // earlier columns attached to the old rows.  This forces the first
+        // pivot in that right half and checks both IPIV and reconstruction.
+        const N: usize = 64;
+        let mut a = vec![0.0_f64; N * N];
+        for i in 0..N {
+            for j in 0..N { a[i * N + j] = ((i * 19 + j * 7) % 23) as f64 * 0.001; }
+            a[i * N + i] += 10.0;
+        }
+        a[32 * N + 32] = 0.0;
+        a[33 * N + 32] = 100.0;
+        let meta = TensorMeta::from_shape(vec![N, N], DType::F64, Device::Cpu);
+        let recursive = super::lu_factor_contiguous_nb_f64(&a, &meta, N).expect("recursive lu");
+        let scalar = super::lu_factor_contiguous_nb_f64(&a, &meta, 1).expect("scalar lu");
+        assert_eq!(recursive.ipiv, scalar.ipiv, "recursive pivots must match GETRF");
+        assert_eq!(recursive.ipiv[32], 33, "fixture must reach the right half pivot");
+        let unpacked = super::lu_unpack(&recursive);
+        let pl = mat_mul_nn(&unpacked.p, &unpacked.l, N);
+        let plu = mat_mul_nn(&pl, &unpacked.u, N);
+        assert_mat_approx_eq(&plu, &a, 1e-8, "right-half pivot must reach all columns");
     }
 
     #[test]
