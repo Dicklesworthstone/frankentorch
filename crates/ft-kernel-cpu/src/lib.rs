@@ -33750,20 +33750,23 @@ mod bidiag {
                 let src = (p0 + r) * n + p0;
                 block[r * ncols..(r + 1) * ncols].copy_from_slice(&q[src..src + ncols]);
             }
-            let mut vt = vec![0.0f64; w * mrows];
-            for r in 0..mrows {
-                for j in 0..w {
-                    vt[j * mrows + r] = vmat[r * w + j];
-                }
-            }
             let mut w1 = vec![0.0f64; w * ncols];
-            // dgemm(m, k, n) wants a: m x k, b: k x n, c: m x n. This is V^T B with
-            // vt = w x mrows and block = mrows x ncols, so k is mrows and n is ncols.
-            // These were transposed, which is INVISIBLE on square input (mrows == ncols)
-            // and panics inside dgemm's `c[..m*n]` slice on any TALL one — the sibling
-            // form_p call is dgemm(w, nrows, nrows, ..), where both arguments are the same
-            // value, so the same slip could not show there.
-            super::gemm::dgemm(w, mrows, ncols, &vt, &block, &mut w1);
+            // V^T B, WITHOUT materialising V^T. `dgemm_tb(m, k, n, a, b, c)` computes
+            // `C[m,n] = A^T @ B` with `A` row-major `[k, m]`, reading A through strides
+            // (rsa=1, csa=m) — and `vmat` is already `[mrows, w]`, exactly that layout. So
+            // m=w, k=mrows, n=ncols.
+            //
+            // WHY: a cache-miss profile puts `dgemm` at 29.80% of the op's misses on 13.32%
+            // of its instructions, the largest single contributor, and the staged transpose
+            // is part of that traffic. `dgemm_tb` documents that its K traversal matches the
+            // materialise-transpose-then-dgemm path element for element, so this is bit-exact
+            // rather than merely equivalent.
+            //
+            // The `dgemm(m, k, n)` argument order is worth keeping in view here: it wants
+            // a: m x k, b: k x n, c: m x n. k and n were once transposed at this call site,
+            // which is INVISIBLE on square input (mrows == ncols) and panics inside dgemm's
+            // `c[..m*n]` slice on any TALL one.
+            super::gemm::dgemm_tb(w, mrows, ncols, &vmat, &block, &mut w1);
             let mut w2 = vec![0.0f64; w * ncols];
             super::gemm::dgemm(w, w, ncols, &tmat, &w1, &mut w2);
             let mut upd = vec![0.0f64; mrows * ncols];
@@ -33889,14 +33892,12 @@ mod bidiag {
                 let src = (row0 + r) * n + row0;
                 block[r * nrows..(r + 1) * nrows].copy_from_slice(&p[src..src + nrows]);
             }
-            let mut vt = vec![0.0f64; w * nrows];
-            for r in 0..nrows {
-                for j in 0..w {
-                    vt[j * nrows + r] = vmat[r * w + j];
-                }
-            }
             let mut w1 = vec![0.0f64; w * nrows];
-            super::gemm::dgemm(w, nrows, nrows, &vt, &block, &mut w1); // V^T B
+            // V^T B without materialising V^T — same substitution as the form_q sibling.
+            // `vmat` is row-major [nrows, w], which is exactly the [k, m] operand `dgemm_tb`
+            // reads through strides, so m=w, k=nrows, n=nrows. Bit-exact: dgemm_tb's K
+            // traversal matches the materialise-then-dgemm path element for element.
+            super::gemm::dgemm_tb(w, nrows, nrows, &vmat, &block, &mut w1); // V^T B
             let mut w2 = vec![0.0f64; w * nrows];
             super::gemm::dgemm(w, w, nrows, &tmat, &w1, &mut w2); // T (V^T B)
             let mut upd = vec![0.0f64; nrows * nrows];
