@@ -42,7 +42,7 @@ fn arg(name: &str, default: usize) -> usize {
 
 /// Deterministic, well-conditioned-enough fixture. A fixed LCG rather than `rand` so the
 /// values are identical on every run, every host and every build.
-fn fixture(n: usize) -> Vec<f64> {
+fn fixture_bumped(n: usize, bump: f64) -> Vec<f64> {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
     let mut out = Vec::with_capacity(n * n);
     for _ in 0..n * n {
@@ -55,7 +55,7 @@ fn fixture(n: usize) -> Vec<f64> {
     // change how many QR sweeps the bidiagonal solver runs, which would make the count
     // depend on the fixture rather than on the code.
     for i in 0..n {
-        out[i * n + i] += 4.0;
+        out[i * n + i] += bump;
     }
     out
 }
@@ -65,7 +65,8 @@ fn main() {
     let iters = arg("--iters", 1);
     let values_only = std::env::var("FT_VALUES_ONLY").is_ok();
 
-    let data = fixture(n);
+    let bump = arg("--bump", 4) as f64;
+    let data = fixture_bumped(n, bump);
     let mut checksum = 0.0f64;
 
     for _ in 0..iters {
