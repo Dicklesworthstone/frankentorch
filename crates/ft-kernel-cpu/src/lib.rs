@@ -33598,6 +33598,130 @@ mod bidiag {
         q
     }
 
+    /// Blocked compact-WY form of [`bidiag_form_q_f64`].
+    ///
+    /// `Q`'s packed column reflector `i` acts on rows `i..m`. A descending
+    /// panel therefore shares the rectangular trailing block
+    /// `[panel_start..m, panel_start..n)`: its reflectors form the same
+    /// staircase-column `V` as [`bidiag_form_p_blocked_f64`], but apply from
+    /// the left to an `m_tail x n_tail` block. The compact-WY identity
+    /// `I - V T V^T` turns the panel from rank-1 BLAS-2 sweeps into three
+    /// GEMMs. Like blocked `form_p`, this reassociates floating-point work and
+    /// is admitted under the SVD tolerance/orthonormality contract rather than
+    /// a bitwise-equality contract.
+    pub(crate) fn bidiag_form_q_blocked_f64(
+        packed: &[f64],
+        m: usize,
+        n: usize,
+        tauq: &[f64],
+        nb: usize,
+    ) -> Vec<f64> {
+        // The SVD prologue normally canonicalizes to m >= n. Keep the helper's
+        // existing rectangular behavior for any direct caller outside that
+        // invariant instead of constructing a panel with no live rows.
+        if m < n {
+            return bidiag_form_q_f64(packed, m, n, tauq);
+        }
+
+        let nb = nb.max(1);
+        let mut q = vec![0.0f64; m * n];
+        for (i, row) in q.chunks_exact_mut(n).enumerate().take(n) {
+            row[i] = 1.0;
+        }
+        if n == 0 {
+            return q;
+        }
+
+        // The unblocked loop applies the greatest-index reflector first. Keep
+        // that panel order so the product remains H_0 H_1 ... H_(n-1).
+        let mut panel_end = n - 1;
+        loop {
+            let w = nb.min(panel_end + 1);
+            let p0 = panel_end + 1 - w;
+            let mrows = m - p0;
+            let ncols = n - p0;
+
+            // Staircase V and its taus. Column j represents reflector p0+j:
+            // it is unit at row j in the panel and contains the packed tail
+            // below it.
+            let mut vmat = vec![0.0f64; mrows * w];
+            let mut taus = vec![0.0f64; w];
+            for j in 0..w {
+                let i = p0 + j;
+                let tau = tauq[i];
+                taus[j] = tau;
+                if tau == 0.0 {
+                    continue;
+                }
+                vmat[j * w + j] = 1.0;
+                for r in 1..(m - i) {
+                    vmat[(j + r) * w + j] = packed[(i + r) * n + i];
+                }
+            }
+
+            // dlarft's forward, columnwise recurrence: the panel represents
+            // H_p0 H_(p0+1) ... H_panel_end.
+            let mut tmat = vec![0.0f64; w * w];
+            for j in 0..w {
+                let tau = taus[j];
+                tmat[j * w + j] = tau;
+                if tau == 0.0 {
+                    continue;
+                }
+                for q_col in 0..j {
+                    let mut dot = 0.0;
+                    for r in j..mrows {
+                        dot += vmat[r * w + q_col] * vmat[r * w + j];
+                    }
+                    tmat[q_col * w + j] = dot;
+                }
+                let mut tcol = vec![0.0f64; j];
+                for q_col in 0..j {
+                    let mut sum = 0.0;
+                    for s in q_col..j {
+                        sum += tmat[q_col * w + s] * tmat[s * w + j];
+                    }
+                    tcol[q_col] = -tau * sum;
+                }
+                for q_col in 0..j {
+                    tmat[q_col * w + j] = tcol[q_col];
+                }
+            }
+
+            // Apply the panel from the left to Q[p0..m, p0..n):
+            // B <- B - V T (V^T B).
+            let mut block = vec![0.0f64; mrows * ncols];
+            for r in 0..mrows {
+                let src = (p0 + r) * n + p0;
+                block[r * ncols..(r + 1) * ncols].copy_from_slice(&q[src..src + ncols]);
+            }
+            let mut vt = vec![0.0f64; w * mrows];
+            for r in 0..mrows {
+                for j in 0..w {
+                    vt[j * mrows + r] = vmat[r * w + j];
+                }
+            }
+            let mut w1 = vec![0.0f64; w * ncols];
+            super::gemm::dgemm(w, ncols, mrows, &vt, &block, &mut w1);
+            let mut w2 = vec![0.0f64; w * ncols];
+            super::gemm::dgemm(w, w, ncols, &tmat, &w1, &mut w2);
+            let mut upd = vec![0.0f64; mrows * ncols];
+            super::gemm::dgemm(mrows, w, ncols, &vmat, &w2, &mut upd);
+            for r in 0..mrows {
+                let dst = (p0 + r) * n + p0;
+                for c in 0..ncols {
+                    q[dst + c] = block[r * ncols + c] - upd[r * ncols + c];
+                }
+            }
+
+            if p0 == 0 {
+                break;
+            }
+            panel_end = p0 - 1;
+        }
+        q
+    }
+
     /// Materialise `P` (`n x n`) from the packed row reflectors left by
     /// [`bidiag_unblocked_f64`], such that `A == Q * B * P^T`.
     ///
@@ -34085,7 +34209,11 @@ fn svd_blocked_bidiag_prologue(
         bidiag::bidiag_form_p_f64(a, n, &taup)
     };
     if track_left {
-        let q = bidiag::bidiag_form_q_f64(a, m, n, &tauq);
+        let q = if n >= 130 {
+            bidiag::bidiag_form_q_blocked_f64(a, m, n, &tauq, svd_bidiag_block_size())
+        } else {
+            bidiag::bidiag_form_q_f64(a, m, n, &tauq)
+        };
         a[..m * n].copy_from_slice(&q);
     }
     SVD_FORM_PQ_NS.fetch_add(
@@ -69319,6 +69447,47 @@ mod tests {
                     (dot - want).abs() < 1e-9,
                     "Q^T Q [{c1},{c2}] = {dot}, expected {want}"
                 );
+            }
+        }
+    }
+
+    /// The compact-WY Q expansion must agree with the reflector-by-reflector
+    /// oracle across square and tall shapes, including a partial final panel.
+    /// The blocked path deliberately reassociates its GEMMs, so agreement is
+    /// tolerance-based; Q^T Q independently checks that the result remains an
+    /// orthonormal basis rather than merely tracking the old implementation.
+    #[test]
+    fn bidiag_blocked_form_q_matches_unblocked_expansion() {
+        for &(m, n) in &[(9usize, 6usize), (24, 16), (40, 33), (12, 3), (5, 1)] {
+            for &nb in &[1usize, 4, 16] {
+                let mut packed = bidiag_test_matrix(m, n, 0xC0DEC0DE ^ (m * 131 + n) as u64);
+                let (_d, _e, tauq, _taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+                let reference = super::bidiag::bidiag_form_q_f64(&packed, m, n, &tauq);
+                let blocked =
+                    super::bidiag::bidiag_form_q_blocked_f64(&packed, m, n, &tauq, nb);
+
+                let worst = reference
+                    .iter()
+                    .zip(&blocked)
+                    .fold(0.0f64, |worst, (a, b)| worst.max((a - b).abs()));
+                assert!(
+                    worst < 1e-11,
+                    "blocked form_q differs from the unblocked oracle by {worst} at m={m} n={n} nb={nb}"
+                );
+
+                for c1 in 0..n {
+                    for c2 in 0..n {
+                        let mut dot = 0.0;
+                        for r in 0..m {
+                            dot += blocked[r * n + c1] * blocked[r * n + c2];
+                        }
+                        let want = if c1 == c2 { 1.0 } else { 0.0 };
+                        assert!(
+                            (dot - want).abs() < 1e-9,
+                            "blocked Q^T Q [{c1},{c2}] = {dot}, expected {want} at m={m} n={n} nb={nb}"
+                        );
+                    }
+                }
             }
         }
     }
