@@ -138,6 +138,20 @@ struct Arm {
     /// between two runs of the same ELF), so both halves must be interleaved
     /// round-by-round inside one process against one live incumbent.
     values_only: bool,
+    /// Whether the U/V rotation replay transposes its row-block first — `frankentorch-i040z`,
+    /// shipped in `8e077e39`. `FT_REPLAY=1,0` puts both halves in ONE invocation against one
+    /// live incumbent.
+    ///
+    /// WHY IT NEEDS TO BE AN ARM. The change is bit-exact (same arithmetic, same order per
+    /// element, only the layout it is read from differs), so it can move time and cannot move
+    /// a number — which is exactly the shape that a two-binary A/B measures badly on this host
+    /// and an interleaved arm measures well. It was landed on an INSTRUCTION count (1.767x
+    /// fewer) and has never been priced in wall time; this is how it gets priced or reverted.
+    ///
+    /// It is only visible on a spectrum that actually exercises the sweep: on the default
+    /// fixture the QR sweep is 0% of the lane, so this arm would read as a null there by
+    /// construction. Run it with `FT_FIXTURE=generic`.
+    replay_transposed: bool,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -156,7 +170,11 @@ fn arm_label(arm: Arm) -> String {
             "1output"
         },
         if arm.values_only { "/VALUES-ONLY" } else { "" }
-    )
+    ) + if arm.replay_transposed {
+        "/replay-T"
+    } else {
+        "/replay-rowmajor"
+    }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -267,6 +285,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
+    let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -295,6 +314,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+        ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -314,6 +334,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+        ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -391,6 +412,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
+    ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
     (ms, sum)
 }
 
@@ -473,6 +495,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .collect();
+    // `frankentorch-i040z`'s lever as a paired arm. Default "1" (the shipped path) so an
+    // existing command measures exactly what it measured before; `FT_REPLAY=1,0` prices it
+    // against the row-major form in ONE invocation against ONE live incumbent. Pair it with
+    // FT_FIXTURE=generic — on the default fixture the QR sweep is 0% of the lane, so this arm
+    // is a null there by construction and would "prove" the lever worthless for the wrong
+    // reason.
+    let replays: Vec<bool> = std::env::var("FT_REPLAY")
+        .unwrap_or_else(|_| "1".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let panel_outputs: Vec<bool> = std::env::var("FT_PANEL_OUTPUT")
         .unwrap_or_else(|_| "1".to_string())
         .split(',')
@@ -496,13 +533,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for &blocked in &rowdots {
             for &fused in &fuseds {
                 for &panel_output_blocked in &panel_outputs {
-                    arms.push(Arm {
-                        gate,
-                        blocked,
-                        fused,
-                        panel_output_blocked,
-                        values_only: false,
-                    });
+                    for &replay_transposed in &replays {
+                        arms.push(Arm {
+                            gate,
+                            blocked,
+                            fused,
+                            panel_output_blocked,
+                            values_only: false,
+                            replay_transposed,
+                        });
+                    }
                 }
             }
         }
