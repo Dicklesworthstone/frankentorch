@@ -36541,6 +36541,21 @@ fn qr_apply_panel_block_reflector_f64(
         &work,
         &mut reflected,
     );
+    // MATERIALISE-THEN-SCATTER STAYS HERE, and that is measured.
+    //
+    // `dgemm_sub_into` (alpha=-1/beta=1 straight into strided C) won 1.082x on the TRAILING
+    // update, so the obvious move was to apply it here too. It was 1.059x SLOWER
+    // (163.296 -> 172.863 ms at n=1024/nb=32/leaf=2).
+    //
+    // WHY THE RULE DOES NOT TRANSFER: `dgemm_sub_into` parallelises over COLUMN WINDOWS of
+    // N. The trailing update's N is the trailing width (~500 columns at n=1024) - plenty to
+    // split. This combine's N is `target_width <= nb = 32`, so there is barely more than
+    // one window and the column-split dispatch costs more than the pass it removes.
+    //
+    // Corrected rule: strided OUTPUT is free once the output is WIDE ENOUGH TO SPLIT. It is
+    // not a property of strided writes; it is a property of having enough columns to
+    // amortise the dispatch. Same failure mode as the backtransform update loop (~640
+    // dispatches over shrinking row sets) and the ungated eigh reduction at small n.
     let mut update = vec![0.0f64; active_rows * target_width];
     gemm::dgemm(
         active_rows,
