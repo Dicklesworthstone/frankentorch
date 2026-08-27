@@ -33757,7 +33757,13 @@ mod bidiag {
                 }
             }
             let mut w1 = vec![0.0f64; w * ncols];
-            super::gemm::dgemm(w, ncols, mrows, &vt, &block, &mut w1);
+            // dgemm(m, k, n) wants a: m x k, b: k x n, c: m x n. This is V^T B with
+            // vt = w x mrows and block = mrows x ncols, so k is mrows and n is ncols.
+            // These were transposed, which is INVISIBLE on square input (mrows == ncols)
+            // and panics inside dgemm's `c[..m*n]` slice on any TALL one — the sibling
+            // form_p call is dgemm(w, nrows, nrows, ..), where both arguments are the same
+            // value, so the same slip could not show there.
+            super::gemm::dgemm(w, mrows, ncols, &vt, &block, &mut w1);
             let mut w2 = vec![0.0f64; w * ncols];
             super::gemm::dgemm(w, w, ncols, &tmat, &w1, &mut w2);
             let mut upd = vec![0.0f64; mrows * ncols];
