@@ -27760,34 +27760,53 @@ fn eigh_tred2_reduce_packed_full(
                 e[i] = scale * g;
                 h -= f * g;
                 row_i[l] = f - g;
+                let row_i_ro: &[f64] = &row_i[..=l];
+                let prev_ro: &[f64] = &previous_rows[..];
+                let ggs: Vec<f64> = (0..=l)
+                    .into_par_iter()
+                    .map(|j| {
+                        let mut gg = 0.0;
+                        let row_j_start = lower_packed_index(j, 0);
+                        let row_j = &prev_ro[row_j_start..=row_j_start + j];
+                        for k in 0..=j {
+                            gg += row_j[k] * row_i_ro[k];
+                        }
+                        let mut lower_col_offset = lower_packed_index(j + 1, j);
+                        for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1)
+                        {
+                            gg += prev_ro[lower_col_offset] * row_i_k;
+                            lower_col_offset += k + 1;
+                        }
+                        gg
+                    })
+                    .collect();
                 f = 0.0;
                 for j in 0..=l {
                     scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
-                    let mut gg = 0.0;
-                    let row_j_start = lower_packed_index(j, 0);
-                    let row_j = &previous_rows[row_j_start..=row_j_start + j];
-                    for k in 0..=j {
-                        gg += row_j[k] * row_i[k];
-                    }
-                    let mut lower_col_offset = lower_packed_index(j + 1, j);
-                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
-                        gg += previous_rows[lower_col_offset] * row_i_k;
-                        lower_col_offset += k + 1;
-                    }
-                    e[j] = gg / h;
+                    e[j] = ggs[j] / h;
                     f += e[j] * row_i[j];
                 }
                 let hh = f / (h + h);
                 for j in 0..=l {
-                    f = row_i[j];
-                    let gg = e[j] - hh * f;
-                    e[j] = gg;
-                    let row_j_start = lower_packed_index(j, 0);
-                    let row_j = &mut previous_rows[row_j_start..=row_j_start + j];
-                    for k in 0..=j {
-                        row_j[k] -= f * e[k] + gg * row_i[k];
+                    e[j] -= hh * row_i[j];
+                }
+                let mut rows: Vec<&mut [f64]> = Vec::with_capacity(l + 1);
+                {
+                    let mut rest: &mut [f64] = previous_rows;
+                    for j in 0..=l {
+                        let (row, tail) = rest.split_at_mut(j + 1);
+                        rows.push(row);
+                        rest = tail;
                     }
                 }
+                let e_ro: &[f64] = &e[..=l];
+                rows.par_iter_mut().enumerate().for_each(|(j, row_j)| {
+                    let fj = row_i_ro[j];
+                    let ggj = e_ro[j];
+                    for k in 0..=j {
+                        row_j[k] -= fj * e_ro[k] + ggj * row_i_ro[k];
+                    }
+                });
             }
         } else {
             e[i] = lower[row_i_start + l];
@@ -44208,7 +44227,24 @@ mod tests {
     /// FT-vs-FT attribution, not a vs-torch ratio.
     #[test]
     fn eigh_phase_attribution() {
-        const N: usize = 1024;
+        // Rayon width is REPORTED, not assumed: these tests run on rch workers, which are
+        // small VPS instances (2 slots each in the fleet config). A parallelisation
+        // experiment on a 2-core box cannot show a gain however correct the code is, so
+        // any FT-vs-FT parallel result from here is meaningless without this number.
+        println!(
+            "EIGH_ENV rayon_threads={} available_parallelism={:?}",
+            rayon::current_num_threads(),
+            std::thread::available_parallelism().map(|v| v.get())
+        );
+        for n in [256usize, 512, 1024] {
+            eigh_phase_at(n);
+        }
+    }
+
+    fn eigh_phase_at(n_dyn: usize) {
+        let n = n_dyn;
+        #[allow(non_snake_case)]
+        let N: usize = n;
         let a: Vec<f64> = (0..N * N)
             .map(|idx| {
                 let i = idx / N;
@@ -44223,6 +44259,25 @@ mod tests {
 
         let _ = super::eigh_stage_profile_f64(&a, N); // warm up
 
+        // DECISIVE: same binary, same process, only the rayon width differs. If the
+        // 1-thread and wide numbers match, the parallel regions are not delivering and
+        // no amount of reasoning about bandwidth or core counts explains it.
+        for width in [1usize, 8, 64] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
+            let mut best = u128::MAX;
+            for _ in 0..3 {
+                let (r, _b, _t) = pool.install(|| super::eigh_stage_profile_f64(&a, N));
+                best = best.min(r);
+            }
+            println!(
+                "EIGH_WIDTH n={N:>5} threads={width:>3} reduce={:8.2}ms",
+                best as f64 / 1e6
+            );
+        }
+
         const REPS: usize = 5;
         let (mut br, mut bb, mut bt) = (u128::MAX, u128::MAX, u128::MAX);
         for _ in 0..REPS {
@@ -44232,11 +44287,19 @@ mod tests {
             bt = bt.min(t);
         }
         let tot = (br + bb + bt) as f64;
+        // Effective rate for the reduction. tred2 is ~4n^3/3 flops; the traffic it
+        // touches is ~n^3/6 elements read+write. If the phase is BANDWIDTH-bound the
+        // GB/s should stay flat while GFLOP/s falls as the triangle outgrows cache
+        // (n=256 -> 256 KB fits L2; n=1024 -> 4 MB does not). If instead rayon simply
+        // was not engaging, the rate would not depend on the working set this way.
+        let nf = N as f64;
+        let gflops = (4.0 / 3.0) * nf * nf * nf / (br as f64);
+        let gbs = (nf * nf * nf / 6.0) * 2.0 * 8.0 / (br as f64);
         println!(
-            "EIGH_PHASE n={N} min-of-{REPS}  reduce={:7.2}ms ({:5.1}%)  backtransform={:7.2}ms ({:5.1}%)  tql2={:7.2}ms ({:5.1}%)",
+            "EIGH_PHASE n={N:>5} min-of-{REPS}  reduce={:8.2}ms ({:5.1}%)  backtransform={:8.2}ms  tql2={:8.2}ms   reduce_rate: {gflops:6.2} GFLOP/s  {gbs:6.2} GB/s",
             br as f64 / 1e6, 100.0 * br as f64 / tot,
-            bb as f64 / 1e6, 100.0 * bb as f64 / tot,
-            bt as f64 / 1e6, 100.0 * bt as f64 / tot,
+            bb as f64 / 1e6,
+            bt as f64 / 1e6,
         );
     }
 
