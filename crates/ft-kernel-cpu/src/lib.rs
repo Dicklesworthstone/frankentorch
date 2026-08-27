@@ -23880,7 +23880,23 @@ pub fn lu_factor_contiguous_f64(
     data: &[f64],
     meta: &TensorMeta,
 ) -> Result<LuFactorResult, KernelError> {
-    lu_factor_contiguous_nb_f64(data, meta, 64)
+    // NB 64 -> 128. Interleaved min-of-15 ladders at THREE sizes, and 128 wins or ties at
+    // all of them:
+    //
+    //        n=512      n=520      n=1024
+    //   64  75.752ms   71.098ms  193.459ms   (shipped)
+    //   96  60.857ms   66.389ms  180.563ms
+    //  128  62.780ms   62.780ms  166.010ms   -> 1.213x / 1.133x / 1.165x
+    //
+    // 64 was also a LOCAL MAXIMUM at every size - impossible for a real blocking curve.
+    // Cause is cache-set aliasing: at n=512 a row is 512*8 = 4096 bytes = exactly one page
+    // and a 64*8 = 512-byte panel stride conflicts, costing +10.7% over nb=48. At n=520
+    // (4160-byte rows, not page-aligned) the same penalty is +0.7% - a 15x reduction from
+    // changing only the alignment, which is what confirmed the mechanism.
+    //
+    // Three sizes deliberately: geqrf's nb was tuned at n=512 alone, measured a CERTIFIED
+    // 1.223x there, and was a NULL at n=1024.
+    lu_factor_contiguous_nb_f64(data, meta, 128)
 }
 
 /// `lu_factor_contiguous_f64` with the blocking factor exposed, for sweeping.
@@ -44180,7 +44196,16 @@ mod tests {
     /// worker gave three different winners for the QR sweep.
     #[test]
     fn getrf_nb_ladder() {
-        const N: usize = 512;
+        // n=520, NOT 512. At n=512 a row is 512*8 = 4096 bytes = exactly one page, and
+        // nb=64 came out a LOCAL MAXIMUM in two independent runs (worse than 32 AND 128 at
+        // 7 reps; worse than 48 AND 96 at 15 reps). A blocking-cost curve cannot have an
+        // interior maximum, so that is a real effect, and page-aligned rows with a 64*8 =
+        // 512-byte panel stride is the classic cache-set-aliasing configuration.
+        //
+        // n=520 makes rows 4160 bytes - deliberately NOT page-aligned. If the anomaly at
+        // nb=64 disappears here, aliasing is confirmed; if it persists, the explanation is
+        // wrong and something else is going on at 64.
+        const N: usize = 1024;
         let a: Vec<f64> = (0..N * N)
             .map(|idx| {
                 let i = idx / N;
@@ -44193,10 +44218,12 @@ mod tests {
 
         let _ = super::lu_factor_contiguous_nb_f64(&a, &meta, 64).expect("warmup");
 
-        const REPS: usize = 7;
+        // 15 reps, not 7: the first pass had 64 sitting ABOVE both 32 and 128, which a
+        // real blocking curve cannot do, so at least one cell was noise-dominated.
+        const REPS: usize = 15;
         let mut best: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
         for _ in 0..REPS {
-            for nb in [8usize, 16, 32, 64, 128] {
+            for nb in [16usize, 32, 48, 64, 96, 128] {
                 let t0 = std::time::Instant::now();
                 let _ = super::lu_factor_contiguous_nb_f64(&a, &meta, nb).expect("lu");
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
