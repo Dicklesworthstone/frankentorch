@@ -44197,6 +44197,49 @@ mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
 
+    /// Which eigh phase actually dominates? This decides whether `dstedc` is worth writing.
+    ///
+    /// I have said repeatedly that eigh's 8.16-8.23x at n=1024 is ALGORITHMIC: we run
+    /// tred2 + tql2, torch runs dsytrd + dstedc divide-and-conquer. But `dstedc` replaces
+    /// only the TRIDIAGONAL EIGEN-ITERATION - it does nothing for the reduction or the
+    /// back-transform. If reduce dominates, writing dstedc buys little and that whole
+    /// conclusion needs revising. I never measured the split before asserting it.
+    ///
+    /// FT-vs-FT attribution, not a vs-torch ratio.
+    #[test]
+    fn eigh_phase_attribution() {
+        const N: usize = 1024;
+        let a: Vec<f64> = (0..N * N)
+            .map(|idx| {
+                let i = idx / N;
+                let j = idx % N;
+                // Symmetric: eigh reads one triangle, so make the fixture genuinely
+                // symmetric or the two halves disagree.
+                let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+                let v = (((lo * 7 + hi * 13) % 101) as f64 - 50.0) / 25.0;
+                if i == j { v + N as f64 } else { v }
+            })
+            .collect();
+
+        let _ = super::eigh_stage_profile_f64(&a, N); // warm up
+
+        const REPS: usize = 5;
+        let (mut br, mut bb, mut bt) = (u128::MAX, u128::MAX, u128::MAX);
+        for _ in 0..REPS {
+            let (r, b, t) = super::eigh_stage_profile_f64(&a, N);
+            br = br.min(r);
+            bb = bb.min(b);
+            bt = bt.min(t);
+        }
+        let tot = (br + bb + bt) as f64;
+        println!(
+            "EIGH_PHASE n={N} min-of-{REPS}  reduce={:7.2}ms ({:5.1}%)  backtransform={:7.2}ms ({:5.1}%)  tql2={:7.2}ms ({:5.1}%)",
+            br as f64 / 1e6, 100.0 * br as f64 / tot,
+            bb as f64 / 1e6, 100.0 * bb as f64 / tot,
+            bt as f64 / 1e6, 100.0 * bt as f64 / tot,
+        );
+    }
+
     /// Sweep getrf's blocking factor. It shipped at NB=64 and was never swept.
     ///
     /// getrf is the worst remaining single-matrix loss (14.715x at n=512) now that the
