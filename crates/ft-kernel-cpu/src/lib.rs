@@ -36686,6 +36686,19 @@ fn qr_blocked_forward_f64(
             // trailing submatrix must be GATHERED into `rt` and the reflectors TRANSPOSED
             // into `vt` before any GEMM can run, then SCATTERED back. This measures that
             // cost so the missing `ld` argument is a number, not a hypothesis.
+            // The GATHER STAYS, and that is a measured result, not an oversight.
+            //
+            // `matrixmultiply::dgemm` does accept arbitrary strides (verified — `dgemm_bt`
+            // uses them for transposes), so this gather CAN be removed. It was, and it was
+            // 1.144x SLOWER at nb=32/leaf=2 (176.639 -> 202.073 ms at n=1024), 1.046x
+            // slower at nb=64, neutral at 96/128 where the trailing matrix is small.
+            //
+            // Mechanism: `copy_from_slice` per row is a sequential memcpy, after which
+            // matrixmultiply packs from CONTIGUOUS memory. Two sequential passes beat one
+            // strided pass. This is the same reason BLIS/Goto pack deliberately.
+            //
+            // So the ~29.9%-of-lane "staging" measured here is NOT a recoverable lever —
+            // it is the cheapest way to feed the GEMM.
             let stage_start = qr_profile_stage_start(profile_enabled);
             let mut rt = vec![0.0f64; m * nt];
             for i in 0..m {
