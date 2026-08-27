@@ -36696,6 +36696,17 @@ fn qr_blocked_forward_f64(
             }
             let mut w2 = vec![0.0f64; nb * nt];
             gemm::dgemm(nb, nb, nt, &tt, &w, &mut w2); // Tᵀ (Vᵀ R)
+            // REVERTED from a fused subtract-into-strided-rows. Measured at n=1024,
+            // min-of-7 interleaved: the fused form was SLOWER in every cell
+            // (nb=32/leaf=2 201.604 -> 206.911ms, nb=16/leaf=2 227.244 -> 247.008ms,
+            // nb=64/leaf=2 210.340 -> 213.319ms). It traded ONE m x nt allocation for a
+            // per-row-block zeroed temporary inside each parallel closure, and the
+            // allocation churn cost more than the saved pass.
+            //
+            // This also bounds the attribution: the SCATTER is not the expensive half of
+            // staging. If it were, removing it would have paid even with that overhead.
+            // The gather + transpose dominate, so a real fix needs `dgemm` to read a
+            // strided B, not just write a strided C.
             let mut upd = vec![0.0f64; m * nt];
             gemm::dgemm(m, nb, nt, &vmat, &w2, &mut upd); // V (...)
             let scatter_start = qr_profile_stage_start(profile_enabled);
