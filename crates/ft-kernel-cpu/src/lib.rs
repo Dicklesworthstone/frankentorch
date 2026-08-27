@@ -27760,9 +27760,43 @@ fn eigh_tred2_reduce_packed_full(
                 e[i] = scale * g;
                 h -= f * g;
                 row_i[l] = f - g;
+                // SIZE GATE. Measured same-process at 8 threads: n=1024 is 2.61x FASTER
+                // (665.05 -> 254.67 ms) but n=256 is 2.35x SLOWER (8.99 -> 21.16 ms) and
+                // n=512 is only 1.09x. The crossover sits between 256 and 512, so below
+                // it the rayon dispatch per Householder step costs more than the step's
+                // O(l^2) work.
+                //
+                // Gated on `l` (this step's width), not on `n`: work per step shrinks as
+                // the reduction proceeds, so a large matrix should fall back to serial for
+                // its cheap tail steps rather than paying dispatch on all n of them.
+                //
+                // This gate also protects a SHIPPED win: batched eigh (B=2000, n=32-96) is
+                // 4.84-7.92x faster than torch precisely because it parallelises ACROSS
+                // planes. Inner parallelism on planes that small would wreck it.
+                const TRED2_PAR_MIN_L: usize = 384;
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
-                let ggs: Vec<f64> = (0..=l)
+                let ggs: Vec<f64> = if l < TRED2_PAR_MIN_L {
+                    (0..=l)
+                        .map(|j| {
+                            let mut gg = 0.0;
+                            let row_j_start = lower_packed_index(j, 0);
+                            let row_j = &prev_ro[row_j_start..=row_j_start + j];
+                            for k in 0..=j {
+                                gg += row_j[k] * row_i_ro[k];
+                            }
+                            let mut lower_col_offset = lower_packed_index(j + 1, j);
+                            for (k, &row_i_k) in
+                                row_i_ro.iter().enumerate().take(l + 1).skip(j + 1)
+                            {
+                                gg += prev_ro[lower_col_offset] * row_i_k;
+                                lower_col_offset += k + 1;
+                            }
+                            gg
+                        })
+                        .collect()
+                } else {
+                (0..=l)
                     .into_par_iter()
                     .map(|j| {
                         let mut gg = 0.0;
@@ -27779,7 +27813,8 @@ fn eigh_tred2_reduce_packed_full(
                         }
                         gg
                     })
-                    .collect();
+                    .collect()
+                };
                 f = 0.0;
                 for j in 0..=l {
                     scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
@@ -27800,13 +27835,18 @@ fn eigh_tred2_reduce_packed_full(
                     }
                 }
                 let e_ro: &[f64] = &e[..=l];
-                rows.par_iter_mut().enumerate().for_each(|(j, row_j)| {
+                let update = |j: usize, row_j: &mut [f64]| {
                     let fj = row_i_ro[j];
                     let ggj = e_ro[j];
                     for k in 0..=j {
                         row_j[k] -= fj * e_ro[k] + ggj * row_i_ro[k];
                     }
-                });
+                };
+                if l < TRED2_PAR_MIN_L {
+                    rows.iter_mut().enumerate().for_each(|(j, r)| update(j, r));
+                } else {
+                    rows.par_iter_mut().enumerate().for_each(|(j, r)| update(j, r));
+                }
             }
         } else {
             e[i] = lower[row_i_start + l];
