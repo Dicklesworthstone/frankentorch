@@ -6413,8 +6413,9 @@ impl FrankenTorchSession {
                         dweight.map(|d| Self::widen_grad_f32_to_f64(&d)),
                     ];
                     if has_bias {
-                        gradients
-                            .push(dbias.map(|d| d.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()));
+                        gradients.push(
+                            dbias.map(|d| d.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()),
+                        );
                     }
                     // The mask does not require grad — the caller's gate guarantees it — so it
                     // gets None rather than a computed-and-discarded gradient.
@@ -6429,7 +6430,8 @@ impl FrankenTorchSession {
                     let mask_id = fn_inputs[mask_index];
                     let mut gradients: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
                     let f32v = |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
-                    let f64v = |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
+                    let f64v =
+                        |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
                     // Grad NODES must live in the F64 grad-space (the regular backward and
                     // tensor_values/autograd_grad are F64). apply_function infers output dtype
                     // from its inputs, so feeding the F32 nodes directly would make the grad
@@ -6480,12 +6482,20 @@ impl FrankenTorchSession {
                                 let (wv, ws) = ins[1];
                                 c.save_for_backward(
                                     dv.to_vec(),
-                                    vec![plan.batch, plan.out_channels, plan.output_h, plan.output_w],
+                                    vec![
+                                        plan.batch,
+                                        plan.out_channels,
+                                        plan.output_h,
+                                        plan.output_w,
+                                    ],
                                 );
                                 c.save_for_backward(wv.to_vec(), ws.to_vec());
                                 let zp = vec![
                                     0.0_f32;
-                                    plan.batch * plan.in_channels * plan.padded_h * plan.padded_w
+                                    plan.batch
+                                        * plan.in_channels
+                                        * plan.padded_h
+                                        * plan.padded_w
                                 ];
                                 let (dp, _, _) = ft_kernel_cpu::conv2d_backward_f32(
                                     &f32v(dv),
@@ -6506,7 +6516,12 @@ impl FrankenTorchSession {
                                 );
                                 Ok((
                                     f64v(&dp),
-                                    vec![plan.batch, plan.in_channels, plan.padded_h, plan.padded_w],
+                                    vec![
+                                        plan.batch,
+                                        plan.in_channels,
+                                        plan.padded_h,
+                                        plan.padded_w,
+                                    ],
                                 ))
                             },
                             move |c, gouts| {
@@ -6567,7 +6582,12 @@ impl FrankenTorchSession {
                                 let (pv, ps) = ins[1];
                                 c.save_for_backward(
                                     dv.to_vec(),
-                                    vec![plan.batch, plan.out_channels, plan.output_h, plan.output_w],
+                                    vec![
+                                        plan.batch,
+                                        plan.out_channels,
+                                        plan.output_h,
+                                        plan.output_w,
+                                    ],
                                 );
                                 c.save_for_backward(pv.to_vec(), ps.to_vec());
                                 let zw = vec![0.0_f32; weight_shape.iter().product::<usize>()];
@@ -6612,7 +6632,10 @@ impl FrankenTorchSession {
                                 );
                                 let zp = vec![
                                     0.0_f32;
-                                    plan.batch * plan.in_channels * plan.padded_h * plan.padded_w
+                                    plan.batch
+                                        * plan.in_channels
+                                        * plan.padded_h
+                                        * plan.padded_w
                                 ];
                                 let (grad_padded, _, _) = ft_kernel_cpu::conv2d_backward_f32(
                                     &f32v(dv),
@@ -172455,7 +172478,20 @@ mod tests {
         let report = session.tensor_backward(loss).unwrap();
 
         let (expected_x, expected_w, _) = ft_kernel_cpu::conv2d_backward_masked_f32(
-            &mask, &x_values, &w_values, n, cin, h, w, k, k, 3, 3, 1, 1, cout,
+            &mask,
+            &x_values,
+            &w_values,
+            n,
+            cin,
+            h,
+            w,
+            k,
+            k,
+            3,
+            3,
+            1,
+            1,
+            cout,
             [true, true, false],
         );
         let widen = |v: &[f32]| -> Vec<f64> { v.iter().map(|&e| f64::from(e)).collect() };

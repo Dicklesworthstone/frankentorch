@@ -199,7 +199,9 @@ fn fill(n: usize) -> Vec<f64> {
 /// so switching it silently would make new rows incomparable with the ledger while looking
 /// identical. The chosen fixture is printed in the header for exactly that reason.
 fn generic_fixture() -> bool {
-    std::env::var("FT_FIXTURE").map(|v| v == "generic").unwrap_or(false)
+    std::env::var("FT_FIXTURE")
+        .map(|v| v == "generic")
+        .unwrap_or(false)
 }
 
 /// A fixture with a GENERIC singular-value spectrum — `frankentorch-gqmws`.

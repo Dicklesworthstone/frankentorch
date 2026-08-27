@@ -23927,8 +23927,13 @@ pub fn lu_stage_take_ns() -> (u64, u64, u64) {
 /// Recursive GETRF panel factorization: pivots swap full rows, while each split
 /// turns its internal Schur-complement update into GEMM before recursing right.
 fn lu_factor_panel_recursive_f64(
-    lu: &mut [f64], n: usize, start: usize, end: usize, pivots: &mut [usize],
-    ipiv: &mut [usize], singular_tol: f64,
+    lu: &mut [f64],
+    n: usize,
+    start: usize,
+    end: usize,
+    pivots: &mut [usize],
+    ipiv: &mut [usize],
+    singular_tol: f64,
 ) {
     const LEAF: usize = 16;
     if end - start <= LEAF {
@@ -23937,16 +23942,23 @@ fn lu_factor_panel_recursive_f64(
             let mut max_val = lu[k * n + k].abs();
             for i in (k + 1)..n {
                 let value = lu[i * n + k].abs();
-                if value > max_val { max_val = value; max_row = i; }
+                if value > max_val {
+                    max_val = value;
+                    max_row = i;
+                }
             }
             ipiv[k] = max_row;
             if max_row != k {
                 pivots.swap(k, max_row);
-                for j in 0..n { lu.swap(k * n + j, max_row * n + j); }
+                for j in 0..n {
+                    lu.swap(k * n + j, max_row * n + j);
+                }
             }
             let diag = lu[k * n + k];
             if diag.abs() < singular_tol {
-                for i in (k + 1)..n { lu[i * n + k] = 0.0; }
+                for i in (k + 1)..n {
+                    lu[i * n + k] = 0.0;
+                }
                 continue;
             }
             if n - k - 1 >= 64 && rayon::current_num_threads() > 1 {
@@ -23955,13 +23967,17 @@ fn lu_factor_panel_recursive_f64(
                 tail.par_chunks_mut(n).for_each(|row| {
                     let multiplier = row[k] / diag;
                     row[k] = multiplier;
-                    for j in (k + 1)..end { row[j] -= multiplier * pivot_row[j]; }
+                    for j in (k + 1)..end {
+                        row[j] -= multiplier * pivot_row[j];
+                    }
                 });
             } else {
                 for i in (k + 1)..n {
                     let multiplier = lu[i * n + k] / diag;
                     lu[i * n + k] = multiplier;
-                    for j in (k + 1)..end { lu[i * n + j] -= multiplier * lu[k * n + j]; }
+                    for j in (k + 1)..end {
+                        lu[i * n + j] -= multiplier * lu[k * n + j];
+                    }
                 }
             }
         }
@@ -23974,7 +23990,9 @@ fn lu_factor_panel_recursive_f64(
     for i in start..mid {
         for j in mid..end {
             let mut value = lu[i * n + j];
-            for h in start..i { value -= lu[i * n + h] * lu[h * n + j]; }
+            for h in start..i {
+                value -= lu[i * n + h] * lu[h * n + j];
+            }
             lu[i * n + j] = value;
         }
     }
@@ -63294,7 +63312,9 @@ mod tests {
         const N: usize = 64;
         let mut a = vec![0.0_f64; N * N];
         for i in 0..N {
-            for j in 0..N { a[i * N + j] = ((i * 19 + j * 7) % 23) as f64 * 0.001; }
+            for j in 0..N {
+                a[i * N + j] = ((i * 19 + j * 7) % 23) as f64 * 0.001;
+            }
             a[i * N + i] += 10.0;
         }
         a[32 * N + 32] = 0.0;
@@ -63302,8 +63322,14 @@ mod tests {
         let meta = TensorMeta::from_shape(vec![N, N], DType::F64, Device::Cpu);
         let recursive = super::lu_factor_contiguous_nb_f64(&a, &meta, N).expect("recursive lu");
         let scalar = super::lu_factor_contiguous_nb_f64(&a, &meta, 1).expect("scalar lu");
-        assert_eq!(recursive.ipiv, scalar.ipiv, "recursive pivots must match GETRF");
-        assert_eq!(recursive.ipiv[32], 33, "fixture must reach the right half pivot");
+        assert_eq!(
+            recursive.ipiv, scalar.ipiv,
+            "recursive pivots must match GETRF"
+        );
+        assert_eq!(
+            recursive.ipiv[32], 33,
+            "fixture must reach the right half pivot"
+        );
         let unpacked = super::lu_unpack(&recursive);
         let pl = mat_mul_nn(&unpacked.p, &unpacked.l, N);
         let plu = mat_mul_nn(&pl, &unpacked.u, N);
@@ -69177,7 +69203,12 @@ mod tests {
         let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
         let mut mismatches: Vec<String> = Vec::new();
         // (m, n): 64x64 square; 96x48 tall; 33x17 and 70x35 both non-multiples of br=8.
-        for &(m, n) in &[(64usize, 64usize), (96usize, 48usize), (33usize, 17usize), (70usize, 35usize)] {
+        for &(m, n) in &[
+            (64usize, 64usize),
+            (96usize, 48usize),
+            (33usize, 17usize),
+            (70usize, 35usize),
+        ] {
             let base = bidiag_test_matrix(m, n, 0x5EED ^ (m * 131 + n) as u64);
 
             let previous = super::set_svd_replay_transposed(false);
@@ -69194,9 +69225,8 @@ mod tests {
             let mut a_tr = base.clone();
             let transposed = super::golub_reinsch_svd(&mut a_tr, m, n);
             super::set_svd_replay_transposed(previous);
-            let (w_tr, v_tr) = transposed.unwrap_or_else(|e| {
-                panic!("transposed svd failed at m={m} n={n}: {e:?}")
-            });
+            let (w_tr, v_tr) = transposed
+                .unwrap_or_else(|e| panic!("transposed svd failed at m={m} n={n}: {e:?}"));
 
             if bits(&a_row) != bits(&a_tr) {
                 mismatches.push(format!("m={m} n={n}: U differs"));
