@@ -162,11 +162,62 @@ fn arm_label(arm: Arm) -> String {
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
 /// singular-value checksum is a real parity check rather than a coincidence of shapes.
 fn fill(n: usize) -> Vec<f64> {
+    if generic_fixture() {
+        return fill_generic(n);
+    }
     let mut a = vec![0.0_f64; n * n];
     for r in 0..n {
         for c in 0..n {
             let v = ((((r + 2) * (c + 3)) % 17) as f64 - 8.0) * 0.05;
             a[r * n + c] = v + if r == c { 3.0 } else { 0.0 };
+        }
+    }
+    a
+}
+
+/// `FT_FIXTURE=generic` selects [`fill_generic`] over the default closed form.
+///
+/// OPT-IN, deliberately. Every banked row on this harness was taken on the default fixture,
+/// so switching it silently would make new rows incomparable with the ledger while looking
+/// identical. The chosen fixture is printed in the header for exactly that reason.
+fn generic_fixture() -> bool {
+    std::env::var("FT_FIXTURE").map(|v| v == "generic").unwrap_or(false)
+}
+
+/// A fixture with a GENERIC singular-value spectrum — `frankentorch-gqmws`.
+///
+/// WHY THIS EXISTS. The default fixture is `3*I` plus a low-rank modular term, and at n=512
+/// **495 of its 512 singular values are exactly 3.0**, with 18 distinct values in the whole
+/// spectrum. The implicit-shift bidiagonal QR sweep terminates by DEFLATION, so a spectrum
+/// that degenerate deflates immediately and the sweep does essentially no work: it times at
+/// 0.255 ms there against 24.291 ms on a generic matrix through the SAME counter, same code,
+/// same n, same thread count. The lane therefore cannot see that phase at all, and any
+/// "phase X is/is not the bottleneck" conclusion drawn from it is a property of the fixture.
+///
+/// BIT-IDENTICAL ON BOTH ARMS, which is the whole point and the thing that is easy to get
+/// wrong: a fixture asymmetry between the Rust and Python sides has already voided one whole
+/// lane in this campaign. Every operation here is integer until the final scale, and the
+/// scale is a power of two, so both arms produce the same f64 bits rather than merely the
+/// same values to some tolerance. `_mk_generic` in the Python setup is the same closed form
+/// in the same order.
+///
+/// It is NOT an RNG: same bits on every run, every host and every build.
+fn fill_generic(n: usize) -> Vec<f64> {
+    let mut a = vec![0.0_f64; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            let h = (r * 73 + c * 151 + (r * c) % 257) % 2048;
+            // /2048, -1.0 and +16.0 are all exact; h is an integer below 2^11, so the result
+            // is an exact f64 and no rounding separates the arms.
+            //
+            // The +16 diagonal is CONDITIONING, not spectrum shaping. Without it the matrix
+            // measures cond 2.7e6 at n=512 (smin 9.3e-5), and there the smallest singular
+            // values differ between Golub-Reinsch and LAPACK gesdd by more than the lane's
+            // parity tolerance — which would report MISMATCH for a difference that is
+            // algorithmic, not a defect. With it: cond 97.4 at n=512, 25.2 at n=256, and the
+            // spectrum stays fully non-degenerate (512 of 512 distinct, against the default
+            // fixture's 495-fold repeat of a single value).
+            a[r * n + c] = (h as f64) / 2048.0 - 1.0 + if r == c { 16.0 } else { 0.0 };
         }
     }
     a
@@ -593,6 +644,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!(
                     "(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))"
                 )
+            } else if generic_fixture() {
+                // Mirrors the Rust arm's fill()/fill_generic() switch. Both selectors are
+                // driven by the SAME predicate so the two arms cannot diverge on which matrix
+                // they factor — an asymmetry here voided a whole lane earlier in this campaign
+                // and every other gate still passed while it did.
+                format!("_mk_generic({n}, {})", if sym { "True" } else { "False" })
             } else {
                 format!("_mk({n}, {})", if sym { "True" } else { "False" })
             };
@@ -610,6 +667,20 @@ def _mk(n, sym=False):
     # Symmetrised for the eig lanes, matching the Rust arm exactly. eigh reads one triangle, so
     # without this the two arms would be answering different questions and the parity column
     # would be meaningless rather than merely failing.
+    return (A + A.T) * 0.5 if sym else A
+def _mk_generic(n, sym=False):
+    # frankentorch-gqmws. Generic singular-value spectrum, against _mk's 495-of-512 degeneracy.
+    # Integer arithmetic throughout and a power-of-two scale, so this is BIT-IDENTICAL to the
+    # Rust arm's fill_generic rather than merely close: int64 ops are exact on both sides and
+    # h/2048 - 1.0 introduces no rounding. Same closed form, same order.
+    r = torch.arange(n, dtype=torch.int64).reshape(n, 1)
+    c = torch.arange(n, dtype=torch.int64).reshape(1, n)
+    h = (r * 73 + c * 151 + (r * c) % 257) % 2048
+    # +16 on the diagonal is CONDITIONING: without it cond is 2.7e6 at n=512 and the smallest
+    # singular values differ between Golub-Reinsch and gesdd by more than the parity tolerance,
+    # which would report MISMATCH for an algorithmic difference rather than a defect. With it,
+    # cond 97.4 at n=512 and the spectrum is still fully non-degenerate (512/512 distinct).
+    A = h.to(torch.float64) / 2048.0 - 1.0 + torch.eye(n, dtype=torch.float64) * 16.0
     return (A + A.T) * 0.5 if sym else A
 def _expm_fixture(n):
     # Scaled by 1/n so the spectral radius stays O(1): expm of the raw fixture overflows
@@ -648,6 +719,19 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         "rayon_threads={} warmup={warmup} (both arms)  default_gate={}",
         rayon::current_num_threads(),
         ft_kernel_cpu::bidiag_parallel_gate()
+    );
+    // Provenance: a banked row that does not name its fixture is how a spectrally degenerate
+    // input went unnoticed long enough to close a bead (frankentorch-gqmws). The default is
+    // 3*I plus a low-rank modular term, whose spectrum has 495 of 512 values equal at n=512 —
+    // the bidiagonal QR sweep deflates immediately on it and times ~95x lower than on a
+    // generic matrix, so phase conclusions from it do not generalise.
+    println!(
+        "fixture={} (FT_FIXTURE=generic selects the generic-spectrum matrix)",
+        if generic_fixture() {
+            "generic (spread spectrum)"
+        } else {
+            "_mk DEFAULT: 3*I + low-rank; 495/512 singular values EQUAL at n=512 — QR sweep is invisible on it"
+        }
     );
     println!(
         "arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): {:?}",
