@@ -23904,6 +23904,26 @@ pub fn lu_factor_contiguous_f64(
 /// `NB` here has never been swept. It shipped at 64 - higher than the QR path's 32, whose
 /// measured optimum turned out to be 16 - and getrf is the worst remaining single-matrix
 /// loss at 14.715x (n=512) now that the Householder family is closed.
+use std::sync::atomic::{AtomicU64, Ordering as LuOrdering};
+
+/// Phase counters for `lu_factor_contiguous_nb_f64` — getrf is the worst measured
+/// single-matrix loss at n=512 (14.715x vs torch) and its panel is a plain BLAS-2 column
+/// loop with pivoting, where geqrf has a recursive BLAS-3 dgeqrt3. This attributes the
+/// split BEFORE anyone writes a recursive dgetrf2.
+static LU_PANEL_NS: AtomicU64 = AtomicU64::new(0);
+static LU_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
+static LU_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset the getrf phase counters: `(panel_ns, solve_ns, trailing_ns)`.
+#[doc(hidden)]
+pub fn lu_stage_take_ns() -> (u64, u64, u64) {
+    (
+        LU_PANEL_NS.swap(0, LuOrdering::Relaxed),
+        LU_SOLVE_NS.swap(0, LuOrdering::Relaxed),
+        LU_TRAIL_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 pub fn lu_factor_contiguous_nb_f64(
     data: &[f64],
     meta: &TensorMeta,
@@ -23959,6 +23979,7 @@ pub fn lu_factor_contiguous_nb_f64(
     while k0 < n {
         let pe = (k0 + NB).min(n); // panel end (exclusive)
 
+        let __t_panel = std::time::Instant::now();
         // --- 1. Factor the column panel [k0, pe), eliminating within the panel ---
         for k in k0..pe {
             // Pivot: row with max |lu[i][k]| for i >= k.
@@ -24018,6 +24039,8 @@ pub fn lu_factor_contiguous_nb_f64(
             break;
         }
 
+        LU_PANEL_NS.fetch_add(__t_panel.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        let __t_solve = std::time::Instant::now();
         // --- 2. Triangular solve U12 = L11^{-1} * A12 (unit-lower L11) ---
         // Each trailing column j ∈ [pe,n) is an INDEPENDENT forward substitution
         // against the shared unit-lower L11, so the solve parallelises over disjoint
@@ -24025,6 +24048,8 @@ pub fn lu_factor_contiguous_nb_f64(
         // frankentorch-kgs4.62.
         gemm::ltrsm_unit_lower_panel_f64(&mut lu, n, k0, pe);
 
+        LU_SOLVE_NS.fetch_add(__t_solve.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        let __t_trail = std::time::Instant::now();
         // --- 3. Trailing update A22 -= L21 * U12, FUSED directly into lu ---
         // Pack L21 (rows pe..n, cols k0..pe) -> contiguous [trows x kb] and U12
         // (rows k0..pe, cols pe..n) -> contiguous [kb x tcols], then one
@@ -24045,6 +24070,7 @@ pub fn lu_factor_contiguous_nb_f64(
             u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
         }
         gemm::dgemm_sub_into(trows, kb, tcols, &l21, &u12, &mut lu, pe * n + pe, n);
+        LU_TRAIL_NS.fetch_add(__t_trail.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
 
         k0 = pe;
     }
@@ -44432,6 +44458,50 @@ mod tests {
             bb as f64 / 1e6,
             bt as f64 / 1e6,
         );
+    }
+
+    /// Where does getrf's time go? Decides whether a recursive dgetrf2 panel is worth it.
+    ///
+    /// getrf is the worst measured single-matrix loss (14.715x vs torch at n=512), and
+    /// `slogdet` is provably the same op (ratio 0.9892x), so one fix covers both. Its
+    /// panel is a plain BLAS-2 column loop with pivoting where geqrf has a recursive
+    /// BLAS-3 dgeqrt3 — but that only matters if the panel actually dominates.
+    #[test]
+    fn getrf_phase_attribution() {
+        for n in [512usize, 1024] {
+            let a: Vec<f64> = (0..n * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    let v = (((i * 7 + j * 13) % 101) as f64 - 50.0) / 25.0;
+                    if i == j { v + n as f64 } else { v }
+                })
+                .collect();
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let _ = super::lu_factor_contiguous_f64(&a, &meta).expect("warmup");
+            let _ = super::lu_stage_take_ns();
+
+            const REPS: usize = 5;
+            let mut best = (u64::MAX, 0u64, 0u64, 0u64);
+            for _ in 0..REPS {
+                let t0 = std::time::Instant::now();
+                let _ = super::lu_factor_contiguous_f64(&a, &meta).expect("lu");
+                let wall = t0.elapsed().as_nanos() as u64;
+                let (p, s, t) = super::lu_stage_take_ns();
+                if wall < best.0 {
+                    best = (wall, p, s, t);
+                }
+            }
+            let (wall, pn, sn, tn) = best;
+            let w = wall as f64;
+            println!(
+                "GETRF_PHASE n={n:>5} min-of-{REPS} wall={:8.2}ms  panel={:5.1}% ({:7.2}ms)  solve={:5.1}% ({:7.2}ms)  trailing={:5.1}% ({:7.2}ms)",
+                w / 1e6,
+                100.0 * pn as f64 / w, pn as f64 / 1e6,
+                100.0 * sn as f64 / w, sn as f64 / 1e6,
+                100.0 * tn as f64 / w, tn as f64 / 1e6,
+            );
+        }
     }
 
     /// Sweep getrf's blocking factor. It shipped at NB=64 and was never swept.
