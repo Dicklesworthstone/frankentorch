@@ -36820,16 +36820,16 @@ fn qr_blocked_forward_f64(
             // staging. If it were, removing it would have paid even with that overhead.
             // The gather + transpose dominate, so a real fix needs `dgemm` to read a
             // strided B, not just write a strided C.
-            let mut upd = vec![0.0f64; m * nt];
-            gemm::dgemm(m, nb, nt, &vmat, &w2, &mut upd); // V (...)
+            // R[:, pe:] -= V (...) accumulated straight into the strided destination via
+            // `dgemm_sub_into`, which parallelises over DISJOINT COLUMN WINDOWS and uses
+            // matrixmultiply's alpha=-1/beta=1. No m x nt temp, no second scatter pass.
+            //
+            // This helper already existed and is shipped in getrf's trailing update. I
+            // previously hand-wrote an equivalent (`dgemm_sub_into_rows`), measured it
+            // 1.026x SLOWER and reverted - it allocated a per-row-block temp and did the
+            // subtract in Rust. That rejected my implementation, not the technique.
             let scatter_start = qr_profile_stage_start(profile_enabled);
-            for i in 0..m {
-                let base = i * n + pe;
-                let src = i * nt;
-                for t in 0..nt {
-                    r_mat[base + t] -= upd[src + t];
-                }
-            }
+            gemm::dgemm_sub_into(m, nb, nt, &vmat, &w2, r_mat, pe, n);
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.copy_zeroing_ns, scatter_start);
             }
