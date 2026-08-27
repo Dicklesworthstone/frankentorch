@@ -104,6 +104,37 @@ fn main() {
         _ => fixture_bumped(n, bump),
     };
     eprintln!("fixture={kind}");
+
+    // FT_OP=eigh re-takes the eigh phase map. The banked one (reduce 42.7% / backtransform
+    // 31.8% / tql2 24.8%) was measured on the DEFAULT fixture, whose symmetrised form has 496
+    // of 512 eigenvalues exactly equal — the tridiagonal QL iteration deflates on equal
+    // eigenvalues, so tql2 is understated there for the same reason the SVD sweep read 0%.
+    // Same defect, second op, so the map has to be re-taken before it picks a lever.
+    if std::env::var("FT_OP").map(|v| v == "eigh").unwrap_or(false) {
+        // eigh reads one triangle, so hand it the symmetrised matrix both arms use.
+        let mut sym = vec![0.0f64; n * n];
+        for r in 0..n {
+            for c in 0..n {
+                sym[r * n + c] = (data[r * n + c] + data[c * n + r]) * 0.5;
+            }
+        }
+        let _ = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n); // warm up
+        let (reduce, back, tql2) = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n);
+        let total = (reduce + back + tql2).max(1);
+        let ms = |v: u128| v as f64 / 1e6;
+        let pct = |v: u128| (v as f64 / total as f64) * 100.0;
+        println!(
+            "eigh_phases n={n} fixture={kind} reduce={:.3}ms ({:.1}%) backtransform={:.3}ms \
+             ({:.1}%) tql2={:.3}ms ({:.1}%)",
+            ms(reduce),
+            pct(reduce),
+            ms(back),
+            pct(back),
+            ms(tql2),
+            pct(tql2)
+        );
+        return;
+    }
     let mut checksum = 0.0f64;
 
     for _ in 0..iters {
