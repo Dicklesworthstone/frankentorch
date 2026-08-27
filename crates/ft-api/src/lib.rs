@@ -6318,118 +6318,6 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
-    /// The F32 half of [`Self::try_fuse_conv2d_loss_mask`] —
-    /// `frankentorch-conv2d-mask-fusion-f64-only-iq1j1`.
-    ///
-    /// Structurally the f64 sibling, with the dtype bridge the f32 conv2d fast path already uses:
-    /// borrowed inputs arrive as `&[f32]`, the incoming gradient arrives from the tape as `f64`
-    /// and is downcast, and the produced gradients are upcast back. That asymmetry is the tape's,
-    /// not this function's.
-    ///
-    /// The backward is `conv2d_backward_mask_fused_f32`, which is proven BIT-IDENTICAL to
-    /// materialising `incoming * mask` and calling the generic f32 backward on it
-    /// (`f32_mixed_signed_mask_matches_materialized_conv2d_backward_bitwise` and
-    /// `f32_every_output_mask_combination_matches_materialized_bitwise`). So this changes which
-    /// buffers exist, not which numbers come out.
-    ///
-    /// NO CREATE_GRAPH ARM. The f64 sibling carries a second-order closure; this returns `None`
-    /// when `create_graph` is live rather than fusing without one, because a fused fast path
-    /// lacking a create_graph backward is exactly the double-backward defect the campaign has
-    /// already paid for once. Second-order f32 masked conv2d keeps the unfused route, which is
-    /// correct and merely slower.
-    fn fuse_conv2d_loss_mask_f32(
-        &mut self,
-        lhs: TensorNodeId,
-        rhs: TensorNodeId,
-        plan: Conv2dMaskPlan,
-    ) -> Result<Option<TensorNodeId>, AutogradError> {
-        if self.tensor_tape.create_graph_enabled() {
-            return Ok(None);
-        }
-        let output_shape = self.tensor_shape(lhs)?;
-        let mut inputs = vec![plan.padded, plan.weight];
-        if let Some(bias) = plan.bias {
-            inputs.push(bias);
-        }
-        inputs.push(rhs);
-        let has_bias = plan.bias.is_some();
-        let mask_index = if has_bias { 3 } else { 2 };
-        let fused = self
-            .tensor_tape
-            .apply_function_f32_output_with_borrowed_inputs(
-                &inputs,
-                move |_ctx, ins| {
-                    let (padded_values, _) = ins[0];
-                    let (weight_values, _) = ins[1];
-                    let bias_values = if has_bias { Some(ins[2].0) } else { None };
-                    let mask_values = ins[mask_index].0;
-                    let out = ft_kernel_cpu::conv2d_forward_f32(
-                        padded_values,
-                        weight_values,
-                        bias_values,
-                        plan.batch,
-                        plan.in_channels,
-                        plan.padded_h,
-                        plan.padded_w,
-                        plan.kernel_h,
-                        plan.kernel_w,
-                        plan.output_h,
-                        plan.output_w,
-                        plan.stride_h,
-                        plan.stride_w,
-                        plan.out_channels,
-                    );
-                    let scored: Vec<f32> = out
-                        .iter()
-                        .zip(mask_values)
-                        .map(|(&v, &m)| v * m)
-                        .collect();
-                    Ok((scored, output_shape.clone()))
-                },
-                move |ctx, grad_outputs, borrowed| {
-                    let need = ctx.needs_input_grad();
-                    let need_input = need.first().copied().unwrap_or(true);
-                    let need_weight = need.get(1).copied().unwrap_or(true);
-                    // The tape carries gradients in f64 even for an f32 op; downcast once, here,
-                    // exactly as the f32 conv2d fast path does.
-                    let incoming: Vec<f32> =
-                        grad_outputs[0].iter().map(|&v| v as f32).collect();
-                    let (dpadded, dweight, dbias) =
-                        ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                            &incoming,
-                            borrowed[mask_index].0,
-                            borrowed[0].0,
-                            borrowed[1].0,
-                            plan.batch,
-                            plan.in_channels,
-                            plan.padded_h,
-                            plan.padded_w,
-                            plan.kernel_h,
-                            plan.kernel_w,
-                            plan.output_h,
-                            plan.output_w,
-                            plan.stride_h,
-                            plan.stride_w,
-                            plan.out_channels,
-                            [need_input, need_weight, has_bias],
-                        );
-                    let up = |g: Option<Vec<f32>>| {
-                        g.map(|v| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>())
-                    };
-                    let mut gradients = vec![up(dpadded), up(dweight)];
-                    if has_bias {
-                        gradients.push(up(dbias));
-                    }
-                    // The mask does not require grad -- the caller's gate guarantees it -- so it
-                    // gets None rather than a computed-and-discarded gradient.
-                    gradients.push(None);
-                    Ok(gradients)
-                },
-            )?;
-        self.conv2d_mask_plans.remove(&lhs.0);
-        Ok(Some(fused))
-    }
-
     fn try_fuse_conv2d_loss_mask(
         &mut self,
         lhs: TensorNodeId,
@@ -6438,27 +6326,14 @@ impl FrankenTorchSession {
         let Some(plan) = self.conv2d_mask_plans.get(&lhs.0).cloned() else {
             return Ok(None);
         };
-        // DTYPE: F64 and F32 both fuse -- `frankentorch-conv2d-mask-fusion-f64-only-iq1j1`.
-        //
-        // This gate was F64-only, which cost the f32 masked lane 2.78x against PyTorch while the
-        // f32 SUMMED lane sat at 1.02x parity -- the same op, shape and dtype, differing only by
-        // the mask multiply (commit ffe22c15, 64 rounds, live PyTorch 2.12.1+cpu co-process, our
-        // arm's A/A null 1.001). The remaining four conditions are CORRECTNESS guards, not dtype
-        // policy, and are unchanged: a grad-requiring mask needs its own gradient, mismatched
-        // shapes are a different op, and retains_grad/hooks both need the unfused intermediate to
-        // exist as a real node.
-        let dtype = self.tensor_dtype(lhs)?;
-        if (dtype != DType::F64 && dtype != DType::F32)
-            || self.tensor_dtype(rhs)? != dtype
+        if self.tensor_dtype(lhs)? != DType::F64
+            || self.tensor_dtype(rhs)? != DType::F64
             || self.tensor_requires_grad(rhs)?
             || self.tensor_shape(lhs)? != self.tensor_shape(rhs)?
             || self.tensor_tape.tensor_retains_grad(lhs)?
             || self.tensor_tape.tensor_has_hooks(lhs)?
         {
             return Ok(None);
-        }
-        if dtype == DType::F32 {
-            return self.fuse_conv2d_loss_mask_f32(lhs, rhs, plan);
         }
 
         let output_shape = self.tensor_shape(lhs)?;
@@ -31508,7 +31383,7 @@ impl FrankenTorchSession {
             if let Some(b) = bias {
                 inputs.push(b);
             }
-            let output = self
+            return self
                 .tensor_tape
                 .apply_function_f32_output_with_create_graph_borrowed_inputs(
                     &inputs,
@@ -31818,35 +31693,7 @@ impl FrankenTorchSession {
 
                         Ok(grads)
                     },
-                )?;
-            // Register the mask plan for the F32 path too --
-            // `frankentorch-conv2d-mask-fusion-f64-only-iq1j1`.
-            //
-            // The f64 branch above has always done this; the f32 branch never did, so
-            // `try_fuse_conv2d_loss_mask`'s `conv2d_mask_plans.get(&lhs.0)` returned None for
-            // every f32 conv2d output and bailed at its FIRST condition -- before the dtype gate
-            // it appears to be blocked by was ever reached. Relaxing that gate alone therefore
-            // changes nothing; the plan has to exist first.
-            self.conv2d_mask_plans.insert(
-                output.0,
-                Conv2dMaskPlan {
-                    padded,
-                    weight,
-                    bias,
-                    batch: b_,
-                    in_channels: ic,
-                    padded_h: ph,
-                    padded_w: pw,
-                    kernel_h: kh,
-                    kernel_w: kw,
-                    output_h: oh,
-                    output_w: ow,
-                    stride_h: sh,
-                    stride_w: sw,
-                    out_channels: oc,
-                },
-            );
-            return Ok(output);
+                );
         }
 
         // Use unfold to extract all patches in O(1) tensor operations instead
