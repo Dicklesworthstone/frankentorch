@@ -44330,8 +44330,13 @@ mod tests {
             // Sweep LEAF at the two best nb values. LEAF is where the dgeqrt3 recursion
             // stops and BLAS-2 begins, so it sits on the panel term (51.5% of the lane at
             // nb=32) rather than on staging (11.8%) or the trailing GEMM.
-            for nb in [16usize, 32, 64] {
-                for leaf in [2usize, 4, 8, 16] {
+            // {32,64,96,128}: the earlier geqrf grid stopped at 64 and never held larger
+            // panels. getrf's optimum turned out to be 128 - and its nb=64 was a
+            // cache-aliasing local maximum - so the same physics may apply here. Not
+            // testing above the previous winner is exactly how the SVD panel sat at 16
+            // when 8 won 15/16 cells.
+            for nb in [32usize, 64, 96, 128] {
+                for leaf in [2usize, 4] {
                     let mut t = super::QrStageTimings::default();
                     let start = std::time::Instant::now();
                     let (_p, _tau) =
