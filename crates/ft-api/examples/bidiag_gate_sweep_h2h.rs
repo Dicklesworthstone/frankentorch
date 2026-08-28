@@ -161,6 +161,11 @@ struct Arm {
     /// (`frankentorch-rpytm`). Bit-identical either way, so this pair can move time and cannot
     /// move a number. `FT_SUBSER=0,1` prices lu_factor's only parallelism in ONE invocation.
     sub_serial: bool,
+    /// Forced column-block WIDTH for the trailing-update GEMM; `0` = the thread-derived
+    /// default (`frankentorch-rpytm`). `block_cols` divides by `rayon::current_num_threads()`,
+    /// so width and thread count move together by default and a thread sweep cannot separate
+    /// them — this arm varies width alone. Bit-identical either way.
+    sub_cols: usize,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -185,6 +190,7 @@ fn arm_label(arm: Arm) -> String {
         "/replay-rowmajor"
     } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
+        + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -300,6 +306,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
+    let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -331,6 +338,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
+        ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -353,6 +361,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
+        ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -433,6 +442,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
+    ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     (ms, sum)
 }
 
@@ -521,6 +531,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FT_FIXTURE=generic — on the default fixture the QR sweep is 0% of the lane, so this arm
     // is a null there by construction and would "prove" the lever worthless for the wrong
     // reason.
+    let subcols: Vec<usize> = std::env::var("FT_SUBCOLS")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
     let subsers: Vec<bool> = std::env::var("FT_SUBSER")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -574,16 +589,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for &replay_transposed in &replays {
                         for &grouped_ggs in &ggs_arms {
                             for &sub_serial in &subsers {
-                                arms.push(Arm {
-                                    gate,
-                                    blocked,
-                                    fused,
-                                    panel_output_blocked,
-                                    values_only: false,
-                                    replay_transposed,
-                                    grouped_ggs,
-                                    sub_serial,
-                                });
+                                for &sub_cols in &subcols {
+                                    arms.push(Arm {
+                                        gate,
+                                        blocked,
+                                        fused,
+                                        panel_output_blocked,
+                                        values_only: false,
+                                        replay_transposed,
+                                        grouped_ggs,
+                                        sub_serial,
+                                        sub_cols,
+                                    });
+                                }
                             }
                         }
                     }
