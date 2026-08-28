@@ -27886,6 +27886,20 @@ fn eigh_tred2_reduce_packed_full(
 /// Shipped gate width. See `eigh_tred2_reduce_packed_full_gated` for the measurements.
 const TRED2_PAR_MIN_L_DEFAULT: usize = 384;
 
+/// Whether the reduction's `ggs` matvec computes FOUR outputs in flight — `frankentorch-wjrqt`.
+/// Default FALSE until measured, per this session's record that unmeasured levers are as often
+/// rejects as wins. Bit-identical to the per-`j` form either way, so the two arms can only move
+/// time.
+static TRED2_GROUPED_GGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+fn tred2_grouped_ggs() -> bool {
+    TRED2_GROUPED_GGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[doc(hidden)]
+pub fn set_tred2_grouped_ggs(on: bool) -> bool {
+    TRED2_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The reduction with its parallel gate exposed, so a same-process A/B can measure the
 /// serial and gated-parallel arms at one thread width instead of inferring across runs.
 fn eigh_tred2_reduce_packed_full_gated(
@@ -27934,7 +27948,82 @@ fn eigh_tred2_reduce_packed_full_gated(
                 // planes. Inner parallelism on planes that small would wreck it.
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
-                let ggs: Vec<f64> = if l < par_min_l {
+                let grouped_ggs: Option<Vec<f64>> = if tred2_grouped_ggs() && l >= 8 {
+                    // FOUR OUTPUTS IN FLIGHT — `frankentorch-wjrqt`, the item-254 lever applied
+                    // to the phase that never got it.
+                    //
+                    // Each `gg[j]` is a dot product accumulated by a SERIAL chain, so the loop
+                    // below runs at one FMA per chain latency no matter how wide the machine is.
+                    // The reduce measures 3.70 GFLOP/s against our GEMM's 34-38, and its cache
+                    // miss rate is UNDER-represented (0.62x per instruction), i.e. it is
+                    // compute-bound — a dependency-chain problem, not bandwidth.
+                    //
+                    // THE LAYOUT MAKES IT CHEAP. `gg[j] = sum_k A[j,k] * row_i[k]` over a
+                    // symmetric matrix in packed-lower storage: for `k <= j` the value is row
+                    // `j`'s element `k`; for `k > j` it is row `k`'s element `j`. For FOUR
+                    // CONSECUTIVE `j` and any `k > j3`, those four values are `A[k, j0..=j3]` —
+                    // ADJACENT in memory. So the dominant range is one 4-wide load times a
+                    // broadcast of `row_i[k]`, into four independent accumulators.
+                    //
+                    // BIT-EXACT. The original accumulates `k = 0..=j` (row) then `k = j+1..=l`
+                    // (column), i.e. ascending `k` throughout; each lane here does exactly that
+                    // for its own `j`, in the same order, from the same values. Nothing is
+                    // summed across lanes.
+                    let mut ggs = vec![0.0f64; l + 1];
+                    let mut j0 = 0usize;
+                    while j0 + 4 <= l + 1 {
+                        let j3 = j0 + 3;
+                        let mut acc = wide::f64x4::ZERO;
+                        // k <= j3: the four lanes read different rows, so this stays scalar.
+                        for k in 0..=j3 {
+                            let mut lane = [0.0f64; 4];
+                            for (t, slot) in lane.iter_mut().enumerate() {
+                                let j = j0 + t;
+                                *slot = if k <= j {
+                                    prev_ro[lower_packed_index(j, 0) + k]
+                                } else {
+                                    prev_ro[lower_packed_index(k, 0) + j]
+                                };
+                            }
+                            acc += wide::f64x4::from(lane) * wide::f64x4::splat(row_i_ro[k]);
+                        }
+                        // k > j3: A[k, j0..=j3] is one contiguous run of four.
+                        for k in (j3 + 1)..=l {
+                            let base = lower_packed_index(k, 0) + j0;
+                            let quad = [
+                                prev_ro[base],
+                                prev_ro[base + 1],
+                                prev_ro[base + 2],
+                                prev_ro[base + 3],
+                            ];
+                            acc += wide::f64x4::from(quad) * wide::f64x4::splat(row_i_ro[k]);
+                        }
+                        let out = acc.to_array();
+                        ggs[j0..j0 + 4].copy_from_slice(&out);
+                        j0 += 4;
+                    }
+                    // Tail: the pre-existing per-j form, unchanged.
+                    for j in j0..=l {
+                        let mut gg = 0.0;
+                        let row_j_start = lower_packed_index(j, 0);
+                        let row_j = &prev_ro[row_j_start..=row_j_start + j];
+                        for k in 0..=j {
+                            gg += row_j[k] * row_i_ro[k];
+                        }
+                        let mut lower_col_offset = lower_packed_index(j + 1, j);
+                        for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1) {
+                            gg += prev_ro[lower_col_offset] * row_i_k;
+                            lower_col_offset += k + 1;
+                        }
+                        ggs[j] = gg;
+                    }
+                    Some(ggs)
+                } else {
+                    None
+                };
+                let ggs: Vec<f64> = if let Some(g) = grouped_ggs {
+                    g
+                } else if l < par_min_l {
                     (0..=l)
                         .map(|j| {
                             let mut gg = 0.0;
@@ -69509,6 +69598,59 @@ mod tests {
     /// matrix put through the real reduction, NOT synthetic reflectors: random u, v are not
     /// valid tred2 output (u = v/h, h = ||v||^2/2 makes each operator orthogonal), and testing
     /// against synthetic ones manufactures divergence that is the fixture's, not the code's.
+    #[test]
+    /// `frankentorch-wjrqt`: the four-outputs-in-flight `ggs` matvec must be BIT-IDENTICAL to
+    /// the per-`j` loop it replaces.
+    ///
+    /// Bitwise is the right assertion, not a tolerance: the grouped form accumulates each `j`
+    /// in the SAME ascending-`k` order from the SAME values, only in a lane instead of a
+    /// scalar. Nothing is reassociated and nothing is summed across lanes — the same argument
+    /// that licensed the transposed replay levers. A tolerance here would hide exactly the
+    /// indexing error this test exists to catch, because the packed-triangle split (`k <= j`
+    /// reads row `j`, `k > j` reads row `k`) is easy to get subtly wrong and would still
+    /// produce plausible eigenvalues.
+    ///
+    /// Sizes straddle the group of four AND the `l >= 8` entry condition, so the scalar tail
+    /// and the fallback path both run.
+    #[test]
+    fn eigh_tred2_grouped_ggs_matches_per_j_bitwise() {
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
+        let mut mismatches: Vec<String> = Vec::new();
+        for &n in &[6usize, 9, 16, 33, 64] {
+            let raw = bidiag_test_matrix(n, n, 0x6664u64.wrapping_mul(n as u64 + 7));
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (raw[r * n + c] + raw[c * n + r]) * 0.5;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+            let previous = super::set_tred2_grouped_ggs(false);
+            let base = super::eigh_contiguous_f64(&sym, &meta).expect("per-j eigh");
+            super::set_tred2_grouped_ggs(true);
+            let grouped = super::eigh_contiguous_f64(&sym, &meta);
+            super::set_tred2_grouped_ggs(previous);
+            let grouped = grouped.expect("grouped eigh");
+
+            if bits(&base.eigenvalues) != bits(&grouped.eigenvalues) {
+                mismatches.push(format!("n={n}: eigenvalues differ"));
+            }
+            if bits(&base.eigenvectors) != bits(&grouped.eigenvectors) {
+                mismatches.push(format!("n={n}: eigenvectors differ"));
+            }
+            assert!(
+                grouped.eigenvectors.iter().any(|v| v.abs() > 1e-12),
+                "n={n}: eigenvectors identically zero, comparison vacuous"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "grouped ggs diverged from the per-j loop: {}",
+            mismatches.join("; ")
+        );
+    }
+
     #[test]
     fn eigh_blocked_backtransform_matches_unblocked() {
         // Builds the reflector state DIRECTLY and calls both backtransforms, rather than

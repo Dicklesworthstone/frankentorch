@@ -209,6 +209,13 @@ fn main() {
         eprintln!("backtransform_nb={nb}");
     }
 
+    // FT_GGS=1 selects the four-outputs-in-flight ggs matvec (frankentorch-wjrqt).
+    if let Ok(v) = std::env::var("FT_GGS") {
+        let on = v.trim() != "0";
+        ft_kernel_cpu::set_tred2_grouped_ggs(on);
+        eprintln!("grouped_ggs={on}");
+    }
+
     // FT_OP=eigh re-takes the eigh phase map. The banked one (reduce 42.7% / backtransform
     // 31.8% / tql2 24.8%) was measured on the DEFAULT fixture, whose symmetrised form has 496
     // of 512 eigenvalues exactly equal — the tridiagonal QL iteration deflates on equal
