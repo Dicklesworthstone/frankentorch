@@ -169,7 +169,7 @@ struct Arm {
     /// Row threshold above which the getrf panel's rank-1 update forks (`frankentorch-rpytm`).
     /// Shipped default 64; the panel forks PER COLUMN, so this sets how many forks a
     /// factorisation pays. Bit-identical either way.
-    panel_par_min: usize,
+    panel_par_min: Option<usize>,
     /// Override for the tred2 reduction's per-step fork threshold; `0` = shipped default 384.
     /// `FT_TPM=0,100000` prices "fork as shipped" against "never fork" in one invocation.
     tred2_par_min: usize,
@@ -177,7 +177,7 @@ struct Arm {
     /// transpose (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QTB=0,1` prices it in ONE
     /// invocation. BIT-IDENTICAL either way — pure data movement — so this pair can move time and
     /// cannot move a number.
-    qr_cm_blocked_transpose: bool,
+    qr_cm_blocked_transpose: Option<bool>,
     /// Whether the blocked QR FORWARD PASS holds R column-major for the whole reduction, which
     /// removes the trailing update's gather and transpose entirely
     /// (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QRC=0,1` prices it in ONE
@@ -185,14 +185,14 @@ struct Arm {
     ///
     /// This arm REASSOCIATES (the three trailing GEMMs change shape), so its parity column is
     /// load-bearing rather than a formality.
-    qr_trailing_cm: bool,
+    qr_trailing_cm: Option<bool>,
     /// Whether the QR/geqrf PANEL factorises against a COLUMN-MAJOR buffer; `false` = the
     /// shipped row-major in-place form (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`).
     /// `FT_QCM=0,1` prices it in ONE invocation against one live PyTorch.
     ///
     /// BIT-IDENTICAL either way (same sums in the same order, same GEMM operand buffers), so this
     /// pair can move time and cannot move a number.
-    qr_panel_cm: bool,
+    qr_panel_cm: Option<bool>,
     /// Fork threshold for the eigh BACKTRANSFORM's two O(i^2) passes; `0` = the shipped
     /// never-fork loop (`frankentorch-wjrqt`). `FT_BTP=0,384` prices the last serial O(n^3)
     /// phase of eigh in ONE invocation against one live PyTorch.
@@ -208,7 +208,7 @@ struct Arm {
     /// This arm REASSOCIATES (it is the one knob here that does), so its parity column is
     /// load-bearing rather than a formality: the two arms must agree with torch's eigenvalues to
     /// the lane's tolerance or the timing means nothing.
-    tred2_block_nb: usize,
+    tred2_block_nb: Option<usize>,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -234,21 +234,36 @@ fn arm_label(arm: Arm) -> String {
     } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
         + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
-        + &format!("/ppm{}", arm.panel_par_min)
+        + &(match arm.panel_par_min {
+            Some(v) => format!("/ppm{v}"),
+            None => "/ppmSHIPPED".to_string(),
+        })
         + &format!("/tpm{}", arm.tred2_par_min)
-        + &(if arm.tred2_block_nb > 0 {
-            format!("/TNB{}", arm.tred2_block_nb)
-        } else {
-            "/tnbOFF".to_string()
+        + &(match arm.tred2_block_nb {
+            Some(0) => "/tnbOFF".to_string(),
+            Some(v) => format!("/TNB{v}"),
+            None => "/tnbSHIPPED".to_string(),
         })
         + &(if arm.eigh_bt_par_min > 0 {
             format!("/BTP{}", arm.eigh_bt_par_min)
         } else {
             "/btpSERIAL".to_string()
         })
-        + if arm.qr_panel_cm { "/panelCM" } else { "/panelROW" }
-        + if arm.qr_trailing_cm { "/RcolCM" } else { "/RrowMAJ" }
-        + if arm.qr_cm_blocked_transpose { "/tbBLK" } else { "/tbNAIVE" }
+        + match arm.qr_panel_cm {
+            Some(true) => "/panelCM",
+            Some(false) => "/panelROW",
+            None => "/panelSHIPPED",
+        }
+        + match arm.qr_trailing_cm {
+            Some(true) => "/RcolCM",
+            Some(false) => "/RrowMAJ",
+            None => "/RSHIPPED",
+        }
+        + match arm.qr_cm_blocked_transpose {
+            Some(true) => "/tbBLK",
+            Some(false) => "/tbNAIVE",
+            None => "/tbSHIPPED",
+        }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -365,12 +380,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
-    let previous_ppm = ft_kernel_cpu::set_lu_panel_par_min(arm.panel_par_min);
+    let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
-    let previous_tnb = ft_kernel_cpu::set_tred2_block_nb(arm.tred2_block_nb);
-    let previous_qcm = ft_kernel_cpu::set_qr_panel_column_major(arm.qr_panel_cm);
-    let previous_qrc = ft_kernel_cpu::set_qr_trailing_column_major(arm.qr_trailing_cm);
-    let previous_qtb = ft_kernel_cpu::set_qr_cm_blocked_transpose(arm.qr_cm_blocked_transpose);
+    let previous_tnb = arm.tred2_block_nb.map(ft_kernel_cpu::set_tred2_block_nb);
+    let previous_qcm = arm.qr_panel_cm.map(ft_kernel_cpu::set_qr_panel_column_major);
+    let previous_qrc = arm.qr_trailing_cm.map(ft_kernel_cpu::set_qr_trailing_column_major);
+    let previous_qtb = arm.qr_cm_blocked_transpose.map(ft_kernel_cpu::set_qr_cm_blocked_transpose);
     let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
         usize::MAX
     } else {
@@ -408,13 +423,13 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
-        ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
+        if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
-        ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
+        if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
-        ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
-        ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
-        ft_kernel_cpu::set_qr_cm_blocked_transpose(previous_qtb);
+        if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
+        if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
+        if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -438,13 +453,13 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
-        ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
+        if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
-        ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
+        if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
-        ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
-        ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
-        ft_kernel_cpu::set_qr_cm_blocked_transpose(previous_qtb);
+        if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
+        if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
+        if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
         return (ms, sum);
     }
     let started = Instant::now();
@@ -526,13 +541,13 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
-    ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
+    if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
-    ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
+    if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
     ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
-    ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
-    ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
-    ft_kernel_cpu::set_qr_cm_blocked_transpose(previous_qtb);
+    if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
+    if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
+    if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
     (ms, sum)
 }
 
@@ -626,48 +641,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
-    let tnbs: Vec<usize> = std::env::var("FT_TNB")
-        .unwrap_or_else(|_| "0".to_string())
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
+    let tnbs: Vec<Option<usize>> = match std::env::var("FT_TNB") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .map(Some)
+            .collect(),
+        Err(_) => vec![None],
+    };
     let btps: Vec<usize> = std::env::var("FT_BTP")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
-    let qtbs: Vec<bool> = std::env::var("FT_QTB")
-        .unwrap_or_else(|_| "1".to_string())
-        .split(',')
-        .filter_map(|t| match t.trim() {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        })
-        .collect();
-    let qrcs: Vec<bool> = std::env::var("FT_QRC")
-        .unwrap_or_else(|_| "0".to_string())
-        .split(',')
-        .filter_map(|t| match t.trim() {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        })
-        .collect();
-    let qcms: Vec<bool> = std::env::var("FT_QCM")
-        .unwrap_or_else(|_| "0".to_string())
-        .split(',')
-        .filter_map(|t| match t.trim() {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        })
-        .collect();
-    let ppms: Vec<usize> = std::env::var("FT_PPM")
-        .unwrap_or_else(|_| "64".to_string())
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
+    let qtbs: Vec<Option<bool>> = match std::env::var("FT_QTB") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let qrcs: Vec<Option<bool>> = match std::env::var("FT_QRC") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let qcms: Vec<Option<bool>> = match std::env::var("FT_QCM") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
+    // AN UNSET KNOB MUST MEAN "LEAVE THE SHIPPED DEFAULT", NOT "FORCE OFF".
+    // Every knob here used to default to a concrete value, so a lane run without naming it
+    // measured whatever that value happened to be — and for four of them that was the PRE-FIX
+    // code. Measured: a full six-op ranking taken this way reported geqrf at 13.630x because
+    // FT_QCM/FT_QRC defaulted to 0 and forced the column-major paths OFF, and eigh without the
+    // shipped blocked dsytrd. 7155beb8 had already recorded the same trap for FT_PPM's default of
+    // 64 (the old getrf threshold) without generalising it. `None` = do not touch the atomic.
+    let ppms: Vec<Option<usize>> = match std::env::var("FT_PPM") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .map(Some)
+            .collect(),
+        Err(_) => vec![None],
+    };
     let subcols: Vec<usize> = std::env::var("FT_SUBCOLS")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -893,16 +927,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lane_entries: Vec<String> = lanes
         .iter()
         .map(|(n, name)| {
+            // FIXTURE SELECTION MUST BE SYMMETRIC. The Rust arm builds its `_spd` and its
+            // `_expm_fixture` from `fill()`, which switches to the generic matrix under
+            // FT_FIXTURE=generic — so these lanes hardcoding `_mk` made the two arms factor
+            // DIFFERENT MATRICES and report a guaranteed parity MISMATCH (measured: cholesky
+            // 6.02e-3, lu_factor 2.23e-1). The harness's own note that "both selectors are driven
+            // by the SAME predicate" was true only for the ops that reach the branch below.
+            let mk = if generic_fixture() { "_mk_generic" } else { "_mk" };
             let base = if op == "orgqr" {
-                format!("torch.geqrf(_mk({n}, False))")
+                format!("torch.geqrf({mk}({n}, False))")
             } else if op == "cholesky" || op == "slogdet" || op == "inv" || op == "lu_factor" {
-                format!("_spd({n})")
+                format!("_spd({n}, {mk})")
             } else if op == "matrix_exp" {
-                format!("_expm_fixture({n})")
+                format!("_expm_fixture({n}, {mk})")
             } else if op == "ormqr" {
                 // (A, tau, C) as a flat 3-tuple: geqrf's two outputs plus the matrix to apply to.
                 format!(
-                    "(lambda g, c: (g[0], g[1], c))(torch.geqrf(_mk({n}, False)), _mk({n}, False))"
+                    "(lambda g, c: (g[0], g[1], c))(torch.geqrf({mk}({n}, False)), {mk}({n}, False))"
                 )
             } else if generic_fixture() {
                 // Mirrors the Rust arm's fill()/fill_generic() switch. Both selectors are
@@ -942,14 +983,18 @@ def _mk_generic(n, sym=False):
     # cond 97.4 at n=512 and the spectrum is still fully non-degenerate (512/512 distinct).
     A = h.to(torch.float64) / 2048.0 - 1.0 + torch.eye(n, dtype=torch.float64) * 16.0
     return (A + A.T) * 0.5 if sym else A
-def _expm_fixture(n):
+def _expm_fixture(n, mk=None):
     # Scaled by 1/n so the spectral radius stays O(1): expm of the raw fixture overflows
     # f64 well before n=512. The Rust arm applies the identical scaling.
-    return _mk(n, False) / float(n)
-def _spd(n):
+    mk = mk or _mk
+    return mk(n, False) / float(n)
+def _spd(n, mk=None):
     # Symmetric + strictly diagonally dominant => positive definite at every n, so the
     # Cholesky factor exists and is unique. The Rust arm builds the identical matrix.
-    A = _mk(n, True)
+    # `mk` is threaded through so FT_FIXTURE=generic reaches THIS lane too — the Rust side's
+    # `fill()` already switched, and the mismatch was silent apart from the parity column.
+    mk = mk or _mk
+    A = mk(n, True)
     return A + torch.eye(n, dtype=torch.float64) * float(n)
 def run(base, fn):
     _t = time.perf_counter()
