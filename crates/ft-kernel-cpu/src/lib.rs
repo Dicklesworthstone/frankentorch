@@ -90,6 +90,14 @@ mod gemm {
         })
     }
 
+    /// Force `dgemm_sub_into`'s column blocks to run SEQUENTIALLY — `frankentorch-rpytm`.
+    /// Default false. Measurement toggle, not a shipped policy; see `dgemm_sub_into`.
+    pub(crate) static DGEMM_SUB_SERIAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn dgemm_sub_serial() -> bool {
+        DGEMM_SUB_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
         rayon::current_num_threads() > 1
@@ -590,6 +598,52 @@ mod gemm {
         let b = &b[..k * n];
         let nb = block_cols(n);
         let cp = TilePtr(c.as_mut_ptr());
+        // SERIAL ARM — `frankentorch-rpytm`. This function is UNCONDITIONALLY parallel, unlike
+        // `dgemm`, which gates on `should_parallelize` (flops and shape). `lu_factor`'s trailing
+        // update is its ONLY parallelism, and a thread sweep measured our own lu_factor 1.62x
+        // SLOWER at 8 threads than at 1 (39.164 -> 63.612 ms at n=1024) with the min-to-median
+        // spread growing 1.055 -> 1.199 — the parallelism costs wall time AND the sample
+        // stability that fails this op's A/A null (0.939, 0.979).
+        //
+        // The toggle exists so that can be measured as an INTERLEAVED ARM against one live
+        // incumbent rather than inferred from a thread sweep across windows. It is deliberately
+        // NOT a proposed fix: a real gate would be a flops/shape predicate like `dgemm`'s, and
+        // picking one needs the measurement this enables. Default OFF = today's behaviour.
+        //
+        // BIT-IDENTICAL either way. The column blocks are disjoint, each computed by the same
+        // `dgemm_mm` call with the same operands and the same k-accumulation order; only the
+        // order in which independent blocks execute changes, and no block reads another's
+        // output. This function is shared with the blocked cholesky/QR/bidiag paths, so the
+        // toggle moves their scheduling too — which is why it is off by default and why any
+        // eventual gate must be justified on more than one op.
+        if dgemm_sub_serial() {
+            for blk in 0..n.div_ceil(nb) {
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                // SAFETY: identical operand model to the parallel arm below; running the same
+                // disjoint blocks sequentially cannot alias where running them concurrently
+                // does not.
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            }
+            return;
+        }
         (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
             let cp = &cp;
             let n0 = blk * nb;
@@ -32647,6 +32701,13 @@ fn svd_replay_transposed() -> bool {
 /// Set the replay layout, returning the previous setting. Exists so the two arms can be
 /// alternated INSIDE one process against one incumbent, which is the only kind of A/B this
 /// host reliably grants.
+/// Force the blocked trailing-update GEMM to run its column blocks sequentially
+/// (`frankentorch-rpytm`). Returns the previous setting. Bit-identical either way.
+#[doc(hidden)]
+pub fn set_dgemm_sub_serial(on: bool) -> bool {
+    gemm::DGEMM_SUB_SERIAL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[doc(hidden)]
 pub fn set_svd_replay_transposed(t: bool) -> bool {
     SVD_REPLAY_TRANSPOSED.swap(t, std::sync::atomic::Ordering::Relaxed)
