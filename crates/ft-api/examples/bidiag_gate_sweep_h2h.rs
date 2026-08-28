@@ -173,6 +173,22 @@ struct Arm {
     /// Override for the tred2 reduction's per-step fork threshold; `0` = shipped default 384.
     /// `FT_TPM=0,100000` prices "fork as shipped" against "never fork" in one invocation.
     tred2_par_min: usize,
+    /// Fork threshold for the eigh BACKTRANSFORM's two O(i^2) passes; `0` = the shipped
+    /// never-fork loop (`frankentorch-wjrqt`). `FT_BTP=0,384` prices the last serial O(n^3)
+    /// phase of eigh in ONE invocation against one live PyTorch.
+    ///
+    /// BIT-IDENTICAL either way — the projection forks over COLUMN blocks (each output still
+    /// accumulates every k in ascending order) and the apply forks over rows, which were already
+    /// independent. So this pair can move time and cannot move a number.
+    eigh_bt_par_min: usize,
+    /// Panel width for the BLOCKED tred2 reduction; `0` = the shipped per-step BLAS-2 sweep
+    /// (`frankentorch-wjrqt`). `FT_TNB=0,32` prices blocked dsytrd against the incumbent in ONE
+    /// invocation against one live PyTorch.
+    ///
+    /// This arm REASSOCIATES (it is the one knob here that does), so its parity column is
+    /// load-bearing rather than a formality: the two arms must agree with torch's eigenvalues to
+    /// the lane's tolerance or the timing means nothing.
+    tred2_block_nb: usize,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -200,6 +216,16 @@ fn arm_label(arm: Arm) -> String {
         + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
         + &format!("/ppm{}", arm.panel_par_min)
         + &format!("/tpm{}", arm.tred2_par_min)
+        + &(if arm.tred2_block_nb > 0 {
+            format!("/TNB{}", arm.tred2_block_nb)
+        } else {
+            "/tnbOFF".to_string()
+        })
+        + &(if arm.eigh_bt_par_min > 0 {
+            format!("/BTP{}", arm.eigh_bt_par_min)
+        } else {
+            "/btpSERIAL".to_string()
+        })
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -318,6 +344,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = ft_kernel_cpu::set_lu_panel_par_min(arm.panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
+    let previous_tnb = ft_kernel_cpu::set_tred2_block_nb(arm.tred2_block_nb);
+    let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
+        usize::MAX
+    } else {
+        arm.eigh_bt_par_min
+    });
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -352,6 +384,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
+        ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
+        ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -377,6 +411,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
+        ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
+        ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -460,6 +496,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
+    ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
+    ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
     (ms, sum)
 }
 
@@ -553,6 +591,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
+    let tnbs: Vec<usize> = std::env::var("FT_TNB")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    let btps: Vec<usize> = std::env::var("FT_BTP")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
     let ppms: Vec<usize> = std::env::var("FT_PPM")
         .unwrap_or_else(|_| "64".to_string())
         .split(',')
@@ -619,6 +667,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 for &sub_cols in &subcols {
                                   for &panel_par_min in &ppms {
                                    for &tred2_par_min in &tpms {
+                                    for &tred2_block_nb in &tnbs {
+                                    for &eigh_bt_par_min in &btps {
                                     arms.push(Arm {
                                         gate,
                                         blocked,
@@ -631,7 +681,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         sub_cols,
                                         panel_par_min,
                                         tred2_par_min,
+                                        tred2_block_nb,
+                                        eigh_bt_par_min,
                                     });
+                                    }
+                                    }
                                    }
                                   }
                                 }

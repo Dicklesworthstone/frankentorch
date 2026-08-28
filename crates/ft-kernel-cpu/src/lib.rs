@@ -28025,6 +28025,26 @@ pub fn set_tred2_grouped_ggs(on: bool) -> bool {
     TRED2_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Sub-phase counters for the tred2 reduction — `frankentorch-wjrqt`.
+///
+/// The reduce is 55% of the eigh lane (7155beb8) and the only structural lever left on it is a
+/// blocked dsytrd, which defers the RANK-2 UPDATE into one rank-2k GEMM per panel and leaves the
+/// `ggs` MATVEC exactly where it is. So the ceiling of that lever is set by the update's share,
+/// and nothing in this campaign has measured it: 4b5be636 sized the lever on an ASSUMED
+/// half-and-half split, which it flagged as its own softest input. These two counters replace
+/// that assumption with a number.
+static TRED2_GGS_NS: AtomicU64 = AtomicU64::new(0);
+static TRED2_UPD_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset the tred2 sub-phase counters: `(ggs_matvec_ns, rank2_update_ns)`.
+#[doc(hidden)]
+pub fn tred2_stage_take_ns() -> (u64, u64) {
+    (
+        TRED2_GGS_NS.swap(0, LuOrdering::Relaxed),
+        TRED2_UPD_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 /// The reduction with its parallel gate exposed, so a same-process A/B can measure the
 /// serial and gated-parallel arms at one thread width instead of inferring across runs.
 fn eigh_tred2_reduce_packed_full_gated(
@@ -28035,6 +28055,13 @@ fn eigh_tred2_reduce_packed_full_gated(
     e: &mut [f64],
     par_min_l: usize,
 ) {
+    // BLOCKED PATH, off by default (`TRED2_BLOCK_NB` = 0). Needs at least two full panels to be
+    // the algorithm it claims to be, so it declines the sizes where it would degenerate.
+    let block_nb = TRED2_BLOCK_NB.load(std::sync::atomic::Ordering::Relaxed);
+    if block_nb >= 2 && n > 2 * block_nb {
+        eigh_tred2_reduce_packed_blocked(n, lower, scaled_reflectors, d, e, par_min_l, block_nb);
+        return;
+    }
     for i in (1..n).rev() {
         let l = i - 1;
         let row_i_start = lower_packed_index(i, 0);
@@ -28073,6 +28100,7 @@ fn eigh_tred2_reduce_packed_full_gated(
                 // planes. Inner parallelism on planes that small would wreck it.
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
+                let __t_ggs = std::time::Instant::now();
                 let grouped_ggs: Option<Vec<f64>> = if tred2_grouped_ggs() && l >= 8 {
                     // FOUR OUTPUTS IN FLIGHT — `frankentorch-wjrqt`, the item-254 lever applied
                     // to the phase that never got it.
@@ -28186,6 +28214,7 @@ fn eigh_tred2_reduce_packed_full_gated(
                         })
                         .collect()
                 };
+                TRED2_GGS_NS.fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                 f = 0.0;
                 for j in 0..=l {
                     scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
@@ -28196,6 +28225,7 @@ fn eigh_tred2_reduce_packed_full_gated(
                 for j in 0..=l {
                     e[j] -= hh * row_i[j];
                 }
+                let __t_upd = std::time::Instant::now();
                 let mut rows: Vec<&mut [f64]> = Vec::with_capacity(l + 1);
                 {
                     let mut rest: &mut [f64] = previous_rows;
@@ -28220,11 +28250,273 @@ fn eigh_tred2_reduce_packed_full_gated(
                         .enumerate()
                         .for_each(|(j, r)| update(j, r));
                 }
+                TRED2_UPD_NS.fetch_add(__t_upd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
         } else {
             e[i] = lower[row_i_start + l];
         }
         d[i] = h;
+    }
+    d[0] = 0.0;
+    e[0] = 0.0;
+}
+
+/// Panel width for the BLOCKED tred2 reduction. `0` = off (the per-step BLAS-2 sweep runs).
+///
+/// DEFAULT 0 — OFF until measured, the same contract the blocked backtransform ships under.
+static TRED2_BLOCK_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the blocked-tred2 panel width, returning the previous setting. `0` disables it.
+#[doc(hidden)]
+pub fn set_tred2_block_nb(nb: usize) -> usize {
+    TRED2_BLOCK_NB.swap(nb, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Dot product of two equal-length `f64` slices with four independent accumulators.
+///
+/// Every inner product the blocked reduction needs — the row-`i` correction, the two panel
+/// projections and the whole rank-2k flush — is this one shape: a contiguous run of `2*nb`
+/// doubles against another. Four accumulators because the flush is the phase's entire arithmetic
+/// budget and a single accumulator would run it at one add per FP latency.
+#[inline]
+fn tred2_dot(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len();
+    let mut acc = [wide::f64x4::ZERO; 4];
+    let mut idx = 0;
+    while idx + 16 <= len {
+        for (t, slot) in acc.iter_mut().enumerate() {
+            let o = idx + t * 4;
+            let av: [f64; 4] = a[o..o + 4].try_into().expect("4 lanes");
+            let bv: [f64; 4] = b[o..o + 4].try_into().expect("4 lanes");
+            *slot += wide::f64x4::from(av) * wide::f64x4::from(bv);
+        }
+        idx += 16;
+    }
+    let mut total: f64 = ((acc[0] + acc[1]) + (acc[2] + acc[3])).to_array().iter().sum();
+    while idx < len {
+        total += a[idx] * b[idx];
+        idx += 1;
+    }
+    total
+}
+
+/// Rows per task in the rank-2k flush. The flush reads `qmat` row `k` once and applies it to
+/// every row of the panel, so this constant is what turns the flush's `V`/`W` traffic from
+/// "re-read the whole panel per output row" into "re-read it per FLUSH_PANEL output rows".
+const TRED2_FLUSH_PANEL: usize = 64;
+
+/// BLOCKED tred2 reduction over PACKED LOWER storage — `frankentorch-wjrqt`.
+///
+/// WHAT THE INCUMBENT DOES. `eigh_tred2_reduce_packed_full_gated` runs LAPACK's `dsytd2`: per
+/// Householder step it computes `ggs = A·v` over the packed triangle and then applies the rank-2
+/// update `A -= v wᵀ + w vᵀ` to that same triangle. Two passes over the active triangle per step,
+/// n steps, and the update half is pure streaming with four flops per element.
+///
+/// WHAT THIS DOES. `nb` steps are taken against the triangle as it stood at the start of the
+/// block: each step's `v`/`w` pair is accumulated into a panel instead of being applied, and the
+/// whole panel lands as ONE rank-2k update per block. The traffic the update half costs falls by
+/// a factor of `nb`; its flop count is unchanged, but it moves from a memory-streaming loop into
+/// a dot-product kernel over panel rows that stay in cache.
+///
+/// WHY THIS IS NOT `eigh_tridiag_reduce_blocked` (the t0b4l NEGATIVE RESULT). That one is also a
+/// blocked dsytrd, it was measured at 0.37-0.70x — SLOWER — on a 64-thread worker, and its
+/// recorded root cause is that "the full-n² WY footprint loses the cache fight to the packed
+/// half-triangle". It stores the matrix DENSE `n x n`, copies the whole matrix once per panel
+/// (`a0 = a.to_vec()`), and runs its trailing update as two `mt x mt` GEMM temporaries plus a
+/// scalar subtract pass. So it changed TWO things at once — blocking AND doubling the footprint —
+/// and measured their sum. This one keeps the packed half-triangle, allocates nothing per step,
+/// and never materialises a product buffer, so it isolates the blocking.
+///
+/// EXACTNESS. Steps inside a block read a stale triangle and correct on the fly: row `i` is
+/// brought up to date against the pending panel before its reflector is taken, and `A_cur·v` is
+/// `A_stale·v` minus the panel's two projections. That is algebraically the same value and a
+/// DIFFERENT summation order, so this REASSOCIATES — admitted under the ratified `qgce4`
+/// tolerance contract for eigensolver outputs (reconstruction/orthogonality 1e-9), exactly as
+/// the blocked backtransform above is.
+///
+/// THE PANEL ALGEBRA, in one primitive. With `pmat[j] = [V[j,:] | W[j,:]]` and
+/// `qmat[j] = [W[j,:] | V[j,:]]`, every quantity the block needs is `tred2_dot` of two such rows:
+///   * row-`i` correction:  `A[i,j] -= pmat[j]·qmat[i]`  (and `A[i,i] -= pmat[i]·qmat[i]`)
+///   * matvec correction:   `ggs[j] -= pmat[j]·swap(c)` where `c = Σ_j pmat[j]·v[j]`
+///   * the flush:           `A[j,k] -= pmat[j]·qmat[k]`
+/// Columns not yet written are zero, so a dot over the full `2*nb` width is the same sum as one
+/// truncated at the current step — no per-step bounds bookkeeping.
+#[allow(clippy::needless_range_loop)]
+fn eigh_tred2_reduce_packed_blocked(
+    n: usize,
+    lower: &mut [f64],
+    scaled_reflectors: &mut [f64],
+    d: &mut [f64],
+    e: &mut [f64],
+    par_min_l: usize,
+    nb: usize,
+) {
+    let m = 2 * nb;
+    let mut pmat = vec![0.0f64; n * m];
+    let mut qmat = vec![0.0f64; n * m];
+    let mut i_hi = n - 1;
+    loop {
+        // `steps` is capped by `i_hi` so the last block stops at i = 1, matching the incumbent's
+        // `for i in (1..n).rev()`.
+        let steps = nb.min(i_hi);
+        let i_lo = i_hi + 1 - steps;
+        let lend = i_lo - 1;
+        for r in 0..=i_hi {
+            pmat[r * m..(r + 1) * m].fill(0.0);
+            qmat[r * m..(r + 1) * m].fill(0.0);
+        }
+        for s in 0..steps {
+            let i = i_hi - s;
+            let l = i - 1;
+            let row_i_start = lower_packed_index(i, 0);
+            let mut h = 0.0;
+            let (previous_rows, current_and_after) = lower.split_at_mut(row_i_start);
+            let row_i = &mut current_and_after[..=i];
+            // ROW i AGAINST THE PENDING PANEL. Steps 0..s deferred their rank-2 updates, and
+            // every one of them covered row i (their update region was rows 0..=l_t with
+            // l_t >= i). The reflector must be taken from the CURRENT row, so pay that here —
+            // O(l·nb), against the O(l²) matvec it precedes.
+            if s > 0 {
+                let __t_upd = std::time::Instant::now();
+                let qi: Vec<f64> = qmat[i * m..(i + 1) * m].to_vec();
+                for j in 0..=l {
+                    row_i[j] -= tred2_dot(&pmat[j * m..(j + 1) * m], &qi);
+                }
+                // The DIAGONAL is load-bearing: `eigh_tred2_packed_full` copies it into `z` and
+                // the backtransform reads it back as `d[i]`. No later step touches row i, so
+                // this is its last chance to be corrected.
+                row_i[i] -= tred2_dot(&pmat[i * m..(i + 1) * m], &qi);
+                TRED2_UPD_NS.fetch_add(__t_upd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            if l > 0 {
+                let mut scale = 0.0;
+                for &value in &row_i[..=l] {
+                    scale += value.abs();
+                }
+                if scale == 0.0 {
+                    e[i] = row_i[l];
+                } else {
+                    for value in &mut row_i[..=l] {
+                        *value /= scale;
+                        h += *value * *value;
+                    }
+                    let mut f = row_i[l];
+                    let g = if f >= 0.0 { -h.sqrt() } else { h.sqrt() };
+                    e[i] = scale * g;
+                    h -= f * g;
+                    row_i[l] = f - g;
+                    let __t_ggs = std::time::Instant::now();
+                    let row_i_ro: &[f64] = &row_i[..=l];
+                    let prev_ro: &[f64] = &previous_rows[..];
+                    // c = Σ_j pmat[j]·v[j]: the panel's two projections onto v, in one pass.
+                    let mut cswap = vec![0.0f64; m];
+                    if s > 0 {
+                        let mut c = vec![0.0f64; m];
+                        for j in 0..=l {
+                            let vj = row_i_ro[j];
+                            if vj == 0.0 {
+                                continue;
+                            }
+                            let pj = &pmat[j * m..(j + 1) * m];
+                            for t in 0..m {
+                                c[t] += pj[t] * vj;
+                            }
+                        }
+                        cswap[..nb].copy_from_slice(&c[nb..]);
+                        cswap[nb..].copy_from_slice(&c[..nb]);
+                    }
+                    let pm: &[f64] = &pmat;
+                    let ggs_at = |j: usize| -> f64 {
+                        let mut gg = 0.0;
+                        let row_j_start = lower_packed_index(j, 0);
+                        let row_j = &prev_ro[row_j_start..=row_j_start + j];
+                        for k in 0..=j {
+                            gg += row_j[k] * row_i_ro[k];
+                        }
+                        let mut lower_col_offset = lower_packed_index(j + 1, j);
+                        for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1) {
+                            gg += prev_ro[lower_col_offset] * row_i_k;
+                            lower_col_offset += k + 1;
+                        }
+                        gg - tred2_dot(&pm[j * m..(j + 1) * m], &cswap)
+                    };
+                    let ggs: Vec<f64> = if l < par_min_l {
+                        (0..=l).map(ggs_at).collect()
+                    } else {
+                        (0..=l).into_par_iter().map(ggs_at).collect()
+                    };
+                    TRED2_GGS_NS.fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                    f = 0.0;
+                    for j in 0..=l {
+                        scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
+                        e[j] = ggs[j] / h;
+                        f += e[j] * row_i[j];
+                    }
+                    let hh = f / (h + h);
+                    for j in 0..=l {
+                        e[j] -= hh * row_i[j];
+                    }
+                    // DEFER, do not apply: this pair is the block's column s.
+                    for j in 0..=l {
+                        let vj = row_i[j];
+                        let wj = e[j];
+                        pmat[j * m + s] = vj;
+                        pmat[j * m + nb + s] = wj;
+                        qmat[j * m + s] = wj;
+                        qmat[j * m + nb + s] = vj;
+                    }
+                }
+            } else {
+                e[i] = row_i[l];
+            }
+            d[i] = h;
+        }
+        // THE FLUSH. `A[j,k] -= pmat[j]·qmat[k]` over the surviving triangle, rows 0..=lend.
+        // Row-panelled so `qmat[k]` is read once per TRED2_FLUSH_PANEL output rows rather than
+        // once per output row — without that the panel's own traffic replaces the traffic the
+        // blocking just removed.
+        let __t_upd = std::time::Instant::now();
+        {
+            let end = lower_packed_index(lend, lend) + 1;
+            let mut rows: Vec<&mut [f64]> = Vec::with_capacity(lend + 1);
+            {
+                let mut rest: &mut [f64] = &mut lower[..end];
+                for j in 0..=lend {
+                    let (row, tail) = rest.split_at_mut(j + 1);
+                    rows.push(row);
+                    rest = tail;
+                }
+            }
+            let pm: &[f64] = &pmat;
+            let qm: &[f64] = &qmat;
+            let flush = |pi: usize, chunk: &mut [&mut [f64]]| {
+                let j0 = pi * TRED2_FLUSH_PANEL;
+                let jmax = j0 + chunk.len() - 1;
+                for k in 0..=jmax {
+                    let qk = &qm[k * m..(k + 1) * m];
+                    let start = k.saturating_sub(j0);
+                    for jj in start..chunk.len() {
+                        let j = j0 + jj;
+                        chunk[jj][k] -= tred2_dot(&pm[j * m..(j + 1) * m], qk);
+                    }
+                }
+            };
+            if lend < par_min_l {
+                rows.chunks_mut(TRED2_FLUSH_PANEL)
+                    .enumerate()
+                    .for_each(|(pi, chunk)| flush(pi, chunk));
+            } else {
+                rows.par_chunks_mut(TRED2_FLUSH_PANEL)
+                    .enumerate()
+                    .for_each(|(pi, chunk)| flush(pi, chunk));
+            }
+        }
+        TRED2_UPD_NS.fetch_add(__t_upd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        if i_lo <= 1 {
+            break;
+        }
+        i_hi = i_lo - 1;
     }
     d[0] = 0.0;
     e[0] = 0.0;
@@ -28339,12 +28631,36 @@ fn eigh_tred2_backtransform_blocked(n: usize, z: &mut [f64], d: &mut [f64], nb: 
     }
 }
 
+/// Step width above which the backtransform's two O(i^2) passes FORK — `frankentorch-wjrqt`.
+///
+/// `usize::MAX` = never fork, which is what this loop has always done. It is the last O(n^3)
+/// phase of eigh still running on one core: at n=1024 it MEASURED 285.62 ms of a 727.10 ms lane
+/// (39%, `tred2_split_probe`), and 2d5e0347 priced it at ~10 GFLOP/s — a single-core rate.
+///
+/// WHY IT IS AN OVERRIDE AND NOT SIMPLY TURNED ON. The file's own PERF NOTE records that
+/// "rayon-parallelizing the accumulation/applies here was MEASURED and REGRESSED (eigh 256
+/// 77->85ms)" — at n=256, where a step's work is 2*i^2 <= 131k flops and cannot amortise a
+/// dispatch. That is the same shape as the reduction's own gate, which is why this is a
+/// THRESHOLD rather than a flag: the reduction settled at 384 and pays off at n=1024 (not
+/// forking it is 1.56-1.59x SLOWER, 7155beb8), and the deciding quantity — work per fork — is
+/// the same here.
+static EIGH_BT_PAR_MIN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set the backtransform's fork threshold, returning the previous value. `usize::MAX` = serial.
+#[doc(hidden)]
+pub fn set_eigh_bt_par_min(v: usize) -> usize {
+    EIGH_BT_PAR_MIN.swap(v, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
     let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
     if nb > 0 {
         eigh_tred2_backtransform_blocked(n, z, d, nb);
         return;
     }
+    let par_min = EIGH_BT_PAR_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    let threads = rayon::current_num_threads();
     let mut projections = Vec::with_capacity(n);
     for i in 0..n {
         if d[i] != 0.0 {
@@ -28353,18 +28669,53 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
             let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
             let row_i = &current_and_after[..i];
             projections.resize(i, 0.0);
-            for k in 0..i {
-                let row_factor = row_i[k];
-                let row = &previous_rows[k * n..k * n + i];
-                for j in 0..i {
-                    projections[j] += row_factor * row[j];
+            // BIT-EXACT EITHER WAY, and that is the whole point of splitting these two loops
+            // the way they are split rather than the obvious way.
+            //
+            // The projection loop is a REDUCTION over k into `projections[j]`, so forking over
+            // k would reassociate it. Forking over COLUMN BLOCKS of j does not: each output
+            // still accumulates every k in ascending order, from the same values — only which
+            // thread walks which column strip changes. The apply loop is a pure map over rows,
+            // already independent. So the parallel and serial paths produce identical bits, and
+            // this pair can move time and cannot move a number.
+            if i >= par_min && threads > 1 {
+                let chunk = i.div_ceil(threads).max(64);
+                let prev: &[f64] = previous_rows;
+                projections[..i]
+                    .par_chunks_mut(chunk)
+                    .enumerate()
+                    .for_each(|(ci, out)| {
+                        let j0 = ci * chunk;
+                        for k in 0..i {
+                            let row_factor = row_i[k];
+                            let row = &prev[k * n + j0..k * n + j0 + out.len()];
+                            for (slot, &value) in out.iter_mut().zip(row) {
+                                *slot += row_factor * value;
+                            }
+                        }
+                    });
+                let proj: &[f64] = &projections;
+                previous_rows.par_chunks_mut(n).for_each(|row_full| {
+                    let reflector = row_full[i];
+                    let row = &mut row_full[..i];
+                    for (slot, &projection) in row.iter_mut().zip(proj) {
+                        *slot -= projection * reflector;
+                    }
+                });
+            } else {
+                for k in 0..i {
+                    let row_factor = row_i[k];
+                    let row = &previous_rows[k * n..k * n + i];
+                    for j in 0..i {
+                        projections[j] += row_factor * row[j];
+                    }
                 }
-            }
-            for k in 0..i {
-                let reflector = previous_rows[k * n + i];
-                let row = &mut previous_rows[k * n..k * n + i];
-                for j in 0..i {
-                    row[j] -= projections[j] * reflector;
+                for k in 0..i {
+                    let reflector = previous_rows[k * n + i];
+                    let row = &mut previous_rows[k * n..k * n + i];
+                    for j in 0..i {
+                        row[j] -= projections[j] * reflector;
+                    }
                 }
             }
         }
@@ -64763,6 +65114,167 @@ mod tests {
             max_abs < 1e-9 * scale.max(1.0),
             "blocked vs packed eigvalsh max abs diff {max_abs} (scale {scale})"
         );
+    }
+
+    /// The BLOCKED packed tred2 reduction against the shipped per-step sweep — wjrqt.
+    ///
+    /// Runs the identical downstream pipeline (build z, backtransform, tql2) off each reduction,
+    /// so any difference is the reduction's. Checked three ways because eigenvalue agreement
+    /// alone would not catch a wrong eigenVECTOR: values, reconstruction `A ≈ Z diag(λ) Zᵀ`, and
+    /// orthogonality `ZᵀZ ≈ I`. Tolerance parity, not bitwise — the blocked path reassociates
+    /// (qgce4), exactly like the blocked backtransform.
+    ///
+    /// n = 137 with nb = 16 and 32: neither divides it, so both a full-width final block and a
+    /// SHORT one are exercised, and 137 > 2·32 keeps the size gate open. A power-of-two n with a
+    /// dividing nb would never run the ragged tail, which is where the `steps = nb.min(i_hi)`
+    /// bound and the `lend` flush boundary are actually decided.
+    fn tred2_pipeline(n: usize, a: &[f64], nb: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut lower = vec![0.0f64; n * (n + 1) / 2];
+        for i in 0..n {
+            let dst = super::lower_packed_index(i, 0);
+            let src = i * n;
+            lower[dst..=dst + i].copy_from_slice(&a[src..=src + i]);
+        }
+        let mut d = vec![0.0f64; n];
+        let mut e = vec![0.0f64; n];
+        let mut scaled = vec![0.0f64; lower.len()];
+        if nb == 0 {
+            super::eigh_tred2_reduce_packed_full_gated(
+                n,
+                &mut lower,
+                &mut scaled,
+                &mut d,
+                &mut e,
+                super::TRED2_PAR_MIN_L_DEFAULT,
+            );
+        } else {
+            super::eigh_tred2_reduce_packed_blocked(
+                n,
+                &mut lower,
+                &mut scaled,
+                &mut d,
+                &mut e,
+                super::TRED2_PAR_MIN_L_DEFAULT,
+                nb,
+            );
+        }
+        let mut z = vec![0.0f64; n * n];
+        for i in 0..n {
+            let row_start = i * n;
+            let lower_start = super::lower_packed_index(i, 0);
+            z[row_start..=row_start + i]
+                .copy_from_slice(&lower[lower_start..=lower_start + i]);
+            for j in 0..i {
+                z[j * n + i] = scaled[super::lower_packed_index(i, j)];
+            }
+        }
+        super::eigh_tred2_backtransform(n, &mut z, &mut d);
+        super::eigh_tql2_z_deferred(n, &mut d, &mut e, &mut z);
+        (d, z)
+    }
+
+    /// The FORKED backtransform against the serial one — BIT-FOR-BIT, `frankentorch-wjrqt`.
+    ///
+    /// Not a tolerance check: the projection forks over column blocks (every output still sums
+    /// every k in ascending order) and the apply forks over rows that were already independent,
+    /// so the two paths must agree in every bit. Compared with `to_bits()` on BOTH outputs —
+    /// eigenvalues alone would not see a wrong eigenvector, and a magnitude comparison would not
+    /// see a sign flip (the trap that hid a reflector defect for a whole family, kzq2y).
+    ///
+    /// n = 200 with a threshold of 64 so the fork actually fires for most steps; the global is
+    /// restored afterwards, and a concurrent test that races it still gets a correct answer
+    /// because the two paths are the same arithmetic.
+    #[test]
+    fn eigh_backtransform_parallel_is_bit_exact() {
+        let n = 200usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let v = (((i * 131 + j * 17 + 7) % 1000) as f64) / 100.0 - 5.0
+                    + if i == j { (i as f64) * 0.5 } else { 0.0 };
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let previous = super::set_eigh_bt_par_min(usize::MAX);
+        let serial = super::eigh_contiguous_f64(&a, &meta).unwrap();
+        super::set_eigh_bt_par_min(64);
+        let forked = super::eigh_contiguous_f64(&a, &meta).unwrap();
+        super::set_eigh_bt_par_min(previous);
+        for i in 0..n {
+            assert_eq!(
+                serial.eigenvalues[i].to_bits(),
+                forked.eigenvalues[i].to_bits(),
+                "eigenvalue {i} differs: {} vs {}",
+                serial.eigenvalues[i],
+                forked.eigenvalues[i]
+            );
+        }
+        for idx in 0..n * n {
+            assert_eq!(
+                serial.eigenvectors[idx].to_bits(),
+                forked.eigenvectors[idx].to_bits(),
+                "eigenvector element {idx} differs: {} vs {}",
+                serial.eigenvectors[idx],
+                forked.eigenvectors[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn tred2_blocked_matches_packed_sweep() {
+        let n = 137usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let v = (((i * 131 + j * 17 + 7) % 1000) as f64) / 100.0 - 5.0
+                    + if i == j { (i as f64) * 0.5 } else { 0.0 };
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+        }
+        let (mut d_ref, _z_ref) = tred2_pipeline(n, &a, 0);
+        d_ref.sort_by(f64::total_cmp);
+        let scale = d_ref.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        for nb in [16usize, 32] {
+            let (d, z) = tred2_pipeline(n, &a, nb);
+            let mut sorted = d.clone();
+            sorted.sort_by(f64::total_cmp);
+            let worst = (0..n).fold(0.0f64, |m, i| m.max((sorted[i] - d_ref[i]).abs()));
+            assert!(
+                worst < 1e-9 * scale,
+                "nb={nb}: blocked vs packed eigenvalue max abs diff {worst} (scale {scale})"
+            );
+            // Reconstruction: eigenvectors are the COLUMNS of z.
+            let mut recon = 0.0f64;
+            for r in 0..n {
+                for c in 0..n {
+                    let mut acc = 0.0;
+                    for k in 0..n {
+                        acc += z[r * n + k] * d[k] * z[c * n + k];
+                    }
+                    recon = recon.max((acc - a[r * n + c]).abs());
+                }
+            }
+            assert!(
+                recon < 1e-9 * scale,
+                "nb={nb}: reconstruction max abs error {recon} (scale {scale})"
+            );
+            // Orthogonality.
+            let mut orth = 0.0f64;
+            for c1 in 0..n {
+                for c2 in 0..n {
+                    let mut acc = 0.0;
+                    for r in 0..n {
+                        acc += z[r * n + c1] * z[r * n + c2];
+                    }
+                    let want = if c1 == c2 { 1.0 } else { 0.0 };
+                    orth = orth.max((acc - want).abs());
+                }
+            }
+            assert!(orth < 1e-9, "nb={nb}: orthogonality max abs error {orth}");
+        }
     }
 
     // ---- Eigendecomposition tests (bd-2drq.7) ----
