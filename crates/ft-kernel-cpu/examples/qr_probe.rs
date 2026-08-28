@@ -81,6 +81,7 @@ fn averaged(total: QrStageTimings, iterations: u128) -> QrStageTimings {
         trailing_r_ns: total.trailing_r_ns / iterations,
         reverse_q_ns: total.reverse_q_ns / iterations,
         total_ns: total.total_ns / iterations,
+        ..QrStageTimings::default()
     }
 }
 

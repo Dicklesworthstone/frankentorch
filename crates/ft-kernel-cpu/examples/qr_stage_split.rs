@@ -81,6 +81,7 @@ fn median_timings(samples: &[QrStageTimings]) -> QrStageTimings {
         trailing_r_ns: median(&mut trailing_r),
         reverse_q_ns: median(&mut reverse_q),
         total_ns: median(&mut total),
+        ..QrStageTimings::default()
     }
 }
 

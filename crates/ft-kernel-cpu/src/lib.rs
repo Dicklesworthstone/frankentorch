@@ -37410,6 +37410,15 @@ pub struct QrStageTimings {
     pub panel_and_t_ns: u128,
     /// Trailing R compact-WY update time.
     pub trailing_r_ns: u128,
+    /// TRUE staging only: the `rt` gather and the `vt` transpose that exist because
+    /// `gemm::dgemm` has no leading-dimension parameter. Split out of `copy_zeroing_ns`
+    /// (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`) because that bucket ALSO wrapped the
+    /// dominant `dgemm_sub_into` trailing GEMM — so every figure quoted from it, including the
+    /// "staging is 29.9% of the geqrf lane" that the strided-B design rests on, was staging PLUS
+    /// the largest GEMM in the op. These two must be separable or the lever cannot be sized.
+    pub trailing_pack_ns: u128,
+    /// The trailing accumulate-GEMM `R[:, pe:] -= V (Tᵀ (Vᵀ R))` alone.
+    pub trailing_gemm_ns: u128,
     /// Reverse dorgqr Q construction time.
     pub reverse_q_ns: u128,
     /// Total profiled helper time.
@@ -38249,6 +38258,200 @@ fn qr_factor_panel_recursive_cm_f64(
     qr_factor_panel_recursive_cm_f64(pbuf, vbuf, m, panel_start, mid, range_end, tau, tiny, leaf);
 }
 
+
+/// Whether the blocked QR forward pass holds R in COLUMN-MAJOR order for the whole reduction.
+/// `false` = the shipped row-major form. `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+///
+/// WHY. `gemm::dgemm` has no leading-dimension parameter, so the row-major trailing update must
+/// GATHER `R[:, pe:n]` into a contiguous `m x nt` buffer and TRANSPOSE `V` before any GEMM can
+/// run. That packing is not a rounding error on the lane: at n=1024, nb=32, leaf=2, on a quiet
+/// worker,
+///
+/// ```text
+/// wall 140.091 ms   panel+T 31.5%   trailing_R 64.2%
+///   inside trailing_R:  pack 43.174 ms (30.8% of wall)   subGEMM 24.775 ms   midGEMM 22.024 ms
+/// ```
+///
+/// The packing alone is larger than either GEMM it feeds. Removing it entirely is worth 1.445x.
+///
+/// TWO WAYS TO REMOVE IT HAVE ALREADY BEEN MEASURED AND BOTH LOST, and both kept row-major
+/// storage while asking `matrixmultiply` to stride-walk an INPUT: dropping the `rt` gather was
+/// 1.144x SLOWER and dropping the `vt` transpose 1.079x SLOWER, because a strided input defeats
+/// the packing the microkernel depends on. That is a real result and this does not contradict it.
+///
+/// THIS CHANGES THE LAYOUT INSTEAD OF THE GEMM. With R stored column-major, the trailing block
+/// `R[:, pe:n]` IS contiguous — it is rows `pe..n` of `Rᵀ` — so the same three GEMMs run on
+/// contiguous operands with no packing at all, in transposed form:
+///
+/// ```text
+///   Wt  (nt x nb) = R_trailᵀ · V            dgemm(nt, m, nb)
+///   W2t (nt x nb) = Wt · T                  dgemm(nt, nb, nb)      (and Tᵀ is no longer built)
+///   R_trailᵀ     -= W2t · Vᵀ                dgemm_bt_sub_into(nt, nb, m)  straight into R
+/// ```
+///
+/// The panel needs no packing either: its `nb` columns are the CONTIGUOUS slice
+/// `rc[p*m .. pe*m]`, which is exactly the column-major buffer `qr_factor_panel_recursive_cm_f64`
+/// already wants, so it factorises IN PLACE. Two whole-matrix transposes are paid once each at
+/// entry and exit (2·m·n elements) against a per-panel gather that costs `m·n²/(2·nb)`.
+///
+/// It REASSOCIATES: the three GEMMs keep the same k-ranges but change shape, and
+/// `matrixmultiply`'s accumulation order depends on shape. Blocked QR in this tree is already
+/// tolerance-parity and validated by reconstruction rather than bitwise, so that is the standard
+/// it is held to.
+/// MEASURED against the SHIPPED configuration (which already has the column-major PANEL), hz4,
+/// live PyTorch in-process, 13 rounds, three arms, FT_FIXTURE=generic:
+///
+/// ```text
+///          geqrf                     qr (same forward pass)
+///   n= 128  0.946x SLOWER null 1.012
+///   n= 256  1.012x a wash  null 1.019
+///   n= 512  1.045x         null 1.001    1.022x  null 1.010
+///   n=1024  1.338x         null 1.004    1.160x  null 0.992
+/// ```
+///
+/// geqrf 12.746x -> 9.373x and qr 4.606x -> 4.011x vs PyTorch at n=1024. The n=1024 figure lands
+/// on the 1.445x ceiling the pack counter predicted for removing the packing outright, less what
+/// the two whole-matrix transposes cost.
+///
+/// THE GATE IS ON `n`, NOT `m`, and that is physics rather than a fitted constant: the transposes
+/// cost `2*m*n` while the packing they replace costs `m*n^2/(2*nb)`, so the ratio is `n/(4*nb)` —
+/// independent of `m`. A tall-skinny matrix (m >> n, small n) would pay more than it saves, which
+/// is exactly what the n=128 row shows.
+///
+/// AN EARLIER PAIR FOR THIS LEVER READ 1.222x/1.421x AND WAS INFLATED. That run left `FT_QCM=0`,
+/// which FORCES the column-major panel off, so arm0 was the fully row-major pre-b002bd73 code and
+/// the ratio double-counted a win that had already shipped. The rows above put the shipped
+/// configuration in arm0.
+/// TRI-STATE, and deliberately: `0` = follow the size gate (the shipped default), `1` = force on
+/// at every size, `2` = force off. A plain bool would have made the size gate unmeasurable —
+/// the n=128 and n=256 rows above, the ones that decided where the gate goes, were taken by
+/// forcing the path on BELOW it.
+static QR_TRAILING_CM_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Smallest COLUMN count at which the column-major forward pass is used.
+const QR_TRAILING_CM_MIN_N: usize = 512;
+
+/// Force the column-major QR forward pass on or off, returning the previous RAW state for
+/// [`restore_qr_trailing_column_major`]. The raw state is returned rather than a bool so a caller
+/// can put the size-gated default back, which a bool cannot express.
+#[doc(hidden)]
+pub fn set_qr_trailing_column_major(on: bool) -> u8 {
+    QR_TRAILING_CM_OVERRIDE.swap(u8::from(!on) + 1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Restore a raw override state captured from [`set_qr_trailing_column_major`].
+#[doc(hidden)]
+pub fn restore_qr_trailing_column_major(state: u8) {
+    QR_TRAILING_CM_OVERRIDE.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn qr_trailing_column_major_for(n: usize) -> bool {
+    match QR_TRAILING_CM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => n >= QR_TRAILING_CM_MIN_N,
+    }
+}
+
+/// `qr_blocked_forward_f64` with R held COLUMN-MAJOR for the whole reduction.
+///
+/// Returns the identical `(panel_start, nb, V, T, tau)` panels — `V` stays `m x nb` row-major, so
+/// every consumer (the reverse dorgqr, geqrf's reflector extraction, ormqr) is untouched.
+fn qr_blocked_forward_cm_f64(
+    r_mat: &mut [f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    nb_block: usize,
+    leaf: usize,
+    mut timings: Option<&mut QrStageTimings>,
+) -> Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    let nb_block = nb_block.max(1);
+    let tiny = f64::EPSILON * 1e6;
+    let profile_enabled = timings.is_some();
+    let mut panels: Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::new();
+
+    // R -> column-major, ONCE. This is the whole cost the per-panel gather is traded against.
+    let transpose_start = qr_profile_stage_start(profile_enabled);
+    let mut rc = vec![0.0f64; m * n];
+    for row in 0..m {
+        let src = row * n;
+        for col in 0..n {
+            rc[col * m + row] = r_mat[src + col];
+        }
+    }
+    if let Some(timings) = timings.as_mut() {
+        qr_profile_record_ns(&mut timings.trailing_pack_ns, transpose_start);
+    }
+
+    let mut p = 0;
+    while p < k {
+        let pe = (p + nb_block).min(k);
+        let nb = pe - p;
+
+        let panel_start_t = qr_profile_stage_start(profile_enabled);
+        // IN PLACE: the panel's nb columns are the contiguous slice rc[p*m .. pe*m], and column
+        // `c`'s diagonal sits at row `p + c` — exactly the layout the cm panel indexes with
+        // `panel_start = p`.
+        let mut vbuf = vec![0.0f64; nb * m];
+        let mut tau = vec![0.0f64; nb];
+        qr_factor_panel_recursive_cm_f64(
+            &mut rc[p * m..pe * m],
+            &mut vbuf,
+            m,
+            p,
+            0,
+            nb,
+            &mut tau,
+            tiny,
+            leaf,
+        );
+        // V back to m x nb row-major for the trailing GEMMs and for every downstream consumer.
+        let mut vmat = vec![0.0f64; m * nb];
+        for c in 0..nb {
+            let src = c * m;
+            for row in 0..m {
+                vmat[row * nb + c] = vbuf[src + row];
+            }
+        }
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb);
+        if let Some(timings) = timings.as_mut() {
+            qr_profile_record_ns(&mut timings.panel_and_t_ns, panel_start_t);
+        }
+
+        let nt = n - pe;
+        if nt > 0 {
+            let trailing_start = qr_profile_stage_start(profile_enabled);
+            // NO PACKING. rc[pe*m..n*m] is the trailing block transposed, contiguous, nt x m.
+            let mut wt = vec![0.0f64; nt * nb];
+            gemm::dgemm(nt, m, nb, &rc[pe * m..n * m], &vmat, &mut wt); // R_trailᵀ · V
+            let mut w2t = vec![0.0f64; nt * nb];
+            gemm::dgemm(nt, nb, nb, &wt, &tmat, &mut w2t); // (Wt) · T  — no Tᵀ buffer
+            let gemm_start = qr_profile_stage_start(profile_enabled);
+            gemm::dgemm_bt_sub_into(nt, nb, m, &w2t, &vmat, &mut rc, pe * m, m);
+            if let Some(timings) = timings.as_mut() {
+                qr_profile_record_ns(&mut timings.trailing_gemm_ns, gemm_start);
+                qr_profile_record_ns(&mut timings.trailing_r_ns, trailing_start);
+            }
+        }
+
+        panels.push((p, nb, vmat, tmat, tau));
+        p = pe;
+    }
+
+    let back_start = qr_profile_stage_start(profile_enabled);
+    for row in 0..m {
+        let dst = row * n;
+        for col in 0..n {
+            r_mat[dst + col] = rc[col * m + row];
+        }
+    }
+    if let Some(timings) = timings.as_mut() {
+        qr_profile_record_ns(&mut timings.trailing_pack_ns, back_start);
+    }
+    panels
+}
+
 /// Forward pass of the blocked compact-WY QR: reduces `r_mat` to R IN PLACE and returns
 /// each panel's `(panel_start, nb, V, T, tau)`.
 ///
@@ -38266,6 +38469,9 @@ fn qr_blocked_forward_f64(
     leaf: usize,
     mut timings: Option<&mut QrStageTimings>,
 ) -> Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> {
+    if qr_trailing_column_major_for(n) {
+        return qr_blocked_forward_cm_f64(r_mat, m, n, k, nb_block, leaf, timings);
+    }
     let nb_block = nb_block.max(1);
     let tiny = f64::EPSILON * 1e6;
     let profile_enabled = timings.is_some();
@@ -38375,6 +38581,7 @@ fn qr_blocked_forward_f64(
             }
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.copy_zeroing_ns, stage_start);
+                qr_profile_record_ns(&mut timings.trailing_pack_ns, stage_start);
             }
             let mut w = vec![0.0f64; nb * nt];
             gemm::dgemm(nb, m, nt, &vt, &rt, &mut w); // Vᵀ R
@@ -38409,6 +38616,7 @@ fn qr_blocked_forward_f64(
             gemm::dgemm_sub_into(m, nb, nt, &vmat, &w2, r_mat, pe, n);
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.copy_zeroing_ns, scatter_start);
+                qr_profile_record_ns(&mut timings.trailing_gemm_ns, scatter_start);
             }
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.trailing_r_ns, trailing_start);
@@ -46203,13 +46411,24 @@ mod tests {
             // as a percentage (it read "panel+T=892978700.0%" before this was fixed).
             let wall_ns = wall_ms * 1e6;
             let pct = |v: u128| 100.0 * v as f64 / wall_ns;
+            // The old single STAGING column was `copy_zeroing_ns`, which wrapped the `rt`/`vt`
+            // packing AND the `dgemm_sub_into` trailing GEMM. Printed separately now: `pack` is
+            // the cost the missing `ld` parameter actually imposes, `subGEMM` is the largest GEMM
+            // in the op, and `midGEMM` is the two small ones (VᵀR and Tᵀ(VᵀR)) by subtraction.
+            let mid_ns = t
+                .trailing_r_ns
+                .saturating_sub(t.trailing_pack_ns + t.trailing_gemm_ns);
             println!(
-                "GEQRF_NB nb={nb:>3} leaf={leaf:>2} wall={wall_ms:8.3}ms  panel+T={:5.1}%  trailing_R={:5.1}% ({:7.3}ms)  STAGING={:5.1}% ({:7.3}ms)",
+                "GEQRF_NB nb={nb:>3} leaf={leaf:>2} wall={wall_ms:8.3}ms  panel+T={:5.1}%  trailing_R={:5.1}% ({:7.3}ms)  pack={:5.1}% ({:7.3}ms)  subGEMM={:5.1}% ({:7.3}ms)  midGEMM={:5.1}% ({:7.3}ms)",
                 pct(t.panel_and_t_ns),
                 pct(t.trailing_r_ns),
                 t.trailing_r_ns as f64 / 1e6,
-                100.0 * t.copy_zeroing_ns as f64 / (t.trailing_r_ns.max(1) as f64),
-                t.copy_zeroing_ns as f64 / 1e6,
+                pct(t.trailing_pack_ns),
+                t.trailing_pack_ns as f64 / 1e6,
+                pct(t.trailing_gemm_ns),
+                t.trailing_gemm_ns as f64 / 1e6,
+                pct(mid_ns),
+                mid_ns as f64 / 1e6,
             );
         }
     }
@@ -65540,6 +65759,55 @@ mod tests {
         super::eigh_tred2_backtransform(n, &mut z, &mut d);
         super::eigh_tql2_z_deferred(n, &mut d, &mut e, &mut z);
         (d, z)
+    }
+
+    /// The COLUMN-MAJOR QR FORWARD PASS against the shipped row-major one — TOLERANCE.
+    /// `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+    ///
+    /// NOT bit-exact, and the distinction is the point: the panel arithmetic is unchanged, but
+    /// the three trailing GEMMs change shape (`Wt = R_trailᵀ·V` instead of `W = Vᵀ·R_trail`) and
+    /// `matrixmultiply` accumulates in an order that depends on shape. Blocked QR in this tree is
+    /// already tolerance-parity and validated by reconstruction, so that is the bar.
+    ///
+    /// Compares the packed output and `tau` ELEMENTWISE AND SIGNED, not by magnitude: a
+    /// |diag(R)| or |Q| checksum is blind to exactly the sign defect that survived a whole family
+    /// of tests once (kzq2y). Square 96x96 is included because the dlarfg zero-column guard is
+    /// only reachable on the last column of a square matrix.
+    #[test]
+    fn qr_trailing_column_major_matches_row_major() {
+        for (m, n) in [(96usize, 96usize), (128usize, 40usize), (137usize, 64usize)] {
+            let a: Vec<f64> = (0..m * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    (((i * 131 + j * 17 + 7) % 1000) as f64) / 100.0 - 5.0
+                        + if i == j { (i as f64) * 0.5 } else { 0.0 }
+                })
+                .collect();
+            let previous = super::set_qr_trailing_column_major(false);
+            let (r_row, tau_row) = super::geqrf_blocked_f64(&a, m, n);
+            super::set_qr_trailing_column_major(true);
+            let (r_col, tau_col) = super::geqrf_blocked_f64(&a, m, n);
+            super::restore_qr_trailing_column_major(previous);
+            let scale = r_row.iter().fold(1.0f64, |acc, v| acc.max(v.abs()));
+            assert_eq!(r_row.len(), r_col.len());
+            let mut worst = 0.0f64;
+            for idx in 0..r_row.len() {
+                worst = worst.max((r_row[idx] - r_col[idx]).abs());
+            }
+            assert!(
+                worst < 1e-9 * scale,
+                "m={m} n={n}: packed max abs diff {worst} (scale {scale})"
+            );
+            let mut worst_tau = 0.0f64;
+            for idx in 0..tau_row.len() {
+                worst_tau = worst_tau.max((tau_row[idx] - tau_col[idx]).abs());
+            }
+            assert!(
+                worst_tau < 1e-9,
+                "m={m} n={n}: tau max abs diff {worst_tau}"
+            );
+        }
     }
 
     /// The COLUMN-MAJOR QR panel against the shipped row-major one — BIT-FOR-BIT.

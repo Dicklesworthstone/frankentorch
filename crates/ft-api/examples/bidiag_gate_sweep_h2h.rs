@@ -173,6 +173,14 @@ struct Arm {
     /// Override for the tred2 reduction's per-step fork threshold; `0` = shipped default 384.
     /// `FT_TPM=0,100000` prices "fork as shipped" against "never fork" in one invocation.
     tred2_par_min: usize,
+    /// Whether the blocked QR FORWARD PASS holds R column-major for the whole reduction, which
+    /// removes the trailing update's gather and transpose entirely
+    /// (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QRC=0,1` prices it in ONE
+    /// invocation against one live PyTorch.
+    ///
+    /// This arm REASSOCIATES (the three trailing GEMMs change shape), so its parity column is
+    /// load-bearing rather than a formality.
+    qr_trailing_cm: bool,
     /// Whether the QR/geqrf PANEL factorises against a COLUMN-MAJOR buffer; `false` = the
     /// shipped row-major in-place form (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`).
     /// `FT_QCM=0,1` prices it in ONE invocation against one live PyTorch.
@@ -234,6 +242,7 @@ fn arm_label(arm: Arm) -> String {
             "/btpSERIAL".to_string()
         })
         + if arm.qr_panel_cm { "/panelCM" } else { "/panelROW" }
+        + if arm.qr_trailing_cm { "/RcolCM" } else { "/RrowMAJ" }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -354,6 +363,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
     let previous_tnb = ft_kernel_cpu::set_tred2_block_nb(arm.tred2_block_nb);
     let previous_qcm = ft_kernel_cpu::set_qr_panel_column_major(arm.qr_panel_cm);
+    let previous_qrc = ft_kernel_cpu::set_qr_trailing_column_major(arm.qr_trailing_cm);
     let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
         usize::MAX
     } else {
@@ -396,6 +406,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
+        ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -424,6 +435,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
+        ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -510,6 +522,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
     ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
     ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
+    ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
     (ms, sum)
 }
 
@@ -613,6 +626,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
+    let qrcs: Vec<bool> = std::env::var("FT_QRC")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let qcms: Vec<bool> = std::env::var("FT_QCM")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -691,6 +713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for &tred2_block_nb in &tnbs {
                                     for &eigh_bt_par_min in &btps {
                                     for &qr_panel_cm in &qcms {
+                                    for &qr_trailing_cm in &qrcs {
                                     arms.push(Arm {
                                         gate,
                                         blocked,
@@ -706,7 +729,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         tred2_block_nb,
                                         eigh_bt_par_min,
                                         qr_panel_cm,
+                                        qr_trailing_cm,
                                     });
+                                    }
                                     }
                                     }
                                     }
