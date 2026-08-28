@@ -152,6 +152,11 @@ struct Arm {
     /// fixture the QR sweep is 0% of the lane, so this arm would read as a null there by
     /// construction. Run it with `FT_FIXTURE=generic`.
     replay_transposed: bool,
+    /// Whether the tred2 reduction's `ggs` matvec keeps FOUR outputs in flight
+    /// (`frankentorch-wjrqt`). Bit-identical to the per-`j` loop, so this pair can move time
+    /// and cannot move a number — `FT_GGS=1,0` prices it in ONE invocation against one live
+    /// incumbent. Only the eigh/eigvalsh lanes touch it.
+    grouped_ggs: bool,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -174,7 +179,7 @@ fn arm_label(arm: Arm) -> String {
         "/replay-T"
     } else {
         "/replay-rowmajor"
-    }
+    } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -288,6 +293,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
+    let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -317,6 +323,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
+        ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -337,6 +344,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
+        ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -415,6 +423,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
+    ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
     (ms, sum)
 }
 
@@ -503,6 +512,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FT_FIXTURE=generic — on the default fixture the QR sweep is 0% of the lane, so this arm
     // is a null there by construction and would "prove" the lever worthless for the wrong
     // reason.
+    let ggs_arms: Vec<bool> = std::env::var("FT_GGS")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let replays: Vec<bool> = std::env::var("FT_REPLAY")
         .unwrap_or_else(|_| "1".to_string())
         .split(',')
@@ -536,14 +554,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for &fused in &fuseds {
                 for &panel_output_blocked in &panel_outputs {
                     for &replay_transposed in &replays {
-                        arms.push(Arm {
-                            gate,
-                            blocked,
-                            fused,
-                            panel_output_blocked,
-                            values_only: false,
-                            replay_transposed,
-                        });
+                        for &grouped_ggs in &ggs_arms {
+                            arms.push(Arm {
+                                gate,
+                                blocked,
+                                fused,
+                                panel_output_blocked,
+                                values_only: false,
+                                replay_transposed,
+                                grouped_ggs,
+                            });
+                        }
                     }
                 }
             }
