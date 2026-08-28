@@ -170,6 +170,9 @@ struct Arm {
     /// Shipped default 64; the panel forks PER COLUMN, so this sets how many forks a
     /// factorisation pays. Bit-identical either way.
     panel_par_min: usize,
+    /// Override for the tred2 reduction's per-step fork threshold; `0` = shipped default 384.
+    /// `FT_TPM=0,100000` prices "fork as shipped" against "never fork" in one invocation.
+    tred2_par_min: usize,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -196,6 +199,7 @@ fn arm_label(arm: Arm) -> String {
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
         + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
         + &format!("/ppm{}", arm.panel_par_min)
+        + &format!("/tpm{}", arm.tred2_par_min)
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -313,6 +317,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = ft_kernel_cpu::set_lu_panel_par_min(arm.panel_par_min);
+    let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -346,6 +351,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
+        ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -370,6 +376,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
+        ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -452,6 +459,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     ft_kernel_cpu::set_lu_panel_par_min(previous_ppm);
+    ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
     (ms, sum)
 }
 
@@ -540,6 +548,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FT_FIXTURE=generic — on the default fixture the QR sweep is 0% of the lane, so this arm
     // is a null there by construction and would "prove" the lever worthless for the wrong
     // reason.
+    let tpms: Vec<usize> = std::env::var("FT_TPM")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
     let ppms: Vec<usize> = std::env::var("FT_PPM")
         .unwrap_or_else(|_| "64".to_string())
         .split(',')
@@ -605,6 +618,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for &sub_serial in &subsers {
                                 for &sub_cols in &subcols {
                                   for &panel_par_min in &ppms {
+                                   for &tred2_par_min in &tpms {
                                     arms.push(Arm {
                                         gate,
                                         blocked,
@@ -616,7 +630,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         sub_serial,
                                         sub_cols,
                                         panel_par_min,
+                                        tred2_par_min,
                                     });
+                                   }
                                   }
                                 }
                             }

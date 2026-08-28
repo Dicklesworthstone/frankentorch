@@ -27985,11 +27985,32 @@ fn eigh_tred2_reduce_packed_full(
     d: &mut [f64],
     e: &mut [f64],
 ) {
-    eigh_tred2_reduce_packed_full_gated(n, lower, scaled_reflectors, d, e, TRED2_PAR_MIN_L_DEFAULT)
+    eigh_tred2_reduce_packed_full_gated(n, lower, scaled_reflectors, d, e, tred2_par_min_l())
 }
 
 /// Shipped gate width. See `eigh_tred2_reduce_packed_full_gated` for the measurements.
 const TRED2_PAR_MIN_L_DEFAULT: usize = 384;
+
+/// Runtime override for the tred2 reduction's fork threshold — `frankentorch-rpytm` transfer.
+/// `0` = use TRED2_PAR_MIN_L_DEFAULT.
+///
+/// WHY. The reduction forks PER HOUSEHOLDER STEP for every step with `l >= threshold`, so the
+/// fork COUNT scales with n: about 128 at n=512 but about 640 at n=1024. The gate was last
+/// swept at n=512 (592cb289), where the parallel region was worth ~1.06x — measured where the
+/// fork count is smallest. getrf had the identical shape and its per-column forks cost 2x at
+/// n=1024 (8a2e1372), which is reason to re-sweep this one where the count is 5x higher rather
+/// than assume the n=512 answer carries.
+static TRED2_PAR_MIN_L_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+fn tred2_par_min_l() -> usize {
+    let v = TRED2_PAR_MIN_L_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if v > 0 { v } else { TRED2_PAR_MIN_L_DEFAULT }
+}
+/// Set the tred2 fork threshold, returning the previous override (`0` = default).
+#[doc(hidden)]
+pub fn set_tred2_par_min_l(v: usize) -> usize {
+    TRED2_PAR_MIN_L_OVERRIDE.swap(v, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Whether the reduction's `ggs` matvec computes FOUR outputs in flight — `frankentorch-wjrqt`.
 /// Default FALSE until measured, per this session's record that unmeasured levers are as often
