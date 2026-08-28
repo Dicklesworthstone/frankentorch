@@ -28758,15 +28758,57 @@ fn eigh_tql2_z_deferred_f32(n: usize, d: &mut [f32], e: &mut [f32], z: &mut [f32
     if !ops.is_empty() {
         let ops = &ops;
         let br = EIGH_TQL2_REPLAY_BLOCK_ROWS.max(1);
+        let transposed = svd_replay_transposed();
         z.par_chunks_mut(br * n).for_each(|block| {
             let nrows = block.len() / n;
+            if !transposed {
+                for &(i, c, s) in ops {
+                    for r in 0..nrows {
+                        let base = r * n;
+                        let a = block[base + i];
+                        let bb = block[base + i + 1];
+                        block[base + i + 1] = s * a + c * bb;
+                        block[base + i] = c * a - s * bb;
+                    }
+                }
+                return;
+            }
+            // The f64 twin's lever (`bf7787b2`), applied to the dtype it stranded. This
+            // function was byte-identical to `eigh_tql2_replay_blocked` before that change,
+            // and fixing only one of a matched dtype pair is a shape this campaign has been
+            // bitten by before. f32 packs EIGHT lanes per 256-bit vector against f64's four,
+            // so if anything the layout matters more here.
+            //
+            // Same reasoning: the rotated pair (i, i+1) is contiguous while the r loop strides
+            // by n, so LLVM vectorises across the PAIR and blends away half of every add and
+            // subtract it computes. Transposing once makes r contiguous and each rotation two
+            // straight vector expressions.
+            //
+            // BIT-EXACT: every element still computes `s*a + c*bb` and `c*a - s*bb` from the
+            // same inputs in the same operand order. Nothing reassociated, nothing summed
+            // across lanes.
+            let mut t = vec![0.0f32; nrows * n];
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    t[col * nrows + r] = block[base + col];
+                }
+            }
             for &(i, c, s) in ops {
+                let (head, tail) = t.split_at_mut((i + 1) * nrows);
+                let xs = &mut head[i * nrows..];
+                let zs = &mut tail[..nrows];
                 for r in 0..nrows {
-                    let base = r * n;
-                    let a = block[base + i];
-                    let bb = block[base + i + 1];
-                    block[base + i + 1] = s * a + c * bb;
-                    block[base + i] = c * a - s * bb;
+                    let a = xs[r];
+                    let bb = zs[r];
+                    zs[r] = s * a + c * bb;
+                    xs[r] = c * a - s * bb;
+                }
+            }
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    block[base + col] = t[col * nrows + r];
                 }
             }
         });
@@ -69272,6 +69314,53 @@ mod tests {
     ///
     /// Sizes straddle the replay row block so the short trailing block is exercised, which is
     /// where a transpose assuming full `br` rows would drop or corrupt rows.
+    /// The f32 twin of [`eigh_tql2_replay_transposed_matches_row_major_bitwise`].
+    ///
+    /// It exists because the f64 test does NOT reach this path: `eigh_tql2_z_deferred_f32` is a
+    /// separate function that was byte-identical to the f64 replay, and the f32 eigh suite
+    /// checks reconstruction to a TOLERANCE, so a green f32 suite is not evidence of
+    /// bit-exactness. Fixing one half of a matched dtype pair and testing only that half is how
+    /// the stranded twin stays broken.
+    #[test]
+    fn eigh_f32_tql2_replay_transposed_matches_row_major_bitwise() {
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|e| e.to_bits()).collect() };
+        let mut mismatches: Vec<String> = Vec::new();
+        for &n in &[8usize, 33, 64, 70] {
+            let raw = bidiag_test_matrix(n, n, 0xF32Bu64.wrapping_mul(n as u64 + 1));
+            let mut sym = vec![0.0f32; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = ((raw[r * n + c] + raw[c * n + r]) * 0.5) as f32;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+
+            let previous = super::set_svd_replay_transposed(false);
+            let row_major = super::eigh_contiguous_f32(&sym, &meta);
+            super::set_svd_replay_transposed(true);
+            let transposed = super::eigh_contiguous_f32(&sym, &meta);
+            super::set_svd_replay_transposed(previous);
+
+            let row_major = row_major.expect("row-major f32 eigh");
+            let transposed = transposed.expect("transposed f32 eigh");
+            if bits(&row_major.eigenvalues) != bits(&transposed.eigenvalues) {
+                mismatches.push(format!("n={n}: f32 eigenvalues differ"));
+            }
+            if bits(&row_major.eigenvectors) != bits(&transposed.eigenvectors) {
+                mismatches.push(format!("n={n}: f32 eigenvectors differ"));
+            }
+            assert!(
+                transposed.eigenvectors.iter().any(|v| v.abs() > 1e-6),
+                "n={n}: f32 eigenvectors identically zero, so the comparison is vacuous"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "transposed f32 tql2 replay diverged from row-major: {}",
+            mismatches.join("; ")
+        );
+    }
+
     #[test]
     fn eigh_tql2_replay_transposed_matches_row_major_bitwise() {
         let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };

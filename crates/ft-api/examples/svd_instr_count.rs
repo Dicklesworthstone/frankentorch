@@ -129,6 +129,23 @@ fn main() {
                 sym[r * n + c] = (data[r * n + c] + data[c * n + r]) * 0.5;
             }
         }
+        // FT_DTYPE=f32 exercises eigh_tql2_z_deferred_f32 instead. It is a SEPARATE function
+        // from the f64 replay, so the f64 numbers say nothing about it — measuring the twin is
+        // the point of having fixed the twin.
+        if std::env::var("FT_DTYPE").map(|v| v == "f32").unwrap_or(false) {
+            let sym32: Vec<f32> = sym.iter().map(|&v| v as f32).collect();
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![n, n],
+                ft_core::DType::F32,
+                ft_core::Device::Cpu,
+            );
+            let out = ft_kernel_cpu::eigh_contiguous_f32(&sym32, &meta).expect("f32 eigh");
+            println!(
+                "eigh_f32 n={n} fixture={kind} lambda0={:.6e}",
+                out.eigenvalues[0]
+            );
+            return;
+        }
         let _ = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n); // warm up
 
         // FT_TRED2_SWEEP=384,128,64,32 prices the reduction's parallel gate INSIDE one process,
