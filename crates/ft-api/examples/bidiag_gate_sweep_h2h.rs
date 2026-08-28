@@ -152,6 +152,15 @@ struct Arm {
     /// fixture the QR sweep is 0% of the lane, so this arm would read as a null there by
     /// construction. Run it with `FT_FIXTURE=generic`.
     replay_transposed: bool,
+    /// Whether the tred2 reduction's `ggs` matvec keeps FOUR outputs in flight
+    /// (`frankentorch-wjrqt`). Bit-identical to the per-`j` loop, so this pair can move time
+    /// and cannot move a number — `FT_GGS=1,0` prices it in ONE invocation against one live
+    /// incumbent. Only the eigh/eigvalsh lanes touch it.
+    grouped_ggs: bool,
+    /// Force the blocked trailing-update GEMM's column blocks to run SEQUENTIALLY
+    /// (`frankentorch-rpytm`). Bit-identical either way, so this pair can move time and cannot
+    /// move a number. `FT_SUBSER=0,1` prices lu_factor's only parallelism in ONE invocation.
+    sub_serial: bool,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -174,7 +183,8 @@ fn arm_label(arm: Arm) -> String {
         "/replay-T"
     } else {
         "/replay-rowmajor"
-    }
+    } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
+        + if arm.sub_serial { "/subSER" } else { "/subPAR" }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -288,6 +298,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
+    let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
+    let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(data.to_vec(), vec![n, n], false)
@@ -317,6 +329,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
+        ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
+        ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -337,6 +351,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
+        ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
+        ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -415,6 +431,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
+    ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
+    ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
     (ms, sum)
 }
 
@@ -503,6 +521,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // FT_FIXTURE=generic — on the default fixture the QR sweep is 0% of the lane, so this arm
     // is a null there by construction and would "prove" the lever worthless for the wrong
     // reason.
+    let subsers: Vec<bool> = std::env::var("FT_SUBSER")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
+    let ggs_arms: Vec<bool> = std::env::var("FT_GGS")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let replays: Vec<bool> = std::env::var("FT_REPLAY")
         .unwrap_or_else(|_| "1".to_string())
         .split(',')
@@ -536,14 +572,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for &fused in &fuseds {
                 for &panel_output_blocked in &panel_outputs {
                     for &replay_transposed in &replays {
-                        arms.push(Arm {
-                            gate,
-                            blocked,
-                            fused,
-                            panel_output_blocked,
-                            values_only: false,
-                            replay_transposed,
-                        });
+                        for &grouped_ggs in &ggs_arms {
+                            for &sub_serial in &subsers {
+                                arms.push(Arm {
+                                    gate,
+                                    blocked,
+                                    fused,
+                                    panel_output_blocked,
+                                    values_only: false,
+                                    replay_transposed,
+                                    grouped_ggs,
+                                    sub_serial,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -920,6 +962,39 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 reduction[PHASE_CALLS / 2],
                 form_pq[PHASE_CALLS / 2],
                 sweep[PHASE_CALLS / 2],
+            );
+        }
+
+        // EIGH PHASES, in the SAME invocation as the incumbent — `frankentorch-wjrqt`.
+        //
+        // The phase block above reads the SVD counters, which are zero on the eigh lanes, and
+        // eigh has no live-call counters. So for eigh we profile the same matrix through
+        // `eigh_stage_profile_f64` here, inside this process and this window, beside the
+        // PyTorch figure printed below.
+        //
+        // WHY IT MATTERS. The claim it supports is that our REDUCTION PHASE ALONE costs several
+        // times PyTorch's ENTIRE eigh. Sourcing the two halves of that ratio from different
+        // windows makes it an anecdote on a host that has moved 1.94x between runs of one ELF;
+        // sourcing them from one invocation makes it a measurement.
+        //
+        // This is a SEPARATE profiled call, not the timed one — the phase split is FT-internal
+        // either way, and the timed arms above are what the vs-PT column is built from.
+        if matches!(ft_op, LinalgOp::Eigh | LinalgOp::Eigvalsh) {
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (data[r * n + c] + data[c * n + r]) * 0.5;
+                }
+            }
+            let _ = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n); // warm
+            let (reduce, back, tql2) = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n);
+            let ms = |v: u128| v as f64 / 1e6;
+            println!(
+                "eigh phases (same invocation, separate profiled call): reduce {:.3} ms  \
+                 backtransform {:.3} ms  tql2 {:.3} ms",
+                ms(reduce),
+                ms(back),
+                ms(tql2)
             );
         }
 

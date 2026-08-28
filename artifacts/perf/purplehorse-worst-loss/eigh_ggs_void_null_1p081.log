@@ -1,0 +1,21 @@
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 11 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=5891a6a3140a593fdbf64482b57003c1241d441a9e578366de30ec7fbe708a5f
+rayon_threads=8 warmup=5 (both arms)  default_gate=262144
+fixture=generic (spread spectrum) (FT_FIXTURE=generic selects the generic-spectrum matrix)
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output/replay-T/ggs4", "262144/4row/fused/4output/replay-T/ggs1", "262144/4row/fused/4output/replay-T/ggs4", "262144/4row/fused/4output/replay-T/ggs1"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+eigh phases (same invocation, separate profiled call): reduce 67.454 ms  backtransform 22.941 ms  tql2 18.489 ms
+
+n=512  PT min 13.174 ms  median 14.987 ms  spread 1.90x  load 37.32->35.21  MHz 3432/4073  iowait 139 jiffies
+  arm=262144/4row/fused/4output/replay-T/ggs4 min   72.130 ms  median   82.378 ms  PT-beside-it min   13.174 ms  paired-vs-PT FT 5.399x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 4.72e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output/replay-T/ggs1 min   77.298 ms  median   80.086 ms  PT-beside-it min   13.666 ms  paired-vs-PT FT 5.436x SLOWER  paired-vs-arm0 1.001x  branches (0, 0, 0)  parity rel 4.72e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output/replay-T/ggs4 min   68.070 ms  median   74.073 ms  PT-beside-it min   14.118 ms  paired-vs-PT FT 4.912x SLOWER  paired-vs-arm0 1.081x  branches (0, 0, 0)  parity rel 4.72e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output/replay-T/ggs1 min   77.190 ms  median   80.157 ms  PT-beside-it min   13.616 ms  paired-vs-PT FT 5.588x SLOWER  paired-vs-arm0 0.972x  branches (0, 0, 0)  parity rel 4.72e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%

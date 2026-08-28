@@ -1,0 +1,16 @@
+measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over 17 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=5891a6a3140a593fdbf64482b57003c1241d441a9e578366de30ec7fbe708a5f
+rayon_threads=8 warmup=8 (both arms)  default_gate=262144
+fixture=_mk DEFAULT: 3*I + low-rank; 495/512 singular values EQUAL at n=512 — QR sweep is invisible on it (FT_FIXTURE=generic selects the generic-spectrum matrix)
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/4row/fused/4output/replay-T/ggs1", "262144/4row/fused/4output/replay-T/ggs1"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+
+n=1024  PT min 5.943 ms  median 6.984 ms  spread 1.50x  load 20.82->20.82  MHz 2062/4264  iowait 11 jiffies
+  arm=262144/4row/fused/4output/replay-T/ggs1 min   47.990 ms  median   71.109 ms  PT-beside-it min    5.943 ms  paired-vs-PT FT 10.952x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  parity rel 7.64e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/4row/fused/4output/replay-T/ggs1 min   56.228 ms  median   72.053 ms  PT-beside-it min    6.073 ms  paired-vs-PT FT 11.071x SLOWER  paired-vs-arm0 0.939x  branches (0, 0, 0)  parity rel 7.64e-13 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%

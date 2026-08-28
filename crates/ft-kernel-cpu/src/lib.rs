@@ -90,6 +90,14 @@ mod gemm {
         })
     }
 
+    /// Force `dgemm_sub_into`'s column blocks to run SEQUENTIALLY — `frankentorch-rpytm`.
+    /// Default false. Measurement toggle, not a shipped policy; see `dgemm_sub_into`.
+    pub(crate) static DGEMM_SUB_SERIAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn dgemm_sub_serial() -> bool {
+        DGEMM_SUB_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
         rayon::current_num_threads() > 1
@@ -513,6 +521,66 @@ mod gemm {
     /// column-blocks. Used by the blocked LU trailing update (A22 -= L21·U12).
     /// frankentorch-kgs4.62.
     #[allow(clippy::too_many_arguments)]
+    /// `C[m,n] = A^T @ B` where `A` is row-major `[k, m]` and `B` is a SUBMATRIX with row
+    /// stride `ldb` starting at `b_off`. `C` is contiguous `[m, n]`.
+    ///
+    /// The strided-B counterpart to [`dgemm_sub_into`]'s strided C — `frankentorch-wjrqt`.
+    /// Between them a blocked update can read and write submatrices of a larger array with NO
+    /// staging copy at all.
+    ///
+    /// WHY IT EXISTS. `gemm::dgemm` has no `ld` parameter, so every blocked update stages a
+    /// packed copy of its operands. That staging is measured at 29.9% of the geqrf lane at
+    /// n=1024, and it is what made the blocked eigh backtransform a REJECT (`bfe29436`:
+    /// instructions flat, because the gather and scatter cost what the BLAS-3 conversion
+    /// saved). `matrixmultiply::dgemm` accepts arbitrary row/column strides and our `dgemm_mm`
+    /// already passes them through; only the safe wrapper layer could not express it.
+    pub fn dgemm_tb_b_strided(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f64],
+        b: &[f64],
+        b_off: usize,
+        ldb: usize,
+        c: &mut [f64],
+    ) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        let a = &a[..k * m];
+        let c = &mut c[..m * n];
+        // Bound the strided read explicitly: the last element touched is row k-1, column n-1.
+        let span = b_off + (k - 1) * ldb + n;
+        assert!(
+            b.len() >= span && ldb >= n,
+            "dgemm_tb_b_strided: B window {span} exceeds {} (ldb={ldb}, n={n})",
+            b.len()
+        );
+        // SAFETY: same operand model as `dgemm_tb_scaled` — A is [k,m] read as A^T via
+        // rsa=1, csa=m — except B is read with rsb=ldb rather than rsb=n, which is exactly
+        // what makes it a submatrix view. The assert above proves every (row, col) the kernel
+        // touches lies inside `b`, and `ldb >= n` proves the row windows do not overlap. C is
+        // contiguous [m,n] and disjoint from both.
+        unsafe {
+            dgemm_mm(
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                1,
+                m as isize,
+                b.as_ptr().add(b_off),
+                ldb as isize,
+                1,
+                0.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
+            );
+        }
+    }
+
     pub fn dgemm_sub_into(
         m: usize,
         k: usize,
@@ -530,6 +598,52 @@ mod gemm {
         let b = &b[..k * n];
         let nb = block_cols(n);
         let cp = TilePtr(c.as_mut_ptr());
+        // SERIAL ARM — `frankentorch-rpytm`. This function is UNCONDITIONALLY parallel, unlike
+        // `dgemm`, which gates on `should_parallelize` (flops and shape). `lu_factor`'s trailing
+        // update is its ONLY parallelism, and a thread sweep measured our own lu_factor 1.62x
+        // SLOWER at 8 threads than at 1 (39.164 -> 63.612 ms at n=1024) with the min-to-median
+        // spread growing 1.055 -> 1.199 — the parallelism costs wall time AND the sample
+        // stability that fails this op's A/A null (0.939, 0.979).
+        //
+        // The toggle exists so that can be measured as an INTERLEAVED ARM against one live
+        // incumbent rather than inferred from a thread sweep across windows. It is deliberately
+        // NOT a proposed fix: a real gate would be a flops/shape predicate like `dgemm`'s, and
+        // picking one needs the measurement this enables. Default OFF = today's behaviour.
+        //
+        // BIT-IDENTICAL either way. The column blocks are disjoint, each computed by the same
+        // `dgemm_mm` call with the same operands and the same k-accumulation order; only the
+        // order in which independent blocks execute changes, and no block reads another's
+        // output. This function is shared with the blocked cholesky/QR/bidiag paths, so the
+        // toggle moves their scheduling too — which is why it is off by default and why any
+        // eventual gate must be justified on more than one op.
+        if dgemm_sub_serial() {
+            for blk in 0..n.div_ceil(nb) {
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                // SAFETY: identical operand model to the parallel arm below; running the same
+                // disjoint blocks sequentially cannot alias where running them concurrently
+                // does not.
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            }
+            return;
+        }
         (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
             let cp = &cp;
             let n0 = blk * nb;
@@ -27826,6 +27940,20 @@ fn eigh_tred2_reduce_packed_full(
 /// Shipped gate width. See `eigh_tred2_reduce_packed_full_gated` for the measurements.
 const TRED2_PAR_MIN_L_DEFAULT: usize = 384;
 
+/// Whether the reduction's `ggs` matvec computes FOUR outputs in flight — `frankentorch-wjrqt`.
+/// Default FALSE until measured, per this session's record that unmeasured levers are as often
+/// rejects as wins. Bit-identical to the per-`j` form either way, so the two arms can only move
+/// time.
+static TRED2_GROUPED_GGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+fn tred2_grouped_ggs() -> bool {
+    TRED2_GROUPED_GGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[doc(hidden)]
+pub fn set_tred2_grouped_ggs(on: bool) -> bool {
+    TRED2_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The reduction with its parallel gate exposed, so a same-process A/B can measure the
 /// serial and gated-parallel arms at one thread width instead of inferring across runs.
 fn eigh_tred2_reduce_packed_full_gated(
@@ -27874,7 +28002,82 @@ fn eigh_tred2_reduce_packed_full_gated(
                 // planes. Inner parallelism on planes that small would wreck it.
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
-                let ggs: Vec<f64> = if l < par_min_l {
+                let grouped_ggs: Option<Vec<f64>> = if tred2_grouped_ggs() && l >= 8 {
+                    // FOUR OUTPUTS IN FLIGHT — `frankentorch-wjrqt`, the item-254 lever applied
+                    // to the phase that never got it.
+                    //
+                    // Each `gg[j]` is a dot product accumulated by a SERIAL chain, so the loop
+                    // below runs at one FMA per chain latency no matter how wide the machine is.
+                    // The reduce measures 3.70 GFLOP/s against our GEMM's 34-38, and its cache
+                    // miss rate is UNDER-represented (0.62x per instruction), i.e. it is
+                    // compute-bound — a dependency-chain problem, not bandwidth.
+                    //
+                    // THE LAYOUT MAKES IT CHEAP. `gg[j] = sum_k A[j,k] * row_i[k]` over a
+                    // symmetric matrix in packed-lower storage: for `k <= j` the value is row
+                    // `j`'s element `k`; for `k > j` it is row `k`'s element `j`. For FOUR
+                    // CONSECUTIVE `j` and any `k > j3`, those four values are `A[k, j0..=j3]` —
+                    // ADJACENT in memory. So the dominant range is one 4-wide load times a
+                    // broadcast of `row_i[k]`, into four independent accumulators.
+                    //
+                    // BIT-EXACT. The original accumulates `k = 0..=j` (row) then `k = j+1..=l`
+                    // (column), i.e. ascending `k` throughout; each lane here does exactly that
+                    // for its own `j`, in the same order, from the same values. Nothing is
+                    // summed across lanes.
+                    let mut ggs = vec![0.0f64; l + 1];
+                    let mut j0 = 0usize;
+                    while j0 + 4 <= l + 1 {
+                        let j3 = j0 + 3;
+                        let mut acc = wide::f64x4::ZERO;
+                        // k <= j3: the four lanes read different rows, so this stays scalar.
+                        for k in 0..=j3 {
+                            let mut lane = [0.0f64; 4];
+                            for (t, slot) in lane.iter_mut().enumerate() {
+                                let j = j0 + t;
+                                *slot = if k <= j {
+                                    prev_ro[lower_packed_index(j, 0) + k]
+                                } else {
+                                    prev_ro[lower_packed_index(k, 0) + j]
+                                };
+                            }
+                            acc += wide::f64x4::from(lane) * wide::f64x4::splat(row_i_ro[k]);
+                        }
+                        // k > j3: A[k, j0..=j3] is one contiguous run of four.
+                        for k in (j3 + 1)..=l {
+                            let base = lower_packed_index(k, 0) + j0;
+                            let quad = [
+                                prev_ro[base],
+                                prev_ro[base + 1],
+                                prev_ro[base + 2],
+                                prev_ro[base + 3],
+                            ];
+                            acc += wide::f64x4::from(quad) * wide::f64x4::splat(row_i_ro[k]);
+                        }
+                        let out = acc.to_array();
+                        ggs[j0..j0 + 4].copy_from_slice(&out);
+                        j0 += 4;
+                    }
+                    // Tail: the pre-existing per-j form, unchanged.
+                    for j in j0..=l {
+                        let mut gg = 0.0;
+                        let row_j_start = lower_packed_index(j, 0);
+                        let row_j = &prev_ro[row_j_start..=row_j_start + j];
+                        for k in 0..=j {
+                            gg += row_j[k] * row_i_ro[k];
+                        }
+                        let mut lower_col_offset = lower_packed_index(j + 1, j);
+                        for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1) {
+                            gg += prev_ro[lower_col_offset] * row_i_k;
+                            lower_col_offset += k + 1;
+                        }
+                        ggs[j] = gg;
+                    }
+                    Some(ggs)
+                } else {
+                    None
+                };
+                let ggs: Vec<f64> = if let Some(g) = grouped_ggs {
+                    g
+                } else if l < par_min_l {
                     (0..=l)
                         .map(|j| {
                             let mut gg = 0.0;
@@ -27956,7 +28159,121 @@ fn eigh_tred2_reduce_packed_full_gated(
     e[0] = 0.0;
 }
 
+/// Panel width for the blocked backtransform. `0` disables it (the unblocked loop runs).
+///
+/// DEFAULT 0 — OFF. The algorithm is verified (see below) but UNMEASURED in this tree, and this
+/// session's record is that unmeasured levers are as often rejects as wins. It ships off so a
+/// same-process A/B can price it; flipping the default is a separate, measured decision.
+static EIGH_BACKTRANSFORM_NB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub fn set_eigh_backtransform_nb(nb: usize) -> usize {
+    EIGH_BACKTRANSFORM_NB.swap(nb, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Blocked backtransform: `frankentorch-wjrqt`, algorithm verified in
+/// `artifacts/perf/purplehorse-worst-loss/backtransform_blocked_wy_verified.py`.
+///
+/// WHY A REFORMULATION WAS NEEDED. The unblocked loop below applies `Q <- (I - u v^T) Q` to a
+/// GROWING leading block and then writes row/col `i` of the identity. Those identity writes are
+/// LOAD-BEARING — step `i`'s projection reads `Z[:i,:i]`, which includes rows and columns that
+/// earlier steps overwrote — so batching the reflector applications directly breaks the result
+/// by ~1e11, measured, not guessed.
+///
+/// THE FIX, and it is BIT-EXACT to the unblocked loop (`0.000e+00` at n = 8..64 in the
+/// prototype): keep the ASCENDING order and the nested leading blocks, and only start the
+/// operand at `I`. That is legal because every reflector is readable UPFRONT from the input —
+/// step `i` reads row `i` and column `i`, which no earlier update (`Z[:j,:j]`, `j<i`) or
+/// identity write (row/col `j<i`) touches — and because starting from `I` is precisely what
+/// those interleaved writes were incrementally producing.
+///
+/// THE BLOCKING. A panel of `nb` reflectors becomes one `I - U T V^T` applied as three GEMMs,
+/// with `T[c, :c] = -(v_c^T U[:, :c]) T[:c, :c]` (later-on-the-left product order). Zero-padding
+/// each `u_i, v_i` up to the panel's largest block is safe: `Q[:i, i:]` is still the identity's
+/// zero block before step `i`, so `v^T Q` has zeros in columns `>= i` and the padded update
+/// touches nothing extra. Verified at n = 16..256, nb = 4..32: max error 3.9e-16..7.8e-16 with
+/// `|Q|max = 1.00`, i.e. machine precision and orders of magnitude inside the ratified
+/// eigenvector tolerance (reconstruction/orthogonality 1e-9).
+///
+/// It REASSOCIATES, so it is admitted under that tolerance contract rather than bitwise.
+fn eigh_tred2_backtransform_blocked(n: usize, z: &mut [f64], d: &mut [f64], nb: usize) {
+    // The reflectors must be copied out before `z` is overwritten with the identity. `d[i]` is
+    // likewise taken from the INPUT: the unblocked loop assigns `d[i] = z[i][i]` after step i's
+    // update, and that update touches `Z[:i,:i]` only, so `z[i][i]` is still its input value.
+    let src = z.to_vec();
+    let d_in: Vec<f64> = d[..n].to_vec();
+    for i in 0..n {
+        d[i] = src[i * n + i];
+    }
+    for (row, slot) in z[..n * n].chunks_exact_mut(n).enumerate() {
+        slot.fill(0.0);
+        slot[row] = 1.0;
+    }
+
+    let nb = nb.max(1);
+    let mut p = 0usize;
+    while p < n {
+        let w = nb.min(n - p);
+        let active: Vec<usize> = (p..p + w).filter(|&i| d_in[i] != 0.0 && i > 0).collect();
+        p += w;
+        let Some(&m) = active.last() else { continue };
+        let k = active.len();
+
+        // U and V are m x k, zero-padded above each reflector's own length.
+        let mut u_mat = vec![0.0f64; m * k];
+        let mut v_mat = vec![0.0f64; m * k];
+        for (c, &i) in active.iter().enumerate() {
+            for r in 0..i {
+                u_mat[r * k + c] = src[r * n + i];
+                v_mat[r * k + c] = src[i * n + r];
+            }
+        }
+        // T[c, :c] = -(v_c^T U[:, :c]) T[:c, :c]; T[c, c] = 1.
+        let mut t_mat = vec![0.0f64; k * k];
+        t_mat[0] = 1.0;
+        for c in 1..k {
+            let mut vu = vec![0.0f64; c];
+            for (col, slot) in vu.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for r in 0..m {
+                    acc += v_mat[r * k + c] * u_mat[r * k + col];
+                }
+                *slot = acc;
+            }
+            for col in 0..c {
+                let mut acc = 0.0;
+                for (s, &vu_s) in vu.iter().enumerate().take(c) {
+                    acc += vu_s * t_mat[s * k + col];
+                }
+                t_mat[c * k + col] = -acc;
+            }
+            t_mat[c * k + c] = 1.0;
+        }
+
+        // NO STAGING. Q[:m,:m] is a strided submatrix of the n-wide z and is read and written
+        // in place: `dgemm_tb_b_strided` reads it as B with rsb=n, and `dgemm_sub_into` writes
+        // it as C with ldc=n. The first version of this staged a contiguous copy in and out,
+        // and that copy cost exactly what the BLAS-3 conversion saved — instructions came out
+        // flat (`bfe29436`). Removing the gather and the scatter is the whole point of the
+        // strided entries.
+        //
+        // W = V^T Q  (k x m), V read as [m,k] through strides, Q read in place.
+        let mut w_mat = vec![0.0f64; k * m];
+        gemm::dgemm_tb_b_strided(k, m, m, &v_mat, z, 0, n, &mut w_mat);
+        // X = T W  (k x m), both contiguous.
+        let mut x_mat = vec![0.0f64; k * m];
+        gemm::dgemm(k, k, m, &t_mat, &w_mat, &mut x_mat);
+        // Q -= U X, accumulated straight into the strided submatrix.
+        gemm::dgemm_sub_into(m, k, m, &u_mat, &x_mat, z, 0, n);
+    }
+}
+
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
+    let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
+    if nb > 0 {
+        eigh_tred2_backtransform_blocked(n, z, d, nb);
+        return;
+    }
     let mut projections = Vec::with_capacity(n);
     for i in 0..n {
         if d[i] != 0.0 {
@@ -28758,15 +29075,57 @@ fn eigh_tql2_z_deferred_f32(n: usize, d: &mut [f32], e: &mut [f32], z: &mut [f32
     if !ops.is_empty() {
         let ops = &ops;
         let br = EIGH_TQL2_REPLAY_BLOCK_ROWS.max(1);
+        let transposed = svd_replay_transposed();
         z.par_chunks_mut(br * n).for_each(|block| {
             let nrows = block.len() / n;
+            if !transposed {
+                for &(i, c, s) in ops {
+                    for r in 0..nrows {
+                        let base = r * n;
+                        let a = block[base + i];
+                        let bb = block[base + i + 1];
+                        block[base + i + 1] = s * a + c * bb;
+                        block[base + i] = c * a - s * bb;
+                    }
+                }
+                return;
+            }
+            // The f64 twin's lever (`bf7787b2`), applied to the dtype it stranded. This
+            // function was byte-identical to `eigh_tql2_replay_blocked` before that change,
+            // and fixing only one of a matched dtype pair is a shape this campaign has been
+            // bitten by before. f32 packs EIGHT lanes per 256-bit vector against f64's four,
+            // so if anything the layout matters more here.
+            //
+            // Same reasoning: the rotated pair (i, i+1) is contiguous while the r loop strides
+            // by n, so LLVM vectorises across the PAIR and blends away half of every add and
+            // subtract it computes. Transposing once makes r contiguous and each rotation two
+            // straight vector expressions.
+            //
+            // BIT-EXACT: every element still computes `s*a + c*bb` and `c*a - s*bb` from the
+            // same inputs in the same operand order. Nothing reassociated, nothing summed
+            // across lanes.
+            let mut t = vec![0.0f32; nrows * n];
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    t[col * nrows + r] = block[base + col];
+                }
+            }
             for &(i, c, s) in ops {
+                let (head, tail) = t.split_at_mut((i + 1) * nrows);
+                let xs = &mut head[i * nrows..];
+                let zs = &mut tail[..nrows];
                 for r in 0..nrows {
-                    let base = r * n;
-                    let a = block[base + i];
-                    let bb = block[base + i + 1];
-                    block[base + i + 1] = s * a + c * bb;
-                    block[base + i] = c * a - s * bb;
+                    let a = xs[r];
+                    let bb = zs[r];
+                    zs[r] = s * a + c * bb;
+                    xs[r] = c * a - s * bb;
+                }
+            }
+            for r in 0..nrows {
+                let base = r * n;
+                for col in 0..n {
+                    block[base + col] = t[col * nrows + r];
                 }
             }
         });
@@ -32342,6 +32701,13 @@ fn svd_replay_transposed() -> bool {
 /// Set the replay layout, returning the previous setting. Exists so the two arms can be
 /// alternated INSIDE one process against one incumbent, which is the only kind of A/B this
 /// host reliably grants.
+/// Force the blocked trailing-update GEMM to run its column blocks sequentially
+/// (`frankentorch-rpytm`). Returns the previous setting. Bit-identical either way.
+#[doc(hidden)]
+pub fn set_dgemm_sub_serial(on: bool) -> bool {
+    gemm::DGEMM_SUB_SERIAL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[doc(hidden)]
 pub fn set_svd_replay_transposed(t: bool) -> bool {
     SVD_REPLAY_TRANSPOSED.swap(t, std::sync::atomic::Ordering::Relaxed)
@@ -69272,6 +69638,192 @@ mod tests {
     ///
     /// Sizes straddle the replay row block so the short trailing block is exercised, which is
     /// where a transpose assuming full `br` rows would drop or corrupt rows.
+    /// The f32 twin of [`eigh_tql2_replay_transposed_matches_row_major_bitwise`].
+    ///
+    /// It exists because the f64 test does NOT reach this path: `eigh_tql2_z_deferred_f32` is a
+    /// separate function that was byte-identical to the f64 replay, and the f32 eigh suite
+    /// checks reconstruction to a TOLERANCE, so a green f32 suite is not evidence of
+    /// bit-exactness. Fixing one half of a matched dtype pair and testing only that half is how
+    /// the stranded twin stays broken.
+    /// `frankentorch-wjrqt`: the blocked backtransform must agree with the unblocked loop it
+    /// replaces, to the ratified eigenvector tolerance.
+    ///
+    /// NOT bitwise, and deliberately so: the panel form reassociates (three GEMMs against a
+    /// sequence of rank-1 updates), which is admitted under the eig/SVD vector policy
+    /// (reconstruction + orthogonality, 1e-9) rather than the elementwise bitwise contract. The
+    /// standalone prototype measures 3.9e-16..7.8e-16 at n=16..256 and nb=4..32, so a bound of
+    /// 1e-9 here is loose by six orders of magnitude — if this ever needs loosening, the panel
+    /// algebra has changed and the reason must be found, not the bound.
+    ///
+    /// Sizes straddle nb so partial trailing panels run, and the fixture is a real symmetric
+    /// matrix put through the real reduction, NOT synthetic reflectors: random u, v are not
+    /// valid tred2 output (u = v/h, h = ||v||^2/2 makes each operator orthogonal), and testing
+    /// against synthetic ones manufactures divergence that is the fixture's, not the code's.
+    #[test]
+    /// `frankentorch-wjrqt`: the four-outputs-in-flight `ggs` matvec must be BIT-IDENTICAL to
+    /// the per-`j` loop it replaces.
+    ///
+    /// Bitwise is the right assertion, not a tolerance: the grouped form accumulates each `j`
+    /// in the SAME ascending-`k` order from the SAME values, only in a lane instead of a
+    /// scalar. Nothing is reassociated and nothing is summed across lanes — the same argument
+    /// that licensed the transposed replay levers. A tolerance here would hide exactly the
+    /// indexing error this test exists to catch, because the packed-triangle split (`k <= j`
+    /// reads row `j`, `k > j` reads row `k`) is easy to get subtly wrong and would still
+    /// produce plausible eigenvalues.
+    ///
+    /// Sizes straddle the group of four AND the `l >= 8` entry condition, so the scalar tail
+    /// and the fallback path both run.
+    #[test]
+    fn eigh_tred2_grouped_ggs_matches_per_j_bitwise() {
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
+        let mut mismatches: Vec<String> = Vec::new();
+        for &n in &[6usize, 9, 16, 33, 64] {
+            let raw = bidiag_test_matrix(n, n, 0x6664u64.wrapping_mul(n as u64 + 7));
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (raw[r * n + c] + raw[c * n + r]) * 0.5;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+            let previous = super::set_tred2_grouped_ggs(false);
+            let base = super::eigh_contiguous_f64(&sym, &meta).expect("per-j eigh");
+            super::set_tred2_grouped_ggs(true);
+            let grouped = super::eigh_contiguous_f64(&sym, &meta);
+            super::set_tred2_grouped_ggs(previous);
+            let grouped = grouped.expect("grouped eigh");
+
+            if bits(&base.eigenvalues) != bits(&grouped.eigenvalues) {
+                mismatches.push(format!("n={n}: eigenvalues differ"));
+            }
+            if bits(&base.eigenvectors) != bits(&grouped.eigenvectors) {
+                mismatches.push(format!("n={n}: eigenvectors differ"));
+            }
+            assert!(
+                grouped.eigenvectors.iter().any(|v| v.abs() > 1e-12),
+                "n={n}: eigenvectors identically zero, comparison vacuous"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "grouped ggs diverged from the per-j loop: {}",
+            mismatches.join("; ")
+        );
+    }
+
+    #[test]
+    fn eigh_blocked_backtransform_matches_unblocked() {
+        // Builds the reflector state DIRECTLY and calls both backtransforms, rather than
+        // flipping the global nb. That global has two arms that are NOT bit-identical (the
+        // panel form reassociates), so setting it from a test races every concurrently running
+        // BITWISE test and fails them — which is exactly what happened on the first version of
+        // this test. The SVD replay toggle is safe to flip from a test because ITS two arms are
+        // bit-identical; that reasoning does not transfer here.
+        //
+        // Reflectors use the scaling tred2 actually produces: v arbitrary, u = v/h with
+        // h = ||v||^2/2, so (I - u v^T) is an ORTHOGONAL Householder reflector. Synthetic
+        // random u,v are NOT valid tred2 output and manufacture divergence that belongs to the
+        // fixture rather than the code.
+        for &n in &[9usize, 16, 33, 64] {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (n as u64).wrapping_mul(0x1234_5678);
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+            };
+            let mut z0 = vec![0.0f64; n * n];
+            let mut d0 = vec![0.0f64; n];
+            for i in 0..n {
+                d0[i] = if i % 4 == 0 { 0.0 } else { next() + 1.5 };
+                if d0[i] != 0.0 && i > 0 {
+                    let v: Vec<f64> = (0..i).map(|_| next()).collect();
+                    let h = v.iter().map(|x| x * x).sum::<f64>() / 2.0;
+                    if h == 0.0 {
+                        d0[i] = 0.0;
+                        continue;
+                    }
+                    for (k, &vk) in v.iter().enumerate() {
+                        z0[i * n + k] = vk;
+                        z0[k * n + i] = vk / h;
+                    }
+                }
+                z0[i * n + i] = next();
+            }
+
+            let mut z_ref = z0.clone();
+            let mut d_ref = d0.clone();
+            super::eigh_tred2_backtransform(n, &mut z_ref, &mut d_ref);
+
+            for &nb in &[4usize, 8, 16] {
+                let mut z_blk = z0.clone();
+                let mut d_blk = d0.clone();
+                super::eigh_tred2_backtransform_blocked(n, &mut z_blk, &mut d_blk, nb);
+
+                let worst_d = d_ref
+                    .iter()
+                    .zip(&d_blk)
+                    .fold(0.0f64, |acc, (a, b)| acc.max((a - b).abs()));
+                assert!(worst_d == 0.0, "n={n} nb={nb}: d differs by {worst_d:e}");
+
+                // Q is orthogonal here, so entries are O(1) and an absolute bound is meaningful.
+                // The standalone prototype measures 3.9e-16..7.8e-16 over n=16..256, nb=4..32;
+                // 1e-9 is the ratified eigenvector tolerance and is loose by six orders of
+                // magnitude. If this ever needs loosening the panel algebra has changed.
+                let worst_z = z_ref
+                    .iter()
+                    .zip(&z_blk)
+                    .fold(0.0f64, |acc, (a, b)| acc.max((a - b).abs()));
+                assert!(worst_z < 1e-9, "n={n} nb={nb}: Q differs by {worst_z:e}");
+                assert!(
+                    z_blk.iter().any(|v| v.abs() > 1e-12),
+                    "n={n} nb={nb}: Q identically zero, comparison vacuous"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eigh_f32_tql2_replay_transposed_matches_row_major_bitwise() {
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|e| e.to_bits()).collect() };
+        let mut mismatches: Vec<String> = Vec::new();
+        for &n in &[8usize, 33, 64, 70] {
+            let raw = bidiag_test_matrix(n, n, 0xF32Bu64.wrapping_mul(n as u64 + 1));
+            let mut sym = vec![0.0f32; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = ((raw[r * n + c] + raw[c * n + r]) * 0.5) as f32;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+
+            let previous = super::set_svd_replay_transposed(false);
+            let row_major = super::eigh_contiguous_f32(&sym, &meta);
+            super::set_svd_replay_transposed(true);
+            let transposed = super::eigh_contiguous_f32(&sym, &meta);
+            super::set_svd_replay_transposed(previous);
+
+            let row_major = row_major.expect("row-major f32 eigh");
+            let transposed = transposed.expect("transposed f32 eigh");
+            if bits(&row_major.eigenvalues) != bits(&transposed.eigenvalues) {
+                mismatches.push(format!("n={n}: f32 eigenvalues differ"));
+            }
+            if bits(&row_major.eigenvectors) != bits(&transposed.eigenvectors) {
+                mismatches.push(format!("n={n}: f32 eigenvectors differ"));
+            }
+            assert!(
+                transposed.eigenvectors.iter().any(|v| v.abs() > 1e-6),
+                "n={n}: f32 eigenvectors identically zero, so the comparison is vacuous"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "transposed f32 tql2 replay diverged from row-major: {}",
+            mismatches.join("; ")
+        );
+    }
+
     #[test]
     fn eigh_tql2_replay_transposed_matches_row_major_bitwise() {
         let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
