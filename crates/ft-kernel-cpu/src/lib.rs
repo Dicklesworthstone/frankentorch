@@ -513,6 +513,66 @@ mod gemm {
     /// column-blocks. Used by the blocked LU trailing update (A22 -= L21·U12).
     /// frankentorch-kgs4.62.
     #[allow(clippy::too_many_arguments)]
+    /// `C[m,n] = A^T @ B` where `A` is row-major `[k, m]` and `B` is a SUBMATRIX with row
+    /// stride `ldb` starting at `b_off`. `C` is contiguous `[m, n]`.
+    ///
+    /// The strided-B counterpart to [`dgemm_sub_into`]'s strided C — `frankentorch-wjrqt`.
+    /// Between them a blocked update can read and write submatrices of a larger array with NO
+    /// staging copy at all.
+    ///
+    /// WHY IT EXISTS. `gemm::dgemm` has no `ld` parameter, so every blocked update stages a
+    /// packed copy of its operands. That staging is measured at 29.9% of the geqrf lane at
+    /// n=1024, and it is what made the blocked eigh backtransform a REJECT (`bfe29436`:
+    /// instructions flat, because the gather and scatter cost what the BLAS-3 conversion
+    /// saved). `matrixmultiply::dgemm` accepts arbitrary row/column strides and our `dgemm_mm`
+    /// already passes them through; only the safe wrapper layer could not express it.
+    pub fn dgemm_tb_b_strided(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f64],
+        b: &[f64],
+        b_off: usize,
+        ldb: usize,
+        c: &mut [f64],
+    ) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        let a = &a[..k * m];
+        let c = &mut c[..m * n];
+        // Bound the strided read explicitly: the last element touched is row k-1, column n-1.
+        let span = b_off + (k - 1) * ldb + n;
+        assert!(
+            b.len() >= span && ldb >= n,
+            "dgemm_tb_b_strided: B window {span} exceeds {} (ldb={ldb}, n={n})",
+            b.len()
+        );
+        // SAFETY: same operand model as `dgemm_tb_scaled` — A is [k,m] read as A^T via
+        // rsa=1, csa=m — except B is read with rsb=ldb rather than rsb=n, which is exactly
+        // what makes it a submatrix view. The assert above proves every (row, col) the kernel
+        // touches lies inside `b`, and `ldb >= n` proves the row windows do not overlap. C is
+        // contiguous [m,n] and disjoint from both.
+        unsafe {
+            dgemm_mm(
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                1,
+                m as isize,
+                b.as_ptr().add(b_off),
+                ldb as isize,
+                1,
+                0.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
+            );
+        }
+    }
+
     pub fn dgemm_sub_into(
         m: usize,
         k: usize,
@@ -28047,27 +28107,21 @@ fn eigh_tred2_backtransform_blocked(n: usize, z: &mut [f64], d: &mut [f64], nb: 
             t_mat[c * k + c] = 1.0;
         }
 
-        // Q[:m,:m] is a STRIDED submatrix of an n-wide z, and gemm::dgemm has no ld parameter,
-        // so the panel is staged contiguous — the same trade the blocked bidiag form_q makes.
-        let mut q_blk = vec![0.0f64; m * m];
-        for r in 0..m {
-            q_blk[r * m..(r + 1) * m].copy_from_slice(&z[r * n..r * n + m]);
-        }
-        // W = V^T Q  (k x m), via the transposed-left GEMM that reads V as [m,k] through strides.
+        // NO STAGING. Q[:m,:m] is a strided submatrix of the n-wide z and is read and written
+        // in place: `dgemm_tb_b_strided` reads it as B with rsb=n, and `dgemm_sub_into` writes
+        // it as C with ldc=n. The first version of this staged a contiguous copy in and out,
+        // and that copy cost exactly what the BLAS-3 conversion saved — instructions came out
+        // flat (`bfe29436`). Removing the gather and the scatter is the whole point of the
+        // strided entries.
+        //
+        // W = V^T Q  (k x m), V read as [m,k] through strides, Q read in place.
         let mut w_mat = vec![0.0f64; k * m];
-        gemm::dgemm_tb(k, m, m, &v_mat, &q_blk, &mut w_mat);
-        // X = T W  (k x m)
+        gemm::dgemm_tb_b_strided(k, m, m, &v_mat, z, 0, n, &mut w_mat);
+        // X = T W  (k x m), both contiguous.
         let mut x_mat = vec![0.0f64; k * m];
         gemm::dgemm(k, k, m, &t_mat, &w_mat, &mut x_mat);
-        // Q -= U X  (m x m)
-        let mut upd = vec![0.0f64; m * m];
-        gemm::dgemm(m, k, m, &u_mat, &x_mat, &mut upd);
-        for r in 0..m {
-            let dst = r * n;
-            for c in 0..m {
-                z[dst + c] = q_blk[r * m + c] - upd[r * m + c];
-            }
-        }
+        // Q -= U X, accumulated straight into the strided submatrix.
+        gemm::dgemm_sub_into(m, k, m, &u_mat, &x_mat, z, 0, n);
     }
 }
 
