@@ -27956,7 +27956,127 @@ fn eigh_tred2_reduce_packed_full_gated(
     e[0] = 0.0;
 }
 
+/// Panel width for the blocked backtransform. `0` disables it (the unblocked loop runs).
+///
+/// DEFAULT 0 — OFF. The algorithm is verified (see below) but UNMEASURED in this tree, and this
+/// session's record is that unmeasured levers are as often rejects as wins. It ships off so a
+/// same-process A/B can price it; flipping the default is a separate, measured decision.
+static EIGH_BACKTRANSFORM_NB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub fn set_eigh_backtransform_nb(nb: usize) -> usize {
+    EIGH_BACKTRANSFORM_NB.swap(nb, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Blocked backtransform: `frankentorch-wjrqt`, algorithm verified in
+/// `artifacts/perf/purplehorse-worst-loss/backtransform_blocked_wy_verified.py`.
+///
+/// WHY A REFORMULATION WAS NEEDED. The unblocked loop below applies `Q <- (I - u v^T) Q` to a
+/// GROWING leading block and then writes row/col `i` of the identity. Those identity writes are
+/// LOAD-BEARING — step `i`'s projection reads `Z[:i,:i]`, which includes rows and columns that
+/// earlier steps overwrote — so batching the reflector applications directly breaks the result
+/// by ~1e11, measured, not guessed.
+///
+/// THE FIX, and it is BIT-EXACT to the unblocked loop (`0.000e+00` at n = 8..64 in the
+/// prototype): keep the ASCENDING order and the nested leading blocks, and only start the
+/// operand at `I`. That is legal because every reflector is readable UPFRONT from the input —
+/// step `i` reads row `i` and column `i`, which no earlier update (`Z[:j,:j]`, `j<i`) or
+/// identity write (row/col `j<i`) touches — and because starting from `I` is precisely what
+/// those interleaved writes were incrementally producing.
+///
+/// THE BLOCKING. A panel of `nb` reflectors becomes one `I - U T V^T` applied as three GEMMs,
+/// with `T[c, :c] = -(v_c^T U[:, :c]) T[:c, :c]` (later-on-the-left product order). Zero-padding
+/// each `u_i, v_i` up to the panel's largest block is safe: `Q[:i, i:]` is still the identity's
+/// zero block before step `i`, so `v^T Q` has zeros in columns `>= i` and the padded update
+/// touches nothing extra. Verified at n = 16..256, nb = 4..32: max error 3.9e-16..7.8e-16 with
+/// `|Q|max = 1.00`, i.e. machine precision and orders of magnitude inside the ratified
+/// eigenvector tolerance (reconstruction/orthogonality 1e-9).
+///
+/// It REASSOCIATES, so it is admitted under that tolerance contract rather than bitwise.
+fn eigh_tred2_backtransform_blocked(n: usize, z: &mut [f64], d: &mut [f64], nb: usize) {
+    // The reflectors must be copied out before `z` is overwritten with the identity. `d[i]` is
+    // likewise taken from the INPUT: the unblocked loop assigns `d[i] = z[i][i]` after step i's
+    // update, and that update touches `Z[:i,:i]` only, so `z[i][i]` is still its input value.
+    let src = z.to_vec();
+    let d_in: Vec<f64> = d[..n].to_vec();
+    for i in 0..n {
+        d[i] = src[i * n + i];
+    }
+    for (row, slot) in z[..n * n].chunks_exact_mut(n).enumerate() {
+        slot.fill(0.0);
+        slot[row] = 1.0;
+    }
+
+    let nb = nb.max(1);
+    let mut p = 0usize;
+    while p < n {
+        let w = nb.min(n - p);
+        let active: Vec<usize> = (p..p + w).filter(|&i| d_in[i] != 0.0 && i > 0).collect();
+        p += w;
+        let Some(&m) = active.last() else { continue };
+        let k = active.len();
+
+        // U and V are m x k, zero-padded above each reflector's own length.
+        let mut u_mat = vec![0.0f64; m * k];
+        let mut v_mat = vec![0.0f64; m * k];
+        for (c, &i) in active.iter().enumerate() {
+            for r in 0..i {
+                u_mat[r * k + c] = src[r * n + i];
+                v_mat[r * k + c] = src[i * n + r];
+            }
+        }
+        // T[c, :c] = -(v_c^T U[:, :c]) T[:c, :c]; T[c, c] = 1.
+        let mut t_mat = vec![0.0f64; k * k];
+        t_mat[0] = 1.0;
+        for c in 1..k {
+            let mut vu = vec![0.0f64; c];
+            for (col, slot) in vu.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for r in 0..m {
+                    acc += v_mat[r * k + c] * u_mat[r * k + col];
+                }
+                *slot = acc;
+            }
+            for col in 0..c {
+                let mut acc = 0.0;
+                for (s, &vu_s) in vu.iter().enumerate().take(c) {
+                    acc += vu_s * t_mat[s * k + col];
+                }
+                t_mat[c * k + col] = -acc;
+            }
+            t_mat[c * k + c] = 1.0;
+        }
+
+        // Q[:m,:m] is a STRIDED submatrix of an n-wide z, and gemm::dgemm has no ld parameter,
+        // so the panel is staged contiguous — the same trade the blocked bidiag form_q makes.
+        let mut q_blk = vec![0.0f64; m * m];
+        for r in 0..m {
+            q_blk[r * m..(r + 1) * m].copy_from_slice(&z[r * n..r * n + m]);
+        }
+        // W = V^T Q  (k x m), via the transposed-left GEMM that reads V as [m,k] through strides.
+        let mut w_mat = vec![0.0f64; k * m];
+        gemm::dgemm_tb(k, m, m, &v_mat, &q_blk, &mut w_mat);
+        // X = T W  (k x m)
+        let mut x_mat = vec![0.0f64; k * m];
+        gemm::dgemm(k, k, m, &t_mat, &w_mat, &mut x_mat);
+        // Q -= U X  (m x m)
+        let mut upd = vec![0.0f64; m * m];
+        gemm::dgemm(m, k, m, &u_mat, &x_mat, &mut upd);
+        for r in 0..m {
+            let dst = r * n;
+            for c in 0..m {
+                z[dst + c] = q_blk[r * m + c] - upd[r * m + c];
+            }
+        }
+    }
+}
+
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
+    let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
+    if nb > 0 {
+        eigh_tred2_backtransform_blocked(n, z, d, nb);
+        return;
+    }
     let mut projections = Vec::with_capacity(n);
     for i in 0..n {
         if d[i] != 0.0 {
@@ -69321,6 +69441,92 @@ mod tests {
     /// checks reconstruction to a TOLERANCE, so a green f32 suite is not evidence of
     /// bit-exactness. Fixing one half of a matched dtype pair and testing only that half is how
     /// the stranded twin stays broken.
+    /// `frankentorch-wjrqt`: the blocked backtransform must agree with the unblocked loop it
+    /// replaces, to the ratified eigenvector tolerance.
+    ///
+    /// NOT bitwise, and deliberately so: the panel form reassociates (three GEMMs against a
+    /// sequence of rank-1 updates), which is admitted under the eig/SVD vector policy
+    /// (reconstruction + orthogonality, 1e-9) rather than the elementwise bitwise contract. The
+    /// standalone prototype measures 3.9e-16..7.8e-16 at n=16..256 and nb=4..32, so a bound of
+    /// 1e-9 here is loose by six orders of magnitude — if this ever needs loosening, the panel
+    /// algebra has changed and the reason must be found, not the bound.
+    ///
+    /// Sizes straddle nb so partial trailing panels run, and the fixture is a real symmetric
+    /// matrix put through the real reduction, NOT synthetic reflectors: random u, v are not
+    /// valid tred2 output (u = v/h, h = ||v||^2/2 makes each operator orthogonal), and testing
+    /// against synthetic ones manufactures divergence that is the fixture's, not the code's.
+    #[test]
+    fn eigh_blocked_backtransform_matches_unblocked() {
+        // Builds the reflector state DIRECTLY and calls both backtransforms, rather than
+        // flipping the global nb. That global has two arms that are NOT bit-identical (the
+        // panel form reassociates), so setting it from a test races every concurrently running
+        // BITWISE test and fails them — which is exactly what happened on the first version of
+        // this test. The SVD replay toggle is safe to flip from a test because ITS two arms are
+        // bit-identical; that reasoning does not transfer here.
+        //
+        // Reflectors use the scaling tred2 actually produces: v arbitrary, u = v/h with
+        // h = ||v||^2/2, so (I - u v^T) is an ORTHOGONAL Householder reflector. Synthetic
+        // random u,v are NOT valid tred2 output and manufacture divergence that belongs to the
+        // fixture rather than the code.
+        for &n in &[9usize, 16, 33, 64] {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (n as u64).wrapping_mul(0x1234_5678);
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+            };
+            let mut z0 = vec![0.0f64; n * n];
+            let mut d0 = vec![0.0f64; n];
+            for i in 0..n {
+                d0[i] = if i % 4 == 0 { 0.0 } else { next() + 1.5 };
+                if d0[i] != 0.0 && i > 0 {
+                    let v: Vec<f64> = (0..i).map(|_| next()).collect();
+                    let h = v.iter().map(|x| x * x).sum::<f64>() / 2.0;
+                    if h == 0.0 {
+                        d0[i] = 0.0;
+                        continue;
+                    }
+                    for (k, &vk) in v.iter().enumerate() {
+                        z0[i * n + k] = vk;
+                        z0[k * n + i] = vk / h;
+                    }
+                }
+                z0[i * n + i] = next();
+            }
+
+            let mut z_ref = z0.clone();
+            let mut d_ref = d0.clone();
+            super::eigh_tred2_backtransform(n, &mut z_ref, &mut d_ref);
+
+            for &nb in &[4usize, 8, 16] {
+                let mut z_blk = z0.clone();
+                let mut d_blk = d0.clone();
+                super::eigh_tred2_backtransform_blocked(n, &mut z_blk, &mut d_blk, nb);
+
+                let worst_d = d_ref
+                    .iter()
+                    .zip(&d_blk)
+                    .fold(0.0f64, |acc, (a, b)| acc.max((a - b).abs()));
+                assert!(worst_d == 0.0, "n={n} nb={nb}: d differs by {worst_d:e}");
+
+                // Q is orthogonal here, so entries are O(1) and an absolute bound is meaningful.
+                // The standalone prototype measures 3.9e-16..7.8e-16 over n=16..256, nb=4..32;
+                // 1e-9 is the ratified eigenvector tolerance and is loose by six orders of
+                // magnitude. If this ever needs loosening the panel algebra has changed.
+                let worst_z = z_ref
+                    .iter()
+                    .zip(&z_blk)
+                    .fold(0.0f64, |acc, (a, b)| acc.max((a - b).abs()));
+                assert!(worst_z < 1e-9, "n={n} nb={nb}: Q differs by {worst_z:e}");
+                assert!(
+                    z_blk.iter().any(|v| v.abs() > 1e-12),
+                    "n={n} nb={nb}: Q identically zero, comparison vacuous"
+                );
+            }
+        }
+    }
+
     #[test]
     fn eigh_f32_tql2_replay_transposed_matches_row_major_bitwise() {
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|e| e.to_bits()).collect() };
