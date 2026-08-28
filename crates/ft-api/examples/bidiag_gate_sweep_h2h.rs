@@ -1016,6 +1016,32 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             );
         }
 
+        // LU PHASES, in the SAME invocation as the incumbent — `frankentorch-rpytm`.
+        //
+        // The block above reads the SVD counters, which are zero on the LU lanes — every
+        // lu_factor row so far printed "reduction 0.000 ms 0%" and said nothing. lu_factor is
+        // the worst certified ratio in the tree, so it needs the phase map eigh and SVD already
+        // have, taken beside its own incumbent rather than in a separate window.
+        //
+        // Printed to STDERR so it survives when only the tail of stdout is captured.
+        if matches!(ft_op, LinalgOp::LuFactor | LinalgOp::Slogdet | LinalgOp::Inv) {
+            let _ = ft_kernel_cpu::lu_stage_take_ns();
+            let _ = ft_kernel_cpu::lu_pivot_swap_take_ns();
+            let probe = ft_one(n, &data, arms[0], ft_op);
+            std::hint::black_box(&probe);
+            let (panel, solve, trail) = ft_kernel_cpu::lu_stage_take_ns();
+            let (pivot, swap) = ft_kernel_cpu::lu_pivot_swap_take_ns();
+            let ms = |v: u64| v as f64 / 1e6;
+            let total = (panel + solve + trail + pivot + swap).max(1) as f64;
+            let pct = |v: u64| 100.0 * v as f64 / total;
+            eprintln!(
+                "LU phases (arm0, one instrumented call): panel {:.3} ms {:.0}%  solve {:.3} ms \
+                 {:.0}%  trailing {:.3} ms {:.0}%  pivot {:.3} ms {:.0}%  swap {:.3} ms {:.0}%",
+                ms(panel), pct(panel), ms(solve), pct(solve), ms(trail), pct(trail),
+                ms(pivot), pct(pivot), ms(swap), pct(swap)
+            );
+        }
+
         let (load_after, mhz_after) = provenance();
         let pt_min = pt_all.iter().copied().fold(f64::INFINITY, f64::min);
         let pt_max = pt_all.iter().copied().fold(0.0f64, f64::max);
