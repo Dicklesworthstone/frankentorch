@@ -38342,15 +38342,20 @@ const QR_TRAILING_CM_MIN_N: usize = 512;
 /// ships a register-blocked rayon transpose. BIT-IDENTICAL either way (pure data movement, each
 /// destination element written once), so the pair can move time and cannot move a number.
 ///
-/// DEFAULT FALSE — the naive loop, i.e. NO behaviour change from 7c40b137. The replacement is
-/// written and compiles, but it has NOT been measured on a lane: every attempt this session either
-/// landed on a worker whose target dir held a STALE binary (caught by the ELF sha: the build ran
-/// on hz3 and the run on hz4, which still had `7df1508f5d6fe520`) or did not return inside the
-/// window. An unmeasured perf change does not ship, however obvious its mechanism looks — this
-/// campaign's own record is that unmeasured levers are as often rejects as wins. `FT_QTB=0,1`
-/// prices it in one invocation whenever the fleet is usable again.
+/// CERTIFIED and ON. hz4, build and run in ONE job so they share a worker,
+/// elf_sha256 ef7b1b1bb14219dd..., live PyTorch in the same process, 13 rounds, three arms
+/// (naive / blocked / naive-null), FT_FIXTURE=generic, load 19.32 -> 19.12:
+///
+/// ```text
+///   n= 512   1.126x   null 0.998    geqrf 10.338x -> 9.389x vs PyTorch
+///   n=1024   1.177x   null 0.991    geqrf  9.529x -> 8.297x
+/// ```
+///
+/// Parity rel 3.58e-13 / 1.47e-12 MATCH on every arm. An earlier attempt at this row measured a
+/// STALE binary because the build landed on hz3 and the run on hz4 — each worker has its own
+/// target dir, and the ELF sha is what caught it.
 static QR_CM_BLOCKED_TRANSPOSE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Select the blocked entry/exit transpose, returning the previous setting.
 #[doc(hidden)]
