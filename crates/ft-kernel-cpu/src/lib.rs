@@ -24041,6 +24041,26 @@ use std::sync::atomic::{AtomicU64, Ordering as LuOrdering};
 /// single-matrix loss at n=512 (14.715x vs torch) and its panel is a plain BLAS-2 column
 /// loop with pivoting, where geqrf has a recursive BLAS-3 dgeqrt3. This attributes the
 /// split BEFORE anyone writes a recursive dgetrf2.
+/// Row-count threshold above which the getrf PANEL's rank-1 update forks — `frankentorch-rpytm`.
+/// Default 64, the shipped value.
+///
+/// WHY IT IS A KNOB. The panel dispatches `par_chunks_mut` PER COLUMN, so an n=1024
+/// factorisation pays on the order of 960 rayon forks, each over a shrinking row set. The panel
+/// is 72% of lu_factor and runs at 1.19 GFLOP/s (a7491c36, e1935052) — the lowest rate measured
+/// in this campaign — and per-fork overhead at that count is a candidate for where it goes.
+/// Raising the threshold trades parallel width for fewer forks; lowering it does the reverse.
+/// Bit-identical either way: each row's update is independent and its arithmetic order is
+/// unchanged, so the two arms can move time and cannot move a number.
+static LU_PANEL_PAR_MIN: AtomicU64 = AtomicU64::new(64);
+fn lu_panel_par_min() -> usize {
+    LU_PANEL_PAR_MIN.load(LuOrdering::Relaxed) as usize
+}
+/// Set the panel's fork threshold, returning the previous value.
+#[doc(hidden)]
+pub fn set_lu_panel_par_min(v: usize) -> usize {
+    LU_PANEL_PAR_MIN.swap(v as u64, LuOrdering::Relaxed) as usize
+}
+
 static LU_PANEL_NS: AtomicU64 = AtomicU64::new(0);
 static LU_PIVOT_NS: AtomicU64 = AtomicU64::new(0);
 static LU_SWAP_NS: AtomicU64 = AtomicU64::new(0);
@@ -24112,7 +24132,7 @@ fn lu_factor_panel_recursive_f64(
                 }
                 continue;
             }
-            if n - k - 1 >= 64 && rayon::current_num_threads() > 1 {
+            if n - k - 1 >= lu_panel_par_min() && rayon::current_num_threads() > 1 {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n..(k + 1) * n];
                 tail.par_chunks_mut(n).for_each(|row| {
