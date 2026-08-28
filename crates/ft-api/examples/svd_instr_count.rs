@@ -105,6 +105,15 @@ fn main() {
     };
     eprintln!("fixture={kind}");
 
+    // FT_REPLAY=0 selects the pre-i040z row-major replay for both the SVD U/V stream and the
+    // eigh tql2 stream. Instruction counts are load-immune, so a same-binary A/B across this
+    // toggle is valid on a busy host where a wall-clock one is not.
+    if let Ok(v) = std::env::var("FT_REPLAY") {
+        let transposed = v.trim() != "0";
+        ft_kernel_cpu::set_svd_replay_transposed(transposed);
+        eprintln!("replay_transposed={transposed}");
+    }
+
     // FT_OP=eigh re-takes the eigh phase map. The banked one (reduce 42.7% / backtransform
     // 31.8% / tql2 24.8%) was measured on the DEFAULT fixture, whose symmetrised form has 496
     // of 512 eigenvalues exactly equal — the tridiagonal QL iteration deflates on equal

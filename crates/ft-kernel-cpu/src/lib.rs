@@ -28413,15 +28413,57 @@ fn eigh_tql2_replay_blocked(z: &mut [f64], n: usize, ops: &[(usize, f64, f64)], 
         return;
     }
     let br = block_rows.max(1);
+    let transposed = svd_replay_transposed();
     z.par_chunks_mut(br * n).for_each(|block| {
         let nrows = block.len() / n;
+        if !transposed {
+            // The pre-i040z row-major replay, kept as the measurement arm.
+            for &(i, c, s) in ops {
+                for r in 0..nrows {
+                    let base = r * n;
+                    let a = block[base + i];
+                    let bb = block[base + i + 1];
+                    block[base + i + 1] = s * a + c * bb;
+                    block[base + i] = c * a - s * bb;
+                }
+            }
+            return;
+        }
+        // Same lever as the SVD U/V replay (`8e077e39`), on the phase that dominates eigh:
+        // this closure is 66.18% of the op's retired instructions at n=512. The rotated pair
+        // (i, i+1) is CONTIGUOUS while the `r` loop strides by `n`, so LLVM vectorises across
+        // the PAIR — shuffle, two multiplies, then an add AND a subtract computed full width
+        // and blended, producing four candidate values to keep two, at 128 bits. Transposing
+        // the block once makes `r` the contiguous axis and each rotation becomes two straight
+        // vector expressions with no shuffle and no discarded lane. The transpose is O(br*n)
+        // per block against O(|ops|*br) of replay over it.
+        //
+        // BIT-EXACT: every element still computes `s*a + c*bb` and `c*a - s*bb` from the same
+        // inputs, in the same operand order, from the same values. Nothing is reassociated and
+        // nothing is summed across lanes; only the layout the arithmetic is read from changes.
+        let mut t = vec![0.0f64; nrows * n];
+        for r in 0..nrows {
+            let base = r * n;
+            for col in 0..n {
+                t[col * nrows + r] = block[base + col];
+            }
+        }
         for &(i, c, s) in ops {
+            // i and i+1 are adjacent columns, so their runs are adjacent in `t`.
+            let (head, tail) = t.split_at_mut((i + 1) * nrows);
+            let xs = &mut head[i * nrows..];
+            let zs = &mut tail[..nrows];
             for r in 0..nrows {
-                let base = r * n;
-                let a = block[base + i];
-                let bb = block[base + i + 1];
-                block[base + i + 1] = s * a + c * bb;
-                block[base + i] = c * a - s * bb;
+                let a = xs[r];
+                let bb = zs[r];
+                zs[r] = s * a + c * bb;
+                xs[r] = c * a - s * bb;
+            }
+        }
+        for r in 0..nrows {
+            let base = r * n;
+            for col in 0..n {
+                block[base + col] = t[col * nrows + r];
             }
         }
     });
@@ -69218,6 +69260,62 @@ mod tests {
     /// On the global toggle and test parallelism: flipping it can only change WHICH of two
     /// bit-identical paths a concurrently running test takes, never that test's result. That
     /// is precisely what this test establishes, so the race is benign by construction.
+    /// `frankentorch-i040z`: the transposed tql2 replay must agree with the row-major loop it
+    /// replaces BIT FOR BIT, on both eigenvalues and eigenvectors.
+    ///
+    /// The eigh suite's existing coverage checks RECONSTRUCTION and orthonormality to a
+    /// tolerance. Those cannot see this change: a layout change that perturbed bits would
+    /// still reconstruct A and still produce an orthonormal basis, and would pass every one of
+    /// them. Bitwise is the correct assertion because the claim is that only the memory layout
+    /// differs — each element still computes `s*a + c*bb` and `c*a - s*bb` from the same
+    /// inputs in the same operand order.
+    ///
+    /// Sizes straddle the replay row block so the short trailing block is exercised, which is
+    /// where a transpose assuming full `br` rows would drop or corrupt rows.
+    #[test]
+    fn eigh_tql2_replay_transposed_matches_row_major_bitwise() {
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
+        let mut mismatches: Vec<String> = Vec::new();
+        for &n in &[8usize, 33, 64, 70] {
+            // Symmetric fixture with a NON-degenerate spectrum: equal eigenvalues deflate the
+            // QL iteration immediately, which would leave the replay with almost no ops to
+            // apply and make this test vacuous — the same defect that hid this phase in the
+            // h2h lane (frankentorch-gqmws).
+            let raw = bidiag_test_matrix(n, n, 0xE16Bu64.wrapping_mul(n as u64 + 1));
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (raw[r * n + c] + raw[c * n + r]) * 0.5;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+            let previous = super::set_svd_replay_transposed(false);
+            let row_major = super::eigh_contiguous_f64(&sym, &meta);
+            super::set_svd_replay_transposed(true);
+            let transposed = super::eigh_contiguous_f64(&sym, &meta);
+            super::set_svd_replay_transposed(previous);
+
+            let row_major = row_major.expect("row-major eigh");
+            let transposed = transposed.expect("transposed eigh");
+            if bits(&row_major.eigenvalues) != bits(&transposed.eigenvalues) {
+                mismatches.push(format!("n={n}: eigenvalues differ"));
+            }
+            if bits(&row_major.eigenvectors) != bits(&transposed.eigenvectors) {
+                mismatches.push(format!("n={n}: eigenvectors differ"));
+            }
+            assert!(
+                transposed.eigenvectors.iter().any(|v| v.abs() > 1e-12),
+                "n={n}: eigenvectors identically zero, so the comparison is vacuous"
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "transposed tql2 replay diverged from row-major: {}",
+            mismatches.join("; ")
+        );
+    }
+
     #[test]
     fn svd_replay_transposed_matches_row_major_bitwise() {
         let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
