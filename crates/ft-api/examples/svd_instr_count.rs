@@ -153,6 +153,15 @@ fn main() {
         return;
     }
 
+    // FT_BT_NB prices the blocked backtransform (frankentorch-wjrqt, shipped default-OFF).
+    // 0 = the unblocked loop; >0 = panel width. Instruction counts are load-immune, so this
+    // same-binary A/B is valid on a busy host where a wall-clock one is not.
+    if let Ok(v) = std::env::var("FT_BT_NB") {
+        let nb: usize = v.trim().parse().unwrap_or(0);
+        ft_kernel_cpu::set_eigh_backtransform_nb(nb);
+        eprintln!("backtransform_nb={nb}");
+    }
+
     // FT_OP=eigh re-takes the eigh phase map. The banked one (reduce 42.7% / backtransform
     // 31.8% / tql2 24.8%) was measured on the DEFAULT fixture, whose symmetrised form has 496
     // of 512 eigenvalues exactly equal — the tridiagonal QL iteration deflates on equal
