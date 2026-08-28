@@ -27961,8 +27961,7 @@ const TRED2_PAR_MIN_L_DEFAULT: usize = 384;
 /// Default FALSE until measured, per this session's record that unmeasured levers are as often
 /// rejects as wins. Bit-identical to the per-`j` form either way, so the two arms can only move
 /// time.
-static TRED2_GROUPED_GGS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TRED2_GROUPED_GGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn tred2_grouped_ggs() -> bool {
     TRED2_GROUPED_GGS.load(std::sync::atomic::Ordering::Relaxed)
 }

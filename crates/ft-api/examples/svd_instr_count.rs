@@ -232,7 +232,10 @@ fn main() {
         // FT_DTYPE=f32 exercises eigh_tql2_z_deferred_f32 instead. It is a SEPARATE function
         // from the f64 replay, so the f64 numbers say nothing about it — measuring the twin is
         // the point of having fixed the twin.
-        if std::env::var("FT_DTYPE").map(|v| v == "f32").unwrap_or(false) {
+        if std::env::var("FT_DTYPE")
+            .map(|v| v == "f32")
+            .unwrap_or(false)
+        {
             let sym32: Vec<f32> = sym.iter().map(|&v| v as f32).collect();
             let meta = ft_core::TensorMeta::from_shape(
                 vec![n, n],
