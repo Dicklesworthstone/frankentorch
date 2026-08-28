@@ -200,7 +200,24 @@ mod gemm {
             && (m as u128) * (k as u128) * (n as u128) >= PAR_MIN_FLOPS_COLS
     }
 
+    /// Override for [`block_cols`] — `frankentorch-rpytm`. `0` = the thread-derived default.
+    ///
+    /// WHY IT EXISTS. `block_cols` divides by `rayon::current_num_threads()`, so BLOCK SIZE IS
+    /// A FUNCTION OF THREAD COUNT. That confounded a thread sweep on lu_factor (778b3602):
+    /// RAYON_NUM_THREADS=1 changed the trailing-update decomposition from eight 128-column
+    /// blocks to ONE 1024-column block at n=1024, and the 1.62x attributed to "parallelism"
+    /// may be the larger block instead. Our GEMM's density rises with that dimension —
+    /// 512x128x512 measures 27.7 GFLOP/s against 38.3 for 512x512x512 (a7979556) — so a
+    /// thread-derived split can make the kernel skinnier than it should be. This knob varies
+    /// width INDEPENDENTLY of thread count so the two can be separated.
+    pub(crate) static DGEMM_SUB_BLOCK_COLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     fn block_cols(n: usize) -> usize {
+        let forced = DGEMM_SUB_BLOCK_COLS.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return forced.min(n).max(MIN_BLOCK_COLS);
+        }
         let threads = rayon::current_num_threads().max(1);
         n.div_ceil(threads).max(MIN_BLOCK_COLS)
     }
@@ -32701,6 +32718,14 @@ fn svd_replay_transposed() -> bool {
 /// Set the replay layout, returning the previous setting. Exists so the two arms can be
 /// alternated INSIDE one process against one incumbent, which is the only kind of A/B this
 /// host reliably grants.
+/// Force the trailing-update GEMM's column-block WIDTH (`frankentorch-rpytm`). `0` restores
+/// the thread-derived default. Returns the previous setting. Bit-identical either way: the
+/// blocks stay disjoint and each is one `dgemm_mm` with unchanged k-accumulation.
+#[doc(hidden)]
+pub fn set_dgemm_sub_block_cols(cols: usize) -> usize {
+    gemm::DGEMM_SUB_BLOCK_COLS.swap(cols, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Force the blocked trailing-update GEMM to run its column blocks sequentially
 /// (`frankentorch-rpytm`). Returns the previous setting. Bit-identical either way.
 #[doc(hidden)]
