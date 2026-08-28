@@ -173,6 +173,13 @@ struct Arm {
     /// Override for the tred2 reduction's per-step fork threshold; `0` = shipped default 384.
     /// `FT_TPM=0,100000` prices "fork as shipped" against "never fork" in one invocation.
     tred2_par_min: usize,
+    /// Whether the QR/geqrf PANEL factorises against a COLUMN-MAJOR buffer; `false` = the
+    /// shipped row-major in-place form (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`).
+    /// `FT_QCM=0,1` prices it in ONE invocation against one live PyTorch.
+    ///
+    /// BIT-IDENTICAL either way (same sums in the same order, same GEMM operand buffers), so this
+    /// pair can move time and cannot move a number.
+    qr_panel_cm: bool,
     /// Fork threshold for the eigh BACKTRANSFORM's two O(i^2) passes; `0` = the shipped
     /// never-fork loop (`frankentorch-wjrqt`). `FT_BTP=0,384` prices the last serial O(n^3)
     /// phase of eigh in ONE invocation against one live PyTorch.
@@ -226,6 +233,7 @@ fn arm_label(arm: Arm) -> String {
         } else {
             "/btpSERIAL".to_string()
         })
+        + if arm.qr_panel_cm { "/panelCM" } else { "/panelROW" }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -345,6 +353,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_ppm = ft_kernel_cpu::set_lu_panel_par_min(arm.panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
     let previous_tnb = ft_kernel_cpu::set_tred2_block_nb(arm.tred2_block_nb);
+    let previous_qcm = ft_kernel_cpu::set_qr_panel_column_major(arm.qr_panel_cm);
     let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
         usize::MAX
     } else {
@@ -386,6 +395,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
         ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
+        ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -413,6 +423,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
         ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
+        ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -498,6 +509,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
     ft_kernel_cpu::set_tred2_block_nb(previous_tnb);
     ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
+    ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
     (ms, sum)
 }
 
@@ -601,6 +613,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
+    let qcms: Vec<bool> = std::env::var("FT_QCM")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let ppms: Vec<usize> = std::env::var("FT_PPM")
         .unwrap_or_else(|_| "64".to_string())
         .split(',')
@@ -669,6 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                    for &tred2_par_min in &tpms {
                                     for &tred2_block_nb in &tnbs {
                                     for &eigh_bt_par_min in &btps {
+                                    for &qr_panel_cm in &qcms {
                                     arms.push(Arm {
                                         gate,
                                         blocked,
@@ -683,7 +705,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         tred2_par_min,
                                         tred2_block_nb,
                                         eigh_bt_par_min,
+                                        qr_panel_cm,
                                     });
+                                    }
                                     }
                                     }
                                    }

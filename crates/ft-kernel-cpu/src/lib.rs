@@ -24054,9 +24054,11 @@ use std::sync::atomic::{AtomicU64, Ordering as LuOrdering};
 /// SHIPPED 4096, raised from 64 — `frankentorch-rpytm`. Certified on the worker against live
 /// PyTorch, both arms in one process, A/A null in parentheses:
 ///
-///     n=512   3.43-3.53x faster not forking   (null 0.979, marginal)
-///     n=1024  2.04x                           (null 1.010, PASS)
-///     n=2048  1.72-1.77x                      (null 1.017, PASS)
+/// ```text
+/// n=512   3.43-3.53x faster not forking   (null 0.979, marginal)
+/// n=1024  2.04x                           (null 1.010, PASS)
+/// n=2048  1.72-1.77x                      (null 1.017, PASS)
+/// ```
 ///
 /// lu_factor moves from 6.0-13.3x to 3.4-4.5x vs PyTorch across those sizes. The benefit
 /// SHRINKS with n (3.4x -> 2.0x -> 1.75x) but never inverts on anything measured, so 4096 is
@@ -28057,7 +28059,7 @@ fn eigh_tred2_reduce_packed_full_gated(
 ) {
     // BLOCKED PATH, off by default (`TRED2_BLOCK_NB` = 0). Needs at least two full panels to be
     // the algorithm it claims to be, so it declines the sizes where it would degenerate.
-    let block_nb = TRED2_BLOCK_NB.load(std::sync::atomic::Ordering::Relaxed);
+    let block_nb = tred2_block_nb_for(n);
     if block_nb >= 2 && n > 2 * block_nb {
         eigh_tred2_reduce_packed_blocked(n, lower, scaled_reflectors, d, e, par_min_l, block_nb);
         return;
@@ -28261,15 +28263,50 @@ fn eigh_tred2_reduce_packed_full_gated(
     e[0] = 0.0;
 }
 
-/// Panel width for the BLOCKED tred2 reduction. `0` = off (the per-step BLAS-2 sweep runs).
-///
-/// DEFAULT 0 — OFF until measured, the same contract the blocked backtransform ships under.
-static TRED2_BLOCK_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Shipped panel width for the BLOCKED tred2 reduction.
+const TRED2_BLOCK_NB_DEFAULT: usize = 32;
 
-/// Set the blocked-tred2 panel width, returning the previous setting. `0` disables it.
+/// Smallest `n` at which the blocked reduction is used. MEASURED, and the gate is the whole
+/// result — the effect CHANGES SIGN across this range. n=1024, 8 threads, hz4, live PyTorch in
+/// the same process, 13 rounds, three arms (incumbent / blocked / incumbent-null):
+///
+///   n=128   0.828x   (SLOWER)   null 0.994
+///   n=256   0.877x   (SLOWER)   null 1.000
+///   n=512   0.996x   (a wash)   null 0.987
+///   n=1024  1.147x              null 1.011      <- certified
+///   n=1024  1.111x              null 0.971      <- replication, earlier window
+///
+/// Monotone in n over four sizes, and the mechanism says it must be: the flush's saving scales
+/// with the triangle (O(n^2) per block) while the per-step correction it pays for scales with
+/// O(n*nb). Below the crossover the corrections dominate. 1024 rather than 512 because 512 is
+/// where the effect merely reaches zero, and shipping a fast path at the size where it stops
+/// losing is how a route gets validated at exactly one shape and generalised wrongly (w3pol).
+const TRED2_BLOCK_MIN_N: usize = 1024;
+
+/// Override for the blocked-tred2 panel width. `usize::MAX` (the default) = follow
+/// `TRED2_BLOCK_MIN_N`; `0` = force the per-step BLAS-2 sweep; any other value forces that panel
+/// width at every size, which is what the `FT_TNB` arm uses to sweep below the shipped gate.
+static TRED2_BLOCK_NB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set the blocked-tred2 panel width override, returning the previous setting. `0` disables the
+/// blocked path outright; `usize::MAX` restores the size-gated default.
 #[doc(hidden)]
 pub fn set_tred2_block_nb(nb: usize) -> usize {
     TRED2_BLOCK_NB.swap(nb, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The panel width to use at this `n`: the override when one is set, else the size gate.
+fn tred2_block_nb_for(n: usize) -> usize {
+    let override_nb = TRED2_BLOCK_NB.load(std::sync::atomic::Ordering::Relaxed);
+    if override_nb != usize::MAX {
+        return override_nb;
+    }
+    if n >= TRED2_BLOCK_MIN_N {
+        TRED2_BLOCK_NB_DEFAULT
+    } else {
+        0
+    }
 }
 
 /// Dot product of two equal-length `f64` slices with four independent accumulators.
@@ -37916,6 +37953,302 @@ fn qr_factor_panel_recursive_f64(
     );
 }
 
+
+/// Whether the QR panel factorisation runs against a COLUMN-MAJOR panel buffer.
+/// `false` = the shipped in-place row-major form. `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+///
+/// WHY. geqrf is the worst measured single-matrix ratio in this tree — 10.06-10.51x vs PyTorch at
+/// n=1024, certified with four A/A nulls inside +/-0.01 (4fbab37a) — and its panel is 51.5% of the
+/// op at nb=32. Every reduction in that panel walks a COLUMN of a ROW-MAJOR matrix:
+/// `r_mat[(j+t)*n + j]` steps by `n*8` = 8 KB at n=1024, so each element of a column norm, of a
+/// reflector dot, and of every rank-1 apply is on its OWN cache line. LAPACK is column-major and
+/// gets all of it contiguous for free.
+///
+/// This packs the panel's `nb` columns into a column-major buffer once per panel, factors there,
+/// and copies back. The panel's inner loops then read two CONTIGUOUS m-vectors.
+///
+/// BIT-EXACT, and deliberately so. Every sum runs over the same values in the same order — only
+/// the address arithmetic changes — and the three panel GEMMs are handed byte-identical operand
+/// buffers, so `dgemm` cannot reassociate differently either. Panel output, `tau`, the compact-WY
+/// `T` and the trailing update are all untouched.
+/// MEASURED, hz4, live PyTorch in the same process, 13 rounds, three arms
+/// (row-major / column-major / row-major null), FT_FIXTURE=generic:
+///
+///   n=  64   1.001x   null 1.000     <- exactly neutral; the gate sits here
+///   n= 128   1.036x   null 0.999
+///   n= 256   1.096x   null 1.000
+///   n= 512   1.147x   null 0.999     <- certified
+///   n=1024   1.103x   null 0.972
+///
+/// Never negative at any measured size and rising with n, which is what a layout fix should do:
+/// the packing costs O(nb*m) per panel while it saves a cache line per element on O(nb^2*m/2) of
+/// column work. `m >= 64` because below that nothing was measured and the batched-tiny planes
+/// live there — the regime where an ungated inner change has wrecked a shipped win before.
+static QR_PANEL_COLUMN_MAJOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Smallest row count at which the column-major panel is used.
+const QR_PANEL_CM_MIN_M: usize = 64;
+
+/// Select the column-major QR panel buffer, returning the previous setting.
+#[doc(hidden)]
+pub fn set_qr_panel_column_major(on: bool) -> bool {
+    QR_PANEL_COLUMN_MAJOR.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn qr_panel_column_major() -> bool {
+    QR_PANEL_COLUMN_MAJOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `qr_build_compact_wy_t_f64` reading a COLUMN-MAJOR `vbuf` (`nb x m`).
+///
+/// Same dot products in the same row order; only `V`'s addressing changes, and it changes from
+/// stride `nb` to stride 1.
+fn qr_build_compact_wy_t_cm_f64(
+    vbuf: &[f64],
+    tau: &[f64],
+    m: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Vec<f64> {
+    let width = col_end - col_start;
+    let mut tmat = vec![0.0f64; width * width];
+    for c in 0..width {
+        let src_c = col_start + c;
+        if tau[src_c] == 0.0 {
+            continue;
+        }
+        tmat[c * width + c] = tau[src_c];
+        for i in 0..c {
+            let src_i = col_start + i;
+            let vi = &vbuf[src_i * m..src_i * m + m];
+            let vc = &vbuf[src_c * m..src_c * m + m];
+            let mut dot = 0.0;
+            for row in 0..m {
+                dot += vi[row] * vc[row];
+            }
+            tmat[i * width + c] = -tau[src_c] * dot;
+        }
+        let mut newcol = vec![0.0f64; c];
+        for i in 0..c {
+            let mut s = 0.0;
+            for l in i..c {
+                s += tmat[i * width + l] * tmat[l * width + c];
+            }
+            newcol[i] = s;
+        }
+        for i in 0..c {
+            tmat[i * width + c] = newcol[i];
+        }
+    }
+    tmat
+}
+
+/// `qr_apply_panel_block_reflector_f64` over the column-major panel.
+///
+/// The three GEMMs are handed the SAME buffers with the same shapes as the row-major form — `vt`
+/// and `vblock` and `panel_cols` all hold identical values — so this is bit-exact. What changes is
+/// how they are filled: `vt` becomes a contiguous `copy_from_slice` per column (it was a
+/// stride-`nb` gather), while `panel_cols` becomes the strided one.
+#[allow(clippy::too_many_arguments)]
+fn qr_apply_panel_block_reflector_cm_f64(
+    pbuf: &mut [f64],
+    vbuf: &[f64],
+    m: usize,
+    panel_start: usize,
+    tau: &[f64],
+    block_start: usize,
+    block_end: usize,
+    target_start: usize,
+    target_end: usize,
+) {
+    let block_width = block_end - block_start;
+    let target_width = target_end - target_start;
+    if block_width == 0
+        || target_width == 0
+        || !tau[block_start..block_end]
+            .iter()
+            .any(|&value| value != 0.0)
+    {
+        return;
+    }
+
+    let first_row = panel_start + block_start;
+    let active_rows = m - first_row;
+    let tmat = qr_build_compact_wy_t_cm_f64(vbuf, tau, m, block_start, block_end);
+    let mut vt = vec![0.0f64; block_width * active_rows];
+    for c in 0..block_width {
+        let src = (block_start + c) * m + first_row;
+        vt[c * active_rows..(c + 1) * active_rows].copy_from_slice(&vbuf[src..src + active_rows]);
+    }
+    let mut vblock = vec![0.0f64; active_rows * block_width];
+    for c in 0..block_width {
+        for local_row in 0..active_rows {
+            vblock[local_row * block_width + c] = vt[c * active_rows + local_row];
+        }
+    }
+    let mut panel_cols = vec![0.0f64; active_rows * target_width];
+    for c in 0..target_width {
+        let src = (target_start + c) * m + first_row;
+        for local_row in 0..active_rows {
+            panel_cols[local_row * target_width + c] = pbuf[src + local_row];
+        }
+    }
+
+    let mut work = vec![0.0f64; block_width * target_width];
+    gemm::dgemm(
+        block_width,
+        active_rows,
+        target_width,
+        &vt,
+        &panel_cols,
+        &mut work,
+    );
+    let mut tt = vec![0.0f64; block_width * block_width];
+    for i in 0..block_width {
+        for j in 0..block_width {
+            tt[i * block_width + j] = tmat[j * block_width + i];
+        }
+    }
+    let mut reflected = vec![0.0f64; block_width * target_width];
+    gemm::dgemm(
+        block_width,
+        block_width,
+        target_width,
+        &tt,
+        &work,
+        &mut reflected,
+    );
+    let mut update = vec![0.0f64; active_rows * target_width];
+    gemm::dgemm(
+        active_rows,
+        block_width,
+        target_width,
+        &vblock,
+        &reflected,
+        &mut update,
+    );
+    for c in 0..target_width {
+        let dst = (target_start + c) * m + first_row;
+        for local_row in 0..active_rows {
+            pbuf[dst + local_row] -= update[local_row * target_width + c];
+        }
+    }
+}
+
+/// `qr_factor_panel_leaf_f64` over the column-major panel — every inner loop contiguous.
+#[allow(clippy::too_many_arguments)]
+fn qr_factor_panel_leaf_cm_f64(
+    pbuf: &mut [f64],
+    vbuf: &mut [f64],
+    m: usize,
+    panel_start: usize,
+    leaf_start: usize,
+    leaf_end: usize,
+    tau: &mut [f64],
+    tiny: f64,
+) {
+    for c in leaf_start..leaf_end {
+        let j = panel_start + c;
+        let col_len = m - j;
+        let col_base = c * m + j;
+        let mut nrm2 = 0.0;
+        for t in 0..col_len {
+            let x = pbuf[col_base + t];
+            nrm2 += x * x;
+        }
+        let norm_v = nrm2.sqrt();
+        // Same dlarfg zero-column guard as the row-major leaf: a column whose BELOW-diagonal part
+        // is already zero needs no reflector, and emitting one would give tau = 2 and negate row j
+        // — invisible to |diag(R)| and to |Q|, visible only in |Q C| (kzq2y).
+        let mut below_sq = 0.0;
+        for t in 1..col_len {
+            let x = pbuf[col_base + t];
+            below_sq += x * x;
+        }
+        if below_sq == 0.0 || norm_v < tiny {
+            continue;
+        }
+        let v0 = pbuf[col_base];
+        let sign = if v0 >= 0.0 { 1.0 } else { -1.0 };
+        vbuf[col_base] = v0 + sign * norm_v;
+        for t in 1..col_len {
+            vbuf[col_base + t] = pbuf[col_base + t];
+        }
+        let mut nv2 = 0.0;
+        for t in 0..col_len {
+            let x = vbuf[col_base + t];
+            nv2 += x * x;
+        }
+        if nv2 < tiny {
+            for t in 0..col_len {
+                vbuf[col_base + t] = 0.0;
+            }
+            continue;
+        }
+        let tau_c = 2.0 / nv2;
+        tau[c] = tau_c;
+        pbuf[col_base] = -sign * norm_v;
+        for t in 1..col_len {
+            pbuf[col_base + t] = 0.0;
+        }
+        for col in (c + 1)..leaf_end {
+            let tgt = col * m + j;
+            let mut dot = 0.0;
+            for t in 0..col_len {
+                dot += vbuf[col_base + t] * pbuf[tgt + t];
+            }
+            let factor = tau_c * dot;
+            for t in 0..col_len {
+                pbuf[tgt + t] -= factor * vbuf[col_base + t];
+            }
+        }
+    }
+}
+
+/// `qr_factor_panel_recursive_f64` (dgeqrt3) over the column-major panel.
+#[allow(clippy::too_many_arguments)]
+fn qr_factor_panel_recursive_cm_f64(
+    pbuf: &mut [f64],
+    vbuf: &mut [f64],
+    m: usize,
+    panel_start: usize,
+    range_start: usize,
+    range_end: usize,
+    tau: &mut [f64],
+    tiny: f64,
+    leaf: usize,
+) {
+    let leaf = leaf.max(1);
+    if range_end - range_start <= leaf {
+        qr_factor_panel_leaf_cm_f64(
+            pbuf,
+            vbuf,
+            m,
+            panel_start,
+            range_start,
+            range_end,
+            tau,
+            tiny,
+        );
+        return;
+    }
+    let mid = range_start + (range_end - range_start) / 2;
+    qr_factor_panel_recursive_cm_f64(pbuf, vbuf, m, panel_start, range_start, mid, tau, tiny, leaf);
+    qr_apply_panel_block_reflector_cm_f64(
+        pbuf,
+        vbuf,
+        m,
+        panel_start,
+        tau,
+        range_start,
+        mid,
+        mid,
+        range_end,
+    );
+    qr_factor_panel_recursive_cm_f64(pbuf, vbuf, m, panel_start, mid, range_end, tau, tiny, leaf);
+}
+
 /// Forward pass of the blocked compact-WY QR: reduces `r_mat` to R IN PLACE and returns
 /// each panel's `(panel_start, nb, V, T, tau)`.
 ///
@@ -37947,7 +38280,43 @@ fn qr_blocked_forward_f64(
         let panel_start = qr_profile_stage_start(profile_enabled);
         let mut vmat = vec![0.0f64; m * nb];
         let mut tau = vec![0.0f64; nb];
-        qr_factor_panel_recursive_f64(r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny, leaf);
+        if qr_panel_column_major() && m >= QR_PANEL_CM_MIN_M {
+            // PACK, FACTOR, UNPACK. Only rows `p..m` are ever touched by the panel — reflector
+            // `c` starts at row `p + c` — so the buffer is `nb x (m - p)` and shrinks with the
+            // panel index, and `panel_start` becomes 0 in the packed coordinates.
+            let mp = m - p;
+            let mut pbuf = vec![0.0f64; nb * mp];
+            for c in 0..nb {
+                let col = p + c;
+                let dst = c * mp;
+                for r in 0..mp {
+                    pbuf[dst + r] = r_mat[(p + r) * n + col];
+                }
+            }
+            let mut vbuf = vec![0.0f64; nb * mp];
+            qr_factor_panel_recursive_cm_f64(
+                &mut pbuf, &mut vbuf, mp, 0, 0, nb, &mut tau, tiny, leaf,
+            );
+            for c in 0..nb {
+                let col = p + c;
+                let src = c * mp;
+                for r in 0..mp {
+                    r_mat[(p + r) * n + col] = pbuf[src + r];
+                }
+            }
+            // `vmat` stays m x nb row-major: the compact-WY T and the trailing update below are
+            // UNCHANGED, which is what keeps this bit-exact rather than a rewrite of the op.
+            for c in 0..nb {
+                let src = c * mp;
+                for r in 0..mp {
+                    vmat[(p + r) * nb + c] = vbuf[src + r];
+                }
+            }
+        } else {
+            qr_factor_panel_recursive_f64(
+                r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny, leaf,
+            );
+        }
 
         // --- Compact-WY T (nb×nb upper triangular, LAPACK dlarft forward) so that
         //     H_p H_{p+1} ... H_{pe-1} = I - V T Vᵀ.
@@ -65171,6 +65540,56 @@ mod tests {
         super::eigh_tred2_backtransform(n, &mut z, &mut d);
         super::eigh_tql2_z_deferred(n, &mut d, &mut e, &mut z);
         (d, z)
+    }
+
+    /// The COLUMN-MAJOR QR panel against the shipped row-major one — BIT-FOR-BIT.
+    /// `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+    ///
+    /// Compares `geqrf_blocked_f64`'s packed output AND `tau` with `to_bits()`, which covers
+    /// everything downstream: the compact-WY T, the trailing update, `orgqr` and `ormqr` all read
+    /// exactly these two arrays and are themselves untouched.
+    ///
+    /// FIXTURES STRADDLE THE BRANCHES. A SQUARE case is mandatory — the dlarfg zero-column guard
+    /// is only reachable when a column has an empty below-diagonal part, i.e. the last column of a
+    /// square matrix, and a tall-only test hid a tau = 2 row negation for a whole family (kzq2y).
+    /// A TALL case (m >> n) is the regime the packing is aimed at, and 137x64 is neither
+    /// panel-aligned nor leaf-aligned so the ragged final panel runs too.
+    #[test]
+    fn qr_panel_column_major_is_bit_exact() {
+        for (m, n) in [(96usize, 96usize), (128usize, 40usize), (137usize, 64usize)] {
+            let a: Vec<f64> = (0..m * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    (((i * 131 + j * 17 + 7) % 1000) as f64) / 100.0 - 5.0
+                        + if i == j { (i as f64) * 0.5 } else { 0.0 }
+                })
+                .collect();
+            let previous = super::set_qr_panel_column_major(false);
+            let (r_row, tau_row) = super::geqrf_blocked_f64(&a, m, n);
+            super::set_qr_panel_column_major(true);
+            let (r_col, tau_col) = super::geqrf_blocked_f64(&a, m, n);
+            super::set_qr_panel_column_major(previous);
+            assert_eq!(r_row.len(), r_col.len());
+            for idx in 0..r_row.len() {
+                assert_eq!(
+                    r_row[idx].to_bits(),
+                    r_col[idx].to_bits(),
+                    "m={m} n={n}: packed element {idx} differs: {} vs {}",
+                    r_row[idx],
+                    r_col[idx]
+                );
+            }
+            for idx in 0..tau_row.len() {
+                assert_eq!(
+                    tau_row[idx].to_bits(),
+                    tau_col[idx].to_bits(),
+                    "m={m} n={n}: tau {idx} differs: {} vs {}",
+                    tau_row[idx],
+                    tau_col[idx]
+                );
+            }
+        }
     }
 
     /// The FORKED backtransform against the serial one — BIT-FOR-BIT, `frankentorch-wjrqt`.

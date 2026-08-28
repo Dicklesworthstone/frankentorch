@@ -120,8 +120,10 @@ pub fn conv2d_backward_mask_fused_f64(
 /// onto the generic one: a separate `mul` tape node, a materialised `conv_output * mask`
 /// intermediate, and an f64->f32 downcast of the incoming gradient. On the board that costs
 ///
-///     conv2d_f32          26.260 ms vs PyTorch 25.704 ms   1.02x SLOWER   (summed, no mask)
-///     conv2d_f32_masked   70.410 ms vs PyTorch 25.371 ms   2.78x SLOWER   (masked)
+/// ```text
+/// conv2d_f32          26.260 ms vs PyTorch 25.704 ms   1.02x SLOWER   (summed, no mask)
+/// conv2d_f32_masked   70.410 ms vs PyTorch 25.371 ms   2.78x SLOWER   (masked)
+/// ```
 ///
 /// — the same op at the same shape and dtype, differing only by the mask multiply
 /// (commit `ffe22c15`, 64 rounds, live PyTorch 2.12.1+cpu co-process, our arm's A/A null 1.001).
