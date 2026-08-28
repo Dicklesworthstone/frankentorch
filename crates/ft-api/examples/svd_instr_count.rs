@@ -125,6 +125,53 @@ fn main() {
     // the rate the GEMM path actually reaches on this machine, in this build, at this size —
     // which is what this measures. Same public route the phases use internally.
     if std::env::var("FT_OP").map(|v| v == "gemm").unwrap_or(false) {
+        // FT_GEMM_SHAPE="m,k,n" measures a RECTANGULAR shape instead of n x n x n. The blocked
+        // backtransform's panel GEMMs are skinny — (nb, m, m), (nb, nb, m) and (m, nb, m) with
+        // nb = 8..64 against m up to 512 — and the standing hypothesis for why that lever came
+        // out flat (9c3b3e1b) is that skinny GEMMs do not reach the density a square one does.
+        // That hypothesis was recorded as UNTESTED; this measures it.
+        let shape: Vec<usize> = std::env::var("FT_GEMM_SHAPE")
+            .ok()
+            .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let (gm, gk, gn) = if shape.len() == 3 {
+            (shape[0], shape[1], shape[2])
+        } else {
+            (n, n, n)
+        };
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lhs: Vec<f64> = (0..gm * gk).map(|i| data[i % data.len()]).collect();
+        let rhs: Vec<f64> = (0..gk * gn).map(|i| data[i % data.len()]).collect();
+        let a = session
+            .tensor_variable(lhs, vec![gm, gk], false)
+            .expect("gemm lhs");
+        let b = session
+            .tensor_variable(rhs, vec![gk, gn], false)
+            .expect("gemm rhs");
+        let _ = session.tensor_matmul(a, b).expect("warm rect matmul");
+        let rounds_r = iters.max(5);
+        let mut best_r = f64::INFINITY;
+        for _ in 0..rounds_r {
+            let started = std::time::Instant::now();
+            let out = session.tensor_matmul(a, b).expect("rect matmul");
+            let elapsed = started.elapsed().as_secs_f64();
+            std::hint::black_box(&out);
+            best_r = best_r.min(elapsed);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let rflops = 2.0 * (gm as f64) * (gk as f64) * (gn as f64);
+        println!(
+            "gemm m={gm} k={gk} n={gn} min={:.4} ms  {:.1} GFLOP/s  (min of {rounds_r})",
+            best_r * 1e3,
+            rflops / best_r / 1e9
+        );
+        return;
+        #[allow(unreachable_code)]
+        {
+            let _ = (a, b);
+        }
+    }
+    if false {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = session
             .tensor_variable(data.clone(), vec![n, n], false)
