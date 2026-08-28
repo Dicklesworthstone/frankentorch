@@ -923,6 +923,39 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             );
         }
 
+        // EIGH PHASES, in the SAME invocation as the incumbent — `frankentorch-wjrqt`.
+        //
+        // The phase block above reads the SVD counters, which are zero on the eigh lanes, and
+        // eigh has no live-call counters. So for eigh we profile the same matrix through
+        // `eigh_stage_profile_f64` here, inside this process and this window, beside the
+        // PyTorch figure printed below.
+        //
+        // WHY IT MATTERS. The claim it supports is that our REDUCTION PHASE ALONE costs several
+        // times PyTorch's ENTIRE eigh. Sourcing the two halves of that ratio from different
+        // windows makes it an anecdote on a host that has moved 1.94x between runs of one ELF;
+        // sourcing them from one invocation makes it a measurement.
+        //
+        // This is a SEPARATE profiled call, not the timed one — the phase split is FT-internal
+        // either way, and the timed arms above are what the vs-PT column is built from.
+        if matches!(ft_op, LinalgOp::Eigh | LinalgOp::Eigvalsh) {
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (data[r * n + c] + data[c * n + r]) * 0.5;
+                }
+            }
+            let _ = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n); // warm
+            let (reduce, back, tql2) = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n);
+            let ms = |v: u128| v as f64 / 1e6;
+            println!(
+                "eigh phases (same invocation, separate profiled call): reduce {:.3} ms  \
+                 backtransform {:.3} ms  tql2 {:.3} ms",
+                ms(reduce),
+                ms(back),
+                ms(tql2)
+            );
+        }
+
         let (load_after, mhz_after) = provenance();
         let pt_min = pt_all.iter().copied().fold(f64::INFINITY, f64::min);
         let pt_max = pt_all.iter().copied().fold(0.0f64, f64::max);
