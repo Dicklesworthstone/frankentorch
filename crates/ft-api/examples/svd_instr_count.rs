@@ -119,6 +119,49 @@ fn main() {
             }
         }
         let _ = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n); // warm up
+
+        // FT_TRED2_SWEEP=384,128,64,32 prices the reduction's parallel gate INSIDE one process,
+        // interleaved round-robin with min-of-N per gate. Separate invocations would compare
+        // two different windows on a host that has moved 1.94x between runs of one ELF; a
+        // round-robin sweep with a min estimator is the form that survives drift.
+        //
+        // The question it answers: eigh's reduce is 52.9% of the op at 8 threads on a generic
+        // spectrum and scales only 1.12x. For SVD the equivalent phase turned out memory-bound,
+        // and forcing its parallel branch measured 34% WORSE — so this is not a widen, it is a
+        // test of whether eigh's reduce is thread-limited or bandwidth-limited. The default
+        // gate is TRED2_PAR_MIN_L_DEFAULT = 384, i.e. only rows with l >= 384 go parallel.
+        if let Ok(spec) = std::env::var("FT_TRED2_SWEEP") {
+            let gates: Vec<usize> = spec
+                .split(',')
+                .filter_map(|t| t.trim().parse().ok())
+                .collect();
+            let rounds: usize = std::env::var("FT_TRED2_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
+            let mut best = vec![(u128::MAX, u128::MAX, u128::MAX); gates.len()];
+            for _ in 0..rounds {
+                for (slot, &gate) in best.iter_mut().zip(gates.iter()) {
+                    let (r, b, t) = ft_kernel_cpu::eigh_stage_profile_gated_f64(&sym, n, gate);
+                    slot.0 = slot.0.min(r);
+                    slot.1 = slot.1.min(b);
+                    slot.2 = slot.2.min(t);
+                }
+            }
+            let ms = |v: u128| v as f64 / 1e6;
+            for (&gate, &(r, b, t)) in gates.iter().zip(best.iter()) {
+                println!(
+                    "tred2_gate={gate} n={n} fixture={kind} reduce={:.3}ms backtransform={:.3}ms \
+                     tql2={:.3}ms total={:.3}ms",
+                    ms(r),
+                    ms(b),
+                    ms(t),
+                    ms(r + b + t)
+                );
+            }
+            return;
+        }
+
         let (reduce, back, tql2) = ft_kernel_cpu::eigh_stage_profile_f64(&sym, n);
         let total = (reduce + back + tql2).max(1);
         let ms = |v: u128| v as f64 / 1e6;
