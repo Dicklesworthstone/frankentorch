@@ -23911,8 +23911,19 @@ use std::sync::atomic::{AtomicU64, Ordering as LuOrdering};
 /// loop with pivoting, where geqrf has a recursive BLAS-3 dgeqrt3. This attributes the
 /// split BEFORE anyone writes a recursive dgetrf2.
 static LU_PANEL_NS: AtomicU64 = AtomicU64::new(0);
+static LU_PIVOT_NS: AtomicU64 = AtomicU64::new(0);
+static LU_SWAP_NS: AtomicU64 = AtomicU64::new(0);
 static LU_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
 static LU_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset the getrf phase counters: `(panel_ns, solve_ns, trailing_ns)`.
+#[doc(hidden)]
+pub fn lu_pivot_swap_take_ns() -> (u64, u64) {
+    (
+        LU_PIVOT_NS.swap(0, LuOrdering::Relaxed),
+        LU_SWAP_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
 
 /// Read and reset the getrf phase counters: `(panel_ns, solve_ns, trailing_ns)`.
 #[doc(hidden)]
@@ -23938,6 +23949,12 @@ fn lu_factor_panel_recursive_f64(
     const LEAF: usize = 16;
     if end - start <= LEAF {
         for k in start..end {
+            // PIVOT SEARCH: a strided column scan in ROW-MAJOR storage - lu[i*n+k] steps by
+            // n*8 bytes, i.e. one cache line (8 KB at n=1024, also a page) per element.
+            // LAPACK is column-major and gets this contiguous for free. Timed separately
+            // because the recursive panel performs the SAME searches, which is the leading
+            // explanation for why recursion moved the vs-torch ratio not at all (cc270881).
+            let __t_piv = std::time::Instant::now();
             let mut max_row = k;
             let mut max_val = lu[k * n + k].abs();
             for i in (k + 1)..n {
@@ -23947,13 +23964,16 @@ fn lu_factor_panel_recursive_f64(
                     max_row = i;
                 }
             }
+            LU_PIVOT_NS.fetch_add(__t_piv.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             ipiv[k] = max_row;
+            let __t_swap = std::time::Instant::now();
             if max_row != k {
                 pivots.swap(k, max_row);
                 for j in 0..n {
                     lu.swap(k * n + j, max_row * n + j);
                 }
             }
+            LU_SWAP_NS.fetch_add(__t_swap.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             let diag = lu[k * n + k];
             if diag.abs() < singular_tol {
                 for i in (k + 1)..n {
