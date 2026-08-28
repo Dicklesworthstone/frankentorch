@@ -75,7 +75,9 @@ fn fixture_bumped(n: usize, bump: f64) -> Vec<f64> {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
     let mut out = Vec::with_capacity(n * n);
     for _ in 0..n * n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // top 26 bits -> [-1, 1), exactly representable, no transcendental in the fixture
         let v = ((state >> 38) as f64) / (f64::from(1u32 << 25)) - 1.0;
         out.push(v);
