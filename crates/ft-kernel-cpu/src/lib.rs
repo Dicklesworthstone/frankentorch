@@ -24051,7 +24051,21 @@ use std::sync::atomic::{AtomicU64, Ordering as LuOrdering};
 /// Raising the threshold trades parallel width for fewer forks; lowering it does the reverse.
 /// Bit-identical either way: each row's update is independent and its arithmetic order is
 /// unchanged, so the two arms can move time and cannot move a number.
-static LU_PANEL_PAR_MIN: AtomicU64 = AtomicU64::new(64);
+/// SHIPPED 4096, raised from 64 — `frankentorch-rpytm`. Certified on the worker against live
+/// PyTorch, both arms in one process, A/A null in parentheses:
+///
+///     n=512   3.43-3.53x faster not forking   (null 0.979, marginal)
+///     n=1024  2.04x                           (null 1.010, PASS)
+///     n=2048  1.72-1.77x                      (null 1.017, PASS)
+///
+/// lu_factor moves from 6.0-13.3x to 3.4-4.5x vs PyTorch across those sizes. The benefit
+/// SHRINKS with n (3.4x -> 2.0x -> 1.75x) but never inverts on anything measured, so 4096 is
+/// chosen to disable the fork for every size tested WITHOUT asserting anything about larger
+/// ones: at n > 4096 the early columns still fork, which is the regime no row covers.
+///
+/// Raising it rather than deleting the branch keeps that regime reachable and keeps the knob
+/// for the sweep that would settle it.
+static LU_PANEL_PAR_MIN: AtomicU64 = AtomicU64::new(4096);
 fn lu_panel_par_min() -> usize {
     LU_PANEL_PAR_MIN.load(LuOrdering::Relaxed) as usize
 }
