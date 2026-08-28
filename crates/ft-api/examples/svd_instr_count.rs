@@ -116,6 +116,43 @@ fn main() {
         eprintln!("replay_transposed={transposed}");
     }
 
+    // FT_OP=gemm measures what OUR OWN GEMM achieves at this size, so the blocking ceiling for
+    // the BLAS-2 phases is a measured number rather than an invented one.
+    //
+    // eigh's backtransform does ~4n^3/3 flops (a GEMV plus a rank-1 update per step, i^2
+    // multiply-adds each) and the certified single-window figure is 17.839 ms at n=512, i.e.
+    // ~10.0 GFLOP/s. The reduce is the same BLAS-2 shape. What blocking can buy is bounded by
+    // the rate the GEMM path actually reaches on this machine, in this build, at this size —
+    // which is what this measures. Same public route the phases use internally.
+    if std::env::var("FT_OP").map(|v| v == "gemm").unwrap_or(false) {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(data.clone(), vec![n, n], false)
+            .expect("gemm lhs");
+        let b = session
+            .tensor_variable(data.clone(), vec![n, n], false)
+            .expect("gemm rhs");
+        // Warm: first call pays allocator first-touch, which is not the GEMM.
+        let _ = session.tensor_matmul(a, b).expect("warm matmul");
+        let rounds = iters.max(3);
+        let mut best = f64::INFINITY;
+        for _ in 0..rounds {
+            let started = std::time::Instant::now();
+            let out = session.tensor_matmul(a, b).expect("matmul");
+            let elapsed = started.elapsed().as_secs_f64();
+            std::hint::black_box(&out);
+            best = best.min(elapsed);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let flops = 2.0 * (n as f64) * (n as f64) * (n as f64);
+        println!(
+            "gemm n={n} min={:.3} ms  {:.1} GFLOP/s  (min of {rounds})",
+            best * 1e3,
+            flops / best / 1e9
+        );
+        return;
+    }
+
     // FT_OP=eigh re-takes the eigh phase map. The banked one (reduce 42.7% / backtransform
     // 31.8% / tql2 24.8%) was measured on the DEFAULT fixture, whose symmetrised form has 496
     // of 512 eigenvalues exactly equal — the tridiagonal QL iteration deflates on equal
