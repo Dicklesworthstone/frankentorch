@@ -38331,6 +38331,37 @@ static QR_TRAILING_CM_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic:
 /// Smallest COLUMN count at which the column-major forward pass is used.
 const QR_TRAILING_CM_MIN_N: usize = 512;
 
+/// Whether the column-major forward pass's entry/exit transposes use the register-blocked
+/// [`transpose_2d_into_f64`] rather than a naive strided double loop.
+/// `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+///
+/// The nb re-sweep (608bd861) found this: `pack` in the column-major path is FLAT at 19.97-21.18
+/// ms across every nb cell, because it no longer scales with the blocking — it is the two
+/// WHOLE-MATRIX transposes, which cost 2*m*n regardless. That is ~20 ms of a ~101 ms op, and 64 MB
+/// moved in 20 ms is 3.2 GB/s: a strided scalar loop, not a transpose kernel. This tree already
+/// ships a register-blocked rayon transpose. BIT-IDENTICAL either way (pure data movement, each
+/// destination element written once), so the pair can move time and cannot move a number.
+///
+/// DEFAULT FALSE — the naive loop, i.e. NO behaviour change from 7c40b137. The replacement is
+/// written and compiles, but it has NOT been measured on a lane: every attempt this session either
+/// landed on a worker whose target dir held a STALE binary (caught by the ELF sha: the build ran
+/// on hz3 and the run on hz4, which still had `7df1508f5d6fe520`) or did not return inside the
+/// window. An unmeasured perf change does not ship, however obvious its mechanism looks — this
+/// campaign's own record is that unmeasured levers are as often rejects as wins. `FT_QTB=0,1`
+/// prices it in one invocation whenever the fleet is usable again.
+static QR_CM_BLOCKED_TRANSPOSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the blocked entry/exit transpose, returning the previous setting.
+#[doc(hidden)]
+pub fn set_qr_cm_blocked_transpose(on: bool) -> bool {
+    QR_CM_BLOCKED_TRANSPOSE.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn qr_cm_blocked_transpose() -> bool {
+    QR_CM_BLOCKED_TRANSPOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Force the column-major QR forward pass on or off, returning the previous RAW state for
 /// [`restore_qr_trailing_column_major`]. The raw state is returned rather than a bool so a caller
 /// can put the size-gated default back, which a bool cannot express.
@@ -38371,13 +38402,21 @@ fn qr_blocked_forward_cm_f64(
     let profile_enabled = timings.is_some();
     let mut panels: Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::new();
 
-    // R -> column-major, ONCE. This is the whole cost the per-panel gather is traded against.
+    // R -> column-major, ONCE. This is the whole cost the per-panel gather is traded against, and
+    // it is worth spending the good transpose on: the naive double loop below ran at 3.2 GB/s
+    // (20.1 ms of a 101 ms op, MEASURED flat across every nb because it scales with m*n and not
+    // with the blocking). `transpose_2d_into_f64` is the shipped register-blocked, rayon-parallel
+    // transpose and is BIT-IDENTICAL — pure data movement, each destination element written once.
     let transpose_start = qr_profile_stage_start(profile_enabled);
     let mut rc = vec![0.0f64; m * n];
-    for row in 0..m {
-        let src = row * n;
-        for col in 0..n {
-            rc[col * m + row] = r_mat[src + col];
+    if qr_cm_blocked_transpose() {
+        transpose_2d_into_f64(&r_mat[..m * n], &mut rc, m, n);
+    } else {
+        for row in 0..m {
+            let src = row * n;
+            for col in 0..n {
+                rc[col * m + row] = r_mat[src + col];
+            }
         }
     }
     if let Some(timings) = timings.as_mut() {
@@ -38440,10 +38479,14 @@ fn qr_blocked_forward_cm_f64(
     }
 
     let back_start = qr_profile_stage_start(profile_enabled);
-    for row in 0..m {
-        let dst = row * n;
-        for col in 0..n {
-            r_mat[dst + col] = rc[col * m + row];
+    if qr_cm_blocked_transpose() {
+        transpose_2d_into_f64(&rc, &mut r_mat[..m * n], n, m);
+    } else {
+        for row in 0..m {
+            let dst = row * n;
+            for col in 0..n {
+                r_mat[dst + col] = rc[col * m + row];
+            }
         }
     }
     if let Some(timings) = timings.as_mut() {

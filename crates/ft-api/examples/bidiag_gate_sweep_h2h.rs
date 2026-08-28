@@ -173,6 +173,11 @@ struct Arm {
     /// Override for the tred2 reduction's per-step fork threshold; `0` = shipped default 384.
     /// `FT_TPM=0,100000` prices "fork as shipped" against "never fork" in one invocation.
     tred2_par_min: usize,
+    /// Whether the column-major forward pass's entry/exit transposes use the register-blocked
+    /// transpose (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QTB=0,1` prices it in ONE
+    /// invocation. BIT-IDENTICAL either way — pure data movement — so this pair can move time and
+    /// cannot move a number.
+    qr_cm_blocked_transpose: bool,
     /// Whether the blocked QR FORWARD PASS holds R column-major for the whole reduction, which
     /// removes the trailing update's gather and transpose entirely
     /// (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QRC=0,1` prices it in ONE
@@ -243,6 +248,7 @@ fn arm_label(arm: Arm) -> String {
         })
         + if arm.qr_panel_cm { "/panelCM" } else { "/panelROW" }
         + if arm.qr_trailing_cm { "/RcolCM" } else { "/RrowMAJ" }
+        + if arm.qr_cm_blocked_transpose { "/tbBLK" } else { "/tbNAIVE" }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -364,6 +370,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_tnb = ft_kernel_cpu::set_tred2_block_nb(arm.tred2_block_nb);
     let previous_qcm = ft_kernel_cpu::set_qr_panel_column_major(arm.qr_panel_cm);
     let previous_qrc = ft_kernel_cpu::set_qr_trailing_column_major(arm.qr_trailing_cm);
+    let previous_qtb = ft_kernel_cpu::set_qr_cm_blocked_transpose(arm.qr_cm_blocked_transpose);
     let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
         usize::MAX
     } else {
@@ -407,6 +414,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
         ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
+        ft_kernel_cpu::set_qr_cm_blocked_transpose(previous_qtb);
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -436,6 +444,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
         ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
+        ft_kernel_cpu::set_qr_cm_blocked_transpose(previous_qtb);
         return (ms, sum);
     }
     let started = Instant::now();
@@ -523,6 +532,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
     ft_kernel_cpu::set_qr_panel_column_major(previous_qcm);
     ft_kernel_cpu::restore_qr_trailing_column_major(previous_qrc);
+    ft_kernel_cpu::set_qr_cm_blocked_transpose(previous_qtb);
     (ms, sum)
 }
 
@@ -626,6 +636,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
+    let qtbs: Vec<bool> = std::env::var("FT_QTB")
+        .unwrap_or_else(|_| "1".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let qrcs: Vec<bool> = std::env::var("FT_QRC")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -714,6 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for &eigh_bt_par_min in &btps {
                                     for &qr_panel_cm in &qcms {
                                     for &qr_trailing_cm in &qrcs {
+                                    for &qr_cm_blocked_transpose in &qtbs {
                                     arms.push(Arm {
                                         gate,
                                         blocked,
@@ -730,7 +750,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         eigh_bt_par_min,
                                         qr_panel_cm,
                                         qr_trailing_cm,
+                                        qr_cm_blocked_transpose,
                                     });
+                                    }
                                     }
                                     }
                                     }
