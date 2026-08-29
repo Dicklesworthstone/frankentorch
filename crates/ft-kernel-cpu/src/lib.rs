@@ -28690,6 +28690,27 @@ pub fn set_eigh_bt_par_min(v: usize) -> usize {
     EIGH_BT_PAR_MIN.swap(v, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the backtransform's PROJECTION loop forks over ROWS with per-thread partials instead
+/// of over column blocks. `frankentorch-wjrqt`.
+///
+/// WHY. Forking the projection over COLUMN blocks was measured at 0.925x — a REJECT — against a
+/// 0.993 null. The mechanism that fits: the serial loop streams whole rows, while a column-block
+/// split hands each thread a 1 KB strip with an 8 KB stride at n=1024 and defeats the prefetcher.
+/// A row split keeps every thread streaming contiguously; the price is that each thread needs a
+/// private partial vector and the sum over `k` is then combined across threads.
+///
+/// SO THIS REASSOCIATES, where the column split did not. It is admitted under the ratified qgce4
+/// tolerance contract for eigensolver outputs, the same standard the blocked backtransform and the
+/// blocked dsytrd ship under — not as a bit-exact claim.
+static EIGH_BT_ROW_SPLIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the row-split projection, returning the previous setting.
+#[doc(hidden)]
+pub fn set_eigh_bt_row_split(on: bool) -> bool {
+    EIGH_BT_ROW_SPLIT.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
     let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
     if nb > 0 {
@@ -28716,8 +28737,37 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
             // already independent. So the parallel and serial paths produce identical bits, and
             // this pair can move time and cannot move a number.
             if i >= par_min && threads > 1 {
-                let chunk = i.div_ceil(threads).max(64);
                 let prev: &[f64] = previous_rows;
+                if EIGH_BT_ROW_SPLIT.load(std::sync::atomic::Ordering::Relaxed) {
+                    // ROW SPLIT: every thread walks whole rows contiguously, exactly as the
+                    // serial loop does, and keeps a private partial. The combine is what
+                    // reassociates.
+                    projections[..i].fill(0.0);
+                    let partial = prev
+                        .par_chunks(n)
+                        .enumerate()
+                        .fold(
+                            || vec![0.0f64; i],
+                            |mut acc, (k, row)| {
+                                let row_factor = row_i[k];
+                                for (slot, &value) in acc.iter_mut().zip(&row[..i]) {
+                                    *slot += row_factor * value;
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || vec![0.0f64; i],
+                            |mut a, b| {
+                                for (slot, value) in a.iter_mut().zip(b) {
+                                    *slot += value;
+                                }
+                                a
+                            },
+                        );
+                    projections[..i].copy_from_slice(&partial);
+                } else {
+                let chunk = i.div_ceil(threads).max(64);
                 projections[..i]
                     .par_chunks_mut(chunk)
                     .enumerate()
@@ -28731,6 +28781,7 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
                             }
                         }
                     });
+                }
                 let proj: &[f64] = &projections;
                 previous_rows.par_chunks_mut(n).for_each(|row_full| {
                     let reflector = row_full[i];
@@ -65908,6 +65959,79 @@ mod tests {
         }
     }
 
+    /// Serialises the two backtransform tests against each other.
+    ///
+    /// They share `EIGH_BT_ROW_SPLIT`, and unlike this file's other flag pairs the two paths are
+    /// NOT the same arithmetic: the row split reassociates on purpose. So a concurrent run of the
+    /// row-split test flips the global out from under `eigh_backtransform_parallel_is_bit_exact`
+    /// and its `to_bits()` comparison fails — which is exactly what happened, and it is a test
+    /// isolation defect rather than a kernel one. Both tests take this lock.
+    static EIGH_BT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The ROW-SPLIT backtransform projection against the serial one — TOLERANCE, `wjrqt`.
+    ///
+    /// Unlike the column-split (which is bit-exact and was measured a REJECT at 0.925x), the row
+    /// split gives each thread a private partial and combines them, so the sum over `k` is
+    /// reassociated. Held to the ratified qgce4 contract: eigenvalues, reconstruction
+    /// `A ~= Z diag(l) Zt`, AND orthogonality `Zt Z ~= I`, because agreeing eigenvalues would not
+    /// catch a wrong eigenvector and a magnitude check would not catch a sign flip.
+    #[test]
+    fn eigh_backtransform_row_split_matches_serial() {
+        let _guard = EIGH_BT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 200usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let v = (((i * 131 + j * 17 + 7) % 1000) as f64) / 100.0 - 5.0
+                    + if i == j { (i as f64) * 0.5 } else { 0.0 };
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let prev_min = super::set_eigh_bt_par_min(usize::MAX);
+        let prev_split = super::set_eigh_bt_row_split(false);
+        let serial = super::eigh_contiguous_f64(&a, &meta).unwrap();
+        super::set_eigh_bt_par_min(64);
+        super::set_eigh_bt_row_split(true);
+        let forked = super::eigh_contiguous_f64(&a, &meta).unwrap();
+        super::set_eigh_bt_par_min(prev_min);
+        super::set_eigh_bt_row_split(prev_split);
+
+        let scale = serial.eigenvalues.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        let worst = (0..n).fold(0.0f64, |m, i| {
+            m.max((serial.eigenvalues[i] - forked.eigenvalues[i]).abs())
+        });
+        assert!(
+            worst < 1e-9 * scale,
+            "row-split vs serial eigenvalue max abs diff {worst} (scale {scale})"
+        );
+        let z = &forked.eigenvectors;
+        let d = &forked.eigenvalues;
+        let mut recon = 0.0f64;
+        for r in 0..n {
+            for c in 0..n {
+                let mut acc = 0.0;
+                for k in 0..n {
+                    acc += z[r * n + k] * d[k] * z[c * n + k];
+                }
+                recon = recon.max((acc - a[r * n + c]).abs());
+            }
+        }
+        assert!(recon < 1e-9 * scale, "reconstruction max abs error {recon}");
+        let mut orth = 0.0f64;
+        for c1 in 0..n {
+            for c2 in 0..n {
+                let mut acc = 0.0;
+                for r in 0..n {
+                    acc += z[r * n + c1] * z[r * n + c2];
+                }
+                orth = orth.max((acc - if c1 == c2 { 1.0 } else { 0.0 }).abs());
+            }
+        }
+        assert!(orth < 1e-9, "orthogonality max abs error {orth}");
+    }
+
     /// The FORKED backtransform against the serial one — BIT-FOR-BIT, `frankentorch-wjrqt`.
     ///
     /// Not a tolerance check: the projection forks over column blocks (every output still sums
@@ -65921,6 +66045,8 @@ mod tests {
     /// because the two paths are the same arithmetic.
     #[test]
     fn eigh_backtransform_parallel_is_bit_exact() {
+        let _guard = EIGH_BT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_split = super::set_eigh_bt_row_split(false);
         let n = 200usize;
         let mut a = vec![0.0f64; n * n];
         for i in 0..n {
@@ -65937,6 +66063,7 @@ mod tests {
         super::set_eigh_bt_par_min(64);
         let forked = super::eigh_contiguous_f64(&a, &meta).unwrap();
         super::set_eigh_bt_par_min(previous);
+        super::set_eigh_bt_row_split(previous_split);
         for i in 0..n {
             assert_eq!(
                 serial.eigenvalues[i].to_bits(),
