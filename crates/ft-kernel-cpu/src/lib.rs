@@ -8361,6 +8361,178 @@ fn group_norm_backward_scalar_f32_general(
 /// order (matching the no-grad fast path bit-for-bit). Parallel over panel rows.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
+/// Whether `conv2d_backward_f64` computes `dweight` by STREAMING the im2col panel in
+/// `DGEMM_KC`-aligned k-tiles instead of materialising all of it.
+/// `frankentorch-hi9r6`.
+///
+/// WHAT IT REPLACES. The generic backward builds `panel = conv2d_im2col_f64(..)`, a
+/// `flat x patch_width` buffer — 18.9 MB at the scored shape — whose ONLY consumer is
+/// `dgemm_tb(out_ch, flat, patch_width, dout_flat, panel, dweight)`. It is written to DRAM
+/// once and read back once, for 37.7 MB of traffic, to feed 75.5 MMAC. `padded` itself is
+/// 2.37 MB and fits in cache; the panel is nothing but a 9x-redundant copy of it.
+///
+/// WHY IT IS BIT-EXACT, WHICH IS THE WHOLE REASON THE SHAPE IS WHAT IT IS. Splitting the
+/// `k` of a GEMM from outside is bit-exact when the split lands on `matrixmultiply`'s own
+/// `DGEMM_KC` boundaries — NEGATIVE_EVIDENCE item 97, and `gemm::dgemm_tb_add_into` exists
+/// for exactly this (item 100). Each output element still accumulates over the whole of
+/// `k` in ascending `DGEMM_KC`-folded order, and the arithmetic is done by the SAME
+/// microkernel rather than by a hand-rolled dot product — which is the difference between
+/// this and the all-ones adjoint's hand-folded reduction, where `dout == 1.0` made the
+/// multiply disappear. The scratch `C` is pre-zeroed and every tile accumulates with
+/// `beta = 1`, including the first: adding to `+0.0` is exact.
+///
+/// WHY IT SPLITS ON `m` AND `n` AND NOT ON `k`. A `k`-parallel version would need
+/// per-thread partials summed afterwards, and `(b0+b1)+(b2+b3)` is not `((b0+b1)+b2)+b3`.
+/// So the parallel axes are the OUTPUT axes, which never touch any element's reduction.
+/// The grid is chosen so `dout_flat` is re-read once per COLUMN block and `padded` — which
+/// is cache-resident — absorbs the rest.
+///
+/// ITEM 117's RETRY PREDICATE, WHICH THIS IS WRITTEN TO MEET. The streamed-panel conv3d
+/// backward was measured at 1.7x SLOWER and reverted, because it forked per k-block; 117c's
+/// predicate for a retry is "a design that keeps ONE wide parallel region". This forks ONCE,
+/// over the output tile grid, and each task walks its own k-tiles serially.
+///
+/// DEFAULT OFF until a paired lane prices it.
+static CONV2D_DWEIGHT_STREAMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the streamed-panel `dweight`, returning the previous setting.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_streamed(on: bool) -> bool {
+    CONV2D_DWEIGHT_STREAMED.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the streamed-panel `dweight` is selected.
+#[must_use]
+pub fn conv2d_dweight_streamed() -> bool {
+    CONV2D_DWEIGHT_STREAMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `dweight[out_ch, patch_width] = dout_flat^T · im2col(padded)`, with the panel never
+/// materialised. See [`conv2d_dweight_streamed`] for why this is bit-exact.
+///
+/// Returns `None` when the shape cannot be tiled bit-exactly or is too small to be worth
+/// the tiling, so the caller keeps the panel route.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_dweight_streamed_f64(
+    dout_flat: &[f64],
+    padded: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Option<Vec<f64>> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+    if out_ch == 0 || patch_width == 0 || flat == 0 {
+        return None;
+    }
+
+    // THE GRID. Splitting on `n` (panel columns) re-reads `dout_flat` once per column block,
+    // so column blocks are kept few and wide; splitting on `m` (out_ch) re-reads `padded`,
+    // which is cache-resident, so row blocks are the cheap axis. `mb` is a multiple of 8 —
+    // one f64 cache line of `dout_flat`'s `out_ch`-major rows — so two row blocks never
+    // share a line.
+    let threads = rayon::current_num_threads().max(1);
+    let mb = if out_ch <= 8 { out_ch } else { 8 };
+    let m_blocks = out_ch.div_ceil(mb);
+    let n_blocks = threads.div_ceil(m_blocks).clamp(1, patch_width.div_ceil(64).max(1));
+    let nb = patch_width.div_ceil(n_blocks);
+    let n_blocks = patch_width.div_ceil(nb);
+
+    // ONE `DGEMM_KC` block per call, which is both the cleanest form of the bit-exactness
+    // argument — `matrixmultiply` does exactly one k-block, so there is no internal fold to
+    // reproduce — and what keeps the tile in L2: at the scored shape `ptile` is 256x72 = 147 KB
+    // and `atile` 256x8 = 16 KB. A wider `krows` would still be bit-exact (any multiple of
+    // `DGEMM_KC` is) but stops being cache-resident, which is the entire point of streaming.
+    // The last tile is short exactly as the GEMM's own last k-block is.
+    let krows = DGEMM_KC;
+
+    // The (channel, kernel-row) runs a column block intersects, precomputed once: they do not
+    // depend on which panel row is being filled, only on the block.
+    let results: Vec<((usize, usize), Vec<f64>)> = (0..m_blocks * n_blocks)
+        .into_par_iter()
+        .map(|tile| {
+            let mi = tile / n_blocks;
+            let ni = tile % n_blocks;
+            let oc0 = mi * mb;
+            let ocn = mb.min(out_ch - oc0);
+            let j0 = ni * nb;
+            let jn = nb.min(patch_width - j0);
+            let mut c = vec![0.0f64; ocn * jn];
+            if ocn == 0 || jn == 0 {
+                return ((oc0, j0), c);
+            }
+            // (channel, kernel row, offset into the kw run, run length, offset into the tile row)
+            let mut runs: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+            for ch in 0..in_ch {
+                let pch = ch * kh * kw;
+                for kr in 0..kh {
+                    let seg0 = pch + kr * kw;
+                    let lo = seg0.max(j0);
+                    let hi = (seg0 + kw).min(j0 + jn);
+                    if lo < hi {
+                        runs.push((ch, kr, lo - seg0, hi - lo, lo - j0));
+                    }
+                }
+            }
+            let mut ptile = vec![0.0f64; krows * jn];
+            let mut atile = vec![0.0f64; krows * ocn];
+            let mut f0 = 0usize;
+            while f0 < flat {
+                let rows = krows.min(flat - f0);
+                for r in 0..rows {
+                    let row = f0 + r;
+                    let b = row / patch_count;
+                    let pc = row % patch_count;
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let batch_off = b * in_ch * ph * pw;
+                    let prow = &mut ptile[r * jn..(r + 1) * jn];
+                    for &(ch, kr, off, len, dst) in &runs {
+                        let irow =
+                            batch_off + ch * ph * pw + (base_h + kr) * pw + base_w + off;
+                        prow[dst..dst + len].copy_from_slice(&padded[irow..irow + len]);
+                    }
+                    let src = row * out_ch + oc0;
+                    atile[r * ocn..(r + 1) * ocn]
+                        .copy_from_slice(&dout_flat[src..src + ocn]);
+                }
+                gemm::dgemm_tb_add_into(
+                    ocn,
+                    rows,
+                    jn,
+                    &atile[..rows * ocn],
+                    &ptile[..rows * jn],
+                    &mut c,
+                );
+                f0 += rows;
+            }
+            ((oc0, j0), c)
+        })
+        .collect();
+
+    // The scatter is `out_ch * patch_width` elements total — 74 KB at the scored shape — so it
+    // is done serially rather than paying a second fork for it.
+    let mut dweight = vec![0.0f64; out_ch * patch_width];
+    for ((oc0, j0), c) in results {
+        let jn = nb.min(patch_width - j0);
+        for (oc, crow) in c.chunks_exact(jn).enumerate() {
+            let dst = (oc0 + oc) * patch_width + j0;
+            dweight[dst..dst + jn].copy_from_slice(crow);
+        }
+    }
+    Some(dweight)
+}
+
 pub fn conv2d_im2col_f64(
     padded: &[f64],
     batch: usize,
@@ -10772,7 +10944,23 @@ pub fn conv2d_backward_f64(
     // ~9x smaller than `dpanel`, so the expected effect is ~0.1 ms and it is recorded as
     // bookkeeping rather than as a lever with a prediction worth defending.
     let dout_flat = conv2d_dout_flat_f64(dout, batch, out_ch, patch_count);
-    let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    // STREAMED dweight — `frankentorch-hi9r6`. When it is on and the shape tiles, `panel` is
+    // never built at all: the only consumer of an 18.9 MB buffer is the GEMM below, and
+    // `conv2d_dweight_streamed_f64` feeds that GEMM `DGEMM_KC`-aligned tiles instead. See
+    // `conv2d_dweight_streamed` for the bit-exactness argument and for why the parallel axes
+    // are `m` and `n` rather than `k`.
+    let streamed = if conv2d_dweight_streamed() {
+        conv2d_dweight_streamed_f64(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        )
+    } else {
+        None
+    };
+    let panel = if streamed.is_some() {
+        Vec::new()
+    } else {
+        conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
+    };
     // dweight_flat [out_ch, patch_width] = dout_flat^T @ panel.
     // dweight = dout_flat^T @ panel via dgemm_tb (reads dout_flat [flat,out_ch] AS
     // its transpose through strides) — no [out_ch,flat] dout_t materialisation, its
@@ -10793,14 +10981,17 @@ pub fn conv2d_backward_f64(
     // GUARD: `gemm::dgemm`-family wrappers return EARLY on `m == 0 || n == 0`, before
     // matrixmultiply's own zero-fill can run, so a degenerate shape would hand back an
     // uninitialized buffer.
-    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f64]| {
-        if out_ch == 0 || patch_width == 0 || flat == 0 {
-            dweight.fill(0.0);
-            return;
-        }
-        CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
-        gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
-    });
+    let dweight = match streamed {
+        Some(dweight) => dweight,
+        None => build_uninit(out_ch * patch_width, |dweight: &mut [f64]| {
+            if out_ch == 0 || patch_width == 0 || flat == 0 {
+                dweight.fill(0.0);
+                return;
+            }
+            CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
+            gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+        }),
+    };
     // FREE THE PANEL HERE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE item 143.
     //
     // `panel` is 18.0 MB at the scored shape and its LAST use is the line above. Without this
@@ -37720,9 +37911,10 @@ fn qr_profile_record_ns(slot: &mut u128, start: Option<std::time::Instant>) {
 ///
 /// The dot product `T[i][c] = -tau_c * (v_i . v_c)` currently runs over ALL `m` rows, but
 /// reflector `c` of a panel starting at row `first_row` is exactly `0.0` above row
-/// `first_row + c` — so roughly half the products are `x * 0.0`. Skipping them is BIT-EXACT:
-/// the accumulator starts at `+0.0`, every skipped term is `±0.0`, and `acc + ±0.0 == acc`
-/// for every finite `acc` (and for `acc == +0.0`, `+0.0 + -0.0 == +0.0`).
+/// `first_row + c` — so roughly half the products are `x * 0.0`. Skipping them is BIT-EXACT
+/// for finite panels: the accumulator starts at `+0.0`, every skipped term is `±0.0`, and
+/// `acc + ±0.0 == acc` (including `acc == +0.0`). Non-finite panels retain the full dot
+/// product because `0.0 * NaN` and `0.0 * infinity` are NaN and therefore observable.
 ///
 /// DEFAULT OFF: sized but NOT yet measured against a live incumbent.
 static QR_PANEL_T_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -37737,6 +37929,13 @@ fn qr_panel_t_fast() -> bool {
     QR_PANEL_T_FAST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The shortened dot product is only algebraically interchangeable with the full one when
+/// every omitted multiplication is an IEEE zero product. A NaN or infinity in the other
+/// reflector would instead make `0.0 * value` a NaN, so retain the scalar path for that case.
+fn qr_panel_t_skip_zeros(values: &[f64]) -> bool {
+    qr_panel_t_fast() && values.iter().all(|value| value.is_finite())
+}
+
 fn qr_build_compact_wy_t_f64(
     vmat: &[f64],
     tau: &[f64],
@@ -37748,7 +37947,7 @@ fn qr_build_compact_wy_t_f64(
 ) -> Vec<f64> {
     let width = col_end - col_start;
     let mut tmat = vec![0.0f64; width * width];
-    let skip_zeros = qr_panel_t_fast();
+    let skip_zeros = qr_panel_t_skip_zeros(vmat);
     for c in 0..width {
         let src_c = col_start + c;
         if tau[src_c] == 0.0 {
@@ -38115,7 +38314,7 @@ fn qr_build_compact_wy_t_cm_f64(
 ) -> Vec<f64> {
     let width = col_end - col_start;
     let mut tmat = vec![0.0f64; width * width];
-    let skip_zeros = qr_panel_t_fast();
+    let skip_zeros = qr_panel_t_skip_zeros(vbuf);
     for c in 0..width {
         let src_c = col_start + c;
         if tau[src_c] == 0.0 {
@@ -48637,6 +48836,94 @@ mod tests {
         }
         // Degenerate input must not divide by zero.
         assert_eq!(super::conv2d_dinput_block_rows(0), 1);
+    }
+
+    #[test]
+    fn conv2d_dweight_streamed_matches_the_panel_gemm_bitwise() {
+        // `frankentorch-hi9r6`. The streamed dweight splits the GEMM's `k` from OUTSIDE, which
+        // is bit-exact only if the split lands on `matrixmultiply`'s own `DGEMM_KC` boundaries
+        // (NEGATIVE_EVIDENCE item 97). That is a claim about a PRIVATE constant of a
+        // dependency, so this test compares against the real GEMM rather than against the
+        // number — a `cargo update` that moved `D_KC` would fail here rather than silently
+        // change gradients.
+        //
+        // EVERY shape below has `flat > DGEMM_KC`, so the fold is genuinely multi-block; a
+        // fixture small enough to fit one k-block would pass no matter what the tiling did.
+        // The set straddles the cases the tiler has to get right: `patch_width` that does not
+        // divide by the column-block width, `in_ch == 1`, `out_ch` below and above the row
+        // block of 8, stride > 1, and a non-square kernel.
+        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 5] = [
+            // batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw
+            (8, 32, 32, 34, 34, 3, 3, 1, 1), // the scored conv2d shape
+            (6, 1, 3, 20, 18, 3, 3, 1, 1),   // in_ch == 1, out_ch < the 8-row block
+            (5, 7, 13, 17, 19, 3, 2, 1, 1),  // prime-ish channels, non-square kernel
+            (4, 5, 9, 23, 21, 3, 3, 2, 2),   // stride 2 on both axes
+            (9, 3, 8, 12, 14, 2, 3, 1, 2),   // out_ch exactly one row block, mixed stride
+        ];
+        for (batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw) in shapes {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let flat = batch * oh * ow;
+            assert!(
+                flat > super::DGEMM_KC,
+                "shape {batch}x{in_ch}x{ph}x{pw} gives flat={flat}, which is one k-block or \
+                 fewer — it would pass without exercising the fold"
+            );
+            let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i % 37) as f64) * 0.013 - 0.21)
+                .collect();
+            let weight_flat: Vec<f64> = (0..out_ch * in_ch * kh * kw)
+                .map(|i| ((i % 11) as f64) * 0.0625 - 0.3125)
+                .collect();
+            // NON-UNIFORM `dout`: an all-ones one would take the adjoint fast path and this
+            // would compare a kernel the toggle does not touch.
+            let dout: Vec<f64> = (0..batch * out_ch * oh * ow)
+                .map(|i| ((i % 23) as f64) * 0.019 - 0.19)
+                .collect();
+
+            // SENTINEL: the streamed route must actually be selectable at this shape, or the
+            // comparison below is panel-against-panel and asserts nothing.
+            let dout_flat = super::conv2d_dout_flat_f64(&dout, batch, out_ch, oh * ow);
+            assert!(
+                super::conv2d_dweight_streamed_f64(
+                    &dout_flat, &padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+                )
+                .is_some(),
+                "the streamed route declined shape {batch}/{in_ch}/{out_ch} — the bitwise \
+                 comparison would then be the panel route against itself"
+            );
+
+            let previous = super::set_conv2d_dweight_streamed(false);
+            let (panel_dpadded, panel_dweight, _) = super::conv2d_backward_f64(
+                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, false,
+            );
+            super::set_conv2d_dweight_streamed(true);
+            let (stream_dpadded, stream_dweight, _) = super::conv2d_backward_f64(
+                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, false,
+            );
+            super::set_conv2d_dweight_streamed(previous);
+
+            assert_eq!(panel_dweight.len(), stream_dweight.len());
+            for (index, (a, b)) in panel_dweight.iter().zip(&stream_dweight).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dweight[{index}] differs at shape {batch}/{in_ch}/{out_ch}/{ph}x{pw} \
+                     k{kh}x{kw} s{sh}x{sw}: panel {a:e} vs streamed {b:e}"
+                );
+            }
+            // The input gradient must not move at all: the toggle touches only how `dweight`
+            // reaches its GEMM.
+            for (index, (a, b)) in panel_dpadded.iter().zip(&stream_dpadded).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dpadded[{index}] moved at shape {batch}/{in_ch}/{out_ch}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -66013,6 +66300,49 @@ mod tests {
                     tau_col[idx]
                 );
             }
+        }
+    }
+
+    /// The dlarft zero-row skip must preserve every observable bit on finite inputs and must
+    /// automatically retain the full IEEE multiplication sequence for NaN/infinity panels.
+    /// `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+    #[test]
+    fn qr_panel_t_zero_skip_matches_full_path_bit_exactly() {
+        static QR_PANEL_T_FAST_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = QR_PANEL_T_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        for special in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            let (m, n) = (160usize, 32usize);
+            let mut a: Vec<f64> = (0..m * n)
+                .map(|index| {
+                    let row = index / n;
+                    let column = index % n;
+                    ((row * 131 + column * 17 + 7) % 1000) as f64 / 100.0 - 5.0
+                        + if row == column { row as f64 * 0.5 } else { 0.0 }
+                })
+                .collect();
+            if let Some(value) = special {
+                a[11 * n + 3] = value;
+            }
+
+            let previous = super::set_qr_panel_t_fast(false);
+            let (full_packed, full_tau) = super::geqrf_blocked_f64(&a, m, n);
+            super::set_qr_panel_t_fast(true);
+            let (fast_packed, fast_tau) = super::geqrf_blocked_f64(&a, m, n);
+            super::set_qr_panel_t_fast(previous);
+
+            assert_eq!(
+                fast_packed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                full_packed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "packed output differs for special={special:?}"
+            );
+            assert_eq!(
+                fast_tau.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                full_tau.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "tau differs for special={special:?}"
+            );
         }
     }
 

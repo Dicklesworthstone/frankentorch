@@ -1155,6 +1155,90 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
     (elapsed, checksum)
 }
 
+thread_local! {
+    /// `(pad_ms, forward_ms, backward_ms)` from the last `timed_conv2d_masked_train_kernels`
+    /// call. See that function.
+    static CONV2D_KERNELS_SPLIT_MS: std::cell::Cell<(f64, f64, f64)> =
+        const { std::cell::Cell::new((0.0, 0.0, 0.0)) };
+}
+
+/// f64 conv2d TRAINING step with NO session and NO tape — the kernels-only twin of
+/// `conv2d_masked_train`. `frankentorch-hi9r6`.
+///
+/// WHY IT EXISTS. Item 223 priced conv2d's frames by DIFFERENCING two certified rows
+/// (`conv2d_big_masked_train` minus `conv2d_big_masked`) and got `dweight` = 1.40x against
+/// 2.38x for everything else. That instrument can separate exactly one component, and it has
+/// been used on the only pair the board had. The frames inside the 2.38x — the FORWARD, the
+/// backward, and the session/tape surround — have never been separated on the f64 lane at all,
+/// so every lever aimed at them has been aimed by argument.
+///
+/// This lane separates them in ONE invocation against ONE live incumbent:
+///
+/// ```text
+///   conv2d_masked_train - (this - pad_ms)   = the session and tape cost
+///   this row's forward_ms / backward_ms     = the split inside the kernels
+/// ```
+///
+/// It follows `timed_conv2d_f32_kernels` exactly, including its correction: the hand-rolled pad
+/// is INSIDE the timed region (so the row stays comparable with the session lane, which pads
+/// inside `functional_conv2d`) but is also measured and printed, because the two arms do not pay
+/// the SAME pad and charging the difference to "session" gets the sign wrong.
+///
+/// THE `dout` IS THE MASK, not all-ones, and that is the whole point: `conv2d_backward_f64`
+/// routes on `conv2d_ones_dout_route` plus an all-ones scan, so an all-ones `dout` would take
+/// the 3x3 adjoint and measure a different kernel than the lane it is the twin of.
+///
+/// The checksum is `sum |crop(dpadded)|`, which is what the session lane's `report.gradient(x)`
+/// sums, so the parity column compares the same quantity on both.
+fn timed_conv2d_masked_train_kernels(
+    values: &[f64],
+    weights: &[f64],
+    mask: &[f64],
+    batch: usize,
+) -> (f64, f64) {
+    let ph = C2_H + 2;
+    let pw = C2_W + 2;
+    let started = Instant::now();
+    let pad_started = Instant::now();
+    let mut padded = vec![0.0f64; batch * C2_CI * ph * pw];
+    for bc in 0..batch * C2_CI {
+        let src = bc * C2_H * C2_W;
+        let dst = bc * ph * pw;
+        for row in 0..C2_H {
+            let from = src + row * C2_W;
+            let to = dst + (row + 1) * pw + 1;
+            padded[to..to + C2_W].copy_from_slice(&values[from..from + C2_W]);
+        }
+    }
+    let pad_ms = pad_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let fwd_started = Instant::now();
+    let _out = ft_kernel_cpu::conv2d_forward_f64(
+        &padded, weights, None, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO,
+    );
+    let fwd_ms = fwd_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let bwd_started = Instant::now();
+    let (dpadded, _dweight, _dbias) = ft_kernel_cpu::conv2d_backward_f64(
+        mask, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO, false,
+    );
+    let bwd_ms = bwd_started.elapsed().as_secs_f64() * 1_000.0;
+    CONV2D_KERNELS_SPLIT_MS.with(|cell| cell.set((pad_ms, fwd_ms, bwd_ms)));
+
+    let mut checksum = 0.0f64;
+    for bc in 0..batch * C2_CI {
+        let dst = bc * ph * pw;
+        for row in 0..C2_H {
+            let to = dst + (row + 1) * pw + 1;
+            for value in &dpadded[to..to + C2_W] {
+                checksum += value.abs();
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    (elapsed, checksum)
+}
+
 fn timed_conv2d_f32(
     values: &[f32],
     weights: &[f32],
@@ -1240,6 +1324,13 @@ fn timed_linear(
     (elapsed, checksum)
 }
 
+thread_local! {
+    /// `(forward_ms, loss_sum_ms, backward_ms)` from the last `timed_attention` call.
+    /// The three frames are timed inside the same operation interval as the live H2H lane.
+    static ATTENTION_SPLIT_MS: std::cell::Cell<(f64, f64, f64)> =
+        const { std::cell::Cell::new((0.0, 0.0, 0.0)) };
+}
+
 /// Scaled dot-product attention, `[B, H, S, D]`, with Q, K and V all requiring grad.
 ///
 /// `frankentorch-58zjz`. The bead's point is that `dgemm_tb` — given a column-parallel path by item
@@ -1263,11 +1354,18 @@ fn timed_attention(query: &[f64], key: &[f64], value: &[f64]) -> (f64, f64) {
         .tensor_variable(value.to_vec(), shape, true)
         .expect("attention value");
     let started = Instant::now();
+    let forward_started = Instant::now();
     let out = session
         .functional_scaled_dot_product_attention(q, k, v, None, false, None)
         .expect("scaled_dot_product_attention");
+    let forward_ms = forward_started.elapsed().as_secs_f64() * 1_000.0;
+    let loss_started = Instant::now();
     let loss = session.tensor_sum(out).expect("sum");
+    let loss_sum_ms = loss_started.elapsed().as_secs_f64() * 1_000.0;
+    let backward_started = Instant::now();
     let report = session.tensor_backward(loss).expect("backward");
+    let backward_ms = backward_started.elapsed().as_secs_f64() * 1_000.0;
+    ATTENTION_SPLIT_MS.with(|cell| cell.set((forward_ms, loss_sum_ms, backward_ms)));
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     let checksum = report
         .gradient(q)
@@ -1622,6 +1720,13 @@ LANES = {
     "conv2d_masked_warm": (c2x, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2m),
     # item 182: masked route with a GRAD-REQUIRING weight on BOTH arms.
     "conv2d_masked_train": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
+    # frankentorch-hi9r6: the kernels-only twin. Our arm calls ft_kernel_cpu directly with no
+    # session and no tape, so conv2d_masked_train minus (this - pad_ms) is the session cost, and
+    # PT(this)/PT(conv2d_masked_train) is a free ~1.0 control on the window.
+    "conv2d_masked_train_kernels": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
+    # frankentorch-hi9r6: the streamed-dweight arm of the same lane. Same torch code under a
+    # second name, so PT(streamed)/PT(train) is a free ~1.0 control on the window.
+    "conv2d_masked_train_streamed": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
     # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
     # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-164e159d dpanel + col2im dinput,
     # which is what this batch-8 lane took before the channel-group route opened the gate.
@@ -2512,6 +2617,37 @@ LANES = {
             Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true)),
         ),
         (
+            // `frankentorch-hi9r6`: the kernels-only twin of the lane above, so the training
+            // step's FORWARD, BACKWARD and SESSION frames separate inside one invocation
+            // against one live incumbent. See `timed_conv2d_masked_train_kernels` — and read
+            // its `pad_ms` diagnostic before differencing, because the two arms do not pay the
+            // same pad.
+            "conv2d_masked_train_kernels",
+            Box::new(|| timed_conv2d_masked_train_kernels(&c2x, &c2w, &c2m, C2_N)),
+        ),
+        (
+            // `frankentorch-hi9r6`: `conv2d_masked_train` with the STREAMED dweight ON, so the
+            // pair differs in exactly one thing and both halves sample the same host minute.
+            //
+            // THE LEVER. The generic backward's `dweight` reads an 18.9 MB im2col panel that is
+            // built solely to feed one `dgemm_tb` — 37.7 MB of DRAM traffic for 75.5 MMAC, over
+            // a `padded` input that is only 2.37 MB and cache-resident. The streamed form feeds
+            // that same GEMM `DGEMM_KC`-aligned k-tiles from a per-task scratch and never
+            // materialises the panel. See `ft_kernel_cpu::conv2d_dweight_streamed`.
+            //
+            // Item 25's rule is why this is a toggle and not a second binary: the two paths are
+            // BIT-IDENTICAL (`conv2d_dweight_streamed_matches_the_panel_gemm_bitwise`), so the
+            // pair can move time and cannot move a number, and PyTorch runs the SAME code under
+            // both names as a free ~1.0 control on the window.
+            "conv2d_masked_train_streamed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(true);
+                let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
+                ft_kernel_cpu::set_conv2d_dweight_streamed(previous);
+                sample
+            }),
+        ),
+        (
             // `frankentorch-hi9r6`: the lane above with the blocked dinput toggled OFF, so the
             // pair differs in exactly one thing and both halves sample the same host minute.
             //
@@ -3382,6 +3518,17 @@ LANES = {
         // The kernels-only f32 conv2d lane carries a hand-rolled pad inside its timed region that
         // the session lane does not pay in the same form. Print it beside the row so nobody
         // computes "session cost" from a subtraction that is contaminated in one direction.
+        if *name == "conv2d_masked_train_kernels" {
+            let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(std::cell::Cell::get);
+            if fwd > 0.0 || bwd > 0.0 {
+                println!(
+                    "    frames: pad {pad:.3} ms | forward {fwd:.3} ms | backward {bwd:.3} ms \
+                     of this lane's {ft_ms:.3} ms. Session cost = conv2d_masked_train - (this - \
+                     pad); the uncorrected subtraction charges a pad the session pays in another \
+                     form."
+                );
+            }
+        }
         if *name == "conv2d_f32_kernels" {
             let pad = CONV2D_F32_KERNELS_PAD_MS.with(std::cell::Cell::get);
             if pad > 0.0 {
@@ -3390,6 +3537,16 @@ LANES = {
                      zero-init + SERIAL scalar copy, not kernel work. The session cost is \
                      conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected \
                      subtraction has been reading NEGATIVE."
+                );
+            }
+        }
+        if *name == "attention" {
+            let (forward, loss_sum, backward) = ATTENTION_SPLIT_MS.with(std::cell::Cell::get);
+            if forward > 0.0 || backward > 0.0 {
+                println!(
+                    "    frames: forward {forward:.3} ms | loss sum {loss_sum:.3} ms | backward \
+                     {backward:.3} ms of this lane's {ft_ms:.3} ms. Forward is tiled QK-to-softmax-to-V; \
+                     backward recomputes per-head score scratch."
                 );
             }
         }
