@@ -39423,3 +39423,72 @@ row is not quotable, even though the paired figure it implies (1.272x) sits exac
 three replications and would have been easy to accept. The two arms did behave differently, so the
 accounting is what is wrong, not obviously the arm; the mechanism is not yet found and is OWED
 before that lane prices anything again.
+
+## 262. THE dlarft ZERO-SKIP IS 1.135x ON geqrf, CERTIFIED — AND ITS OWN CORRECTNESS GUARD WAS EATING 79% OF IT
+
+`frankentorch-geqrf-misses-blocked-kernel-1zp6r`. Shipped ON and ungated in `43065b91`.
+
+### 262a. THE LEVER
+
+`qr_build_compact_wy_t_f64` ran its `nb^2/2` dot products over ALL `m` rows, but reflector `c` of
+a panel starting at row `first_row` is exactly `0.0` above row `first_row + c`. Roughly half the
+products were `x * 0.0`. Skipping them is bit-exact: the accumulator starts at `+0.0` and every
+skipped term is `+/-0.0`.
+
+### 262b. THE LIVE ROW SAID 1.02x AND THE COUNTER SAID IT SHOULD BE 1.17x
+
+Four windows of `FT_OP=geqrf FT_QTF=0,1,0` priced the lever at 1.008-1.029x, with the A/A null
+swinging 0.956-1.008 across replications — the effect inside its own null's spread, i.e.
+UNRESOLVED rather than small. Meanwhile `panel_t_build_ns` (the counter added with the lever, and
+never read until now) said the outer T build was **29.6% of the lane, 15.548 ms of 52.545**.
+Halving that is ~1.17x. **Both could not be true.**
+
+### 262c. WHAT THE TWO-ARM LADDER FOUND
+
+`geqrf_nb_ladder` now runs BOTH dlarft arms adjacent inside each rep and prints the panel split
+per arm, which is what separates "the skip does not reach the T build" from "the skip reaches it
+and saves little". n=1024, nb=32, leaf=2, 16 threads:
+
+    arm     wall        factor        Tbuild
+    Tfull   55.240ms    12.120ms     15.836ms
+    Tskip   50.330ms    18.052ms      8.354ms      wall 1.098x
+
+The skip worked exactly as designed — **Tbuild 15.836 -> 8.354, a 47% cut**. But `factor`, where
+the recursive combines live, ROSE by 5.93 ms and gave back 79% of the win.
+
+**The cause was the lever's own correctness guard.** `qr_panel_t_skip_zeros` scanned the ENTIRE
+`m * nb` buffer on every call to authorise the skip, and the T build is called once per panel PLUS
+once per recursive combine — about 31 combines per panel at `leaf = 2`. That is 32,768 elements
+scanned to authorise a dot product over as few as two columns.
+
+Scoping the scan to `col_start..col_end` is both cheaper and STRICTLY MORE CORRECT: a non-finite
+value in a column this T build never reads cannot make its shortened dot product wrong. After:
+
+    n=1024  Tfull wall 90.290 factor 18.830 Tbuild 19.848
+            Tskip wall 78.266 factor 17.252 Tbuild 10.524    wall 1.154x
+    n= 512  Tfull wall 19.826 factor  4.303 Tbuild  4.927
+            Tskip wall 17.157 factor  3.985 Tbuild  2.586    wall 1.156x
+
+`factor` is now slightly FASTER on the skip arm, which is what it should have been all along.
+
+### 262d. THE CERTIFIED ROWS, AND NO SIZE GATE
+
+Three windows, thinkstation1, live PyTorch 2.12.1 interleaved in the same invocation, 25 rounds,
+FT_FIXTURE=generic, the repeated arm as the A/A null:
+
+    effect 1.145x  null 1.003    geqrf 7.817x -> 7.036x SLOWER
+    effect 1.135x  null 0.991    geqrf 7.920x -> 6.938x
+    effect 1.125x  null 0.984    geqrf 7.927x -> 6.900x
+
+Every null inside +/-0.02 against a 12.5-14.5% effect. The size curve is positive everywhere —
+1.142 / 1.165 / 1.165 / 1.102 / 1.132 / 1.140x at n = 32 / 64 / 128 / 256 / 512 / 1024 — so unlike
+item 261's streamed `dweight`, which saves a DRAM round trip and needed a 4 MB panel gate, this
+one ships UNGATED. A pure work-removal lever removes work at every size.
+
+### 262e. THE TRANSFERABLE PART
+
+**A correctness guard is code, and code has a cost that the lever it protects has to pay.** This
+one was written correctly, reviewed as correct, and quietly consumed four fifths of the
+improvement it was guarding — invisibly, because the lane-level number just looked small and the
+obvious reading of a small number is "small lever". What separated the two readings was a counter
+that had been in the tree since the lever landed and that nobody, including its author, had read.
