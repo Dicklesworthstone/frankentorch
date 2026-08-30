@@ -15347,52 +15347,57 @@ impl TensorTape {
                     } else {
                         original_shape[ndim - 1]
                     };
-                    let mut contrib = vec![0.0; in_numel];
-                    if inner_len == 0 {
-                        // ndim == 0 (scalar) or a zero-length innermost axis: no rows to
-                        // copy. A 0-d pad has in_numel == 1 and its single element sits at
-                        // flat_out 0, which the per-element walk below still handles.
-                        let mut coords = vec![0usize; ndim];
-                        for flat_in in 0..in_numel {
-                            let mut rem = flat_in;
-                            for d in 0..ndim {
-                                coords[d] = rem / in_strides[d];
-                                rem %= in_strides[d];
+                    // Every branch below writes every contribution exactly once before it is
+                    // read. Zeroing this buffer first is therefore a dead full-size write on
+                    // the conv2d route (about 40 MiB at the board shape); let the gather own
+                    // the first touch instead.
+                    let contrib = ft_kernel_cpu::build_uninit(in_numel, |contrib| {
+                        if inner_len == 0 {
+                            // ndim == 0 (scalar) or a zero-length innermost axis: no rows to
+                            // copy. A 0-d pad has in_numel == 1 and its single element sits at
+                            // flat_out 0, which the per-element walk below still handles.
+                            let mut coords = vec![0usize; ndim];
+                            for flat_in in 0..in_numel {
+                                let mut rem = flat_in;
+                                for d in 0..ndim {
+                                    coords[d] = rem / in_strides[d];
+                                    rem %= in_strides[d];
+                                }
+                                let mut flat_out = 0;
+                                for d in 0..ndim {
+                                    flat_out += (coords[d] + pad_before[d]) * out_strides[d];
+                                }
+                                contrib[flat_in] = incoming[flat_out];
                             }
-                            let mut flat_out = 0;
-                            for d in 0..ndim {
-                                flat_out += (coords[d] + pad_before[d]) * out_strides[d];
-                            }
-                            contrib[flat_in] = incoming[flat_out];
-                        }
-                    } else {
-                        // `in_strides[d]` is a multiple of `inner_len` for every d < ndim-1
-                        // (it is the product of all trailing extents, which includes the
-                        // innermost one), so the row-space stride below divides exactly.
-                        let row_base = pad_before[ndim - 1];
-                        let copy_row = |row: usize, dst: &mut [f64]| {
-                            let mut rem = row;
-                            let mut flat_out = row_base;
-                            for d in 0..ndim - 1 {
-                                let row_stride = in_strides[d] / inner_len;
-                                let coord = rem / row_stride;
-                                rem %= row_stride;
-                                flat_out += (coord + pad_before[d]) * out_strides[d];
-                            }
-                            dst.copy_from_slice(&incoming[flat_out..flat_out + inner_len]);
-                        };
-                        if in_numel >= PAD_BWD_PAR_MIN {
-                            use rayon::prelude::*;
-                            contrib
-                                .par_chunks_mut(inner_len)
-                                .enumerate()
-                                .for_each(|(row, dst)| copy_row(row, dst));
                         } else {
-                            for (row, dst) in contrib.chunks_mut(inner_len).enumerate() {
-                                copy_row(row, dst);
+                            // `in_strides[d]` is a multiple of `inner_len` for every d < ndim-1
+                            // (it is the product of all trailing extents, which includes the
+                            // innermost one), so the row-space stride below divides exactly.
+                            let row_base = pad_before[ndim - 1];
+                            let copy_row = |row: usize, dst: &mut [f64]| {
+                                let mut rem = row;
+                                let mut flat_out = row_base;
+                                for d in 0..ndim - 1 {
+                                    let row_stride = in_strides[d] / inner_len;
+                                    let coord = rem / row_stride;
+                                    rem %= row_stride;
+                                    flat_out += (coord + pad_before[d]) * out_strides[d];
+                                }
+                                dst.copy_from_slice(&incoming[flat_out..flat_out + inner_len]);
+                            };
+                            if in_numel >= PAD_BWD_PAR_MIN {
+                                use rayon::prelude::*;
+                                contrib
+                                    .par_chunks_mut(inner_len)
+                                    .enumerate()
+                                    .for_each(|(row, dst)| copy_row(row, dst));
+                            } else {
+                                for (row, dst) in contrib.chunks_mut(inner_len).enumerate() {
+                                    copy_row(row, dst);
+                                }
                             }
                         }
-                    }
+                    });
 
                     // `contrib` is this Pad node's sole contribution to its input on
                     // the ordinary first-order route. Move the freshly gathered crop
@@ -30092,6 +30097,26 @@ mod tests {
 
         let expected = unpad_gather_reference_4d(&mask, SHAPE, PAD_BEFORE, PADDED_SHAPE);
         assert_eq!(report.gradient(x).expect("grad 3d").to_vec(), expected);
+    }
+
+    #[test]
+    fn pad_backward_scalar_materializes_its_only_contribution() {
+        // A scalar has `inner_len == 0`, so this exercises the non-row-copy branch of
+        // the uninitialized crop allocation. The non-uniform multiplier makes an
+        // unwritten scalar observable rather than letting an all-ones sum hide it.
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0], vec![], true).expect("scalar leaf");
+        let padded = tape.pad(x, &[], 0.0).expect("scalar pad");
+        let multiplier = tape
+            .leaf(vec![-3.5], vec![], false)
+            .expect("scalar multiplier");
+        let (scaled, _) = tape
+            .mul(padded, multiplier, ExecutionMode::Strict)
+            .expect("scalar multiply");
+        let (root, _) = tape.sum(scaled, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(root).expect("backward");
+
+        assert_eq!(report.gradient(x).expect("gradient").to_vec(), vec![-3.5]);
     }
 
     #[test]
