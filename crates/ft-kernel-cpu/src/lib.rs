@@ -38132,8 +38132,36 @@ fn qr_profile_record_ns(slot: &mut u128, start: Option<std::time::Instant>) {
 /// `acc + ±0.0 == acc` (including `acc == +0.0`). Non-finite panels retain the full dot
 /// product because `0.0 * NaN` and `0.0 * infinity` are NaN and therefore observable.
 ///
-/// DEFAULT OFF: sized but NOT yet measured against a live incumbent.
-static QR_PANEL_T_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// SHIPPED ON, UNGATED — and the size curve is why there is no gate. `geqrf_nb_ladder` runs both
+/// arms adjacent inside each rep (hz4, 64 cores, loadavg 7.6, width min(16, nproc), min of 9
+/// after discarding the first):
+///
+/// ```text
+///   n=  32   0.050 -> 0.044 ms   1.142x
+///   n=  64   0.180 -> 0.155 ms   1.165x
+///   n= 128   0.840 -> 0.721 ms   1.165x
+///   n= 256   5.240 -> 4.756 ms   1.102x
+///   n= 512  24.235 -> 21.407 ms  1.132x
+///   n=1024  88.780 -> 77.868 ms  1.140x
+/// ```
+///
+/// Never below 1.10x anywhere in the range, which is what a pure work-removal lever should look
+/// like: the rows it skips are zero at every size, and the finiteness guard is scoped so its cost
+/// is proportional to what the T build actually reads. Compare the streamed conv2d `dweight`,
+/// whose saving was a DRAM round trip and therefore had to be gated on the panel size.
+///
+/// CERTIFIED vs the live incumbent, three windows, thinkstation1, `FT_OP=geqrf FT_QTF=0,1,0`
+/// (the repeated arm IS the A/A null), FT_FIXTURE=generic, 25 rounds, elf
+/// `6c61953bbea82e10f5cd1e9e288a31ff695bbf68f04ecf4f8e26470afed6bd12`:
+///
+/// ```text
+///   effect 1.145x  null 1.003    geqrf 7.817x -> 7.036x SLOWER vs PyTorch 2.12.1
+///   effect 1.135x  null 0.991    geqrf 7.920x -> 6.938x
+///   effect 1.125x  null 0.984    geqrf 7.927x -> 6.900x
+/// ```
+///
+/// All three nulls inside +/-0.02 against an effect of 12.5-14.5%.
+static QR_PANEL_T_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Select the zero-skipping compact-WY `T` build, returning the previous setting.
 #[doc(hidden)]
