@@ -39330,3 +39330,96 @@ the exact error item 241 recorded against the panel width.
 **The measured fact stands on its own and is the useful output here**: our port has been leaving a
 1.14-1.24x bit-exact factor on the table on this host, on one op, for the entire campaign, and the
 same flag applies to every other kernel in the tree.
+
+## 261. conv2d's dweight PANEL IS REMOVABLE BIT-EXACTLY AND IS WORTH A PAIRED 1.25x — AND MY FIRST ROW FOR IT WAS 1.017x ON A BRANCH THAT NEVER EXECUTED
+
+`frankentorch-hi9r6` (P0). Shipped in `9e00dec4` above a 4 MB panel.
+
+### 261a. THE FRAME ATTRIBUTION THAT PICKED THE TARGET
+
+A kernels-only twin of the f64 training lane (`conv2d_masked_train_kernels`) separates the frames
+inside ONE invocation against one live incumbent. thinkstation1, PyTorch 2.12.1 in-process,
+RAYON_NUM_THREADS=16, 16 rounds:
+
+    conv2d_masked                5.543 FT / 3.943 PT   1.41x
+    conv2d_masked_train          9.302 FT / 5.918 PT   1.57x
+    conv2d_masked_train_kernels  7.082 FT / 5.729 PT   1.24x
+      frames: pad 0.807 | forward 1.285 | backward 5.961
+
+    session/tape = 9.302 - (7.082 - 0.807) = 3.027 ms, 33% of the lane
+    dweight      = 9.302 - 5.543 = 3.759 ms vs torch's 1.975 = 1.90x, everything else 1.41x
+
+**Item 139's "91% kernel" was measured on a different lane and does not hold here, and item 223's
+ordering INVERTS with batch**: at batch 16 it found dweight 1.40x against 2.38x for the rest; at
+batch 8 dweight is the worst component, not the best. Which third of the kernel is worst is a
+function of the batch, so "the gap is not in dweight" was true of the lane that measured it and
+false of this one.
+
+### 261b. THE LEVER, AND WHY IT IS BIT-EXACT
+
+`dweight`'s `panel` is 18.9 MB built solely to feed one `dgemm_tb` — 37.7 MB of DRAM traffic for
+75.5 MMAC over a `padded` that is 2.37 MB and cache-resident. `conv2d_dweight_streamed_f64` feeds
+the same GEMM `DGEMM_KC`-aligned k-tiles from an L2-resident scratch and never materialises it.
+
+This extends **item 97**'s partition result from the all-ones adjoint's hand-folded SUM (where
+`dout == 1.0` makes the multiply vanish) to a GENERIC dot product, by letting the same microkernel
+do the arithmetic through `gemm::dgemm_tb_add_into` — the accumulating entry **item 100** banked
+and left uncalled, naming "a future panel-elimination lever" as its consumer. It is that consumer.
+
+**Item 117's retry predicate is met.** The conv3d streamed panel was 1.7x SLOWER because it forked
+per k-block; 117c asks for "a design that keeps ONE wide parallel region". This forks once over the
+output tile grid and each task walks its own k-tiles serially. `k` is never a parallel axis,
+because per-thread partials summed afterwards would reassociate.
+
+### 261c. THE ROWS
+
+Paired, three replications, thinkstation1, 32 rounds, guard + drift_gate PASS every run, elf
+`b59ef32ea8775cb4b73f34f4784eece5af0519607fe0916babd6ee0d143b5cf6`:
+
+    run  FT train  FT streamed  PAIRED   PT control   vs torch          sentinel
+     A    8.855      7.076      1.251x    1.0145       1.68x -> 1.37x   160
+     B    8.536      6.864      1.244x    1.0379       1.62x -> 1.35x   160
+     C    8.979      7.163      1.254x    0.9732       1.71x -> 1.33x   160
+
+The PT control moves in both directions, so it is window noise rather than slot bias.
+
+### 261d. THE SIZE CURVE IS THE GATE
+
+hz4, 64 cores, loadavg 2.41, width = min(16, nproc), both arms adjacent per rep, min of 9:
+
+    0.05 MB  0.986x LOSS   1.12 MB  0.984x LOSS   2.25 MB  0.888x LOSS
+    ------------------------------ gate at 4 MB ------------------------------
+    4.50 MB  1.441x   9.00 MB 1.572x   18.00 MB 1.414x   36 MB 2.04-2.24x   72 MB 2.101x
+
+Every shape above 4 MB wins, every loss is at or below 2.25 MB, and nothing sits between. The
+sub-gate wins (1.2-1.7x on sub-millisecond work) are given up because their SIGN did not replicate
+across hosts while the large sizes did.
+
+**A host-shape error nearly mis-set this gate, and it was mine.** An earlier pass read the scored
+shape at 1.901x on hz3 and 0.983x on a 10-core worker, and I was one step from filing "the lever
+is host-dependent". The 10-core run FORCED `RAYON_NUM_THREADS=16` onto ten cores — a configuration
+no deployment uses, since `pool::configure_global_pool` ships `min(16, physical)`. The sweep now
+derives the width.
+
+### 261e. THE PART WORTH KEEPING: 1.017x ON A BRANCH THAT NEVER RAN
+
+The first paired row for this lever was **1.017x**, and I was about to file it as a null. The
+toggle had been wired into `conv2d_backward_f64` only. The masked training lane does not go
+through that entry: `try_fuse_conv2d_loss_mask` routes it to `conv2d_backward_mask_fused_f64`,
+which carries a SECOND COPY of the panel + `dgemm_tb` at `masked_conv2d.rs:56`. A shared routine
+duplicated for one caller is the same defect class as item 132's gate — **the fix does not travel,
+and nothing in a paired lane can tell you so**, because a lever that never executed and a lever
+with no effect produce the same number.
+
+Fixed three ways, all code: one shared gate both entries call; a
+`take_conv2d_dweight_streamed_calls()` execution counter the lane prints; and the bitwise test now
+asserts the count is 0 with the toggle off and 1 with it on, at BOTH entries, before comparing any
+bits. That 1.017x is now this pair's cleanest negative control.
+
+**And the sentinel immediately earned its keep a second time.** With streaming shipped ON, the
+paired lane was flipped so the toggled arm forces the LEGACY path. That run's sentinel reads
+**160 in the incumbent and 160 in the forced-legacy arm** — the legacy arm must be zero — so the
+row is not quotable, even though the paired figure it implies (1.272x) sits exactly on top of the
+three replications and would have been easy to accept. The two arms did behave differently, so the
+accounting is what is wrong, not obviously the arm; the mechanism is not yet found and is OWED
+before that lane prices anything again.
