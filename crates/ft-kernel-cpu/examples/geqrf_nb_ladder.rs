@@ -89,6 +89,19 @@ fn main() {
             pct(t.trailing_gemm_ns),
             pct(mid_ns),
         );
+        // The panel+T bucket, split three ways. `panel_and_t_ns` has been the largest single
+        // term since the column-major trailing update landed, and it wraps three different
+        // things: the recursive dgeqrt3, one V transpose, and the outer dlarft T build.
+        eprintln!(
+            "GEQRF_LADDER n={n:>5} nb={nb:>3} leaf={leaf:>2}   PANEL SPLIT  factor={:5.1}% \
+             ({:7.3}ms)  vT={:5.1}% ({:7.3}ms)  Tbuild={:5.1}% ({:7.3}ms)",
+            pct(t.panel_factor_ns),
+            t.panel_factor_ns as f64 / 1e6,
+            pct(t.panel_v_transpose_ns),
+            t.panel_v_transpose_ns as f64 / 1e6,
+            pct(t.panel_t_build_ns),
+            t.panel_t_build_ns as f64 / 1e6,
+        );
     }
     if let Some(((nb, leaf), ms)) = winner {
         let shipped = best.get(&(32, 2)).map(|v| v.0);

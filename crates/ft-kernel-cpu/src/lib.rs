@@ -37459,6 +37459,16 @@ pub struct QrStageTimings {
     pub copy_zeroing_ns: u128,
     /// Panel Householder factorization plus compact-WY T construction time.
     pub panel_and_t_ns: u128,
+    /// SPLIT OF `panel_and_t_ns`, column-major forward pass only: the recursive `dgeqrt3`
+    /// factorization of the panel (leaf sweeps plus the inner block-reflector combines).
+    pub panel_factor_ns: u128,
+    /// SPLIT OF `panel_and_t_ns`: the `V` column-major -> row-major transpose done once per
+    /// panel so the trailing GEMMs and every downstream consumer see the row-major `vmat`.
+    pub panel_v_transpose_ns: u128,
+    /// SPLIT OF `panel_and_t_ns`: the OUTER compact-WY `T` build (`dlarft`) for the whole
+    /// panel. It is a serial scalar triple loop of `nb^2/2` dot products, each currently run
+    /// over ALL `m` rows even though `v_c` is exactly zero above row `panel_start + c`.
+    pub panel_t_build_ns: u128,
     /// Trailing R compact-WY update time.
     pub trailing_r_ns: u128,
     /// TRUE staging only: the `rt` gather and the `vt` transpose that exist because
@@ -37705,6 +37715,28 @@ fn qr_profile_record_ns(slot: &mut u128, start: Option<std::time::Instant>) {
     }
 }
 
+/// Whether the compact-WY `T` build (`dlarft`) skips the rows on which its reflectors are
+/// EXACTLY ZERO. `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+///
+/// The dot product `T[i][c] = -tau_c * (v_i . v_c)` currently runs over ALL `m` rows, but
+/// reflector `c` of a panel starting at row `first_row` is exactly `0.0` above row
+/// `first_row + c` — so roughly half the products are `x * 0.0`. Skipping them is BIT-EXACT:
+/// the accumulator starts at `+0.0`, every skipped term is `±0.0`, and `acc + ±0.0 == acc`
+/// for every finite `acc` (and for `acc == +0.0`, `+0.0 + -0.0 == +0.0`).
+///
+/// DEFAULT OFF: sized but NOT yet measured against a live incumbent.
+static QR_PANEL_T_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Select the zero-skipping compact-WY `T` build, returning the previous setting.
+#[doc(hidden)]
+pub fn set_qr_panel_t_fast(on: bool) -> bool {
+    QR_PANEL_T_FAST.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn qr_panel_t_fast() -> bool {
+    QR_PANEL_T_FAST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn qr_build_compact_wy_t_f64(
     vmat: &[f64],
     tau: &[f64],
@@ -37712,19 +37744,28 @@ fn qr_build_compact_wy_t_f64(
     nb: usize,
     col_start: usize,
     col_end: usize,
+    first_row: usize,
 ) -> Vec<f64> {
     let width = col_end - col_start;
     let mut tmat = vec![0.0f64; width * width];
+    let skip_zeros = qr_panel_t_fast();
     for c in 0..width {
         let src_c = col_start + c;
         if tau[src_c] == 0.0 {
             continue;
         }
         tmat[c * width + c] = tau[src_c];
+        // Reflector `src_c` is exactly zero above row `first_row + src_c`, and `src_i < src_c`,
+        // so every product below that row is `x * 0.0`. See `qr_panel_t_fast`.
+        let row0 = if skip_zeros {
+            (first_row + src_c).min(m)
+        } else {
+            0
+        };
         for i in 0..c {
             let src_i = col_start + i;
             let mut dot = 0.0;
-            for row in 0..m {
+            for row in row0..m {
                 dot += vmat[row * nb + src_i] * vmat[row * nb + src_c];
             }
             tmat[i * width + c] = -tau[src_c] * dot;
@@ -37771,7 +37812,7 @@ fn qr_apply_panel_block_reflector_f64(
 
     let first_row = panel_start + block_start;
     let active_rows = m - first_row;
-    let tmat = qr_build_compact_wy_t_f64(vmat, tau, m, nb, block_start, block_end);
+    let tmat = qr_build_compact_wy_t_f64(vmat, tau, m, nb, block_start, block_end, panel_start);
     let mut vblock = vec![0.0f64; active_rows * block_width];
     let mut vt = vec![0.0f64; block_width * active_rows];
     for local_row in 0..active_rows {
@@ -38070,21 +38111,28 @@ fn qr_build_compact_wy_t_cm_f64(
     m: usize,
     col_start: usize,
     col_end: usize,
+    first_row: usize,
 ) -> Vec<f64> {
     let width = col_end - col_start;
     let mut tmat = vec![0.0f64; width * width];
+    let skip_zeros = qr_panel_t_fast();
     for c in 0..width {
         let src_c = col_start + c;
         if tau[src_c] == 0.0 {
             continue;
         }
         tmat[c * width + c] = tau[src_c];
+        let row0 = if skip_zeros {
+            (first_row + src_c).min(m)
+        } else {
+            0
+        };
         for i in 0..c {
             let src_i = col_start + i;
-            let vi = &vbuf[src_i * m..src_i * m + m];
-            let vc = &vbuf[src_c * m..src_c * m + m];
+            let vi = &vbuf[src_i * m + row0..src_i * m + m];
+            let vc = &vbuf[src_c * m + row0..src_c * m + m];
             let mut dot = 0.0;
-            for row in 0..m {
+            for row in 0..(m - row0) {
                 dot += vi[row] * vc[row];
             }
             tmat[i * width + c] = -tau[src_c] * dot;
@@ -38135,7 +38183,7 @@ fn qr_apply_panel_block_reflector_cm_f64(
 
     let first_row = panel_start + block_start;
     let active_rows = m - first_row;
-    let tmat = qr_build_compact_wy_t_cm_f64(vbuf, tau, m, block_start, block_end);
+    let tmat = qr_build_compact_wy_t_cm_f64(vbuf, tau, m, block_start, block_end, panel_start);
     let mut vt = vec![0.0f64; block_width * active_rows];
     for c in 0..block_width {
         let src = (block_start + c) * m + first_row;
@@ -38501,6 +38549,10 @@ fn qr_blocked_forward_cm_f64(
             tiny,
             leaf,
         );
+        let v_transpose_start = qr_profile_stage_start(profile_enabled);
+        if let Some(timings) = timings.as_mut() {
+            qr_profile_record_ns(&mut timings.panel_factor_ns, panel_start_t);
+        }
         // V back to m x nb row-major for the trailing GEMMs and for every downstream consumer.
         let mut vmat = vec![0.0f64; m * nb];
         for c in 0..nb {
@@ -38509,8 +38561,13 @@ fn qr_blocked_forward_cm_f64(
                 vmat[row * nb + c] = vbuf[src + row];
             }
         }
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb);
+        let t_build_start = qr_profile_stage_start(profile_enabled);
         if let Some(timings) = timings.as_mut() {
+            qr_profile_record_ns(&mut timings.panel_v_transpose_ns, v_transpose_start);
+        }
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb, p);
+        if let Some(timings) = timings.as_mut() {
+            qr_profile_record_ns(&mut timings.panel_t_build_ns, t_build_start);
             qr_profile_record_ns(&mut timings.panel_and_t_ns, panel_start_t);
         }
 
@@ -38625,7 +38682,7 @@ fn qr_blocked_forward_f64(
 
         // --- Compact-WY T (nb×nb upper triangular, LAPACK dlarft forward) so that
         //     H_p H_{p+1} ... H_{pe-1} = I - V T Vᵀ.
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb);
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb, p);
         if let Some(timings) = timings.as_mut() {
             qr_profile_record_ns(&mut timings.panel_and_t_ns, panel_start);
         }
@@ -38936,7 +38993,7 @@ pub fn orgqr_blocked_f64(packed: &[f64], tau: &[f64], m: usize, n: usize, k: usi
                 vmat[i * nb + c] = packed[i * n + j];
             }
         }
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb);
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb, p);
         panels.push((nb, vmat, tmat));
         p = pe;
     }
@@ -38986,7 +39043,7 @@ fn householder_panels_from_packed_f64(
                 vmat[i * nb + c] = packed[i * n + j];
             }
         }
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb);
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb, p);
         panels.push((nb, vmat, tmat));
         p = pe;
     }
