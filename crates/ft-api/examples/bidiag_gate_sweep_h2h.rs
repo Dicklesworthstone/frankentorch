@@ -178,6 +178,11 @@ struct Arm {
     /// invocation. BIT-IDENTICAL either way — pure data movement — so this pair can move time and
     /// cannot move a number.
     qr_cm_blocked_transpose: Option<bool>,
+    /// Whether dlarft skips reflector rows known to be zero on finite panels
+    /// (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QTF=0,1` prices the two forms
+    /// in one invocation against one live PyTorch incumbent. Non-finite panels retain the full
+    /// path, so both arms preserve NaN/infinity propagation.
+    qr_panel_t_fast: Option<bool>,
     /// Whether the blocked QR FORWARD PASS holds R column-major for the whole reduction, which
     /// removes the trailing update's gather and transpose entirely
     /// (`frankentorch-geqrf-misses-blocked-kernel-1zp6r`). `FT_QRC=0,1` prices it in ONE
@@ -273,6 +278,11 @@ fn arm_label(arm: Arm) -> String {
             Some(true) => "/tbBLK",
             Some(false) => "/tbNAIVE",
             None => "/tbSHIPPED",
+        }
+        + match arm.qr_panel_t_fast {
+            Some(true) => "/Tskip",
+            Some(false) => "/Tfull",
+            None => "/TSHIPPED",
         }
 }
 
@@ -396,6 +406,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_qcm = arm.qr_panel_cm.map(ft_kernel_cpu::set_qr_panel_column_major);
     let previous_qrc = arm.qr_trailing_cm.map(ft_kernel_cpu::set_qr_trailing_column_major);
     let previous_qtb = arm.qr_cm_blocked_transpose.map(ft_kernel_cpu::set_qr_cm_blocked_transpose);
+    let previous_qtf = arm.qr_panel_t_fast.map(ft_kernel_cpu::set_qr_panel_t_fast);
     let previous_btr = arm.eigh_bt_row_split.map(ft_kernel_cpu::set_eigh_bt_row_split);
     let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
         usize::MAX
@@ -441,6 +452,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
         if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
         if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
+        if let Some(v) = previous_qtf { ft_kernel_cpu::set_qr_panel_t_fast(v); }
         if let Some(v) = previous_btr { ft_kernel_cpu::set_eigh_bt_row_split(v); }
         return (ms, sum);
     }
@@ -472,6 +484,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
         if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
         if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
+        if let Some(v) = previous_qtf { ft_kernel_cpu::set_qr_panel_t_fast(v); }
         if let Some(v) = previous_btr { ft_kernel_cpu::set_eigh_bt_row_split(v); }
         return (ms, sum);
     }
@@ -561,6 +574,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
     if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
     if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
+    if let Some(v) = previous_qtf { ft_kernel_cpu::set_qr_panel_t_fast(v); }
     if let Some(v) = previous_btr { ft_kernel_cpu::set_eigh_bt_row_split(v); }
     (ms, sum)
 }
@@ -690,6 +704,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         Err(_) => vec![None],
     };
+    let qtfs: Vec<Option<bool>> = match std::env::var("FT_QTF") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
     let qrcs: Vec<Option<bool>> = match std::env::var("FT_QRC") {
         Ok(v) => v
             .split(',')
@@ -773,7 +798,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !gate_values.is_empty()
             && !rowdots.is_empty()
             && !fuseds.is_empty()
-            && !panel_outputs.is_empty(),
+            && !panel_outputs.is_empty()
+            && !qtfs.is_empty(),
         "empty grid"
     );
     let mut arms: Vec<Arm> =
@@ -793,6 +819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for &qr_panel_cm in &qcms {
                                     for &qr_trailing_cm in &qrcs {
                                     for &qr_cm_blocked_transpose in &qtbs {
+                                    for &qr_panel_t_fast in &qtfs {
                                     for &eigh_bt_row_split in &btrs {
                                     arms.push(Arm {
                                         gate,
@@ -811,8 +838,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         qr_panel_cm,
                                         qr_trailing_cm,
                                         qr_cm_blocked_transpose,
+                                        qr_panel_t_fast,
                                         eigh_bt_row_split,
                                     });
+                                    }
                                     }
                                     }
                                     }

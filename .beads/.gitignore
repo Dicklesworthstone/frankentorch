@@ -43,3 +43,6 @@ redirect
 
 # fsqlite migration state (per-machine, ephemeral)
 *.fsqlite-migration-state
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+*.vacuum-wal-cert*

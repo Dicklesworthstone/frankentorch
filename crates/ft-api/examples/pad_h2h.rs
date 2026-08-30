@@ -3,16 +3,23 @@
 //! landed-win ANCHOR for worker-health (discard the run if it regresses far from ~3-6x).
 //! Run: PYTORCH_PYTHON=/path/to/python cargo run --release -p ft-api --example pad_h2h
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
+use ft_api::harness_interleave::{
+    BALANCED_SQUARE, QUIT_REQUEST, READY_MARKER, SAMPLE_LOOP_PY, interpreter_args,
+    parse_sample_line, sample_request,
+};
 use ft_core::ExecutionMode;
 
 const R: usize = 4000;
 const C: usize = 4000;
 const P: usize = 16;
+const GRAD_REPS: usize = 12;
+const GRAD_NULL_MIN: f64 = 0.97;
+const GRAD_NULL_MAX: f64 = 1.03;
 
 type UnaryOp = fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId);
 
@@ -49,7 +56,212 @@ fn time_ft_f32_constant_pad() -> f64 {
     best
 }
 
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    }
+}
+
+fn paired_slot_median(mut values: [f64; 2]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    (values[0] + values[1]) * 0.5
+}
+
+fn grad_reps() -> usize {
+    std::env::var("FT_GRAD_PAD_REPS")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .filter(|reps: &usize| *reps >= 8)
+        .unwrap_or(GRAD_REPS)
+}
+
+/// Builds the leaf outside the clock, then prices only the graph-producing pad forward.
+///
+/// `wb7vt` specifically removed the no-grad guard from the block-copy path, so this must keep
+/// `requires_grad=true` even though the backward crop is intentionally outside this forward gate.
+fn timed_grad_constant_pad(data: &[f32], r: usize, c: usize, p: usize) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let input = session
+        .tensor_variable_f32(data.to_vec(), vec![r, c], true)
+        .expect("grad-pad input");
+    let started = Instant::now();
+    let output = session
+        .tensor_pad(input, &[p, p, p, p], 0.0)
+        .expect("grad-pad forward");
+    let milliseconds = started.elapsed().as_secs_f64() * 1_000.0;
+    assert!(
+        session
+            .tensor_requires_grad(output)
+            .expect("grad-pad output grad flag"),
+        "the measured pad must retain its autograd node"
+    );
+    let checksum = session
+        .tensor_values_f32(output)
+        .expect("grad-pad output values")
+        .iter()
+        .map(|value| f64::from(*value))
+        .sum();
+    (milliseconds, checksum)
+}
+
+fn incumbent_grad_pad_sample(
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
+) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+    writeln!(stdin, "{}", sample_request("constant_pad_f32_grad"))?;
+    stdin.flush()?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err("PyTorch co-process closed before its grad-pad sample".into());
+        }
+        if let Some(sample) = parse_sample_line(&line) {
+            assert_eq!(sample.lane, "constant_pad_f32_grad");
+            return Ok((sample.milliseconds, sample.gradient_checksum));
+        }
+    }
+}
+
+fn run_grad_pad_h2h() -> Result<(), Box<dyn std::error::Error>> {
+    let data: Vec<f32> = (0..R * C).map(|i| ((i % 17) as f32) - 8.0).collect();
+    let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let py_setup = r#"
+import time, torch
+import torch.nn.functional as F
+print('PT_TORCH_VERSION %s' % torch.__version__, flush=True)
+torch.set_num_threads(8)
+R,C,P=4000,4000,16
+idx=torch.arange(R*C,dtype=torch.int64)
+pad_input=((idx%17).float()-8.0).reshape(R,C).requires_grad_(True)
+def run(base, fn):
+    s=time.perf_counter()
+    out=fn(base)
+    elapsed=(time.perf_counter()-s)*1e3
+    assert out.requires_grad
+    return elapsed, out.detach().sum().item()
+print('PT_TIMED_STEPS forward_with_grad_graph', flush=True)
+LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='constant',value=0.0))}
+"#;
+    let py = format!("{py_setup}{SAMPLE_LOOP_PY}");
+    let mut child = Command::new(&python)
+        .args(interpreter_args(&py))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no PyTorch stdin"))?;
+    let mut reader = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no PyTorch stdout"))?,
+    );
+    let mut preamble = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(format!("PyTorch arm ({python}) exited before {READY_MARKER}: {preamble}").into());
+        }
+        if line.trim() == READY_MARKER {
+            break;
+        }
+        preamble.push_str(&line);
+    }
+    let torch_version = ft_api::harness_provenance::require_reported_version(&preamble)?;
+    assert!(
+        preamble.contains("PT_TIMED_STEPS forward_with_grad_graph"),
+        "the PyTorch arm must time graph-producing pad forward only"
+    );
+    println!(
+        "executing_elf_sha256={}",
+        ft_api::harness_provenance::executing_elf_sha256()
+    );
+    println!(
+        "{}",
+        ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
+    );
+    println!(
+        "measurement=CONSTANT PAD f32 FORWARD WITH requires_grad=true; leaf/checksum outside timer; balanced-square interleaved same invocation"
+    );
+
+    for _ in 0..std::env::var("FT_H2H_WARMUP")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(4)
+    {
+        std::hint::black_box(timed_grad_constant_pad(&data, R, C, P));
+    }
+    let reps = grad_reps();
+    let mut ft_times = Vec::with_capacity(reps);
+    let mut pt_times = Vec::with_capacity(reps);
+    let mut ft_first_half = Vec::with_capacity(reps);
+    let mut ft_second_half = Vec::with_capacity(reps);
+    let mut pt_first_half = Vec::with_capacity(reps);
+    let mut pt_second_half = Vec::with_capacity(reps);
+    let mut ft_checksum = 0.0;
+    let mut pt_checksum = 0.0;
+    for _ in 0..reps {
+        let mut ft_slots = Vec::with_capacity(4);
+        let mut pt_slots = Vec::with_capacity(4);
+        for incumbent_slot in BALANCED_SQUARE {
+            if incumbent_slot {
+                let (milliseconds, checksum) = incumbent_grad_pad_sample(&mut stdin, &mut reader)?;
+                pt_slots.push(milliseconds);
+                pt_checksum = checksum;
+            } else {
+                let (milliseconds, checksum) = timed_grad_constant_pad(&data, R, C, P);
+                ft_slots.push(milliseconds);
+                ft_checksum = checksum;
+            }
+        }
+        ft_first_half.push(paired_slot_median([ft_slots[0], ft_slots[1]]));
+        ft_second_half.push(paired_slot_median([ft_slots[2], ft_slots[3]]));
+        pt_first_half.push(paired_slot_median([pt_slots[0], pt_slots[1]]));
+        pt_second_half.push(paired_slot_median([pt_slots[2], pt_slots[3]]));
+        ft_times.push(median(ft_slots));
+        pt_times.push(median(pt_slots));
+    }
+    writeln!(stdin, "{QUIT_REQUEST}")?;
+    stdin.flush()?;
+    drop(stdin);
+    child.wait()?;
+
+    let ratio = median(pt_times.clone()) / median(ft_times.clone());
+    let pt_null = median(pt_first_half) / median(pt_second_half);
+    let ft_null = median(ft_first_half) / median(ft_second_half);
+    let parity = (ft_checksum - pt_checksum).abs()
+        <= 1e-5 * pt_checksum.abs().max(1.0);
+    let nulls_pass = (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&pt_null)
+        && (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&ft_null);
+    println!(
+        "constant_pad_f32_grad {R}x{C} pad={P}: FT {:.3} ms PT {:.3} ms = FT {:.3}x {} | PT A/A {pt_null:.3} {} FT A/A {ft_null:.3} {} parity {}",
+        median(ft_times),
+        median(pt_times),
+        if ratio >= 1.0 { ratio } else { 1.0 / ratio },
+        if ratio >= 1.0 { "FASTER" } else { "SLOWER" },
+        if (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&pt_null) { "PASS" } else { "FAIL" },
+        if (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&ft_null) { "PASS" } else { "FAIL" },
+        if parity { "MATCH" } else { "MISMATCH" },
+    );
+    if !(nulls_pass && parity) {
+        println!(
+            "NOT QUOTABLE: require both duplicate-arm A/A nulls inside {GRAD_NULL_MIN:.2}..{GRAD_NULL_MAX:.2} and checksum parity"
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("FT_GRAD_PAD_H2H").is_some() {
+        return run_grad_pad_h2h();
+    }
     let data: Vec<f64> = (0..R * C).map(|i| ((i % 17) as f64) - 8.0).collect();
     let ops: Vec<(&str, UnaryOp)> = vec![
         ("cat_anchor", |s, x| {
@@ -137,4 +349,22 @@ for name,fn in [("cat_anchor",lambda:torch.cat([x,x],1)),
         lookup("constant_pad_f32"),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{median, paired_slot_median, timed_grad_constant_pad};
+
+    #[test]
+    fn grad_pad_sample_keeps_the_pad_node_and_prices_only_forward() {
+        let (milliseconds, checksum) = timed_grad_constant_pad(&[1.0, 2.0, 3.0, 4.0], 2, 2, 1);
+        assert!(milliseconds.is_finite() && milliseconds >= 0.0);
+        assert_eq!(checksum.to_bits(), 10.0_f64.to_bits());
+    }
+
+    #[test]
+    fn balanced_slot_medians_are_order_independent() {
+        assert_eq!(median(vec![9.0, 1.0, 3.0, 7.0]), 5.0);
+        assert_eq!(paired_slot_median([9.0, 1.0]), 5.0);
+    }
 }
