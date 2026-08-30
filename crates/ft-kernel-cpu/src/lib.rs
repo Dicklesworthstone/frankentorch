@@ -33838,6 +33838,67 @@ mod bidiag {
         prev
     }
 
+    /// A stable snapshot of the bidiagonal helpers' dispatch state.
+    ///
+    /// One `dlabrd_panel_f64` call applies several dependent reflectors.  The
+    /// reflector arithmetic cannot run concurrently, but the gate and the
+    /// current Rayon-pool width do not change while the panel is executing.
+    /// Snapshot them once, then keep submitting the same per-reflector tasks to
+    /// Rayon’s already-live global pool.  This deliberately does *not* create a
+    /// worker team or alter task boundaries; the persistent-team replacement was
+    /// measured as a null at n=1024 (NEGATIVE_EVIDENCE item 258).
+    #[derive(Clone, Copy)]
+    struct BidiagParallelPlan {
+        gate: u64,
+        pool_has_width: bool,
+    }
+
+    impl BidiagParallelPlan {
+        #[inline]
+        fn capture() -> Self {
+            Self {
+                gate: parallel_gate(),
+                pool_has_width: rayon::current_num_threads() > 1,
+            }
+        }
+
+        #[inline]
+        fn takes_parallel(self, nrows: usize, ncols: usize) -> bool {
+            self.pool_has_width && (nrows as u64) * (ncols as u64) >= self.gate
+        }
+    }
+
+    /// Keep the legacy per-reflector lookup available only to the paired
+    /// measurement arm.  The shipped path snapshots the decision per panel.
+    static PARALLEL_GATE_HOISTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    #[inline]
+    fn panel_parallel_plan() -> Option<BidiagParallelPlan> {
+        PARALLEL_GATE_HOISTED
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(BidiagParallelPlan::capture)
+    }
+
+    #[inline]
+    fn takes_parallel(
+        plan: Option<BidiagParallelPlan>,
+        nrows: usize,
+        ncols: usize,
+    ) -> bool {
+        plan.map_or_else(
+            || {
+                rayon::current_num_threads() > 1
+                    && (nrows as u64) * (ncols as u64) >= parallel_gate()
+            },
+            |snapshot| snapshot.takes_parallel(nrows, ncols),
+        )
+    }
+
+    pub(crate) fn set_parallel_gate_hoisted(hoisted: bool) -> bool {
+        PARALLEL_GATE_HOISTED.swap(hoisted, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Rows per task in [`reduce_scaled_rows_f64`]. Fixed (not derived from the
     /// thread count) so the partial-sum tree — and therefore the result — is
     /// identical on every machine and every run.
@@ -33860,13 +33921,14 @@ mod bidiag {
         ncols: usize,
         v: &[f64],
         acc: &mut [f64],
+        plan: Option<BidiagParallelPlan>,
     ) {
         let nrows = v.len();
         if nrows == 0 || ncols == 0 {
             return;
         }
         let block = &block[..nrows * lda];
-        if (nrows as u64) * (ncols as u64) < parallel_gate() || rayon::current_num_threads() <= 1 {
+        if !takes_parallel(plan, nrows, ncols) {
             for (row, &vr) in block.chunks_exact(lda).zip(v) {
                 let seg = &row[col0..col0 + ncols];
                 for c in 0..ncols {
@@ -33906,13 +33968,14 @@ mod bidiag {
         ncols: usize,
         v: &[f64],
         acc: &[f64],
+        plan: Option<BidiagParallelPlan>,
     ) {
         let nrows = v.len();
         if nrows == 0 || ncols == 0 {
             return;
         }
         let block = &mut block[..nrows * lda];
-        if (nrows as u64) * (ncols as u64) < parallel_gate() || rayon::current_num_threads() <= 1 {
+        if !takes_parallel(plan, nrows, ncols) {
             for (row, &vr) in block.chunks_exact_mut(lda).zip(v) {
                 let seg = &mut row[col0..col0 + ncols];
                 for c in 0..ncols {
@@ -34400,6 +34463,10 @@ mod bidiag {
         // trailing column. Allocated once per call, outside the `i` loop.
         let pacc = &mut workspace.pacc[..nb];
         let cacc = &mut workspace.cacc[..n_sub];
+        // The gate and pool width are invariant for this dependent reflector
+        // panel. Capture them once; individual reflectors still retain their
+        // existing work-size threshold and task boundaries.
+        let parallel_plan = panel_parallel_plan();
 
         for i in 0..nb {
             // (1) Apply the accumulated updates to column i before reducing it.
@@ -34468,6 +34535,7 @@ mod bidiag {
                     ncols,
                     &u[..urows],
                     &mut acc[..ncols],
+                    parallel_plan,
                 );
                 for (t, &value) in acc[..ncols].iter().enumerate() {
                     y[(i + 1 + t) * ldy + i] = value;
@@ -34586,9 +34654,7 @@ mod bidiag {
                 // item 253: the knob was documented as THE gate for this family and did not
                 // in fact govern the reduction's own matvec, so every "gate raised" run so far
                 // left step (12) forking exactly as before. Default value is unchanged.
-                if (xrows as u64) * (vlen as u64) >= parallel_gate()
-                    && rayon::current_num_threads() > 1
-                {
+                if takes_parallel(parallel_plan, xrows, vlen) {
                     note_parallel_branch(2);
                     // `X_ROW_CHUNK` rows per task, not one. The previous form handed rayon one
                     // row per item, so at nb=8 each item was an 8-element slice carrying a
@@ -34832,6 +34898,7 @@ mod bidiag {
         }
         let mut acc = vec![0.0f64; n];
         let mut v = vec![0.0f64; m];
+        let parallel_plan = panel_parallel_plan();
         for i in (0..n).rev() {
             let tau = tauq[i];
             if tau == 0.0 || i >= m {
@@ -34844,11 +34911,27 @@ mod bidiag {
                 v[r] = packed[(i + r) * n + i];
             }
             acc[..ncols].fill(0.0);
-            reduce_scaled_rows_f64(&q[i * n..], n, i, ncols, &v[..nrows], &mut acc[..ncols]);
+            reduce_scaled_rows_f64(
+                &q[i * n..],
+                n,
+                i,
+                ncols,
+                &v[..nrows],
+                &mut acc[..ncols],
+                parallel_plan,
+            );
             for value in &mut acc[..ncols] {
                 *value *= tau;
             }
-            apply_scaled_rank1_f64(&mut q[i * n..], n, i, ncols, &v[..nrows], &acc[..ncols]);
+            apply_scaled_rank1_f64(
+                &mut q[i * n..],
+                n,
+                i,
+                ncols,
+                &v[..nrows],
+                &acc[..ncols],
+                parallel_plan,
+            );
         }
         q
     }
@@ -35124,6 +35207,7 @@ mod bidiag {
         }
         let mut acc = vec![0.0f64; n];
         let mut v = vec![0.0f64; n];
+        let parallel_plan = panel_parallel_plan();
         for i in (0..n).rev() {
             let tau = taup[i];
             if i + 1 >= n || tau == 0.0 {
@@ -35143,6 +35227,7 @@ mod bidiag {
                 nrows,
                 &v[..nrows],
                 &mut acc[..nrows],
+                parallel_plan,
             );
             for value in &mut acc[..nrows] {
                 *value *= tau;
@@ -35154,6 +35239,7 @@ mod bidiag {
                 nrows,
                 &v[..nrows],
                 &acc[..nrows],
+                parallel_plan,
             );
         }
         p
@@ -36596,6 +36682,16 @@ pub fn svd_prologue_p_orthogonality() -> Option<f64> {
 #[doc(hidden)]
 pub fn bidiag_parallel_gate_set(gate: u64) -> u64 {
     bidiag::set_parallel_gate(gate)
+}
+
+/// Select whether bidiagonal panels snapshot the gate and Rayon width once.
+///
+/// `true` is the shipped path. `false` retains the former per-reflector lookup
+/// for the paired `bidiag_gate_sweep_h2h` measurement arm; both forms submit
+/// identical work to the same Rayon pool and are required to be bit-exact.
+#[doc(hidden)]
+pub fn bidiag_parallel_gate_hoisted_set(hoisted: bool) -> bool {
+    bidiag::set_parallel_gate_hoisted(hoisted)
 }
 
 /// Read and reset the count of PARALLEL branches taken by the gated bidiagonal helpers.
@@ -71346,6 +71442,54 @@ mod tests {
                  Moving PARALLEL_GATE is then not a tolerance question but a correctness one."
             );
         }
+    }
+
+    /// `frankentorch-mzrnh`: caching the dispatch predicate at panel entry is
+    /// only a scheduling-overhead change. It must retain the legacy branch for
+    /// every reflector and therefore every output bit, including the partial
+    /// sums taken by the parallel reduction.
+    #[test]
+    fn bidiag_hoisted_gate_matches_per_reflector_decision_bits() {
+        let previous_gate = super::bidiag::set_parallel_gate(1);
+        let previous_hoisted = super::bidiag::set_parallel_gate_hoisted(true);
+        let nb = super::svd_bidiag_block_size();
+
+        for &n in &[136usize, 192] {
+            let input = bidiag_test_matrix(n, n, 0xB1D1_A6 ^ n as u64);
+
+            let mut hoisted_packed = input.clone();
+            let (hoisted_d, hoisted_e, hoisted_tauq, hoisted_taup) =
+                super::bidiag::bidiag_blocked_f64(&mut hoisted_packed, n, n, nb);
+            let hoisted_q =
+                super::bidiag::bidiag_form_q_f64(&hoisted_packed, n, n, &hoisted_tauq);
+            let hoisted_p = super::bidiag::bidiag_form_p_f64(&hoisted_packed, n, &hoisted_taup);
+
+            super::bidiag::set_parallel_gate_hoisted(false);
+            let mut legacy_packed = input;
+            let (legacy_d, legacy_e, legacy_tauq, legacy_taup) =
+                super::bidiag::bidiag_blocked_f64(&mut legacy_packed, n, n, nb);
+            let legacy_q =
+                super::bidiag::bidiag_form_q_f64(&legacy_packed, n, n, &legacy_tauq);
+            let legacy_p = super::bidiag::bidiag_form_p_f64(&legacy_packed, n, &legacy_taup);
+
+            let same_bits = |left: &[f64], right: &[f64]| {
+                left.iter()
+                    .map(|value| value.to_bits())
+                    .eq(right.iter().map(|value| value.to_bits()))
+            };
+            assert!(same_bits(&hoisted_d, &legacy_d), "n={n}: d changed");
+            assert!(same_bits(&hoisted_e, &legacy_e), "n={n}: e changed");
+            assert!(same_bits(&hoisted_tauq, &legacy_tauq), "n={n}: tauq changed");
+            assert!(same_bits(&hoisted_taup, &legacy_taup), "n={n}: taup changed");
+            assert!(same_bits(&hoisted_packed, &legacy_packed), "n={n}: packed changed");
+            assert!(same_bits(&hoisted_q, &legacy_q), "n={n}: Q changed");
+            assert!(same_bits(&hoisted_p, &legacy_p), "n={n}: P changed");
+
+            super::bidiag::set_parallel_gate_hoisted(true);
+        }
+
+        super::bidiag::set_parallel_gate_hoisted(previous_hoisted);
+        super::bidiag::set_parallel_gate(previous_gate);
     }
 
     /// Is the reduction's panel width right at the sizes we actually measure? —

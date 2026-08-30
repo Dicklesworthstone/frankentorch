@@ -46,6 +46,7 @@
 //! `FT_GATE_SIZES` (default `128,136,256,512`), `FT_GATE_VALUES` (default the shipped gate and
 //! always-serial), `FT_ROWDOT` (`1` = the four-row step-(12) kernel, `0` = the one-row loop it
 //! replaced), `FT_PANEL_OUTPUT` (`1` = four exact-order panel outputs, `0` = scalar),
+//! `FT_GATE_HOIST` (`1` = snapshot the gate once per panel, `0` = legacy per-reflector lookup),
 //! `FT_ROUNDS` (default 9) and `FT_H2H_WARMUP` (default 8, read by BOTH arms).
 
 use std::io::{BufRead, BufReader, Write};
@@ -109,6 +110,11 @@ enum LinalgOp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Arm {
     gate: u64,
+    /// Snapshot the fixed gate/pool-width decision once per bidiag panel rather
+    /// than reloading both for every dependent reflector (`frankentorch-mzrnh`).
+    /// Both forms use the same Rayon pool and task boundaries, so they must be
+    /// bit-exact; `FT_GATE_HOIST=1,0,1` includes its own A/A control.
+    gate_hoisted: bool,
     blocked: bool,
     /// Whether the panel's two trailing updates run as ONE pass over `A22`
     /// (`frankentorch-4zjaa`, NEGATIVE_EVIDENCE item 247b). Bit-identical either way, so this
@@ -228,7 +234,8 @@ fn arm_label(arm: Arm) -> String {
         format!("{}", arm.gate)
     };
     format!(
-        "{gate}/{}/{}/{}{}",
+        "{gate}/{}/{}/{}/{}{}",
+        if arm.gate_hoisted { "gate-hoisted" } else { "gate-per-reflector" },
         if arm.blocked { "4row" } else { "1row" },
         if arm.fused { "fused" } else { "2pass" },
         if arm.panel_output_blocked {
@@ -393,6 +400,7 @@ fn provenance() -> (f64, f64) {
 /// arms time the same region.
 fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_gate = ft_kernel_cpu::bidiag_parallel_gate_set(arm.gate);
+    let previous_gate_hoisted = ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(arm.gate_hoisted);
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
@@ -438,6 +446,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
             .map(|v| v.abs())
             .sum();
         ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+        ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
@@ -470,6 +479,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
             .map(|v| v.abs())
             .sum();
         ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+        ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
@@ -560,6 +570,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         .iter()
         .sum();
     ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
+    ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
@@ -793,12 +804,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .collect();
+    let gate_hoists: Vec<bool> = std::env::var("FT_GATE_HOIST")
+        .unwrap_or_else(|_| "1".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     assert!(
         !sizes.is_empty()
             && !gate_values.is_empty()
             && !rowdots.is_empty()
             && !fuseds.is_empty()
             && !panel_outputs.is_empty()
+            && !gate_hoists.is_empty()
             && !qtfs.is_empty(),
         "empty grid"
     );
@@ -823,6 +844,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     for &eigh_bt_row_split in &btrs {
                                     arms.push(Arm {
                                         gate,
+                                        gate_hoisted: true,
                                         blocked,
                                         fused,
                                         panel_output_blocked,
@@ -858,6 +880,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Expand this after the established grid so every legacy knob keeps its
+    // exact nesting/order. The default remains the shipped hoisted form.
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            gate_hoists.iter().map(move |&gate_hoisted| Arm {
+                gate_hoisted,
+                ..arm
+            })
+        })
+        .collect();
     // FT_VALUES_ARM=1 appends ONE extra arm running the values-only entry, with the shipped
     // configuration otherwise identical to `arms[0]`. `arms[0] - this` is the expansion phase
     // (form_p + form_q), measured at the lane level rather than read off the untrustworthy
