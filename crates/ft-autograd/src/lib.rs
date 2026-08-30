@@ -13399,31 +13399,89 @@ impl TensorTape {
                 }
                 TensorNodeOp::Sum { input, input_numel } => {
                     let grad_scalar = incoming[0];
-                    // d(sum(x))/dx_i = 1: every input element accumulates the same
-                    // scalar incoming gradient. Accumulate it lazily instead of
-                    // materializing a full `vec![grad_scalar; input_numel]` constant
-                    // contribution only to read it back once — that buffer is pure
-                    // alloc+fill+read traffic on the universal `loss.backward()`
-                    // reduction. Bit-identical to the prior form: same ascending
-                    // index order, same `target[i] += grad_scalar` f64 op. Parallelized:
-                    // the broadcast fill/accumulate fans over Rayon (bit-identical to the
-                    // serial form — constant contribution, ascending order, below-threshold
-                    // fallback stays serial). This is the universal `loss.backward()` hot
-                    // path, so the serial 16.7M fill dominated it. frankentorch-96e5d.
-                    Self::accumulate_tensor_gradient_par_with(
-                        input,
-                        &mut grads[input.0],
-                        input_numel,
-                        |_| grad_scalar,
-                    )?;
+                    // `sum(lhs * mask)` is the training-loss shape used by conv2d's
+                    // masked lane.  When the product has this sum as its only consumer
+                    // and exactly one operand needs grad, the ordinary route first
+                    // materialises an all-`grad_scalar` buffer for Sum and then has Mul
+                    // immediately multiply that buffer by the non-grad operand.  Feed
+                    // the scaled operand directly into the sole grad slot instead.  This
+                    // preserves the exact per-element `grad_scalar * value` expression
+                    // and skips two full output-sized gradient passes.
+                    let fused_mul_sum = if pending[input.0] == 1 {
+                        match self.nodes[input.0].op {
+                            TensorNodeOp::Mul { lhs, rhs } => {
+                                let lhs_requires_grad = self.nodes[lhs.0].requires_grad;
+                                let rhs_requires_grad = self.nodes[rhs.0].requires_grad;
+                                match (lhs_requires_grad, rhs_requires_grad) {
+                                    (true, false)
+                                        if self.nodes[lhs.0].tensor.meta().numel() == input_numel
+                                            && self.nodes[rhs.0].tensor.meta().numel()
+                                                == input_numel =>
+                                    {
+                                        Some((lhs, rhs))
+                                    }
+                                    (false, true)
+                                        if self.nodes[rhs.0].tensor.meta().numel() == input_numel
+                                            && self.nodes[lhs.0].tensor.meta().numel()
+                                                == input_numel =>
+                                    {
+                                        Some((rhs, lhs))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((grad_input, scale_values)) = fused_mul_sum {
+                        let values =
+                            Self::operand_values_cow(&self.nodes[scale_values.0].tensor)?;
+                        Self::ensure_tensor_len(scale_values, values.len(), input_numel)?;
+                        Self::accumulate_tensor_gradient_par_with(
+                            grad_input,
+                            &mut grads[grad_input.0],
+                            input_numel,
+                            |index| grad_scalar * values[index],
+                        )?;
+                        // The Mul node is bypassed, so satisfy its direct input
+                        // dependencies here rather than queueing it with a temporary
+                        // all-ones gradient.
+                        Self::complete_dependency(&mut pending, grad_input, &mut queue)?;
+                        Self::complete_dependency(&mut pending, scale_values, &mut queue)?;
+                        steps.push(TensorBackwardStep {
+                            node: node_id,
+                            incoming_grad_len: incoming.len(),
+                            rule: "d(sum(a*b))/da=b*grad (single-grad fused)",
+                        });
+                    } else {
+                        // d(sum(x))/dx_i = 1: every input element accumulates the same
+                        // scalar incoming gradient. Accumulate it lazily instead of
+                        // materializing a full `vec![grad_scalar; input_numel]` constant
+                        // contribution only to read it back once — that buffer is pure
+                        // alloc+fill+read traffic on the universal `loss.backward()`
+                        // reduction. Bit-identical to the prior form: same ascending
+                        // index order, same `target[i] += grad_scalar` f64 op. Parallelized:
+                        // the broadcast fill/accumulate fans over Rayon (bit-identical to the
+                        // serial form — constant contribution, ascending order, below-threshold
+                        // fallback stays serial). This is the universal `loss.backward()` hot
+                        // path, so the serial 16.7M fill dominated it. frankentorch-96e5d.
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |_| grad_scalar,
+                        )?;
 
-                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                        Self::complete_dependency(&mut pending, input, &mut queue)?;
 
-                    steps.push(TensorBackwardStep {
-                        node: node_id,
-                        incoming_grad_len: incoming.len(),
-                        rule: "d(sum(x))/dx_i=1",
-                    });
+                        steps.push(TensorBackwardStep {
+                            node: node_id,
+                            incoming_grad_len: incoming.len(),
+                            rule: "d(sum(x))/dx_i=1",
+                        });
+                    }
                 }
                 TensorNodeOp::Mean { input, input_numel } => {
                     let grad_scalar = incoming[0];
@@ -22714,6 +22772,31 @@ mod tests {
             err,
             AutogradError::DenseTensor(DenseTensorError::UnsupportedLayout)
         ));
+    }
+
+    #[test]
+    fn tensor_backward_sum_mul_single_grad_fuses_mask_scale() {
+        let mut tape = TensorTape::new();
+        let values = tape
+            .leaf(vec![2.0, -3.0, 5.0, 7.0], vec![2, 2], true)
+            .expect("grad leaf");
+        let mask = tape
+            .leaf(vec![-0.5, 4.0, 0.0, 1.5], vec![2, 2], false)
+            .expect("constant mask");
+        let (scaled, _) = tape
+            .mul(values, mask, ExecutionMode::Strict)
+            .expect("same-shape mul");
+        let (loss, _) = tape.sum(scaled, ExecutionMode::Strict).expect("sum");
+
+        let report = tape.backward(loss).expect("backward");
+        assert_eq!(
+            report.gradient(values).expect("input gradient").to_vec(),
+            vec![-0.5, 4.0, 0.0, 1.5]
+        );
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.rule == "d(sum(a*b))/da=b*grad (single-grad fused)"));
     }
 
     #[test]
