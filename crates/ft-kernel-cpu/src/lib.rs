@@ -38148,8 +38148,41 @@ fn qr_panel_t_fast() -> bool {
 /// The shortened dot product is only algebraically interchangeable with the full one when
 /// every omitted multiplication is an IEEE zero product. A NaN or infinity in the other
 /// reflector would instead make `0.0 * value` a NaN, so retain the scalar path for that case.
-fn qr_panel_t_skip_zeros(values: &[f64]) -> bool {
-    qr_panel_t_fast() && values.iter().all(|value| value.is_finite())
+///
+/// SCOPED TO THE COLUMNS THE T BUILD ACTUALLY READS, and that is a measured requirement rather
+/// than tidiness. The first form scanned the WHOLE `m * nb` buffer on every call, and the T
+/// build is called once per panel plus once per recursive combine — about 31 combines per panel
+/// at `leaf = 2`. MEASURED on the two-arm ladder at n=1024, nb=32, leaf=2 (16 threads, quiet
+/// host): the skip did exactly what it was designed to do, taking the T-build bucket from
+/// **15.836 ms to 8.354 ms**, but the panel-factor bucket — which is where those combines live —
+/// rose from **12.120 ms to 18.052 ms**, giving back 79% of the win. A full-buffer scan per
+/// combine is 32,768 elements to authorise a dot product over as few as two columns.
+///
+/// Scanning `col_start..col_end` is also STRICTLY MORE CORRECT: a non-finite value in a column
+/// this T build never reads cannot make its shortened dot product wrong, so disabling the skip
+/// for it was conservative to the point of being an error in the other direction.
+fn qr_panel_t_skip_zeros_cols(
+    values: &[f64],
+    m: usize,
+    stride: usize,
+    col_start: usize,
+    col_end: usize,
+) -> bool {
+    if !qr_panel_t_fast() {
+        return false;
+    }
+    if stride == 1 {
+        // COLUMN-MAJOR `vbuf`: column `c` is the contiguous run `values[c * m .. c * m + m]`.
+        return values[col_start * m..col_end * m]
+            .iter()
+            .all(|value| value.is_finite());
+    }
+    // ROW-MAJOR `vmat`: column `c` is `values[row * stride + c]`.
+    (0..m).all(|row| {
+        values[row * stride + col_start..row * stride + col_end]
+            .iter()
+            .all(|value| value.is_finite())
+    })
 }
 
 fn qr_build_compact_wy_t_f64(
@@ -38163,7 +38196,7 @@ fn qr_build_compact_wy_t_f64(
 ) -> Vec<f64> {
     let width = col_end - col_start;
     let mut tmat = vec![0.0f64; width * width];
-    let skip_zeros = qr_panel_t_skip_zeros(vmat);
+    let skip_zeros = qr_panel_t_skip_zeros_cols(vmat, m, nb, col_start, col_end);
     for c in 0..width {
         let src_c = col_start + c;
         if tau[src_c] == 0.0 {
@@ -38530,7 +38563,7 @@ fn qr_build_compact_wy_t_cm_f64(
 ) -> Vec<f64> {
     let width = col_end - col_start;
     let mut tmat = vec![0.0f64; width * width];
-    let skip_zeros = qr_panel_t_skip_zeros(vbuf);
+    let skip_zeros = qr_panel_t_skip_zeros_cols(vbuf, m, 1, col_start, col_end);
     for c in 0..width {
         let src_c = col_start + c;
         if tau[src_c] == 0.0 {

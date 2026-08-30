@@ -33,6 +33,24 @@ fn main() {
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
+    // THE dlarft ZERO-SKIP ARM — `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
+    //
+    // The live h2h lane priced this lever at 1.02x while `panel_t_build_ns` says the outer T
+    // build is 29.6% of the lane, so halving it should be worth ~1.17x. Those two cannot both be
+    // right, and the ladder is where the disagreement is settled: it reports the T-BUILD BUCKET
+    // for each arm, so "the skip does not reach the T build" and "the skip reaches it and saves
+    // little" stop being indistinguishable. Both arms run inside each rep, adjacent.
+    let qtf_arms: Vec<Option<bool>> = match std::env::var("FT_QTF") {
+        Ok(raw) => raw
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
 
     let a: Vec<f64> = (0..n * n)
         .map(|idx| {
@@ -50,19 +68,31 @@ fn main() {
     // Warm up: the first call pays allocator and page-fault costs the rest do not.
     let _ = ft_kernel_cpu::geqrf_blocked_nb_f64(&a, n, n, 32, 2, None);
 
-    let mut best: std::collections::BTreeMap<(usize, usize), (f64, QrStageTimings)> =
+    let mut best: std::collections::BTreeMap<(usize, usize, i8), (f64, QrStageTimings)> =
         std::collections::BTreeMap::new();
     for _rep in 0..reps {
         for &nb in &nbs {
             for &leaf in &leaves {
-                let mut t = QrStageTimings::default();
-                let start = std::time::Instant::now();
-                let (_p, _tau) = ft_kernel_cpu::geqrf_blocked_nb_f64(&a, n, n, nb, leaf, Some(&mut t));
-                let ms = start.elapsed().as_secs_f64() * 1e3;
-                match best.get(&(nb, leaf)) {
-                    Some((prev, _)) if *prev <= ms => {}
-                    _ => {
-                        best.insert((nb, leaf), (ms, t));
+                for &qtf in &qtf_arms {
+                    let key = match qtf {
+                        None => -1i8,
+                        Some(false) => 0,
+                        Some(true) => 1,
+                    };
+                    let previous = qtf.map(ft_kernel_cpu::set_qr_panel_t_fast);
+                    let mut t = QrStageTimings::default();
+                    let start = std::time::Instant::now();
+                    let (_p, _tau) =
+                        ft_kernel_cpu::geqrf_blocked_nb_f64(&a, n, n, nb, leaf, Some(&mut t));
+                    let ms = start.elapsed().as_secs_f64() * 1e3;
+                    if let Some(previous) = previous {
+                        ft_kernel_cpu::set_qr_panel_t_fast(previous);
+                    }
+                    match best.get(&(nb, leaf, key)) {
+                        Some((prev, _)) if *prev <= ms => {}
+                        _ => {
+                            best.insert((nb, leaf, key), (ms, t));
+                        }
                     }
                 }
             }
@@ -71,15 +101,20 @@ fn main() {
     let winner = best
         .iter()
         .min_by(|a, b| a.1.0.total_cmp(&b.1.0))
-        .map(|(k, v)| (*k, v.0));
-    for ((nb, leaf), (wall_ms, t)) in &best {
+        .map(|(k, v)| ((k.0, k.1), v.0));
+    for ((nb, leaf, qtf), (wall_ms, t)) in &best {
+        let arm = match qtf {
+            -1 => "Tshipped",
+            0 => "Tfull",
+            _ => "Tskip",
+        };
         let wall_ns = wall_ms * 1e6;
         let pct = |v: u128| 100.0 * v as f64 / wall_ns;
         let mid_ns = t
             .trailing_r_ns
             .saturating_sub(t.trailing_pack_ns + t.trailing_gemm_ns);
         eprintln!(
-            "GEQRF_LADDER n={n:>5} nb={nb:>3} leaf={leaf:>2} wall={wall_ms:8.3}ms  \
+            "GEQRF_LADDER n={n:>5} nb={nb:>3} leaf={leaf:>2} arm={arm:<9} wall={wall_ms:8.3}ms  \
              panel+T={:5.1}%  trailing_R={:5.1}%  pack={:5.1}% ({:7.3}ms)  subGEMM={:5.1}%  \
              midGEMM={:5.1}%",
             pct(t.panel_and_t_ns),
@@ -93,7 +128,7 @@ fn main() {
         // term since the column-major trailing update landed, and it wraps three different
         // things: the recursive dgeqrt3, one V transpose, and the outer dlarft T build.
         eprintln!(
-            "GEQRF_LADDER n={n:>5} nb={nb:>3} leaf={leaf:>2}   PANEL SPLIT  factor={:5.1}% \
+            "GEQRF_LADDER n={n:>5} nb={nb:>3} leaf={leaf:>2} arm={arm:<9} PANEL SPLIT  factor={:5.1}% \
              ({:7.3}ms)  vT={:5.1}% ({:7.3}ms)  Tbuild={:5.1}% ({:7.3}ms)",
             pct(t.panel_factor_ns),
             t.panel_factor_ns as f64 / 1e6,
@@ -104,7 +139,10 @@ fn main() {
         );
     }
     if let Some(((nb, leaf), ms)) = winner {
-        let shipped = best.get(&(32, 2)).map(|v| v.0);
+        let shipped = best
+            .iter()
+            .find(|((nb, leaf, _), _)| *nb == 32 && *leaf == 2)
+            .map(|(_, v)| v.0);
         match shipped {
             Some(s) => eprintln!(
                 "GEQRF_LADDER n={n:>5} WINNER nb={nb} leaf={leaf} at {ms:.3}ms; shipped nb=32 \
