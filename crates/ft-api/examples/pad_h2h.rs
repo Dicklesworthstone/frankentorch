@@ -108,11 +108,33 @@ fn timed_grad_constant_pad(data: &[f32], r: usize, c: usize, p: usize) -> (f64, 
     (milliseconds, checksum)
 }
 
+/// Builds the graph outside the clock, then prices only the Pad crop in backward.
+fn timed_grad_constant_pad_backward(data: &[f32], r: usize, c: usize, p: usize) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let input = session
+        .tensor_variable_f32(data.to_vec(), vec![r, c], true)
+        .expect("grad-pad input");
+    let output = session
+        .tensor_pad(input, &[p, p, p, p], 0.0)
+        .expect("grad-pad forward");
+    let loss = session.tensor_sum(output).expect("grad-pad loss");
+    let started = Instant::now();
+    let report = session.tensor_backward(loss).expect("grad-pad backward");
+    let milliseconds = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(input)
+        .expect("grad-pad input gradient")
+        .iter()
+        .sum();
+    (milliseconds, checksum)
+}
+
 fn incumbent_grad_pad_sample(
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
+    lane: &str,
 ) -> Result<(f64, f64), Box<dyn std::error::Error>> {
-    writeln!(stdin, "{}", sample_request("constant_pad_f32_grad"))?;
+    writeln!(stdin, "{}", sample_request(lane))?;
     stdin.flush()?;
     let mut line = String::new();
     loop {
@@ -121,7 +143,7 @@ fn incumbent_grad_pad_sample(
             return Err("PyTorch co-process closed before its grad-pad sample".into());
         }
         if let Some(sample) = parse_sample_line(&line) {
-            assert_eq!(sample.lane, "constant_pad_f32_grad");
+            assert_eq!(sample.lane, lane);
             return Ok((sample.milliseconds, sample.gradient_checksum));
         }
     }
@@ -129,6 +151,12 @@ fn incumbent_grad_pad_sample(
 
 fn run_grad_pad_h2h() -> Result<(), Box<dyn std::error::Error>> {
     let data: Vec<f32> = (0..R * C).map(|i| ((i % 17) as f32) - 8.0).collect();
+    let backward_only = std::env::var_os("FT_GRAD_PAD_BACKWARD_H2H").is_some();
+    let lane = if backward_only {
+        "constant_pad_f32_grad_backward"
+    } else {
+        "constant_pad_f32_grad"
+    };
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let py_setup = r#"
 import time, torch
@@ -144,10 +172,38 @@ def run(base, fn):
     elapsed=(time.perf_counter()-s)*1e3
     assert out.requires_grad
     return elapsed, out.detach().sum().item()
+def run_backward(base, fn):
+    inp=base.detach().requires_grad_(True)
+    out=fn(inp)
+    loss=out.sum()
+    s=time.perf_counter()
+    loss.backward()
+    elapsed=(time.perf_counter()-s)*1e3
+    return elapsed, inp.grad.detach().sum().item()
 print('PT_TIMED_STEPS forward_with_grad_graph', flush=True)
-LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='constant',value=0.0))}
+print('PT_TIMED_STEPS backward_after_pad_graph', flush=True)
+LANES = {
+    "constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='constant',value=0.0)),
+}
 "#;
-    let py = format!("{py_setup}{SAMPLE_LOOP_PY}");
+    let backward_sample_loop = r#"
+import sys, os
+for _ in range(int(os.environ.get('FT_H2H_WARMUP', '32'))):
+    run_backward(pad_input, lambda x: F.pad(x,(P,P,P,P),mode='constant',value=0.0))
+print('PT_READY', flush=True)
+for _line in sys.stdin:
+    _line = _line.strip()
+    if _line == 'QUIT':
+        break
+    if _line == 'SAMPLE constant_pad_f32_grad_backward':
+        _ms, _g = run_backward(pad_input, lambda x: F.pad(x,(P,P,P,P),mode='constant',value=0.0))
+        print('PT_SAMPLE constant_pad_f32_grad_backward %.6f %.12g' % (_ms, _g), flush=True)
+"#;
+    let py = if backward_only {
+        format!("{py_setup}{backward_sample_loop}")
+    } else {
+        format!("{py_setup}{SAMPLE_LOOP_PY}")
+    };
     let mut child = Command::new(&python)
         .args(interpreter_args(&py))
         .stdin(Stdio::piped())
@@ -167,7 +223,9 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Err(format!("PyTorch arm ({python}) exited before {READY_MARKER}: {preamble}").into());
+            return Err(
+                format!("PyTorch arm ({python}) exited before {READY_MARKER}: {preamble}").into(),
+            );
         }
         if line.trim() == READY_MARKER {
             break;
@@ -175,9 +233,14 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
         preamble.push_str(&line);
     }
     let torch_version = ft_api::harness_provenance::require_reported_version(&preamble)?;
+    let timed_step = if backward_only {
+        "PT_TIMED_STEPS backward_after_pad_graph"
+    } else {
+        "PT_TIMED_STEPS forward_with_grad_graph"
+    };
     assert!(
-        preamble.contains("PT_TIMED_STEPS forward_with_grad_graph"),
-        "the PyTorch arm must time graph-producing pad forward only"
+        preamble.contains(timed_step),
+        "the PyTorch arm must report its timed step"
     );
     println!(
         "executing_elf_sha256={}",
@@ -188,7 +251,8 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
         ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
     );
     println!(
-        "measurement=CONSTANT PAD f32 FORWARD WITH requires_grad=true; leaf/checksum outside timer; balanced-square interleaved same invocation"
+        "measurement=CONSTANT PAD f32 {} WITH requires_grad=true; graph construction/checksum outside timer; balanced-square interleaved same invocation",
+        if backward_only { "BACKWARD" } else { "FORWARD" }
     );
 
     for _ in 0..std::env::var("FT_H2H_WARMUP")
@@ -196,7 +260,11 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(4)
     {
-        std::hint::black_box(timed_grad_constant_pad(&data, R, C, P));
+        std::hint::black_box(if backward_only {
+            timed_grad_constant_pad_backward(&data, R, C, P)
+        } else {
+            timed_grad_constant_pad(&data, R, C, P)
+        });
     }
     let reps = grad_reps();
     let mut ft_times = Vec::with_capacity(reps);
@@ -212,11 +280,16 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
         let mut pt_slots = Vec::with_capacity(4);
         for incumbent_slot in BALANCED_SQUARE {
             if incumbent_slot {
-                let (milliseconds, checksum) = incumbent_grad_pad_sample(&mut stdin, &mut reader)?;
+                let (milliseconds, checksum) =
+                    incumbent_grad_pad_sample(&mut stdin, &mut reader, lane)?;
                 pt_slots.push(milliseconds);
                 pt_checksum = checksum;
             } else {
-                let (milliseconds, checksum) = timed_grad_constant_pad(&data, R, C, P);
+                let (milliseconds, checksum) = if backward_only {
+                    timed_grad_constant_pad_backward(&data, R, C, P)
+                } else {
+                    timed_grad_constant_pad(&data, R, C, P)
+                };
                 ft_slots.push(milliseconds);
                 ft_checksum = checksum;
             }
@@ -236,18 +309,25 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
     let ratio = median(pt_times.clone()) / median(ft_times.clone());
     let pt_null = median(pt_first_half) / median(pt_second_half);
     let ft_null = median(ft_first_half) / median(ft_second_half);
-    let parity = (ft_checksum - pt_checksum).abs()
-        <= 1e-5 * pt_checksum.abs().max(1.0);
+    let parity = (ft_checksum - pt_checksum).abs() <= 1e-5 * pt_checksum.abs().max(1.0);
     let nulls_pass = (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&pt_null)
         && (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&ft_null);
     println!(
-        "constant_pad_f32_grad {R}x{C} pad={P}: FT {:.3} ms PT {:.3} ms = FT {:.3}x {} | PT A/A {pt_null:.3} {} FT A/A {ft_null:.3} {} parity {}",
+        "{lane} {R}x{C} pad={P}: FT {:.3} ms PT {:.3} ms = FT {:.3}x {} | PT A/A {pt_null:.3} {} FT A/A {ft_null:.3} {} parity {}",
         median(ft_times),
         median(pt_times),
         if ratio >= 1.0 { ratio } else { 1.0 / ratio },
         if ratio >= 1.0 { "FASTER" } else { "SLOWER" },
-        if (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&pt_null) { "PASS" } else { "FAIL" },
-        if (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&ft_null) { "PASS" } else { "FAIL" },
+        if (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&pt_null) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        if (GRAD_NULL_MIN..=GRAD_NULL_MAX).contains(&ft_null) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
         if parity { "MATCH" } else { "MISMATCH" },
     );
     if !(nulls_pass && parity) {
@@ -259,7 +339,9 @@ LANES = {"constant_pad_f32_grad": (pad_input, lambda x: F.pad(x,(P,P,P,P),mode='
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("FT_GRAD_PAD_H2H").is_some() {
+    if std::env::var_os("FT_GRAD_PAD_H2H").is_some()
+        || std::env::var_os("FT_GRAD_PAD_BACKWARD_H2H").is_some()
+    {
         return run_grad_pad_h2h();
     }
     let data: Vec<f64> = (0..R * C).map(|i| ((i % 17) as f64) - 8.0).collect();
