@@ -8408,6 +8408,55 @@ pub fn conv2d_dweight_streamed() -> bool {
     CONV2D_DWEIGHT_STREAMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [`conv2d_dweight_streamed_f64`] behind [`conv2d_dweight_streamed`]'s gate.
+///
+/// Exists so the generic backward and the FUSED MASKED backward — which keeps its own copy of
+/// the panel GEMM rather than delegating — cannot drift into disagreeing about which route a
+/// shape takes. Wiring only one of them is what made this lever's first paired row a 1.017x on
+/// a branch that never executed. `frankentorch-hi9r6`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_dweight_streamed_f64_if_enabled(
+    dout_flat: &[f64],
+    padded: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Option<Vec<f64>> {
+    if !conv2d_dweight_streamed() {
+        return None;
+    }
+    let streamed = conv2d_dweight_streamed_f64(
+        dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+    );
+    if streamed.is_some() {
+        CONV2D_DWEIGHT_STREAMED_CALLS.with(|c| c.set(c.get() + 1));
+    }
+    streamed
+}
+
+thread_local! {
+    /// How many times the streamed `dweight` route has actually RUN on this thread.
+    ///
+    /// A SENTINEL, not bookkeeping. "no effect" and "never executed" are indistinguishable in a
+    /// paired lane, and this lever's first paired row was a 1.017x taken on a branch that never
+    /// ran — the fused masked backward keeps its own copy of the panel GEMM and the toggle had
+    /// only been wired into the generic one. A lane that reports this as 0 has measured nothing.
+    static CONV2D_DWEIGHT_STREAMED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read and reset this thread's streamed-`dweight` call count. See the sentinel note above.
+pub fn take_conv2d_dweight_streamed_calls() -> u64 {
+    CONV2D_DWEIGHT_STREAMED_CALLS.with(|c| c.replace(0))
+}
+
 /// `dweight[out_ch, patch_width] = dout_flat^T · im2col(padded)`, with the panel never
 /// materialised. See [`conv2d_dweight_streamed`] for why this is bit-exact.
 ///
@@ -10949,13 +10998,9 @@ pub fn conv2d_backward_f64(
     // `conv2d_dweight_streamed_f64` feeds that GEMM `DGEMM_KC`-aligned tiles instead. See
     // `conv2d_dweight_streamed` for the bit-exactness argument and for why the parallel axes
     // are `m` and `n` rather than `k`.
-    let streamed = if conv2d_dweight_streamed() {
-        conv2d_dweight_streamed_f64(
-            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
-        )
-    } else {
-        None
-    };
+    let streamed = conv2d_dweight_streamed_f64_if_enabled(
+        &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+    );
     let panel = if streamed.is_some() {
         Vec::new()
     } else {
@@ -48921,6 +48966,48 @@ mod tests {
                     a.to_bits(),
                     b.to_bits(),
                     "dpadded[{index}] moved at shape {batch}/{in_ch}/{out_ch}"
+                );
+            }
+
+            // THE FUSED MASKED ENTRY, which is the route the h2h training lane actually takes.
+            // It does NOT delegate to `conv2d_backward_f64`; it keeps its own copy of the panel
+            // GEMM, so it needs its own bit-identity check and its own proof that the streamed
+            // branch fires. Covering only the generic entry is what let the first paired row be
+            // taken on a branch that never ran.
+            let mask: Vec<f64> = (0..batch * out_ch * oh * ow)
+                .map(|i| ((i % 17) as f64) * 0.031 - 0.24)
+                .collect();
+            let previous = super::set_conv2d_dweight_streamed(false);
+            let _ = super::take_conv2d_dweight_streamed_calls();
+            let (_, fused_panel_dw, _) = super::conv2d_backward_mask_fused_f64(
+                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
+                sw, out_ch, [true, true, false],
+            );
+            assert_eq!(
+                super::take_conv2d_dweight_streamed_calls(),
+                0,
+                "the streamed route ran with the toggle OFF at shape {batch}/{in_ch}/{out_ch}"
+            );
+            super::set_conv2d_dweight_streamed(true);
+            let (_, fused_stream_dw, _) = super::conv2d_backward_mask_fused_f64(
+                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
+                sw, out_ch, [true, true, false],
+            );
+            assert_eq!(
+                super::take_conv2d_dweight_streamed_calls(),
+                1,
+                "the fused masked route did NOT reach the streamed dweight at shape \
+                 {batch}/{in_ch}/{out_ch} — the comparison below would be the panel route \
+                 against itself"
+            );
+            super::set_conv2d_dweight_streamed(previous);
+            let fused_panel_dw = fused_panel_dw.expect("fused panel dweight");
+            let fused_stream_dw = fused_stream_dw.expect("fused streamed dweight");
+            for (index, (a, b)) in fused_panel_dw.iter().zip(&fused_stream_dw).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "fused-masked dweight[{index}] differs at shape {batch}/{in_ch}/{out_ch}"
                 );
             }
         }

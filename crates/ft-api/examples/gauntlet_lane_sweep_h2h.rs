@@ -1156,6 +1156,12 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
 }
 
 thread_local! {
+    /// How many times the streamed `dweight` route actually ran across the whole
+    /// `conv2d_masked_train_streamed` lane. Zero means the lane measured nothing.
+    static CONV2D_STREAMED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
     /// `(pad_ms, forward_ms, backward_ms)` from the last `timed_conv2d_masked_train_kernels`
     /// call. See that function.
     static CONV2D_KERNELS_SPLIT_MS: std::cell::Cell<(f64, f64, f64)> =
@@ -2643,6 +2649,14 @@ LANES = {
             Box::new(|| {
                 let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(true);
                 let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
+                // SENTINEL. "no effect" and "never executed" are indistinguishable in a paired
+                // lane, and this lever's FIRST paired row was a 1.017x taken on a branch that
+                // never ran: the fused masked backward keeps its own copy of the panel GEMM and
+                // the toggle had only been wired into the generic entry. The count is read on
+                // this thread, which is the thread that calls the gate.
+                CONV2D_STREAMED_CALLS.with(|cell| {
+                    cell.set(cell.get() + ft_kernel_cpu::take_conv2d_dweight_streamed_calls());
+                });
                 ft_kernel_cpu::set_conv2d_dweight_streamed(previous);
                 sample
             }),
@@ -3518,6 +3532,14 @@ LANES = {
         // The kernels-only f32 conv2d lane carries a hand-rolled pad inside its timed region that
         // the session lane does not pay in the same form. Print it beside the row so nobody
         // computes "session cost" from a subtraction that is contaminated in one direction.
+        if *name == "conv2d_masked_train_streamed" {
+            let calls = CONV2D_STREAMED_CALLS.with(std::cell::Cell::get);
+            println!(
+                "    streamed dweight ran {calls} time(s) in this lane. ZERO means the arm is \
+                 the shipped path under a second name and the pair measures NOTHING — which is \
+                 what the first row of this lever was."
+            );
+        }
         if *name == "conv2d_masked_train_kernels" {
             let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(std::cell::Cell::get);
             if fwd > 0.0 || bwd > 0.0 {

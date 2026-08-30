@@ -54,6 +54,16 @@ pub fn conv2d_backward_mask_fused_f64(
     };
 
     let dweight = output_mask[1].then(|| {
+        // STREAMED dweight — `frankentorch-hi9r6`. This block is a SECOND COPY of the generic
+        // backward's panel GEMM: the fused masked route does not delegate to
+        // `conv2d_backward_f64`, so a toggle wired only there reaches this lane's `dweight`
+        // never, and the paired lane measures the shipped path against itself. That is exactly
+        // what the first attempt did — a 1.017x that was noise on a branch that never ran.
+        if let Some(streamed) = super::conv2d_dweight_streamed_f64_if_enabled(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        ) {
+            return streamed;
+        }
         let panel = super::conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         super::build_uninit(out_ch * patch_width, |dw: &mut [f64]| {
             if out_ch == 0 || patch_width == 0 || flat == 0 {
