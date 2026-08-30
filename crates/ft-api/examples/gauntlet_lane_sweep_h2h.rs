@@ -1025,8 +1025,23 @@ fn timed_conv2d(
         None => out,
     };
     let loss = session.tensor_sum(scored).expect("sum");
+    // THE FORWARD/BACKWARD BOUNDARY — `frankentorch-hi9r6`.
+    //
+    // With the streamed `dweight` shipped, the frames on this lane read pad 0.870 | forward
+    // 1.072 | backward 3.680 ms of KERNEL work against a 7.161 ms lane, which leaves ~2.0 ms
+    // (28%) that is session and tape. That residue is now the largest single frame and nothing
+    // has ever split it. This boundary does: everything before it is the forward session (the
+    // internal pad, the fused mask multiply, the sum, and the tape nodes for all three),
+    // everything after is `tensor_backward` (the tape walk, the dsum broadcast, the gradient
+    // allocation). Subtracting the kernels-only lane's own forward and backward then attributes
+    // each half separately instead of leaving one 2 ms lump.
+    //
+    // Read OUTSIDE the timed arithmetic in the sense that matters — it is one `Instant::now()`
+    // between two operations that were already sequential, so it adds no work to either side.
+    let forward_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    CONV2D_SESSION_SPLIT_MS.with(|cell| cell.set((forward_ms, elapsed - forward_ms)));
     let checksum = report
         .gradient(x)
         .expect("grad")
@@ -1153,6 +1168,15 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
     }
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     (elapsed, checksum)
+}
+
+thread_local! {
+    /// `(forward_ms, backward_ms)` from the last `timed_conv2d` call: the SESSION-level split,
+    /// forward being everything up to and including `tensor_sum` and backward being
+    /// `tensor_backward` alone. Paired with the kernels-only lane's frames this separates the
+    /// ~2 ms of session/tape that is now `conv2d_masked_train`'s largest unattributed frame.
+    static CONV2D_SESSION_SPLIT_MS: std::cell::Cell<(f64, f64)> =
+        const { std::cell::Cell::new((0.0, 0.0)) };
 }
 
 thread_local! {
@@ -3570,6 +3594,17 @@ LANES = {
                  prices the lever only if the first is NONZERO and the second is ZERO — a lever \
                  that never executed and a lever with no effect read identically."
             );
+        }
+        if *name == "conv2d_masked_train" {
+            let (fwd, bwd) = CONV2D_SESSION_SPLIT_MS.with(std::cell::Cell::get);
+            if fwd > 0.0 || bwd > 0.0 {
+                println!(
+                    "    session split: forward (pad + conv + fused mask + sum) {fwd:.3} ms | \
+                     backward (tape walk + dsum + grad alloc) {bwd:.3} ms of this lane's \
+                     {ft_ms:.3} ms. Subtract conv2d_masked_train_kernels' own forward/backward \
+                     frames to get the session and tape cost of each half separately."
+                );
+            }
         }
         if *name == "conv2d_masked_train_kernels" {
             let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(std::cell::Cell::get);
