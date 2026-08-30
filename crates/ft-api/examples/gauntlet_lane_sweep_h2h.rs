@@ -1206,6 +1206,10 @@ fn timed_conv2d_masked_train_kernels(
 ) -> (f64, f64) {
     let ph = C2_H + 2;
     let pw = C2_W + 2;
+    // Drain the streamed-dweight counter on entry. This lane's panel is above the gate, so it
+    // DOES stream, and leaving its increments undrained is what mis-attributed 160 executions to
+    // the forced-legacy arm of the paired lane.
+    let _ = ft_kernel_cpu::take_conv2d_dweight_streamed_calls();
     let started = Instant::now();
     let pad_started = Instant::now();
     let mut padded = vec![0.0f64; batch * C2_CI * ph * pw];
@@ -2623,6 +2627,13 @@ LANES = {
             // computing a discarded gradient" from "conv2d got faster".
             "conv2d_masked_train",
             Box::new(|| {
+                // DRAIN FIRST, and this is not belt-and-braces — it is the fix for a real
+                // mis-attribution. `conv2d_masked_train_kernels` ALSO runs the streamed dweight
+                // (its panel is 18 MB, above the gate) and did not drain, so its increments were
+                // attributed to whichever arm drained next. That is how the forced-LEGACY arm
+                // came to report 160 executions when it must report 0. Draining on entry makes
+                // each arm's count depend only on its own work, whatever any other lane does.
+                let _ = ft_kernel_cpu::take_conv2d_dweight_streamed_calls();
                 let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
                 // SENTINEL on the INCUMBENT side. Counting only the legacy arm would prove the
                 // toggle turned something OFF and say nothing about whether the shipped path
@@ -2664,6 +2675,8 @@ LANES = {
             "conv2d_masked_train_dwpanel",
             Box::new(|| {
                 let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(false);
+                // Drain first — see the incumbent arm above for why.
+                let _ = ft_kernel_cpu::take_conv2d_dweight_streamed_calls();
                 let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
                 // SENTINEL. "no effect" and "never executed" are indistinguishable in a paired
                 // lane, and this lever's FIRST paired row was a 1.017x taken on a branch that
