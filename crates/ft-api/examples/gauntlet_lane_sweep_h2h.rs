@@ -1156,9 +1156,11 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
 }
 
 thread_local! {
-    /// How many times the streamed `dweight` route actually ran across the whole
-    /// `conv2d_masked_train_streamed` lane. Zero means the lane measured nothing.
+    /// How many times the streamed `dweight` route ran in the SHIPPED `conv2d_masked_train`
+    /// lane. Zero means the incumbent arm is not on the path this pair claims to price.
     static CONV2D_STREAMED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The same count for the forced-legacy `conv2d_masked_train_dwpanel` arm. It must be 0.
+    static CONV2D_LEGACY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
@@ -1730,9 +1732,9 @@ LANES = {
     # session and no tape, so conv2d_masked_train minus (this - pad_ms) is the session cost, and
     # PT(this)/PT(conv2d_masked_train) is a free ~1.0 control on the window.
     "conv2d_masked_train_kernels": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
-    # frankentorch-hi9r6: the streamed-dweight arm of the same lane. Same torch code under a
-    # second name, so PT(streamed)/PT(train) is a free ~1.0 control on the window.
-    "conv2d_masked_train_streamed": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
+    # frankentorch-hi9r6: the legacy panel-dweight arm of the same lane. Same torch code under
+    # a second name, so PT(dwpanel)/PT(train) is a free ~1.0 control on the window.
+    "conv2d_masked_train_dwpanel": (c2x, lambda x: Fn.conv2d(x,c2w_train,None,(1,1),(1,1))*c2m),
     # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
     # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-164e159d dpanel + col2im dinput,
     # which is what this batch-8 lane took before the channel-group route opened the gate.
@@ -2620,7 +2622,17 @@ LANES = {
             // where the weight is frozen and NOTHING here, so the pair separates "we stopped
             // computing a discarded gradient" from "conv2d got faster".
             "conv2d_masked_train",
-            Box::new(|| timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true)),
+            Box::new(|| {
+                let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
+                // SENTINEL on the INCUMBENT side. Counting only the legacy arm would prove the
+                // toggle turned something OFF and say nothing about whether the shipped path
+                // turns it ON. Both counts are printed on the `_dwpanel` row. Read outside the
+                // timed region, so it cannot move the sample.
+                CONV2D_STREAMED_CALLS.with(|cell| {
+                    cell.set(cell.get() + ft_kernel_cpu::take_conv2d_dweight_streamed_calls());
+                });
+                sample
+            }),
         ),
         (
             // `frankentorch-hi9r6`: the kernels-only twin of the lane above, so the training
@@ -2632,8 +2644,12 @@ LANES = {
             Box::new(|| timed_conv2d_masked_train_kernels(&c2x, &c2w, &c2m, C2_N)),
         ),
         (
-            // `frankentorch-hi9r6`: `conv2d_masked_train` with the STREAMED dweight ON, so the
-            // pair differs in exactly one thing and both halves sample the same host minute.
+            // `frankentorch-hi9r6`: `conv2d_masked_train` with the streamed dweight FORCED OFF,
+            // so the pair differs in exactly one thing and both halves sample the same host
+            // minute. The arm is the LEGACY one because streaming is now the shipped default —
+            // `feedback_unset_knob_means_forced_off` is the rule this follows: an incumbent arm
+            // must be what production runs, so the toggled arm is the one that departs from it.
+            // While the lever was default-OFF this lane forced it ON and was named `_streamed`.
             //
             // THE LEVER. The generic backward's `dweight` reads an 18.9 MB im2col panel that is
             // built solely to feed one `dgemm_tb` — 37.7 MB of DRAM traffic for 75.5 MMAC, over
@@ -2645,16 +2661,16 @@ LANES = {
             // BIT-IDENTICAL (`conv2d_dweight_streamed_matches_the_panel_gemm_bitwise`), so the
             // pair can move time and cannot move a number, and PyTorch runs the SAME code under
             // both names as a free ~1.0 control on the window.
-            "conv2d_masked_train_streamed",
+            "conv2d_masked_train_dwpanel",
             Box::new(|| {
-                let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(true);
+                let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(false);
                 let sample = timed_conv2d(&c2x, &c2w, Some(&c2m), C2_N, true);
                 // SENTINEL. "no effect" and "never executed" are indistinguishable in a paired
                 // lane, and this lever's FIRST paired row was a 1.017x taken on a branch that
                 // never ran: the fused masked backward keeps its own copy of the panel GEMM and
                 // the toggle had only been wired into the generic entry. The count is read on
                 // this thread, which is the thread that calls the gate.
-                CONV2D_STREAMED_CALLS.with(|cell| {
+                CONV2D_LEGACY_CALLS.with(|cell| {
                     cell.set(cell.get() + ft_kernel_cpu::take_conv2d_dweight_streamed_calls());
                 });
                 ft_kernel_cpu::set_conv2d_dweight_streamed(previous);
@@ -3532,12 +3548,14 @@ LANES = {
         // The kernels-only f32 conv2d lane carries a hand-rolled pad inside its timed region that
         // the session lane does not pay in the same form. Print it beside the row so nobody
         // computes "session cost" from a subtraction that is contaminated in one direction.
-        if *name == "conv2d_masked_train_streamed" {
+        if *name == "conv2d_masked_train_dwpanel" {
             let calls = CONV2D_STREAMED_CALLS.with(std::cell::Cell::get);
+            let legacy = CONV2D_LEGACY_CALLS.with(std::cell::Cell::get);
             println!(
-                "    streamed dweight ran {calls} time(s) in this lane. ZERO means the arm is \
-                 the shipped path under a second name and the pair measures NOTHING — which is \
-                 what the first row of this lever was."
+                "    sentinel: streamed dweight ran {calls} time(s) in the incumbent \
+                 conv2d_masked_train and {legacy} time(s) in this forced-legacy arm. The pair \
+                 prices the lever only if the first is NONZERO and the second is ZERO — a lever \
+                 that never executed and a lever with no effect read identically."
             );
         }
         if *name == "conv2d_masked_train_kernels" {

@@ -8392,9 +8392,76 @@ fn group_norm_backward_scalar_f32_general(
 /// predicate for a retry is "a design that keeps ONE wide parallel region". This forks ONCE,
 /// over the output tile grid, and each task walks its own k-tiles serially.
 ///
-/// DEFAULT OFF until a paired lane prices it.
+/// SHIPPED ON above [`CONV2D_DWEIGHT_STREAM_MIN_PANEL`]. See that constant for the size curve;
+/// the gate is the result, not a detail of it.
 static CONV2D_DWEIGHT_STREAMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Smallest panel, in ELEMENTS (`flat * patch_width`), at which the streamed `dweight` is used.
+/// 1<<19 = 524,288 f64 = 4 MB. `frankentorch-hi9r6`.
+///
+/// THE SIZE CURVE IS THE RESULT. The lever saves a panel ROUND TRIP, so it pays in proportion to
+/// the panel and cannot pay where there is no panel worth avoiding. Measured arm-internal, both
+/// arms adjacent inside each rep, min of 9 after discarding the first, hz4 (64 cores, loadavg
+/// 2.41, RAYON_NUM_THREADS = min(16, nproc) = the shipped width policy), every row bit-identical:
+///
+/// ```text
+///   panel     shape                              ratio
+///    0.00 MB  b1  ci1  co1   8x8                 1.681x
+///    0.02 MB  b2  ci2  co4   8x8                 1.392x
+///    0.02 MB  b1  ci4  co8   8x8                 1.345x
+///    0.03 MB  b1  ci3  co6  12x12                1.236x
+///    0.05 MB  b1  ci16 co32  7x7                 0.986x   <-- LOSS
+///    0.14 MB  b1  ci8  co16 16x16                1.229x
+///    0.56 MB  b2  ci16 co16 16x16                1.350x
+///    1.12 MB  b64 ci4  co4   8x8                 0.984x   <-- LOSS
+///    2.25 MB  b4  ci32 co64 32x32 s2             0.888x   <-- LOSS, the worst
+///   -------------------------------------------- gate at 4 MB --------------------------------
+///    4.50 MB  b4  ci16 co32 32x32                1.441x
+///   18.00 MB  b8  ci32 co32 32x32 (the lane)     1.414x
+///    9.00 MB  b32 ci16 co16 16x16                1.572x
+///   36.00 MB  b8  ci64 co32 32x32                2.042x
+///   36.00 MB  b16 ci32 co32 32x32                2.235x
+///   72.00 MB  b8  ci32 co32 64x64                2.101x
+/// ```
+///
+/// EVERY shape above 4 MB wins and EVERY loss is below 2.25 MB, with no shape between 2.25 and
+/// 4.50 MB to make the boundary ambiguous. The sub-gate wins (1.2-1.7x) are deliberately given
+/// up: they are on sub-millisecond work and they did NOT replicate across hosts, which the
+/// larger sizes did.
+///
+/// THE HOST DEPENDENCE, RECORDED BECAUSE IT NEARLY MIS-SET THIS GATE. The same sweep read the
+/// scored shape at 1.901x on hz3 (64 cores, loadavg 55) and 0.983x on a 10-core worker — but
+/// that second run FORCED `RAYON_NUM_THREADS=16` onto ten cores, a configuration no deployment
+/// uses, because `pool::configure_global_pool` ships `min(16, physical)`. That was my
+/// measurement error, not a property of the lever; re-run at the shipped width the curve above
+/// is what the machine says. `feedback_measurement_host_identity` is the standing rule and this
+/// is another instance of it.
+const CONV2D_DWEIGHT_STREAM_MIN_PANEL: usize = 1 << 19;
+
+/// Runtime override for [`CONV2D_DWEIGHT_STREAM_MIN_PANEL`]; `usize::MAX` means "use the const".
+///
+/// The gate has to be drivable from OUTSIDE, and that is not a convenience. The rows that
+/// decided where it goes were taken by forcing the path on BELOW it — a gate you cannot open
+/// cannot be measured, only assumed (`feedback_tuning_grid_missing_the_winner`). The bitwise
+/// test uses it for the same reason: bit-identity is a property of the ARITHMETIC and must be
+/// checked at small shapes too, not only at the shapes the gate happens to admit.
+static CONV2D_DWEIGHT_STREAM_MIN_PANEL_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set the streamed-`dweight` panel floor, returning the previous setting.
+/// `usize::MAX` restores the shipped constant.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_stream_min_panel(value: usize) -> usize {
+    CONV2D_DWEIGHT_STREAM_MIN_PANEL_OVERRIDE.swap(value, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn conv2d_dweight_stream_min_panel() -> usize {
+    match CONV2D_DWEIGHT_STREAM_MIN_PANEL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => CONV2D_DWEIGHT_STREAM_MIN_PANEL,
+        value => value,
+    }
+}
 
 /// Select the streamed-panel `dweight`, returning the previous setting.
 #[doc(hidden)]
@@ -8430,7 +8497,15 @@ pub(crate) fn conv2d_dweight_streamed_f64_if_enabled(
     sw: usize,
     out_ch: usize,
 ) -> Option<Vec<f64>> {
-    if !conv2d_dweight_streamed() {
+    if !conv2d_dweight_streamed()
+        || batch
+            .saturating_mul(oh)
+            .saturating_mul(ow)
+            .saturating_mul(in_ch)
+            .saturating_mul(kh)
+            .saturating_mul(kw)
+            < conv2d_dweight_stream_min_panel()
+    {
         return None;
     }
     let streamed = conv2d_dweight_streamed_f64(
@@ -49034,15 +49109,26 @@ mod tests {
                  comparison would then be the panel route against itself"
             );
 
+            // Force the SIZE gate open for the whole shape: bit-identity is a property of the
+            // arithmetic and must hold at shapes the gate declines, not only at the ones it
+            // admits. Several fixtures here are deliberately below the shipped 4 MB floor.
+            let previous_floor = super::set_conv2d_dweight_stream_min_panel(0);
             let previous = super::set_conv2d_dweight_streamed(false);
             let (panel_dpadded, panel_dweight, _) = super::conv2d_backward_f64(
                 &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
                 out_ch, false,
             );
             super::set_conv2d_dweight_streamed(true);
+            let _ = super::take_conv2d_dweight_streamed_calls();
             let (stream_dpadded, stream_dweight, _) = super::conv2d_backward_f64(
                 &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
                 out_ch, false,
+            );
+            assert_eq!(
+                super::take_conv2d_dweight_streamed_calls(),
+                1,
+                "the GENERIC entry did not reach the streamed dweight at shape \
+                 {batch}/{in_ch}/{out_ch} — the comparison below would be panel-vs-panel"
             );
             super::set_conv2d_dweight_streamed(previous);
 
@@ -49097,6 +49183,7 @@ mod tests {
                  against itself"
             );
             super::set_conv2d_dweight_streamed(previous);
+            super::set_conv2d_dweight_stream_min_panel(previous_floor);
             let fused_panel_dw = fused_panel_dw.expect("fused panel dweight");
             let fused_stream_dw = fused_stream_dw.expect("fused streamed dweight");
             for (index, (a, b)) in fused_panel_dw.iter().zip(&fused_stream_dw).enumerate() {
