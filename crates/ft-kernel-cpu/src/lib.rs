@@ -27526,6 +27526,38 @@ pub fn cholesky_stage_take_ns() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Cholesky blocking width NB, overridable for the nb SWEEP. `frankentorch-valnx`.
+///
+/// 0 = the shipped default of 128, so an unset knob is the shipped path and not a forced
+/// alternative (`feedback_unset_knob_means_forced_off`).
+///
+/// WHY IT IS A SWEEP AND NOT A CONSTANT EDIT. Panel MACs over a whole factorisation are
+/// `(n/nb)·nb³/6 = n·nb²/6` — at n=512, nb=128 that predicts 1,398,101 against a measured census
+/// of 1,398,016, so the model is exact rather than fitted — while the trailing update always does
+/// ~`n³/3` MACs whatever nb is, and only its `k` changes. The panel runs at 0.85 GF/s and the
+/// trailing at ~90, so shrinking nb trades a QUADRATIC panel term against a shape change in a
+/// term that is 100x faster per FLOP. The optimum is therefore a curve in n, which is why this is
+/// swept at several sizes instead of retuned once (item 279).
+///
+/// CHANGING THIS IS NOT BIT-EXACT, and does not need to be: the blocked path is ALREADY
+/// tolerance-validated rather than bitwise, precisely because panel-vs-trailing blocking
+/// reassociates the sums. An nb change stays inside that existing contract, but it must be
+/// validated by reconstruction and the oracle, never by `to_bits()`.
+static CHOLESKY_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Override the Cholesky blocking width; `0` restores the shipped 128. Returns the previous value.
+#[doc(hidden)]
+pub fn set_cholesky_nb(nb: usize) -> usize {
+    CHOLESKY_NB.swap(nb, LuOrdering::Relaxed)
+}
+
+fn cholesky_nb() -> usize {
+    match CHOLESKY_NB.load(LuOrdering::Relaxed) {
+        0 => 128,
+        v => v.max(1),
+    }
+}
+
 /// Which formulation the Cholesky PANEL uses. `frankentorch-valnx`.
 ///
 /// 0 = SHIPPED serial per-column dots. 1 = the same dots with the independent rows fanned out.
@@ -27762,7 +27794,7 @@ pub fn cholesky_contiguous_f64(
     // This REASSOCIATES the trailing sums (panel-by-panel vs one long dot), so the
     // result matches the serial kernel only to tolerance — validated by
     // reconstruction (L·L^T ≈ A) and the numpy oracle, not bit-for-bit.
-    const NB: usize = 128;
+    let nb_width = cholesky_nb();
     let mut l = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..=i {
@@ -27773,11 +27805,11 @@ pub fn cholesky_contiguous_f64(
     // Scratch reused across panels: `l21` holds the sub-diagonal panel (m×nb),
     // packed once per panel. Allocating once (max size n×NB) avoids a fresh alloc
     // per panel. frankentorch-kgs4.61.
-    let mut l21 = vec![0.0f64; n * NB];
+    let mut l21 = vec![0.0f64; n * nb_width];
 
     let mut jb = 0;
     while jb < n {
-        let je = (jb + NB).min(n);
+        let je = (jb + nb_width).min(n);
         let nb = je - jb;
 
         // 1. Factor the diagonal block l[jb:je, jb:je] (lower) in place.
@@ -70366,6 +70398,70 @@ mod tests {
     /// include a row count that is NOT a multiple of four, which is the remainder path mode 2
     /// would otherwise never execute.
     #[test]
+    /// `frankentorch-valnx`: the NB knob must be BEHAVIOUR-NEUTRAL at its default and CORRECT at
+    /// every other width.
+    ///
+    /// Two obligations, and they are different. (1) `set_cholesky_nb(0)` must reproduce the
+    /// shipped path BITWISE — the knob is for a sweep, and a knob that changes the default is a
+    /// silent reblocking of every caller. (2) Other widths must still factor: nb changes the
+    /// blocking, which REASSOCIATES the trailing sums, so those are checked by reconstruction
+    /// against A and NOT by `to_bits()`. The blocked path already carries exactly that contract —
+    /// it is tolerance-validated rather than bitwise for this very reason — so this widens no
+    /// numerical promise.
+    #[test]
+    fn cholesky_nb_knob_is_neutral_at_default_and_correct_elsewhere() {
+        for n in [96usize, 192, 300] {
+            let mut a = vec![0.0f64; n * n];
+            for i in 0..n {
+                for j in 0..i {
+                    let v = ((i * 13 + j * 29) % 19) as f64 * 0.01 - 0.08;
+                    a[i * n + j] = v;
+                    a[j * n + i] = v;
+                }
+                a[i * n + i] = n as f64;
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+            let previous = super::set_cholesky_nb(0);
+            let shipped = super::cholesky_contiguous_f64(&a, &meta, false).expect("shipped");
+            // (1) an explicit 128 is the same code path as the default 0.
+            super::set_cholesky_nb(128);
+            let explicit = super::cholesky_contiguous_f64(&a, &meta, false).expect("nb=128");
+            for (i, (x, y)) in explicit.factor.iter().zip(&shipped.factor).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "n={n}: nb=128 must be bitwise identical to the default at {i}"
+                );
+            }
+            // (2) other widths factor correctly, checked by reconstruction.
+            for nb in [16usize, 32, 64, 96] {
+                super::set_cholesky_nb(nb);
+                let got = super::cholesky_contiguous_f64(&a, &meta, false).expect("nb");
+                let l = &got.factor;
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        assert_eq!(l[i * n + j], 0.0, "n={n} nb={nb} upper triangle not zeroed");
+                    }
+                }
+                for i in 0..n.min(32) {
+                    for j in 0..=i.min(31) {
+                        let mut acc = 0.0f64;
+                        for k in 0..=j {
+                            acc += l[i * n + k] * l[j * n + k];
+                        }
+                        let want = a[i * n + j];
+                        assert!(
+                            (acc - want).abs() <= 1e-8 * want.abs().max(1.0),
+                            "n={n} nb={nb} reconstruction failed at ({i},{j}): {acc} vs {want}"
+                        );
+                    }
+                }
+            }
+            super::set_cholesky_nb(previous);
+        }
+    }
+
     fn cholesky_panel_modes_agree_bitwise() {
         for n in [130usize, 192, 259] {
             let mut a = vec![0.0f64; n * n];
