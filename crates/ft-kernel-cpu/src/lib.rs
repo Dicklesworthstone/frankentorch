@@ -24755,9 +24755,28 @@ static LU_PANEL_NS: AtomicU64 = AtomicU64::new(0);
 static LU_PIVOT_NS: AtomicU64 = AtomicU64::new(0);
 static LU_SWAP_NS: AtomicU64 = AtomicU64::new(0);
 /// Whether the getrf triangular solve accumulates each row in a local buffer instead of
-/// read-modify-writing it once per `t`. `frankentorch-x6wc3`. DEFAULT OFF until measured.
+/// read-modify-writing it once per `t`. `frankentorch-x6wc3`. DEFAULT ON — MEASURED.
+///
+/// Paired FT-vs-FT inside one invocation, OFF/ON/ON/OFF per rep with the first rep discarded,
+/// per-rep min-of-2 per arm and the MEDIAN of the per-rep ratios. The A/A null is the two OFF
+/// positions of the same rep, so it reads what the harness can actually resolve:
+///
+///   hetzner2, 16c, load 0.58, rayon=8, 41 reps   n=512  lane 1.0351x  solve 1.1453x  null 0.9994
+///                                                n=1024 lane 1.0354x  solve 1.1525x  null 0.9897
+///   hz4,      64c, load 8.24, rayon=8, 41 reps   n=256  lane 1.0537x  solve 1.2769x  null 1.0083
+///                                                n=512  lane 1.0575x  solve 1.3980x  null 0.9968
+///                                                n=1024 lane 1.0506x  solve 1.2840x  null 1.0019
+///
+/// Five cells, two hosts, every null inside 0.97-1.03, same sign everywhere. The decomposition
+/// also CLOSES, which is what separates this from a lucky ratio: at n=1024 on hetzner2 the frame
+/// saves 1.386 ms and the whole lane saves 1.213 ms, so the predicted lane ratio is 1.0352
+/// against 1.0354 observed. The lane gain is small because the solve is only ~22-28% of the LU —
+/// a 1.15-1.40x frame cannot buy more than that, and that bound is the more useful finding.
+///
+/// The knob survives because it is how the row was taken and how it can be retaken; a lower-rep
+/// version of this same A/B printed 0.82x with a FAILING null, so the estimator is load-bearing.
 static LU_TRSM_ROW_ACCUM: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Select the row-accumulating triangular solve, returning the previous setting.
 #[doc(hidden)]
@@ -26681,6 +26700,51 @@ pub fn winograd_conv2d_3x3_s1_f32(
     output
 }
 
+static CHOLESKY_PANEL_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_TRSM_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_TRAILING_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_ZERO_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset live blocked-Cholesky phase counters:
+/// `(panel_ns, trsm_ns, trailing_update_ns, upper_zero_ns)`.
+#[doc(hidden)]
+pub fn cholesky_stage_take_ns() -> (u64, u64, u64, u64) {
+    (
+        CHOLESKY_PANEL_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_TRSM_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_TRAILING_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_ZERO_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
+/// Subtract a short dot product using four independent FMA chains. The blocked
+/// Cholesky path already has tolerance (rather than bitwise) parity because its
+/// rank-NB update reassociates the factorization; this removes the single
+/// dependency chain from its still-serial diagonal panel without widening that
+/// numerical contract.
+#[inline]
+fn cholesky_panel_dot_sub_f64(mut value: f64, lhs: &[f64], rhs: &[f64]) -> f64 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    let mut p = 0;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut s3 = 0.0;
+    while p + 4 <= lhs.len() {
+        s0 = (-lhs[p]).mul_add(rhs[p], s0);
+        s1 = (-lhs[p + 1]).mul_add(rhs[p + 1], s1);
+        s2 = (-lhs[p + 2]).mul_add(rhs[p + 2], s2);
+        s3 = (-lhs[p + 3]).mul_add(rhs[p + 3], s3);
+        p += 4;
+    }
+    value += (s0 + s1) + (s2 + s3);
+    while p < lhs.len() {
+        value = (-lhs[p]).mul_add(rhs[p], value);
+        p += 1;
+    }
+    value
+}
+
 pub fn cholesky_contiguous_f64(
     data: &[f64],
     meta: &TensorMeta,
@@ -26735,24 +26799,34 @@ pub fn cholesky_contiguous_f64(
         let nb = je - jb;
 
         // 1. Factor the diagonal block l[jb:je, jb:je] (lower) in place.
+        let panel_started = std::time::Instant::now();
         for jj in jb..je {
-            let mut s = l[jj * n + jj];
-            for p in jb..jj {
-                s -= l[jj * n + p] * l[jj * n + p];
-            }
+            let diagonal = jj * n;
+            let s = cholesky_panel_dot_sub_f64(
+                l[diagonal + jj],
+                &l[diagonal + jb..diagonal + jj],
+                &l[diagonal + jb..diagonal + jj],
+            );
             if s <= 0.0 {
                 return Err(KernelError::NotPositiveDefinite);
             }
             let d = s.sqrt();
             l[jj * n + jj] = d;
             for ii in (jj + 1)..je {
-                let mut t = l[ii * n + jj];
-                for p in jb..jj {
-                    t -= l[ii * n + p] * l[jj * n + p];
-                }
+                let row = ii * n;
+                let t = cholesky_panel_dot_sub_f64(
+                    l[row + jj],
+                    &l[row + jb..row + jj],
+                    &l[diagonal + jb..diagonal + jj],
+                );
                 l[ii * n + jj] = t / d;
             }
         }
+
+        CHOLESKY_PANEL_NS.fetch_add(
+            panel_started.elapsed().as_nanos() as u64,
+            LuOrdering::Relaxed,
+        );
 
         let m = n - je; // trailing rows below the panel
         if m == 0 {
@@ -26761,6 +26835,7 @@ pub fn cholesky_contiguous_f64(
 
         // 2. TRSM: L21 = A21 · L11^{-T}, panel l[je:n, jb:je] in place. Each
         //    trailing row solves the lower-triangular L11 independently.
+        let trsm_started = std::time::Instant::now();
         let (head, tail) = l.split_at_mut(je * n);
         let trsm_body = |row: &mut [f64]| {
             for c in 0..nb {
@@ -26777,6 +26852,11 @@ pub fn cholesky_contiguous_f64(
             tail.chunks_mut(n).for_each(trsm_body);
         }
 
+        CHOLESKY_TRSM_NS.fetch_add(
+            trsm_started.elapsed().as_nanos() as u64,
+            LuOrdering::Relaxed,
+        );
+
         // 3. Trailing rank-nb update A22 -= L21 · L21^T, FUSED directly into l.
         //    Pack L21 (m×nb) once, then one accumulate-GEMM (alpha=-1, beta=1)
         //    writes -L21·L21^T straight into l's strided trailing block — no temp
@@ -26784,6 +26864,7 @@ pub fn cholesky_contiguous_f64(
         //    wall time; the GEMM FLOPs were already cheap). dgemm_bt reads L21^T via
         //    strides. The full m×m rectangle is written; the unused strict-upper
         //    triangle is zeroed after the factorisation. frankentorch-kgs4.61.
+        let trailing_started = std::time::Instant::now();
         let l21 = &mut l21[..m * nb];
         for i in 0..m {
             for c in 0..nb {
@@ -26792,6 +26873,10 @@ pub fn cholesky_contiguous_f64(
         }
         let l21: &[f64] = l21;
         gemm::dgemm_bt_sub_into(m, nb, m, l21, l21, &mut l, je * n + je, n);
+        CHOLESKY_TRAILING_NS.fetch_add(
+            trailing_started.elapsed().as_nanos() as u64,
+            LuOrdering::Relaxed,
+        );
 
         jb = je;
     }
@@ -26799,12 +26884,18 @@ pub fn cholesky_contiguous_f64(
     // The fused trailing GEMM wrote full m×m rectangles, polluting the strict-upper
     // triangle of each trailing block. Clear it so the returned lower factor has
     // exact zeros above the diagonal. frankentorch-kgs4.61.
+    let zero_started = std::time::Instant::now();
     for i in 0..n {
         let row = i * n;
         for j in (i + 1)..n {
             l[row + j] = 0.0;
         }
     }
+
+    CHOLESKY_ZERO_NS.fetch_add(
+        zero_started.elapsed().as_nanos() as u64,
+        LuOrdering::Relaxed,
+    );
 
     if upper {
         // Transpose L to get U
@@ -68972,6 +69063,31 @@ mod tests {
                 a[i * n + j]
             );
         }
+    }
+
+    #[test]
+    fn cholesky_blocked_phase_counters_cover_each_live_stage() {
+        // n > NB makes the production path execute a panel, parallel-row TRSM,
+        // trailing rank-NB update, and final strict-upper zeroing.
+        let n = 192usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..i {
+                let v = ((i * 17 + j * 31) % 23) as f64 * 0.01 - 0.1;
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+            a[i * n + i] = n as f64;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let _ = super::cholesky_stage_take_ns();
+        let factor = super::cholesky_contiguous_f64(&a, &meta, false).expect("cholesky");
+        assert_eq!(factor.factor.len(), n * n);
+        let (panel, trsm, trailing, zero) = super::cholesky_stage_take_ns();
+        assert!(panel > 0, "panel phase was not attributed");
+        assert!(trsm > 0, "TRSM phase was not attributed");
+        assert!(trailing > 0, "trailing update was not attributed");
+        assert!(zero > 0, "strict-upper zeroing was not attributed");
     }
 
     #[test]

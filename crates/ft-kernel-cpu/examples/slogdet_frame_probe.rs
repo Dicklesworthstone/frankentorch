@@ -29,10 +29,27 @@ use ft_core::{DType, Device, TensorMeta};
 use std::time::Instant;
 
 fn main() {
-    let reps: usize = std::env::var("FT_REPS")
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
-        .unwrap_or(9);
+    // CONFIG COMES FROM ARGV, NOT THE ENVIRONMENT, and that is not a style preference — it is
+    // forced. This probe runs on an rch worker via `cargo run`, and rch does NOT forward the
+    // caller's environment: a run asking for `RAYON_NUM_THREADS=8 FT_AB=1 FT_SIZES=512,1024`
+    // came back at rayon=16 having quietly executed the DEFAULT decomposition instead, exit 0,
+    // no warning. An env knob that silently reverts to its default across the boundary is a
+    // measurement hazard of exactly the kind that gets a wrong row banked, so every setting the
+    // row depends on — including the pool width — is an argument the binary echoes back.
+    //
+    //   slogdet_frame_probe [mode] [sizes] [reps] [threads]
+    //   slogdet_frame_probe ab 512,1024 9 8
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let arg = |i: usize| argv.get(i).map(String::as_str).unwrap_or("");
+    let ab = arg(0) == "ab";
+    let reps: usize = arg(2).parse().unwrap_or(9);
+    let threads: usize = arg(3).parse().unwrap_or(0);
+    if threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .expect("rayon pool width");
+    }
     // SWEEP n — `frankentorch-x6wc3`. Two phase maps of the same op disagree by ~10x on `solve`:
     // `frankentorch-e1isq` measured panel 79-82% / solve 2.4-2.8% / trailing 4.6-10.8% at
     // n=512 and n=1024, while this probe reads panel 36-38% / solve 22-25% / trailing 15% at
@@ -48,17 +65,24 @@ fn main() {
     // A single sweep on one estimator distinguishes them: if the shares move smoothly with n and
     // reach 79-82% by n=1024, it is size; if the panel stays low at every n, e1isq's premise is
     // stale and the binding frame has moved for the whole LU family.
-    let sizes: Vec<usize> = std::env::var("FT_SIZES")
-        .unwrap_or_else(|_| "128,256,512,1024".to_string())
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
+    // PROVENANCE, printed by the binary itself. This runs under `cargo run` on an rch worker, so
+    // nothing outside the process knows which machine served the job — and a row without a machine
+    // on it cannot be compared with any other row (the same cell has read 1.2693x and 0.0093x on
+    // two workers with both nulls passing). The loadavg matters for the same reason: these workers
+    // are shared, and a lane timed next to somebody's build is not a lane.
+    eprintln!(
+        "PROV host={} nproc={} rayon={} mode={} reps={reps} loadavg={}",
+        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+        rayon::current_num_threads(),
+        if ab { "ab" } else { "decompose" },
+        std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+    );
+
+    let spec = if arg(1).is_empty() { "128,256,512,1024" } else { arg(1) };
+    let sizes: Vec<usize> = spec.split(',').filter_map(|t| t.trim().parse().ok()).collect();
     for n in sizes {
-        if std::env::var("FT_AB").is_ok_and(|v| v.trim() == "1") {
-            run_ab(n, reps);
-        } else {
-            run_one(n, reps);
-        }
+        if ab { run_ab(n, reps); } else { run_one(n, reps); }
     }
 }
 
@@ -182,25 +206,54 @@ fn run_ab(n: usize, reps: usize) {
         (ms, solve_ns)
     };
 
-    // Four positions per rep: OFF ON ON OFF.
-    let mut best = [f64::INFINITY; 4];
-    let mut solve = [f64::INFINITY; 4];
+    // PER-REP PAIRING, and the first shape of this harness had to be thrown away to get here.
+    //
+    // v1 took a min over each POSITION across all reps, then compared position-minima. Its A/A
+    // null — the two OFF positions against each other — came back 1.3332 at n=512 and 0.8134 at
+    // n=1024, i.e. the same code at two points in the rep differed by 33% and 19%. That voids
+    // any arm ratio printed beside it, and it voids it in BOTH directions: the null landed above
+    // 1 at one size and below 1 at the other, so this is not a fixed position bias that could be
+    // subtracted out. A min-over-positions estimator also SELECTS the luckiest sample per
+    // position, which makes more reps look better rather than truer.
+    //
+    // So: pair inside the rep. Each rep contributes min-of-2 for OFF and min-of-2 for ON drawn
+    // from the SAME rep, the ratio is formed per rep, and the reported figure is the MEDIAN of
+    // those ratios. A rep that lands next to somebody else's build inflates both arms and mostly
+    // cancels; a median then refuses to be moved by the one rep where it does not.
+    let mut off_lane = Vec::new();
+    let mut on_lane = Vec::new();
+    let mut off_solve_v = Vec::new();
+    let mut on_solve_v = Vec::new();
+    let mut nulls = Vec::new();
     for rep in 0..reps {
         let r = [once(false), once(true), once(true), once(false)];
         if rep == 0 {
             continue;
         }
-        for (slot, (ms, s_ns)) in r.iter().enumerate() {
-            best[slot] = best[slot].min(*ms);
-            solve[slot] = solve[slot].min(*s_ns as f64 / 1e6);
-        }
+        off_lane.push(r[0].0.min(r[3].0));
+        on_lane.push(r[1].0.min(r[2].0));
+        off_solve_v.push((r[0].1.min(r[3].1)) as f64 / 1e6);
+        on_solve_v.push((r[1].1.min(r[2].1)) as f64 / 1e6);
+        // The null is the two OFF positions of THIS rep — same code, same rep, so it measures
+        // exactly what this harness cannot resolve.
+        nulls.push(r[0].0 / r[3].0);
     }
 
-    let off = best[0].min(best[3]);
-    let on = best[1].min(best[2]);
-    let off_solve = solve[0].min(solve[3]);
-    let on_solve = solve[1].min(solve[2]);
-    let null = best[0] / best[3];
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+    };
+    let ratios = |a: &[f64], b: &[f64]| -> f64 {
+        let mut r: Vec<f64> = a.iter().zip(b).map(|(x, y)| x / y).collect();
+        median(&mut r)
+    };
+    let lane_ratio = ratios(&off_lane, &on_lane);
+    let solve_ratio = ratios(&off_solve_v, &on_solve_v);
+    let null = median(&mut nulls.clone());
+    let off = median(&mut off_lane.clone());
+    let on = median(&mut on_lane.clone());
+    let off_solve = median(&mut off_solve_v.clone());
+    let on_solve = median(&mut on_solve_v.clone());
 
     eprintln!(
         "TRSM_AB n={n} reps={reps} threads={} (OFF ON ON OFF per rep, first rep discarded)",
@@ -209,9 +262,7 @@ fn run_ab(n: usize, reps: usize) {
     eprintln!("TRSM_AB   lu OFF (shipped)  {off:8.3} ms   solve frame {off_solve:7.3} ms");
     eprintln!("TRSM_AB   lu ON  (row-acc)  {on:8.3} ms   solve frame {on_solve:7.3} ms");
     eprintln!(
-        "TRSM_AB   LANE  {:.4}x   SOLVE FRAME {:.4}x   A/A null {null:.4} {}",
-        off / on,
-        off_solve / on_solve.max(f64::MIN_POSITIVE),
+        "TRSM_AB   LANE  {lane_ratio:.4}x   SOLVE FRAME {solve_ratio:.4}x   A/A null {null:.4} {}",
         if (0.97..=1.03).contains(&null) {
             "PASS"
         } else {

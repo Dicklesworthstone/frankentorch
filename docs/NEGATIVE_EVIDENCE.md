@@ -40033,3 +40033,92 @@ this" into "checked, optimal, with the curve on both sides", and it removes the 
 story about the frame. The override stays so the constant can be re-swept on a DIFFERENT shape or
 host, where the optimum may well move — a 576 KiB budget is an L2 argument, and L2 is not the same
 size everywhere.
+
+---
+
+## 273. The getrf triangular solve responds to traffic reduction (1.15-1.40x) but is capped at ~1.3x of the LU lane — SHIPPED at 1.035-1.058x, and the CAP is the real result
+
+`frankentorch-x6wc3` (slogdet 4.30x slower than torch). Chain of attribution, each link on ONE
+estimator rather than a quotient of two:
+
+* **slogdet is 92-102% LU.** Replicated on two hosts. The slogdet-specific residue — the sign and
+  log-product pass — is 1-6% at n=128-512 and reads slightly NEGATIVE at n=1024, which is the
+  honest way of saying it is below the noise floor. There is essentially no slogdet-specific code
+  to optimise; this bead is an LU bead.
+* **Inside the LU, the panel is 42-53%** (hetzner2, 16c) and is `frankentorch-e1isq`'s territory.
+* **The largest frame OUTSIDE that ownership boundary is the solve, at 22-28% of the LU.**
+
+### The lever, and why it looked promising
+
+`gemm::ltrsm_unit_lower_panel_f64`'s parallel arm read-modify-writes `lu[i*n + j]` once per `t`:
+one FMA per element against a load and a store, ~1 flop per 8 bytes. The arithmetic intensity
+argument was stark — at n=1024, RAYON=8 the solve did ~17 MFLOP in 8.453 ms (~2 GFLOP/s) beside a
+trailing update doing ~358 MFLOP in 8.560 ms (~42 GFLOP/s): the same wall time for a twentieth of
+the arithmetic. Holding the running total in a local buffer and storing it once should halve the
+traffic on a loop that is entirely traffic-bound.
+
+### It does work, and it is bit-exact
+
+Identical subtractions in identical order on identical values; only the destination of the running
+total moves, and row `t < i` is final and never written during pass `i`. Pinned by
+`lu_trsm_row_accum_matches_the_shipped_solve_bitwise` through the real kernel entry at n=128 (the
+unblocked route), n=200 (deliberately not a multiple of the panel width, so the short final panel
+and the `j1 = min(j0+cb, n)` tail both run) and n=256/384, comparing `to_bits()` and pivots.
+
+Paired FT-vs-FT inside one invocation, OFF/ON/ON/OFF per rep, first rep discarded, per-rep
+min-of-2 per arm, MEDIAN of the per-rep ratios. The A/A null is the two OFF positions of the SAME
+rep:
+
+| host | n | LANE | SOLVE FRAME | A/A null |
+|---|---|---|---|---|
+| hetzner2 16c load 0.58 | 512  | 1.0351x | 1.1453x | 0.9994 PASS |
+| hetzner2 16c load 0.58 | 1024 | 1.0354x | 1.1525x | 0.9897 PASS |
+| hz4 64c load 8.24      | 256  | 1.0537x | 1.2769x | 1.0083 PASS |
+| hz4 64c load 8.24      | 512  | 1.0575x | 1.3980x | 0.9968 PASS |
+| hz4 64c load 8.24      | 1024 | 1.0506x | 1.2840x | 1.0019 PASS |
+
+**The decomposition closes**, which is what separates this from a lucky ratio: at n=1024 on
+hetzner2 the solve frame saves 1.386 ms and the whole lane saves 1.213 ms, so the predicted lane
+ratio is 40.725/(40.725-1.386) = 1.0352 against 1.0354 observed. SHIPPED ON.
+
+### 273a. THE ESTIMATOR WAS LOAD-BEARING, AND THE FIRST VERSION OF THIS ROW SAID 0.82x
+
+The first harness took a min over each POSITION across reps and compared position-minima. It
+printed **LANE 0.8212x at n=512 and 0.8407x at n=1024** — a confident 18% REGRESSION, exactly the
+sign that gets a lever reverted and a "traffic reduction does not help" line written into this
+file. Its A/A null read **1.3332 and 0.8134**: the same code at two points in the same rep,
+differing by 33% and 19%, and differing in OPPOSITE DIRECTIONS at the two sizes, so it was not
+even a fixed position bias that could be subtracted out.
+
+Per-rep pairing with median-of-ratios, same binary, same host, same lever: **1.0351x with a
+null of 0.9994**. A min-over-positions estimator also SELECTS the luckiest sample per position,
+so more reps make it look better rather than truer.
+
+**Both the sign and the magnitude were wrong, and only the null said so.** Had this A/B been run
+without the two OFF positions to check against each other, the ledger would now carry a
+fabricated 0.82x rejection of a lever that ships at 1.035-1.058x.
+
+### 273b. WHAT THIS BOUNDS — the useful half
+
+The frame moved 1.15-1.40x and bought only 1.035-1.058x, because **the solve is 22-28% of the LU**.
+That arithmetic runs in the other direction too, and it is the finding worth keeping:
+
+> **Even a solve that took ZERO TIME caps the LU lane at ~1.3x**, and slogdet needs 4.3x.
+
+So the remaining LU headroom outside `frankentorch-e1isq`'s panel cannot close this bead by
+itself. Anything that closes slogdet is either the panel (42-53%, already owned) or a change to
+the blocking/algorithm that moves more than one frame. Do not file another solve-frame lever
+expecting a lane win; the ceiling is now measured, not assumed.
+
+### 273c. rch does NOT forward the caller's environment
+
+A run asking for `RAYON_NUM_THREADS=8 FT_AB=1 FT_SIZES=512,1024` through
+`rch exec -- cargo run ...` came back at **rayon=16 having executed the DEFAULT decomposition
+instead** — exit 0, no warning, and it would have been read as an A/B row that was never run. Also
+note `rch exec` refuses non-compilation commands outright (`[RCH-E301]`), so `bash -c` wrappers are
+not available and `cargo run` is the way to execute on a worker.
+
+Pass every setting the row depends on — pool width included — as ARGV, and have the binary echo
+its own host, nproc, rayon width, mode and loadavg back. A knob that silently reverts to its
+default across a process boundary is the same failure class as
+`feedback_unset_knob_means_forced_off`.
