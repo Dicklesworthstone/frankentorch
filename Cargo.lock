@@ -869,6 +869,7 @@ dependencies = [
  "matrixmultiply",
  "proptest",
  "rayon",
+ "rusty-fork",
  "wide",
 ]
 
