@@ -37,6 +37,24 @@ pub fn probe_dgemm_tb(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mu
     gemm::dgemm_tb(m, k, n, a, b, c);
 }
 
+/// Probe shim for the trailing-update GEMM `C -= A·B` shared by the whole LU family
+/// (`lu_factor`, `slogdet`, `inv`, `lu_solve`) and the blocked cholesky/QR/bidiag paths.
+/// `frankentorch-valnx`. `mod gemm` is private, so an isolation probe cannot reach it otherwise.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn probe_dgemm_sub_into(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f64],
+    b: &[f64],
+    c: &mut [f64],
+    c_off: usize,
+    ldc: usize,
+) {
+    gemm::dgemm_sub_into(m, k, n, a, b, c, c_off, ldc);
+}
+
 pub use masked_conv2d::{
     conv2d_backward_mask_fused_f32, conv2d_backward_mask_fused_f64, masked_frame_take_ns,
     set_masked_dout_tiled,
@@ -127,6 +145,26 @@ mod gemm {
         std::sync::atomic::AtomicBool::new(false);
     pub(crate) fn dgemm_sub_serial() -> bool {
         DGEMM_SUB_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Below this output AREA the 2-D grid cuts tiles too small to pay for their own fork/join,
+    /// and the arm turns into a loss. MEASURED, not guessed — the isolation sweep over an n=512
+    /// LU's trailing updates (thinkstation1, rayon=16, min of 9) reads:
+    ///
+    ///     m=448  1.500x    m=384  1.780x    m=320  1.384x    m=256  1.178x
+    ///     m=192  1.287x    m=128  1.013x    m=64   0.720x   <- the arm LOSES here
+    ///
+    /// 128x128 is the last shape that does not lose, so the floor sits there. A gate fitted to one
+    /// sweep is a gate fitted to one dataset, which is why the crossover is quoted above rather
+    /// than merely asserted; item 279 records that the size curve IS the result.
+    const TILE_2D_MIN_AREA: usize = 128 * 128;
+
+    /// Whether `dgemm_sub_into` may tile BOTH output axes when the column split alone cannot
+    /// fill the pool. `frankentorch-valnx`. DEFAULT OFF until it has a paired row.
+    pub(crate) static DGEMM_SUB_TILE_2D: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn dgemm_sub_tile_2d() -> bool {
+        DGEMM_SUB_TILE_2D.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
@@ -718,6 +756,70 @@ mod gemm {
                     );
                 }
             }
+            return;
+        }
+        // 2-D TILE ARM — `frankentorch-valnx`. The column split above is the ONLY parallelism
+        // this function has, and `block_cols` floors block WIDTH at `MIN_BLOCK_COLS` (128),
+        // which is therefore a CEILING ON BLOCK COUNT: at n=512 on 16 threads it yields
+        // 512/128 = 4 blocks, so three quarters of the pool idles. The LU/slogdet/inv trailing
+        // update makes that worse as it goes — its submatrix shrinks every panel, so the block
+        // count falls to 2, then 1, exactly while the remaining work is still O(n^2) per step.
+        //
+        // Tiling the M axis as well reaches those shapes. This is the same grid `dgemm` already
+        // uses for "the shapes the column split cannot reach" (`tile_shape`/`tile_grid`), applied
+        // to the subtract-accumulate form.
+        //
+        // BIT-EXACT, for the same reason the column split is: K is NEVER tiled, so every output
+        // element's k-reduction still happens whole, inside ONE `dgemm_mm` call, with the same
+        // operands and the same accumulation order. Only which thread runs which disjoint
+        // rectangle changes. Rows and columns both partition C, so no two tiles touch an element
+        // — which matters more here than in `dgemm` because beta=1 ACCUMULATES: two tiles sharing
+        // an element would race on a read-modify-write, not merely on a write.
+        //
+        // Engaged only when the column split genuinely under-fills the pool, so no shape that
+        // already parallelises changes path.
+        let col_blocks = n.div_ceil(nb);
+        let threads = rayon::current_num_threads().max(1);
+        if dgemm_sub_tile_2d()
+            && col_blocks < threads
+            && m >= 2 * MIN_BLOCK_ROWS
+            && m * n >= TILE_2D_MIN_AREA
+        {
+            let (mb2, nb2) = tile_shape(m, n);
+            (0..n.div_ceil(nb2)).into_par_iter().for_each(|j_blk| {
+                let cp = &cp;
+                let j0 = j_blk * nb2;
+                let bj = (j0 + nb2).min(n) - j0;
+                (0..m.div_ceil(mb2)).into_par_iter().for_each(|i_blk| {
+                    let i0 = i_blk * mb2;
+                    let bi = (i0 + mb2).min(m) - i0;
+                    // SAFETY: A is [m,k] row-major (rsa=k, csa=1), so its row window
+                    // [i0,i0+bi) starts at a.add(i0*k). B is [k,n] row-major (rsb=n, csb=1),
+                    // so its column window starts at b.add(j0). The output tile begins at
+                    // c_off + i0*ldc + j0 and its last element is c_off + (i0+bi-1)*ldc +
+                    // j0+bj-1, inside the window the callers guarantee. Tiles partition C in
+                    // both axes, so no element is touched twice and the beta=1 accumulate
+                    // cannot race. K is NOT tiled.
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            bj,
+                            -1.0,
+                            a.as_ptr().add(i0 * k),
+                            k as isize,
+                            1,
+                            b.as_ptr().add(j0),
+                            n as isize,
+                            1,
+                            1.0,
+                            cp.0.add(c_off + i0 * ldc + j0),
+                            ldc as isize,
+                            1,
+                        );
+                    }
+                });
+            });
             return;
         }
         (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
@@ -34696,6 +34798,13 @@ pub fn set_dgemm_sub_serial(on: bool) -> bool {
     gemm::DGEMM_SUB_SERIAL.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Select the 2-D tiled arm of `dgemm_sub_into`, returning the previous setting.
+/// `frankentorch-valnx`.
+#[doc(hidden)]
+pub fn set_dgemm_sub_tile_2d(on: bool) -> bool {
+    gemm::DGEMM_SUB_TILE_2D.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[doc(hidden)]
 pub fn set_svd_replay_transposed(t: bool) -> bool {
     SVD_REPLAY_TRANSPOSED.swap(t, std::sync::atomic::Ordering::Relaxed)
@@ -49791,6 +49900,70 @@ mod tests {
             }
         }
         assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
+    }
+
+    /// `frankentorch-valnx`: the 2-D tile arm of `dgemm_sub_into` must be BITWISE identical to
+    /// the column-split arm it replaces.
+    ///
+    /// Both arms run in ONE process against the live incumbent path, toggled per call, so this is
+    /// not a comparison against a remembered constant. The claim rests on K never being tiled —
+    /// every output element's reduction stays whole inside one `dgemm_mm` call — and that claim is
+    /// checked here rather than trusted, because the identical argument was made for a hand-fused
+    /// conv2d loop and turned out to be false when the microkernel contracted a multiply-add.
+    ///
+    /// Shapes STRADDLE the gate in both directions: below `TILE_2D_MIN_AREA`, above it, and
+    /// non-square, plus a STRIDED C window (`ldc > n` with a nonzero `c_off`), which is how every
+    /// LU/cholesky/bidiag caller actually uses this function. A flat contiguous fixture would pass
+    /// while a strided one corrupted its neighbours.
+    #[test]
+    fn dgemm_sub_into_2d_tile_matches_the_column_split_bitwise() {
+        // (m, k, n) — 64x64 sits below the area floor, the rest above; the last two are
+        // deliberately non-square so a grid that assumed m == n would show up.
+        for &(m, k, n) in &[
+            (64_usize, 64_usize, 64_usize),
+            (128, 64, 128),
+            (192, 64, 192),
+            (320, 64, 320),
+            (256, 32, 128),
+            (128, 96, 320),
+            (200, 48, 136),
+        ] {
+            let a: Vec<f64> = (0..m * k).map(|i| (i % 97) as f64 * 0.011 - 0.5).collect();
+            let b: Vec<f64> = (0..k * n).map(|i| (i % 89) as f64 * 0.013 - 0.4).collect();
+            // Strided C: a wider row stride and a nonzero offset, with guard values around the
+            // window so an out-of-window write is caught rather than silently tolerated.
+            let ldc = n + 7;
+            let c_off = 2 * ldc + 3;
+            let c_len = c_off + (m - 1) * ldc + n + 11;
+            let base: Vec<f64> = (0..c_len).map(|i| (i % 71) as f64 * 0.02 - 0.7).collect();
+
+            let previous = crate::set_dgemm_sub_tile_2d(false);
+            let mut off = base.clone();
+            crate::gemm::dgemm_sub_into(m, k, n, &a, &b, &mut off, c_off, ldc);
+            crate::set_dgemm_sub_tile_2d(true);
+            let mut on = base.clone();
+            crate::gemm::dgemm_sub_into(m, k, n, &a, &b, &mut on, c_off, ldc);
+            crate::set_dgemm_sub_tile_2d(previous);
+
+            assert_eq!(off.len(), on.len());
+            for (i, (x, y)) in off.iter().zip(&on).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "({m},{k},{n}) differs at flat index {i}: {x:?} vs {y:?}"
+                );
+            }
+            // Non-vacuity: the update must actually have changed C, or the comparison above is
+            // two copies of the untouched fixture agreeing with each other.
+            assert!(
+                off.iter().zip(&base).any(|(x, y)| x.to_bits() != y.to_bits()),
+                "({m},{k},{n}) left C untouched, so the bitwise check proves nothing"
+            );
+            // And everything OUTSIDE the [c_off, ..] window must be untouched in both arms.
+            for i in 0..c_off {
+                assert_eq!(on[i].to_bits(), base[i].to_bits(), "wrote before the window");
+            }
+        }
     }
 
     /// Build the four operands and the C tile for a fused-trailing-update case.
