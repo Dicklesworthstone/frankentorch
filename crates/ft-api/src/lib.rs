@@ -57609,7 +57609,7 @@ impl FrankenTorchSession {
                 let mut par = false;
                 self.tensor_tape
                     .update_tensor_values_f32_with(target, |vals| {
-                        par = vals.len() >= PARALLEL_ELEMENTWISE_MIN;
+                        par = vals.len() >= inplace_unary_f32_parallel_min();
                         if par {
                             if profile_inplace {
                                 let started = std::time::Instant::now();
@@ -101186,6 +101186,30 @@ const PARALLEL_ELEMENTWISE_MIN: usize = 8192;
 fn inplace_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("FT_INPLACE_PROFILE").is_ok_and(|value| value == "1"))
+}
+
+/// Candidate parallel cutoff for f32 in-place unary maps when the serial-threshold lever is on.
+///
+/// At the 2 MiB f32 probe point (524,288 elements), the measured Rayon map/join boundary was
+/// 0.202 ms while the ledger write was 0.941 us.  The current 8,192-element cutoff therefore
+/// enters Rayon long before its fixed dispatch cost can repay itself for this cheap map.  One
+/// mebibyte of elements (4 MiB f32) is a deliberately conservative first cutoff: it serializes
+/// the measured bad point while leaving a substantial bandwidth-sized range for Rayon to repay
+/// its dispatch.
+const INPLACE_UNARY_F32_CANDIDATE_PARALLEL_MIN: usize = 1 << 20;
+
+/// Defaults to the existing elementwise cutoff.  Set `FT_INPLACE_F32_SERIAL_THRESHOLD=1` in a
+/// fresh process to evaluate the candidate cutoff above; the default-off gate preserves current
+/// behavior until an admitted paired row establishes its value.
+fn inplace_unary_f32_parallel_min() -> usize {
+    static CANDIDATE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *CANDIDATE_ENABLED.get_or_init(|| {
+        std::env::var("FT_INPLACE_F32_SERIAL_THRESHOLD").is_ok_and(|value| value == "1")
+    }) {
+        INPLACE_UNARY_F32_CANDIDATE_PARALLEL_MIN
+    } else {
+        PARALLEL_ELEMENTWISE_MIN
+    }
 }
 
 
