@@ -39681,3 +39681,59 @@ special path's advantage is arithmetic it skips, and none of it is available to 
 What remains on this route is real but different in kind: the f32 masked backward runs at roughly
 105 GFLOP/s against an AVX2 f32 ceiling several times that, so the headroom is in making the
 GENERAL path faster, not in chasing a specialisation whose prize does not exist.
+
+## 266. MY SCATTER HYPOTHESIS IS REFUTED BY MY OWN ARM — THE DIRECT dinput ROUTE IS 2.71x THE LEGACY PANEL ONE ON f32, AND TWO EARLIER FINDINGS REPLICATE QUIET
+
+`frankentorch-hi9r6`. Probe arm in `664fdf08`. **No lever this item.**
+
+### 266a. THE PREDICTION, AND IT WAS WRONG
+
+Item 265 left the f32 dinput half at ~28-31 ms and I reasoned from arithmetic: ~3.02 GFLOP in
+~31 ms is ~97 GFLOP/s against an AVX2 f32 ceiling several times that, while ~45 MB of traffic in
+the same window is ~1.5 GB/s against a DRAM ceiling ~30x that. **A phase at 12% of compute and 3%
+of bandwidth is bound by neither**, which I took to point at the scatter's access pattern — and
+therefore predicted that forcing the LEGACY panel + col2im route would land near the direct one,
+since on that reading the panel is not what costs.
+
+hetzner2, 16 cores, RAYON=16, loadavg 3.26 -> 3.75 (stable), arms adjacent inside each rep, min of
+9 after discarding the first:
+
+    all-ones 3x3 adjoint                      4.854 ms
+    fused mask, dinput + dweight             64.626 ms
+    fused mask, dinput ONLY                  31.073 ms
+    fused mask, dweight ONLY                 29.694 ms
+    fused mask, ALL-ONES mask (separator)    62.087 ms
+    dinput ONLY, LEGACY panel + col2im       84.268 ms
+
+    ROUTE: legacy / direct = **2.712x**   (predicted ~1.0)
+
+### 266b. WHAT IS ACTUALLY TRUE
+
+Materialising the `flat x patch_width` panel is NOT irrelevant to dinput — it is most of the
+legacy cost. 84.268 -> 31.073 ms is **53 ms of pure panel overhead**, and ~378 MB written and
+re-read in 53 ms is ~7 GB/s, a bandwidth signature. The direct route already removes it, and this
+is the first time that route has been PRICED on f32 rather than assumed: **2.71x on the dinput
+half.**
+
+What survives of the original reasoning is only the RESIDUAL. The remaining 31 ms is still bound
+by neither compute nor bandwidth, so something else bounds it — but there is now no evidence
+naming the scatter, and it should not be named again without an arm that isolates it.
+
+### 266c. TWO EARLIER FINDINGS REPLICATE, QUIET THIS TIME
+
+  * **The 50/50 split.** Item 265 flagged it as needing re-taking after the noisy hz4 run read
+    42%/63%. Here: 31.073 and 29.694 of 64.626 — **48% / 46%**. The quiet reading was right and
+    the noisy one was the artefact, exactly as 265 predicted it would be.
+  * **The general-dout refutation.** The separator reads **0.961x** here against 1.075x on hz4.
+    Both are ~1.0 from opposite sides, so the generic path extracts nothing from ones on either
+    host, and item 265 stands on two independent windows.
+
+### 266d. THE TRANSFERABLE PART
+
+**An arithmetic bound argument names what a phase is NOT limited by; it does not name what it IS
+limited by, and the gap between those is where the wrong lever gets built.** "12% of compute and
+3% of bandwidth, therefore the scatter" was a real inference from real numbers and it was still
+wrong, because "bound by neither of the two things I computed" leaves every other cause standing —
+including the one I had already dismissed. The cheap corrective is the same shape as item 265's:
+**make the thing you believe is irrelevant vary, and see whether it moves.** One arm, and a
+plausible story died before it became a kernel.
