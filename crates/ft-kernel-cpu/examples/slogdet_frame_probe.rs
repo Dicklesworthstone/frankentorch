@@ -151,8 +151,7 @@ fn run_phase_split(n: usize, reps: usize) {
     eprintln!("  {:<28} {:>9.4} {:>7.1}%", "TOTAL (wall)", ms(wall), 100.0);
     eprintln!(
         "ACCOUNTING CLOSURE: LU stages {:.4} ms of {:.4} ms wall = {:.1}%. The residual is \
-         shown as glue; on this existing counter set it also contains the terminal panel, whose \
-         counter is not committed when `tcols == 0`.",
+         shown as glue; the panel counter includes the terminal panel even when `tcols == 0`.",
         ms(accounted),
         ms(wall),
         100.0 * accounted as f64 / wall.max(1) as f64

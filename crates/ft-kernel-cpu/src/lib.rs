@@ -25540,11 +25540,14 @@ pub fn lu_factor_contiguous_nb_f64(
         lu_factor_panel_recursive_f64(&mut lu, n, k0, pe, &mut pivots, &mut ipiv, singular_tol);
         let kb = pe - k0; // panel width
         let tcols = n - pe; // trailing columns
+        // Every panel, including the final one with no U12/A22 work, belongs to the
+        // panel stage. Commit it before the terminal exit so `lu_stage_take_ns()`
+        // accounts for the complete LU factorization.
+        LU_PANEL_NS.fetch_add(__t_panel.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
         if tcols == 0 {
             break;
         }
 
-        LU_PANEL_NS.fetch_add(__t_panel.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
         let __t_solve = std::time::Instant::now();
         // --- 2. Triangular solve U12 = L11^{-1} * A12 (unit-lower L11) ---
         // Each trailing column j ∈ [pe,n) is an INDEPENDENT forward substitution
