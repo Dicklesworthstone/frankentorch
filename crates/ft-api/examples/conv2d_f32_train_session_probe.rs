@@ -209,7 +209,12 @@ fn main() {
     // and the tensor_mul FRAME are reported: the lever removes a duplicate convolution from the
     // frame, and the lane is what the board would see.
     {
-        let once = |reuse: bool| -> (f64, f64) {
+        // Returns (lane, mul, fwd, bwd). The extra two frames exist to LOCALISE the displacement:
+        // the reuse lever sheds ~11 ms from `mul` and the lane only moves ~1 ms, so ~9.6 ms
+        // reappears somewhere, and "somewhere" was inferred from (lane - mul) rather than
+        // measured. On this campaign an inferred residual has already been wrong by 4x (277a), so
+        // the neighbouring frames get their own clocks.
+        let once = |reuse: bool| -> (f64, f64, f64, f64) {
             let prev = ft_api::set_fuse_conv2d_reuse_f32(reuse);
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = session
@@ -222,23 +227,31 @@ fn main() {
                 .tensor_variable_f32(mask.clone(), vec![BATCH, OUT_CH, H, W], false)
                 .expect("leaf mask");
             let lane0 = Instant::now();
+            let f0 = Instant::now();
             let out = session
                 .functional_conv2d(x, w, None, (1, 1), (1, 1))
                 .expect("conv2d");
+            let fwd = f0.elapsed().as_secs_f64() * 1e3;
             let m0 = Instant::now();
             let scored = session.tensor_mul(out, m).expect("mask multiply");
             let mul = m0.elapsed().as_secs_f64() * 1e3;
             let loss = session.tensor_sum(scored).expect("sum");
+            let b0 = Instant::now();
             let report = session.tensor_backward(loss).expect("backward");
+            let bwd = b0.elapsed().as_secs_f64() * 1e3;
             let lane = lane0.elapsed().as_secs_f64() * 1e3;
             std::hint::black_box(report.gradient(x).expect("grad").len());
             ft_api::set_fuse_conv2d_reuse_f32(prev);
-            (lane, mul)
+            (lane, mul, fwd, bwd)
         };
         let mut off_l = Vec::new();
         let mut on_l = Vec::new();
         let mut off_m = Vec::new();
         let mut on_m = Vec::new();
+        let mut off_f = Vec::new();
+        let mut on_f = Vec::new();
+        let mut off_b = Vec::new();
+        let mut on_b = Vec::new();
         let mut nulls = Vec::new();
         for rep in 0..reps {
             let r = if rep % 2 == 0 {
@@ -255,6 +268,10 @@ fn main() {
             on_l.push(r[1].0.min(r[2].0));
             off_m.push(r[0].1.min(r[3].1));
             on_m.push(r[1].1.min(r[2].1));
+            off_f.push(r[0].2.min(r[3].2));
+            on_f.push(r[1].2.min(r[2].2));
+            off_b.push(r[0].3.min(r[3].3));
+            on_b.push(r[1].3.min(r[2].3));
             nulls.push(r[0].0 / r[3].0);
         }
         let median = |v: &mut Vec<f64>| -> f64 {
@@ -278,6 +295,21 @@ fn main() {
             olm / onm,
             off_l.len(),
             if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+        );
+        // WHERE THE SHED TIME WENT. Each neighbouring frame is measured, not inferred.
+        let ofm = median(&mut off_f.clone());
+        let onf = median(&mut on_f.clone());
+        let obm = median(&mut off_b.clone());
+        let onb = median(&mut on_b.clone());
+        eprintln!(
+            "TRAIN_AB   DISPLACEMENT  mul {:+.3} ms | fwd {:+.3} ms | bwd {:+.3} ms | lane {:+.3} ms   (ON minus OFF; mul is the shed, the rest is where it went)",
+            onmm - omm,
+            onf - ofm,
+            onb - obm,
+            onm - olm
+        );
+        eprintln!(
+            "TRAIN_AB   frames OFF fwd {ofm:7.3} mul {omm:7.3} bwd {obm:7.3}   ON fwd {onf:7.3} mul {onmm:7.3} bwd {onb:7.3}"
         );
     }
 }

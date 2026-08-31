@@ -29314,6 +29314,20 @@ pub fn set_tred2_grouped_ggs(on: bool) -> bool {
     TRED2_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether eigvalsh's values-only Householder reduction computes four `ggs`
+/// outputs in flight. This is deliberately independent from the full-eigh
+/// switch: eigvalsh skips every eigenvector accumulation, so its n=256 lane is
+/// a distinct retry of the full-path grouped-GGS rejection.
+static EIGVALSH_GROUPED_GGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+fn eigvalsh_grouped_ggs() -> bool {
+    EIGVALSH_GROUPED_GGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[doc(hidden)]
+pub fn set_eigvalsh_grouped_ggs(on: bool) -> bool {
+    EIGVALSH_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Sub-phase counters for the tred2 reduction — `frankentorch-wjrqt`.
 ///
 /// The reduce is 55% of the eigh lane (7155beb8) and the only structural lever left on it is a
@@ -30153,20 +30167,75 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
                 h -= f * g;
                 row_i[l] = f - g;
                 f = 0.0;
-                for j in 0..=l {
-                    let mut gg = 0.0;
-                    let row_j_start = lower_packed_index(j, 0);
-                    let row_j = &previous_rows[row_j_start..=row_j_start + j];
-                    for k in 0..=j {
-                        gg += row_j[k] * row_i[k];
+                if eigvalsh_grouped_ggs() && l >= 8 {
+                    // Keep each output's ascending-k sum intact while carrying
+                    // four independent dependency chains. Unlike full eigh this
+                    // path has no reflector/backtransform work after the
+                    // reduction, so it needs its own paired verdict.
+                    let mut ggs = vec![0.0f64; l + 1];
+                    let mut j0 = 0usize;
+                    while j0 + 4 <= l + 1 {
+                        let j3 = j0 + 3;
+                        let mut acc = wide::f64x4::ZERO;
+                        for k in 0..=j3 {
+                            let mut lane = [0.0f64; 4];
+                            for (t, slot) in lane.iter_mut().enumerate() {
+                                let j = j0 + t;
+                                *slot = if k <= j {
+                                    previous_rows[lower_packed_index(j, 0) + k]
+                                } else {
+                                    previous_rows[lower_packed_index(k, 0) + j]
+                                };
+                            }
+                            acc += wide::f64x4::from(lane) * wide::f64x4::splat(row_i[k]);
+                        }
+                        for k in (j3 + 1)..=l {
+                            let base = lower_packed_index(k, 0) + j0;
+                            let quad = [
+                                previous_rows[base],
+                                previous_rows[base + 1],
+                                previous_rows[base + 2],
+                                previous_rows[base + 3],
+                            ];
+                            acc += wide::f64x4::from(quad) * wide::f64x4::splat(row_i[k]);
+                        }
+                        ggs[j0..j0 + 4].copy_from_slice(&acc.to_array());
+                        j0 += 4;
                     }
-                    let mut lower_col_offset = lower_packed_index(j + 1, j);
-                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
-                        gg += previous_rows[lower_col_offset] * row_i_k;
-                        lower_col_offset += k + 1;
+                    for j in j0..=l {
+                        let mut gg = 0.0;
+                        let row_j_start = lower_packed_index(j, 0);
+                        let row_j = &previous_rows[row_j_start..=row_j_start + j];
+                        for k in 0..=j {
+                            gg += row_j[k] * row_i[k];
+                        }
+                        let mut lower_col_offset = lower_packed_index(j + 1, j);
+                        for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                            gg += previous_rows[lower_col_offset] * row_i_k;
+                            lower_col_offset += k + 1;
+                        }
+                        ggs[j] = gg;
                     }
-                    e[j] = gg / h;
-                    f += e[j] * row_i[j];
+                    for j in 0..=l {
+                        e[j] = ggs[j] / h;
+                        f += e[j] * row_i[j];
+                    }
+                } else {
+                    for j in 0..=l {
+                        let mut gg = 0.0;
+                        let row_j_start = lower_packed_index(j, 0);
+                        let row_j = &previous_rows[row_j_start..=row_j_start + j];
+                        for k in 0..=j {
+                            gg += row_j[k] * row_i[k];
+                        }
+                        let mut lower_col_offset = lower_packed_index(j + 1, j);
+                        for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                            gg += previous_rows[lower_col_offset] * row_i_k;
+                            lower_col_offset += k + 1;
+                        }
+                        e[j] = gg / h;
+                        f += e[j] * row_i[j];
+                    }
                 }
                 let hh = f / (h + h);
                 for j in 0..=l {
@@ -73368,6 +73437,27 @@ mod tests {
             "grouped ggs diverged from the per-j loop: {}",
             mismatches.join("; ")
         );
+    }
+
+    #[test]
+    fn eigvalsh_grouped_ggs_matches_scalar_bitwise() {
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
+        for &n in &[9usize, 16, 33, 64] {
+            let raw = bidiag_test_matrix(n, n, 0xE161u64.wrapping_mul(n as u64 + 11));
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (raw[r * n + c] + raw[c * n + r]) * 0.5;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let previous = super::set_eigvalsh_grouped_ggs(false);
+            let scalar = super::eigvalsh_contiguous_f64(&sym, &meta).expect("scalar eigvalsh");
+            super::set_eigvalsh_grouped_ggs(true);
+            let grouped = super::eigvalsh_contiguous_f64(&sym, &meta).expect("grouped eigvalsh");
+            super::set_eigvalsh_grouped_ggs(previous);
+            assert_eq!(bits(&scalar), bits(&grouped), "n={n}");
+        }
     }
 
     #[test]

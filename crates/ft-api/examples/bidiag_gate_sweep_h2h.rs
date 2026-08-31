@@ -413,6 +413,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
+    let previous_eigvalsh_ggs = ft_kernel_cpu::set_eigvalsh_grouped_ggs(arm.grouped_ggs);
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
@@ -460,6 +461,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
+        ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
@@ -494,6 +496,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
+        ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
@@ -586,6 +589,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
+    ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
