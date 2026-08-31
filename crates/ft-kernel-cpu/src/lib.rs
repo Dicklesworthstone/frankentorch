@@ -915,6 +915,54 @@ mod gemm {
             }
             return;
         }
+        if crate::lu_trsm_row_accum() {
+            // ACCUMULATE ROW `i` ONCE - `frankentorch-x6wc3`.
+            //
+            // The shipped loop below read-modify-writes `lu[i*n + j]` on EVERY `t`, so row
+            // `i` is loaded and stored `i - k0` times per column block while doing one FMA
+            // per element: ~1 flop per 8 bytes, 0.125 flop/byte. It shows. MEASURED at
+            // n=1024, RAYON=8: the solve does about 17 MFLOP in 8.453 ms (~2 GFLOP/s) while
+            // the trailing update beside it does ~358 MFLOP in 8.560 ms (~42 GFLOP/s) - the
+            // same wall time for a twentieth of the arithmetic.
+            //
+            // Holding row `i` in a local buffer (cb elements, a few hundred bytes) and
+            // storing it once turns `kb^2 * cb` of traffic into `kb^2/2 * cb` reads plus one
+            // load and one store of row `i` - roughly half, on a loop that is entirely
+            // traffic-bound.
+            //
+            // BIT-EXACT: identical subtractions in identical order on identical values; only
+            // the destination of the running total moves from memory to a local. Row `t < i`
+            // is never written during pass `i`, so nothing aliases and no value is read
+            // before its final write. DEFAULT OFF until it has a paired row.
+            let base = TilePtr(lu.as_mut_ptr());
+            let cb = tcols.div_ceil(rayon::current_num_threads() * 4).max(16);
+            (0..tcols.div_ceil(cb)).into_par_iter().for_each(|blk| {
+                let base = &base;
+                let j0 = pe + blk * cb;
+                let j1 = (j0 + cb).min(n);
+                let mut acc = vec![0.0f64; j1 - j0];
+                for i in k0..pe {
+                    for (o, slot) in acc.iter_mut().enumerate() {
+                        // SAFETY: row i, cols [j0,j1) - disjoint across blocks and rows.
+                        *slot = unsafe { *base.0.add(i * n + j0 + o) };
+                    }
+                    for t in k0..i {
+                        let lit = unsafe { *base.0.add(i * n + t) };
+                        if lit != 0.0 {
+                            for (o, slot) in acc.iter_mut().enumerate() {
+                                // SAFETY: row t < i is final, not written in this pass.
+                                let src = unsafe { *base.0.add(t * n + j0 + o) };
+                                *slot -= lit * src;
+                            }
+                        }
+                    }
+                    for (o, slot) in acc.iter().enumerate() {
+                        unsafe { *base.0.add(i * n + j0 + o) = *slot };
+                    }
+                }
+            });
+            return;
+        }
         let base = TilePtr(lu.as_mut_ptr());
         let cb = tcols.div_ceil(rayon::current_num_threads() * 4).max(16);
         (0..tcols.div_ceil(cb)).into_par_iter().for_each(|blk| {
@@ -24706,6 +24754,21 @@ pub fn set_lu_panel_par_min(v: usize) -> usize {
 static LU_PANEL_NS: AtomicU64 = AtomicU64::new(0);
 static LU_PIVOT_NS: AtomicU64 = AtomicU64::new(0);
 static LU_SWAP_NS: AtomicU64 = AtomicU64::new(0);
+/// Whether the getrf triangular solve accumulates each row in a local buffer instead of
+/// read-modify-writing it once per `t`. `frankentorch-x6wc3`. DEFAULT OFF until measured.
+static LU_TRSM_ROW_ACCUM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the row-accumulating triangular solve, returning the previous setting.
+#[doc(hidden)]
+pub fn set_lu_trsm_row_accum(on: bool) -> bool {
+    LU_TRSM_ROW_ACCUM.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn lu_trsm_row_accum() -> bool {
+    LU_TRSM_ROW_ACCUM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static LU_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
 static LU_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -49521,6 +49584,51 @@ mod tests {
                 b.to_bits(),
                 "generic f32 dpadded[{index}] differs: panel {a:e} vs direct {b:e}"
             );
+        }
+    }
+
+    #[test]
+    fn lu_trsm_row_accum_matches_the_shipped_solve_bitwise() {
+        // `frankentorch-x6wc3`. The row-accumulating triangular solve keeps the running total in
+        // a local buffer instead of read-modify-writing `lu[i*n + j]` once per `t`. The claim is
+        // that this is BIT-EXACT — identical subtractions, identical order, identical values,
+        // with only the destination of the running total moved — and the whole lever rests on
+        // that, so it is pinned against the shipped path through the real kernel entry.
+        //
+        // Sizes straddle what matters: n=128 takes the UNBLOCKED route (its phase counters read
+        // zero, so the parallel solve never runs), n=256 and n=384 take the blocked one, and
+        // n=200 is deliberately not a multiple of the panel width so the final short panel and
+        // the `j1 = min(j0+cb, n)` tail are both exercised.
+        for n in [128usize, 200, 256, 384] {
+            let data: Vec<f64> = (0..n * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+                    if i == j { v + (n as f64) } else { v }
+                })
+                .collect();
+            let meta = ft_core::TensorMeta::from_shape(vec![n, n], ft_core::DType::F64, ft_core::Device::Cpu);
+
+            let previous = super::set_lu_trsm_row_accum(false);
+            let shipped = super::lu_factor_contiguous_f64(&data, &meta).expect("shipped lu");
+            super::set_lu_trsm_row_accum(true);
+            let accum = super::lu_factor_contiguous_f64(&data, &meta).expect("row-accum lu");
+            super::set_lu_trsm_row_accum(previous);
+
+            assert_eq!(
+                shipped.lu.len(),
+                accum.lu.len(),
+                "factor length differs at n={n}"
+            );
+            for (index, (a, b)) in shipped.lu.iter().zip(&accum.lu).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "LU[{index}] differs at n={n}: shipped {a:e} vs row-accum {b:e}"
+                );
+            }
+            assert_eq!(shipped.pivots, accum.pivots, "pivot sequence differs at n={n}");
         }
     }
 
