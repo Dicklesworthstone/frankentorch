@@ -39627,3 +39627,57 @@ adjoint route has caught up, and the entire remaining deficit is the GENERIC (ma
 That reframes the target. The gap is not "f32 is slow"; it is that the generic backward costs
 2.25-2.34x what the specialised one does, on a lane where `dweight` is excluded — so it is the
 dinput half of the fused masked path, which already has every route this dtype owns.
+
+## 265. THE GENERAL-DOUT 3x3 LEVER IS REFUTED BEFORE BEING BUILT — THE ADJOINT'S 13.8x IS LESS WORK, NOT FASTER WORK
+
+`frankentorch-hi9r6`. Probe in `48a3e64b`. **No code was written for the lever; this is why none
+should be.**
+
+### 265a. THE QUESTION THE PREVIOUS PROBE COULD NOT ANSWER
+
+Item 264 left the f32 masked route 2.34-2.39x behind PyTorch while the summed route was at parity
+or better, and `907271d1` timed the two kernels: the 3x3 stride-1 all-ones adjoint does the whole
+backward in **4.121 ms** against **56.858 ms** generic — 13.8x. The obvious lever is a general-dout
+3x3 kernel. But that 13.8x has TWO sources, and only one of them transfers:
+
+  * the 3x3 stride-1 STRUCTURAL specialisation — would transfer;
+  * `dout == 1` COLLAPSING the work (every dweight row is the same row; dinput is a fixed
+    stencil) — would not.
+
+### 265b. THE SEPARATOR, AND IT IS ONE ARM
+
+Run the GENERIC fused entry with an ALL-ONES mask. Same code path, same shape, same 3x3 stride-1
+structure; the only thing that changes is whether the values happen to be 1.0.
+
+    fused mask, non-uniform mask   64.949 ms
+    fused mask, ALL-ONES mask      69.832 ms
+    ratio                           1.075x
+
+**The generic path extracts nothing from ones.** The adjoint is fast because it does LESS WORK,
+not because it does the same work better, so a general-dout 3x3 kernel cannot recover the 13.8x —
+13.8x of it was never available to a general dout. One arm, and the lever dies before a line of it
+is written.
+
+### 265c. READ THE ABSOLUTES WEAKLY AND THE RATIO STRONGLY
+
+This ran on hz4 with loadavg 16.77 -> 30.98 (15-min average 40.99). The absolutes disagree with
+the quiet hetzner2 run — adjoint 7.157 vs 4.121, dweight-only 41.206 vs 28.525 — so they are not
+usable. The SEPARATOR is within-run with all arms adjacent inside each rep, so drift is
+common-mode and it is the part that survives.
+
+The same caution runs the other way, against my own earlier finding: **the clean 50/50
+dinput/dweight split from the quiet host did NOT reproduce here (42% / 63%)**. That ratio belongs
+to the quiet reading and must be re-taken before anyone sizes a one-half lever against it.
+
+### 265d. THE TRANSFERABLE PART
+
+**A specialisation's speedup is not a budget for generalising it.** The instinct — "the specialised
+path is 13.8x, so there is 13.8x of headroom in the general one" — is wrong whenever the
+specialisation works by *removing work* rather than by *doing the same work better*, and those two
+are indistinguishable from the timing alone. The distinguishing experiment is cheap and it is
+always the same shape: **feed the GENERAL path the special input.** If it does not speed up, the
+special path's advantage is arithmetic it skips, and none of it is available to you.
+
+What remains on this route is real but different in kind: the f32 masked backward runs at roughly
+105 GFLOP/s against an AVX2 f32 ceiling several times that, so the headroom is in making the
+GENERAL path faster, not in chasing a specialisation whose prize does not exist.
