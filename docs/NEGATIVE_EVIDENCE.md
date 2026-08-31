@@ -41253,3 +41253,39 @@ Honest range, not a point: neg_ read 1.40x / 2.18x / 2.63x over three invocation
 is almost entirely the INCUMBENT (0.445 / 0.295 / 0.243 ms) while ours barely moved. exp_ read
 2.67-2.95x and never cleared both nulls in a drift-clean window — at 64 reps it passed BOTH nulls
 but the host drifted 1.27x, so that row is refused rather than quoted.
+
+### 289b. THE BINARY IN-PLACE CLONE WAS 25x, AND THE FIX IS THE MEASUREMENT
+
+Same bead, binary arm. `apply_tensor_binary_in_place`'s f32 branch cloned BOTH operands and
+allocated a third buffer for the result; the f64 twin clones only `other`. Matching them removed
+two of three allocations — and the new `inplace_mul_f32` lane then said the remaining one was
+still the entire cost:
+
+    FT 25.048 ms   PT 0.966 ms   MIN ESTIMATOR FT 31.98x SLOWER
+    PT null 0.990 PASS  FT null 1.002 PASS  drift PASS  parity match
+
+25 ms for a 6,422,528-element f32 multiply is ~0.5 GB/s. That is a 25.7 MB copy and its serial
+first-touch page faults, not arithmetic. **The commit that removed two buffers named the third as
+the leading explanation and explicitly declined to call it measured** — which was the right call,
+because the next commit is what proved it.
+
+`update_tensor_values_f32_with_other` mutates `target` while READING `other` in place. `nodes` is a
+`Vec`, so the disjoint borrow is plain safe Rust via `split_at_mut` (this crate forbids `unsafe`;
+no pointer trick is needed). Bounds-check BOTH indices first — `split_at_mut` panics past the end
+and a bad node id must surface as the tape's error, not a panic. Aliased operands (`x.mul_(x)`) are
+DECLINED with a new `AliasedInPlaceOperands` and fall back to cloning, rather than the fast path
+guessing.
+
+    before  FT 25.048 ms   25.92x SLOWER
+    after   FT  1.111 / 1.135 / 1.085 ms over three gate-passing invocations
+
+**The claim is PARITY, not a win.** The verdict sign flips across those three windows
+(1.34x FASTER / 1.22x SLOWER / 1.02x FASTER) because the INCUMBENT moves (1.487 / 0.930 / 1.109)
+while ours does not. Quoting the friendliest of three equally-gated invocations is exactly the
+denominator error item 280a records. What is defensible: a **25.9x deficit is closed** and FT now
+sits inside measurement noise of torch on this lane.
+
+Two lessons worth more than the number. **A residual you can name is not a residual you have
+measured** — removing exactly the suspected copy and watching 25 ms become 1.1 ms is what turned
+the hypothesis into a result. And **test the branch your test cannot reach**: the bitwise test used
+distinct operands, so the aliased fallback would have shipped unexecuted; it needed its own case.
