@@ -39531,3 +39531,54 @@ band.
 Instrument limit found: `FT_QTF` cannot express "one arm SHIPPED, one arm forced off" — unset
 yields `None` for every arm — so the shipped-vs-legacy comparison is necessarily two single-arm
 runs whose absolute ms are not comparable (the PT minimum moved 6.9% between them).
+
+## 263. THE f32 TRAINING ROUTE HAD NO LANE AT ALL — AND THE MOMENT IT DID, THE STREAMED dweight PRICED AT 1.74x THERE AGAINST 1.25x ON f64
+
+`frankentorch-0icdh`, `frankentorch-hi9r6`. Lanes in `4d39acf4`, kernel in `d620651f`.
+
+### 263a. A SHIPPED KERNEL PATH WITH NO LANE THAT REACHED IT
+
+Item 182 found that every conv2d lane froze its weight, so "the training route" never computed a
+weight gradient, and fixed it for f64. **f32 never received that fix.** All three f32 lanes passed
+`weight_grad = false`, so `output_mask[1]` was false and `dweight` was skipped entirely.
+`conv2d_dweight_streamed_f32` was therefore correct, bit-exact, SHIPPED — and unreachable.
+
+The board could not have noticed: every f32 row it produced was of a step that does no weight
+gradient, so the whole weight-gradient half of the dtype was invisible rather than slow.
+
+### 263b. THE INCUMBENT NEEDED A REAL LEAF, OR IT WOULD HAVE BEEN A HANDICAP
+
+`c2w32 = c2w.float()` is a NON-leaf when `c2w` requires grad, and a non-leaf's `.grad` is never
+populated — torch would have silently skipped `dweight` while our arm computed it. `c2w32_train`
+is built as its own leaf from the same f64 generator: identical bits, real gradient. **A lane
+where only one arm does the work is not a comparison.**
+
+### 263c. THE ROWS
+
+thinkstation1, RAYON=16, live PyTorch 2.12.1 in the same invocation, 32 rounds, elf
+`3f733d1902a78e17`:
+
+    win  drift   FT train   FT dwpanel   PAIRED   PT control   sentinel
+     1   FAIL     68.379      119.600    1.749x     0.979       160 / 0
+     2   FAIL     69.494      120.371    1.732x     1.019       160 / 0
+     3   PASS     66.830      118.874    1.779x     1.032       160 / 0
+     4   PASS     70.781      119.553    1.689x     0.995       160 / 0
+
+Median PAIRED **1.74x**, both arms' A/A nulls PASS in both drift-clean windows, parity `match`
+throughout. The effect is larger than f64's 1.25x for the predicted reason: the saving is a panel
+round trip and this lane's panel is ~189 MB against f64's ~18.9 MB — the same ratio WindyElk saw
+(1.652x f32 vs 1.082x f64) for the analogous removal.
+
+### 263d. THE STANDING IS NOT QUOTABLE, AND THE INCUMBENT IS WHY
+
+**PyTorch's own arm swung 19.5 -> 35.2 ms across these four windows — a factor of 1.8 — while our
+two arms moved less than 6%.** The standing therefore reads anywhere from 1.96x to 3.56x SLOWER
+depending which window you pick, and none of that spread is a property of our code. Two windows
+failed the drift gate outright.
+
+**This is the mirror image of `feedback_aa_null_blind_to_scaled_incumbent`.** There, every gate
+passed while a uniformly scaled incumbent hid a 2x. Here the gates correctly refuse, and the
+lesson is the same one from the other side: a paired FT-vs-FT figure survives an unstable
+incumbent because it never touches it, and that is exactly when it is worth more than a standing.
+Claim the LEVER; the standing needs a window where the incumbent holds still, and four tries did
+not produce one.
