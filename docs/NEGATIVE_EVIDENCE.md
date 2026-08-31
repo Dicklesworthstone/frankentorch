@@ -41533,3 +41533,17 @@ under-covered. The arm stays DEFAULT OFF on the evidence of two lanes, not one.
 Method note worth keeping: this op's A/A null is 1.052x where slogdet's was 1.014x, on the same
 host and harness within the hour. **A null is a property of the LANE AND THE WINDOW, not of the
 box** — carrying slogdet's 1.014x over to inv would have made 1.054x look like a clean 5% win.
+
+**REOPEN PREDICATE — the arm is KEPT, default OFF, and this is the condition for revisiting it.**
+It is not reverted: it is inert at runtime (default OFF), bit-exact under test, and its isolation
+win is real and reproduced. Deleting tested inert code only invites someone to rebuild it from
+scratch and re-learn items 291/291a the expensive way.
+
+**Reopen ONLY for a lane whose QUALIFYING-call time fraction dominates** — that is, where the
+`dgemm_sub_into` calls that actually clear the gate (`col_blocks < threads` AND
+`m*n >= TILE_2D_MIN_AREA`) account for the bulk of the lane's time, not merely the bulk of its
+call count. Both refutations here failed that test in the same way: slogdet qualified 16% of calls
+and inv 42%, and NEITHER moved, because call share is not time share. The sentinel already reports
+`(tiled, column)` per invocation; what a candidate lane must additionally show is that the tiled
+calls are where the seconds are. Do not reopen on a raw coverage number, and do not reopen on a
+single paired reading — this lever's first inv invocation read 1.054x against a 1.052x null.
