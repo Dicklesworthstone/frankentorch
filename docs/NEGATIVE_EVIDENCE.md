@@ -41457,3 +41457,46 @@ CAVEAT, not closable from these windows: absolutes ran 52-124 ms against ~43 ms 
 windows, because a peer's `cargo test --workspace` held the host at load 9-90 throughout. The pair
 is measured inside one invocation so contention hits both arms and the sign is consistent across
 five runs, but these absolutes are NOT comparable to the banked quiet-window ones.
+
+### 291. A 1.28-1.40x BIT-EXACT KERNEL WIN THAT MOVES NO LANE — THE SENTINEL SAID 5 CALLS OF 31
+
+`frankentorch-valnx`. `dgemm_sub_into` is the trailing-update GEMM of the whole LU family
+(`lu_factor`, `slogdet`, `inv`, `lu_solve`) plus the blocked cholesky/QR/bidiag paths, and its only
+parallelism was a split of N into `block_cols(n)`-wide strips. `block_cols` floors strip WIDTH at
+`MIN_BLOCK_COLS = 128`, and a floor on width is a CEILING ON COUNT: n=512 on 16 threads gives 4
+blocks (25% occupancy), n=256 gives 2, n=128 gives 1. A factorisation's trailing submatrix shrinks
+every panel, so it walks down that list. The M axis was never split at all.
+
+Tiling both axes — the same grid `dgemm` already uses "for the shapes the column split cannot
+reach" — is a real win IN ISOLATION, bit-exact at every shape (K is never tiled, so each output
+element's reduction stays whole inside one `dgemm_mm` call):
+
+    m       448    384    320    256    192    128     64
+    speedup 1.186  1.495  1.247  1.199  1.343  1.257  0.992     TOTAL 1.2820x (1.4012x quieter)
+
+The sweep also SET ITS OWN GATE: before the area floor the m=64 shape read **0.720x** — the grid
+cuts 16x16 tiles that cannot pay for their own fork/join. `TILE_2D_MIN_AREA = 128*128` is the last
+shape that does not lose, and the crossover is quoted in the constant rather than asserted.
+
+**AND IT MOVES THE LANE NOT AT ALL.** slogdet n=512, both arms interleaved in one invocation,
+guard PASS, parity MATCH:
+
+    paired-vs-arm0  0.986 / 1.064 / 1.014 / 1.073 / 0.980   median 1.014x
+    A/A NULL (two IDENTICAL arms, same window)              1.014x
+
+The median IS the null. Readings straddle 1.0 and disagree in sign; quoting the 1.073x would be
+picking the friendliest of five equally-gated runs.
+
+**THE EXECUTION SENTINEL IS WHAT MADE THAT READABLE.** Of the 31 `dgemm_sub_into` calls a slogdet
+n=512 makes, only **5 take the 2-D arm** — `dgemm_sub(2d,col)` reads (0,31) off and (5,26) on. The
+isolation win applies to a small minority of the lane's calls and dilutes to nothing. Without the
+counter, 0.986x and 1.064x were equally tellable stories. Note the harness's existing `branches`
+counter is bidiag-specific and reads (0,0,0) on this op — a zero that looks like an answer and
+is not.
+
+The transferable pair: **isolation is necessary and nowhere near sufficient** (item 217's
+5.7x-standalone-becomes-1.118x-regression, registered in the probe's doc BEFORE the run), and
+**when a kernel win does not reach its lane, count the calls before theorising** — the answer here
+was arithmetic, not subtle. Kept default OFF rather than reverted: it is not negative, it is a
+tested gated bit-exact improvement whose lane has not been found, and the actionable follow-up is
+the GATE admitting 5 of 31, not the arm.
