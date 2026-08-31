@@ -480,6 +480,117 @@ fn main() {
         );
     }
 
+    // PAIRED ROW FOR THE n-SPLIT TILING -- `frankentorch-06csx`.
+    //
+    // OFF restores the previous heuristic exactly (mb=8, min_nb=64); ON is the shipped default.
+    // Whole fused backward, alternating square per rep, per-rep min-of-2, median of per-rep
+    // ratios, A/A null from the two same-arm samples of one rep, marginal and sign test printed
+    // beside it (ledger 274c/275b).
+    {
+        let once = |on: bool| -> f64 {
+            let (pm, pn) = if on {
+                (ft_kernel_cpu::set_conv2d_dweight_mb(0), ft_kernel_cpu::set_conv2d_dweight_min_nb(0))
+            } else {
+                // min_nb=72, NOT 64. Under the new n-split code, min_nb=64 gives
+                // n_blocks = min(16, ceil(288/64)) = 5 and so 4 x 5 = 20 tiles on 16 threads --
+                // a ragged second round the OLD heuristic never had, because it derived
+                // n_blocks = threads.div_ceil(m_blocks) = 4 and produced exactly 16 tiles.
+                // Measuring against that straw man read 2.2969x. 288/72 = 4 reproduces the
+                // incumbent tiling exactly: m_blocks 4, n_blocks 4, nb 72, 16 tiles.
+                (ft_kernel_cpu::set_conv2d_dweight_mb(8), ft_kernel_cpu::set_conv2d_dweight_min_nb(72))
+            };
+            let start = Instant::now();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [true, true, false],
+            );
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&out);
+            ft_kernel_cpu::set_conv2d_dweight_mb(pm);
+            ft_kernel_cpu::set_conv2d_dweight_min_nb(pn);
+            ms
+        };
+        let mut off_v = Vec::new();
+        let mut on_v = Vec::new();
+        let mut nulls = Vec::new();
+        for rep in 0..reps {
+            let r = if rep % 2 == 0 {
+                let a = [once(false), once(true), once(true), once(false)];
+                [a[0], a[1], a[2], a[3]]
+            } else {
+                let a = [once(true), once(false), once(false), once(true)];
+                [a[1], a[0], a[3], a[2]]
+            };
+            if rep == 0 {
+                continue;
+            }
+            off_v.push(r[0].min(r[3]));
+            on_v.push(r[1].min(r[2]));
+            nulls.push(r[0] / r[3]);
+        }
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let mut ratios: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
+        let paired = median(&mut ratios);
+        let null = median(&mut nulls.clone());
+        let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
+        let off_m = median(&mut off_v.clone());
+        let on_m = median(&mut on_v.clone());
+        eprintln!(
+            "F32_NSPLIT fused backward  OFF (incumbent tiling: 4x4=16 tiles, nb=72) {off_m:7.3} ms   ON (n-split) {on_m:7.3} ms"
+        );
+        eprintln!(
+            "F32_NSPLIT   marginal {:.4}x   paired {paired:.4}x   SIGN TEST ON faster in {wins}/{} reps   A/A null {null:.4} {}",
+            off_m / on_m,
+            off_v.len(),
+            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+        );
+    }
+
+    // THE CELL THE CLAMP HID -- `frankentorch-06csx`. The mb sweep showed the gather scaling with
+    // m_blocks while the frame did not, because `n_blocks` is clamped to patch_width/64 = 5 and so
+    // raising mb converts saved gather work into idle cores. This sweeps (mb, min_nb) together so
+    // occupancy is held at 16 tiles while m_blocks falls -- the combination the one-dimensional
+    // sweep could not reach.
+    //
+    // PREDICTION RECORDED BEFORE THE RUN: (mb=32, min_nb=18) should be the best cell. It gathers
+    // once instead of four times (82.5 vs 298.7 ms CPU in the frame's dominant half) at full
+    // occupancy. The risk is that nb=18 is a poor GEMM width -- the shape probe measured only
+    // 1.12x between a good and a bad shape, so the gather term should dominate. If it does NOT
+    // win, GEMM width matters more than the shape probe suggested and the frame is closed.
+    for (mb, min_nb) in [(8usize, 0usize), (32, 64), (32, 18), (32, 9), (16, 18), (32, 32)] {
+        let prev_nb = ft_kernel_cpu::set_conv2d_dweight_min_nb(min_nb);
+        let previous = ft_kernel_cpu::set_conv2d_dweight_mb(mb);
+        let mut best = f64::INFINITY;
+        let mut best_g = f64::INFINITY;
+        let mut best_m = f64::INFINITY;
+        for rep in 0..reps {
+            let _ = ft_kernel_cpu::masked_frame_take_ns();
+            let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [false, true, false],
+            );
+            std::hint::black_box(&out);
+            let (_, w_ns, _) = ft_kernel_cpu::masked_frame_take_ns();
+            let (g_ns, m_ns) = ft_kernel_cpu::conv2d_dweight_split_take_ns();
+            if rep > 0 {
+                best = best.min(w_ns as f64 / 1e6);
+                best_g = best_g.min(g_ns as f64 / 1e6);
+                best_m = best_m.min(m_ns as f64 / 1e6);
+            }
+        }
+        ft_kernel_cpu::set_conv2d_dweight_mb(previous);
+        ft_kernel_cpu::set_conv2d_dweight_min_nb(prev_nb);
+        let m_blocks = OUT_CH.div_ceil(mb);
+        eprintln!(
+            "F32_DWNB mb={mb:2} min_nb={min_nb:2} -> m_blocks {m_blocks}   frame {best:7.3} ms   gather {best_g:8.3} + GEMM {best_m:7.3} ms CPU{}",
+            if mb == 8 && min_nb == 0 { "   <- SHIPPED" } else { "" }
+        );
+    }
+
     for mb in [4usize, 8, 16, 32] {
         let previous = ft_kernel_cpu::set_conv2d_dweight_mb(mb);
         let mut best = f64::INFINITY;

@@ -8699,6 +8699,37 @@ pub fn conv2d_dweight_split_take_ns() -> (u64, u64) {
     )
 }
 
+/// Override for the streamed dweight's minimum N-block width; `0` means the shipped 64.
+///
+/// `frankentorch-06csx`. `n_blocks` is clamped to `patch_width.div_ceil(64)`, which at
+/// patch_width=288 caps it at 5. That clamp and `mb` are therefore THE SAME KNOB for thread
+/// occupancy, and the mb sweep could not separate them:
+///
+/// ```text
+///   mb   m_blocks  n_blocks  tiles  threads busy   gather CPU   frame
+///    8       4         4       16        16         298.7 ms   22.950 ms
+///   16       2         5       10        10         162.8      22.874
+///   32       1         5        5         5          82.5      28.410
+/// ```
+///
+/// The gather scales almost exactly with `m_blocks` (1.86x, 1.83x, 1.97x per halving), so raising
+/// `mb` really does remove the redundant panel gather — it just hands the saving straight back as
+/// idle cores. The cell worth having, m_blocks=1 at FULL occupancy, is unreachable while the clamp
+/// stands: it needs `nb = 18`, and the clamp forbids anything below ~58.
+///
+/// Lowering this trades GEMM shape for occupancy and for 3.6x less gather work, and which wins is
+/// exactly what a sweep is for. f32 only — the f64 twin is byte-identical here and has not been
+/// measured.
+static CONV2D_DWEIGHT_MIN_NB: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the streamed f32 dweight minimum N-block width, returning the previous value. `0` restores
+/// the shipped 64.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_min_nb(min_nb: usize) -> usize {
+    CONV2D_DWEIGHT_MIN_NB.swap(min_nb, std::sync::atomic::Ordering::Relaxed)
+}
+
 static CONV2D_DWEIGHT_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Set the streamed f32 dweight M-block width, returning the previous value. `0` restores the
@@ -8731,20 +8762,52 @@ fn conv2d_dweight_streamed_f32(
     }
 
     let threads = rayon::current_num_threads().max(1);
-    let mb = match CONV2D_DWEIGHT_MB.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => {
-            if out_ch <= 8 {
-                out_ch
-            } else {
-                8
-            }
-        }
-        value => value.clamp(1, out_ch),
+
+    // SPLIT N FIRST, THEN M — `frankentorch-06csx`. The tiling decides how many times the panel is
+    // GATHERED, and counters put that gather at 82% of this frame (GEMM is the other 18%, already
+    // running at 75% of this box's square-GEMM ceiling).
+    //
+    // `ptile` depends only on the n-index and `atile` only on the m-index, so the gather is
+    // repeated once per M-BLOCK while `dout_flat` is merely re-read once per n-block — and
+    // `dout_flat` is 21 MB against the panel's 189 MB. The two splits are not symmetric, so
+    // m_blocks should be 1 whenever the pool can be filled from N alone.
+    //
+    // The previous heuristic did the opposite. It fixed `mb = 8` (four m-blocks at out_ch=32) and
+    // derived n_blocks from what was left, under a floor of 64 columns that capped n_blocks at 5.
+    // That made m_blocks and thread occupancy the same knob: raising `mb` removed gather work and
+    // handed the saving straight back as idle cores, which is why a one-dimensional `mb` sweep
+    // measured it as worth nothing.
+    //
+    // MEASURED, hz4 rayon=16, dweight frame with gather/GEMM counters inside the kernel:
+    //
+    //   mb  min_nb  m_blocks  tiles  frame       gather CPU   GEMM CPU
+    //    8      64      4       16   24.749 ms     314.795      65.117   <- previous default
+    //   32      64      1        5   28.865         86.091      55.117   gather down, 5 threads
+    //   32      32      1        9   16.821         89.995      55.854   gather down, 9 threads
+    //   32      18      1       16   11.363        100.175      75.722   <- SHIPPED
+    //   32       9      1       16   11.330        100.127      75.759   flat below 18
+    //   16      18      2       16   15.231        164.980      67.841   m_blocks=2 costs 1.34x
+    //
+    // 2.18x on the frame. The gather falls 3.1x while the GEMM rises 16% on the narrower `nb`, and
+    // the accounting closes: (100.175 + 75.722) / 16 = 11.0 ms against an 11.363 ms frame.
+    //
+    // GENERALISATION, deliberately by construction rather than by fitting this shape. `NB_FLOOR`
+    // keeps each GEMM at least 16 columns wide; n_blocks then takes as much of the pool as N can
+    // supply, and m_blocks picks up the remainder ONLY when N cannot fill it (small `patch_width`
+    // with many threads). At this lane's shape that yields exactly the measured winner —
+    // n_blocks 16, m_blocks 1, nb 18. `conv3d_direct_gate_misset` is the standing warning against
+    // validating at one shape and gating open-ended, so both constants stay overridable.
+    const NB_FLOOR: usize = 16;
+    let min_nb = match CONV2D_DWEIGHT_MIN_NB.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => NB_FLOOR,
+        value => value,
     };
-    let m_blocks = out_ch.div_ceil(mb);
-    let n_blocks = threads
-        .div_ceil(m_blocks)
-        .clamp(1, patch_width.div_ceil(64).max(1));
+    let n_blocks = threads.min(patch_width.div_ceil(min_nb).max(1));
+    let m_blocks = match CONV2D_DWEIGHT_MB.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => threads.div_ceil(n_blocks).clamp(1, out_ch),
+        value => out_ch.div_ceil(value.clamp(1, out_ch)),
+    };
+    let mb = out_ch.div_ceil(m_blocks);
     let nb = patch_width.div_ceil(n_blocks);
     let n_blocks = patch_width.div_ceil(nb);
     let krows = SGEMM_KC;

@@ -40466,3 +40466,85 @@ and `frankentorch-x6wc3` together.
 The one blocking constant on this frame that remains untested is `SGEMM_KC` (krows=256), but it is
 shared with every other `sgemm` caller, so it cannot be swept from here without a scoped override
 and should be scoped with the microkernel work rather than as another conv lever.
+
+---
+
+## 278. THE dweight FRAME IS 82% PANEL GATHER, NOT GEMM — SPLIT N FIRST AND THE FUSED BACKWARD GOES 1.55x. Item 277c is RETRACTED
+
+`frankentorch-06csx`, opened on the premise that "the shared GEMM microkernel is the binding
+constraint behind t1gph, 37sxo and x6wc3". **That premise was wrong, and the bead refuted it in two
+probes.**
+
+### 278a. The microkernel is at 75% of ceiling and is 18% of the frame
+
+`gemm::sgemm` delegates to `matrixmultiply`, which already IS a Goto-style packed-panel
+implementation. "Write a packed microkernel" was largely rediscovering a dependency. Single-thread,
+hz4, flop-matched arms (8*72*163840 and 32*288*10240 are both 188.7 MFLOP):
+
+    CEILING     sgemm 1024x1024x1024           32.420 ms   66.2 GFLOP/s
+    OUTPUT-PAR  640 x tb_add_into(8,256,72)     3.808 ms   49.6 GFLOP/s   <- dweight's shape
+    SPLIT-K     1 x tb_add_into(32,10240,288)   3.410 ms   55.4 GFLOP/s   <- same flops
+    ONE-CALL    1 x tb_add_into(8,163840,72)    7.551 ms   25.0 GFLOP/s
+
+The shape dweight calls already reaches **75% of the square-GEMM ceiling**. Split-K, predicted here
+to win "by a lot", wins **1.12x**. And per-call overhead is the OPPOSITE of a problem: one call
+with the full K is 2x SLOWER, so the k-blocking that bit-exactness locks to `SGEMM_KC` is helping
+cache residency. Counters then confirmed it: **panel gather 296-300 ms CPU against GEMM 65 ms CPU,
+gather is 82%** — and 65.4/16 = 4.09 ms per thread against the probe's independent 3.808 ms.
+
+### 278b. RETRACTION: 277c's "the redundant gather costs nothing" was thread starvation
+
+277c swept `mb`, saw the frame barely move between mb=8 and mb=16, and concluded the redundant
+panel gather was free. The gather COUNTER says the opposite — it scales almost exactly with
+`m_blocks` (554 -> 299 -> 163 -> 82.5 ms CPU for 8/4/2/1, ratios 1.86, 1.83, 1.97). The traffic
+model was right; what cancelled it is that `n_blocks` was clamped to `patch_width.div_ceil(64)` = 5,
+so **`mb` and thread occupancy were the same knob**:
+
+    mb= 8  m_blocks 4  n_blocks 4  -> 16 tiles, 16 threads   frame 22.950 ms
+    mb=16  m_blocks 2  n_blocks 5  -> 10 tiles, 10 threads   frame 22.874
+    mb=32  m_blocks 1  n_blocks 5  ->  5 tiles,  5 threads   frame 28.410
+
+Raising `mb` removed gather work and handed the saving straight back as idle cores.
+**A grid that cannot reach a cell cannot rule it out**, and a one-dimensional sweep over a knob
+that is secretly two knobs will report a real effect as a null.
+
+### 278c. The lever, and why N and M are not symmetric
+
+`ptile` depends only on the n-index, `atile` only on the m-index. So m-splitting repeats the
+**panel** gather (189 MB) while n-splitting merely re-reads **dout_flat** (21 MB). They are not
+symmetric, and `m_blocks` should be 1 whenever the pool can be filled from N alone. Sweeping both
+together, with the gather/GEMM counters inside the kernel:
+
+    mb  min_nb  m_blocks  tiles  frame       gather CPU   GEMM CPU
+     8      64      4       16   24.749 ms     314.795      65.117   <- previous default
+    32      64      1        5   28.865         86.091      55.117
+    32      32      1        9   16.821         89.995      55.854
+    32      18      1       16   11.363        100.175      75.722   <- SHIPPED
+    32       9      1       16   11.330        100.127      75.759
+    16      18      2       16   15.231        164.980      67.841
+
+Gather falls 3.1x, GEMM rises 16% on the narrower `nb`, and the accounting closes:
+(100.175 + 75.722)/16 = 11.0 ms against an 11.363 ms frame. The heuristic now splits N first under
+a 16-column floor and only splits M when N cannot fill the pool, which reproduces the measured
+winner by construction rather than by hardcoding this shape.
+
+**PAIRED ROW, whole fused backward**, alternating square, per-rep min-of-2, median of per-rep
+ratios: OFF 34.384 ms, ON 22.375 ms, **marginal 1.5367x, paired 1.5468x, sign test 20/20, A/A null
+1.0041 PASS**. BIT-EXACT — `conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise` passes
+unchanged, so the retiling does not reassociate anything.
+
+### 278d. THE OFF ARM WAS A STRAW MAN AND READ 2.2969x
+
+The first version of that A/B restored the incumbent as `(mb=8, min_nb=64)`. Under the NEW code
+that gives `n_blocks = min(16, ceil(288/64)) = 5`, hence **4 x 5 = 20 tiles on 16 threads** — a
+ragged second round the old heuristic never had, because it derived `n_blocks` from
+`threads.div_ceil(m_blocks)` and produced exactly 16. Measured against that, the lever read
+**2.2969x**; against the true incumbent tiling (`min_nb = 72`, so 4 x 4 = 16 tiles, nb = 72) it
+reads **1.5468x**.
+
+The tell was available and was checked: the straw OFF arm timed 52.075 ms where every previous run
+had the same configuration at 33-34 ms, while the corrected arm reads 34.384 ms and matches.
+**When an incumbent arm disagrees with its own banked history, the arm is wrong, not the history** —
+compare the earlier case where a toggle A/B forced a shipped default off and inflated 1.338x to
+1.421x. Restoring an incumbent through a REWRITTEN parameterisation is not the same as running the
+incumbent, and it must be checked against a banked absolute.
