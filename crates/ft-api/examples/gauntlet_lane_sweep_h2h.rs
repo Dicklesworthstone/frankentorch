@@ -1170,6 +1170,49 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
     (elapsed, checksum)
 }
 
+/// The FT-side conv2d frame diagnostics, printed BEFORE the PyTorch gate.
+/// `frankentorch-hi9r6`.
+///
+/// Every number here is our own arm's timing, so none of it needs an incumbent. They used to sit
+/// BELOW the `PyTorch row missing` early-continue, which meant the one way to run this
+/// attribution on a quiet rch worker — `FT_H2H_NO_INCUMBENT=1`, since no worker has torch — was
+/// also the one way to guarantee it printed nothing. That is how a 50-minute wait for a
+/// contended local window became the only route to numbers that never needed the incumbent.
+fn conv2d_frame_diagnostics(name: &str, ft_ms: f64) {
+    if name == "conv2d_masked_train_dwpanel" {
+        let calls = CONV2D_STREAMED_CALLS.with(std::cell::Cell::get);
+        let legacy = CONV2D_LEGACY_CALLS.with(std::cell::Cell::get);
+        println!(
+            "    sentinel: streamed dweight ran {calls} time(s) in the incumbent \
+             conv2d_masked_train and {legacy} time(s) in this forced-legacy arm. The pair \
+             prices the lever only if the first is NONZERO and the second is ZERO — a lever \
+             that never executed and a lever with no effect read identically."
+        );
+    }
+    if name == "conv2d_masked_train" {
+        let (fwd, bwd) = CONV2D_SESSION_SPLIT_MS.with(std::cell::Cell::get);
+        if fwd > 0.0 || bwd > 0.0 {
+            println!(
+                "    session split: forward (pad + conv + fused mask + sum) {fwd:.3} ms | \
+                 backward (tape walk + dsum + grad alloc) {bwd:.3} ms of this lane's \
+                 {ft_ms:.3} ms. Subtract conv2d_masked_train_kernels' own forward/backward \
+                 frames to get the session and tape cost of each half separately."
+            );
+        }
+    }
+    if name == "conv2d_masked_train_kernels" {
+        let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(std::cell::Cell::get);
+        if fwd > 0.0 || bwd > 0.0 {
+            println!(
+                "    frames: pad {pad:.3} ms | forward {fwd:.3} ms | backward {bwd:.3} ms \
+                 of this lane's {ft_ms:.3} ms. Session cost = conv2d_masked_train - (this - \
+                 pad); the uncorrected subtraction charges a pad the session pays in another \
+                 form."
+            );
+        }
+    }
+}
+
 thread_local! {
     /// `(forward_ms, backward_ms)` from the last `timed_conv2d` call: the SESSION-level split,
     /// forward being everything up to and including `tensor_sum` and backward being
@@ -3524,6 +3567,7 @@ LANES = {
             ft_null.label()
         };
         let ft_ms = median(ft_times[index].clone());
+        conv2d_frame_diagnostics(name, ft_ms);
         let (Some(pt_grad), false) = (pt_grads[index], pt_times[index].is_empty()) else {
             println!("  {name:<12} {ft_ms:8.3}       --   PyTorch row missing");
             continue;
@@ -3585,38 +3629,6 @@ LANES = {
         // The kernels-only f32 conv2d lane carries a hand-rolled pad inside its timed region that
         // the session lane does not pay in the same form. Print it beside the row so nobody
         // computes "session cost" from a subtraction that is contaminated in one direction.
-        if *name == "conv2d_masked_train_dwpanel" {
-            let calls = CONV2D_STREAMED_CALLS.with(std::cell::Cell::get);
-            let legacy = CONV2D_LEGACY_CALLS.with(std::cell::Cell::get);
-            println!(
-                "    sentinel: streamed dweight ran {calls} time(s) in the incumbent \
-                 conv2d_masked_train and {legacy} time(s) in this forced-legacy arm. The pair \
-                 prices the lever only if the first is NONZERO and the second is ZERO — a lever \
-                 that never executed and a lever with no effect read identically."
-            );
-        }
-        if *name == "conv2d_masked_train" {
-            let (fwd, bwd) = CONV2D_SESSION_SPLIT_MS.with(std::cell::Cell::get);
-            if fwd > 0.0 || bwd > 0.0 {
-                println!(
-                    "    session split: forward (pad + conv + fused mask + sum) {fwd:.3} ms | \
-                     backward (tape walk + dsum + grad alloc) {bwd:.3} ms of this lane's \
-                     {ft_ms:.3} ms. Subtract conv2d_masked_train_kernels' own forward/backward \
-                     frames to get the session and tape cost of each half separately."
-                );
-            }
-        }
-        if *name == "conv2d_masked_train_kernels" {
-            let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(std::cell::Cell::get);
-            if fwd > 0.0 || bwd > 0.0 {
-                println!(
-                    "    frames: pad {pad:.3} ms | forward {fwd:.3} ms | backward {bwd:.3} ms \
-                     of this lane's {ft_ms:.3} ms. Session cost = conv2d_masked_train - (this - \
-                     pad); the uncorrected subtraction charges a pad the session pays in another \
-                     form."
-                );
-            }
-        }
         if *name == "conv2d_f32_kernels" {
             let pad = CONV2D_F32_KERNELS_PAD_MS.with(std::cell::Cell::get);
             if pad > 0.0 {

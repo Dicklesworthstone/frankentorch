@@ -23,34 +23,53 @@ fn fill(batch: usize, m: usize, n: usize) -> Vec<f64> {
     a
 }
 
-fn run_ft(batch: usize, m: usize, n: usize) -> Result<(f64, f64), Box<dyn Error>> {
+fn run_ft(
+    batch: usize,
+    m: usize,
+    n: usize,
+    full_matrices: bool,
+    requires_grad: bool,
+) -> Result<(f64, f64), Box<dyn Error>> {
     let mut best = f64::INFINITY;
     let mut checksum = 0.0_f64;
     for _ in 0..5 {
         let data = fill(batch, m, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = s
-            .tensor_variable(data, vec![batch, m, n], true)
+            .tensor_variable(data, vec![batch, m, n], requires_grad)
             .map_err(boxed)?;
         let start = Instant::now();
-        let (_u, sg, _vh) = s.tensor_linalg_svd(a, false).map_err(boxed)?;
+        let (_u, sg, _vh) = s
+            .tensor_linalg_svd(a, full_matrices)
+            .map_err(boxed)?;
         let loss = s.tensor_sum(sg).map_err(boxed)?;
-        s.tensor_backward(loss).map_err(boxed)?;
+        if requires_grad {
+            s.tensor_backward(loss).map_err(boxed)?;
+        }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
         if elapsed_ms < best {
             best = elapsed_ms;
-            checksum = s
-                .tensor_grad(a)
-                .map_err(boxed)?
-                .unwrap_or_default()
-                .iter()
-                .sum();
+            checksum = if requires_grad {
+                s.tensor_grad(a)
+                    .map_err(boxed)?
+                    .unwrap_or_default()
+                    .iter()
+                    .sum()
+            } else {
+                s.tensor_values(loss).map_err(boxed)?[0]
+            };
         }
     }
     Ok((best, checksum))
 }
 
-fn run_pytorch(batch: usize, m: usize, n: usize) -> Option<(f64, f64)> {
+fn run_pytorch(
+    batch: usize,
+    m: usize,
+    n: usize,
+    full_matrices: bool,
+    requires_grad: bool,
+) -> Option<(f64, f64)> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let script = format!(
         r#"
@@ -63,10 +82,13 @@ cols=torch.arange(N,dtype=torch.int64).reshape(1,1,N)
 A=((((p+1)*(rows+2)*(cols+3))%17).to(torch.float64)-8.0)*0.05
 A=A+torch.eye(M,N,dtype=torch.float64).unsqueeze(0)*(3.0+rows.to(torch.float64))
 def step():
-    Ar=A.clone().requires_grad_(True)
-    U,S,Vh=torch.linalg.svd(Ar,full_matrices=False)
-    S.sum().backward()
-    return Ar.grad
+    Ar=A.clone().requires_grad_({requires_grad})
+    U,S,Vh=torch.linalg.svd(Ar,full_matrices={full_matrices})
+    loss=S.sum()
+    if {requires_grad}:
+        loss.backward()
+        return Ar.grad
+    return loss
 for _ in range(2): step()
 s=[]
 for _ in range(5):
@@ -99,14 +121,35 @@ print("MS", min(s)); print("SUM", g.sum().item())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (batch, m, n) in [
-        (20_000usize, 4usize, 8usize),
-        (8_000usize, 8usize, 16usize),
-        (3_000usize, 16usize, 32usize),
-    ] {
-        let (ft_ms, ft_sum) = run_ft(batch, m, n)?;
-        print!("B={batch} m={m} n={n}: FT {ft_ms:.3} ms gradsum {ft_sum:.6e}");
-        if let Some((tms, tsum)) = run_pytorch(batch, m, n) {
+    let full_tall = std::env::var("FT_SVD_FULL_TALL")
+        .ok()
+        .is_some_and(|value| value == "1");
+    let (full_matrices, requires_grad, cases) = if full_tall {
+        (
+            true,
+            false,
+            vec![
+                (1usize, 128usize, 16usize),
+                (1usize, 192usize, 24usize),
+                (1usize, 256usize, 32usize),
+            ],
+        )
+    } else {
+        (
+            false,
+            true,
+            vec![
+                (20_000usize, 4usize, 8usize),
+                (8_000usize, 8usize, 16usize),
+                (3_000usize, 16usize, 32usize),
+            ],
+        )
+    };
+    for (batch, m, n) in cases {
+        let (ft_ms, ft_sum) = run_ft(batch, m, n, full_matrices, requires_grad)?;
+        let check_label = if requires_grad { "gradsum" } else { "ssum" };
+        print!("B={batch} m={m} n={n}: FT {ft_ms:.3} ms {check_label} {ft_sum:.6e}");
+        if let Some((tms, tsum)) = run_pytorch(batch, m, n, full_matrices, requires_grad) {
             let rel = (ft_sum - tsum).abs() / (tsum.abs() + 1e-12);
             let ratio = tms / ft_ms;
             let tag = if ratio >= 1.0 { "FASTER" } else { "SLOWER" };
