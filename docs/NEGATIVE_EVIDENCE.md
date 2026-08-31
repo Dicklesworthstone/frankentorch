@@ -39494,3 +39494,40 @@ obvious reading of a small number is "small lever". What separated the two readi
 that had been in the tree since the lever landed and that nobody, including its author, had read.
 
 `frankentorch-4zjaa` (2026-08-30): live paired SVD at n=136/256 is 1.197-1.689x SLOWER than same-invocation PyTorch 2.12.1+cpu; compact-WY form-P versus unblocked reads 0.968x/1.027x against repeated-blocked A/A 1.001x/0.974x, so the whole-op loss stands but the toggle is `NO_VERDICT`.
+
+`frankentorch-58zjz` (2026-08-30): source-matched live H2H dV gate lanes are FT/PT 0.761x (narrow) and 0.797x (wide) against PyTorch 2.12.1+cpu, with both dual A/A controls passing; this is an incumbent-relative loss observation, not a speedup claim from the lane-only measurement addition.
+
+### 262f. ADVERSARIALLY RE-VERIFIED — THE LEVER HOLDS, THE ABSOLUTE BAND DOES NOT
+
+Re-run 2026-08-30 on a NEW ELF at a later HEAD
+(`f6c852e4f025714903f7df6604de0145cfa10970b11b2153006538310d48fa66`; the certified run used
+`6c61953bbea82e10`), same command, thinkstation1, live PyTorch 2.12.1 interleaved, generic
+fixture, 25 rounds, guard PASS:
+
+    Tfull  min 75.180 ms   paired 1.000   7.749x SLOWER
+    Tskip  min 64.810 ms   paired 1.128   7.004x SLOWER
+    Tfull  min 73.293 ms   paired 1.026   7.604x SLOWER   <- the A/A null
+    TSHIPPED (FT_QTF unset, separate single-arm run)      7.151x SLOWER
+
+**The effect replicates**: 1.128x against a certified median of 1.135x, four windows now.
+
+**Two things do not.** The A/A null read **1.026**, outside the +/-0.02 band, where all three
+certified windows were inside — so this row is NOT individually quotable, and it is reported as a
+failed gate rather than waved through on the effect being 5x the deviation. And the absolute band
+"7.82-7.93x -> 6.90-7.04x" no longer holds: forced-legacy reads 7.749x and SHIPPED reads 7.151x,
+both outside what was quoted.
+
+**The cause is that the tree moved under the claim.** The arm labels now carry `formP-blocked`,
+absent from the certified run — a peer landed the blocked form-P path (`6d2ceea9`,
+`frankentorch-4zjaa`) into the same op in between.
+
+**THE TRANSFERABLE PART.** `feedback_measurement_host_identity` says a row is not comparable
+across MACHINES. This is the same lesson across COMMITS: an absolute vs-incumbent band is a
+property of one tree state, and in a repo where a dozen agents ship into the same ops it decays
+within hours. **Quote a lever as a DELTA, which survives, and treat any absolute standing as
+perishable and dated.** Item 262's headline should be read as ~1.13x on geqrf, not as a fixed
+band.
+
+Instrument limit found: `FT_QTF` cannot express "one arm SHIPPED, one arm forced off" — unset
+yields `None` for every arm — so the shipped-vs-legacy comparison is necessarily two single-arm
+runs whose absolute ms are not comparable (the PT minimum moved 6.9% between them).
