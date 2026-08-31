@@ -9273,8 +9273,23 @@ fn conv2d_backward_dinput_blocked_rows_f32(
                         for kr in 0..kh {
                             let irow = ch_off + (base_h + kr) * pw + base_w;
                             let prow_off = prow + pch + kr * kw;
-                            for kc in 0..kw {
-                                dpb[irow + kc] += block[prow_off + kc];
+                            // SLICE-WISE ACCUMULATE — `frankentorch-hi9r6`. Identical arithmetic in identical
+                            // order, so this is bit-exact by construction; only the indexing changes. The two
+                            // `kw`-runs are disjoint slices of DIFFERENT buffers, which the indexed form did not
+                            // let the compiler see: every `dpb[irow + kc] += block[prow_off + kc]` carried a
+                            // bounds check and an aliasing question per element.
+                            //
+                            // WHY HERE. Item 267 left the whole f32 deficit in this backward, and the arm added
+                            // for it measured `conv2d_col2im_f32` alone at 0.843x and 0.867x of the ENTIRE direct
+                            // dinput route on a quiet host — so this scatter is 84-87% of the frame that carries
+                            // the 2.34x. It is 160 * 1024 * 288 = 47.2M read-modify-writes at the scored shape.
+                            //
+                            // CHEAP AND REFUTABLE, which is why it is first: if the scatter is bound by memory
+                            // latency on scattered RMW rather than by per-element overhead, this changes nothing
+                            // and the next candidate is the gather inversion (write each output once) instead.
+                            let (dst, src) = (&mut dpb[irow..irow + kw], &block[prow_off..prow_off + kw]);
+                            for (d, s) in dst.iter_mut().zip(src) {
+                                *d += *s;
                             }
                         }
                     }
@@ -39758,14 +39773,8 @@ pub fn orgqr_blocked_f64(packed: &[f64], tau: &[f64], m: usize, n: usize, k: usi
     // Q_block . X = X - V (T (Vᵀ X)), innermost panel first.
     for (nb, vmat, tmat) in panels.iter().rev() {
         let nb = *nb;
-        let mut vt = vec![0.0f64; nb * m];
-        for row in 0..m {
-            for c in 0..nb {
-                vt[c * m + row] = vmat[row * nb + c];
-            }
-        }
         let mut w1 = vec![0.0f64; nb * n];
-        gemm::dgemm(nb, m, n, &vt, &x, &mut w1); // Vᵀ X
+        gemm::dgemm_tb(nb, m, n, vmat, &x, &mut w1); // Vᵀ X
         let mut w2 = vec![0.0f64; nb * n];
         gemm::dgemm(nb, nb, n, tmat, &w1, &mut w2); // T (Vᵀ X)
         let mut upd = vec![0.0f64; m * n];
