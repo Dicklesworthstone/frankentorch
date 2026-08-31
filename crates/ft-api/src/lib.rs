@@ -817,6 +817,35 @@ struct GridSamplePoint {
     x: isize,
 }
 
+/// See [`FrankenTorchSession::fuse_conv2d_reuse_f32`]. `frankentorch-t1gph`. DEFAULT ON.
+///
+/// SHIPPED ON REDUNDANCY AND DTYPE CONSISTENCY, NOT ON A LANE CLAIM. The f32 fusion recomputed a
+/// whole forward convolution that `functional_conv2d` had already performed; the f64 twin has
+/// always reused it. Removing that duplicate is right on its own terms, and the FRAME it sits in
+/// moves decisively:
+///
+///   run 1  tensor_mul 18.077 -> 7.092 ms (2.5490x)   lane paired 1.0201x, marginal 1.0139x, 12/14
+///   run 2  tensor_mul 17.513 -> 6.753 ms (2.5934x)   lane paired 1.0172x, marginal 1.0021x, 10/14
+///
+/// The LANE effect is NOT claimed: 10/14 is not significant and the marginal ratio fell to
+/// 1.0021 on replication, so by this campaign's own standard that cell is unreliable. Roughly
+/// 9.6 ms of the ~11 ms shed from the frame reappears elsewhere in the lane — the third
+/// displacement on this campaign (compare 276b, 281) and, unlike those, still unexplained. The
+/// likeliest cause is peak memory: forming `precomputed` eagerly holds `lhs`, the mask and the
+/// product live at once, where the recompute path peaked lower.
+///
+/// PARITY: 0 bitwise mismatches across 5,242,880 input-gradient elements and an identical weight
+/// gradient, verified twice through the real session — not a unit fixture — because a stale
+/// `precomputed` or a wrong node is a tape-level mistake a kernel test would not see.
+static FUSE_CONV2D_REUSE_F32: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Select the reuse path for the f32 conv2d/mask fusion, returning the previous setting.
+#[doc(hidden)]
+pub fn set_fuse_conv2d_reuse_f32(on: bool) -> bool {
+    FUSE_CONV2D_REUSE_F32.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl FrankenTorchSession {
     #[must_use]
     pub fn new(mode: ExecutionMode) -> Self {
@@ -6338,6 +6367,31 @@ impl FrankenTorchSession {
     /// double-backward defect this campaign has already paid for once. The arm below is the
     /// f64 recipe with every nested adjoint node casting to f32 and using the f32 kernels, so
     /// the second derivative matches torch's f32-precision backward.
+    /// Whether the f32 conv2d/mask fusion REUSES the already-computed convolution output instead
+    /// of recomputing it inside the fused node's forward closure.
+    ///
+    /// `frankentorch-t1gph`. The f64 fusion computes `scored` eagerly from
+    /// `values_borrowed(lhs)` — the convolution output `functional_conv2d` has ALREADY produced —
+    /// and moves it into the closure. The f32 twin instead calls `conv2d_forward_f32` again from
+    /// `plan.padded` and `plan.weight`, so on every f32 masked lane the forward convolution runs
+    /// TWICE: once in `functional_conv2d` and once inside `tensor_mul`.
+    ///
+    /// MEASURED on the training lane (hz4, rayon=16, session probe, min of 9): the lane is
+    /// 80.836 ms of which `functional_conv2d` is 11.711 ms (14.5%) and `tensor_mul` is
+    /// **16.753 ms (20.7%)** — the mask multiply costing more than the whole forward convolution,
+    /// which for a 5.24M-element elementwise product is only explicable as a second convolution.
+    ///
+    /// BIT-EXACT: `functional_conv2d`'s f32 grad branch produces `lhs` by calling
+    /// `conv2d_forward_f32(padded, weight, bias, ..)` with exactly the plan parameters this
+    /// closure re-passes, so reusing the stored values is the same deterministic function on the
+    /// same inputs. This is the asymmetric-dtype shape `project_asymmetric_dtype_fastpath`
+    /// records: one dtype got the reuse and its twin was left recomputing.
+    ///
+    /// DEFAULT OFF until it has a paired row.
+    fn fuse_conv2d_reuse_f32(&self) -> bool {
+        FUSE_CONV2D_REUSE_F32.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn fuse_conv2d_loss_mask_f32(
         &mut self,
         lhs: TensorNodeId,
@@ -6352,11 +6406,38 @@ impl FrankenTorchSession {
         inputs.push(rhs);
         let has_bias = plan.bias.is_some();
         let mask_index = if has_bias { 3 } else { 2 };
+        // Formed HERE, before the tape borrow, exactly as the f64 path forms its `scored`. A
+        // `RefCell<Option<..>>` because the closure is `Fn`, not `FnOnce`, and the value is
+        // consumed on the single forward call the tape makes; a later re-entry (create_graph
+        // replay) finds `None` and falls through to the recompute, which is the same answer.
+        let precomputed: std::cell::RefCell<Option<Vec<f32>>> = std::cell::RefCell::new(
+            if self.fuse_conv2d_reuse_f32() {
+                let conv_output = self.tensor_tape.values_f32_borrowed(lhs)?;
+                let mask = self.tensor_tape.values_f32_borrowed(rhs)?;
+                Some(
+                    conv_output
+                        .iter()
+                        .zip(mask)
+                        .map(|(&v, &m)| v * m)
+                        .collect::<Vec<f32>>(),
+                )
+            } else {
+                None
+            },
+        );
         let fused = self
             .tensor_tape
             .apply_function_f32_output_with_create_graph_borrowed_inputs(
                 &inputs,
                 move |_ctx, ins| {
+                    // REUSE, not recompute — see `fuse_conv2d_reuse_f32`. `precomputed` holds
+                    // `lhs * mask` formed from the convolution output `functional_conv2d` already
+                    // produced; the f64 twin has always done this, and the f32 path recomputing
+                    // the whole convolution here is what made `tensor_mul` cost more than the
+                    // forward convolution it duplicates.
+                    if let Some(scored) = precomputed.borrow_mut().take() {
+                        return Ok((scored, output_shape.clone()));
+                    }
                     let (padded_values, _) = ins[0];
                     let (weight_values, _) = ins[1];
                     let bias_values = if has_bias { Some(ins[2].0) } else { None };

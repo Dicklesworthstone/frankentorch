@@ -40790,3 +40790,66 @@ plus torch's 8 ARE the rise, and the gate needs
 `start_load >= 4 * self_load * (1 - exp(-T/60))` ~ 86 at this width — unreachable on a 32-core box,
 and **waiting for a quiet host makes it strictly worse** because `start_load` falls. The banked
 2.34-2.39x therefore STANDS; the voided runs' 2.11-2.33x are not rows and must not be quoted.
+
+---
+
+## 283. THE f32 CONV2D/MASK FUSION RECOMPUTED THE WHOLE FORWARD CONVOLUTION — the f64 twin never did
+
+`frankentorch-t1gph`. Found by attributing the TRAINING lane rather than the kernel, which nothing
+on this campaign had done: every lever so far was measured against
+`conv2d_backward_mask_fused_f32` called directly, while the board's lane is a `FrankenTorchSession`
+running `functional_conv2d -> tensor_mul(mask) -> tensor_sum -> tensor_backward` with the whole
+thing inside the clock.
+
+    TRAIN lane total                  80.836 ms
+      functional_conv2d (pad+fwd)     11.711 ms  (14.5%)
+      tensor_mul (mask)               16.753 ms  (20.7%)   <- larger than the forward convolution
+      tensor_sum                       0.448 ms  ( 0.6%)
+      tensor_backward (tape walk)     50.996 ms  (63.1%)
+      accounted 98.9%
+
+**A 5.24M-element elementwise product costing more than the convolution that produced its input is
+not a slow multiply — it is a second convolution.** It was. `fuse_conv2d_loss_mask_f32`'s forward
+closure called `ft_kernel_cpu::conv2d_forward_f32(plan.padded, plan.weight, ..)` to obtain the
+value it then multiplied by the mask. The f64 path has always done the opposite:
+
+    let conv_output = self.tensor_tape.values_borrowed(lhs)?;   // f64: REUSE
+    multiply_forward_f64(conv_output, mask)
+
+so on every f32 masked lane — the headline lane AND the training lane — the forward convolution ran
+TWICE. Textbook `project_asymmetric_dtype_fastpath`: one dtype got the reuse, its twin was left
+recomputing.
+
+Fixed by forming the product eagerly from `values_f32_borrowed(lhs)`, exactly as f64 does.
+**BIT-EXACT**: `functional_conv2d`'s f32 grad branch produces `lhs` with the same
+`conv2d_forward_f32` on the same plan inputs, so reuse is the identical deterministic function —
+verified as **0 mismatches across 5,242,880 input-gradient elements plus an identical weight
+gradient, twice, through the real session** rather than a unit fixture, because a stale cached
+value or a wrong node is a tape-level mistake no kernel test would see.
+
+    run 1  tensor_mul 18.077 -> 7.092 ms (2.5490x)   lane paired 1.0201x, marginal 1.0139x, 12/14
+    run 2  tensor_mul 17.513 -> 6.753 ms (2.5934x)   lane paired 1.0172x, marginal 1.0021x, 10/14
+
+### 283a. SHIPPED ON REDUNDANCY, NOT ON A LANE CLAIM — and the displacement is UNEXPLAINED
+
+The frame result is decisive and replicates. **The lane result is not claimed**: 10/14 is p~0.09
+and the marginal ratio fell to 1.0021 on replication, so by this campaign's own standard
+(275b: a cell whose estimators disagree has not been measured) that cell is unreliable.
+
+Roughly **9.6 of the ~11 ms shed from the frame reappears elsewhere in the lane.** That is the
+third displacement here — 276b traced its cost to first-touch, 281 to a serial prologue — and
+unlike those two **this one is not yet explained.** The likeliest cause is peak memory: forming
+the product eagerly holds `lhs`, the mask and the result live simultaneously, where the recompute
+path peaked lower. It is recorded as open rather than guessed at.
+
+Shipping anyway is right on its own terms: it deletes a duplicated O(n^3) convolution, it makes the
+f32 path consistent with its f64 twin, it is bit-exact, and no arm regressed. **A lever can be
+correct to ship and still not be a lane win, and saying which is which is the whole discipline.**
+
+### 283b. THE LESSON: attribute the LANE, not the kernel you happen to own
+
+Six shipped levers and eight refutations on this campaign were all aimed at
+`conv2d_backward_mask_fused_*`. The largest single defect in the training lane was one call
+upstream, in `tensor_mul`, and it was found the first time anyone timed the session instead of the
+kernel. **Probe the thing the board measures.** The FT-only session probe needs no PyTorch arm, so
+it runs on any rch worker and sidesteps the h2h drift gate entirely (282d).
