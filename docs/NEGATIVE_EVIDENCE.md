@@ -41209,3 +41209,47 @@ priced at 1.0583x below it (item 287), and that is the whole claim.
 
 Check the LANE INVENTORY before scoping a sweep, not after routing it: the routing is still correct
 work, but knowing this at the start would have priced the effort honestly.
+
+### 289. f32 IN-PLACE WAS 10.6x ITS OWN f64 TWIN, AND TWO OF MY THREE EXPLANATIONS WERE WRONG
+
+`frankentorch-f32-inplace-accessor-gap-5fxq2`. f32 moves HALF the bytes of f64, so an elementwise
+op should be roughly twice as FAST in f32. It was 10.6x slower (hz4, rayon=16, 4,194,304 elements,
+alternating arms, min-of-2 per rep, 0 of 12 reps faster, A/A null 1.0260 PASS). **A prediction
+registered before the run is what made the result readable** — without "~0.5x if the extra passes
+are free" written down first, 10.6x is just a number.
+
+    WRONG 1  "the f32 branch must be serial"  -- 19.98 ms for 4M IS serial-exp time.
+             A branch sentinel says parallel=19, serial=0. Refuted by my own counter.
+    WRONG 2  "three passes instead of one"    -- three passes cannot cost 10x.
+    RIGHT    in-call decomposition:  read(to_vec clone) 10.653 ms 69.2%
+                                     map                 3.109 ms 20.2%
+                                     writeback           1.640 ms 10.6%
+
+The clone is a fresh 16 MB allocation whose FIRST TOUCH is serial page faults (item 276b's vein).
+The fix is to not allocate, not to allocate faster: one in-place pass through a new
+`update_contiguous_values_f32_with`, giving f32/f64 **10.62x -> 1.0349x** paired (marginal 1.0324x,
+estimators agree; absolute 19.374 -> 1.911 ms).
+
+**The accessor was not missing the way the bead claimed.** `contiguous_values_f32_mut` already
+existed. It is the wrong tool because it does NOT bump `version`, and a silent in-place mutation
+that leaves the version unchanged is the open `no version check at backward` defect. Mirror the f64
+entry point instead of reaching for the raw `&mut`.
+
+### 289a. THE 10x DID NOT CLOSE THE GAP — BUILD THE LANE BEFORE DECLARING VICTORY
+
+The in-place family had NO h2h lane in any dtype, which is how a 10.6x internal anomaly survived.
+Built one (`inplace_neg_f32`, `inplace_exp_f32`) and the answer was not the flattering one:
+
+    inplace_neg_f32   FT 0.644 ms  PT 0.295 ms   FT 2.18x SLOWER
+    thinkstation1, rayon=16, torch 2.12.1+cpu, ELF d807a452bef9b1c2, REPS=32,
+    PT null PASS [0.815,1.232]  FT null PASS [0.948,1.016]  parity match, drift PASS
+
+**A 10x self-speedup that leaves you 2-3x behind the incumbent is not a finish line**, and only the
+lane can tell you which one you are looking at. Pick the certifying op for PARITY, not
+convenience: `neg_` is exact in both dtypes so its checksum can only fail on a real disagreement,
+whereas `exp_` (f64-then-narrow vs native f32) is a tolerance lane by construction.
+
+Honest range, not a point: neg_ read 1.40x / 2.18x / 2.63x over three invocations and the movement
+is almost entirely the INCUMBENT (0.445 / 0.295 / 0.243 ms) while ours barely moved. exp_ read
+2.67-2.95x and never cleared both nulls in a drift-clean window — at 64 reps it passed BOTH nulls
+but the host drifted 1.27x, so that row is refused rather than quoted.
