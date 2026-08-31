@@ -427,6 +427,58 @@ fn main() {
     );
 
     // ---------------------------------------------------------------------------------------
+    // WHERE THE ~6 ms ACTUALLY IS — `frankentorch-t1gph`, ledger 276d.
+    //
+    // The deficit map left a residual I refused to name: the tiled `dout_flat` build (2.668 ms)
+    // plus the direct dinput kernel (~11.3 ms) is ~14.0 ms, against a measured 20.037 ms for the
+    // fused dinput-only entry. Six milliseconds unaccounted, and the tempting stories — first
+    // touch on the fresh 21 MB `dout_flat`, or on the 23.7 MB output — are exactly the kind of
+    // plausible attribution that item 276a already punished on this bead (18 ms claimed, 4 ms
+    // real).
+    //
+    // So this reads COUNTERS INSIDE THE ENTRY instead of subtracting arms. The three frames are
+    // timed where they happen, and the entry's own wall clock is timed around all of them. What
+    // the frames do not account for is then genuinely OUTSIDE all three — the `Vec` allocations
+    // and their first touch, and the return — which is a different lever from any of the three and
+    // cannot be reached by tuning them.
+    //
+    // Both `output_mask` shapes are run because they answer different questions: dinput-only is
+    // the arm the 20.037 ms figure came from, and dinput+dweight is the arm the lane actually
+    // executes.
+    for (label, om) in [
+        ("dinput ONLY      ", [true, false, false]),
+        ("dinput + dweight ", [true, true, false]),
+    ] {
+        let mut entry = f64::INFINITY;
+        let mut best_dout = f64::INFINITY;
+        let mut best_dw = f64::INFINITY;
+        let mut best_di = f64::INFINITY;
+        for rep in 0..reps {
+            let _ = ft_kernel_cpu::masked_frame_take_ns();
+            let start = Instant::now();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                om,
+            );
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&out);
+            let (d_ns, w_ns, i_ns) = ft_kernel_cpu::masked_frame_take_ns();
+            if rep > 0 {
+                entry = entry.min(ms);
+                best_dout = best_dout.min(d_ns as f64 / 1e6);
+                best_dw = best_dw.min(w_ns as f64 / 1e6);
+                best_di = best_di.min(i_ns as f64 / 1e6);
+            }
+        }
+        let accounted = best_dout + best_dw + best_di;
+        eprintln!(
+            "F32_FRAMES {label} entry {entry:7.3} ms = dout_flat {best_dout:6.3} + dweight {best_dw:7.3} + dinput {best_di:7.3}  -> accounted {:5.1}%, OUTSIDE all three {:6.3} ms",
+            100.0 * accounted / entry,
+            entry - accounted
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
     // THE PAIRED ROW FOR THE TILED dout_flat LEVER — `frankentorch-t1gph`.
     //
     // The tiled build shipped on FRAME evidence (4.017 -> 2.784 ms on the build loop, bitwise

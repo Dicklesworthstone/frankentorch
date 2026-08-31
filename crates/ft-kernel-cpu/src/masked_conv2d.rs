@@ -21,6 +21,29 @@ pub fn set_masked_dout_tiled(on: bool) -> bool {
     MASKED_DOUT_TILED.swap(on, Ordering::Relaxed)
 }
 
+/// Per-frame wall time inside the f32 fused backward. `frankentorch-t1gph`.
+///
+/// These exist because a SUBTRACTION between two probe arms left ~6 ms unexplained: the tiled
+/// `dout_flat` build (2.668 ms) plus the direct dinput kernel (~11.3 ms) is ~14.0 ms against a
+/// measured 20.037 ms for the fused dinput-only entry. Item 276a is this bead's own example of
+/// what naming such a gap costs — 18 ms was claimed there and the truth was 4 ms — so the gap gets
+/// counters INSIDE the entry rather than a story. Whatever the three frames do not account for is
+/// then genuinely outside them (allocation, first touch, return), which is a different lever from
+/// any of the three.
+static MASKED_DOUT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MASKED_DWEIGHT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MASKED_DINPUT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drain the f32 fused backward's `(dout_flat, dweight, dinput)` frames, in nanoseconds.
+#[doc(hidden)]
+pub fn masked_frame_take_ns() -> (u64, u64, u64) {
+    (
+        MASKED_DOUT_NS.swap(0, Ordering::Relaxed),
+        MASKED_DWEIGHT_NS.swap(0, Ordering::Relaxed),
+        MASKED_DINPUT_NS.swap(0, Ordering::Relaxed),
+    )
+}
+
 fn masked_dout_tiled() -> bool {
     MASKED_DOUT_TILED.load(Ordering::Relaxed)
 }
@@ -246,6 +269,7 @@ pub fn conv2d_backward_mask_fused_f32(
     debug_assert_eq!(incoming.len(), batch * out_ch * patch_count);
     debug_assert_eq!(mask.len(), incoming.len());
 
+    let dout_start = std::time::Instant::now();
     let dout_flat = if output_mask[0] || output_mask[1] {
         super::build_uninit(flat * out_ch, |flat_grad: &mut [f32]| {
             // TILED TRANSPOSE — `frankentorch-t1gph`. This is a transpose: the source is laid out
@@ -307,6 +331,9 @@ pub fn conv2d_backward_mask_fused_f32(
         Vec::new()
     };
 
+    MASKED_DOUT_NS.fetch_add(dout_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    let dweight_start = std::time::Instant::now();
     let dweight = output_mask[1].then(|| {
         // STREAMED dweight, f32 — `frankentorch-hi9r6`. Same second-copy hazard the f64 half
         // had: this fused entry does NOT delegate to `conv2d_backward_f32`, it keeps its own
@@ -327,6 +354,9 @@ pub fn conv2d_backward_mask_fused_f32(
         })
     });
 
+    MASKED_DWEIGHT_NS.fetch_add(dweight_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    let dinput_start = std::time::Instant::now();
     let dpadded = output_mask[0].then(|| {
         if super::conv2d_dinput_blocked_any(batch, in_ch) {
             return super::conv2d_backward_dinput_direct_f32(
@@ -351,6 +381,8 @@ pub fn conv2d_backward_mask_fused_f32(
         });
         super::conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
     });
+
+    MASKED_DINPUT_NS.fetch_add(dinput_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let dbias = output_mask[2].then(|| {
         let mut dbias = vec![0.0f32; out_ch];

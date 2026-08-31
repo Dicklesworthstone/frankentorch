@@ -10,7 +10,8 @@ mod masked_conv2d;
 pub mod pool;
 
 pub use masked_conv2d::{
-    conv2d_backward_mask_fused_f32, conv2d_backward_mask_fused_f64, set_masked_dout_tiled,
+    conv2d_backward_mask_fused_f32, conv2d_backward_mask_fused_f64, masked_frame_take_ns,
+    set_masked_dout_tiled,
 };
 
 use rayon::prelude::*;
