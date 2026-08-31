@@ -27523,6 +27523,179 @@ pub fn cholesky_stage_take_ns() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Which formulation the Cholesky PANEL uses. `frankentorch-valnx`.
+///
+/// 0 = SHIPPED serial per-column dots. 1 = the same dots with the independent rows fanned out.
+/// 2 = the same dots batched FOUR ROWS AT A TIME over one pass of the diagonal row.
+///
+/// Ledger 292a measured the panel at 96.5% per-column sub-diagonal row dots and 0.81 GFLOP/s
+/// against the trailing update's ~90, so this is where the phase's time is. The arms exist to be
+/// MEASURED against each other at panel shapes, not to be chosen by preference: a column carries
+/// ~2,730 multiply-accumulates and ~6.7 us, and item 255 priced a rayon fork on this host at
+/// ~7 us — the fork is the same order as the work, which is exactly the hazard that killed the
+/// small in-place ops.
+///
+/// ALL THREE ARE BIT-EXACT WITH EACH OTHER. Every arm computes each row's dot with the identical
+/// four-chain FMA sequence and the identical `(s0+s1)+(s2+s3)` reduction; only which thread runs a
+/// row, or how many rows share one pass over the diagonal row, changes. No accumulation order
+/// moves, so no tolerance argument is needed and none is offered.
+///
+/// MEASURED, AND BOTH ALTERNATIVES ARE REFUTED — ledger 292b. Isolation at real panel shapes,
+/// thinkstation1, rayon=16, n=512, min of 31, three runs, bitwise identical at every shape:
+///
+///     nb      arm 1 (parallel rows)        arm 2 (level-2, 4 rows/pass)
+///     16      0.011 / 0.010 / 0.010        1.053 / 1.199 / 1.234
+///     32      0.036 / 0.028 / 0.023        1.326 / 0.985 / 0.940
+///     64      0.089 / 0.082 / 0.086        0.794 / 0.976 / 1.014
+///     96      0.207 / 0.162 / 0.176        1.115 / 0.945 / 1.023
+///     128     0.318 / 0.261 / 0.280        1.047 / 1.014 / 1.015
+///
+/// **Arm 1 is a 3.5x loss at the shipped nb=128 and a 100x loss at nb=16**, worsening as nb
+/// shrinks — the fork is the same order as the column's entire work, exactly as the pre-registered
+/// prediction said. **Arm 2 is flat**: 1.015x median at nb=128, and its one promising cell
+/// (nb=32, 1.326x) does not replicate.
+///
+/// THE REAL FINDING IS THE RATE. Every arm sits at 0.5-0.9 GFLOP/s against the trailing update's
+/// ~90. Neither dispatch nor diagonal-row traffic is the constraint, so the panel is limited by
+/// the dependent FMA chain itself — the third possibility the probe registered before running, and
+/// the one that means neither formulation is the lever.
+///
+/// KEPT AT MODE 0, inert and bit-exact under test, so the next reader finds the measurement rather
+/// than rebuilding it. REOPEN only for a formulation that changes the RATE — a genuine level-3
+/// recast (recursive/blocked panel, so the inner work becomes a real GEMM), not another schedule
+/// for the same scalar chain.
+static CHOLESKY_PANEL_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Select the panel formulation, returning the previous setting. `frankentorch-valnx`.
+#[doc(hidden)]
+pub fn set_cholesky_panel_mode(mode: u8) -> u8 {
+    CHOLESKY_PANEL_MODE.swap(mode, LuOrdering::Relaxed)
+}
+
+/// Probe shim: factor ONE panel in place at the current mode, so the arms can be compared at real
+/// panel shapes without a whole factorisation around them. `frankentorch-valnx`.
+#[doc(hidden)]
+pub fn probe_cholesky_panel_factor(
+    l: &mut [f64],
+    n: usize,
+    jb: usize,
+    je: usize,
+) -> Result<(), KernelError> {
+    cholesky_panel_factor_f64(l, n, jb, je)
+}
+
+/// One panel of the blocked Cholesky: factor `l[jb..je, jb..je]` in place, lower triangle.
+fn cholesky_panel_factor_f64(
+    l: &mut [f64],
+    n: usize,
+    jb: usize,
+    je: usize,
+) -> Result<(), KernelError> {
+    let census = CHOLESKY_PANEL_CENSUS_ENABLED.load(LuOrdering::Relaxed);
+    let mode = CHOLESKY_PANEL_MODE.load(LuOrdering::Relaxed);
+    for jj in jb..je {
+        let diagonal = jj * n;
+        let diag_started = census.then(std::time::Instant::now);
+        let s = cholesky_panel_dot_sub_f64(
+            l[diagonal + jj],
+            &l[diagonal + jb..diagonal + jj],
+            &l[diagonal + jb..diagonal + jj],
+        );
+        if s <= 0.0 {
+            return Err(KernelError::NotPositiveDefinite);
+        }
+        let d = s.sqrt();
+        l[jj * n + jj] = d;
+        if let Some(started) = diag_started {
+            CHOLESKY_PANEL_DIAG_NS
+                .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        }
+        let rows_started = census.then(std::time::Instant::now);
+        let rows = je - jj - 1;
+        if rows > 0 {
+            // The rows below the diagonal are INDEPENDENT: row `ii` reads only its own
+            // `l[ii, jb..jj]` and the shared diagonal row `l[jj, jb..jj]`, and writes only
+            // `l[ii, jj]`. `split_at_mut` at row `jj+1` proves that to the borrow checker —
+            // the diagonal row lives in `head`, every target row in `tail`.
+            let (head, tail) = l.split_at_mut((jj + 1) * n);
+            let drow = &head[diagonal + jb..diagonal + jj];
+            let len = jj - jb;
+            match mode {
+                1 => {
+                    use rayon::prelude::*;
+                    tail[..rows * n]
+                        .par_chunks_mut(n)
+                        .for_each(|row| {
+                            let t = cholesky_panel_dot_sub_f64(row[jj], &row[jb..jj], drow);
+                            row[jj] = t / d;
+                        });
+                }
+                2 => {
+                    // FOUR ROWS PER PASS over `drow`. Each row keeps its OWN four FMA chains in
+                    // the same order as `cholesky_panel_dot_sub_f64`, so the arithmetic per row is
+                    // unchanged and the result is bit-exact; what changes is that one traversal of
+                    // the diagonal row now serves four rows, and sixteen independent chains are in
+                    // flight instead of four.
+                    let mut chunks = tail[..rows * n].chunks_mut(4 * n);
+                    let mut base = jj + 1;
+                    while let Some(block) = chunks.next() {
+                        let nrows = block.len() / n;
+                        if nrows == 4 {
+                            let (r0, rest) = block.split_at_mut(n);
+                            let (r1, rest) = rest.split_at_mut(n);
+                            let (r2, r3) = rest.split_at_mut(n);
+                            let mut a = [[0.0f64; 4]; 4];
+                            let mut p = 0;
+                            while p + 4 <= len {
+                                for (c, acc) in a.iter_mut().enumerate() {
+                                    let rp = drow[p + c];
+                                    acc[0] = (-r0[jb + p + c]).mul_add(rp, acc[0]);
+                                    acc[1] = (-r1[jb + p + c]).mul_add(rp, acc[1]);
+                                    acc[2] = (-r2[jb + p + c]).mul_add(rp, acc[2]);
+                                    acc[3] = (-r3[jb + p + c]).mul_add(rp, acc[3]);
+                                }
+                                p += 4;
+                            }
+                            let rows_mut = [r0, r1, r2, r3];
+                            for (k, row) in rows_mut.into_iter().enumerate() {
+                                let mut v = row[jj];
+                                v += (a[0][k] + a[1][k]) + (a[2][k] + a[3][k]);
+                                let mut q = p;
+                                while q < len {
+                                    v = (-row[jb + q]).mul_add(drow[q], v);
+                                    q += 1;
+                                }
+                                row[jj] = v / d;
+                            }
+                        } else {
+                            for row in block.chunks_mut(n) {
+                                let t = cholesky_panel_dot_sub_f64(row[jj], &row[jb..jj], drow);
+                                row[jj] = t / d;
+                            }
+                        }
+                        base += nrows;
+                    }
+                    let _ = base;
+                }
+                _ => {
+                    for row in tail[..rows * n].chunks_mut(n) {
+                        let t = cholesky_panel_dot_sub_f64(row[jj], &row[jb..jj], drow);
+                        row[jj] = t / d;
+                    }
+                }
+            }
+        }
+        if let Some(started) = rows_started {
+            CHOLESKY_PANEL_ROWS_NS
+                .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            CHOLESKY_PANEL_COLS.fetch_add(1, LuOrdering::Relaxed);
+            let macs = (jj - jb) as u64;
+            CHOLESKY_PANEL_MACS.fetch_add(macs * (rows as u64 + 1), LuOrdering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
 /// Subtract a short dot product using four independent FMA chains. The blocked
 /// Cholesky path already has tolerance (rather than bitwise) parity because its
 /// rank-NB update reassociates the factorization; this removes the single
@@ -27606,45 +27779,7 @@ pub fn cholesky_contiguous_f64(
 
         // 1. Factor the diagonal block l[jb:je, jb:je] (lower) in place.
         let panel_started = std::time::Instant::now();
-        let census = CHOLESKY_PANEL_CENSUS_ENABLED.load(LuOrdering::Relaxed);
-        for jj in jb..je {
-            let diagonal = jj * n;
-            let diag_started = census.then(std::time::Instant::now);
-            let s = cholesky_panel_dot_sub_f64(
-                l[diagonal + jj],
-                &l[diagonal + jb..diagonal + jj],
-                &l[diagonal + jb..diagonal + jj],
-            );
-            if s <= 0.0 {
-                return Err(KernelError::NotPositiveDefinite);
-            }
-            let d = s.sqrt();
-            l[jj * n + jj] = d;
-            if let Some(started) = diag_started {
-                CHOLESKY_PANEL_DIAG_NS
-                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
-            }
-            let rows_started = census.then(std::time::Instant::now);
-            for ii in (jj + 1)..je {
-                let row = ii * n;
-                let t = cholesky_panel_dot_sub_f64(
-                    l[row + jj],
-                    &l[row + jb..row + jj],
-                    &l[diagonal + jb..diagonal + jj],
-                );
-                l[ii * n + jj] = t / d;
-            }
-            if let Some(started) = rows_started {
-                CHOLESKY_PANEL_ROWS_NS
-                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
-                CHOLESKY_PANEL_COLS.fetch_add(1, LuOrdering::Relaxed);
-                // Multiply-accumulates: the diagonal dot is (jj-jb) long, and each of the
-                // (je-jj-1) rows below it does another dot of the same length.
-                let len = (jj - jb) as u64;
-                let rows = (je - jj - 1) as u64;
-                CHOLESKY_PANEL_MACS.fetch_add(len * (rows + 1), LuOrdering::Relaxed);
-            }
-        }
+        cholesky_panel_factor_f64(&mut l, n, jb, je)?;
 
         CHOLESKY_PANEL_NS.fetch_add(
             panel_started.elapsed().as_nanos() as u64,
@@ -70215,6 +70350,67 @@ mod tests {
     }
 
     #[test]
+    /// `frankentorch-valnx`: the three PANEL formulations must agree BITWISE.
+    ///
+    /// Mode 1 fans the independent rows across the pool and mode 2 batches four rows over one
+    /// pass of the diagonal row. Neither moves any accumulation: every row is still reduced by
+    /// the same four FMA chains in the same order with the same `(s0+s1)+(s2+s3)` tail, so the
+    /// claim is bit-exactness and not tolerance — and it is executed here rather than argued,
+    /// because the identical argument was made for a hand-fused conv2d loop and was FALSE once
+    /// the microkernel contracted a multiply-add.
+    ///
+    /// n is chosen larger than NB=128 so more than one panel runs, and the shapes deliberately
+    /// include a row count that is NOT a multiple of four, which is the remainder path mode 2
+    /// would otherwise never execute.
+    #[test]
+    fn cholesky_panel_modes_agree_bitwise() {
+        for n in [130usize, 192, 259] {
+            let mut a = vec![0.0f64; n * n];
+            for i in 0..n {
+                for j in 0..i {
+                    let v = ((i * 17 + j * 31) % 23) as f64 * 0.01 - 0.1;
+                    a[i * n + j] = v;
+                    a[j * n + i] = v;
+                }
+                a[i * n + i] = n as f64;
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+            let previous = super::set_cholesky_panel_mode(0);
+            let base = super::cholesky_contiguous_f64(&a, &meta, false).expect("mode 0");
+            for mode in [1u8, 2] {
+                super::set_cholesky_panel_mode(mode);
+                let got = super::cholesky_contiguous_f64(&a, &meta, false).expect("mode");
+                assert_eq!(got.factor.len(), base.factor.len());
+                for (i, (x, y)) in got.factor.iter().zip(&base.factor).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "n={n} mode {mode} differs from mode 0 at {i}: {x:?} vs {y:?}"
+                    );
+                }
+            }
+            super::set_cholesky_panel_mode(previous);
+
+            // Non-vacuity: the factor must actually be a factorisation, or three modes could
+            // agree on garbage. Check the lower triangle reconstructs A.
+            let l = &base.factor;
+            for i in 0..n.min(24) {
+                for j in 0..=i.min(23) {
+                    let mut acc = 0.0f64;
+                    for k in 0..=j {
+                        acc += l[i * n + k] * l[j * n + k];
+                    }
+                    let want = a[i * n + j];
+                    assert!(
+                        (acc - want).abs() <= 1e-8 * want.abs().max(1.0),
+                        "n={n} reconstruction failed at ({i},{j}): {acc} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
     fn cholesky_blocked_phase_counters_cover_each_live_stage() {
         // n > NB makes the production path execute a panel, parallel-row TRSM,
         // trailing rank-NB update, and final strict-upper zeroing.
