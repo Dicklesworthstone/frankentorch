@@ -172,6 +172,10 @@ struct Arm {
     /// (`frankentorch-rpytm`). Bit-identical either way, so this pair can move time and cannot
     /// move a number. `FT_SUBSER=0,1` prices lu_factor's only parallelism in ONE invocation.
     sub_serial: bool,
+    /// `frankentorch-valnx`: whether `dgemm_sub_into` may tile BOTH output axes when the column
+    /// split alone cannot fill the pool. `FT_SUBTILE=0,1` prices it against the live incumbent
+    /// inside ONE invocation.
+    sub_tile_2d: bool,
     /// Forced column-block WIDTH for the trailing-update GEMM; `0` = the thread-derived
     /// default (`frankentorch-rpytm`). `block_cols` divides by `rayon::current_num_threads()`,
     /// so width and thread count move together by default and a thread sweep cannot separate
@@ -259,6 +263,7 @@ fn arm_label(arm: Arm) -> String {
         "/replay-rowmajor"
     } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
+        + if arm.sub_tile_2d { "/sub2D" } else { "/subCOL" }
         + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
         + &(match arm.panel_par_min {
             Some(v) => format!("/ppm{v}"),
@@ -423,6 +428,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
     let previous_eigvalsh_ggs = ft_kernel_cpu::set_eigvalsh_grouped_ggs(arm.grouped_ggs);
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
+    let previous_subtile = ft_kernel_cpu::set_dgemm_sub_tile_2d(arm.sub_tile_2d);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
@@ -474,6 +480,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
+        ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -510,6 +517,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
+        ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -604,6 +612,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
     ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
+    ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -825,6 +834,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .collect();
+    // `frankentorch-valnx`: same shape as FT_SUBSER — a comma list makes each value its own ARM,
+    // interleaved against the others in one invocation, so the pair is priced against a live
+    // incumbent rather than across windows.
+    let subtiles: Vec<bool> = std::env::var("FT_SUBTILE")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|v| v.trim().parse::<u8>().ok())
+                .map(|v| v == 1)
+                .collect()
+        })
+        .unwrap_or_else(|| vec![false]);
     let ggs_arms: Vec<bool> = std::env::var("FT_GGS")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -881,6 +902,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for &replay_transposed in &replays {
                         for &grouped_ggs in &ggs_arms {
                             for &sub_serial in &subsers {
+                            for &sub_tile_2d in &subtiles {
                                 for &sub_cols in &subcols {
                                   for &panel_par_min in &ppms {
                                    for &tred2_par_min in &tpms {
@@ -903,6 +925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         replay_transposed,
                                         grouped_ggs,
                                         sub_serial,
+                                        sub_tile_2d,
                                         sub_cols,
                                         panel_par_min,
                                         tred2_par_min,
@@ -926,6 +949,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                    }
                                   }
                                 }
+                            }
                             }
                         }
                     }
@@ -1317,14 +1341,17 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // contended sample. A single sample of anything on this host is not a measurement.
         const PHASE_CALLS: usize = 3;
         let mut branches = vec![(0u64, 0u64, 0u64); arms.len()];
+        let mut sub_arms = vec![(0u64, 0u64); arms.len()];
         let mut phases = vec![(0u64, 0u64, 0u64); arms.len()];
         for (idx, &arm) in arms.iter().enumerate() {
             let mut samples: Vec<(u64, u64, u64)> = Vec::with_capacity(PHASE_CALLS);
             for _ in 0..PHASE_CALLS {
                 let _ = ft_kernel_cpu::bidiag_parallel_branches_take();
+                let _ = ft_kernel_cpu::dgemm_sub_arm_hits_take();
                 let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
                 let _ = ft_one(n, &data, arm, ft_op);
                 branches[idx] = ft_kernel_cpu::bidiag_parallel_branches_take();
+                sub_arms[idx] = ft_kernel_cpu::dgemm_sub_arm_hits_take();
                 samples.push(ft_kernel_cpu::svd_reduction_sweep_ns_take());
             }
             let mut reduction: Vec<u64> = samples.iter().map(|s| s.0).collect();
@@ -1428,12 +1455,14 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             println!(
                 "  arm={:<16} min {min:8.3} ms  median {med:8.3} ms  PT-beside-it min \
                  {:8.3} ms  paired-vs-PT {}  paired-vs-arm0 {:.3}x  branches {:?}  \
+                 dgemm_sub(2d,col) {:?}  \
                  parity rel {rel:.2e} {}",
                 arm_label(*arm),
                 pt_ms[idx].iter().copied().fold(f64::INFINITY, f64::min),
                 ratio_label(median(&mut vs_pt)),
                 median(&mut vs_arm0),
                 branches[idx],
+                sub_arms[idx],
                 if rel < 1e-9 { "MATCH" } else { "MISMATCH" }
             );
             let (reduction, form_pq, sweep) = phases[idx];

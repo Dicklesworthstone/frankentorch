@@ -167,6 +167,14 @@ mod gemm {
         DGEMM_SUB_TILE_2D.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many `dgemm_sub_into` calls took the 2-D arm, and how many the column split.
+    /// `frankentorch-valnx`. A lever that silently never fires reads as a null, and the lane
+    /// difference here is ~1% — well inside what one window's noise can produce.
+    pub(crate) static DGEMM_SUB_TILE_HITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static DGEMM_SUB_COL_HITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
         rayon::current_num_threads() > 1
@@ -786,6 +794,7 @@ mod gemm {
             && m * n >= TILE_2D_MIN_AREA
         {
             let (mb2, nb2) = tile_shape(m, n);
+            DGEMM_SUB_TILE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (0..n.div_ceil(nb2)).into_par_iter().for_each(|j_blk| {
                 let cp = &cp;
                 let j0 = j_blk * nb2;
@@ -822,6 +831,7 @@ mod gemm {
             });
             return;
         }
+        DGEMM_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
             let cp = &cp;
             let n0 = blk * nb;
@@ -34803,6 +34813,15 @@ pub fn set_dgemm_sub_serial(on: bool) -> bool {
 #[doc(hidden)]
 pub fn set_dgemm_sub_tile_2d(on: bool) -> bool {
     gemm::DGEMM_SUB_TILE_2D.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drain `dgemm_sub_into`'s arm counts as `(tiled_2d, column_split)`. `frankentorch-valnx`.
+#[doc(hidden)]
+pub fn dgemm_sub_arm_hits_take() -> (u64, u64) {
+    (
+        gemm::DGEMM_SUB_TILE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        gemm::DGEMM_SUB_COL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 #[doc(hidden)]
