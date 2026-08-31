@@ -1166,9 +1166,9 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
     let py = format!("{py_setup}{SAMPLE_LOOP_PY}");
 
     println!(
-        "measurement=SVD FORWARD ONLY (full U,S,Vh); estimator=min over {rounds} rounds, every \
-         arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first \
-         round discarded; every ratio is the median of the PAIRED per-round ratio"
+        "measurement={ft_op:?}; estimator=min over {rounds} rounds, every arm AND the incumbent \
+         sampled once per round, arm order reversed on odd rounds, first round discarded; every \
+         ratio is the median of the PAIRED per-round ratio"
     );
     println!(
         "elf_sha256={}",
