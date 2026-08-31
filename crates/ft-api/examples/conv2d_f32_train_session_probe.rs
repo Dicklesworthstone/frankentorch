@@ -210,6 +210,103 @@ fn main() {
     );
     eprintln!("TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms");
 
+    // THE ALLOCATOR-WARMTH TEST -- `frankentorch-t1gph`, ledger 283d.
+    //
+    // The reuse lever sheds ~11 ms from `tensor_mul` and the BACKWARD gains ~10 ms, replicated
+    // across two 40-sample windows. My first explanation (the tape re-invokes the forward closure
+    // and the one-shot cache falls through) was REFUTED by a counter: the closure runs exactly
+    // once in each arm. The standing hypothesis is allocator warmth -- the recompute arm allocates
+    // and drops a transient 21 MB `out` buffer inside the closure, leaving a block of exactly that
+    // size on the free list for the backward to reuse, while the reuse arm never creates it.
+    //
+    // THIS TESTS THE HYPOTHESIS WITHOUT WRITING A LEVER FOR IT. A third arm runs the reuse path
+    // but allocates and drops an equivalent dummy buffer first, priming the free list the same way
+    // the recompute incidentally did. Three pre-specified outcomes:
+    //   * dummy ~= recompute  -> allocator warmth CONFIRMED, and a backward-side buffer reuse is
+    //     worth ~10 ms of a ~95 ms lane;
+    //   * dummy ~= reuse      -> REFUTED, the free list is not the mechanism and the backward's
+    //     extra time is something else;
+    //   * in between          -> partial, and the remainder still needs a name.
+    // A few lines either way, versus a kernel's worth of work to find out by shipping.
+    {
+        let once = |reuse: bool, prime: bool| -> f64 {
+            let prev = ft_api::set_fuse_conv2d_reuse_f32(reuse);
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(values.clone(), vec![BATCH, IN_CH, H, W], true)
+                .expect("leaf x");
+            let w = session
+                .tensor_variable_f32(weights.clone(), vec![OUT_CH, IN_CH, K, K], true)
+                .expect("leaf w");
+            let m = session
+                .tensor_variable_f32(mask.clone(), vec![BATCH, OUT_CH, H, W], false)
+                .expect("leaf mask");
+            let lane0 = Instant::now();
+            let out = session
+                .functional_conv2d(x, w, None, (1, 1), (1, 1))
+                .expect("conv2d");
+            let scored = session.tensor_mul(out, m).expect("mask multiply");
+            if prime {
+                // Same element count as the `out` buffer the recompute arm drops. Touched so the
+                // pages are really faulted in, then dropped, leaving it on the free list.
+                let mut dummy = vec![0.0f32; BATCH * OUT_CH * H * W];
+                dummy[0] = 1.0;
+                dummy[BATCH * OUT_CH * H * W - 1] = 1.0;
+                std::hint::black_box(&dummy);
+                drop(dummy);
+            }
+            let loss = session.tensor_sum(scored).expect("sum");
+            let report = session.tensor_backward(loss).expect("backward");
+            let lane = lane0.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(report.gradient(x).expect("grad").len());
+            ft_api::set_fuse_conv2d_reuse_f32(prev);
+            lane
+        };
+        let mut recompute = Vec::new();
+        let mut plain = Vec::new();
+        let mut primed = Vec::new();
+        for rep in 0..reps {
+            // Rotate the order each rep so no arm keeps a fixed slot (ledger 274c).
+            let (a, b, c) = match rep % 3 {
+                0 => (once(false, false), once(true, false), once(true, true)),
+                1 => {
+                    let x = once(true, false);
+                    let y = once(true, true);
+                    let z = once(false, false);
+                    (z, x, y)
+                }
+                _ => {
+                    let x = once(true, true);
+                    let y = once(false, false);
+                    let z = once(true, false);
+                    (y, z, x)
+                }
+            };
+            if rep == 0 {
+                continue;
+            }
+            recompute.push(a);
+            plain.push(b);
+            primed.push(c);
+        }
+        let med = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let r = med(&mut recompute.clone());
+        let pl = med(&mut plain.clone());
+        let pr = med(&mut primed.clone());
+        eprintln!(
+            "TRAIN_PRIME lane  recompute {r:8.3} ms | reuse {pl:8.3} ms | reuse+primed {pr:8.3} ms"
+        );
+        eprintln!(
+            "TRAIN_PRIME   priming recovered {:+.3} ms of the {:+.3} ms the reuse arm gives up vs recompute in the backward  ({:.0}%)",
+            pl - pr,
+            pl - r,
+            if (pl - r).abs() > 1e-9 { 100.0 * (pl - pr) / (pl - r) } else { 0.0 }
+        );
+    }
+
     // PAIRED A/B for the reuse lever, alternating square, per-rep min-of-2, median of per-rep
     // ratios, A/A null from the two same-arm samples of one rep (ledger 274c/275b). Both the LANE
     // and the tensor_mul FRAME are reported: the lever removes a duplicate convolution from the

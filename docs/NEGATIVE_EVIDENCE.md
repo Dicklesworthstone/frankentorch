@@ -40924,3 +40924,33 @@ estimator (1.0021-1.0139), which is the conservative one here; the paired estima
 agree and are individually significant. A 1% effect is measurable on this harness — it just cannot
 be measured with fourteen paired samples, and the honest response to a marginal row is to take a
 bigger one rather than to argue about the one in hand.
+
+### 283f. ALLOCATOR WARMTH IS REFUTED TOO — two mechanisms down, the displacement is still unnamed
+
+283d refuted the closure-re-entry explanation with a counter and left allocator warmth as the
+standing hypothesis: the recompute arm allocates and drops a transient 21 MB `out` buffer inside
+the fusion closure, priming the free list for the backward, while the reuse arm never creates it.
+
+Tested directly, without writing a lever for it — a third arm runs the reuse path but allocates,
+touches and drops an equivalent dummy buffer before the backward, priming the free list the same
+way the recompute incidentally did. Outcomes were pre-specified: dummy ~= recompute confirms,
+dummy ~= reuse refutes, in between is partial.
+
+    lane  recompute 96.790 ms | reuse 95.277 ms | reuse+primed 95.142 ms
+    priming recovered +0.134 ms
+
+**REFUTED.** Priming recovers 0.134 ms — nothing. The free list is not the mechanism.
+
+So the ~10 ms the backward gains when the multiply sheds it has now survived TWO refuted
+explanations. What remains untested is CACHE rather than allocator: in the recompute arm the
+fusion's closure reads the whole 23.7 MB `padded` buffer to redo the convolution, leaving it warm
+for the backward that reads it again; the reuse arm never touches `padded` in the forward, so the
+backward reads it cold. That is a different experiment and it is NOT run here — it is recorded as
+the next hypothesis, not as an answer.
+
+**Two cheap refutations beat one expensive lever.** Both mechanisms were plausible, one of them was
+written into the source as though established, and each cost a few lines to kill. The practical
+consequence is that the ~10 ms is not cheaply recoverable — no lever follows from it yet, and the
+confirmed ~1.01x (283e) stands on its own without needing the displacement explained.
+
+The run also supplies a fifth independent positive lane reading: 96.790 -> 95.277 ms = 1.0159x.
