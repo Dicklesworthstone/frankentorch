@@ -39940,3 +39940,50 @@ vs-incumbent rows; this is the same failure inside an arm-internal decomposition
 easier to forget because there is no incumbent to remind you. Two hosts disagreed by 1.3x on which
 half dominates — enough to aim a lever at the wrong one, which is exactly what items 267-269 did
 by spending four candidates on dinput.
+
+## 271. THE f32 TRAINING LEVER IS 1.71-1.79x ACROSS SEVEN WINDOWS — AND ITS STANDING IS STILL UNQUOTABLE BECAUSE THE INCUMBENT MOVES 1.65x BETWEEN DRIFT-CLEAN WINDOWS
+
+`frankentorch-hi9r6`, `frankentorch-0icdh`. Three more windows on the parked standing, elf
+`13a0a9eab3d07304`, thinkstation1, RAYON=16, live PyTorch 2.12.1 in the same invocation, 32
+rounds, guard PASS on all three:
+
+    win  drift  FT train   PT      standing   FT dwpanel   PT      PAIRED   PT control
+     1   FAIL   67.450   32.633    2.07x      120.385    32.541   1.785x    0.997
+     2   PASS   70.687   33.350    2.12x      120.962    33.781   1.711x    1.013
+     3   PASS   68.625   20.271    3.39x      121.648    20.846   1.773x    1.028
+
+Sentinel 160 / 0 in every window; parity `match` on every arm.
+
+### 271a. THE LEVER IS SETTLED
+
+**PAIRED 1.711-1.785x, median 1.773x**, and with the four earlier windows that is **seven
+independent measurements spanning 1.689-1.785x**. Our two arms are extraordinarily stable across
+these three: 67.45 / 70.69 / 68.63 (spread 1.048x) and 120.4 / 121.0 / 121.6 (spread **1.010x**).
+The PT control is inside 3% every window. There is nothing left to establish about the lever.
+
+### 271b. THE STANDING IS NOT, AND THE REASON IS THE INCUMBENT
+
+The standing reads **2.07x, 2.12x, 3.39x** — entirely because PyTorch's own arm read 32.633,
+33.350, then **20.271 ms**. That is a **1.65x swing in the incumbent** while our arms moved under
+5%.
+
+**Windows 2 and 3 BOTH PASSED the drift gate**, and they disagree about the standing by 1.6x. That
+is the finding: **the drift gate watches OUR host's load, not the incumbent's stability.** A row
+can be drift-clean, guard-clean, and A/A-clean on our side while the thing it is measured against
+moved by more than the effect being claimed. PyTorch's A/A null read OFFSET in most of these
+windows, which is the gate that does see it — and it is the one that has refused this lane's
+standing seven times now.
+
+### 271c. WHAT TO DO WITH THAT
+
+**Stop trying to bank a vs-PyTorch standing for `conv2d_f32_masked_train` on this host.** Four
+sessions of windows have produced 1.96x, 2.07x, 2.12x, 2.22x, 2.39x, 3.20x, 3.39x, 3.45x, 3.56x —
+a 1.8x spread driven by the incumbent, not by us. The PAIRED figure is what this lane can support,
+and it is well established. A standing needs either a host where torch holds still or many more
+windows than the effect warrants, and neither is worth the fleet time given the lever is already
+settled.
+
+**The transferable form: when the incumbent is noisier than the effect, a paired FT-vs-FT figure
+is not a weaker substitute for a standing — it is the only honest measurement available**, and
+continuing to chase the standing converts a solid result into a coin flip about which window you
+quote.
