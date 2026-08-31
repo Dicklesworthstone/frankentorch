@@ -1097,6 +1097,27 @@ pub struct TensorSchedulerTelemetry {
     pub reentrant_depth: usize,
     pub reentrant_guard_triggered: bool,
     pub hardened_fallback_used: bool,
+    /// Wall-clock decomposition of the first-order tensor-tape backward. The
+    /// category fields are subsets of `node_dispatch_ns`; they make a live tape
+    /// frame measurable without inferring it by subtracting unrelated calls.
+    pub machinery: TensorBackwardMachineryTelemetry,
+}
+
+/// In-context timing for the first-order tensor-tape backward path.
+///
+/// This is diagnostic telemetry only: timings do not participate in scheduling,
+/// gradients, or the deterministic scheduler contract. `sum_dispatch_ns`,
+/// `pad_dispatch_ns`, and `custom_function_dispatch_ns` are overlapping named
+/// subsets of `node_dispatch_ns` for the three frames in the f32 training lane.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TensorBackwardMachineryTelemetry {
+    pub setup_ns: u64,
+    pub loop_ns: u64,
+    pub hook_ns: u64,
+    pub node_dispatch_ns: u64,
+    pub sum_dispatch_ns: u64,
+    pub pad_dispatch_ns: u64,
+    pub custom_function_dispatch_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -11872,6 +11893,7 @@ impl TensorTape {
             return Err(AutogradError::TensorRootDoesNotRequireGrad { node: root });
         }
 
+        let setup_started = std::time::Instant::now();
         let mut reentrant_guard_triggered = false;
         let mut hardened_fallback_used = false;
         if options.current_reentrant_depth > options.max_reentrant_depth {
@@ -11920,6 +11942,11 @@ impl TensorTape {
 
         let mut steps = Vec::with_capacity(self.nodes.len());
         let mut execution_order = Vec::with_capacity(self.nodes.len());
+        let mut machinery = TensorBackwardMachineryTelemetry {
+            setup_ns: u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            ..TensorBackwardMachineryTelemetry::default()
+        };
+        let loop_started = std::time::Instant::now();
 
         while let Some(node_id) = queue.pop() {
             // Move this node's accumulated gradient OUT of `grads` (no clone) and
@@ -11934,8 +11961,20 @@ impl TensorTape {
             if incoming.is_empty() && grads[node_id.0].expected_len > 0 {
                 incoming = ft_core::buffer_pool::take_zeroed(grads[node_id.0].expected_len);
             }
+            let hook_started = std::time::Instant::now();
             let incoming = self.apply_tensor_hooks(node_id, incoming)?;
+            machinery.hook_ns = machinery.hook_ns.saturating_add(
+                u64::try_from(hook_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
             execution_order.push(node_id);
+
+            let is_sum = matches!(&self.nodes[node_id.0].op, TensorNodeOp::Sum { .. });
+            let is_pad = matches!(&self.nodes[node_id.0].op, TensorNodeOp::Pad { .. });
+            let is_custom = matches!(
+                &self.nodes[node_id.0].op,
+                TensorNodeOp::CustomFunction { .. }
+            );
+            let dispatch_started = std::time::Instant::now();
 
             match self.nodes[node_id.0].op {
                 TensorNodeOp::Leaf => {
@@ -15862,7 +15901,22 @@ impl TensorTape {
                     Self::check_gradient_anomaly(true, TensorNodeId(idx), grad, op_name)?;
                 }
             }
+            let dispatch_ns =
+                u64::try_from(dispatch_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            machinery.node_dispatch_ns = machinery.node_dispatch_ns.saturating_add(dispatch_ns);
+            if is_sum {
+                machinery.sum_dispatch_ns = machinery.sum_dispatch_ns.saturating_add(dispatch_ns);
+            }
+            if is_pad {
+                machinery.pad_dispatch_ns = machinery.pad_dispatch_ns.saturating_add(dispatch_ns);
+            }
+            if is_custom {
+                machinery.custom_function_dispatch_ns = machinery
+                    .custom_function_dispatch_ns
+                    .saturating_add(dispatch_ns);
+            }
         }
+        machinery.loop_ns = u64::try_from(loop_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         let telemetry = TensorSchedulerTelemetry {
             execution_order,
@@ -15873,6 +15927,7 @@ impl TensorTape {
             reentrant_depth,
             reentrant_guard_triggered,
             hardened_fallback_used,
+            machinery,
         };
 
         self.accumulate_persistent_gradients(&gradients)?;
@@ -18684,6 +18739,7 @@ impl TensorTape {
             reentrant_depth: options.current_reentrant_depth,
             reentrant_guard_triggered: false,
             hardened_fallback_used: false,
+            machinery: TensorBackwardMachineryTelemetry::default(),
         };
 
         Ok(TensorBackwardReport {
@@ -21549,6 +21605,7 @@ mod tests {
                 reentrant_depth: 0,
                 reentrant_guard_triggered: false,
                 hardened_fallback_used: false,
+                machinery: super::TensorBackwardMachineryTelemetry::default(),
             },
         };
         drop(report);
