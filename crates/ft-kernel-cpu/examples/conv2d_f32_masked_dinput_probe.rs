@@ -130,6 +130,20 @@ fn main() {
     // REFUTES THE CANDIDATE IF ~1.0: same volume, same geometry, and the write-once direction
     // buys nothing, so the inversion would not either.
     let mut im2col = f64::INFINITY;
+    // THE dweight ROUTE ARM — `frankentorch-hi9r6`. Every probe since item 267 aimed at dinput,
+    // so this prices the half nobody looked inside.
+    //
+    // WHICH HALF IS LARGER IS HOST-DEPENDENT AND IS NOT SETTLED. fixmydocuments read dweight
+    // 27.3-35.2 against dinput 17.1-18.2 (dweight 60-65%); hetzner2 read 25.3-31.6 against
+    // 27.8-28.5 (dweight 48-53%). I briefly wrote "dweight is the larger half" here on the
+    // fixmydocuments numbers alone and it does not survive the second host. The defensible
+    // statement is that the two halves are COMPARABLE and neither is negligible.
+    //
+    // It forces the streamed dweight OFF against the shipped ON, dweight-only, both inside each
+    // rep. That does two things at once: it prices my own lever at the KERNEL level (the 1.74x
+    // in item 263 is a LANE figure), and it says how much of the remaining 27-35 ms is the panel
+    // the lever already removed versus arithmetic that no panel change can touch.
+    let mut dweight_legacy = f64::INFINITY;
 
     let mut adjoint = f64::INFINITY;
     let mut fused_both = f64::INFINITY;
@@ -170,6 +184,16 @@ fn main() {
         );
         let t_dw = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&d);
+
+        let previous_stream = ft_kernel_cpu::set_conv2d_dweight_streamed(false);
+        let start = Instant::now();
+        let dwl = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            [false, true, false],
+        );
+        let t_dw_legacy = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&dwl);
+        ft_kernel_cpu::set_conv2d_dweight_streamed(previous_stream);
 
         let start = Instant::now();
         let ic = ft_kernel_cpu::conv2d_im2col_f32(
@@ -221,6 +245,7 @@ fn main() {
             forward = forward.min(t_fw);
             col2im = col2im.min(t_col2im);
             im2col = im2col.min(t_im2col);
+            dweight_legacy = dweight_legacy.min(t_dw_legacy);
         }
     }
 
@@ -231,6 +256,7 @@ fn main() {
     eprintln!("F32_DINPUT fused mask, dinput+dweight        {fused_both:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dinput ONLY           {fused_dinput:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dweight ONLY          {fused_dweight:8.3} ms");
+    eprintln!("F32_DINPUT dweight ONLY, LEGACY panel route   {dweight_legacy:8.3} ms");
     eprintln!("F32_DINPUT fused mask, ALL-ONES mask (separator) {fused_ones_mask:8.3} ms");
     eprintln!("F32_DINPUT dinput ONLY, LEGACY panel+col2im route  {legacy_dinput:8.3} ms");
     eprintln!(
@@ -275,5 +301,12 @@ fn main() {
          volume and geometry. Much greater than 1 means writing each output ONCE is the win the \
          gather inversion would buy; ~1.0 REFUTES it before the kernel is written.",
         col2im / im2col
+    );
+    eprintln!(
+        "F32_DINPUT DWEIGHT LEVER (kernel level): legacy / streamed = {:.3}x. dweight is {:.0}% \
+         of the dinput+dweight pair on THIS host; the split is host-dependent (48-65% observed) \
+         and the two halves are comparable.",
+        dweight_legacy / fused_dweight,
+        100.0 * fused_dweight / (fused_dweight + fused_dinput)
     );
 }

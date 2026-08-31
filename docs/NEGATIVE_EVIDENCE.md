@@ -39902,3 +39902,41 @@ col2im are transposes of each other over identical volume and geometry — so th
 probe arm to test instead of a kernel to write. Three of this bead's last four candidates died
 this way, each for a single arm, and the pattern is the same every time: **find the cheapest thing
 already in the tree that embodies the claim, and measure that.**
+
+## 270. THE STREAMED f32 dweight IS 2.4-3.0x AT THE KERNEL — AND "dweight IS THE LARGER HALF" DID NOT SURVIVE A SECOND HOST
+
+`frankentorch-hi9r6`. Arm in the same probe. Two results, one of them a correction to a claim I
+made in this ledger.
+
+### 270a. THE LEVER, PRICED AT THE KERNEL FOR THE FIRST TIME
+
+Item 263 priced the streamed f32 `dweight` at a PAIRED **1.74x** — but that is a LANE figure,
+diluted by the forward, the session, and the dinput half. Forcing the streamed path off against
+the shipped one, dweight-only, both arms inside each rep, hetzner2 16 cores, loadavg 2.1-3.3:
+
+    dweight ONLY, shipped (streamed)   25.349 / 31.612 ms
+    dweight ONLY, LEGACY panel route   77.161 / 76.372 ms
+    legacy / streamed                  **3.044x / 2.416x**
+
+**The lever is 2.4-3.0x at the kernel**, against 1.74x at the lane. Both are honest; they measure
+different things, and quoting either without saying which would misrepresent it by ~1.6x.
+
+### 270b. THE CORRECTION
+
+On fixmydocuments I read dweight 27.3-35.2 ms against dinput 17.1-18.2 — dweight 60-65% of the
+pair — and wrote that dweight is the larger half, correcting item 267's 50/50. **That does not
+survive hetzner2**, which reads dweight 25.3-31.6 against dinput 27.8-28.5, i.e. dweight 48-53%.
+
+So the honest statement is neither "50/50" nor "dweight is larger": **the two halves are
+comparable, which is larger is host-dependent, and neither is negligible.** Item 267's 50/50 was
+one host's reading presented as a property of the kernel, and my correction to it was another
+host's reading making the same mistake in the opposite direction. The probe comment now says so.
+
+### 270c. THE TRANSFERABLE PART
+
+**A phase SPLIT is a property of a machine as much as of a kernel, and it needs the same
+multi-host discipline as a ratio.** `feedback_measurement_host_identity` is usually invoked for
+vs-incumbent rows; this is the same failure inside an arm-internal decomposition, where it is
+easier to forget because there is no incumbent to remind you. Two hosts disagreed by 1.3x on which
+half dominates — enough to aim a lever at the wrong one, which is exactly what items 267-269 did
+by spending four candidates on dinput.
