@@ -148,7 +148,7 @@ mod gemm {
         // a small-M GEMM yields only ~m/MIN_BLOCK_ROWS blocks, while the column
         // path scales with N. (should_parallelize_cols already requires n > 4*m,
         // so non-wide matmuls are unaffected and keep the row split.)
-        if should_parallelize_cols(m, k, n) {
+        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
             dgemm_col_parallel(m, k, n, a, b, c);
         } else if should_parallelize(m, k, n) {
             if n >= 2 * MIN_BLOCK_COLS {
@@ -211,6 +211,34 @@ mod gemm {
     // BIT-FOR-BIT identical to dgemm_block.
     const PAR_MIN_FLOPS_COLS: u128 = 1 << 24; // ~16.8M FMA
     const MIN_BLOCK_COLS: usize = 128;
+
+    // Compact-WY Householder application at n=512 has two hot panel GEMMs below the
+    // generic 16.8M-FMA parallel gate: `32x512x512` (VᵀX) and `512x32x512` (V·W).
+    // Both otherwise run one matrixmultiply kernel despite four independent
+    // 128-column output windows. Splitting N preserves each output element's complete
+    // K traversal, so it is bit-exact; the shape predicate leaves unrelated small-K
+    // GEMMs on the established dispatch. `=0` is a measurement kill switch.
+    const HOUSEHOLDER_PANEL_WIDTH: usize = 32;
+    const HOUSEHOLDER_SKINNY_MIN_DIM: usize = 512;
+    const HOUSEHOLDER_SKINNY_MIN_FLOPS: u128 = 1 << 23;
+
+    fn householder_skinny_parallel_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("FT_HOUSEHOLDER_SKINNY_GEMM")
+                .map_or(true, |value| value != "0")
+        })
+    }
+
+    fn should_parallelize_householder_skinny(m: usize, k: usize, n: usize) -> bool {
+        let is_panel_shape = n >= HOUSEHOLDER_SKINNY_MIN_DIM
+            && ((m == HOUSEHOLDER_PANEL_WIDTH && k >= HOUSEHOLDER_SKINNY_MIN_DIM)
+                || (k == HOUSEHOLDER_PANEL_WIDTH && m >= HOUSEHOLDER_SKINNY_MIN_DIM));
+        householder_skinny_parallel_enabled()
+            && rayon::current_num_threads() > 1
+            && is_panel_shape
+            && (m as u128) * (k as u128) * (n as u128) >= HOUSEHOLDER_SKINNY_MIN_FLOPS
+    }
 
     fn should_parallelize_cols(m: usize, k: usize, n: usize) -> bool {
         rayon::current_num_threads() > 1
@@ -1464,7 +1492,7 @@ mod gemm {
     #[cfg(test)]
     mod tile_iso_tests {
         use super::{
-            dgemm_2d_parallel, dgemm_block, dgemm_bt_2d_parallel, dgemm_bt_block,
+            dgemm, dgemm_2d_parallel, dgemm_block, dgemm_bt_2d_parallel, dgemm_bt_block,
             dgemm_col_parallel, sgemm, sgemm_2d_parallel, sgemm_block, sgemm_bt_2d_parallel,
             sgemm_bt_block, sgemm_col_parallel, sgemm_reused_output,
         };
@@ -1577,6 +1605,36 @@ mod gemm {
                     s3.iter().zip(&t3).all(|(x, y)| x.to_bits() == y.to_bits()),
                     "sgemm_col {m}x{k}x{n}"
                 );
+            }
+        }
+
+        #[test]
+        fn householder_skinny_parallel_matches_serial_bit_exact() {
+            // The n=512 compact-WY reverse-apply shapes are below the normal flop gate but
+            // have four disjoint 128-column windows. The production dispatch must take that
+            // split while preserving the single-call K accumulation bit-for-bit.
+            for &(m, k, n) in &[(32usize, 512usize, 512usize), (512, 32, 512)] {
+                assert!(
+                    super::should_parallelize_householder_skinny(m, k, n),
+                    "Householder skinny gate must select {m}x{k}x{n}"
+                );
+                let a: Vec<f64> = (0..m * k)
+                    .map(|i| ((i % 29) as f64 - 14.0) * 0.0625 + (i as f64) * 1e-7)
+                    .collect();
+                let b: Vec<f64> = (0..k * n)
+                    .map(|i| ((i % 31) as f64 - 15.0) * 0.03125 - (i as f64) * 1e-7)
+                    .collect();
+                let mut serial = vec![0.0_f64; m * n];
+                let mut parallel = vec![0.0_f64; m * n];
+                dgemm_block(m, k, n, &a, &b, &mut serial);
+                dgemm(m, k, n, &a, &b, &mut parallel);
+                for (index, (expected, actual)) in serial.iter().zip(&parallel).enumerate() {
+                    assert_eq!(
+                        expected.to_bits(),
+                        actual.to_bits(),
+                        "Householder skinny split diverged at {index} for {m}x{k}x{n}"
+                    );
+                }
             }
         }
     }
