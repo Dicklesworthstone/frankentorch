@@ -199,6 +199,14 @@ pub fn conv2d_backward_mask_fused_f32(
     };
 
     let dweight = output_mask[1].then(|| {
+        // STREAMED dweight, f32 — `frankentorch-hi9r6`. Same second-copy hazard the f64 half
+        // had: this fused entry does NOT delegate to `conv2d_backward_f32`, it keeps its own
+        // panel GEMM, so a toggle wired only there would reach this lane never.
+        if let Some(streamed) = super::conv2d_dweight_streamed_f32_if_enabled(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        ) {
+            return streamed;
+        }
         let panel = super::conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         super::build_uninit(out_ch * patch_width, |dw: &mut [f32]| {
             if out_ch == 0 || patch_width == 0 || flat == 0 {

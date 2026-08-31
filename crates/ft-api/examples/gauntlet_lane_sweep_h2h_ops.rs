@@ -36,6 +36,28 @@ const ATTN_HEADS: usize = 8;
 const ATTN_SEQUENCE: usize = 256;
 const ATTN_DIM: usize = 64;
 
+// frankentorch-58zjz: `sdpa_backward_f64` reaches `dgemm_tb` for
+// `dV = P^T @ dOut`, so its real gate dimensions are
+// `(m, k, n) = (sequence, sequence, head_dimension)`. These two lanes straddle
+// `should_parallelize_cols` without guessing from the attention front-end shape.
+const ATTN_GATE_BATCH: usize = 2;
+const ATTN_GATE_HEADS: usize = 8;
+const ATTN_GATE_NARROW_SEQUENCE: usize = 256;
+const ATTN_GATE_NARROW_DIM: usize = 256;
+const ATTN_GATE_WIDE_SEQUENCE: usize = 192;
+const ATTN_GATE_WIDE_DIM: usize = 1024;
+#[cfg(test)]
+const DGEMM_COLUMN_MIN_N: usize = 4 * 128;
+#[cfg(test)]
+const DGEMM_COLUMN_MIN_FMAS: u128 = 1 << 24;
+
+#[cfg(test)]
+fn attention_dv_uses_column_gate(sequence: usize, dimension: usize) -> bool {
+    dimension >= DGEMM_COLUMN_MIN_N
+        && dimension > 4 * sequence
+        && (sequence as u128) * (sequence as u128) * (dimension as u128) >= DGEMM_COLUMN_MIN_FMAS
+}
+
 type LaneRun<'a> = Box<dyn Fn() -> (f64, f64) + 'a>;
 
 fn seq(n: usize) -> Vec<f64> {
@@ -281,6 +303,14 @@ attnq=seq({ATTN_BATCH}*{ATTN_HEADS}*{ATTN_SEQUENCE}*{ATTN_DIM}).reshape({ATTN_BA
 attnk=seq({ATTN_BATCH}*{ATTN_HEADS}*{ATTN_SEQUENCE}*{ATTN_DIM}).reshape({ATTN_BATCH},{ATTN_HEADS},{ATTN_SEQUENCE},{ATTN_DIM})
 attnv=seq({ATTN_BATCH}*{ATTN_HEADS}*{ATTN_SEQUENCE}*{ATTN_DIM}).reshape({ATTN_BATCH},{ATTN_HEADS},{ATTN_SEQUENCE},{ATTN_DIM})
 attnm=seq({ATTN_BATCH}*{ATTN_HEADS}*{ATTN_SEQUENCE}*{ATTN_DIM}).reshape({ATTN_BATCH},{ATTN_HEADS},{ATTN_SEQUENCE},{ATTN_DIM})
+attn_gate_narrow_q=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_NARROW_SEQUENCE}*{ATTN_GATE_NARROW_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_NARROW_SEQUENCE},{ATTN_GATE_NARROW_DIM})
+attn_gate_narrow_k=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_NARROW_SEQUENCE}*{ATTN_GATE_NARROW_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_NARROW_SEQUENCE},{ATTN_GATE_NARROW_DIM})
+attn_gate_narrow_v=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_NARROW_SEQUENCE}*{ATTN_GATE_NARROW_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_NARROW_SEQUENCE},{ATTN_GATE_NARROW_DIM})
+attn_gate_narrow_m=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_NARROW_SEQUENCE}*{ATTN_GATE_NARROW_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_NARROW_SEQUENCE},{ATTN_GATE_NARROW_DIM})
+attn_gate_wide_q=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_WIDE_SEQUENCE}*{ATTN_GATE_WIDE_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_WIDE_SEQUENCE},{ATTN_GATE_WIDE_DIM})
+attn_gate_wide_k=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_WIDE_SEQUENCE}*{ATTN_GATE_WIDE_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_WIDE_SEQUENCE},{ATTN_GATE_WIDE_DIM})
+attn_gate_wide_v=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_WIDE_SEQUENCE}*{ATTN_GATE_WIDE_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_WIDE_SEQUENCE},{ATTN_GATE_WIDE_DIM})
+attn_gate_wide_m=seq({ATTN_GATE_BATCH}*{ATTN_GATE_HEADS}*{ATTN_GATE_WIDE_SEQUENCE}*{ATTN_GATE_WIDE_DIM}).reshape({ATTN_GATE_BATCH},{ATTN_GATE_HEADS},{ATTN_GATE_WIDE_SEQUENCE},{ATTN_GATE_WIDE_DIM})
 def timed(build):
     # All leaf and mask construction is outside this timestamp, just as on the Rust arm.
     x, w, mask, op = build()
@@ -300,6 +330,20 @@ def attention():
     started=time.perf_counter()
     (Fn.scaled_dot_product_attention(q,k,v)*attnm).sum().backward()
     return (time.perf_counter()-started)*1e3, q.grad.abs().sum().item()+k.grad.abs().sum().item()+v.grad.abs().sum().item()
+def attention_gate_narrow():
+    q=attn_gate_narrow_q.detach().clone().requires_grad_(True)
+    k=attn_gate_narrow_k.detach().clone().requires_grad_(True)
+    v=attn_gate_narrow_v.detach().clone().requires_grad_(True)
+    started=time.perf_counter()
+    (Fn.scaled_dot_product_attention(q,k,v)*attn_gate_narrow_m).sum().backward()
+    return (time.perf_counter()-started)*1e3, q.grad.abs().sum().item()+k.grad.abs().sum().item()+v.grad.abs().sum().item()
+def attention_gate_wide():
+    q=attn_gate_wide_q.detach().clone().requires_grad_(True)
+    k=attn_gate_wide_k.detach().clone().requires_grad_(True)
+    v=attn_gate_wide_v.detach().clone().requires_grad_(True)
+    started=time.perf_counter()
+    (Fn.scaled_dot_product_attention(q,k,v)*attn_gate_wide_m).sum().backward()
+    return (time.perf_counter()-started)*1e3, q.grad.abs().sum().item()+k.grad.abs().sum().item()+v.grad.abs().sum().item()
 def run(build, _unused):
     return build()
 LANES={{
@@ -307,6 +351,8 @@ LANES={{
   'linear_narrow_masked': (linear_narrow, None),
   'conv2d_masked_train_ops': (conv2d_train, None),
   'attention_masked': (attention, None),
+  'attention_dv_narrow': (attention_gate_narrow, None),
+  'attention_dv_wide': (attention_gate_wide, None),
 }}
 print('PT_TIMED_STEPS forward,loss_sum,backward', flush=True)
 "#,
@@ -343,6 +389,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attention_key = seq(ATTN_BATCH * ATTN_HEADS * ATTN_SEQUENCE * ATTN_DIM);
     let attention_value = seq(ATTN_BATCH * ATTN_HEADS * ATTN_SEQUENCE * ATTN_DIM);
     let attention_mask = seq(ATTN_BATCH * ATTN_HEADS * ATTN_SEQUENCE * ATTN_DIM);
+    let attention_gate_narrow_query =
+        seq(ATTN_GATE_BATCH * ATTN_GATE_HEADS * ATTN_GATE_NARROW_SEQUENCE * ATTN_GATE_NARROW_DIM);
+    let attention_gate_narrow_key = attention_gate_narrow_query.clone();
+    let attention_gate_narrow_value = attention_gate_narrow_query.clone();
+    let attention_gate_narrow_mask = attention_gate_narrow_query.clone();
+    let attention_gate_wide_query =
+        seq(ATTN_GATE_BATCH * ATTN_GATE_HEADS * ATTN_GATE_WIDE_SEQUENCE * ATTN_GATE_WIDE_DIM);
+    let attention_gate_wide_key = attention_gate_wide_query.clone();
+    let attention_gate_wide_value = attention_gate_wide_query.clone();
+    let attention_gate_wide_mask = attention_gate_wide_query.clone();
 
     let lanes: Vec<(&str, LaneRun<'_>)> = vec![
         (
@@ -400,6 +456,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ATTN_HEADS,
                     ATTN_SEQUENCE,
                     ATTN_DIM,
+                )
+            }),
+        ),
+        (
+            // dV is `dgemm_tb(sequence, sequence, dimension)`. This shape reaches the
+            // FLOP floor but fails `dimension > 4 * sequence`, so it is the non-column twin.
+            "attention_dv_narrow",
+            Box::new(|| {
+                timed_attention(
+                    &attention_gate_narrow_query,
+                    &attention_gate_narrow_key,
+                    &attention_gate_narrow_value,
+                    &attention_gate_narrow_mask,
+                    ATTN_GATE_BATCH,
+                    ATTN_GATE_HEADS,
+                    ATTN_GATE_NARROW_SEQUENCE,
+                    ATTN_GATE_NARROW_DIM,
+                )
+            }),
+        ),
+        (
+            // The same dV call now has `n=1024 > 4*m=768` and 37.7M FMAs, so the
+            // column-parallel `dgemm_tb` path is live.
+            "attention_dv_wide",
+            Box::new(|| {
+                timed_attention(
+                    &attention_gate_wide_query,
+                    &attention_gate_wide_key,
+                    &attention_gate_wide_value,
+                    &attention_gate_wide_mask,
+                    ATTN_GATE_BATCH,
+                    ATTN_GATE_HEADS,
+                    ATTN_GATE_WIDE_SEQUENCE,
+                    ATTN_GATE_WIDE_DIM,
                 )
             }),
         ),
@@ -562,7 +652,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{null_passes, timed_attention, timed_conv2d, timed_linear};
+    use super::{
+        ATTN_GATE_NARROW_DIM, ATTN_GATE_NARROW_SEQUENCE, ATTN_GATE_WIDE_DIM,
+        ATTN_GATE_WIDE_SEQUENCE, attention_dv_uses_column_gate, null_passes, timed_attention,
+        timed_conv2d, timed_linear,
+    };
+
+    #[test]
+    fn attention_dv_gate_shapes_straddle_column_parallelism() {
+        assert!(!attention_dv_uses_column_gate(
+            ATTN_GATE_NARROW_SEQUENCE,
+            ATTN_GATE_NARROW_DIM,
+        ));
+        assert!(attention_dv_uses_column_gate(
+            ATTN_GATE_WIDE_SEQUENCE,
+            ATTN_GATE_WIDE_DIM,
+        ));
+    }
 
     #[test]
     fn linear_non_uniform_loss_reaches_backward() {

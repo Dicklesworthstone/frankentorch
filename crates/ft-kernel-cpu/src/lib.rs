@@ -1764,6 +1764,45 @@ mod gemm {
         }
     }
 
+    /// `C += A^T · B` — the ACCUMULATING twin of [`sgemm_tb`], and the f32 counterpart of
+    /// [`dgemm_tb_add_into`].
+    ///
+    /// Exists so a transpose-GEMM's k dimension can be split from OUTSIDE and the pieces summed
+    /// into one `C`, which is what lets the f32 conv2d backward consume its im2col panel one
+    /// [`SGEMM_KC`]-aligned block at a time instead of materialising all of it. Same
+    /// `alpha=1, beta=1` shape as the f64 entry; the caller drives k, and every output element
+    /// still accumulates over the whole of k in ascending order.
+    /// `frankentorch-hi9r6`.
+    pub fn sgemm_tb_add_into(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        let a = &a[..k * m];
+        let b = &b[..k * n];
+        let c = &mut c[..m * n];
+        // SAFETY: identical operand model to `sgemm_tb_scaled` — A is [k,m] read as A^T via
+        // strides, B and C are contiguous row-major with exactly these dimensions. Only `beta`
+        // differs, and beta=1 reads C before writing it, which is why the caller pre-zeroes it.
+        unsafe {
+            sgemm_mm(
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                1,
+                m as isize,
+                b.as_ptr(),
+                n as isize,
+                1,
+                1.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
+            );
+        }
+    }
+
     fn sgemm_bt_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
         // SAFETY: a is m*k, b is n*k (read as B^T via rsb=1,csb=k), c is m*n.
         unsafe {
@@ -8475,6 +8514,165 @@ pub fn conv2d_dweight_streamed() -> bool {
     CONV2D_DWEIGHT_STREAMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [`conv2d_dweight_streamed_f32`] behind [`conv2d_dweight_streamed`]'s gate, with the floor
+/// counted in ELEMENTS so the two dtypes gate on the same panel geometry rather than the same
+/// byte count. `frankentorch-hi9r6`.
+///
+/// WHY f32 GETS THIS AT ALL. `project_asymmetric_dtype_fastpath` is the standing rule — a fast
+/// path gated on ONE dtype strands the other, often the common one — and this is that shape
+/// exactly: the streamed `dweight` shipped f64-only, while all three f32 backward entries kept
+/// building the whole im2col panel. The f32 lane is also where it should pay MOST: it runs at
+/// batch 160 against f64's batch 8, so its panel is ~189 MB rather than ~18.9 MB, and the same
+/// panel-elimination transformation was measured at 1.652x on the f32 lane against 1.082x on
+/// the f64 one for precisely that reason.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv2d_dweight_streamed_f32_if_enabled(
+    dout_flat: &[f32],
+    padded: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Option<Vec<f32>> {
+    if !conv2d_dweight_streamed()
+        || batch
+            .saturating_mul(oh)
+            .saturating_mul(ow)
+            .saturating_mul(in_ch)
+            .saturating_mul(kh)
+            .saturating_mul(kw)
+            < conv2d_dweight_stream_min_panel()
+    {
+        return None;
+    }
+    let streamed = conv2d_dweight_streamed_f32(
+        dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+    );
+    if streamed.is_some() {
+        CONV2D_DWEIGHT_STREAMED_CALLS.with(|c| c.set(c.get() + 1));
+    }
+    streamed
+}
+
+/// `dweight[out_ch, patch_width] = dout_flat^T · im2col(padded)` in f32, with the panel never
+/// materialised — the dtype twin of [`conv2d_dweight_streamed_f64`].
+///
+/// Same argument throughout, with [`SGEMM_KC`] in place of `DGEMM_KC`: splitting a GEMM's `k`
+/// from outside is bit-exact when the split lands on `matrixmultiply`'s own k-block boundary,
+/// the arithmetic is done by the SAME microkernel via `gemm::sgemm_tb_add_into` rather than by a
+/// hand-rolled dot product, and the parallel axes are the OUTPUT axes so no element's reduction
+/// is ever split. The scratch `C` is pre-zeroed and every tile accumulates with `beta = 1`,
+/// including the first: adding to `+0.0` is exact.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_dweight_streamed_f32(
+    dout_flat: &[f32],
+    padded: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Option<Vec<f32>> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+    if out_ch == 0 || patch_width == 0 || flat == 0 {
+        return None;
+    }
+
+    let threads = rayon::current_num_threads().max(1);
+    let mb = if out_ch <= 8 { out_ch } else { 8 };
+    let m_blocks = out_ch.div_ceil(mb);
+    let n_blocks = threads
+        .div_ceil(m_blocks)
+        .clamp(1, patch_width.div_ceil(64).max(1));
+    let nb = patch_width.div_ceil(n_blocks);
+    let n_blocks = patch_width.div_ceil(nb);
+    let krows = SGEMM_KC;
+
+    let results: Vec<((usize, usize), Vec<f32>)> = (0..m_blocks * n_blocks)
+        .into_par_iter()
+        .map(|tile| {
+            let mi = tile / n_blocks;
+            let ni = tile % n_blocks;
+            let oc0 = mi * mb;
+            let ocn = mb.min(out_ch - oc0);
+            let j0 = ni * nb;
+            let jn = nb.min(patch_width - j0);
+            let mut c = vec![0.0f32; ocn * jn];
+            if ocn == 0 || jn == 0 {
+                return ((oc0, j0), c);
+            }
+            let mut runs: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+            for ch in 0..in_ch {
+                let pch = ch * kh * kw;
+                for kr in 0..kh {
+                    let seg0 = pch + kr * kw;
+                    let lo = seg0.max(j0);
+                    let hi = (seg0 + kw).min(j0 + jn);
+                    if lo < hi {
+                        runs.push((ch, kr, lo - seg0, hi - lo, lo - j0));
+                    }
+                }
+            }
+            let mut ptile = vec![0.0f32; krows * jn];
+            let mut atile = vec![0.0f32; krows * ocn];
+            let mut f0 = 0usize;
+            while f0 < flat {
+                let rows = krows.min(flat - f0);
+                for r in 0..rows {
+                    let row = f0 + r;
+                    let b = row / patch_count;
+                    let pc = row % patch_count;
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let batch_off = b * in_ch * ph * pw;
+                    let prow = &mut ptile[r * jn..(r + 1) * jn];
+                    for &(ch, kr, off, len, dst) in &runs {
+                        let irow = batch_off + ch * ph * pw + (base_h + kr) * pw + base_w + off;
+                        prow[dst..dst + len].copy_from_slice(&padded[irow..irow + len]);
+                    }
+                    let src = row * out_ch + oc0;
+                    atile[r * ocn..(r + 1) * ocn].copy_from_slice(&dout_flat[src..src + ocn]);
+                }
+                gemm::sgemm_tb_add_into(
+                    ocn,
+                    rows,
+                    jn,
+                    &atile[..rows * ocn],
+                    &ptile[..rows * jn],
+                    &mut c,
+                );
+                f0 += rows;
+            }
+            ((oc0, j0), c)
+        })
+        .collect();
+
+    let mut dweight = vec![0.0f32; out_ch * patch_width];
+    for ((oc0, j0), c) in results {
+        let jn = nb.min(patch_width - j0);
+        for (oc, crow) in c.chunks_exact(jn).enumerate() {
+            let dst = (oc0 + oc) * patch_width + j0;
+            dweight[dst..dst + jn].copy_from_slice(crow);
+        }
+    }
+    Some(dweight)
+}
+
 /// [`conv2d_dweight_streamed_f64`] behind [`conv2d_dweight_streamed`]'s gate.
 ///
 /// Exists so the generic backward and the FUSED MASKED backward — which keeps its own copy of
@@ -9635,7 +9833,18 @@ pub fn conv2d_backward_f32(
     }
     // Item 153's dead-zero-fill fix, which f32 did not get: the gather writes every element.
     let dout_flat = conv2d_dout_flat_f32(dout, batch, out_ch, patch_count);
-    let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    // STREAMED dweight, f32 — `frankentorch-hi9r6`. When it is on and the shape clears the panel
+    // floor, `panel` is never built: its only consumer is the GEMM below, and
+    // `conv2d_dweight_streamed_f32` feeds that same GEMM SGEMM_KC-aligned tiles from an
+    // L2-resident scratch instead.
+    let streamed = conv2d_dweight_streamed_f32_if_enabled(
+        &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+    );
+    let panel = if streamed.is_some() {
+        Vec::new()
+    } else {
+        conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
+    };
     // dweight = dout_flat^T @ panel. sgemm_tb reads dout_flat [flat,out_ch] AS its
     // transpose via strides — no [out_ch,flat] dout_t materialisation — with a
     // K-traversal matching transpose-then-sgemm per output element, so dweight is
@@ -9655,14 +9864,17 @@ pub fn conv2d_backward_f32(
     // GUARD: `gemm::sgemm`-family wrappers return EARLY on `m == 0 || n == 0`, before
     // matrixmultiply's own zero-fill can run, so a degenerate shape would hand back an
     // uninitialized buffer.
-    let dweight = build_uninit(out_ch * patch_width, |dweight: &mut [f32]| {
-        if out_ch == 0 || patch_width == 0 || flat == 0 {
-            dweight.fill(0.0);
-            return;
-        }
-        CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
-        gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
-    });
+    let dweight = match streamed {
+        Some(dweight) => dweight,
+        None => build_uninit(out_ch * patch_width, |dweight: &mut [f32]| {
+            if out_ch == 0 || patch_width == 0 || flat == 0 {
+                dweight.fill(0.0);
+                return;
+            }
+            CONV2D_DWEIGHT_GEMMS.with(|c| c.set(c.get() + 1));
+            gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
+        }),
+    };
     // FREE THE PANEL AT ITS LAST USE — `frankentorch-hi9r6`, NEGATIVE_EVIDENCE items 146/148.
     //
     // `panel`'s last use is the GEMM above, but without this it lives to the end of the
@@ -46736,6 +46948,43 @@ mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
 
+    // The bidiag H2H controls are process-global atomics. Rust's test runner executes
+    // independent tests concurrently, so a test that temporarily forces the parallel
+    // gate must not overlap a test asserting thread-count bit exactness.
+    static BIDIAG_DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_bidiag_dispatch_for_test() -> std::sync::MutexGuard<'static, ()> {
+        BIDIAG_DISPATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct BidiagDispatchOverride {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous_gate: u64,
+        previous_hoisted: bool,
+    }
+
+    impl BidiagDispatchOverride {
+        fn force_parallel_legacy_path() -> Self {
+            let lock = lock_bidiag_dispatch_for_test();
+            let previous_gate = super::bidiag::set_parallel_gate(1);
+            let previous_hoisted = super::bidiag::set_parallel_gate_hoisted(true);
+            Self {
+                _lock: lock,
+                previous_gate,
+                previous_hoisted,
+            }
+        }
+    }
+
+    impl Drop for BidiagDispatchOverride {
+        fn drop(&mut self) {
+            super::bidiag::set_parallel_gate_hoisted(self.previous_hoisted);
+            super::bidiag::set_parallel_gate(self.previous_gate);
+        }
+    }
+
     /// Which eigh phase actually dominates? This decides whether `dstedc` is worth writing.
     ///
     /// I have said repeatedly that eigh's 8.16-8.23x at n=1024 is ALGORITHMIC: we run
@@ -49150,6 +49399,123 @@ mod tests {
         }
         // Degenerate input must not divide by zero.
         assert_eq!(super::conv2d_dinput_block_rows(0), 1);
+    }
+
+    #[test]
+    fn conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise() {
+        // `frankentorch-hi9r6`. The f32 twin of the f64 bitwise check, and it needs its OWN test
+        // rather than inheriting the f64 one: the claim is about `SGEMM_KC`, a DIFFERENT private
+        // constant of the dependency than `DGEMM_KC`, and f32's shorter mantissa makes any
+        // reassociation easier to see, not harder. Comparing against the real GEMM rather than
+        // against the number means a `cargo update` that moved either k-block fails here instead
+        // of silently changing gradients.
+        //
+        // Every shape has `flat > SGEMM_KC` so the fold is genuinely multi-block, and the set
+        // straddles what the tiler must get right: a `patch_width` that does not divide by the
+        // column-block width, `in_ch == 1`, `out_ch` below and above the 8-row block, stride 2,
+        // and a non-square kernel.
+        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 5] = [
+            (8, 32, 32, 34, 34, 3, 3, 1, 1),
+            (6, 1, 3, 20, 18, 3, 3, 1, 1),
+            (5, 7, 13, 17, 19, 3, 2, 1, 1),
+            (4, 5, 9, 23, 21, 3, 3, 2, 2),
+            (9, 3, 8, 12, 14, 2, 3, 1, 2),
+        ];
+        for (batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw) in shapes {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let flat = batch * oh * ow;
+            assert!(
+                flat > super::SGEMM_KC,
+                "shape {batch}x{in_ch}x{ph}x{pw} gives flat={flat}, one k-block or fewer"
+            );
+            let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i % 37) as f32) * 0.013 - 0.21)
+                .collect();
+            let weight_flat: Vec<f32> = (0..out_ch * in_ch * kh * kw)
+                .map(|i| ((i % 11) as f32) * 0.0625 - 0.3125)
+                .collect();
+            // NON-UNIFORM `dout`: all-ones would take the f32 adjoint fast path instead.
+            let dout: Vec<f32> = (0..batch * out_ch * oh * ow)
+                .map(|i| ((i % 23) as f32) * 0.019 - 0.19)
+                .collect();
+            let mask: Vec<f32> = (0..batch * out_ch * oh * ow)
+                .map(|i| ((i % 17) as f32) * 0.031 - 0.24)
+                .collect();
+
+            // Force the size gate open: bit-identity is a property of the arithmetic and must
+            // hold at shapes the shipped floor declines.
+            let previous_floor = super::set_conv2d_dweight_stream_min_panel(0);
+            let previous = super::set_conv2d_dweight_streamed(false);
+            let (panel_dpadded, panel_dweight, _) = super::conv2d_backward_f32(
+                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, false,
+            );
+            super::set_conv2d_dweight_streamed(true);
+            let _ = super::take_conv2d_dweight_streamed_calls();
+            let (stream_dpadded, stream_dweight, _) = super::conv2d_backward_f32(
+                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, false,
+            );
+            assert_eq!(
+                super::take_conv2d_dweight_streamed_calls(),
+                1,
+                "the GENERIC f32 entry did not reach the streamed dweight at shape \
+                 {batch}/{in_ch}/{out_ch} — the comparison would be panel-vs-panel"
+            );
+
+            for (index, (a, b)) in panel_dweight.iter().zip(&stream_dweight).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "f32 dweight[{index}] differs at shape {batch}/{in_ch}/{out_ch}: \
+                     panel {a:e} vs streamed {b:e}"
+                );
+            }
+            for (index, (a, b)) in panel_dpadded.iter().zip(&stream_dpadded).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "f32 dpadded[{index}] moved at shape {batch}/{in_ch}/{out_ch}"
+                );
+            }
+
+            // THE FUSED MASKED f32 ENTRY, which keeps its own copy of the panel GEMM.
+            super::set_conv2d_dweight_streamed(false);
+            let _ = super::take_conv2d_dweight_streamed_calls();
+            let (_, fused_panel_dw, _) = super::conv2d_backward_mask_fused_f32(
+                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
+                sw, out_ch, [true, true, false],
+            );
+            assert_eq!(
+                super::take_conv2d_dweight_streamed_calls(),
+                0,
+                "the f32 streamed route ran with the toggle OFF at {batch}/{in_ch}/{out_ch}"
+            );
+            super::set_conv2d_dweight_streamed(true);
+            let (_, fused_stream_dw, _) = super::conv2d_backward_mask_fused_f32(
+                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
+                sw, out_ch, [true, true, false],
+            );
+            assert_eq!(
+                super::take_conv2d_dweight_streamed_calls(),
+                1,
+                "the FUSED f32 entry did not reach the streamed dweight at \
+                 {batch}/{in_ch}/{out_ch}"
+            );
+            super::set_conv2d_dweight_streamed(previous);
+            super::set_conv2d_dweight_stream_min_panel(previous_floor);
+
+            let fused_panel_dw = fused_panel_dw.expect("fused f32 panel dweight");
+            let fused_stream_dw = fused_stream_dw.expect("fused f32 streamed dweight");
+            for (index, (a, b)) in fused_panel_dw.iter().zip(&fused_stream_dw).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "fused-masked f32 dweight[{index}] differs at {batch}/{in_ch}/{out_ch}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -68016,6 +68382,7 @@ mod tests {
 
     #[test]
     fn svd_deferred_left_thread_count_bit_exact() {
+        let _dispatch_lock = lock_bidiag_dispatch_for_test();
         let n = 96usize;
         let a = svd_wellconditioned_square_fixture(n);
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
@@ -71669,8 +72036,7 @@ mod tests {
     /// sums taken by the parallel reduction.
     #[test]
     fn bidiag_hoisted_gate_matches_per_reflector_decision_bits() {
-        let previous_gate = super::bidiag::set_parallel_gate(1);
-        let previous_hoisted = super::bidiag::set_parallel_gate_hoisted(true);
+        let _dispatch_override = BidiagDispatchOverride::force_parallel_legacy_path();
         let nb = super::svd_bidiag_block_size();
 
         for &n in &[136usize, 192] {
@@ -71706,9 +72072,6 @@ mod tests {
 
             super::bidiag::set_parallel_gate_hoisted(true);
         }
-
-        super::bidiag::set_parallel_gate_hoisted(previous_hoisted);
-        super::bidiag::set_parallel_gate(previous_gate);
     }
 
     /// Is the reduction's panel width right at the sizes we actually measure? —
