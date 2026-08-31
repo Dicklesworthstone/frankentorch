@@ -591,15 +591,20 @@ struct GroupNormF32SumShortcut {
 
 /// The create_graph (second-order) arm for the f32 conv2d/loss-mask fusion.
 ///
-/// EXTRACTED so it can serve TWO nodes: the fused node itself, and the
-/// `frankentorch-qnfq8` sum shortcut, which reaches it by broadcasting its SCALAR upstream
-/// to the output shape. Before the extraction the shortcut had no second-order arm at all,
-/// so a `create_graph` backward on that loss failed closed — honest, but a regression against
-/// the fused node it replaces.
+/// A CAPABILITY, extracted under `frankentorch-qnfq8` and kept after the experiment that
+/// prompted it was withdrawn. It was pulled out of `fuse_conv2d_loss_mask_f32`'s closure so a
+/// SECOND node could share it — a scalar-loss shortcut that reached it by broadcasting its
+/// scalar upstream to the output shape. That shortcut has since been removed, so this has one
+/// caller again, and the extraction is retained on its own merit rather than for a speed reason:
+/// any future node that fuses this conv2d/mask pair needs a second-order arm, and writing a
+/// second copy of a 279-line derivation is how two copies drift apart.
+/// `project_double_backward_custom_op_vein` records this campaign already paying once for a
+/// fused fast path whose second order was wrong.
 ///
-/// Kept as a free function rather than duplicated: a second copy of a 279-line second-order
-/// recipe is how the two drift apart, and `project_double_backward_custom_op_vein` records
-/// this campaign already paying once for a fused fast path whose second order was wrong.
+/// Its correctness is pinned by `f32_masked_conv2d_fused_second_derivative_matches_unfused_route`,
+/// which compares the fused route's second derivative against the composed one and asserts the
+/// result is not identically zero — the signature of a missing arm, which would make any
+/// tolerance comparison vacuous.
 fn conv2d_f32_mask_create_graph_gradients(
     ctx: &ft_autograd::FunctionCtx,
     grad_outs: &[TensorNodeId],
