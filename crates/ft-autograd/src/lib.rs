@@ -1330,6 +1330,13 @@ pub enum AutogradError {
         recorded: u64,
         observed: u64,
     },
+    /// A two-node in-place accessor was handed the SAME node for both operands
+    /// (`frankentorch-f32-inplace-accessor-gap-5fxq2`). `x.mul_(x)` is legal, but two disjoint
+    /// borrows of one index are not, so the split-borrow path declines it and the caller falls
+    /// back to cloning rather than the tape guessing what was meant.
+    AliasedInPlaceOperands {
+        node: TensorNodeId,
+    },
     ReentrantDepthExceeded {
         current: usize,
         max: usize,
@@ -1389,6 +1396,11 @@ impl fmt::Display for AutogradError {
                 "one of the tensors needed for gradient computation has been modified by an \
                  in-place operation: tensor node {node:?} was at version {recorded} when the \
                  forward ran and is at version {observed} now"
+            ),
+            Self::AliasedInPlaceOperands { node } => write!(
+                f,
+                "in-place operands alias: tensor node {node:?} was given as both target and \
+                 other, which the two-node split borrow cannot serve"
             ),
             Self::ReentrantDepthExceeded { current, max } => write!(
                 f,
@@ -21638,6 +21650,63 @@ impl TensorTape {
         let node = self.node_mut(id)?;
         node.tensor
             .update_contiguous_values_f32_with(update)
+            .map_err(AutogradError::DenseTensor)
+    }
+
+    /// Transform `target`'s f32 values in place while READING `other`'s in place — the two-node
+    /// split-borrow this family's ceiling was waiting on.
+    /// `frankentorch-f32-inplace-accessor-gap-5fxq2`.
+    ///
+    /// WHY IT EXISTS. Every binary in-place op had to clone `other` first, because
+    /// [`Self::update_tensor_values_f32_with`] borrows the whole tape mutably and the second
+    /// node cannot then be read. That clone is not a rounding error in the budget: the
+    /// `inplace_mul_f32` board lane measured **FT 25.048 ms against torch's 0.966 ms** at
+    /// 6,422,528 elements — about 0.5 GB/s, which is not arithmetic — and the unary arm's
+    /// decomposition had already priced a 16 MB clone at 10.653 ms, 69.2% of its call, because a
+    /// fresh allocation's first touch is serial page faults.
+    ///
+    /// `nodes` is a `Vec`, so the disjoint borrow is expressible in SAFE Rust with
+    /// `split_at_mut` — this crate forbids `unsafe`, and no raw pointer trick is needed for it.
+    ///
+    /// ALIASING IS HANDLED BY THE CALLER, NOT PAPERED OVER HERE: `x.mul_(x)` is legal, and two
+    /// disjoint borrows of one index are not, so an aliased call returns
+    /// `AliasedInPlaceOperands` rather than silently doing something else. The caller falls back
+    /// to the cloning path for that case.
+    pub fn update_tensor_values_f32_with_other<F>(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+        update: F,
+    ) -> Result<(), AutogradError>
+    where
+        F: FnOnce(&mut [f32], &[f32]),
+    {
+        if target.0 == other.0 {
+            return Err(AutogradError::AliasedInPlaceOperands { node: target });
+        }
+        // Bounds-check BOTH before splitting: `split_at_mut` panics past the end, and a bad node
+        // id must surface as the tape's own error rather than as a panic.
+        if self.nodes.len() <= target.0 {
+            return Err(AutogradError::UnknownTensorNode(target));
+        }
+        if self.nodes.len() <= other.0 {
+            return Err(AutogradError::UnknownTensorNode(other));
+        }
+        let split = target.0.max(other.0);
+        let (left, right) = self.nodes.split_at_mut(split);
+        // `right[0]` is the node at `split`; the other index is strictly below it and so lives in
+        // `left`. Which of the two is the target decides the direction only.
+        let (target_node, other_tensor) = if target.0 > other.0 {
+            (&mut right[0], &left[other.0].tensor)
+        } else {
+            (&mut left[target.0], &right[0].tensor)
+        };
+        let other_values = other_tensor
+            .contiguous_values_f32()
+            .map_err(AutogradError::DenseTensor)?;
+        target_node
+            .tensor
+            .update_contiguous_values_f32_with(|t_vals| update(t_vals, other_values))
             .map_err(AutogradError::DenseTensor)
     }
 

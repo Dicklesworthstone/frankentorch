@@ -52542,20 +52542,37 @@ impl FrankenTorchSession {
                 // BIT-IDENTICAL: `f32_op` is unchanged and still native f32 — this commit removes
                 // buffers, it does not touch arithmetic. Element i still reads target[i] and
                 // other[i] and nothing else, so the write order cannot matter.
-                let other_vals = self.tensor_tape.values_f32(other)?;
-                self.tensor_tape
-                    .update_tensor_values_f32_with(target, |t_vals| {
-                        if t_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-                            t_vals
-                                .par_iter_mut()
-                                .zip(other_vals.par_iter())
-                                .for_each(|(a, b)| *a = f32_op(*a, *b));
-                        } else {
-                            for (a, b) in t_vals.iter_mut().zip(other_vals.iter()) {
-                                *a = f32_op(*a, *b);
-                            }
+                // ZERO buffers on the common path: the two-node split borrow reads `other` where
+                // it lives. The clone this replaced was not incidental — `inplace_mul_f32`
+                // measured 25.048 ms against torch's 0.966 ms at 6,422,528 elements, about
+                // 0.5 GB/s, which is a 25.7 MB copy and its serial first-touch page faults, not
+                // arithmetic (ledger 289/289b).
+                //
+                // `x.mul_(x)` aliases, and two disjoint borrows of one node are impossible, so
+                // that case keeps the clone. It is the rare one and it is CORRECT either way; the
+                // fallback exists so the fast path never has to guess.
+                let apply = |t_vals: &mut [f32], other_vals: &[f32]| {
+                    if t_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
+                        t_vals
+                            .par_iter_mut()
+                            .zip(other_vals.par_iter())
+                            .for_each(|(a, b)| *a = f32_op(*a, *b));
+                    } else {
+                        for (a, b) in t_vals.iter_mut().zip(other_vals.iter()) {
+                            *a = f32_op(*a, *b);
                         }
-                    })?;
+                    }
+                };
+                if target == other {
+                    let other_vals = self.tensor_tape.values_f32(other)?;
+                    self.tensor_tape
+                        .update_tensor_values_f32_with(target, |t_vals| {
+                            apply(t_vals, &other_vals);
+                        })?;
+                } else {
+                    self.tensor_tape
+                        .update_tensor_values_f32_with_other(target, other, apply)?;
+                }
             }
             _ => {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -107788,6 +107805,31 @@ mod tests {
                     s.tensor_values_f32(o).expect("other values"),
                     b_base,
                     "{name} mutated its `other` operand at len={len}"
+                );
+            }
+        }
+    }
+
+    /// `x.mul_(x)` ALIASES, and the split-borrow path cannot serve it — two disjoint borrows of
+    /// one node do not exist. The test above uses distinct operands and so never reaches the
+    /// clone fallback, which would leave the rarer branch unexecuted by the suite.
+    /// `frankentorch-f32-inplace-accessor-gap-5fxq2`.
+    #[test]
+    fn f32_binary_in_place_with_aliased_operands_takes_the_clone_fallback_and_is_correct() {
+        for len in [3usize, 8192, 20_000] {
+            let base: Vec<f32> = (0..len).map(|i| (i % 31) as f32 * 0.25 - 3.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable_f32(base.clone(), vec![len], false)
+                .expect("target");
+            s.tensor_mul_(x, x).expect("mul_ aliased");
+            let got = s.tensor_values_f32(x).expect("values");
+            for (i, (g, b)) in got.iter().zip(base.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    (b * b).to_bits(),
+                    "aliased mul_ differs at index {i} of {len}: {g:?} vs {:?}",
+                    b * b
                 );
             }
         }
