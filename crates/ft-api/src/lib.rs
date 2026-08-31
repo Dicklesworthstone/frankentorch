@@ -52530,23 +52530,32 @@ impl FrankenTorchSession {
                     })?;
             }
             DType::F32 => {
-                let target_vals = self.tensor_tape.values_f32(target)?;
+                // Mirrors the F64 arm above: clone ONLY `other` (needed because
+                // `update_tensor_values_f32_with` borrows the tape mutably for `target`, so both
+                // nodes cannot be borrowed at once) and mutate `target` in place. The old shape
+                // cloned BOTH operands and allocated a third buffer for the result, so an f32
+                // binary in-place op paid three numel-sized allocations where its f64 twin paid
+                // one. Each of those is a fresh allocation whose first touch is serial page
+                // faults, which on the unary arm was 69% of the whole call
+                // (`frankentorch-f32-inplace-accessor-gap-5fxq2`, ledger 289).
+                //
+                // BIT-IDENTICAL: `f32_op` is unchanged and still native f32 — this commit removes
+                // buffers, it does not touch arithmetic. Element i still reads target[i] and
+                // other[i] and nothing else, so the write order cannot matter.
                 let other_vals = self.tensor_tape.values_f32(other)?;
-                let new_values: Vec<f32> = if target_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-                    target_vals
-                        .par_iter()
-                        .zip(other_vals.par_iter())
-                        .map(|(&a, &b)| f32_op(a, b))
-                        .collect()
-                } else {
-                    target_vals
-                        .iter()
-                        .zip(other_vals.iter())
-                        .map(|(&a, &b)| f32_op(a, b))
-                        .collect()
-                };
                 self.tensor_tape
-                    .update_tensor_values_f32(target, new_values)?;
+                    .update_tensor_values_f32_with(target, |t_vals| {
+                        if t_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
+                            t_vals
+                                .par_iter_mut()
+                                .zip(other_vals.par_iter())
+                                .for_each(|(a, b)| *a = f32_op(*a, *b));
+                        } else {
+                            for (a, b) in t_vals.iter_mut().zip(other_vals.iter()) {
+                                *a = f32_op(*a, *b);
+                            }
+                        }
+                    })?;
             }
             _ => {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -107706,6 +107715,80 @@ mod tests {
                         "{name} differs at index {i} of {len}: {g:?} vs {w:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The binary twin of the test above: `apply_tensor_binary_in_place`'s f32 arm now mutates
+    /// `target` through `update_tensor_values_f32_with` and clones only `other`, where it used to
+    /// clone both operands and allocate a third buffer for the result. The arithmetic is
+    /// untouched — `f32_op` was already native f32, so this is a buffer change and the values must
+    /// be identical, not merely close.
+    #[test]
+    fn f32_binary_in_place_is_bitwise_identical_to_the_two_clone_shape() {
+        for len in [1usize, 3, 8191, 8192, 8193, 20_000] {
+            let a_base: Vec<f32> = (0..len)
+                .map(|i| match i % 5 {
+                    0 => 0.0,
+                    1 => -2.75,
+                    2 => f32::MIN_POSITIVE,
+                    3 => 7.5,
+                    _ => (i % 97) as f32 * 0.03 - 1.0,
+                })
+                .collect();
+            let b_base: Vec<f32> = (0..len)
+                .map(|i| match i % 4 {
+                    0 => 1.0,
+                    1 => -0.5,
+                    2 => 3.25,
+                    _ => (i % 53) as f32 * 0.07 + 0.5,
+                })
+                .collect();
+
+            #[allow(clippy::type_complexity)]
+            let ops: [(
+                &str,
+                fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId),
+                fn(f32, f32) -> f32,
+            ); 4] = [
+                ("add_", |s, t, o| s.tensor_add_(t, o).expect("add_"), |a, b| a + b),
+                ("sub_", |s, t, o| s.tensor_sub_(t, o).expect("sub_"), |a, b| a - b),
+                ("mul_", |s, t, o| s.tensor_mul_(t, o).expect("mul_"), |a, b| a * b),
+                ("div_", |s, t, o| s.tensor_div_(t, o).expect("div_"), |a, b| a / b),
+            ];
+
+            for (name, apply, op) in ops {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let t = s
+                    .tensor_variable_f32(a_base.clone(), vec![len], false)
+                    .expect("target");
+                let o = s
+                    .tensor_variable_f32(b_base.clone(), vec![len], false)
+                    .expect("other");
+                apply(&mut s, t, o);
+                let got = s.tensor_values_f32(t).expect("values");
+
+                let want: Vec<f32> = a_base
+                    .iter()
+                    .zip(b_base.iter())
+                    .map(|(&a, &b)| op(a, b))
+                    .collect();
+
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "{name} differs at index {i} of {len}: {g:?} vs {w:?}"
+                    );
+                }
+
+                // `other` must be UNCHANGED — it is cloned, and an in-place op that scribbled on
+                // its second operand would still pass the check above.
+                assert_eq!(
+                    s.tensor_values_f32(o).expect("other values"),
+                    b_base,
+                    "{name} mutated its `other` operand at len={len}"
+                );
             }
         }
     }

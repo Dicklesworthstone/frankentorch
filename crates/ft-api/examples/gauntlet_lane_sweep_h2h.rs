@@ -526,6 +526,31 @@ where
     (elapsed, checksum)
 }
 
+/// The BINARY in-place twin of [`timed_inplace_f32`] — `mul_`, with a second same-shaped operand.
+///
+/// Both leaves are rebuilt per sample and outside the clock: the op mutates `target`, so reusing
+/// it would feed each sample the previous sample's output.
+fn timed_inplace_binary_f32(values: &[f32], other: &[f32]) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let shape = vec![GN_N, GN_C, GN_H, GN_W];
+    let x = session
+        .tensor_variable_f32(values.to_vec(), shape.clone(), false)
+        .expect("f32 target");
+    let y = session
+        .tensor_variable_f32(other.to_vec(), shape, false)
+        .expect("f32 other");
+    let started = Instant::now();
+    session.tensor_mul_(x, y).expect("mul_ f32");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = session
+        .tensor_values_f32(x)
+        .expect("values")
+        .iter()
+        .map(|v| f64::from(v.abs()))
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
@@ -1751,6 +1776,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|value| value as f32)
         .collect();
+    // frankentorch-f32-inplace-accessor-gap-5fxq2: second operand for `inplace_mul_f32`. The
+    // `+ 0.5` matches the incumbent's `(seq(..)+0.5)` exactly, so both arms multiply by
+    // bit-identical values — an offset applied on one side only would make the parity column
+    // meaningless while still "matching" on magnitude.
+    #[allow(clippy::cast_possible_truncation)]
+    let gnx2: Vec<f32> = seq(GN_N * GN_C * GN_H * GN_W)
+        .into_iter()
+        .map(|value| (value + 0.5) as f32)
+        .collect();
     #[allow(clippy::cast_possible_truncation)]
     let gnw: Vec<f32> = seq(GN_C)
         .into_iter()
@@ -1837,6 +1871,11 @@ mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
 # which is the whole point of the row — the f32 no-grad path has long been fused,
 # and it is the GRAD path the scorecard measured at 19.04x.
 gnx=seq(32*64*56*56).reshape(32,64,56,56).float()   # frankentorch-uilzh: keep in lockstep with GN_N/GN_C/GN_H/GN_W
+# frankentorch-f32-inplace-accessor-gap-5fxq2: second operand for the binary in-place lane.
+# Offset by 1 inside `seq` so it is not bit-identical to gnx, and shifted away from zero so a
+# division lane could reuse it later without dividing by zero. Same generator as every other
+# fixture here, so the Rust arm can reproduce it exactly.
+gnx2=(seq(32*64*56*56)+0.5).reshape(32,64,56,56).float()
 gnw=(seq(64)*10.0+1.0).float().requires_grad_(True)
 gnb=(seq(64)*3.0).float().requires_grad_(True)
 # frankentorch-68pwz: f64 BatchNorm fixtures — same generator and shape as the f32 ones, no
@@ -2080,6 +2119,11 @@ LANES = {
     # property of the dtype policy, not evidence of a bug. Read this lane's timing column and
     # treat its checksum as a tolerance comparison.
     "inplace_exp_f32": (gnx, inplace(lambda x: x.exp_())),
+    # The BINARY arm. `gnx2` is a second fixture of the same shape so the op is a true
+    # elementwise binary rather than a scalar broadcast. mul_ is a NATIVE f32 multiply on both
+    # arms -- FrankenTorch's binary helper takes an f32 op and does not route through f64 -- so
+    # this lane is bit-exact by construction like inplace_neg_f32, not a tolerance lane.
+    "inplace_mul_f32": (gnx, inplace(lambda x: x.mul_(gnx2))),
 }
 "#;
     // ISOLATION MODE PICKS A DIFFERENT CO-PROCESS — `frankentorch-rayon-pool-width-qq8as`.
@@ -2577,6 +2621,10 @@ LANES = {
             Box::new(|| {
                 timed_inplace_f32(&gnx, |s, x| s.tensor_exp_(x).expect("exp_ f32"))
             }),
+        ),
+        (
+            "inplace_mul_f32",
+            Box::new(|| timed_inplace_binary_f32(&gnx, &gnx2)),
         ),
         (
             "group_norm_f32",
