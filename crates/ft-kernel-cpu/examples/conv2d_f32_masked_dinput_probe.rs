@@ -480,6 +480,63 @@ fn main() {
         );
     }
 
+    // PAIRED ROW FOR THE PER-WORKER DINPUT SCRATCH -- `frankentorch-t1gph`.
+    //
+    // Measured at output_mask = [true, false, false], which is EXACTLY what the headline lane
+    // conv2d_f32_masked requests (weight_grad = false). Every dweight lever is routed away from
+    // that lane, so this arm is the one that prices a change against the bead's actual number.
+    {
+        let once = |on: bool| -> f64 {
+            let prev = ft_kernel_cpu::set_conv2d_dinput_worker_scratch(on);
+            let start = Instant::now();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [true, false, false],
+            );
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&out);
+            ft_kernel_cpu::set_conv2d_dinput_worker_scratch(prev);
+            ms
+        };
+        let mut off_v = Vec::new();
+        let mut on_v = Vec::new();
+        let mut nulls = Vec::new();
+        for rep in 0..reps {
+            let r = if rep % 2 == 0 {
+                let a = [once(false), once(true), once(true), once(false)];
+                [a[0], a[1], a[2], a[3]]
+            } else {
+                let a = [once(true), once(false), once(false), once(true)];
+                [a[1], a[0], a[3], a[2]]
+            };
+            if rep == 0 {
+                continue;
+            }
+            off_v.push(r[0].min(r[3]));
+            on_v.push(r[1].min(r[2]));
+            nulls.push(r[0] / r[3]);
+        }
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let mut ratios: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
+        let paired = median(&mut ratios);
+        let null = median(&mut nulls.clone());
+        let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
+        let off_m = median(&mut off_v.clone());
+        let on_m = median(&mut on_v.clone());
+        eprintln!(
+            "F32_SCRATCH dinput-only entry (headline lane mask)  OFF per-batch {off_m:7.3} ms   ON per-worker {on_m:7.3} ms"
+        );
+        eprintln!(
+            "F32_SCRATCH   marginal {:.4}x   paired {paired:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
+            off_m / on_m,
+            off_v.len(),
+            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+        );
+    }
+
     // ---------------------------------------------------------------------------------------
     // THE f64 TWIN -- `frankentorch-06csx`.
     //
