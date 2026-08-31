@@ -41579,3 +41579,41 @@ cheaper than a source read and cannot be talked out of** — the same lesson as
 `feedback_sentinel_before_fixing`, applied to routing rather than to a branch.
 
 Next target named by this split: the PANEL, not the GEMM. No lever proposed here.
+
+### 292a. INSIDE THE CHOLESKY PANEL: 96.5% IS PER-COLUMN BLAS-1 ROW DOTS AT 0.81 GFLOP/s
+
+`frankentorch-valnx`, completing item 292. The panel was 53-58% of an n=512 factorisation; this is
+what it is made of. Opt-in census, default OFF because it costs two `Instant` pairs per COLUMN
+against the coarse counters' one pair per PANEL. thinkstation1, rayon=16, min-wall rep of 15, guard
+PASS, three invocations:
+
+    diagonal dot + sqrt     2.5% / 2.6% / 2.5%
+    sub-diagonal row dots  96.5% / 96.4% / 96.5%
+    loop/index residual     1.0% / 1.0% / 1.0%
+    closure                99.0% in all three
+
+**It is not bounds checks, not layout, not the square root.** It is the inner
+`for ii in (jj+1)..je` loop: one short dot product and one divide per row below the diagonal, for
+each of 128 columns per panel.
+
+THE RATE IS THE RESULT:
+
+    panel             1,398,016 MACs in 3.45 ms  ->   0.81 GFLOP/s
+    trailing update  44,739,242 MACs in 1.01 ms  ->  ~90    GFLOP/s
+
+**3.1% of the factorisation's arithmetic, at ~1% of the trailing update's rate, becomes 53-61% of
+its wall time.** The panel is a serial unblocked dot-based `potf2` — no `par_iter` in it at all —
+and its dots are at most nb=128 long with a dependent accumulation chain, so it gets neither
+parallelism nor a wide inner loop. A 110x rate gap on the phase that dominates the clock is a
+better-specified target than anything the GEMM side of this family offered.
+
+METHOD NOTE, and it cuts against the instrument: the census-on panel read +10.0%, **-13.1%** and
++9.4% against census-off across three runs. A census cannot make code faster, so -13.1% is noise
+and the honest statement is that **the instrument's cost is below this comparison's noise floor**,
+not that it is 10%. Quoting the +10.0% alone would have been picking the reading that flattered the
+instrument. The sub-phase SHARES are unaffected — they reproduce to 0.1% across all three runs.
+
+No lever proposed. Two shapes are visible from here (parallelising independent rows, or replacing
+the per-column BLAS-1 with a BLAS-2/blocked panel), and both need their own measurement: the rows
+are independent but short, and item 255 priced a rayon fork on this host at ~7 us against a panel
+whose ENTIRE cost is 3.4 ms across 512 columns.
