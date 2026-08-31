@@ -39737,3 +39737,65 @@ wrong, because "bound by neither of the two things I computed" leaves every othe
 including the one I had already dismissed. The cheap corrective is the same shape as item 265's:
 **make the thing you believe is irrelevant vary, and see whether it moves.** One arm, and a
 plausible story died before it became a kernel.
+
+## 267. WHERE conv2d_f32_masked's 2.34x ACTUALLY GOES — TOP-3 FRAMES ON ONE HOST, AND THE FORWARD IS EXONERATED
+
+`frankentorch-hi9r6`. Forward arm in `1a2de1f0`. **Warm-start summary for whoever takes this
+next; no lever, and the candidate list I had is exhausted.**
+
+### 267a. THE FRAMES
+
+Every figure below is hetzner2, 16 cores, RAYON=16, arms adjacent inside each rep, min of 9 after
+discarding the first. The forward arm exists specifically so that all three frames come from ONE
+host: the lane figures are thinkstation1 and the kernel figures are hetzner2, and
+`feedback_measurement_host_identity` forbids splicing those into one decomposition.
+
+    forward                              15.141 ms    36% of masked-lane kernels
+    backward (fused mask, dinput ONLY)   26.700 ms    64%      "
+    session / tape                       ~4.1-4.7 ms  (thinkstation1 — DIFFERENT HOST, see below)
+
+    masked-lane kernels  = 15.141 + 26.700 = 41.841 ms
+    summed-lane kernels  = 15.141 +  6.203 = 21.345 ms
+
+The masked lane runs `weight_grad = false`, so its backward is the dinput-only arm; the summed
+lane reaches the all-ones 3x3 adjoint instead.
+
+### 267b. THE FORWARD IS EXONERATED, WHICH IS THE USEFUL HALF
+
+The forward is 15.1 ms — 36% of the masked lane's kernels and 71% of the summed lane's — and yet
+**the SUMMED lane measures at PARITY with PyTorch** (1.01-1.02x FASTER, both A/A gates PASS, item
+264). A frame that large sitting inside a lane that WINS cannot be why a different lane loses.
+
+So the entire 2.34x deficit is the BACKWARD. Sharper: **our masked backward alone (26.7-31.1 ms)
+exceeds PyTorch's entire masked forward-plus-backward (23.6-24.3 ms).** A free forward and a free
+session would still not close this lane.
+
+### 267c. WHAT IS ALREADY EXCLUDED, SO NOBODY RE-RUNS IT
+
+  * **A general-dout 3x3 kernel** — item 265. The separator (generic path fed an ALL-ONES mask)
+    reads 0.961x / 1.024x / 1.075x across three windows: the generic path extracts nothing from
+    ones, so the adjoint's 4-6 ms is LESS WORK, not faster work, and its speedup does not
+    transfer.
+  * **Another panel elimination on dinput** — item 266. Legacy panel+col2im versus the shipped
+    direct route reads 2.213x / 2.712x across two windows, so the panel is already gone from this
+    path and removing it again is not available.
+  * **The scatter, on bound-arithmetic grounds** — item 266. The residual is at ~12% of compute
+    peak AND ~3% of DRAM, bound by neither, and I inferred the scatter from that and was WRONG.
+    The inference is unsound, not merely unlucky; do not repeat it without an arm that isolates
+    the scatter directly.
+
+### 267d. TWO CAUTIONS FOR THE NEXT AGENT
+
+  * **Do not trust the dweight-only arm.** It read 29.694 ms on a quiet run and 44.096 ms on one
+    where load rose 2.38 -> 8.65 mid-run, while the dinput arm moved far less (31.073 -> 26.700).
+    Take your own quiet reading before sizing anything against it.
+  * **The session figure is from a different host than the kernel figures**, and is listed
+    separately for that reason rather than folded into the percentages. It is small either way
+    (~4.1-4.7 ms of a ~56 ms lane) and is not where this lane loses.
+
+### 267e. WHAT IS LEFT
+
+The backward at 26.7-31.1 ms is ~97 GFLOP/s against an AVX2 f32 ceiling several times that. The
+headroom is real and it is in making the GENERAL path faster — but the three cheapest stories for
+why it is slow have now been measured and killed, so the next candidate needs an arm that isolates
+a phase INSIDE `conv2d_backward_dinput_direct_f32`, not another whole-kernel comparison.
