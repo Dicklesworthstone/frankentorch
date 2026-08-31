@@ -40954,3 +40954,50 @@ consequence is that the ~10 ms is not cheaply recoverable — no lever follows f
 confirmed ~1.01x (283e) stands on its own without needing the displacement explained.
 
 The run also supplies a fifth independent positive lane reading: 96.790 -> 95.277 ms = 1.0159x.
+
+---
+
+## 284. THE TRAIN LANE'S vs-TORCH ROW, DELIVERED — 1.43-1.45x, and the drift gate IS reachable (shorten the SWEEP, not the load)
+
+`frankentorch-t1gph`. The open deliverable: every dweight lever this campaign shipped reaches
+`conv2d_f32_masked_train`, not the 2.34x headline lane (282a), and that train lane had never been
+measured against live PyTorch.
+
+    thinkstation1, Threadripper PRO 5975WX, rayon=16, torch 8 threads, PyTorch 2.12.1+cpu
+    ELF 88bc3e150d66cccf072644d8a0e28bfbb6cd7195a5b46f50d40c745737be70aa
+    single lane, FT_H2H_LANES_EXACT=1, three back-to-back invocations
+
+    run 1  load_1m 5.68 -> 5.97  drift PASS  series PASS  endpoint PASS
+           FT 49.729 ms   PT 34.746 ms   FT 1.43x SLOWER   parity match
+           A/A: PT OFFSET [0.855,1.092]   FT PASS [0.959,1.022]
+    run 2  load_1m 7.37 -> 9.32  LOAD-DRIFTED — discarded, not quoted
+    run 3  load_1m 7.91 -> 8.10  drift PASS  series PASS  endpoint PASS
+           FT 49.995 ms   PT 34.480 ms   FT 1.45x SLOWER   parity match
+           A/A: PT PASS [0.907,1.086]   FT OFFSET [0.988,1.054]
+
+**Two gate-passing rows agreeing at 1.43x and 1.45x.** Neither A/A gate FAILED in either run,
+though each run has one arm at OFFSET rather than PASS, which is stated rather than rounded up to
+"both nulls pass".
+
+The binary includes every lever shipped this session — streamed dweight, tiled `dout_flat`, the f32
+and f64 n-splits, and the fusion reuse (283). Earlier readings of this lane at 1.73-1.87x came from
+gate-VOIDED invocations on an older ELF and are **not** a baseline; no delta is claimed from them.
+
+**Context that matters for scoping: the train lane is in BETTER shape than the headline lane.**
+`conv2d_f32_masked` is banked at 2.34-2.39x while `conv2d_f32_masked_train` measures 1.43-1.45x —
+so the bead's title attaches its worst number to the lane the campaign's levers cannot reach, and
+its best-covered lane is the healthier one.
+
+### 284a. CORRECTION: the drift gate is reachable — shorten the SWEEP, not the host
+
+282d and the mail thread said this gate was unreachable on a quiet 32-core box at rayon=16 plus
+torch's 8 threads, deriving `start_load >= 4 * self_load * (1 - exp(-T/60))` ~ 86. **That is right
+for a 21-lane sweep and wrong as a general claim.** `T` is in the formula, and it is the term under
+our control: cutting 21 lanes to 4 bought the ENDPOINT gate (7.18 -> 8.10) but not the series gate;
+cutting to ONE lane passed drift, series and endpoint together, twice, starting from loads of 5.68
+and 7.91 — nowhere near 86.
+
+The earlier four failures were not evidence that the gate is unreachable, only that a long sweep
+cannot reach it. **When a gate refuses, check which of its terms you actually control before
+concluding the measurement is impossible** — and prefer shortening the measurement over loading the
+host, which would buy the gate at the cost of contention the ratio cannot see.
