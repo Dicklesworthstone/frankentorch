@@ -349,6 +349,60 @@ fn main() {
         );
     }
 
+    // WHICH LANES ACTUALLY REACH A NARROW -- `frankentorch-dwto7`.
+    //
+    // Before claiming anything for a site, find out whether a lane executes it. On t1gph FOUR
+    // shipped levers turned out to be routed away from that bead's own headline lane (282a), and
+    // the fix there was to read the harness flags first. Here the equivalent check is cheaper: the
+    // shared helper counts its own calls, so routing a site through it makes the site
+    // self-reporting.
+    //
+    // Three lane shapes, matching the board:
+    //   plain      timed_conv2d_f32(.., mask=None, weight_grad=false)  -> "conv2d_f32"
+    //   masked     mask, weight_grad=false                             -> "conv2d_f32_masked"
+    //   train      mask, weight_grad=true                              -> "conv2d_f32_masked_train"
+    // The plain lane is the one that can reach `functional_conv2d`'s OWN f32 backward, because the
+    // masked lanes are intercepted by the conv2d/mask fusion. It may still skip the narrow: the
+    // all-ones adjoint above it (item 185) handles a sum-loss dout without converting anything.
+    {
+        let probe = |with_mask: bool, weight_grad: bool| -> (u64, u64) {
+            ft_api::reset_narrow_counts();
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(values.clone(), vec![BATCH, IN_CH, H, W], true)
+                .expect("leaf x");
+            let w = session
+                .tensor_variable_f32(weights.clone(), vec![OUT_CH, IN_CH, K, K], weight_grad)
+                .expect("leaf w");
+            let out = session
+                .functional_conv2d(x, w, None, (1, 1), (1, 1))
+                .expect("conv2d");
+            let scored = if with_mask {
+                let m = session
+                    .tensor_variable_f32(mask.clone(), vec![BATCH, OUT_CH, H, W], false)
+                    .expect("leaf mask");
+                session.tensor_mul(out, m).expect("mask multiply")
+            } else {
+                out
+            };
+            let loss = session.tensor_sum(scored).expect("sum");
+            let report = session.tensor_backward(loss).expect("backward");
+            std::hint::black_box(report.gradient(x).expect("grad").len());
+            ft_api::narrow_counts()
+        };
+        for (name, with_mask, wg) in [
+            ("conv2d_f32        (no mask, no wgrad)", false, false),
+            ("conv2d_f32_masked (mask, no wgrad)   ", true, false),
+            ("conv2d_f32_masked_train (mask+wgrad) ", true, true),
+        ] {
+            let (calls, elems) = probe(with_mask, wg);
+            eprintln!(
+                "NARROW_ROUTE {name}  narrow calls {calls}  elements {elems}{}",
+                if calls == 0 { "   <- UNREACHED: gate is correctness only, no perf claim" } else { "" }
+            );
+        }
+    }
+
     // PAIRED A/B for the PARALLEL NARROW -- `frankentorch-t1gph`, ledger 286.
     //
     // The tape is f64 and the kernel is f32, so every backward narrows 5.24M elements. The widen

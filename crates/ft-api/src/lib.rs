@@ -31992,8 +31992,14 @@ impl FrankenTorchSession {
                             let (dp, dw, db) = fast;
                             (need_input.then_some(dp), need_weight.then_some(dw), db)
                         } else {
-                            let dout_f32: Vec<f32> =
-                                grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            // Through the shared SIZE-GATED helper — `frankentorch-dwto7`. This is
+                            // the FALLBACK arm: the all-ones adjoint above skips the narrow
+                            // entirely (item 185's narrow-skip), so whether this line executes at
+                            // all on a given lane is a routing question, and `narrow_counts()`
+                            // answers it rather than a source reading. The gate matters here even
+                            // if no lane reaches it: an ungated par_iter would pessimise small
+                            // shapes by a measured 4.3x at 64 threads.
+                            let dout_f32: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                             let (dp, dw, db) = ft_kernel_cpu::conv2d_backward_masked_f32(
                                 &dout_f32,
                                 padded_values,
