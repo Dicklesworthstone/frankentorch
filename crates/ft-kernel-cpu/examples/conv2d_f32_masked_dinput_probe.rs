@@ -58,6 +58,20 @@ fn main() {
         rayon::current_num_threads()
     );
 
+    // THE SEPARATING ARM — `frankentorch-hi9r6`. The 13.8x between the adjoint and the generic
+    // entry has two candidate sources and the earlier probe could not tell them apart: the 3x3
+    // stride-1 STRUCTURAL specialisation, and `dout == 1` COLLAPSING the work (with ones, every
+    // dweight row is the same row and dinput is a fixed stencil). Only the first would transfer
+    // to a general-dout 3x3 kernel, so building one is justified only if the first dominates.
+    //
+    // This arm runs the GENERIC fused entry with an ALL-ONES mask. Same code path, same shape,
+    // same 3x3 stride-1 structure — the only thing that changes is whether the values happen to
+    // be 1.0. If it matches the non-uniform-mask arm, the generic path extracts NOTHING from
+    // ones, which means the adjoint's 4.121 ms is it doing LESS WORK rather than the same work
+    // faster, and the 13.8x does not transfer.
+    let ones_mask: Vec<f32> = vec![1.0; BATCH * OUT_CH * H * W];
+    let mut fused_ones_mask = f64::INFINITY;
+
     let mut adjoint = f64::INFINITY;
     let mut fused_both = f64::INFINITY;
     let mut fused_dinput = f64::INFINITY;
@@ -98,12 +112,21 @@ fn main() {
         let t_dw = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&d);
 
+        let start = Instant::now();
+        let e = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+            &ones, &ones_mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            [true, true, false],
+        );
+        let t_ones_mask = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&e);
+
         // Discard the first rep on every arm: allocator and page-fault costs the rest do not pay.
         if rep > 0 {
             adjoint = adjoint.min(t_adjoint);
             fused_both = fused_both.min(t_both);
             fused_dinput = fused_dinput.min(t_din);
             fused_dweight = fused_dweight.min(t_dw);
+            fused_ones_mask = fused_ones_mask.min(t_ones_mask);
         }
     }
 
@@ -111,10 +134,17 @@ fn main() {
     eprintln!("F32_DINPUT fused mask, dinput+dweight        {fused_both:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dinput ONLY           {fused_dinput:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dweight ONLY          {fused_dweight:8.3} ms");
+    eprintln!("F32_DINPUT fused mask, ALL-ONES mask (separator) {fused_ones_mask:8.3} ms");
     eprintln!(
         "F32_DINPUT kernel-level gap (fused both - adjoint) {:8.3} ms; dinput is {:.0}% of the \
          fused entry",
         fused_both - adjoint,
         100.0 * fused_dinput / fused_both
+    );
+    eprintln!(
+        "F32_DINPUT SEPARATOR: generic-with-ones / generic-with-mask = {:.3}x. ~1.0 means the \
+         generic path extracts NOTHING from ones, so the adjoint's speed is LESS WORK and the \
+         13.8x does NOT transfer to a general-dout 3x3 kernel.",
+        fused_ones_mask / fused_both
     );
 }
