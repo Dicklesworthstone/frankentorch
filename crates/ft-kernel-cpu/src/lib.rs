@@ -9926,15 +9926,38 @@ pub fn conv2d_backward_f32(
     //
     // BIT-EXACT: allocation changes, computation does not. The GEMM performs the same stores in
     // the same order; only the dead pass before it is gone.
-    let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
-        if flat == 0 || patch_width == 0 {
-            dpanel.fill(0.0);
-            return;
-        }
-        CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
-        gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
-    });
-    let dpadded = conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    // THE DIRECT dinput ROUTE, WHICH f32 HAD AND NEVER REACHED FROM HERE — `frankentorch-hi9r6`.
+    //
+    // `conv2d_backward_f64` gates this exact choice on `conv2d_dinput_blocked_any` and takes the
+    // direct route when it fires. The f32 twin did not: it built `dpanel` UNCONDITIONALLY and
+    // col2im'd it, even though `conv2d_backward_dinput_direct_f32` already exists and the FUSED
+    // f32 entry (`masked_conv2d.rs:222`) already calls it under the same predicate. The routine
+    // was ported; the routing was not.
+    //
+    // `dpanel` here is `flat * patch_width` f32 — ~189 MB at the f32 lane's batch 160 — written
+    // once and read once by `col2im`, which is the same panel round trip the streamed `dweight`
+    // removes on the other half of this backward. Item 132's lesson, third instance on this bead:
+    // a shared routine fixed for one caller is not fixed for its siblings, and a gate is how the
+    // fix fails to travel.
+    //
+    // BIT-EXACT: this is the same function the fused f32 path already uses, under the same
+    // predicate, so the two f32 entries now agree about which route a shape takes rather than
+    // disagreeing — `conv2d_ones_dout_route`'s rationale applied to dinput.
+    let dpadded = if conv2d_dinput_blocked_any(batch, in_ch) {
+        conv2d_backward_dinput_direct_f32(
+            &dout_flat, weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        )
+    } else {
+        let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
+            if flat == 0 || patch_width == 0 {
+                dpanel.fill(0.0);
+                return;
+            }
+            CONV2D_DPANEL_GEMMS.with(|c| c.set(c.get() + 1));
+            gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+        });
+        conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw)
+    };
     let dbias = if has_bias {
         let mut db = vec![0.0f32; out_ch];
         db.par_iter_mut().enumerate().for_each(|(oc, dbo)| {
@@ -46955,44 +46978,8 @@ unsafe fn transpose_block_8x8_avx2_f32(
 #[cfg(test)]
 mod tests {
     use rayon::prelude::*;
+    use rusty_fork::rusty_fork_test;
     use std::fmt::Write as _;
-
-    // The bidiag H2H controls are process-global atomics. Rust's test runner executes
-    // independent tests concurrently, so a test that temporarily forces the parallel
-    // gate must not overlap a test asserting thread-count bit exactness.
-    static BIDIAG_DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_bidiag_dispatch_for_test() -> std::sync::MutexGuard<'static, ()> {
-        BIDIAG_DISPATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    struct BidiagDispatchOverride {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous_gate: u64,
-        previous_hoisted: bool,
-    }
-
-    impl BidiagDispatchOverride {
-        fn force_parallel_legacy_path() -> Self {
-            let lock = lock_bidiag_dispatch_for_test();
-            let previous_gate = super::bidiag::set_parallel_gate(1);
-            let previous_hoisted = super::bidiag::set_parallel_gate_hoisted(true);
-            Self {
-                _lock: lock,
-                previous_gate,
-                previous_hoisted,
-            }
-        }
-    }
-
-    impl Drop for BidiagDispatchOverride {
-        fn drop(&mut self) {
-            super::bidiag::set_parallel_gate_hoisted(self.previous_hoisted);
-            super::bidiag::set_parallel_gate(self.previous_gate);
-        }
-    }
 
     /// Which eigh phase actually dominates? This decides whether `dstedc` is worth writing.
     ///
@@ -49423,6 +49410,60 @@ mod tests {
     /// bit-identity across pools it configures itself). A test that mutates a global and asserts
     /// on a global needs the lock; the alternative is a suite whose result depends on scheduling.
     static CONV2D_DWEIGHT_STREAM_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn conv2d_generic_f32_dinput_direct_matches_the_panel_route_bitwise() {
+        // `frankentorch-hi9r6`. `conv2d_backward_f32` now takes the DIRECT dinput route under
+        // `conv2d_dinput_blocked_any`, as its f64 twin always has; before this it built the
+        // `flat * patch_width` panel unconditionally and col2im'd it. The routine was ported
+        // long ago and the ROUTING was not — so this pins that the two produce identical bits,
+        // which is the only thing that makes the routing change safe rather than a rewrite.
+        //
+        // `conv2d_dinput_panel_legacy` is the same switch the f64 sibling's test drives, and it
+        // forces the panel route back on, so both arms run through the real kernel entry.
+        let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        // `batch` is large enough that `conv2d_dinput_blocked_any` is open on any worker in this
+        // fleet without pinning a pool, and tiny in every other dimension so it costs nothing.
+        let (batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw) = (128, 2, 3, 7, 6, 3, 3, 1, 1);
+        let (oh, ow) = ((ph - kh) / sh + 1, (pw - kw) / sw + 1);
+        assert!(
+            super::conv2d_dinput_blocked_any(batch, in_ch),
+            "the direct route must be selectable here or this test asserts nothing"
+        );
+        let dout: Vec<f32> = (0..batch * out_ch * oh * ow)
+            .map(|i| ((i % 29) as f32) * 0.017 - 0.25)
+            .collect();
+        let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i % 31) as f32) * 0.011 - 0.17)
+            .collect();
+        let weight_flat: Vec<f32> = (0..out_ch * in_ch * kh * kw)
+            .map(|i| ((i % 13) as f32) * 0.125 - 0.75)
+            .collect();
+
+        let previous = super::set_conv2d_dinput_panel_legacy(true);
+        let (panel_dpadded, _, _) = super::conv2d_backward_f32(
+            &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+            false,
+        );
+        super::set_conv2d_dinput_panel_legacy(false);
+        let (direct_dpadded, _, _) = super::conv2d_backward_f32(
+            &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+            false,
+        );
+        super::set_conv2d_dinput_panel_legacy(previous);
+
+        assert_eq!(panel_dpadded.len(), direct_dpadded.len());
+        for (index, (a, b)) in panel_dpadded.iter().zip(&direct_dpadded).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "generic f32 dpadded[{index}] differs: panel {a:e} vs direct {b:e}"
+            );
+        }
+    }
 
     #[test]
     fn conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise() {
@@ -68413,7 +68454,6 @@ mod tests {
 
     #[test]
     fn svd_deferred_left_thread_count_bit_exact() {
-        let _dispatch_lock = lock_bidiag_dispatch_for_test();
         let n = 96usize;
         let a = svd_wellconditioned_square_fixture(n);
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
@@ -72061,13 +72101,18 @@ mod tests {
         }
     }
 
-    /// `frankentorch-mzrnh`: caching the dispatch predicate at panel entry is
-    /// only a scheduling-overhead change. It must retain the legacy branch for
-    /// every reflector and therefore every output bit, including the partial
-    /// sums taken by the parallel reduction.
+    // `frankentorch-mzrnh`: caching the dispatch predicate at panel entry is
+    // only a scheduling-overhead change. It must retain the legacy branch for
+    // every reflector and therefore every output bit, including the partial
+    // sums taken by the parallel reduction.
+    rusty_fork_test! {
     #[test]
     fn bidiag_hoisted_gate_matches_per_reflector_decision_bits() {
-        let _dispatch_override = BidiagDispatchOverride::force_parallel_legacy_path();
+        // These controls are intentionally process-global for the measurement harness. Run
+        // the check in a separate harness process so its forced route cannot leak into the
+        // concurrently scheduled numerical tests in the parent process.
+        let previous_gate = super::bidiag::set_parallel_gate(1);
+        let previous_hoisted = super::bidiag::set_parallel_gate_hoisted(true);
         let nb = super::svd_bidiag_block_size();
 
         for &n in &[136usize, 192] {
@@ -72103,6 +72148,10 @@ mod tests {
 
             super::bidiag::set_parallel_gate_hoisted(true);
         }
+
+        super::bidiag::set_parallel_gate_hoisted(previous_hoisted);
+        super::bidiag::set_parallel_gate(previous_gate);
+    }
     }
 
     /// Is the reduction's panel width right at the sizes we actually measure? —
