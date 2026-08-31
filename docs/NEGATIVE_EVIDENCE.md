@@ -41319,3 +41319,46 @@ The transferable rule: when a ratio improves, check the NUMERATOR moved before b
 lever. Our arm's absolute is the only number a lever can be responsible for, and on this campaign
 the incumbent alone spanned 0.243-0.467 ms on one lane — a 1.9x band with no code change at all.
 Any future retry here needs a mechanism that predicts a change in the FT absolute.
+
+### 289d. THE "2.18x SLOWER" IN-PLACE GAP IS A SHAPE ARTIFACT — THE SIGN FLIPS ACROSS THE SIZE SWEEP
+
+`frankentorch-f32-inplace-accessor-gap-5fxq2`, unary residual, decided by one sweep whose rival
+predictions were written into the harness source BEFORE it ran: (a) cache residency -> ratio
+collapses past L3 with a GROWING absolute gap; (c) per-element overhead -> ratio flat everywhere;
+(d) fixed per-call cost -> ratio collapses with a CONSTANT absolute gap. Ratio and absolute gap are
+both printed so (a) and (d) cannot be conflated afterwards. **The answer was none of them, and the
+harness says so itself.**
+
+thinkstation1 (Threadripper PRO 5975WX, L2 16 MiB agg, L3 128 MiB), rayon=16, torch 2.12.1+cpu,
+two invocations (reps 12 / 32), every row parity match:
+
+    size          FT ms    PT ms    run1            run2
+    l2_2MiB       0.152    0.014    10.85x SLOWER   14.03x SLOWER
+    l3_24MiB      0.665    0.480     1.38x SLOWER    1.64x SLOWER
+    l3_128MiB     3.149    4.715     1.49x FASTER    1.22x FASTER
+    dram_256MiB   6.955   10.819     1.56x FASTER    1.67x FASTER
+
+A 17-23x swing, replicated, **with certified rows on BOTH SIDES of parity** — run1 l3_24MiB
+(1.38x slower, nulls 1.007/1.012) and run2 l3_128MiB (1.22x FASTER, nulls 0.971/0.991).
+
+Effective bandwidth explains it completely:
+
+                  2 MiB   24 MiB  128 MiB  256 MiB
+        FT        24.7     79.4     78.3     76.5   GB/s   FLAT
+        torch    349      130       64.3     46.1   GB/s   DEGRADES
+
+We are DRAM-rate and stay there; torch is far above DRAM rate while the buffer is L3-resident and
+falls BELOW us once it is not. **The board's 2.18x was never a property of our kernel** — 24.5 MiB
+is the one shape where torch still has cache and we have already paid our fixed cost. Quoting any
+single-shape ratio for a bandwidth-bound op is quoting the shape, and item 279 said the size curve
+IS the result; this is the same lesson with the sign reversing rather than the magnitude.
+
+Consequences. **"Close the in-place bandwidth gap" is not a lever**: past L3, where neither arm can
+cache, we are already 1.2-1.7x faster and there is nothing to win. What IS real is a **fixed
+per-call cost of ~0.10-0.16 ms** — at 2 MiB we spend 0.152-0.170 ms against torch's 0.012-0.014, so
+our overhead alone is an order of magnitude larger than torch's entire call. Fitting
+`T = c + bytes/78GB/s` gives `c ~ 0.06-0.10 ms`. It is invisible at 128 MiB and catastrophic below
+L2, and **small tensors are the common case** for in-place ops — an optimizer step calls `foo_` on
+many small parameter tensors and none of them is 128 MiB. Suspects inside the timed region, NOT yet
+decomposed: rayon fork/join, `Arc::make_mut`, and `record_tensor_in_place_operation`, which formats
+a String into the evidence ledger on every call.
