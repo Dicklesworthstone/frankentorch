@@ -115,6 +115,21 @@ const GRADIENT_WIDEN_PARALLEL_MIN: usize = 1 << 20;
 /// now routed here. What IS batch-, index- or grid-sized is the `usize as f64` family, which is a
 /// different conversion this helper cannot take at all.
 ///
+/// AND THE CORRECTION WAS ITSELF INCOMPLETE, same commit-pair. That survey was run against the
+/// `grad_outputs[0]` spelling, so it saw only widens sitting in a backward closure's first
+/// statement. Widening the grep to the bare `.iter().map(..).collect()` shape found two more:
+/// `functional_conv2d_grouped`'s `f32v`/`f64v` closures (whole padded input, whole grad-output,
+/// whole dpadded — numel-scaled, not per-group as the name suggests), and
+/// `update_tensor_values_for_float`, which is the f32 writeback for the ENTIRE in-place family:
+/// **121 call sites reach that one line**, and it was the largest single site in the sweep by
+/// call count while being invisible to a grep for gradients, because it is not one.
+///
+/// The exhaustion criterion is therefore stated as a command, not as prose. What remains under
+/// `\.iter\(\)\.map\(\|&v\| v as f32\)\.collect` is this helper's own body, `#[cfg(test)]` code,
+/// sites already on `par_iter` (`tensor_cdist`, `tensor_pdist`) and genuinely small ones
+/// (`tensor_unique_consecutive`'s unique values). Re-run the grep before believing the sweep is
+/// closed; two successive "no sites remain" claims here were both wrong.
+///
 /// WHY THIS EXISTS. The f32 GroupNorm backward hands its gradient to the tape as a
 /// `Vec<f64>`, and did so with a serial `.iter().map(f64::from).collect()`. For the
 /// scored `[32,64,56,56]` lane that is 6,422,528 elements — a 49 MiB materialization
@@ -30918,12 +30933,12 @@ impl FrankenTorchSession {
                                 let weight_id = fn_inputs[1];
                                 let mut grads: Vec<Option<TensorNodeId>> =
                                     vec![None; fn_inputs.len()];
-                                let f32v = |s: &[f64]| -> Vec<f32> {
-                                    s.iter().map(|&v| v as f32).collect()
-                                };
-                                let f64v = |s: &[f32]| -> Vec<f64> {
-                                    s.iter().map(|&v| v as f64).collect()
-                                };
+                                // Both directions of the grouped-conv backward's dtype hop. The
+                                // arguments are the whole padded input, the whole grad-output and
+                                // the whole dpadded, so these are numel-scaled, not per-group;
+                                // routed onto the gated helpers. `frankentorch-dwto7`.
+                                let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+                                let f64v = |s: &[f32]| -> Vec<f64> { widen_f32_to_f64(s) };
                                 // F64 grad-space: cast F32 weight/padded to F64 nodes so the
                                 // grad nodes are F64 (else F64-only readers ERR). frankentorch-gir5b.
                                 let weight64 = tape.to_f64(weight_id)?;
@@ -57422,7 +57437,12 @@ impl FrankenTorchSession {
         match self.tensor_tape.dtype(target)? {
             DType::F64 => self.tensor_tape.update_tensor_values(target, values),
             DType::F32 => {
-                let values_f32: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+                // The single f32 writeback for the whole in-place family: 121 call sites reach
+                // this one line, every `foo_` op among them, and each pays a numel-scaled narrow
+                // because the session computes in f64 and an F32 tape node stores f32. Routed
+                // onto the gated helper so it inherits the size threshold rather than being
+                // serial at every size. `frankentorch-dwto7`.
+                let values_f32: Vec<f32> = narrow_f64_to_f32(&values);
                 self.tensor_tape
                     .update_tensor_values_f32(target, values_f32)
             }
