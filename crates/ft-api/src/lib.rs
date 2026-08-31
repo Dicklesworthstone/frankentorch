@@ -27398,7 +27398,9 @@ impl FrankenTorchSession {
         inputs.push(mask);
         let mask_index = inputs.len() - 1;
 
-        let out = self.tensor_apply_function_f32_output_borrowed_inputs(
+        let out = self
+            .tensor_tape
+            .apply_function_f32_output_with_create_graph_borrowed_inputs(
             &inputs,
             move |_ctx, _ins| Ok((vec![sum], vec![1])),
             move |ctx, grad_outputs, borrowed| {
@@ -27440,6 +27442,36 @@ impl FrankenTorchSession {
                 // The mask does not require grad.
                 gradients.push(None);
                 Ok(gradients)
+            },
+            // SECOND-ORDER ARM. This node's output is the SCALAR sum, so its upstream arrives as a
+            // scalar node, while the shared recipe wants the per-element upstream the fused node
+            // would have received. Broadcasting the scalar reconstructs exactly that, and the
+            // materialisation happens ONLY here — the first-order fast path, which is the whole
+            // point of the shortcut, never builds it.
+            //
+            // Sharing `conv2d_f32_mask_create_graph_gradients` rather than writing a second
+            // 279-line recipe is deliberate: two copies of a second-order derivation drift, and
+            // `project_double_backward_custom_op_vein` records this campaign already paying once
+            // for a fused fast path whose second order was wrong.
+            move |ctx, grad_outs, fn_inputs, tape| {
+                let dout = tape.expand(
+                    grad_outs[0],
+                    vec![
+                        plan.batch,
+                        plan.out_channels,
+                        plan.output_h,
+                        plan.output_w,
+                    ],
+                )?;
+                conv2d_f32_mask_create_graph_gradients(
+                    ctx,
+                    &[dout],
+                    fn_inputs,
+                    tape,
+                    plan,
+                    mask_index,
+                    has_bias,
+                )
             },
         )?;
         Ok(Some(out))
@@ -107875,49 +107907,87 @@ mod tests {
     /// over for exactly this reason. The transcendentals are included deliberately: `transform`
     /// still runs in f64 and narrows, so any accidental switch to a native-f32 call would show up
     /// here as a last-bit difference rather than passing quietly.
-    /// `frankentorch-qnfq8`: with the shortcut LIVE, a `create_graph` backward on this loss must
-    /// FAIL CLOSED rather than return a wrong second derivative.
+    /// `frankentorch-qnfq8`: with the shortcut LIVE, the SECOND derivative must agree with the
+    /// generic route's.
     ///
-    /// This is the limitation that keeps `CONV2D_F32_MASK_SUM_SHORTCUT` default OFF, and it is
-    /// asserted rather than described so that whoever writes the shared create_graph arm finds a
-    /// test that flips from "errors" to "agrees" the moment the arm exists.
+    /// This test began life asserting the opposite — that `create_graph` FAILED CLOSED, because
+    /// the shortcut node had no second-order arm and the tape refused rather than returning a
+    /// first-order-only answer. It was written so it would flip to an agreement test the moment
+    /// the arm existed. It has flipped: the fused node's 279-line create_graph recipe is now the
+    /// shared `conv2d_f32_mask_create_graph_gradients`, and the shortcut reaches it by expanding
+    /// its scalar upstream to the output shape.
+    ///
+    /// Not asserted bitwise, for the reason the sibling fused/unfused test gives: the two routes
+    /// build `incoming * mask` differently and can round apart by an ulp. A missing or wrong
+    /// second-order arm is off by orders of magnitude — commonly identically zero — which is why
+    /// the non-vacuity check below matters more than the tolerance.
     #[test]
-    fn conv2d_f32_mask_sum_shortcut_fails_closed_under_create_graph() {
-        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        session.set_conv2d_f32_mask_sum_shortcut(true);
-        let x = session
-            .tensor_variable_f32(vec![0.25_f32; 2 * 3 * 5 * 5], vec![2, 3, 5, 5], true)
-            .expect("x");
-        let w = session
-            .tensor_variable_f32(vec![0.1_f32; 4 * 3 * 3 * 3], vec![4, 3, 3, 3], true)
-            .expect("w");
-        let m = session
-            .tensor_variable_f32(vec![0.5_f32; 2 * 4 * 5 * 5], vec![2, 4, 5, 5], false)
-            .expect("mask");
-        let out = session
-            .functional_conv2d(x, w, None, (1, 1), (1, 1))
-            .expect("conv2d");
-        let scored = session.tensor_mul(out, m).expect("mask multiply");
-        let loss = session.tensor_sum(scored).expect("sum");
-        let result = session.tensor_backward_with_options(
-            loss,
-            BackwardOptions {
-                create_graph: true,
-                ..BackwardOptions::strict_default()
-            },
-        );
-        let error = result.expect_err(
-            "the shortcut has no create_graph arm, so a second-order backward MUST error rather \
-             than silently produce a first-order-only answer",
-        );
+    fn conv2d_f32_mask_sum_shortcut_second_derivative_matches_the_generic_route() {
+        let build = |shortcut: bool| -> Vec<f64> {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            session.set_conv2d_f32_mask_sum_shortcut(shortcut);
+            let x = session
+                .tensor_variable_f32(
+                    (0..2 * 3 * 5 * 5).map(|i| (i % 9) as f32 * 0.1 - 0.3).collect(),
+                    vec![2, 3, 5, 5],
+                    true,
+                )
+                .expect("x");
+            let w = session
+                .tensor_variable_f32(
+                    (0..4 * 3 * 3 * 3).map(|i| (i % 7) as f32 * 0.05 - 0.1).collect(),
+                    vec![4, 3, 3, 3],
+                    true,
+                )
+                .expect("w");
+            let m = session
+                .tensor_variable_f32(
+                    (0..2 * 4 * 5 * 5).map(|i| (i % 11) as f32 * 0.06 - 0.2).collect(),
+                    vec![2, 4, 5, 5],
+                    false,
+                )
+                .expect("mask");
+            let out = session
+                .functional_conv2d(x, w, None, (1, 1), (1, 1))
+                .expect("conv2d");
+            let scored = session.tensor_mul(out, m).expect("mask multiply");
+            let loss = session.tensor_sum(scored).expect("sum");
+            let report = session
+                .tensor_backward_with_options(
+                    loss,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("first backward with create_graph");
+            let hits = session.conv2d_f32_mask_sum_shortcut_hits();
+            assert_eq!(
+                hits > 0,
+                shortcut,
+                "shortcut fired {hits} time(s) with the toggle {shortcut}; the two arms must take \
+                 DIFFERENT routes or this test compares a path with itself"
+            );
+            let gx = report.gradient_node(x).expect("connected f32 input gradient");
+            let g_sum = session.tensor_sum(gx).expect("reduce the first derivative");
+            let second = session.tensor_backward(g_sum).expect("second backward");
+            session.tensor_gradient(&second, w).expect("d2/dw").to_vec()
+        };
+
+        let with_shortcut = build(true);
+        let generic = build(false);
+        assert_eq!(with_shortcut.len(), generic.len());
+        for (a, b) in with_shortcut.iter().zip(&generic) {
+            let scale = a.abs().max(b.abs()).max(1.0);
+            assert!(
+                (a - b).abs() / scale < 1e-6,
+                "shortcut second derivative {a} diverges from the generic route's {b}"
+            );
+        }
         assert!(
-            matches!(
-                error,
-                AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet { .. }
-                ))
-            ),
-            "expected the tape's fail-closed create_graph refusal, got {error:?}"
+            with_shortcut.iter().any(|v| v.abs() > 1e-12),
+            "the second derivative is identically zero — the missing-create_graph-arm signature, \
+             which would make the comparison above vacuous"
         );
     }
 
