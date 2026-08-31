@@ -131,6 +131,7 @@ fn main() {
     let mut t_sum = f64::INFINITY;
     let mut t_bwd = f64::INFINITY;
     let mut t_grad = f64::INFINITY;
+    let mut t_kernel = f64::INFINITY;
 
     for rep in 0..reps {
         // Leaf construction is timed separately and EXCLUDED from the lane total below, because
@@ -167,9 +168,18 @@ fn main() {
         let loss = session.tensor_sum(scored).expect("sum");
         let sum = s0.elapsed().as_secs_f64() * 1e3;
 
+        // ATTRIBUTE THE BACKWARD -- `frankentorch-t1gph`. tensor_backward is 63% of this lane and
+        // only the conv2d kernel inside it has ever been attributed; the tape walk, the gradient
+        // allocation and dsum never have. The counters live INSIDE
+        // conv2d_backward_mask_fused_f32, so draining them around this call splits the backward
+        // in-context — no subtraction across two different call sites, which is the trap that
+        // invented a 6 ms frame in ledger 277a.
+        let _ = ft_kernel_cpu::masked_frame_take_ns();
         let b0 = Instant::now();
         let report = session.tensor_backward(loss).expect("backward");
         let bwd = b0.elapsed().as_secs_f64() * 1e3;
+        let (k_dout, k_dweight, k_dinput) = ft_kernel_cpu::masked_frame_take_ns();
+        let kernel_ms = (k_dout + k_dweight + k_dinput) as f64 / 1e6;
 
         let lane = lane_start.elapsed().as_secs_f64() * 1e3;
 
@@ -193,6 +203,7 @@ fn main() {
             t_sum = t_sum.min(sum);
             t_bwd = t_bwd.min(bwd);
             t_grad = t_grad.min(grad);
+            t_kernel = t_kernel.min(kernel_ms);
         }
     }
 
@@ -207,6 +218,16 @@ fn main() {
         "TRAIN   accounted {:5.1}%   unattributed {:8.3} ms",
         100.0 * accounted / total,
         total - accounted
+    );
+    eprintln!(
+        "TRAIN     of that backward: conv2d fused KERNEL {t_kernel:8.3} ms  ({:5.1}% of the backward, {:5.1}% of the lane)",
+        100.0 * t_kernel / t_bwd,
+        100.0 * t_kernel / total
+    );
+    eprintln!(
+        "TRAIN     backward NON-kernel (tape walk, dsum, grad alloc) {:8.3} ms  ({:5.1}% of the lane)  <- never attributed before",
+        t_bwd - t_kernel,
+        100.0 * (t_bwd - t_kernel) / total
     );
     eprintln!("TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms");
 

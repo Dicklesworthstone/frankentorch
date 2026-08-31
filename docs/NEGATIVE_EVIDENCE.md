@@ -41001,3 +41001,50 @@ The earlier four failures were not evidence that the gate is unreachable, only t
 cannot reach it. **When a gate refuses, check which of its terms you actually control before
 concluding the measurement is impossible** — and prefer shortening the measurement over loading the
 host, which would buy the gate at the cost of contention the ratio cannot see.
+
+---
+
+## 285. t1gph's SCOPE IS NOT EMPTY — ~40% of the training lane is backward machinery no lever has ever touched
+
+`frankentorch-t1gph`. Asked whether the bead can close, the honest answer is no, and the reason is
+a frame that had never been measured. The session probe's counters live INSIDE
+`conv2d_backward_mask_fused_f32`, so draining them around `tensor_backward` splits it in-context —
+no subtraction across call sites (277a's trap). hz4, rayon=16, two runs:
+
+    run 1  lane 96.471 ms   backward 76.526 (79.3%)   kernel 38.886 (50.8% of bwd)   NON-kernel 37.640 = 39.0% of lane
+    run 2  lane 94.675 ms   backward 75.101 (79.3%)   kernel 35.314 (47.0% of bwd)   NON-kernel 39.787 = 42.0% of lane
+
+**The backward is ~79% of the lane and only about HALF of it is the conv2d kernel.** The other
+39-42% of the whole lane — the tape walk, the gradient allocation and `dsum` — has never been
+attributed, let alone levered. It is larger than the entire forward convolution (12.4-12.8 ms) and
+comparable to the fused conv2d backward itself.
+
+Both hosts were loaded (loadavg 12.8-13.8), so the ABSOLUTE times are inflated; the SPLIT is the
+measured quantity and it replicates.
+
+### 285a. What IS exhausted, so the boundary is clear
+
+The KERNEL scope is finished, and thoroughly:
+
+    SHIPPED, reaching the headline lane (conv2d_f32_masked, weight_grad=false)
+      tiled dout_flat transpose   frame 1.4429-1.4473x, entry 1.0401x paired, 20/20   (276a)
+      f32 fusion reuse            frame 2.55-2.95x, lane ~1.01x over 4 windows, 87/108 (283)
+    SHIPPED, reaching conv2d_f32_masked_train only (the dweight levers; 282a)
+      streamed f32 dweight        paired 1.74x                                        (263)
+      f32 n-split tiling          fused backward 1.5468x paired, 20/20                (278)
+      f64 n-split tiling          fused backward 1.2299x paired, 20/20                (280)
+    REFUTED WITH NUMBERS
+      general-dout 3x3 (265); second panel elimination (266); scatter loop tightening (268, null);
+      gather inversion (269); block budget (272, shipped value optimal); panel-free rewrite
+      (276, 0.268x); mb sweep (277, shipped value stands); run-outer gather (279, 0.9586x / 0-of-20);
+      origins hoist (281, 0.9570x / 1-of-20); per-worker dinput scratch (282, 10-of-20);
+      the GEMM-microkernel premise and split-K (278a, 1.12x); the closure-re-entry mechanism (283d);
+      allocator warmth (283f).
+    ROWS
+      headline lane   2.34-2.39x banked, NOT refreshed (four gate-voided attempts, 282d)
+      train lane      1.43-1.45x, two gate-passing invocations                          (284)
+
+Five shipped, fourteen refuted, and the dinput frame closed at its memory floor after seven of
+those. **What remains is not a conv2d lever at all** — it is autograd machinery, which is why it
+survived a campaign aimed entirely at kernels, and it may belong to a different bead than this one.
+That is a scoping call, not a measurement one.
