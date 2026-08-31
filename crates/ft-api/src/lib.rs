@@ -589,6 +589,305 @@ struct GroupNormF32SumShortcut {
     input_version: u64,
 }
 
+/// The create_graph (second-order) arm for the f32 conv2d/loss-mask fusion.
+///
+/// EXTRACTED so it can serve TWO nodes: the fused node itself, and the
+/// `frankentorch-qnfq8` sum shortcut, which reaches it by broadcasting its SCALAR upstream
+/// to the output shape. Before the extraction the shortcut had no second-order arm at all,
+/// so a `create_graph` backward on that loss failed closed — honest, but a regression against
+/// the fused node it replaces.
+///
+/// Kept as a free function rather than duplicated: a second copy of a 279-line second-order
+/// recipe is how the two drift apart, and `project_double_backward_custom_op_vein` records
+/// this campaign already paying once for a fused fast path whose second order was wrong.
+fn conv2d_f32_mask_create_graph_gradients(
+    ctx: &ft_autograd::FunctionCtx,
+    grad_outs: &[TensorNodeId],
+    fn_inputs: &[TensorNodeId],
+    tape: &mut ft_autograd::TensorTape,
+    plan: Conv2dMaskPlan,
+    mask_index: usize,
+    has_bias: bool,
+) -> Result<Vec<Option<TensorNodeId>>, AutogradError> {
+    let need = ctx.needs_input_grad().to_vec();
+    let dout_id = grad_outs[0];
+    let padded_id = fn_inputs[0];
+    let weight_id = fn_inputs[1];
+    let mask_id = fn_inputs[mask_index];
+    let mut gradients: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
+    let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+    let f64v =
+        |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
+    // Grad NODES must live in the F64 grad-space (the regular backward and
+    // tensor_values/autograd_grad are F64). apply_function infers output dtype
+    // from its inputs, so feeding the F32 nodes directly would make the grad
+    // node F32 and F64-only readers would then ERR UnsupportedDType. Cast to
+    // F64 nodes first (differentiable CastF64; grad flows back to the F32
+    // leaf). The f32 kernel math inside the nested nodes is unchanged.
+    // frankentorch-gir5b.
+    let weight64 = tape.to_f64(weight_id)?;
+    let padded64 = tape.to_f64(padded_id)?;
+    let mask64 = tape.to_f64(mask_id)?;
+
+    // The fused first-order backward multiplies the incoming gradient by the
+    // mask in f32 inside the kernel; do the same here so the second-order
+    // graph starts from the identical value.
+    let masked_dout = tape.apply_function(
+        &[dout_id, mask64],
+        move |c, ins| {
+            let (incoming, shape) = ins[0];
+            let (mask, _) = ins[1];
+            c.save_for_backward(mask.to_vec(), shape.to_vec());
+            let prod: Vec<f64> = incoming
+                .iter()
+                .zip(mask)
+                .map(|(&g, &m)| f64::from((g as f32) * (m as f32)))
+                .collect();
+            Ok((prod, shape.to_vec()))
+        },
+        move |c, incoming| {
+            let mask = &c.saved_tensors()[0];
+            Ok(vec![
+                Some(
+                    incoming[0]
+                        .iter()
+                        .zip(mask)
+                        .map(|(&g, &m)| f64::from((g as f32) * (m as f32)))
+                        .collect(),
+                ),
+                None,
+            ])
+        },
+    )?;
+
+    if need.first().copied().unwrap_or(false) {
+        let dpadded = tape.apply_function(
+            &[masked_dout, weight64],
+            move |c, ins| {
+                let (dv, _) = ins[0];
+                let (wv, ws) = ins[1];
+                c.save_for_backward(
+                    dv.to_vec(),
+                    vec![
+                        plan.batch,
+                        plan.out_channels,
+                        plan.output_h,
+                        plan.output_w,
+                    ],
+                );
+                c.save_for_backward(wv.to_vec(), ws.to_vec());
+                let zp = vec![
+                    0.0_f32;
+                    plan.batch
+                        * plan.in_channels
+                        * plan.padded_h
+                        * plan.padded_w
+                ];
+                let (dp, _, _) = ft_kernel_cpu::conv2d_backward_f32(
+                    &f32v(dv),
+                    &zp,
+                    &f32v(wv),
+                    plan.batch,
+                    plan.in_channels,
+                    plan.padded_h,
+                    plan.padded_w,
+                    plan.kernel_h,
+                    plan.kernel_w,
+                    plan.output_h,
+                    plan.output_w,
+                    plan.stride_h,
+                    plan.stride_w,
+                    plan.out_channels,
+                    false,
+                );
+                Ok((
+                    f64v(&dp),
+                    vec![
+                        plan.batch,
+                        plan.in_channels,
+                        plan.padded_h,
+                        plan.padded_w,
+                    ],
+                ))
+            },
+            move |c, gouts| {
+                let saved = c.saved_tensors();
+                let dv = &saved[0];
+                let wv = &saved[1];
+                let grad_dout = ft_kernel_cpu::conv2d_forward_f32(
+                    &f32v(gouts[0]),
+                    &f32v(wv),
+                    None,
+                    plan.batch,
+                    plan.in_channels,
+                    plan.padded_h,
+                    plan.padded_w,
+                    plan.kernel_h,
+                    plan.kernel_w,
+                    plan.output_h,
+                    plan.output_w,
+                    plan.stride_h,
+                    plan.stride_w,
+                    plan.out_channels,
+                );
+                let zw = vec![0.0_f32; wv.len()];
+                let (_, grad_weight, _) = ft_kernel_cpu::conv2d_backward_f32(
+                    &f32v(dv),
+                    &f32v(gouts[0]),
+                    &zw,
+                    plan.batch,
+                    plan.in_channels,
+                    plan.padded_h,
+                    plan.padded_w,
+                    plan.kernel_h,
+                    plan.kernel_w,
+                    plan.output_h,
+                    plan.output_w,
+                    plan.stride_h,
+                    plan.stride_w,
+                    plan.out_channels,
+                    false,
+                );
+                Ok(vec![Some(f64v(&grad_dout)), Some(f64v(&grad_weight))])
+            },
+        )?;
+        gradients[0] = Some(dpadded);
+    }
+
+    if need.get(1).copied().unwrap_or(false) {
+        let weight_shape = vec![
+            plan.out_channels,
+            plan.in_channels,
+            plan.kernel_h,
+            plan.kernel_w,
+        ];
+        let dweight = tape.apply_function(
+            &[masked_dout, padded64],
+            move |c, ins| {
+                let (dv, _) = ins[0];
+                let (pv, ps) = ins[1];
+                c.save_for_backward(
+                    dv.to_vec(),
+                    vec![
+                        plan.batch,
+                        plan.out_channels,
+                        plan.output_h,
+                        plan.output_w,
+                    ],
+                );
+                c.save_for_backward(pv.to_vec(), ps.to_vec());
+                let zw = vec![0.0_f32; weight_shape.iter().product::<usize>()];
+                let (_, dw, _) = ft_kernel_cpu::conv2d_backward_f32(
+                    &f32v(dv),
+                    &f32v(pv),
+                    &zw,
+                    plan.batch,
+                    plan.in_channels,
+                    plan.padded_h,
+                    plan.padded_w,
+                    plan.kernel_h,
+                    plan.kernel_w,
+                    plan.output_h,
+                    plan.output_w,
+                    plan.stride_h,
+                    plan.stride_w,
+                    plan.out_channels,
+                    false,
+                );
+                Ok((f64v(&dw), weight_shape.clone()))
+            },
+            move |c, gouts| {
+                let saved = c.saved_tensors();
+                let dv = &saved[0];
+                let pv = &saved[1];
+                let grad_dout = ft_kernel_cpu::conv2d_forward_f32(
+                    &f32v(pv),
+                    &f32v(gouts[0]),
+                    None,
+                    plan.batch,
+                    plan.in_channels,
+                    plan.padded_h,
+                    plan.padded_w,
+                    plan.kernel_h,
+                    plan.kernel_w,
+                    plan.output_h,
+                    plan.output_w,
+                    plan.stride_h,
+                    plan.stride_w,
+                    plan.out_channels,
+                );
+                let zp = vec![
+                    0.0_f32;
+                    plan.batch
+                        * plan.in_channels
+                        * plan.padded_h
+                        * plan.padded_w
+                ];
+                let (grad_padded, _, _) = ft_kernel_cpu::conv2d_backward_f32(
+                    &f32v(dv),
+                    &zp,
+                    &f32v(gouts[0]),
+                    plan.batch,
+                    plan.in_channels,
+                    plan.padded_h,
+                    plan.padded_w,
+                    plan.kernel_h,
+                    plan.kernel_w,
+                    plan.output_h,
+                    plan.output_w,
+                    plan.stride_h,
+                    plan.stride_w,
+                    plan.out_channels,
+                    false,
+                );
+                Ok(vec![Some(f64v(&grad_dout)), Some(f64v(&grad_padded))])
+            },
+        )?;
+        gradients[1] = Some(dweight);
+    }
+
+    if has_bias && need.get(2).copied().unwrap_or(false) {
+        let dbias = tape.apply_function(
+            &[masked_dout],
+            // dbias = sum_{n,oh,ow} dout[:,oc,:,:]. Accumulated in f64, matching
+            // the f32 conv2d fast path's own create_graph arm — the reduction
+            // is a plain sum of values already produced at f32 precision, and
+            // narrowing the accumulator here would diverge from the neighbour
+            // for no reason.
+            move |_c, ins| {
+                let dout = ins[0].0;
+                let plane = plan.output_h * plan.output_w;
+                let mut db = vec![0.0_f64; plan.out_channels];
+                for n in 0..plan.batch {
+                    for channel in 0..plan.out_channels {
+                        let base = (n * plan.out_channels + channel) * plane;
+                        let mut acc = 0.0_f64;
+                        for patch in 0..plane {
+                            acc += dout[base + patch];
+                        }
+                        db[channel] += acc;
+                    }
+                }
+                Ok((db, vec![plan.out_channels]))
+            },
+            move |_c, incoming| {
+                let plane = plan.output_h * plan.output_w;
+                let mut grad_dout =
+                    vec![0.0_f64; plan.batch * plan.out_channels * plane];
+                for n in 0..plan.batch {
+                    for channel in 0..plan.out_channels {
+                        let base = (n * plan.out_channels + channel) * plane;
+                        grad_dout[base..base + plane].fill(incoming[0][channel]);
+                    }
+                }
+                Ok(vec![Some(grad_dout)])
+            },
+        )?;
+        gradients[2] = Some(dbias);
+    }
+
+    Ok(gradients)
+}
 /// Registered on the f32 conv2d/loss-mask fused node so a following plain `tensor_sum` reaches a
 /// scalar-loss backward instead of materialising a per-element `dy`. `frankentorch-qnfq8`.
 ///
@@ -6661,284 +6960,9 @@ impl FrankenTorchSession {
                     Ok(gradients)
                 },
                 move |ctx, grad_outs, fn_inputs, tape| {
-                    let need = ctx.needs_input_grad().to_vec();
-                    let dout_id = grad_outs[0];
-                    let padded_id = fn_inputs[0];
-                    let weight_id = fn_inputs[1];
-                    let mask_id = fn_inputs[mask_index];
-                    let mut gradients: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
-                    let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
-                    let f64v =
-                        |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
-                    // Grad NODES must live in the F64 grad-space (the regular backward and
-                    // tensor_values/autograd_grad are F64). apply_function infers output dtype
-                    // from its inputs, so feeding the F32 nodes directly would make the grad
-                    // node F32 and F64-only readers would then ERR UnsupportedDType. Cast to
-                    // F64 nodes first (differentiable CastF64; grad flows back to the F32
-                    // leaf). The f32 kernel math inside the nested nodes is unchanged.
-                    // frankentorch-gir5b.
-                    let weight64 = tape.to_f64(weight_id)?;
-                    let padded64 = tape.to_f64(padded_id)?;
-                    let mask64 = tape.to_f64(mask_id)?;
-
-                    // The fused first-order backward multiplies the incoming gradient by the
-                    // mask in f32 inside the kernel; do the same here so the second-order
-                    // graph starts from the identical value.
-                    let masked_dout = tape.apply_function(
-                        &[dout_id, mask64],
-                        move |c, ins| {
-                            let (incoming, shape) = ins[0];
-                            let (mask, _) = ins[1];
-                            c.save_for_backward(mask.to_vec(), shape.to_vec());
-                            let prod: Vec<f64> = incoming
-                                .iter()
-                                .zip(mask)
-                                .map(|(&g, &m)| f64::from((g as f32) * (m as f32)))
-                                .collect();
-                            Ok((prod, shape.to_vec()))
-                        },
-                        move |c, incoming| {
-                            let mask = &c.saved_tensors()[0];
-                            Ok(vec![
-                                Some(
-                                    incoming[0]
-                                        .iter()
-                                        .zip(mask)
-                                        .map(|(&g, &m)| f64::from((g as f32) * (m as f32)))
-                                        .collect(),
-                                ),
-                                None,
-                            ])
-                        },
-                    )?;
-
-                    if need.first().copied().unwrap_or(false) {
-                        let dpadded = tape.apply_function(
-                            &[masked_dout, weight64],
-                            move |c, ins| {
-                                let (dv, _) = ins[0];
-                                let (wv, ws) = ins[1];
-                                c.save_for_backward(
-                                    dv.to_vec(),
-                                    vec![
-                                        plan.batch,
-                                        plan.out_channels,
-                                        plan.output_h,
-                                        plan.output_w,
-                                    ],
-                                );
-                                c.save_for_backward(wv.to_vec(), ws.to_vec());
-                                let zp = vec![
-                                    0.0_f32;
-                                    plan.batch
-                                        * plan.in_channels
-                                        * plan.padded_h
-                                        * plan.padded_w
-                                ];
-                                let (dp, _, _) = ft_kernel_cpu::conv2d_backward_f32(
-                                    &f32v(dv),
-                                    &zp,
-                                    &f32v(wv),
-                                    plan.batch,
-                                    plan.in_channels,
-                                    plan.padded_h,
-                                    plan.padded_w,
-                                    plan.kernel_h,
-                                    plan.kernel_w,
-                                    plan.output_h,
-                                    plan.output_w,
-                                    plan.stride_h,
-                                    plan.stride_w,
-                                    plan.out_channels,
-                                    false,
-                                );
-                                Ok((
-                                    f64v(&dp),
-                                    vec![
-                                        plan.batch,
-                                        plan.in_channels,
-                                        plan.padded_h,
-                                        plan.padded_w,
-                                    ],
-                                ))
-                            },
-                            move |c, gouts| {
-                                let saved = c.saved_tensors();
-                                let dv = &saved[0];
-                                let wv = &saved[1];
-                                let grad_dout = ft_kernel_cpu::conv2d_forward_f32(
-                                    &f32v(gouts[0]),
-                                    &f32v(wv),
-                                    None,
-                                    plan.batch,
-                                    plan.in_channels,
-                                    plan.padded_h,
-                                    plan.padded_w,
-                                    plan.kernel_h,
-                                    plan.kernel_w,
-                                    plan.output_h,
-                                    plan.output_w,
-                                    plan.stride_h,
-                                    plan.stride_w,
-                                    plan.out_channels,
-                                );
-                                let zw = vec![0.0_f32; wv.len()];
-                                let (_, grad_weight, _) = ft_kernel_cpu::conv2d_backward_f32(
-                                    &f32v(dv),
-                                    &f32v(gouts[0]),
-                                    &zw,
-                                    plan.batch,
-                                    plan.in_channels,
-                                    plan.padded_h,
-                                    plan.padded_w,
-                                    plan.kernel_h,
-                                    plan.kernel_w,
-                                    plan.output_h,
-                                    plan.output_w,
-                                    plan.stride_h,
-                                    plan.stride_w,
-                                    plan.out_channels,
-                                    false,
-                                );
-                                Ok(vec![Some(f64v(&grad_dout)), Some(f64v(&grad_weight))])
-                            },
-                        )?;
-                        gradients[0] = Some(dpadded);
-                    }
-
-                    if need.get(1).copied().unwrap_or(false) {
-                        let weight_shape = vec![
-                            plan.out_channels,
-                            plan.in_channels,
-                            plan.kernel_h,
-                            plan.kernel_w,
-                        ];
-                        let dweight = tape.apply_function(
-                            &[masked_dout, padded64],
-                            move |c, ins| {
-                                let (dv, _) = ins[0];
-                                let (pv, ps) = ins[1];
-                                c.save_for_backward(
-                                    dv.to_vec(),
-                                    vec![
-                                        plan.batch,
-                                        plan.out_channels,
-                                        plan.output_h,
-                                        plan.output_w,
-                                    ],
-                                );
-                                c.save_for_backward(pv.to_vec(), ps.to_vec());
-                                let zw = vec![0.0_f32; weight_shape.iter().product::<usize>()];
-                                let (_, dw, _) = ft_kernel_cpu::conv2d_backward_f32(
-                                    &f32v(dv),
-                                    &f32v(pv),
-                                    &zw,
-                                    plan.batch,
-                                    plan.in_channels,
-                                    plan.padded_h,
-                                    plan.padded_w,
-                                    plan.kernel_h,
-                                    plan.kernel_w,
-                                    plan.output_h,
-                                    plan.output_w,
-                                    plan.stride_h,
-                                    plan.stride_w,
-                                    plan.out_channels,
-                                    false,
-                                );
-                                Ok((f64v(&dw), weight_shape.clone()))
-                            },
-                            move |c, gouts| {
-                                let saved = c.saved_tensors();
-                                let dv = &saved[0];
-                                let pv = &saved[1];
-                                let grad_dout = ft_kernel_cpu::conv2d_forward_f32(
-                                    &f32v(pv),
-                                    &f32v(gouts[0]),
-                                    None,
-                                    plan.batch,
-                                    plan.in_channels,
-                                    plan.padded_h,
-                                    plan.padded_w,
-                                    plan.kernel_h,
-                                    plan.kernel_w,
-                                    plan.output_h,
-                                    plan.output_w,
-                                    plan.stride_h,
-                                    plan.stride_w,
-                                    plan.out_channels,
-                                );
-                                let zp = vec![
-                                    0.0_f32;
-                                    plan.batch
-                                        * plan.in_channels
-                                        * plan.padded_h
-                                        * plan.padded_w
-                                ];
-                                let (grad_padded, _, _) = ft_kernel_cpu::conv2d_backward_f32(
-                                    &f32v(dv),
-                                    &zp,
-                                    &f32v(gouts[0]),
-                                    plan.batch,
-                                    plan.in_channels,
-                                    plan.padded_h,
-                                    plan.padded_w,
-                                    plan.kernel_h,
-                                    plan.kernel_w,
-                                    plan.output_h,
-                                    plan.output_w,
-                                    plan.stride_h,
-                                    plan.stride_w,
-                                    plan.out_channels,
-                                    false,
-                                );
-                                Ok(vec![Some(f64v(&grad_dout)), Some(f64v(&grad_padded))])
-                            },
-                        )?;
-                        gradients[1] = Some(dweight);
-                    }
-
-                    if has_bias && need.get(2).copied().unwrap_or(false) {
-                        let dbias = tape.apply_function(
-                            &[masked_dout],
-                            // dbias = sum_{n,oh,ow} dout[:,oc,:,:]. Accumulated in f64, matching
-                            // the f32 conv2d fast path's own create_graph arm — the reduction
-                            // is a plain sum of values already produced at f32 precision, and
-                            // narrowing the accumulator here would diverge from the neighbour
-                            // for no reason.
-                            move |_c, ins| {
-                                let dout = ins[0].0;
-                                let plane = plan.output_h * plan.output_w;
-                                let mut db = vec![0.0_f64; plan.out_channels];
-                                for n in 0..plan.batch {
-                                    for channel in 0..plan.out_channels {
-                                        let base = (n * plan.out_channels + channel) * plane;
-                                        let mut acc = 0.0_f64;
-                                        for patch in 0..plane {
-                                            acc += dout[base + patch];
-                                        }
-                                        db[channel] += acc;
-                                    }
-                                }
-                                Ok((db, vec![plan.out_channels]))
-                            },
-                            move |_c, incoming| {
-                                let plane = plan.output_h * plan.output_w;
-                                let mut grad_dout =
-                                    vec![0.0_f64; plan.batch * plan.out_channels * plane];
-                                for n in 0..plan.batch {
-                                    for channel in 0..plan.out_channels {
-                                        let base = (n * plan.out_channels + channel) * plane;
-                                        grad_dout[base..base + plane].fill(incoming[0][channel]);
-                                    }
-                                }
-                                Ok(vec![Some(grad_dout)])
-                            },
-                        )?;
-                        gradients[2] = Some(dbias);
-                    }
-
-                    Ok(gradients)
+                    conv2d_f32_mask_create_graph_gradients(
+                        ctx, grad_outs, fn_inputs, tape, plan, mask_index, has_bias,
+                    )
                 },
             )?;
         self.conv2d_mask_plans.remove(&lhs.0);

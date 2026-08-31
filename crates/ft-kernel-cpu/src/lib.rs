@@ -25,6 +25,12 @@ pub fn probe_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [
     gemm::sgemm(m, k, n, a, b, c);
 }
 
+/// Probe shim for the shared f64 GEMM. `frankentorch-5rnsq`.
+#[doc(hidden)]
+pub fn probe_dgemm(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    gemm::dgemm(m, k, n, a, b, c);
+}
+
 pub use masked_conv2d::{
     conv2d_backward_mask_fused_f32, conv2d_backward_mask_fused_f64, masked_frame_take_ns,
     set_masked_dout_tiled,
