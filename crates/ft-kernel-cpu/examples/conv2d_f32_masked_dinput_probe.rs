@@ -480,6 +480,129 @@ fn main() {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // THE f64 TWIN -- `frankentorch-06csx`.
+    //
+    // The f32 twin ships an n-split-first tiling worth 1.5468x paired (ledger 278). The f64 twin
+    // still runs the old 4x4 tiling, and the gather-repetition argument behind the win is
+    // dtype-independent -- but its MAGNITUDE is not, which is why this is measured rather than
+    // inherited. The f64 lane's batch is 8 against the f32 lane's 160, so `flat` is 8192 not
+    // 163840: 32 k-blocks per tile instead of 640, which makes the fixed per-tile costs (building
+    // `runs`, allocating `ptile`) a ~20x larger share of the frame.
+    //
+    // PREDICTION RECORDED BEFORE THE RUN: (mb=32, min_nb=18) wins, in the same direction as f32 but
+    // by LESS than 1.5468x, because the fixed per-tile costs it cannot remove are a bigger fraction
+    // here. If it does not win at all, the gather repetition is being dominated by those fixed
+    // costs at this batch, and the f64 twin should keep its heuristic -- which would itself be the
+    // useful result, since it would mean the f32 win does NOT generalise by shape argument alone.
+    {
+        const B64: usize = 8; // C2_N, the f64 conv2d lane's batch
+        let padded64: Vec<f64> = (0..B64 * IN_CH * PH * PW)
+            .map(|i| ((i % 37) as f64) * 0.013 - 0.21)
+            .collect();
+        let weight64: Vec<f64> = (0..OUT_CH * IN_CH * K * K)
+            .map(|i| ((i % 11) as f64) * 0.0625 - 0.3125)
+            .collect();
+        let ones64: Vec<f64> = vec![1.0; B64 * OUT_CH * H * W];
+        let mask64: Vec<f64> = (0..B64 * OUT_CH * H * W)
+            .map(|i| ((i % 23) as f64) * 0.019 - 0.19)
+            .collect();
+
+        // PAIRED ROW, f64 fused backward. OFF restores the OLD tiling exactly -- (mb=8,
+        // min_nb=72) gives m_blocks 4, n_blocks min(16, 288/72)=4, 16 tiles, nb=72 -- rather than
+        // (8, 64), which under the new n-split code would yield 20 tiles on 16 threads and be a
+        // straw man. That mistake inflated the f32 row from 1.5468x to 2.2969x before it was
+        // caught, and the tell was the OFF arm's ABSOLUTE disagreeing with banked history.
+        {
+            let once = |on: bool| -> f64 {
+                let (pm, pn) = if on {
+                    (
+                        ft_kernel_cpu::set_conv2d_dweight_mb_f64(0),
+                        ft_kernel_cpu::set_conv2d_dweight_min_nb_f64(0),
+                    )
+                } else {
+                    (
+                        ft_kernel_cpu::set_conv2d_dweight_mb_f64(8),
+                        ft_kernel_cpu::set_conv2d_dweight_min_nb_f64(72),
+                    )
+                };
+                let start = Instant::now();
+                let out = ft_kernel_cpu::conv2d_backward_mask_fused_f64(
+                    &ones64, &mask64, &padded64, &weight64, B64, IN_CH, PH, PW, K, K, H, W, 1, 1,
+                    OUT_CH,
+                    [true, true, false],
+                );
+                let ms = start.elapsed().as_secs_f64() * 1e3;
+                std::hint::black_box(&out);
+                ft_kernel_cpu::set_conv2d_dweight_mb_f64(pm);
+                ft_kernel_cpu::set_conv2d_dweight_min_nb_f64(pn);
+                ms
+            };
+            let mut off_v = Vec::new();
+            let mut on_v = Vec::new();
+            let mut nulls = Vec::new();
+            for rep in 0..reps {
+                let r = if rep % 2 == 0 {
+                    let a = [once(false), once(true), once(true), once(false)];
+                    [a[0], a[1], a[2], a[3]]
+                } else {
+                    let a = [once(true), once(false), once(false), once(true)];
+                    [a[1], a[0], a[3], a[2]]
+                };
+                if rep == 0 {
+                    continue;
+                }
+                off_v.push(r[0].min(r[3]));
+                on_v.push(r[1].min(r[2]));
+                nulls.push(r[0] / r[3]);
+            }
+            let median = |v: &mut Vec<f64>| -> f64 {
+                v.sort_by(f64::total_cmp);
+                if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            };
+            let mut ratios: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
+            let paired = median(&mut ratios);
+            let null = median(&mut nulls.clone());
+            let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
+            let off_m = median(&mut off_v.clone());
+            let on_m = median(&mut on_v.clone());
+            eprintln!(
+                "F64_NSPLIT fused backward  OFF (old tiling 4x4, nb=72) {off_m:7.3} ms   ON (n-split) {on_m:7.3} ms"
+            );
+            eprintln!(
+                "F64_NSPLIT   marginal {:.4}x   paired {paired:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
+                off_m / on_m,
+                off_v.len(),
+                if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+            );
+        }
+
+        for (mb, min_nb) in [(0usize, 0usize), (32, 18), (32, 9), (16, 18), (32, 32)] {
+            let pm = ft_kernel_cpu::set_conv2d_dweight_mb_f64(mb);
+            let pn = ft_kernel_cpu::set_conv2d_dweight_min_nb_f64(min_nb);
+            let mut best = f64::INFINITY;
+            for rep in 0..reps {
+                let start = Instant::now();
+                let out = ft_kernel_cpu::conv2d_backward_mask_fused_f64(
+                    &ones64, &mask64, &padded64, &weight64, B64, IN_CH, PH, PW, K, K, H, W, 1, 1,
+                    OUT_CH,
+                    [false, true, false],
+                );
+                let ms = start.elapsed().as_secs_f64() * 1e3;
+                std::hint::black_box(&out);
+                if rep > 0 {
+                    best = best.min(ms);
+                }
+            }
+            ft_kernel_cpu::set_conv2d_dweight_mb_f64(pm);
+            ft_kernel_cpu::set_conv2d_dweight_min_nb_f64(pn);
+            eprintln!(
+                "F64_DWTILE mb={mb:2} min_nb={min_nb:2}   dweight entry {best:7.3} ms{}",
+                if mb == 0 { "   <- SHIPPED" } else { "" }
+            );
+        }
+    }
+
     // PAIRED ROW FOR THE n-SPLIT TILING -- `frankentorch-06csx`.
     //
     // OFF restores the previous heuristic exactly (mb=8, min_nb=64); ON is the shipped default.

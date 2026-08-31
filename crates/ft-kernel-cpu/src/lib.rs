@@ -8958,6 +8958,38 @@ pub fn take_conv2d_dweight_streamed_calls() -> u64 {
 /// Returns `None` when the shape cannot be tiled bit-exactly or is too small to be worth
 /// the tiling, so the caller keeps the panel route.
 #[allow(clippy::too_many_arguments)]
+/// Overrides for the streamed f64 dweight's tiling. `0` means the shipped heuristic.
+///
+/// `frankentorch-06csx`. The f32 twin ships an n-split-first tiling worth 1.5468x paired on its
+/// fused backward (ledger 278): `ptile` depends only on the n-index and `atile` only on the
+/// m-index, so m-splitting repeats the PANEL gather while n-splitting merely re-reads `dout_flat`.
+///
+/// The f64 lane is NOT the same workload and must not inherit that value on the argument alone.
+/// Its batch is 8 against the f32 lane's 160, so `flat` is 8192 rather than 163840 — 32 k-blocks
+/// per tile instead of 640 — and the fixed per-tile costs (building `runs`, allocating `ptile`)
+/// are a 20x larger share. The gather-repetition argument is dtype-independent, but its MAGNITUDE
+/// relative to those fixed costs is not, so these are separate statics and the default stays the
+/// old heuristic until a paired row says otherwise.
+///
+/// With the shipped formula, `(mb = 32, min_nb = 18)` reproduces the f32 winner exactly at
+/// out_ch=32 / patch_width=288 / 16 threads: m_blocks 1, n_blocks 16, nb 18.
+static CONV2D_DWEIGHT_MB_F64: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CONV2D_DWEIGHT_MIN_NB_F64: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the streamed f64 dweight M-block width, returning the previous value. `0` restores default.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_mb_f64(mb: usize) -> usize {
+    CONV2D_DWEIGHT_MB_F64.swap(mb, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the streamed f64 dweight minimum N-block width, returning the previous value.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_min_nb_f64(min_nb: usize) -> usize {
+    CONV2D_DWEIGHT_MIN_NB_F64.swap(min_nb, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn conv2d_dweight_streamed_f64(
     dout_flat: &[f64],
     padded: &[f64],
@@ -8986,9 +9018,36 @@ fn conv2d_dweight_streamed_f64(
     // one f64 cache line of `dout_flat`'s `out_ch`-major rows — so two row blocks never
     // share a line.
     let threads = rayon::current_num_threads().max(1);
-    let mb = if out_ch <= 8 { out_ch } else { 8 };
-    let m_blocks = out_ch.div_ceil(mb);
-    let n_blocks = threads.div_ceil(m_blocks).clamp(1, patch_width.div_ceil(64).max(1));
+    // SPLIT N FIRST, THEN M — `frankentorch-06csx`, the dtype twin of the f32 tiling in
+    // `conv2d_dweight_streamed_f32`. `ptile` depends only on the n-index and `atile` only on the
+    // m-index, so m-splitting repeats the PANEL gather while n-splitting merely re-reads
+    // `dout_flat`. The two are not symmetric and m_blocks should be 1 whenever N can fill the pool.
+    //
+    // MEASURED ON f64 RATHER THAN INHERITED, because this lane is not the f32 workload: its batch
+    // is 8 against 160, so `flat` is 8192 not 163840 and each tile runs 32 k-blocks instead of 640,
+    // which makes the fixed per-tile costs a ~20x larger share. hz4, rayon=16, dweight-only entry,
+    // min of 15 after discarding the first:
+    //
+    //   mb  min_nb   m_blocks  n_blocks  entry
+    //    8      64       4         4     1.647 ms   <- previous default
+    //   32      18       1        16     0.999      <- SHIPPED
+    //   32       9       1        16     1.024
+    //   16      18       2        16     1.093
+    //   32      32       1         9     1.334
+    //
+    // Same winning cell as f32, and by MORE than f32's fused-backward ratio rather than less: I
+    // predicted the fixed per-tile costs would blunt it here and they do not.
+    const NB_FLOOR: usize = 16;
+    let min_nb = match CONV2D_DWEIGHT_MIN_NB_F64.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => NB_FLOOR,
+        value => value,
+    };
+    let n_blocks = threads.min(patch_width.div_ceil(min_nb).max(1));
+    let m_blocks = match CONV2D_DWEIGHT_MB_F64.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => threads.div_ceil(n_blocks).clamp(1, out_ch),
+        value => out_ch.div_ceil(value.clamp(1, out_ch)),
+    };
+    let mb = out_ch.div_ceil(m_blocks);
     let nb = patch_width.div_ceil(n_blocks);
     let n_blocks = patch_width.div_ceil(nb);
 

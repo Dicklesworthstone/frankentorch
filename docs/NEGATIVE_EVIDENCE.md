@@ -40593,3 +40593,61 @@ dweight is now 11.1 ms against dinput's 8.9 — the two halves are comparable ag
 time on this campaign, and the 82%-gather figure that motivated this lever is a share of a frame
 that item 278 already halved. The short `kw`-length copies look latency-bound in the same way
 ledger 268 found for the dinput scatter, and loop order cannot move that.
+
+---
+
+## 280. THE f64 TWIN TAKES THE SAME n-SPLIT TILING — 1.2299x paired, bit-exact, and the win does NOT transfer at the same size
+
+`frankentorch-06csx`. Item 278 shipped n-split-first tiling on the f32 streamed dweight for
+1.5468x paired. The f64 twin still ran the old 4x4 tiling. The gather-repetition argument behind
+the win is dtype-independent, so the temptation was to port it on the argument alone — and that is
+exactly what `project_conv3d_direct_gate_misset` and
+`feedback_batched_figures_dont_predict_single_matrix` warn against.
+
+**It is a different workload.** The f64 conv2d lane's batch is `C2_N = 8` against the f32 lane's
+160, so `flat` is 8192 rather than 163840 and each tile runs 32 k-blocks instead of 640 — which
+makes the fixed per-tile costs (building `runs`, allocating `ptile`) roughly a 20x larger share of
+the frame. Separate statics, default left on the old heuristic, and measured. hz4, rayon=16,
+dweight-only entry, min of 15 after discarding the first:
+
+    mb  min_nb   m_blocks  n_blocks  entry
+     8      64       4         4     1.647 ms   <- previous default
+    32      18       1        16     0.999      <- SHIPPED
+    32       9       1        16     1.024
+    16      18       2        16     1.093
+    32      32       1         9     1.334
+
+Same winning cell as f32. **PAIRED ROW, f64 fused backward**, alternating square, per-rep min-of-2,
+median of per-rep ratios: OFF 2.947 ms, ON 2.389 ms, **marginal 1.2336x, paired 1.2299x, sign test
+20/20, A/A null 1.0011 PASS**. BIT-EXACT —
+`conv2d_dweight_streamed_matches_the_panel_gemm_bitwise` passes unchanged.
+
+The OFF arm is `(mb = 8, min_nb = 72)`, which reproduces the old tiling exactly (m_blocks 4,
+n_blocks 4, 16 tiles, nb 72). `(8, 64)` would have given 20 tiles on 16 threads under the new code
+— the straw man that inflated the f32 row to 2.2969x before it was caught (278d).
+
+### 280a. THE WIN IS REAL BUT SMALLER, AND I BRIEFLY MISREAD IT BY MIXING DENOMINATORS
+
+Recorded prediction: "wins, in the same direction as f32 but by LESS than 1.5468x, because the
+fixed per-tile costs it cannot remove are a bigger fraction here."
+
+Mid-run I called that wrong, on seeing the f64 **dweight-only entry** go 1.647 -> 0.999 = 1.649x
+and comparing it to f32's **fused-backward** 1.5468x. Those are different denominators. Like for
+like:
+
+    f64 dweight-only entry     1.649x
+    f64 fused backward         1.2299x
+    f32 fused backward         1.5468x
+
+The original prediction was right. **A ratio is meaningless without its denominator named**, and
+the failure mode is not exotic — it took one glance at two numbers that were both "the speedup".
+Compare item 275's `slogdet is 64-78% LU`, retracted for dividing a one-call phase map by a
+min-of-16 lane.
+
+### 280b. WHY IT TRANSFERS AT ALL, AND WHY LESS
+
+The gather repetition scales with `m_blocks`, which the retiling drops from 4 to 1 in both dtypes —
+so the mechanism transfers exactly. What does not transfer is its SHARE: at batch 8 the dweight
+frame is a smaller part of the fused backward and the fixed per-tile costs are proportionally
+larger, so the same mechanism buys 1.23x here against 1.55x there. **Port the mechanism, measure
+the magnitude** — the shape argument was sound and the number was not predictable from it.
