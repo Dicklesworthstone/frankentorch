@@ -83,6 +83,12 @@ fn main() {
     // land close, the panel is not the cost and the scatter is — which would say the remaining
     // dinput lever is the scatter's memory order, not another panel-elimination.
     let mut legacy_dinput = f64::INFINITY;
+    // THE FORWARD ARM — `frankentorch-hi9r6`. A top-3 frame summary for `conv2d_f32_masked` is
+    // only sound if every frame comes from the SAME host: the lane figures are thinkstation1 and
+    // every kernel figure here is hetzner2, and `feedback_measurement_host_identity` forbids
+    // splicing those into one decomposition. Timing the forward here puts all three frames on one
+    // machine, so the shares are a decomposition rather than a cross-host estimate.
+    let mut forward = f64::INFINITY;
 
     let mut adjoint = f64::INFINITY;
     let mut fused_both = f64::INFINITY;
@@ -124,6 +130,13 @@ fn main() {
         let t_dw = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&d);
 
+        let start = Instant::now();
+        let fw = ft_kernel_cpu::conv2d_forward_f32(
+            &padded, &weight, None, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+        );
+        let t_fw = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&fw);
+
         let previous_legacy = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
         let start = Instant::now();
         let f = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
@@ -150,9 +163,11 @@ fn main() {
             fused_dweight = fused_dweight.min(t_dw);
             fused_ones_mask = fused_ones_mask.min(t_ones_mask);
             legacy_dinput = legacy_dinput.min(t_legacy);
+            forward = forward.min(t_fw);
         }
     }
 
+    eprintln!("F32_DINPUT forward                             {forward:8.3} ms");
     eprintln!("F32_DINPUT all-ones adjoint (summed route)   {adjoint:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dinput+dweight        {fused_both:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dinput ONLY           {fused_dinput:8.3} ms");
@@ -176,5 +191,18 @@ fn main() {
          generic path extracts NOTHING from ones, so the adjoint's speed is LESS WORK and the \
          13.8x does NOT transfer to a general-dout 3x3 kernel.",
         fused_ones_mask / fused_both
+    );
+    // The masked lane runs weight_grad = false, so its backward is the dinput-ONLY arm.
+    let masked_kernels = forward + fused_dinput;
+    eprintln!(
+        "F32_DINPUT MASKED-LANE KERNELS (one host): forward {:.3} ({:.0}%) + backward {:.3} \
+         ({:.0}%) = {:.3} ms. The SUMMED lane's kernels are forward + adjoint = {:.3} ms, and \
+         that lane measures at PARITY with PyTorch — so the forward is not the deficit.",
+        forward,
+        100.0 * forward / masked_kernels,
+        fused_dinput,
+        100.0 * fused_dinput / masked_kernels,
+        masked_kernels,
+        forward + adjoint
     );
 }
