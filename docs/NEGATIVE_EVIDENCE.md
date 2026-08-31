@@ -40651,3 +40651,71 @@ so the mechanism transfers exactly. What does not transfer is its SHARE: at batc
 frame is a smaller part of the fused backward and the fixed per-tile costs are proportionally
 larger, so the same mechanism buys 1.23x here against 1.55x there. **Port the mechanism, measure
 the magnitude** — the shape argument was sound and the number was not predictable from it.
+
+---
+
+## 281. THE n-SPLIT CAPTURED 68% OF THE GATHER — ALL THE REDUNDANCY. THE REST IS NOT REACHABLE, AND THE HOIST THAT TARGETED IT IS A MEASURED LOSS
+
+`frankentorch-06csx`. Answering the headroom question directly, then closing it.
+
+### 281a. What the n-split captured
+
+From the `(mb, min_nb)` sweep in ONE invocation, so the figures are comparable:
+
+    before (mb=8, min_nb=64, m_blocks=4):  gather 314.795 ms CPU   GEMM 65.117   frame 24.749 ms
+    after  (mb=32, min_nb=18, m_blocks=1): gather 100.175 ms CPU   GEMM 75.722   frame 11.363 ms
+
+**3.142x, i.e. 214.6 of 314.8 ms CPU removed — 68.2% of the gather.** With `m_blocks = 1` each
+panel column belongs to exactly one n-block, so every panel element is now gathered EXACTLY ONCE.
+**The redundancy vein is exhausted**; there is no second n-split to take.
+
+### 281b. The residue was quantified, attributed, attacked, and it did not pay
+
+Redundancy alone predicted 4x and the measurement was 3.142x. Both configurations run 16 tiles, so
+the row count is identical and the shortfall had to be a per-row term independent of `nb`. Solving
+`(F + 72v)/(F + 18v) = 3.142` gives `F = 7.21v`, putting the fixed part at **28.6%** of the
+remaining gather.
+
+The cause was structural and created by the n-split itself: with `m_blocks = 1` every tile walks
+the SAME rows, each recomputing `row/patch_count`, `row%patch_count`, `pc/ow`, `pc%ow` — four
+divisions by RUNTIME divisors, so real hardware divs — 16 times over for identical results. Hoisting
+them into one shared `flat`-entry table was the obvious lever.
+
+    OFF  22.085 ms (gather 99.365 ms CPU)   ON hoisted  23.139 ms (gather 89.552 ms CPU)
+    marginal 0.9544x   paired 0.9570x   GATHER FRAME 1.1096x
+    SIGN TEST 1/20     A/A null 1.0013 PASS
+
+**The target frame improved and the lane got worse.** The gather fell 1.1096x — so the divisions
+were real — but by 9.9%, a third of the predicted 28.6%. And the lane lost, because the 1.3 MB
+table is built by a single-threaded `(0..flat).map(...).collect()` **before** the parallel loop:
+parallel work was traded for serial work sitting on the critical path, and the gather counter
+could not see the cost because it only times inside the tiles.
+
+Reverted. Even with a parallel table build the ceiling is 9.8 ms CPU / 16 threads = 0.61 ms wall on
+a 22 ms lane = **1.028x — inside the A/A null band**, so it could not be certified by this harness
+even if it worked. The inline computation carries a comment saying not to re-hoist it without both
+a parallel build and a lane that resolves 3%.
+
+### 281c. THE TRANSFERABLE PART: a counter that only covers the parallel region cannot price a serial prologue
+
+This is the second displacement on this campaign (276b was the first) and the first where the
+displacement went the WRONG way — the frame counter said 1.1096x BETTER while the lane said
+0.9570x WORSE, with a 1/20 sign test and a passing null. The counter was not wrong; it was
+**scoped to the parallel region**, and the cost was moved outside it.
+
+**When a lever moves work across a parallelism boundary, the frame counter stops being a proxy for
+the lane.** Instrument the new location, or time the whole entry, before believing a frame
+improvement. Compare item 277a, where a subtraction between two arms invented a 6 ms frame that did
+not exist; here a legitimate counter measured a real improvement that the lane did not receive.
+
+### 281d. 06csx IS CLOSED
+
+Two shipped — f32 n-split 1.5468x paired (278), f64 n-split 1.2299x paired (280), both bit-exact.
+Four refuted with numbers: the GEMM-microkernel premise the bead was FILED on (278a), split-K at
+1.12x, the run-outer gather at 0.9586x / 0-of-20 (279), and this hoist at 0.9570x / 1-of-20.
+
+Remaining state: `entry 21.795 = dout_flat 1.614 + dweight 11.133 + dinput 8.945`. dinput is at its
+memory floor after six refutations (items 265-269, 276); dweight's GEMM half runs at 75% of this
+box's square-GEMM ceiling; its gather half is at exactly 1x redundancy with the only reachable
+residue measured and rejected. **The remaining options are parity-breaking (split-K, panel-free) and
+both are already measured at 1.12x and 0.268x, so they are a policy question, not a lever.**

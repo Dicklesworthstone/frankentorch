@@ -8852,6 +8852,13 @@ fn conv2d_dweight_streamed_f32(
                 // for source jumps that were already cheap. Do not re-swap this loop.
                 for r in 0..rows {
                     let row = f0 + r;
+                    // Computed per row per tile, and HOISTING IT INTO A SHARED TABLE IS A MEASURED
+                    // LOSS (ledger 281): the gather frame improves 1.1096x, but the `flat`-entry
+                    // table has to be built before the parallel loop, and that serial prologue
+                    // costs the lane more than the parallel saving is worth — 0.9570x paired with
+                    // a 1/20 sign test. Even built in parallel the ceiling is ~1.028x, inside the
+                    // null band. Do not re-hoist without a parallel build AND a lane that can
+                    // resolve 3%.
                     let b = row / patch_count;
                     let pc = row % patch_count;
                     let base_h = (pc / ow) * sh;
