@@ -41090,3 +41090,35 @@ decomposition before it can be attacked. The DOWNCAST is a single named 14.776 m
 proven-parallel twin beside it, so it is the first cheap-refutable lever even though it is not the
 largest bundle. Saying which is which matters: "the top frame is the remainder" would be true and
 useless.
+
+### 286b. SHIPPED — the parallel narrow is 1.149-1.170x on the training lane, and the saving ARRIVES
+
+One line, `.iter()` -> `.par_iter()`, matching the widen twin beside it.
+
+    run 1  hz4 rayon=16 load 5.6   lane 90.325 -> 77.352 ms   frame 15.193 -> 2.023 (7.5091x)
+           marginal 1.1677x   paired 1.1695x   SIGN TEST 20/20   A/A null 0.9984 PASS
+    run 2  hz4 rayon=16 load 61    lane 103.087 -> 89.667 ms  frame 15.542 -> 2.193 (7.0884x)
+           marginal 1.1497x   paired 1.1492x   SIGN TEST 20/20   A/A null 1.0140 PASS
+
+**Two windows, both estimators agreeing to three decimals in each, 40 of 40 paired wins, both
+nulls passing — and the accounting CLOSES**: run 1 sheds 13.17 ms from the frame and delivers
+12.97 ms to the lane. That is the difference from the three displacements this campaign recorded
+(276b first-touch, 281 serial prologue, 283 unexplained): here the shed time actually arrives.
+
+Run 2 was taken at loadavg 61, which inflates both arms; the paired ratio survives it because both
+arms sit inside the same rep. Afterwards the narrow runs 2.023 ms for 5.24M elements against the
+widen's 3.604 ms for 5.92M — the same rate. **The asymmetry is gone.**
+
+BIT-EXACT by construction and unchanged parity in the same runs: 0 mismatches across 5,242,880
+input-gradient elements. `-p frankentorch-api --lib` 2600 passed / 0 failed with it ON.
+
+**This is the largest lever of the campaign, and it was not in a kernel.** Every conv2d frame had
+been ground to its floor — seven refutations on dinput alone — while a one-line serial conversion
+in the autograd glue carried 16% of the lane. It was invisible to every kernel A/B because it sits
+between the tape and the kernel, and it surfaced only once the LANE was decomposed instead of the
+routine (`feedback_attribute_the_lane_not_the_kernel`).
+
+**The generalisation is the valuable part**: the tape is f64, so EVERY f32 op's backward pays a
+narrow and a widen. This fixed one site. `project_serial_widen_vein` already records "12 of 14
+sites unharvested" for the widen direction — the narrow direction should be swept the same way,
+and that is a bead of its own, not a conv2d lever.

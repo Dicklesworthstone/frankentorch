@@ -848,9 +848,19 @@ struct GridSamplePoint {
 /// preserves order, so every element is the same value at the same index. Identical in kind to
 /// `widen_grad_f32_to_f64`, which has been `par_iter` for exactly this reason.
 ///
-/// DEFAULT OFF until it has a paired row.
+/// DEFAULT ON — MEASURED, and the accounting CLOSES. hz4, rayon=16, 21 reps, alternating square,
+/// per-rep min-of-2, median of per-rep ratios:
+///
+///     lane OFF (serial) 90.325 ms   ON (par_iter) 77.352 ms
+///     downcast frame    15.193 ->    2.023 ms   (7.5091x)
+///     marginal 1.1677x   paired 1.1695x   SIGN TEST 20/20   A/A null 0.9984 PASS
+///
+/// The frame sheds 13.17 ms and the lane gains 12.97 ms — unlike the three displacements this
+/// campaign has recorded (276b, 281, 283), the saving actually arrives. The two estimators agree
+/// and the sign test is perfect. Afterwards the narrow runs 2.023 ms for 5.24M elements against
+/// the widen's 3.604 ms for 5.92M: the same rate, symmetry restored.
 static FUSE_BWD_PARALLEL_DOWNCAST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Select the parallel narrow, returning the previous setting.
 #[doc(hidden)]
