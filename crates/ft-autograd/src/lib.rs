@@ -15852,6 +15852,21 @@ impl TensorTape {
                 }
             }
 
+            let dispatch_ns =
+                u64::try_from(dispatch_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            machinery.node_dispatch_ns = machinery.node_dispatch_ns.saturating_add(dispatch_ns);
+            if is_sum {
+                machinery.sum_dispatch_ns = machinery.sum_dispatch_ns.saturating_add(dispatch_ns);
+            }
+            if is_pad {
+                machinery.pad_dispatch_ns = machinery.pad_dispatch_ns.saturating_add(dispatch_ns);
+            }
+            if is_custom {
+                machinery.custom_function_dispatch_ns = machinery
+                    .custom_function_dispatch_ns
+                    .saturating_add(dispatch_ns);
+            }
+
             // Restore the (hook-adjusted) gradient we moved out at the top of the
             // loop so post-backward lookups for this node return it. A node is
             // never its own input, so `grads[node_id.0]` was untouched by the
@@ -15900,20 +15915,6 @@ impl TensorTape {
                     };
                     Self::check_gradient_anomaly(true, TensorNodeId(idx), grad, op_name)?;
                 }
-            }
-            let dispatch_ns =
-                u64::try_from(dispatch_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            machinery.node_dispatch_ns = machinery.node_dispatch_ns.saturating_add(dispatch_ns);
-            if is_sum {
-                machinery.sum_dispatch_ns = machinery.sum_dispatch_ns.saturating_add(dispatch_ns);
-            }
-            if is_pad {
-                machinery.pad_dispatch_ns = machinery.pad_dispatch_ns.saturating_add(dispatch_ns);
-            }
-            if is_custom {
-                machinery.custom_function_dispatch_ns = machinery
-                    .custom_function_dispatch_ns
-                    .saturating_add(dispatch_ns);
             }
         }
         machinery.loop_ns = u64::try_from(loop_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
