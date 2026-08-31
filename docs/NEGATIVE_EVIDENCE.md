@@ -40548,3 +40548,48 @@ had the same configuration at 33-34 ms, while the corrected arm reads 34.384 ms 
 compare the earlier case where a toggle A/B forced a shipped default off and inflated 1.338x to
 1.421x. Restoring an incumbent through a REWRITTEN parameterisation is not the same as running the
 incumbent, and it must be checked against a banked absolute.
+
+---
+
+## 279. THE RUN-OUTER GATHER ORDER IS A MEASURED LOSS — reverted, and the `dout_flat`/`lu_solve` analogy is where the prediction went wrong
+
+`frankentorch-06csx`. After the n-split retiling (item 278) the panel gather is still the larger
+half of the dweight frame — 100.2 ms CPU against the GEMM's 75.7 — so it was attacked directly.
+
+The shipped order is patch-outer / run-inner: the DESTINATION `ptile` row is written contiguously
+while the SOURCE jumps `ph * pw` floats between channels. That looked backwards, because `ptile` is
+`rows * jn` = 256 * 18 = 18 KiB and L1-resident while `padded` is 23.7 MiB in L3, and **the same
+inversion had already paid twice on this campaign** — the tiled `dout_flat` transpose (276a,
+1.4473x on its frame) and the row-wise `lu_solve` RHS permutation (274). The run-outer form also
+hoists the per-patch `div`/`mod` into a `rows`-entry origin table built once per k-block.
+
+    OFF patch-outer  22.021 ms   gather  97.246 ms CPU
+    ON  run-outer    22.979 ms   gather 111.743 ms CPU
+    marginal 0.9583x   paired 0.9586x   GATHER FRAME 0.8703x
+    SIGN TEST 0/20     A/A null 0.9989 PASS
+
+**The gather got 15% SLOWER and the ON arm lost every single rep.** Reverted; the patch-outer loop
+carries a comment saying not to re-swap it.
+
+### 279a. WHY THE ANALOGY FAILED, which is the transferable part
+
+The `dout_flat` and `lu_solve` cases both had a LARGE strided side and a small contiguous one, so
+moving the stride onto the resident buffer removed real cache-line traffic. Here the geometry is
+the opposite after item 278 shrank `jn` to 18: a `ptile` row is 18 floats, about 1.5 cache lines.
+Patch-outer touches that row ONCE, contiguously. Run-outer touches the same row once per run — six
+times at this shape — so it pays roughly 6x the write-side cache-line traffic to remove source
+jumps that were already cheap, L3-resident and prefetchable.
+
+**A loop-order inversion is not a general technique; it is a bet on which side is bigger.** Check
+the two sizes before predicting, and note that item 278 CHANGED one of them: the same swap might
+well have won against the old `jn = 72`. A lever's premise can be invalidated by the previous
+lever on the same frame.
+
+### 279b. WHERE dweight STANDS
+
+    entry 21.795 ms = dout_flat 1.614 + dweight 11.133 + dinput 8.945   (accounted 99.5%)
+
+dweight is now 11.1 ms against dinput's 8.9 — the two halves are comparable again for the first
+time on this campaign, and the 82%-gather figure that motivated this lever is a share of a frame
+that item 278 already halved. The short `kw`-length copies look latency-bound in the same way
+ledger 268 found for the dinput scatter, and loop order cannot move that.
