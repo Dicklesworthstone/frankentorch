@@ -38,7 +38,7 @@ fn main() {
     // row depends on — including the pool width — is an argument the binary echoes back.
     //
     //   slogdet_frame_probe [mode] [sizes] [reps] [threads]
-    //   slogdet_frame_probe ab 512,1024 9 8
+    //   slogdet_frame_probe phase 512 15 16
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| argv.get(i).map(String::as_str).unwrap_or("");
     let ab = arg(0) == "ab";
@@ -87,9 +87,76 @@ fn main() {
             "inv" => run_inv(n, reps),
             "permab" => run_perm_ab(n, reps),
             "structab" => run_struct_ab(n, reps),
+            "phase" => run_phase_split(n, reps),
             _ => run_one(n, reps),
         }
     }
+}
+
+/// Attribute one coherent `slogdet` call: all counters and the wall estimator come from the
+/// same winning rep. This is deliberately distinct from `run_one`, which compares a separate
+/// direct-LU arm to the full operation and therefore cannot truthfully use its phase counters
+/// for the `slogdet` wall-time closure.
+fn run_phase_split(n: usize, reps: usize) {
+    let data: Vec<f64> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx % n;
+            let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+            if i == j { v + n as f64 } else { v }
+        })
+        .collect();
+    let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+    for _ in 0..2 {
+        let value = ft_kernel_cpu::slogdet_contiguous_f64(&data, &meta).expect("warmup");
+        std::hint::black_box(value);
+    }
+
+    let mut best = (u64::MAX, 0u64, 0u64, 0u64);
+    for _ in 0..reps {
+        let _ = ft_kernel_cpu::lu_stage_take_ns();
+        let started = Instant::now();
+        let value = ft_kernel_cpu::slogdet_contiguous_f64(&data, &meta).expect("slogdet");
+        let wall = started.elapsed().as_nanos() as u64;
+        std::hint::black_box(value);
+        let (panel, solve, trailing) = ft_kernel_cpu::lu_stage_take_ns();
+        if wall < best.0 {
+            best = (wall, panel, solve, trailing);
+        }
+    }
+
+    let (wall, panel, solve, trailing) = best;
+    let ms = |v: u64| v as f64 / 1e6;
+    let pct = |v: u64| 100.0 * v as f64 / wall.max(1) as f64;
+    let accounted = panel.saturating_add(solve).saturating_add(trailing);
+    let glue = wall.saturating_sub(accounted);
+
+    eprintln!("SLOGDET PHASE SPLIT n={n}, min-wall rep of {reps}");
+    eprintln!("  {:<28} {:>9} {:>8}", "phase", "ms", "% lane");
+    eprintln!("  {:<28} {:>9.4} {:>7.1}%", "LU panel", ms(panel), pct(panel));
+    eprintln!("  {:<28} {:>9.4} {:>7.1}%", "LU solve", ms(solve), pct(solve));
+    eprintln!(
+        "  {:<28} {:>9.4} {:>7.1}%",
+        "LU trailing update",
+        ms(trailing),
+        pct(trailing)
+    );
+    eprintln!(
+        "  {:<28} {:>9.4} {:>7.1}%   <- residual, not a measured phase",
+        "glue (residual)",
+        ms(glue),
+        pct(glue)
+    );
+    eprintln!("  {:<28} {:>9.4} {:>7.1}%", "TOTAL (wall)", ms(wall), 100.0);
+    eprintln!(
+        "ACCOUNTING CLOSURE: LU stages {:.4} ms of {:.4} ms wall = {:.1}%. The residual is \
+         shown as glue; on this existing counter set it also contains the terminal panel, whose \
+         counter is not committed when `tcols == 0`.",
+        ms(accounted),
+        ms(wall),
+        100.0 * accounted as f64 / wall.max(1) as f64
+    );
 }
 
 fn run_one(n: usize, reps: usize) {
