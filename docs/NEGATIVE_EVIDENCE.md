@@ -41362,3 +41362,52 @@ L2, and **small tensors are the common case** for in-place ops — an optimizer 
 many small parameter tensors and none of them is 128 MiB. Suspects inside the timed region, NOT yet
 decomposed: rayon fork/join, `Arc::make_mut`, and `record_tensor_in_place_operation`, which formats
 a String into the evidence ledger on every call.
+
+### 290. A FRAME MEASURED ON ONE LANE IS NOT A PREDICTION FOR ANOTHER — 1.089x PREDICTED, 1.029x MEASURED
+
+`frankentorch-qnfq8`. The conv2d-f32-mask lane's loss is a plain `tensor_sum`, so its backward
+materialises a 5.24M f64 buffer of ones and the fused node then NARROWS it to f32 — two passes
+carrying nothing but the constant 1.0. torch's `sum().backward()` is a stride-0 expanded view and
+pays neither, so it is a structural parity gap; six ops already had the sum-shortcut remedy and the
+conv2d mask fusion did not.
+
+I priced the lever BEFORE building it, which was right, and priced it WRONG, which is the item:
+
+    predicted   sum 2.385 ms + narrow 1.692 ms = 4.077 of 45.604  ->  1.0890x
+    measured    drift-clean paired twin lanes                     ->  1.0329x / 1.0243x
+
+**Those counters came from the SESSION PROBE and I applied them to the BOARD lane** — a different
+harness at a different shape. The frames this actually removes on the board lane are ~1.0-1.4 ms,
+not 4.1. Same class as item 289d's shape artifact and as `batched figures don't predict
+single-matrix`: a frame is a property of a LANE, not of an op, and carrying one across lanes is a
+prediction with no measurement behind it. Price a lever from counters taken on the lane you intend
+to move.
+
+Two things that kept the small number honest. An EXECUTION SENTINEL — the shortcut fired **160
+times** — because a ~1 ms difference on a 43 ms lane is well inside what noise could fake and a
+lever that silently never fires reads as a small win. And a twin lane carrying byte-identical torch
+code under a second name, so PT/PT is a free ~1.0 control and the pair is priced inside ONE
+invocation. Of five invocations, two passed the drift gate; one of the three that failed read
+0.879x with absolutes of 52/59 ms against ~43 everywhere else, which is exactly what the gate is
+for.
+
+### 290a. THE LEVER IS CORRECT AND STILL DEFAULT OFF: NO create_graph ARM
+
+The shortcut node is built with `tensor_apply_function_f32_output_borrowed_inputs`, which registers
+NO create_graph arm, while the fused node it replaces carries a 279-line one. With the shortcut live
+a second-order backward **FAILS CLOSED** — the tape errors rather than returning a first-order-only
+answer — and the pre-existing `f32_masked_conv2d_fused_second_derivative_matches_unfused_route`
+caught it immediately.
+
+**No forward-time guard can exist**: `create_graph` is chosen when `.backward()` is called, long
+after the node is built. `fuse_conv2d_loss_mask_f32` already records an earlier attempt at exactly
+such a guard failing to compile, and notes that merely making it compile would have shipped a fused
+path with no second-order arm. Shipping needs the fused arm EXTRACTED into a shared function taking
+the per-element upstream, with this shortcut broadcasting its scalar to the output shape and calling
+it — a materialisation on the rare create_graph path only. **A 1.03x lever does not justify a hasty
+second-order arm**, which is the defect `project_double_backward_custom_op_vein` records.
+
+Process note worth more than the lever: the toggle started as a process-wide `AtomicBool` like its
+siblings in this file, and `cargo test`'s PARALLEL harness turned that into a race — flipping it in
+one test made an unrelated second-derivative test fail. Session-scoped state cannot do that. Any new
+A/B toggle in ft-api should be a session field, not a static.
