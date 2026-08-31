@@ -41547,3 +41547,35 @@ and inv 42%, and NEITHER moved, because call share is not time share. The sentin
 `(tiled, column)` per invocation; what a candidate lane must additionally show is that the tiled
 calls are where the seconds are. Do not reopen on a raw coverage number, and do not reopen on a
 single paired reading — this lever's first inv invocation read 1.054x against a 1.052x null.
+
+### 292. CHOLESKY n=512 SPENDS 53-58% IN THE PANEL, AND NEVER CALLS `dgemm_sub_into` AT ALL
+
+`frankentorch-valnx`. Items 291/291a refuted the 2-D trailing-update arm on two lanes without
+saying where those lanes DO spend. This is the decomposition, taken before any further lever.
+
+thinkstation1, rayon=16, n=512, min-wall rep of 15, guard PASS, three invocations:
+
+    phase                  run1            run2            run3
+    panel factor      3.081  53.0%    3.082  53.2%    3.226  57.6%
+    TRSM              0.649  11.2%    0.680  11.7%    0.610  10.9%
+    trailing update   1.579  27.2%    1.489  25.7%    1.288  23.0%
+    strict-upper zero 0.169   2.9%    0.191   3.3%    0.169   3.0%
+    glue (residual)   0.334   5.7%    0.350   6.0%    0.308   5.5%
+    closure             94.3%           94.0%           94.5%
+
+**The PANEL FACTOR is 53-58% — larger than the trailing update and TRSM combined.** Stable across
+three windows, with the accounting closing to 94% and the residual named as glue and SHOWN rather
+than assumed away. A factorisation is not its GEMM.
+
+**AND THE CENSUS READ (0, 0).** Cholesky never calls `dgemm_sub_into` once: its trailing update is
+`gemm::dgemm_bt_sub_into`, the TRANSPOSED sibling, because `A22 -= L21·L21^T`. So the 2-D arm was
+structurally unreachable from this op — not under-covered, unreachable — and cholesky cannot satisfy
+291a's reopen predicate through it at any size.
+
+`dgemm_sub_into`'s own doc says it "is shared with the blocked cholesky/QR/bidiag paths". For
+cholesky that is wrong, and it is the kind of wrong that costs a campaign: anyone reasoning about
+cholesky's GEMM from that sentence is reasoning about a function it does not call. **A census is
+cheaper than a source read and cannot be talked out of** — the same lesson as
+`feedback_sentinel_before_fixing`, applied to routing rather than to a branch.
+
+Next target named by this split: the PANEL, not the GEMM. No lever proposed here.
