@@ -21621,6 +21621,26 @@ impl TensorTape {
     }
 
     /// Replace the storage values of a float32 tensor node in-place (version is bumped).
+    /// Transform an f32 tensor's values in place — the f32 twin of
+    /// [`Self::update_tensor_values_with`]. `frankentorch-f32-inplace-accessor-gap-5fxq2`.
+    ///
+    /// Its absence is why the f32 in-place op family kept clone -> map -> writeback while the f64
+    /// family collapsed to one pass in 2026-07: an in-call decomposition put 69.2% of f32 `exp_`
+    /// in the clone alone.
+    pub fn update_tensor_values_f32_with<F>(
+        &mut self,
+        id: TensorNodeId,
+        update: F,
+    ) -> Result<(), AutogradError>
+    where
+        F: FnOnce(&mut [f32]),
+    {
+        let node = self.node_mut(id)?;
+        node.tensor
+            .update_contiguous_values_f32_with(update)
+            .map_err(AutogradError::DenseTensor)
+    }
+
     pub fn update_tensor_values_f32(
         &mut self,
         id: TensorNodeId,

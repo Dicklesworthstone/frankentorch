@@ -1774,6 +1774,51 @@ impl DenseTensor {
         Ok(())
     }
 
+    /// Transform the contiguous f32 values in place, the f32 twin of
+    /// [`Self::update_contiguous_values_with`] — `frankentorch-f32-inplace-accessor-gap-5fxq2`.
+    ///
+    /// WHY THIS EXISTS RATHER THAN `contiguous_values_f32_mut`. That accessor already hands out
+    /// `&mut [f32]`, so an in-place f32 op could have used it — but it does NOT bump `version`,
+    /// and a silent in-place mutation that leaves the version unchanged is precisely the defect
+    /// `[bug][autograd] no version check at backward` describes. This entry point mutates and
+    /// bumps, exactly as the f64 twin does, so the two dtypes cannot drift apart on the
+    /// invariant that matters most here.
+    ///
+    /// MEASURED MOTIVE. `apply_tensor_unary_in_place` had to do clone -> map -> writeback on f32
+    /// for want of this function, and its cost is not the extra passes people assumed: an
+    /// in-call decomposition of f32 `exp_` at 4,194,304 elements put **69.2% in the `to_vec`
+    /// clone** (10.653 ms), 20.2% in the map and 10.6% in the writeback. The clone is a fresh
+    /// 16 MB allocation whose first touch is serial page faults, which is why the f32 arm ran
+    /// 9.6-11.2x its f64 twin while moving HALF the bytes. This function removes the allocation
+    /// entirely rather than making it cheaper.
+    ///
+    /// `Arc::make_mut` keeps the copy-on-write contract: sole owner mutates in place, shared
+    /// storage is cloned first, so no other tensor's values are ever clobbered.
+    pub fn update_contiguous_values_f32_with<F>(
+        &mut self,
+        update: F,
+    ) -> Result<(), DenseTensorError>
+    where
+        F: FnOnce(&mut [f32]),
+    {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::contiguous_required_len(&self.meta)?;
+        match &mut self.storage {
+            TensorStorage::F32(v) => {
+                let buf = Arc::make_mut(v);
+                update(&mut buf[start..end]);
+            }
+            _ => {
+                return Err(DenseTensorError::UnsupportedDType(self.meta.dtype()));
+            }
+        }
+        self.version += 1;
+        Ok(())
+    }
+
     /// Update the contiguous f32 values in-place and bump the version counter.
     pub fn update_contiguous_values_f32(
         &mut self,

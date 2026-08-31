@@ -57538,20 +57538,45 @@ impl FrankenTorchSession {
                 // f32 has no in-place `_with` accessor, so keep clone -> map -> writeback,
                 // but parallelize the (compute-heavy) map. Bit-identical: par collect
                 // preserves index order.
-                let target_vals = self.tensor_tape.values_f32(target)?;
-                let new_values: Vec<f32> = if target_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-                    target_vals
-                        .par_iter()
-                        .map(|&v| transform(v as f64) as f32)
-                        .collect()
-                } else {
-                    target_vals
-                        .iter()
-                        .map(|&v| transform(v as f64) as f32)
-                        .collect()
-                };
+                //
+                // BRANCH SENTINEL, `frankentorch-f32-inplace-accessor-gap-5fxq2`. A probe measured
+                // f32 `exp_` at 10.6x the f64 twin on HALF the bytes, and 19.98 ms for 4M is
+                // serial-exp time while the f64 arm's 1.85 ms is parallel. Three passes and a
+                // dtype round trip cannot cost 10x, so which branch actually runs is a question
+                // to answer with a counter rather than by re-reading this block.
+                // ONE in-place pass, matching the F64 arm above. The old shape was
+                // `values_f32()` clone -> `par_iter().map().collect()` -> writeback, kept only
+                // because no f32 `_with` accessor existed; an in-call decomposition of `exp_` at
+                // 4,194,304 elements put **69.2% of the arm in the clone** (10.653 ms of 15.402),
+                // 20.2% in the map and 10.6% in the writeback, because the clone is a fresh 16 MB
+                // allocation paying serial first-touch page faults. That is the
+                // `project_expand_uninit_firsttouch` shape, and the fix is to not allocate at all
+                // rather than to allocate faster.
+                //
+                // BIT-IDENTICAL to the old shape: `*v = transform(*v as f64) as f32` is the same
+                // expression per element that the map computed, and each output depends only on
+                // its own input, so dropping the intermediate buffer cannot change a bit. The f64
+                // round trip is DELIBERATELY PRESERVED here — computing natively in f32 would
+                // change results (`add_`/`mul_` double-round the other way), and this commit is a
+                // pass-count lever, not a numerics change.
+                let mut par = false;
                 self.tensor_tape
-                    .update_tensor_values_f32(target, new_values)?;
+                    .update_tensor_values_f32_with(target, |vals| {
+                        if vals.len() >= PARALLEL_ELEMENTWISE_MIN {
+                            par = true;
+                            vals.par_iter_mut()
+                                .for_each(|v| *v = transform(f64::from(*v)) as f32);
+                        } else {
+                            for v in vals.iter_mut() {
+                                *v = transform(f64::from(*v)) as f32;
+                            }
+                        }
+                    })?;
+                if par {
+                    INPLACE_UNARY_F32_PAR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    INPLACE_UNARY_F32_SER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             _ => {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -101086,6 +101111,32 @@ fn erfinv_positive_approx(p: f64, q: f64) -> f64 {
 /// Element count above which compute-bound elementwise special functions are
 /// evaluated across the rayon pool (below it, thread overhead is not worth it).
 const PARALLEL_ELEMENTWISE_MIN: usize = 8192;
+
+/// Which branch of `apply_tensor_unary_in_place`'s F32 arm actually runs —
+/// `frankentorch-f32-inplace-accessor-gap-5fxq2`.
+///
+/// Exists because a source read and a measurement disagreed. The block is gated on
+/// `len >= PARALLEL_ELEMENTWISE_MIN` (8192) and the probe runs 4,194,304 elements, so reading the
+/// code says "parallel"; the probe says f32 `exp_` costs 10.6x its f64 twin while moving HALF the
+/// bytes, and 19.98 ms for 4M elements is serial-exp time. `feedback_sentinel_before_fixing`
+/// records source reading giving three confident wrong answers on one bug, so this counts the
+/// branch instead of arguing about it.
+static INPLACE_UNARY_F32_PAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INPLACE_UNARY_F32_SER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drain the F32 in-place unary branch counts as `(parallel, serial)`.
+#[doc(hidden)]
+pub fn take_inplace_unary_f32_branches() -> (u64, u64) {
+    (
+        INPLACE_UNARY_F32_PAR.swap(0, std::sync::atomic::Ordering::Relaxed),
+        INPLACE_UNARY_F32_SER.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+// The three sub-frame timers that produced the decomposition above (read 69.2% / map 20.2% /
+// write 10.6%) are deliberately NOT kept. They measured a clone and a writeback that no longer
+// happen, so retaining them would leave two counters that can only ever read zero. The numbers
+// they produced live in `update_contiguous_values_f32_with`'s doc and in ledger 289.
 const LOGIT_F64_PARALLEL_MIN: usize = 1 << 19;
 
 // Gate for PURE MOVEMENT/COPY materialization (flip/roll/repeat): these build a
@@ -107588,6 +107639,105 @@ mod tests {
         assert_eq!(
             s.tensor_values_f32(t).expect("values"),
             vec![0.0f32, 0.5, 0.0]
+        );
+    }
+
+    /// `frankentorch-f32-inplace-accessor-gap-5fxq2`: the f32 unary in-place arm now transforms
+    /// the storage through `update_tensor_values_f32_with` instead of
+    /// clone -> `par_iter().map().collect()` -> writeback. This asserts the two shapes agree
+    /// BITWISE, and does it by computing the old shape's result right here rather than trusting
+    /// a remembered constant.
+    ///
+    /// Sizes straddle `PARALLEL_ELEMENTWISE_MIN` (8192) in both directions, because the new code
+    /// has a serial and a parallel branch and a test that only ever runs one of them proves half
+    /// the claim — `feedback_sign_blind_checksums` records a family whose tests were blind twice
+    /// over for exactly this reason. The transcendentals are included deliberately: `transform`
+    /// still runs in f64 and narrows, so any accidental switch to a native-f32 call would show up
+    /// here as a last-bit difference rather than passing quietly.
+    #[test]
+    fn f32_unary_in_place_is_bitwise_identical_to_the_clone_map_writeback_shape() {
+        for len in [1usize, 3, 8191, 8192, 8193, 20_000] {
+            // Values chosen to include a negative, a zero, a subnormal and a large magnitude, so
+            // the comparison is not confined to the well-behaved middle of the range.
+            let base: Vec<f32> = (0..len)
+                .map(|i| match i % 7 {
+                    0 => 0.0,
+                    1 => -1.5,
+                    2 => f32::MIN_POSITIVE / 4.0,
+                    3 => 12.25,
+                    4 => -0.000_123,
+                    5 => 3.5,
+                    _ => (i % 100) as f32 * 0.01 - 0.5,
+                })
+                .collect();
+
+            #[allow(clippy::type_complexity)]
+            let ops: [(&str, fn(&mut FrankenTorchSession, TensorNodeId), fn(f64) -> f64); 4] = [
+                ("neg_", |s, t| s.tensor_neg_(t).expect("neg_"), |v| -v),
+                ("abs_", |s, t| s.tensor_abs_(t).expect("abs_"), f64::abs),
+                ("exp_", |s, t| s.tensor_exp_(t).expect("exp_"), f64::exp),
+                (
+                    "relu_",
+                    |s, t| s.tensor_relu_(t).expect("relu_"),
+                    |v| if v > 0.0 { v } else { 0.0 },
+                ),
+            ];
+
+            for (name, apply, transform) in ops {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let t = s
+                    .tensor_variable_f32(base.clone(), vec![len], false)
+                    .expect("target");
+                apply(&mut s, t);
+                let got = s.tensor_values_f32(t).expect("values");
+
+                // The OLD shape, computed independently: map the clone, collect, compare.
+                #[allow(clippy::cast_possible_truncation)]
+                let want: Vec<f32> = base
+                    .iter()
+                    .map(|&v| transform(f64::from(v)) as f32)
+                    .collect();
+
+                assert_eq!(got.len(), want.len(), "{name} len at len={len}");
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "{name} differs at index {i} of {len}: {g:?} vs {w:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The in-place transform must BUMP THE VERSION, which is the whole reason
+    /// `update_contiguous_values_f32_with` exists rather than the already-present
+    /// `contiguous_values_f32_mut`: that accessor mutates without bumping, and a silent mutation
+    /// that leaves the version unchanged is the defect `[bug][autograd] no version check at
+    /// backward` describes. Asserted at the ft-core layer, where the counter lives.
+    #[test]
+    fn f32_in_place_transform_bumps_the_tensor_version() {
+        use ft_core::{Device, DenseTensor};
+        let mut tensor =
+            DenseTensor::from_contiguous_values_f32(vec![1.0f32, 2.0, 3.0], vec![3], Device::Cpu)
+                .expect("tensor");
+        let before = tensor.version();
+        tensor
+            .update_contiguous_values_f32_with(|vals| {
+                for v in vals.iter_mut() {
+                    *v *= 2.0;
+                }
+            })
+            .expect("in-place f32 update");
+        assert_eq!(
+            tensor.contiguous_values_f32().expect("values"),
+            &[2.0f32, 4.0, 6.0]
+        );
+        assert!(
+            tensor.version() > before,
+            "an in-place f32 mutation that does not bump the version is invisible to the \
+             backward-time version check: {before} -> {}",
+            tensor.version()
         );
     }
 
