@@ -104,7 +104,27 @@ fn paired_slot_median(values: [f64; 2]) -> f64 {
 /// is not a nicety here: the op MUTATES its input, so a reused leaf would hand each sample the
 /// previous sample's output. The incumbent's `base.detach().clone()` is the same shape of work in
 /// the same place, so neither arm is timing its allocation.
-fn timed_neg_f32(values: &[f32]) -> (f64, f64) {
+fn profile_field(summary: &str, name: &str) -> Option<u128> {
+    summary
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(name)?.parse().ok())
+}
+
+/// Returns the in-call spans after the outer timer stops, when profiling is enabled.
+fn inplace_profile_spans(session: &FrankenTorchSession) -> Option<(u128, u128)> {
+    session.evidence().iter().rev().find_map(|entry| {
+        let summary = entry.summary.as_ref();
+        if !summary.starts_with("inplace_profile op=neg_ ") {
+            return None;
+        }
+        Some((
+            profile_field(summary, "rayon_map_join_ns=")?,
+            profile_field(summary, "ledger_format_append_ns=")?,
+        ))
+    })
+}
+
+fn timed_neg_f32(values: &[f32]) -> (f64, f64, Option<(u128, u128)>) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable_f32(values.to_vec(), vec![values.len()], false)
@@ -118,7 +138,7 @@ fn timed_neg_f32(values: &[f32]) -> (f64, f64) {
         .iter()
         .map(|v| f64::from(v.abs()))
         .sum::<f64>();
-    (elapsed, checksum)
+    (elapsed, checksum, inplace_profile_spans(&session))
 }
 
 fn incumbent_sample(
@@ -147,6 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(12);
+    let profile_inplace = std::env::var("FT_INPLACE_PROFILE").is_ok_and(|value| value == "1");
     let python =
         std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "/data/tmp/torchvenv-2121/bin/python".to_owned());
 
@@ -230,6 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             incumbent_sample(&mut stdin, &mut reader, name)?;
         }
         let (mut ft_times, mut pt_times) = (Vec::new(), Vec::new());
+        let (mut rayon_spans_ns, mut ledger_spans_ns) = (Vec::new(), Vec::new());
         let (mut ft_a, mut ft_b, mut pt_a, mut pt_b) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut ft_checksum, mut pt_checksum) = (0.0, 0.0);
         for _ in 0..reps {
@@ -240,9 +262,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pt_slots.push(milliseconds);
                     pt_checksum = checksum;
                 } else {
-                    let (milliseconds, checksum) = timed_neg_f32(&data);
+                    let (milliseconds, checksum, spans) = timed_neg_f32(&data);
                     ft_slots.push(milliseconds);
                     ft_checksum = checksum;
+                    if let Some((rayon_ns, ledger_ns)) = spans {
+                        rayon_spans_ns.push(rayon_ns);
+                        ledger_spans_ns.push(ledger_ns);
+                    }
                 }
             }
             ft_a.push(paired_slot_median([ft_slots[0], ft_slots[1]]));
@@ -252,6 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ft_times.push(median(ft_slots));
             pt_times.push(median(pt_slots));
         }
+        let expected_profile_samples = ft_times.len() * 4;
         let ft = median(ft_times);
         let pt = median(pt_times);
         let pt_null = median(pt_a) / median(pt_b);
@@ -268,6 +295,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if !quotable {
             println!("    ^ NOT QUOTABLE: a null is outside {NULL_MIN:.2}..{NULL_MAX:.2}");
+        }
+        if profile_inplace {
+            if rayon_spans_ns.len() == expected_profile_samples
+                && ledger_spans_ns.len() == expected_profile_samples
+            {
+                println!(
+                    "    INPLACE_PROFILE samples={} rayon_map_join median={:.3} ms ledger_format_append median={:.3} us",
+                    expected_profile_samples,
+                    median(rayon_spans_ns.iter().map(|&nanos| nanos as f64 / 1_000_000.0).collect()),
+                    median(ledger_spans_ns.iter().map(|&nanos| nanos as f64 / 1_000.0).collect()),
+                );
+            } else {
+                println!("    INPLACE_PROFILE MISSING: expected one span pair per FT sample");
+            }
         }
         rows.push((name.to_owned(), ft, pt, slower, quotable && parity));
     }
