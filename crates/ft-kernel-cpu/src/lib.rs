@@ -9387,10 +9387,27 @@ fn conv2d_backward_dinput_blocked_rows_f32(
                             // The form is kept because it is bit-exact and no worse, and because this comment
                             // is where the next person will look; do NOT re-try indexing tweaks here.
                             //
-                            // THE ONLY CANDIDATE LEFT ON THIS FRAME is the gather inversion: compute each
-                            // `dpadded` element from the contributions that reach it, so every output is
-                            // WRITTEN ONCE with no accumulation conflict. That is a real kernel, not a tweak,
-                            // and this null is what promotes it from "the expensive option" to "the only one".
+                            // THE GATHER INVERSION THAT THIS COMMENT USED TO PROMOTE IS REFUTED — item 269.
+                            // The premise was that computing each `dpadded` element from the contributions
+                            // reaching it, so every output is WRITTEN ONCE, would beat accumulating into it
+                            // nine times. The tree already contained both directions over identical volume
+                            // and geometry: `conv2d_im2col_f32` writes each of its 47.2M outputs once,
+                            // `conv2d_col2im_f32` accumulates into 5.92M outputs nine times. On the quietest
+                            // window this bead has had, the scatter measured 0.913x / 0.963x of the gather —
+                            // already as fast or faster. Dead for one probe arm instead of a kernel.
+                            //
+                            // AND SO IS THE PANEL-FREE REWRITE — `frankentorch-t1gph`. The remaining idea was
+                            // that PyTorch does not materialise a panel at all, so a fused direct kernel would
+                            // delete the whole panel round trip. Written as a probe arm (hoisted per-channel
+                            // weights, contiguous inner dot over `out_ch`) it is CORRECT to 1.593e-7 and
+                            // SLOWER: 0.852x at 64 threads and 0.268x at rayon=16, the width that matters.
+                            // That matches item 68, where this codebase's other panel-free direct 3x3 kernel
+                            // wins 1.134x at in_ch=8 and loses 0.658x at in_ch=12 — and this lane is in_ch=32.
+                            //
+                            // So this frame has no identified lever left. At ~16 GB/s on a 47.2M-element
+                            // scatter it is near its memory floor FOR THIS ALGORITHM, and the distance to
+                            // PyTorch is a vectorised direct-convolution microkernel (oneDNN-class), which is
+                            // a different piece of work and not another pass over these frames.
                             let (dst, src) = (&mut dpb[irow..irow + kw], &block[prow_off..prow_off + kw]);
                             for (d, s) in dst.iter_mut().zip(src) {
                                 *d += *s;

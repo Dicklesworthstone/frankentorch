@@ -40259,3 +40259,79 @@ mis-set).
 At 61 reps the same cell reads **56/60 with both estimators agreeing**. The first two were noisy,
 not negative. When the marginal ratio, the paired ratio and the sign test do not tell the same
 story, the honest reading is that the cell has not been measured yet.
+
+---
+
+## 276. THE PANEL-FREE BACKWARD IS REFUTED — correct to 1.6e-7 and 0.268x at the width that matters. The f32 masked backward has no identified lever left
+
+`frankentorch-t1gph`. Item 269 closed every identified lever on this frame and left exactly one
+direction: "the remaining distance to PyTorch is almost certainly that PyTorch does not
+materialise a panel at all." That would be a different backward, and before writing one the
+evidence already in the tree pointed BOTH ways.
+
+**Against.** This codebase already has a panel-free direct 3x3 convolution
+(`conv3d_forward_direct_3x3s1_f64`), and item 68 measured it winning 1.134x at in_ch=8 and LOSING
+0.658x at in_ch=12, degrading to a 1.5-3.3x pessimization above. The f32 masked lane runs at
+**in_ch=32** — four times past the measured crossover.
+
+**For.** Item 68 measured a FORWARD, where the panel is built once and consumed once. In this
+BACKWARD the panel round trip is most of the cost: item 269b has the direct dinput route at
+16.983/17.117 ms with the col2im scatter alone at 13.086/13.266 ms, so ~77% of the frame writes
+189 MB of panel and reads it back to accumulate into 23.7 MB. A panel-free kernel deletes that
+entire round trip. It could lose on arithmetic throughput and still win on traffic.
+
+Arithmetic cannot settle which effect dominates, so it was measured — as a PROBE ARM, touching no
+shipping path, because going panel-free is also a PARITY decision (it accumulates over `oc` in a
+different order than the GEMM, which would break
+`conv2d_dinput_direct_f32_matches_panel_col2im_bitwise` and the fused-vs-materialised bitwise
+test). The kernel is straightforward but not stupid: per-channel weights hoisted into a 9 x out_ch
+L1-resident block, innermost loop a contiguous length-`out_ch` dot product.
+
+    dinput ONLY, shipping route      27.026 ms (64t)    22.657 ms (rayon=16)
+    dinput ONLY, PANEL-FREE direct   31.720 ms (64t)    84.475 ms (rayon=16)
+    ratio                            0.8520x            0.2682x
+    worst relative difference        1.593e-7  (it is CORRECT, just slower)
+
+**Refuted, and more decisively at the realistic width than at 64 threads.** Item 68's crossover
+governs: packed-GEMM microkernels beat stencil loops once channel depth gives them enough reuse.
+Cost: one probe arm, no kernel written, and no parity policy call needed for a direction that
+would have lost anyway.
+
+### 276a. A SUBTRACTION SAID 18 ms AND THE TRUTH WAS 4 ms
+
+The budget-sweep arm times `conv2d_backward_dinput_direct_f32` ALONE at 8.4-8.9 ms while the
+"fused mask, dinput ONLY" arm reads 27.026 ms for the same dinput work. Attributing that ~18 ms
+gap to the fused entry's `dout_flat` construction was tempting and would have been **wrong by more
+than 4x**: measured directly it is **4.017 ms**. Item 141 again — a residual is not a measurement
+of whatever you name it. The lever it suggested was still real, just small.
+
+That build is a transpose (`[n][out_ch][patch]` -> `[n][patch][out_ch]`). The old form handed out
+one `out_ch`-wide row per task and gathered its sources 4 KiB apart, putting each of 5.24M reads
+on its own cache line at 128-byte task granularity — the same shape as the strided column gather
+item 274 removed from `lu_solve`. Tiling it (`oc` outside, `patch` inside, over a block of
+patches) makes the read contiguous and keeps the strided write in an L1-resident tile:
+**4.017 -> 2.784 ms, 1.4429x, bitwise match confirmed.** SHIPPED in both the f64 and f32 fused
+entries.
+
+**It is shipped as a bit-exact improvement, NOT claimed as a lane win**: 1.2 ms of a 22.7 ms
+dinput arm is ~5%, at or below what the lane harness resolves. Saying so is the point — the frame
+ratio is measured and the lane ratio is not, and those are different claims.
+
+### 276b. THE STATE OF THIS FRAME IS NOW CLOSED
+
+    forward             EXONERATED (item 267)
+    dweight             levered — streamed panel elimination, paired 1.74x (263)
+    dinput panel        already eliminated (266)
+    dinput scatter      77-95% of the route, LATENCY-bound (268)
+      loop tightening       NULL, pre-specified (268)
+      gather inversion      REFUTED (269)
+      panel-free rewrite    REFUTED (this item)
+    general-dout 3x3    REFUTED (265)
+    block budget        SWEPT, shipped value is the interior optimum (272)
+    dout_flat build     levered — tiled transpose, 1.4429x bit-exact (this item)
+
+**Six candidates measured and killed, three shipped.** At ~16 GB/s on a 47.2M-element scatter this
+implementation is near its memory floor for this algorithm. The remaining distance to PyTorch is a
+vectorised direct-convolution microkernel of the oneDNN class — hand-tuned register blocking, not
+a rearrangement of these frames — and it should be scoped as its own piece of work rather than
+filed as another lever here. **Do not re-probe this frame.**

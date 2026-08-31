@@ -22,6 +22,7 @@
 //!
 //! Everything goes to STDERR so a remote runner returns it.
 
+use rayon::prelude::*;
 use std::time::Instant;
 
 // The f32 lane's shape, copied from `C2F32_N` and the `C2_*` constants so the probe and the lane
@@ -36,10 +37,25 @@ const PH: usize = H + 2;
 const PW: usize = W + 2;
 
 fn main() {
-    let reps: usize = std::env::var("FT_REPS")
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
-        .unwrap_or(7);
+    // ARGV, not env: `rch exec` does not forward the caller's environment, so an env-configured
+    // run silently executes the DEFAULT at the worker's full width (ledger 273c). These arms are
+    // thread-sensitive, so the width is an argument and the probe echoes it back.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let reps: usize = argv.first().and_then(|t| t.parse().ok()).unwrap_or(7);
+    let threads: usize = argv.get(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+    if threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .expect("rayon pool width");
+    }
+    eprintln!(
+        "PROV host={} nproc={} rayon={} loadavg={}",
+        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+        rayon::current_num_threads(),
+        std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+    );
 
     let padded: Vec<f32> = (0..BATCH * IN_CH * PH * PW)
         .map(|i| ((i % 37) as f32) * 0.013 - 0.21)
@@ -295,6 +311,216 @@ fn main() {
     eprintln!("F32_DINPUT dweight ONLY, LEGACY panel route   {dweight_legacy:8.3} ms");
     eprintln!("F32_DINPUT fused mask, ALL-ONES mask (separator) {fused_ones_mask:8.3} ms");
     eprintln!("F32_DINPUT dinput ONLY, LEGACY panel+col2im route  {legacy_dinput:8.3} ms");
+
+    // ---------------------------------------------------------------------------------------
+    // THE PANEL-FREE ARM — `frankentorch-t1gph`.
+    //
+    // Item 269 closed every identified lever on this frame and left ONE direction: "the remaining
+    // distance to PyTorch is almost certainly that PyTorch does not materialise a panel at all."
+    // That is a different backward, not a faster version of this one, and before anyone writes it
+    // there are two things worth knowing, because the evidence already in the tree points BOTH
+    // ways.
+    //
+    // AGAINST: this codebase already has a panel-free direct 3x3 convolution
+    // (`conv3d_forward_direct_3x3s1_f64`), and item 68 measured it winning 1.134x at in_ch=8 and
+    // LOSING 0.658x at in_ch=12, degrading to a 1.5-3.3x pessimization above. This lane runs at
+    // in_ch=32 — four times past the measured crossover. Packed-GEMM microkernels beat stencil
+    // loops once the channel depth gives them enough reuse, and that is not shape-specific
+    // folklore, it is measured here.
+    //
+    // FOR: item 68 measured a FORWARD, where the panel is built once and consumed once. In THIS
+    // backward the panel round trip is most of the cost — item 269b has the direct dinput route at
+    // 16.983/17.117 ms with the col2im scatter alone at 13.086/13.266 ms, so ~77% of the frame is
+    // spent writing 189 MB of panel and reading it back to accumulate into 23.7 MB. A panel-free
+    // kernel deletes that entire round trip and writes each output ONCE. So it could lose badly on
+    // arithmetic throughput and still win on traffic.
+    //
+    // Arithmetic alone cannot settle which effect dominates, so this measures it — WITHOUT
+    // touching a shipping path, because going panel-free is also a PARITY decision: it accumulates
+    // over `oc` in a different order than the GEMM does, which would break
+    // `conv2d_dinput_direct_f32_matches_panel_col2im_bitwise` and the fused-vs-materialised bitwise
+    // test. That is a policy call, and it should be made against a number rather than a hope.
+    //
+    // The kernel below is deliberately STRAIGHTFORWARD BUT NOT STUPID: per-channel weights are
+    // hoisted into a 9 x out_ch block that stays in L1, and the innermost loop is a contiguous
+    // length-`out_ch` dot product over `dout`, which vectorises. If a fair-but-unoptimised direct
+    // kernel lands anywhere near the shipping route, the lever is alive and worth real blocking
+    // work; if it is an order of magnitude off, item 68's crossover governs and this direction is
+    // dead for the same reason conv3d's was.
+    // ---------------------------------------------------------------------------------------
+    // THE dout_flat TRANSPOSE ARMS — `frankentorch-t1gph`.
+    //
+    // The budget sweep above times `conv2d_backward_dinput_direct_f32` ALONE at 8.4-8.9 ms while
+    // "fused mask, dinput ONLY" reads 27.026 ms for the same dinput work. That ~18 ms sits in the
+    // fused entry's `dout_flat` construction, and a residual is not a measurement of whatever you
+    // name it (item 141), so both forms are timed DIRECTLY here.
+    //
+    // What the shipping build does: `par_chunks_mut(out_ch)` hands out one 32-float row per task
+    // and each row gathers its 32 sources from `(n*out_ch + oc)*patch_count + patch` — addresses
+    // `patch_count * 4` = 4 KiB apart. Every one of the 5.24M reads therefore lands on its own
+    // cache line, and the task granularity is 128 bytes. That is the same shape as the strided
+    // column gather item 274 removed from `lu_solve`.
+    //
+    // The candidate tiles it: for a block of patches, loop `oc` OUTSIDE and `patch` INSIDE, so the
+    // source read is contiguous along `patch` and the strided write lands inside an 8 KiB
+    // L1-resident tile. Same products, same values, pure data movement — bit-exact by
+    // construction.
+    let patch_count_t = H * W;
+    let mut dout_build_shipped = f64::INFINITY;
+    let mut dout_build_tiled = f64::INFINITY;
+    let mut tiled_matches = true;
+    for rep in 0..reps {
+        let start = Instant::now();
+        let mut shipped = vec![0.0f32; BATCH * patch_count_t * OUT_CH];
+        shipped
+            .par_chunks_mut(OUT_CH)
+            .enumerate()
+            .for_each(|(row, destination)| {
+                let n = row / patch_count_t;
+                let patch = row % patch_count_t;
+                for (out_channel, slot) in destination.iter_mut().enumerate() {
+                    let source = (n * OUT_CH + out_channel) * patch_count_t + patch;
+                    *slot = ones[source] * mask[source];
+                }
+            });
+        let t_shipped = start.elapsed().as_secs_f64() * 1e3;
+
+        const PBLK: usize = 64;
+        let start = Instant::now();
+        let mut tiled = vec![0.0f32; BATCH * patch_count_t * OUT_CH];
+        tiled
+            .par_chunks_mut(patch_count_t * OUT_CH)
+            .enumerate()
+            .for_each(|(n, plane)| {
+                let mut p0 = 0;
+                while p0 < patch_count_t {
+                    let p1 = (p0 + PBLK).min(patch_count_t);
+                    for oc in 0..OUT_CH {
+                        let base = (n * OUT_CH + oc) * patch_count_t;
+                        for patch in p0..p1 {
+                            plane[patch * OUT_CH + oc] =
+                                ones[base + patch] * mask[base + patch];
+                        }
+                    }
+                    p0 = p1;
+                }
+            });
+        let t_tiled = start.elapsed().as_secs_f64() * 1e3;
+
+        if rep == 0 {
+            tiled_matches = shipped
+                .iter()
+                .zip(&tiled)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        }
+        if rep > 0 {
+            dout_build_shipped = dout_build_shipped.min(t_shipped);
+            dout_build_tiled = dout_build_tiled.min(t_tiled);
+        }
+        std::hint::black_box(&shipped);
+        std::hint::black_box(&tiled);
+    }
+    eprintln!("F32_DINPUT dout_flat build, SHIPPED row-gather    {dout_build_shipped:8.3} ms");
+    eprintln!(
+        "F32_DINPUT dout_flat build, TILED transpose       {dout_build_tiled:8.3} ms  ({:.4}x, bitwise match {tiled_matches})",
+        dout_build_shipped / dout_build_tiled
+    );
+
+    // `incoming * mask` in the `[flat][out_ch]` layout the fused entry forms internally, so the
+    // panel-free arm consumes exactly what the shipping route consumes. `ones` stands in for
+    // `incoming` here, matching the arms above.
+    let patch_count_probe = H * W;
+    let mut dout_flat = vec![0.0f32; BATCH * patch_count_probe * OUT_CH];
+    for n in 0..BATCH {
+        for oc in 0..OUT_CH {
+            let src = (n * OUT_CH + oc) * patch_count_probe;
+            for patch in 0..patch_count_probe {
+                dout_flat[(n * patch_count_probe + patch) * OUT_CH + oc] =
+                    ones[src + patch] * mask[src + patch];
+            }
+        }
+    }
+
+    let mut panel_free = f64::INFINITY;
+    let mut panel_free_worst_rel = 0.0f64;
+    for rep in 0..reps {
+        let start = Instant::now();
+        let direct = {
+            let patch_width = IN_CH * K * K;
+            let patch_count = H * W;
+            let mut out = vec![0.0f32; BATCH * IN_CH * PH * PW];
+            out.par_chunks_mut(IN_CH * PH * PW)
+                .enumerate()
+                .for_each(|(b, plane)| {
+                    // 9 x OUT_CH of weights for one input channel: 288 floats, L1-resident, and
+                    // laid out so the inner loop reads it contiguously.
+                    let mut w9 = vec![0.0f32; K * K * OUT_CH];
+                    for c in 0..IN_CH {
+                        for tap in 0..K * K {
+                            for oc in 0..OUT_CH {
+                                w9[tap * OUT_CH + oc] =
+                                    weight[oc * patch_width + c * K * K + tap];
+                            }
+                        }
+                        for ih in 0..PH {
+                            for iw in 0..PW {
+                                let mut acc = 0.0f32;
+                                for kr in 0..K {
+                                    // Wrapping sub: an out-of-range origin becomes huge and the
+                                    // bound check rejects it, so no signed arithmetic is needed.
+                                    let oh_i = ih.wrapping_sub(kr);
+                                    if oh_i >= H {
+                                        continue;
+                                    }
+                                    for kc in 0..K {
+                                        let ow_i = iw.wrapping_sub(kc);
+                                        if ow_i >= W {
+                                            continue;
+                                        }
+                                        let pc = oh_i * W + ow_i;
+                                        let drow = &dout_flat
+                                            [(b * patch_count + pc) * OUT_CH..][..OUT_CH];
+                                        let wrow = &w9[(kr * K + kc) * OUT_CH..][..OUT_CH];
+                                        for (d, w) in drow.iter().zip(wrow) {
+                                            acc += *d * *w;
+                                        }
+                                    }
+                                }
+                                plane[c * PH * PW + ih * PW + iw] = acc;
+                            }
+                        }
+                    }
+                });
+            out
+        };
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        if rep > 0 {
+            panel_free = panel_free.min(ms);
+        }
+        if rep == 0 {
+            // Tolerance, not bits: summing `oc` sequentially is a different association than the
+            // GEMM's. Checking it at all is the point — a fast kernel computing the wrong thing is
+            // the failure mode a timing probe cannot see.
+            let reference = ft_kernel_cpu::conv2d_backward_dinput_direct_f32(
+                &dout_flat, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            );
+            for (a, b) in reference.iter().zip(&direct) {
+                let rel = f64::from((a - b).abs()) / (1.0 + f64::from(a.abs()));
+                if rel > panel_free_worst_rel {
+                    panel_free_worst_rel = rel;
+                }
+            }
+        }
+        std::hint::black_box(&direct);
+    }
+    eprintln!("F32_DINPUT dinput ONLY, PANEL-FREE direct kernel   {panel_free:8.3} ms  (worst rel vs shipping route {panel_free_worst_rel:.3e})");
+    let gflop = 2.0 * (BATCH * H * W * IN_CH * K * K * OUT_CH) as f64 / 1e9;
+    eprintln!(
+        "F32_DINPUT   {gflop:.3} GFLOP -> shipping {:.1} GFLOP/s, panel-free {:.1} GFLOP/s, ratio {:.4}x",
+        gflop / (legacy_dinput.min(fused_dinput) / 1e3),
+        gflop / (panel_free / 1e3),
+        fused_dinput / panel_free
+    );
     eprintln!(
         "F32_DINPUT ROUTE: legacy / direct = {:.3}x. ~1.0 means materialising the panel is NOT \
          the dinput cost and the SCATTER is, so the remaining lever is memory order rather than \
