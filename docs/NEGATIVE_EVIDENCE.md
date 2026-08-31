@@ -40393,3 +40393,76 @@ So the f32 conv backward and the f64 linalg lanes are limited by the **same shar
 microkernel**, not by anything specific to either op. That is the packed-panel Goto/BLIS lever in
 the GEMM bandwidth vein. It is one piece of work that would move both families, and it should be
 scoped as such rather than re-derived a third time as a conv lever or a linalg lever.
+
+---
+
+## 277. THE ~6 ms RESIDUAL DID NOT EXIST, dweight IS 66-68% OF THE BACKWARD, AND ITS REDUNDANT PANEL GATHER IS NOT THE COST
+
+`frankentorch-t1gph`. Two refutations, one of them of my own item 276d.
+
+### 277a. Counters inside the entry close to 98.8-99.7%; there is no allocation lever
+
+276d left ~6 ms unattributed and flagged first touch on the fresh 21 MB `dout_flat` or the 23.7 MB
+output as plausible but unmeasured. Counters placed INSIDE `conv2d_backward_mask_fused_f32` say it
+is neither, because it is not there. Four runs, hz4, rayon=16:
+
+    dinput ONLY      entry 10.884-11.516 = dout_flat 1.716-1.962 + dinput 8.986-9.434
+                     accounted 98.9-99.8%, OUTSIDE all three 0.019-0.120 ms
+    dinput + dweight entry 33.058-34.601 = dout_flat 1.558-1.780 + dweight 22.495-23.467
+                                          + dinput 8.834-9.284
+                     accounted 98.8-99.7%, OUTSIDE all three 0.104-0.393 ms
+
+**The residual was an artifact of comparing arms measured at different points in the rep.** The
+same call reads 20.990 ms in the standalone arm and 11.516 ms in the counter arm, IN THE SAME
+PROCESS AND THE SAME RUN — allocator and cache warmth, the effect this file already records as "a
+standalone ladder INVERTED in situ". Declining to name that gap as first-touch was right twice
+over: the cause was wrong AND the frame it would have been charged to is not where the time goes.
+
+### 277b. The map, redrawn on counters — and it points somewhere nobody has been looking
+
+    dweight    22.5-23.5 ms   66-68% of the fused backward
+    dinput      8.8-9.3        27%
+    dout_flat   1.6-1.8         5%
+
+**Every lever and refutation on this bead — items 265, 266, 268, 269, 272, 276 — aimed at dinput,
+which is the smaller half by more than 2x.** That is what a decomposition built from whole-entry
+subtractions will do to a campaign: the earlier "48-65% host-dependent" dweight/dinput split came
+from differencing arms, and the counters put it at a stable 66-68% across four runs on two loads.
+
+### 277c. The redundant panel gather is NOT the cost — the traffic model is refuted
+
+`ptile` depends only on `ni` and `atile` only on `mi`, so panel columns are re-gathered once per
+m-block while `dout_flat` is re-read once per n-block. At out_ch=32, patch_width=288, 16 threads
+the two totals move in opposite directions, and the shipped `mb = 8` looked like the worst choice:
+
+    mb    m_blocks x panel   n_blocks x dout   predicted traffic   MEASURED dweight frame
+     4       8 x 189 MB         2 x 21 MB         1554 MB          42.236 ms
+     8       4 x 189            4 x 21             840 MB          22.390 ms   <- SHIPPED
+    16       2 x 189            8 x 21             546 MB          22.273 ms
+    32       1 x 189           16 x 21             525 MB          27.433 ms
+
+**The prediction was recorded before the run and it is wrong.** mb=32 has the LOWEST traffic and
+runs 22% SLOWER; mb=16 halves the redundant gather against the shipped value and moves the frame
+by 0.5%, which is inside noise. So the 4x redundant panel gather costs approximately nothing, and
+what actually governs is GEMM SHAPE: raising `mb` shrinks `nb` from 72 to 18, and the microkernel
+loses more on the narrow N than the traffic saves.
+
+The alternative outcome was pre-specified — "if mb=32 loses, the microkernel term dominates the
+traffic term, and that is the useful result" — which is what makes this reportable rather than a
+story fitted afterwards. **The shipped `mb = 8` stands**, now with a curve on both sides of it
+(mb=4 is 1.9x worse, mb=32 is 1.2x worse) instead of being an unexamined constant. The override
+stays so it can be re-swept on a different shape, where out_ch is not 32 and the balance moves.
+
+### 277d. WHAT THIS LEAVES
+
+dweight is 22.5 ms for ~3.02 GFLOP, i.e. ~134 GFLOP/s, and it is bound by the shape its GEMM is
+given rather than by its memory traffic or its tiling. dinput is 9.0 ms and near its memory floor
+(items 268/269). Both land on the same conclusion as item 276e and as item 275 from the linalg
+side: **the binding constraint is the shared GEMM microkernel**, and at out_ch=32 the dweight GEMM
+is a very skinny one (M=32, N=288, K=163840) that a packed-panel kernel would serve far better
+than the current path. That is the one piece of work that moves this bead, `frankentorch-37sxo`
+and `frankentorch-x6wc3` together.
+
+The one blocking constant on this frame that remains untested is `SGEMM_KC` (krows=256), but it is
+shared with every other `sgemm` caller, so it cannot be swept from here without a scoped override
+and should be scoped with the microkernel work rather than as another conv lever.

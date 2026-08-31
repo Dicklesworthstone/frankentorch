@@ -8631,6 +8631,45 @@ pub(crate) fn conv2d_dweight_streamed_f32_if_enabled(
 /// is ever split. The scratch `C` is pre-zeroed and every tile accumulates with `beta = 1`,
 /// including the first: adding to `+0.0` is exact.
 #[allow(clippy::too_many_arguments)]
+/// Override for the streamed dweight's M-block width; `0` means the shipped heuristic.
+///
+/// `frankentorch-t1gph`. `mb` is capped at 8 by a hardcoded constant and has never been swept, and
+/// it sits on the frame that in-entry counters now put at 66-68% of the fused backward
+/// (22.501-23.467 ms of 33.889-34.601). It is worth sweeping because it trades two streams against
+/// each other rather than simply making a block bigger:
+///
+/// `ptile` depends only on `ni`, so the SAME panel columns are re-gathered once per m-block, while
+/// `atile` depends only on `mi`, so `dout_flat` is re-read once per n-block. At the f32 lane's
+/// shape (out_ch=32, patch_width=288, 16 threads) the two totals move in OPPOSITE directions:
+///
+/// ```text
+///   mb   m_blocks x panel   n_blocks x dout   total
+///    8      4 x 189 MB         4 x 21 MB      840 MB   <- SHIPPED
+///   16      2 x 189            8 x 21         546 MB
+///   32      1 x 189           16 x 21         525 MB
+/// ```
+///
+/// So the shipped value is predicted to be the WORST of the three on traffic, by ~1.6x. The
+/// counter-risk is real and is why this is a sweep rather than a one-line edit: raising `mb`
+/// shrinks `nb` (72 -> 18 at mb=32), and a narrower N can cost more in the GEMM microkernel than
+/// the traffic saves.
+///
+/// An override rather than an env knob, for `feedback_tuning_grid_missing_the_winner`'s reason: a
+/// constant that cannot be driven from a measurement cannot be swept, and this one needs sweeping
+/// in BOTH directions from 8.
+///
+/// f32 ONLY for now. The f64 twin carries a byte-identical `mb` line and a global replace would
+/// have silently parameterised both; the f64 lane has not been measured and must not inherit a
+/// value chosen on f32 evidence.
+static CONV2D_DWEIGHT_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the streamed f32 dweight M-block width, returning the previous value. `0` restores the
+/// shipped heuristic.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_mb(mb: usize) -> usize {
+    CONV2D_DWEIGHT_MB.swap(mb, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn conv2d_dweight_streamed_f32(
     dout_flat: &[f32],
     padded: &[f32],
@@ -8654,7 +8693,16 @@ fn conv2d_dweight_streamed_f32(
     }
 
     let threads = rayon::current_num_threads().max(1);
-    let mb = if out_ch <= 8 { out_ch } else { 8 };
+    let mb = match CONV2D_DWEIGHT_MB.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            if out_ch <= 8 {
+                out_ch
+            } else {
+                8
+            }
+        }
+        value => value.clamp(1, out_ch),
+    };
     let m_blocks = out_ch.div_ceil(mb);
     let n_blocks = threads
         .div_ceil(m_blocks)

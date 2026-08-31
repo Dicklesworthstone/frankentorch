@@ -427,6 +427,52 @@ fn main() {
     );
 
     // ---------------------------------------------------------------------------------------
+    // THE dweight M-BLOCK SWEEP -- `frankentorch-t1gph`.
+    //
+    // In-entry counters put dweight at 22.501 ms of a 33.889 ms fused backward: 66%, and more than
+    // twice dinput. Every lever and refutation on this bead so far aimed at dinput, which is now
+    // the smaller half; this is the first arm pointed at the frame that actually dominates.
+    //
+    // `mb` is capped at 8 by a hardcoded constant and has never been swept. It matters because it
+    // trades two streams against each other: `ptile` depends only on `ni`, so panel columns are
+    // re-gathered once per m-block, while `atile` depends only on `mi`, so `dout_flat` is re-read
+    // once per n-block. At this shape the totals move in OPPOSITE directions -- mb=8 gives
+    // 4x189 + 4x21 = 840 MB, mb=16 gives 546 MB, mb=32 gives 525 MB -- so the SHIPPED value is
+    // predicted to be the worst of the three by ~1.6x on traffic.
+    //
+    // PREDICTION RECORDED BEFORE THE RUN: mb=32 wins, by LESS than the 1.6x traffic ratio, because
+    // raising mb shrinks nb from 72 to 18 and a narrower N costs something in the microkernel. If
+    // mb=32 LOSES, the microkernel term dominates the traffic term, and that is the useful result:
+    // it would say this frame is bound by GEMM shape rather than by the redundant gather.
+    //
+    // mb=4 is included because grids that only look upward from the shipped value are how the SVD
+    // panel width sat at 16 while 8 won 15 of 16 cells.
+    //
+    // The dweight frame is read from the entry's OWN counter, so this is not a subtraction.
+    for mb in [4usize, 8, 16, 32] {
+        let previous = ft_kernel_cpu::set_conv2d_dweight_mb(mb);
+        let mut best = f64::INFINITY;
+        for rep in 0..reps {
+            let _ = ft_kernel_cpu::masked_frame_take_ns();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [false, true, false],
+            );
+            std::hint::black_box(&out);
+            let (_, w_ns, _) = ft_kernel_cpu::masked_frame_take_ns();
+            if rep > 0 {
+                best = best.min(w_ns as f64 / 1e6);
+            }
+        }
+        ft_kernel_cpu::set_conv2d_dweight_mb(previous);
+        let m_blocks = OUT_CH.div_ceil(mb);
+        eprintln!(
+            "F32_DWMB mb={mb:2} -> m_blocks {m_blocks}   dweight frame {best:7.3} ms{}",
+            if mb == 8 { "   <- SHIPPED" } else { "" }
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
     // WHERE THE ~6 ms ACTUALLY IS — `frankentorch-t1gph`, ledger 276d.
     //
     // The deficit map left a residual I refused to name: the tiled `dout_flat` build (2.668 ms)
