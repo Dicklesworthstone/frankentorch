@@ -41411,3 +41411,49 @@ Process note worth more than the lever: the toggle started as a process-wide `At
 siblings in this file, and `cargo test`'s PARALLEL harness turned that into a race — flipping it in
 one test made an unrelated second-derivative test fail. Session-scoped state cannot do that. Any new
 A/B toggle in ft-api should be a session field, not a static.
+
+### 290b. VERDICT: THE create_graph ARM COSTS MORE THAN THE SUM SHORTCUT SAVES — LEVER STAYS OFF
+
+`frankentorch-qnfq8`, completing item 290. Corrected order applied: extract the second-order arm,
+THEN re-measure, and ship ON only on a clean row above the null band. Two things came out of it.
+
+**Item 290's 1.029x never justified shipping in the first place.** It sits INSIDE the 0.97-1.03 A/A
+null band, so it is not distinguishable from noise — it justified keeping the lever alive, not
+enabling it. `feedback_aa_null_is_the_noisy_part` says the band is a ratio of two 4-sample medians
+whose own variance exceeds it; a paired figure inside the band is a reason to keep measuring.
+
+**And the re-measurement reversed the sign.** Paired twin lanes, one invocation, byte-identical
+torch code under both names:
+
+    window   FT train   FT sumcut   pair     drift
+      A       52.131     58.707     0.888x   PASS
+      B       54.978     61.359     0.896x   PASS
+      C       60.342     66.009     0.914x   PASS
+      D       53.600     60.217     0.890x   PASS
+      E      117.663    124.571     0.945x   DRIFTED
+
+Five runs, four drift-clean, every one SLOWER with the shortcut on, against 1.043 / 1.012 / 1.033 /
+1.024x FASTER before the extraction.
+
+**The first-order code is byte-identical across that reversal.** The shortcut's backward closure did
+not change; its node is merely registered through
+`apply_function_f32_output_with_create_graph_borrowed_inputs` instead of the plain variant. So the
+sumcut lane now carries an EXTRA create_graph-capable custom node where the plain lane has a cheap
+generic sum, and that registration costs more than the f64-ones materialisation plus narrow it was
+built to remove. Leading explanation, consistent across five runs, NOT decomposed — so not a
+measured attribution.
+
+The transferable result: **a fast path that needs a second-order arm to be CORRECT can be negative
+once it has one.** Price the arm, not just the saving. Registering create_graph is not free, and a
+lever whose whole margin is 1-4 ms cannot absorb it.
+
+Kept anyway, both worth having independently of the verdict: the fused node's 279-line second-order
+recipe is now the shared free function `conv2d_f32_mask_create_graph_gradients` rather than a
+candidate for a second copy, and the shortcut's test flipped from "create_graph fails closed" to
+"second derivative agrees with the generic route" exactly as it was written to. The lever itself
+stays DEFAULT OFF.
+
+CAVEAT, not closable from these windows: absolutes ran 52-124 ms against ~43 ms in the earlier quiet
+windows, because a peer's `cargo test --workspace` held the host at load 9-90 throughout. The pair
+is measured inside one invocation so contention hits both arms and the sign is consistent across
+five runs, but these absolutes are NOT comparable to the banked quiet-window ones.
