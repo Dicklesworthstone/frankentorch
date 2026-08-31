@@ -41171,3 +41171,41 @@ crate.
 worktree and ignores the rest of the index; and check `git diff --cached --stat` before committing
 anyway.** `feedback_uncommitted_gets_swept` records being on the losing end of this; this is the
 causing end, and the fix is different from what that item suggests.
+
+### 288. A SURVEY SCOPED TO A SPELLING UNDER-COUNTS, AND THE BIGGEST SITE WAS NOT IN THE CATEGORY
+
+`frankentorch-dwto7` swept ft-api for numel-scaled f32<->f64 conversions to route onto the two
+gated helpers. I declared the site list exhausted **twice**, and was wrong both times.
+
+    pass 1   grepped `grad_outputs[0]...`   -> "zero raw sites remain"
+    pass 2   grepped `f64::from`            -> found 10 WIDENS the doc claimed did not exist
+    pass 3   grepped the bare shape
+             `.iter().map(|&v| v as f32).collect()`   -> found 2 more, one with 121 callers
+
+Each earlier grep was anchored on a SPELLING (`grad_outputs[0]`, `f64::from`) rather than on the
+operation, so it could only see conversions written the way I happened to picture them. The helper's
+own doc had hardened one of those under-counts into a positive claim — "every remaining `f32 -> f64`
+conversion in this file is batch-, window-, index- or grid-sized" — which is how a survey artifact
+becomes a fact the next reader trusts.
+
+**The largest site by call count was not a gradient at all.** `update_tensor_values_for_float` is
+the f32 writeback for the whole in-place family, **121 call sites into one line**, and every `foo_`
+op on an F32 tape node pays it. No grep for a gradient could ever have returned it. The category I
+was searching was narrower than the phenomenon.
+
+**State an exhaustion criterion as the COMMAND to re-run, never as prose**, and name what
+legitimately remains under it (here: the helper's own body, `cfg(test)` code, `tensor_cdist` /
+`tensor_pdist` which are already `par_iter`, and `tensor_unique_consecutive`'s small values). Prose
+cannot be re-run; a grep can.
+
+### 288a. TWELVE SITES ROUTED, ZERO PERF ROWS, AND THE BOARD IS WHY
+
+None of the 12 is measurable. `grep -oE '"[a-z0-9_]*f32[a-z0-9_]*"'` over
+`crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs` returns 19 f32 lanes and all 19 are
+`conv2d_f32*`, `group_norm_f32*` or `batch_norm2d_f32_dense`. There is no in-place lane, no
+sdpa/cross-entropy f32 lane and no grouped-conv lane, so **nothing on the board executes these
+sites** and an FT-vs-FT toggle would be maintenance, not a win. They are routed to inherit the gate
+priced at 1.0583x below it (item 287), and that is the whole claim.
+
+Check the LANE INVENTORY before scoping a sweep, not after routing it: the routing is still correct
+work, but knowing this at the start would have priced the effort honestly.
