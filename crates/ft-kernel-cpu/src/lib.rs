@@ -29197,10 +29197,9 @@ pub fn banded_to_tridiagonal_f64(band: &[f64], n: usize, b: usize) -> (Vec<f64>,
 /// This is the **end-to-end correctness vehicle** for the two-stage swing
 /// (frankentorch-5oqum): it must agree with the live [`eigvalsh_contiguous_f64`]
 /// to reduction tolerance (proven by `eigvalsh_two_stage_matches_live`). It is
-/// NOT yet faster — stage-1 is still the unblocked reference and the rotations
-/// are full-length — and is NOT wired into the live dispatch. Once stage-1 gains
-/// its BLAS-3 blocked panel and stage-2 a band-packed apply, this becomes the
-/// drop-in fast path (gated behind a same-worker Score>=2.0 + golden-SHA check).
+/// This path is intentionally opt-in: [`eigvalsh_contiguous_f64`] retains its
+/// packed reduction unless the H2H arm sets a non-zero two-stage bandwidth. The
+/// paired verdict, including tolerance parity, decides whether it may ship.
 pub fn eigvalsh_two_stage_f64(a: &[f64], n: usize, b: usize) -> Result<Vec<f64>, KernelError> {
     if a.len() < n * n {
         return Err(KernelError::ShapeMismatch {
@@ -29213,10 +29212,8 @@ pub fn eigvalsh_two_stage_f64(a: &[f64], n: usize, b: usize) -> Result<Vec<f64>,
     }
     let bw = b.clamp(1, n.saturating_sub(1).max(1));
     // Values-only stage-1: BLAS-3 blocked panel reduction (no Q accumulation).
-    let mut band = symmetric_to_banded_values_f64(a, n, bw)?;
-    let mut d = vec![0.0f64; n];
-    let mut e = vec![0.0f64; n];
-    eigh_tred2_values_only_full_lower(n, &mut band, &mut d, &mut e);
+    let band = symmetric_to_banded_values_f64(a, n, bw)?;
+    let (mut d, mut e) = banded_to_tridiagonal_f64(&band, n, bw);
     eigh_tql2_values_only(n, &mut d, &mut e);
     d.sort_by(f64::total_cmp);
     Ok(d)
@@ -29326,6 +29323,17 @@ fn eigvalsh_grouped_ggs() -> bool {
 #[doc(hidden)]
 pub fn set_eigvalsh_grouped_ggs(on: bool) -> bool {
     EIGVALSH_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Optional half-bandwidth for eigvalsh's full -> band -> tridiagonal path.
+/// Zero keeps the production packed `dsytd2` route.
+static EIGVALSH_TWO_STAGE_BAND: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set eigvalsh's opt-in two-stage half-bandwidth, returning the prior value.
+#[doc(hidden)]
+pub fn set_eigvalsh_two_stage_band(band: usize) -> usize {
+    EIGVALSH_TWO_STAGE_BAND.swap(band, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Sub-phase counters for the tred2 reduction — `frankentorch-wjrqt`.
@@ -32569,6 +32577,11 @@ pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f6
         return Ok(Vec::new());
     }
     let offset = meta.storage_offset();
+
+    let two_stage_band = EIGVALSH_TWO_STAGE_BAND.load(std::sync::atomic::Ordering::Relaxed);
+    if two_stage_band > 0 {
+        return eigvalsh_two_stage_f64(&data[offset..], n, two_stage_band);
+    }
 
     // Eigenvalues-only: run the SAME Householder reduction + implicit-shift QL
     // as `eigh_contiguous_f64`, but skip BOTH O(n^3) eigenvector accumulations
@@ -62079,6 +62092,19 @@ mod tests {
             assert!(
                 (bsp - tsp).abs() <= tol,
                 "eigenvalue[{idx}] band={bsp} tridiag={tsp} (tol {tol})"
+            );
+        }
+
+        // End-to-end route: stage 1's band feeds the band-packed stage 2, not
+        // the full dense Householder sweep. Compare against the live packed
+        // solver on the original matrix to make that wiring observable.
+        let live = super::eigvalsh_contiguous_f64(&a, &meta).unwrap();
+        let two_stage = super::eigvalsh_two_stage_f64(&a, n, b).unwrap();
+        for (idx, (&want, &got)) in live.iter().zip(two_stage.iter()).enumerate() {
+            let tol = 1e-7 + 1e-8 * want.abs();
+            assert!(
+                (want - got).abs() <= tol,
+                "eigenvalue[{idx}] live={want} two-stage={got} (tol {tol})"
             );
         }
     }

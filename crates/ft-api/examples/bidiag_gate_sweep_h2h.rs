@@ -230,6 +230,9 @@ struct Arm {
     /// load-bearing rather than a formality: the two arms must agree with torch's eigenvalues to
     /// the lane's tolerance or the timing means nothing.
     tred2_block_nb: Option<usize>,
+    /// Half-bandwidth for eigvalsh's opt-in full -> band -> tridiagonal path.
+    /// `FT_TSB=0,32` compares the production packed sweep with the band-packed candidate.
+    eigvalsh_two_stage_band: Option<usize>,
 }
 
 fn arm_label(arm: Arm) -> String {
@@ -266,6 +269,11 @@ fn arm_label(arm: Arm) -> String {
             Some(0) => "/tnbOFF".to_string(),
             Some(v) => format!("/TNB{v}"),
             None => "/tnbSHIPPED".to_string(),
+        })
+        + &(match arm.eigvalsh_two_stage_band {
+            Some(0) => "/tsbOFF".to_string(),
+            Some(v) => format!("/TSB{v}"),
+            None => "/tsbSHIPPED".to_string(),
         })
         + &(if arm.eigh_bt_par_min > 0 {
             format!("/BTP{}", arm.eigh_bt_par_min)
@@ -419,6 +427,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
     let previous_tnb = arm.tred2_block_nb.map(ft_kernel_cpu::set_tred2_block_nb);
+    let previous_tsb = arm
+        .eigvalsh_two_stage_band
+        .map(ft_kernel_cpu::set_eigvalsh_two_stage_band);
     let previous_qcm = arm.qr_panel_cm.map(ft_kernel_cpu::set_qr_panel_column_major);
     let previous_qrc = arm.qr_trailing_cm.map(ft_kernel_cpu::set_qr_trailing_column_major);
     let previous_qtb = arm.qr_cm_blocked_transpose.map(ft_kernel_cpu::set_qr_cm_blocked_transpose);
@@ -467,6 +478,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
         if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
+        if let Some(v) = previous_tsb { ft_kernel_cpu::set_eigvalsh_two_stage_band(v); }
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
         if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
@@ -502,6 +514,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
         if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
+        if let Some(v) = previous_tsb { ft_kernel_cpu::set_eigvalsh_two_stage_band(v); }
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
         if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
         if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
@@ -595,6 +608,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
     if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
+    if let Some(v) = previous_tsb { ft_kernel_cpu::set_eigvalsh_two_stage_band(v); }
     ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
     if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
     if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
@@ -707,6 +721,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|t| t.trim().parse().ok())
         .collect();
     let tnbs: Vec<Option<usize>> = match std::env::var("FT_TNB") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .map(Some)
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let tsbs: Vec<Option<usize>> = match std::env::var("FT_TSB") {
         Ok(v) => v
             .split(',')
             .filter_map(|t| t.trim().parse().ok())
@@ -863,6 +885,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                   for &panel_par_min in &ppms {
                                    for &tred2_par_min in &tpms {
                                     for &tred2_block_nb in &tnbs {
+                                    for &eigvalsh_two_stage_band in &tsbs {
                                     for &eigh_bt_par_min in &btps {
                                     for &qr_panel_cm in &qcms {
                                     for &qr_trailing_cm in &qrcs {
@@ -884,6 +907,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         panel_par_min,
                                         tred2_par_min,
                                         tred2_block_nb,
+                                        eigvalsh_two_stage_band,
                                         eigh_bt_par_min,
                                         qr_panel_cm,
                                         qr_trailing_cm,
@@ -891,6 +915,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         qr_panel_t_fast,
                                         eigh_bt_row_split,
                                     });
+                                    }
                                     }
                                     }
                                     }
