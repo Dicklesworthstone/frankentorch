@@ -40897,3 +40897,30 @@ The practical consequence stands either way: the lever is worth ~1.009x on the l
 2.58x its own frame shows, it is bit-exact, and it deletes a duplicated O(n^3) convolution. If the
 allocator hypothesis holds, a backward-side buffer reuse would collect the rest of the 10.3 ms —
 that is a separate lever, on a separate frame, and it needs its own row.
+
+### 283e. CONFIRMED — the lane claim stands at ~1.01x, four windows, 87 of 108 paired wins
+
+283a declined the lane claim (10/14, estimators disagreeing) and 283c re-took it powered. A fourth
+window settles it:
+
+    reps  paired    marginal  sign test  A/A null
+     15   1.0201x   1.0139x   12/14      1.0076 PASS
+     15   1.0172x   1.0021x   10/14      0.9997 PASS
+     41   1.0094x   1.0089x   29/40      1.0000 PASS
+     41   1.0268x   1.0130x   36/40      0.9995 PASS
+
+**Every window positive, every A/A null inside 0.97-1.03, and 87 of 108 pooled paired wins**
+(z ~ 6.3). The last window's 36/40 alone is p ~ 2e-7. The frame replicates at 2.5842x / 2.9544x
+and the displacement replicates too: `bwd +10.321` then `+9.754` ms against `mul -10.925` then
+`-11.574`.
+
+**Verdict: SHIPS, and the lane figure is now bankable at ~1.01x** — quoted from the MARGINAL
+estimator (1.0021-1.0139), which is the conservative one here; the paired estimator runs
+1.0094-1.0268. It was already default ON, landed on redundancy and dtype-consistency grounds in
+283; what changed is that the lane number is no longer withheld.
+
+**What a 1% win needed to become quotable was not a better lever but more samples.** The two
+14-sample rows disagreed with themselves and one fell to the coin flip; the two 40-sample rows
+agree and are individually significant. A 1% effect is measurable on this harness — it just cannot
+be measured with fourteen paired samples, and the honest response to a marginal row is to take a
+bigger one rather than to argue about the one in hand.
