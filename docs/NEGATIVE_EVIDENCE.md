@@ -41289,3 +41289,33 @@ Two lessons worth more than the number. **A residual you can name is not a resid
 measured** — removing exactly the suspected copy and watching 25 ms become 1.1 ms is what turned
 the hypothesis into a result. And **test the branch your test cannot reach**: the bitwise test used
 distinct operands, so the aliased fallback would have shipped unexecuted; it needed its own case.
+
+### 289c. NATIVE-f32 UNARY IN-PLACE: REFUTED. THE RATIO IMPROVED BECAUSE THE INCUMBENT SLOWED
+
+`frankentorch-f32-inplace-accessor-gap-5fxq2`, unary residual. With the clone gone (289/289b) the
+two arms of the in-place family became structurally identical — one in-place pass, same tape
+accessor, same rayon gate — and differed in one thing only:
+
+    binary mul_   native f32 op                -> PARITY with torch
+    unary  neg_   transform(v as f64) as f32   -> 2.18x SLOWER
+
+That is a natural experiment rather than a guess, so the lever wrote itself: an optional native-f32
+transform for the seven ops where it is BIT-IDENTICAL to the round trip (neg/abs/relu are sign-bit
+work and a select; floor/ceil/round/trunc produce integer-valued results exactly representable in
+both dtypes). Built, and the existing bitwise test proved the identity honestly — `want` still
+computed through f64 while the code took the native path, six lengths straddling the gate.
+
+**It did not move our arm.**
+
+    ELF d807a452 (f64 round trip)   FT 0.620 / 0.644 / 0.638 ms
+    ELF e2948a2c (native f32)       FT 0.691 / 0.730 / 0.697 ms
+
+Three drift-passing runs each, no overlap, sign the wrong way. The LANE read better — 2.18x ->
+1.56x slower — purely because the incumbent went 0.295 -> 0.467 ms. **Banking that would be item
+280a's denominator error committed deliberately, one commit after warning about it.** Reverted; the
+machinery is gone rather than left unused.
+
+The transferable rule: when a ratio improves, check the NUMERATOR moved before believing the
+lever. Our arm's absolute is the only number a lever can be responsible for, and on this campaign
+the incumbent alone spanned 0.243-0.467 ms on one lane — a 1.9x band with no code change at all.
+Any future retry here needs a mechanism that predicts a change in the FT absolute.
