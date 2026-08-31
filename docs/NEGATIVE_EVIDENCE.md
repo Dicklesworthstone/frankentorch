@@ -41684,3 +41684,52 @@ and the existing phase counters already report both terms, so an nb sweep reads 
 The lesson to carry: **when a phase is rate-limited and the rate will not move, change how much
 work reaches it.** Two schedules for the same scalar chain returned 0.29x and 1.015x; the blocking
 constant that decides how many MACs enter that chain was never touched.
+
+### 292d. THE NB REBALANCE LANDS: CHOLESKY NB 128 -> 64, 1.264x ON THE LANE, CERTIFIED
+
+`frankentorch-valnx`. After two panel formulations returned 0.29x and 1.015x (292b/292c), the lever
+was not another schedule for the panel's scalar chain — it was **how much work reaches that chain**.
+
+MODEL FIRST, derived before any sweep: panel MACs over a factorisation are `n·nb²/6` (predicting
+1,398,101 at n=512/nb=128 against a measured census of 1,398,016 — exact, not fitted), while the
+trailing update does `~n³/3` whatever nb is and only its `k` changes. Panel runs at 0.85 GF/s,
+trailing at 50-130. Halving nb therefore cuts a QUADRATIC term at the slow rate and merely reshapes
+the fast one. The single risk was named in advance — the trailing rate at smaller k — with a
+break-even computed at 25.9 GF/s.
+
+SWEEP, three sizes, two runs, guard PASS, every phase counted per cell. The trailing rate degrades
+as predicted (n=512: 62.4 GF/s at nb=128 -> 35.4 at nb=64) and stays far above break-even, which is
+why nb=16 loses and the curve has an interior optimum. Against the shipped 128:
+
+               n=256        n=512        n=1024
+    nb=64    1.33 / 1.45  1.27 / 1.22  1.39 / 1.11    median 1.30x, range 1.11-1.45
+    nb=32    1.31 / 1.58  1.13 / 1.60  1.12 / 1.04    median 1.22x, range 1.04-1.60
+
+**The two runs DISAGREE about whether 32 or 64 wins at n<=512** — the same cell's trailing rate read
+22.9 and 44.7 GF/s — so the optimum is not resolved there. 64 was taken for beating the incumbent in
+ALL SIX cells rather than for topping any one of them; nb=32's best cell is the friendliest reading
+of a noisy sweep, and taking it would be item 279's error with the sign reversed. Three sizes were
+load-bearing: nb=64 wins at n=1024 in both runs while the small-n winner flips, which a single-size
+sweep would have reported as a clean winner.
+
+LANE ROW, arm0 = shipped so the toggled arm departs from production, both interleaved in one
+invocation, guard PASS before each, parity rel 2.55e-12 MATCH:
+
+    PAIRED (old nb=128 vs shipped nb=64)   0.814 / 0.756 / 0.791 / 0.791   median 0.791 -> 1.264x
+    A/A NULL (shipped vs shipped)          0.977 / 0.967 / 0.991 / 1.005   range 0.967-1.005
+
+**Roughly six times outside the null**, against three consecutive nulls earlier in this arc. Versus
+live torch the standing moves 5.48-6.36x SLOWER to 4.88-5.44x — it removes a cause of the gap, it
+does not close it.
+
+NOT BIT-EXACT and correctly so: blocking reassociates the trailing sums, which is why this path has
+always been tolerance-validated. Gate is reconstruction plus the oracle — ft-conformance 203/0,
+kernel-cpu 759/0, api 2604/0 — never `to_bits()`. The knob's default is separately asserted BITWISE
+identical to an explicit `CHOLESKY_NB_SHIPPED`, and that test tracks the constant so a future retune
+cannot leave it comparing against a stale width.
+
+**The lesson, and it took four refutations to earn: when a phase is rate-limited and the rate will
+not move, change how much work reaches it.** Three levers aimed at making the slow code faster
+(2-D trailing tiles, parallel panel rows, level-2 panel recast) returned a null, 0.29x and 1.015x.
+The one that worked left every line of the slow code untouched and altered a single constant that
+decides how many operations enter it.
