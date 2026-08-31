@@ -89,6 +89,47 @@ fn main() {
     // splicing those into one decomposition. Timing the forward here puts all three frames on one
     // machine, so the shares are a decomposition rather than a cross-host estimate.
     let mut forward = f64::INFINITY;
+    // THE SCATTER ARM — `frankentorch-hi9r6`, item 267's "isolate a phase INSIDE the kernel".
+    //
+    // `conv2d_backward_dinput_blocked_rows_f32` has exactly two frames: a per-row-block
+    // `sgemm`, and a fully SCALAR accumulate `dpb[irow + kc] += block[...]` nested over
+    // in_ch x kh x kw. At this shape that scatter is 160 * 1024 * 288 = 47.2M read-modify-writes.
+    // `gemm` is private to the crate so the GEMM cannot be timed from an example, but
+    // `conv2d_col2im_f32` IS public and is structurally the same scatter over the same total
+    // work — so timing it bounds the frame without instrumenting shipped code.
+    //
+    // READ IT AS AN UPPER BOUND, not as the blocked route's scatter cost: standalone col2im
+    // streams a 189 MB panel from DRAM, while the blocked route scatters from a cache-resident
+    // block. That asymmetry is the whole point of the blocking, so if col2im alone is COMPARABLE
+    // to the entire direct route then the scatter is the dominant frame; if it is far larger,
+    // the blocking is already doing the work and the GEMM is what remains.
+    let dpanel: Vec<f32> = (0..BATCH * H * W * IN_CH * K * K)
+        .map(|i| ((i % 19) as f32) * 0.007 - 0.06)
+        .collect();
+    let mut col2im = f64::INFINITY;
+    // THE GATHER-DIRECTION ARM — `frankentorch-hi9r6`, item 268's promoted candidate probed the
+    // cheap way BEFORE writing a kernel.
+    //
+    // Item 268 measured the scatter as 84-95% of the direct dinput route and latency-bound on
+    // scattered read-modify-write, which promotes the GATHER INVERSION: compute each `dpadded`
+    // element from the contributions reaching it, so every output is WRITTEN ONCE instead of
+    // accumulated into 9 times. That is a real kernel, so its premise gets tested first.
+    //
+    // THE PREMISE, ISOLATED WITHOUT WRITING IT: `conv2d_im2col_f32` and `conv2d_col2im_f32` move
+    // the SAME 47.2M elements between the SAME two buffers at the SAME stencil geometry, in
+    // opposite directions. im2col writes each of its 47.2M outputs exactly once; col2im
+    // accumulates into 5.92M outputs 9 times each. That is precisely the difference the gather
+    // inversion is proposing to buy.
+    //
+    // WHY THIS AND NOT A MICROBENCHMARK: `feedback_insitu_over_standalone` records a standalone
+    // ladder INVERTING in situ — a predicted 5.7x that measured as a 1.118x REGRESSION once
+    // allocator warmth was real. Both arms here are SHIPPED kernels called through their public
+    // entries in the same process as everything else in this probe, so there is no standalone
+    // artefact to be fooled by.
+    //
+    // REFUTES THE CANDIDATE IF ~1.0: same volume, same geometry, and the write-once direction
+    // buys nothing, so the inversion would not either.
+    let mut im2col = f64::INFINITY;
 
     let mut adjoint = f64::INFINITY;
     let mut fused_both = f64::INFINITY;
@@ -131,6 +172,20 @@ fn main() {
         std::hint::black_box(&d);
 
         let start = Instant::now();
+        let ic = ft_kernel_cpu::conv2d_im2col_f32(
+            &padded, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1,
+        );
+        let t_im2col = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&ic);
+
+        let start = Instant::now();
+        let sc = ft_kernel_cpu::conv2d_col2im_f32(
+            &dpanel, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1,
+        );
+        let t_col2im = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&sc);
+
+        let start = Instant::now();
         let fw = ft_kernel_cpu::conv2d_forward_f32(
             &padded, &weight, None, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
         );
@@ -164,10 +219,14 @@ fn main() {
             fused_ones_mask = fused_ones_mask.min(t_ones_mask);
             legacy_dinput = legacy_dinput.min(t_legacy);
             forward = forward.min(t_fw);
+            col2im = col2im.min(t_col2im);
+            im2col = im2col.min(t_im2col);
         }
     }
 
     eprintln!("F32_DINPUT forward                             {forward:8.3} ms");
+    eprintln!("F32_DINPUT col2im scatter alone (upper bound) {col2im:8.3} ms");
+    eprintln!("F32_DINPUT im2col gather alone (same volume)  {im2col:8.3} ms");
     eprintln!("F32_DINPUT all-ones adjoint (summed route)   {adjoint:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dinput+dweight        {fused_both:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dinput ONLY           {fused_dinput:8.3} ms");
@@ -204,5 +263,17 @@ fn main() {
         100.0 * fused_dinput / masked_kernels,
         masked_kernels,
         forward + adjoint
+    );
+    eprintln!(
+        "F32_DINPUT SCATTER: col2im alone / direct dinput = {:.3}x. Comparable means the SCATTER \
+         is the dominant frame inside the direct route; much larger means the blocking already \
+         beats it and the per-block GEMM is what remains.",
+        col2im / fused_dinput
+    );
+    eprintln!(
+        "F32_DINPUT GATHER-DIRECTION: col2im (scatter) / im2col (gather) = {:.3}x on identical \
+         volume and geometry. Much greater than 1 means writing each output ONCE is the win the \
+         gather inversion would buy; ~1.0 REFUTES it before the kernel is written.",
+        col2im / im2col
     );
 }
