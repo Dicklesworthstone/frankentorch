@@ -494,6 +494,38 @@ where
 /// FrankenTorch's f64 path against PyTorch's f32 one and read as a large loss for
 /// a reason that has nothing to do with the kernel. The whole scorecard row is
 /// about the f32 GRAD path, so the dtype is the measurement.
+/// An f32 IN-PLACE unary op on a no-grad leaf — `frankentorch-f32-inplace-accessor-gap-5fxq2`.
+///
+/// The timed region is the single mutating call, matching the PyTorch arm's `fn(x)` exactly.
+/// `requires_grad` is FALSE on both arms because an in-place op on a grad-requiring leaf is an
+/// error on both, so this lane is a pure forward-path measurement with no tape walk in it — the
+/// first such lane on this board.
+///
+/// The leaf is rebuilt per sample and OUTSIDE the clock, which matters more here than on the
+/// differentiable lanes: the op mutates its input, so a shared leaf would feed the second sample
+/// the first sample's output and every repetition would measure different values.
+fn timed_inplace_f32<F>(values: &[f32], apply: F) -> (f64, f64)
+where
+    F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId),
+{
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable_f32(values.to_vec(), vec![GN_N, GN_C, GN_H, GN_W], false)
+        .expect("f32 leaf");
+    let started = Instant::now();
+    apply(&mut session, x);
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    // Teardown after the clock, as on the incumbent side. An in-place op returns nothing, so the
+    // mutated tensor IS the result being checked.
+    let checksum = session
+        .tensor_values_f32(x)
+        .expect("values")
+        .iter()
+        .map(|v| f64::from(v.abs()))
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
 fn timed_group_norm_f32(values: &[f32], weight: &[f32], bias: &[f32]) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
@@ -1823,7 +1855,27 @@ prw=(seq(512)*0.1+0.05).requires_grad_(True)
 # biasing every ratio. Written as an independent literal rather than generated
 # from the Rust constant, which would make the agreement check tautological.
 print('PT_TIMED_STEPS forward,loss_sum,backward', flush=True)
+# frankentorch-f32-inplace-accessor-gap-5fxq2: mark a lane's callable as an IN-PLACE lane.
+# An in-place op is not differentiable work -- it mutates a no-grad tensor and returns None --
+# so it cannot go through the sum().backward() route below. The marker rides on the callable
+# rather than on a second dict because `harness_interleave.SAMPLE_LOOP_PY` unpacks LANES as a
+# 2-tuple and is SHARED with pad_h2h and pdist_f32_h2h; changing its shape would edit two other
+# harnesses to add a lane to this one.
+def inplace(f):
+    f.inplace = True
+    return f
+
 def run(base, fn):
+    if getattr(fn, 'inplace', False):
+        # No requires_grad: an in-place op on a grad-requiring leaf is an ERROR on both arms.
+        # The timed region is the single mutating call, which is the whole lane.
+        x=base.detach().clone()
+        s=time.perf_counter()
+        fn(x)                       # <- the in-place op: the timed region
+        elapsed=(time.perf_counter()-s)*1e3
+        # teardown after the clock, exactly as below; the tensor itself is the result here
+        # because an in-place op returns no new value to check.
+        return elapsed, x.abs().sum().item()
     # leaf built OUTSIDE the timed region, matching the FrankenTorch side
     x=base.detach().clone().requires_grad_(True)
     s=time.perf_counter()
@@ -2011,6 +2063,23 @@ LANES = {
     # frankentorch-mdsmm: prelu's DENSE-route incumbent twin. SQUARED here so this arm's loss is
     # sum(out*out) and matches what the FT arm times, exactly as avg_pool1d_dense does it.
     "prelu_dense": (prx, lambda x: Fn.prelu(x,prw)**2),
+    # frankentorch-f32-inplace-accessor-gap-5fxq2: the FIRST lane on this board to execute an
+    # in-place op in any dtype. The family had never been priced against torch, which is why an
+    # f32 in-place unary could sit at 10.6x its own f64 twin unnoticed.
+    #
+    # neg_ FIRST, and the choice is about PARITY, not about it being easy. Negation is exact in
+    # both dtypes, so FrankenTorch's f64 round trip (`-(v as f64) as f32`) and torch's native f32
+    # negation must agree BIT FOR BIT -- the checksum column can therefore only fail if the two
+    # arms really disagree, never because of a rounding difference the lane was built to have.
+    # It is also pure memory traffic, which is exactly what the 69%-in-the-clone finding was
+    # about.
+    "inplace_neg_f32": (gnx, inplace(lambda x: x.neg_())),
+    # exp_ is the compute-heavy twin, carried to separate bandwidth from arithmetic. NOTE its
+    # parity is NOT bit-exact by construction: FrankenTorch computes exp in f64 and narrows
+    # while torch calls a native f32 exp, so a last-bit difference here is EXPECTED and is a
+    # property of the dtype policy, not evidence of a bug. Read this lane's timing column and
+    # treat its checksum as a tolerance comparison.
+    "inplace_exp_f32": (gnx, inplace(lambda x: x.exp_())),
 }
 "#;
     // ISOLATION MODE PICKS A DIFFERENT CO-PROCESS — `frankentorch-rayon-pool-width-qq8as`.
@@ -2492,6 +2561,21 @@ LANES = {
                 });
                 ft_core::buffer_pool::set_enabled(true);
                 sample
+            }),
+        ),
+        (
+            // frankentorch-f32-inplace-accessor-gap-5fxq2: the board's first in-place lanes.
+            // Same `gnx` fixture as the group_norm rows so the two families are directly
+            // comparable on identical bytes.
+            "inplace_neg_f32",
+            Box::new(|| {
+                timed_inplace_f32(&gnx, |s, x| s.tensor_neg_(x).expect("neg_ f32"))
+            }),
+        ),
+        (
+            "inplace_exp_f32",
+            Box::new(|| {
+                timed_inplace_f32(&gnx, |s, x| s.tensor_exp_(x).expect("exp_ f32"))
             }),
         ),
         (
