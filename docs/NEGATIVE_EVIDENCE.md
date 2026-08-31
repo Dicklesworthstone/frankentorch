@@ -40335,3 +40335,61 @@ implementation is near its memory floor for this algorithm. The remaining distan
 vectorised direct-convolution microkernel of the oneDNN class — hand-tuned register blocking, not
 a rearrangement of these frames — and it should be scoped as its own piece of work rather than
 filed as another lever here. **Do not re-probe this frame.**
+
+### 276c. THE PAIRED ROW FOR THE TILED dout_flat LEVER, AND A PREDICTION THAT HELD
+
+276a shipped the tiled build on FRAME evidence and said the LANE ratio was not measured. It is now.
+The row-gather form was restored behind `MASKED_DOUT_TILED` (default ON) purely to serve as the
+live incumbent, and the A/B runs through the real fused entry with the square ALTERNATED per rep:
+
+    hz4, rayon=16, loadavg 3.63, 21 reps, fused backward [dinput, dweight]
+      OFF row-gather   37.461 ms
+      ON  tiled        36.087 ms
+      marginal 1.0381x   paired 1.0401x   SIGN TEST 20/20   A/A null 0.9932 PASS
+
+The frame replicated alongside it: 3.862 -> 2.668 ms, **1.4473x** against the earlier 1.4429x,
+bitwise match confirmed again.
+
+**The prediction was recorded in the commit BEFORE the run**: "~4 ms of a ~22.7 ms arm, saving
+~1.2 ms, so the entry should move ~1.05x — at or below what this harness resolves." Measured
+1.04x, with both estimators agreeing and a 20/20 sign test. Writing the predicted number down
+first is what makes a small ratio like this reportable rather than fittable: 1.04x is exactly the
+size of effect that an unstated expectation would have talked itself into calling either a win or
+a null after the fact.
+
+### 276d. THE REMAINING BACKWARD DEFICIT, AND WHAT IS *NOT* ATTRIBUTED
+
+One host, one estimator, one process (hz4, rayon=16, arms adjacent inside each rep, min of 21
+after discarding the first). MEASURED frames only:
+
+    forward                                10.395 ms
+    fused backward, dinput ONLY            20.037
+    fused backward, dweight ONLY           24.752
+    fused backward, both                   46.232
+    dout_flat build (tiled)                 2.668
+    direct dinput kernel alone         10.654-11.317   (budget sweep)
+    col2im scatter alone                   16.152
+    all-ones adjoint (summed route)         5.881
+
+**dweight is now the LARGER half on this host** — 24.752 against dinput's 20.037, i.e. 55% of the
+pair. That split is host-dependent (48-65% observed across three hosts) and must never be quoted
+without the host.
+
+**A ~6 ms RESIDUAL IS UNATTRIBUTED AND IS LEFT THAT WAY.** `dout_flat` (2.668) plus the direct
+dinput kernel (~11.3) is ~14.0 ms, against a measured 20.037 ms for the fused dinput-only entry.
+Six milliseconds are unaccounted. The obvious stories — first-touch on the fresh 21 MB `dout_flat`
+allocation, or on the 23.7 MB output — are plausible and NOT measured, and item 276a is this
+bead's own recent example of what happens when a gap between two arms gets a name instead of a
+counter. **Closing that attribution is the next diagnostic step; it is not yet a lever.**
+
+### 276e. THE TARGET IS SHARED WITH THE LINALG BEADS
+
+Both remaining frames are running at roughly the same rate: the dinput route reads **150.7
+GFLOP/s** on 3.020 GFLOP, and dweight's `sgemm_tb` is ~3.02 GFLOP in ~22 ms, i.e. ~137 GFLOP/s.
+That is the same wall item 275 hit from the other side — `inv`'s solve runs ~32 GFLOP/s (f64)
+against torch's implied ~78, and its FLOP excess explains only 1.33x of a 3.99x gap.
+
+So the f32 conv backward and the f64 linalg lanes are limited by the **same shared GEMM
+microkernel**, not by anything specific to either op. That is the packed-panel Goto/BLIS lever in
+the GEMM bandwidth vein. It is one piece of work that would move both families, and it should be
+scoped as such rather than re-derived a third time as a conv lever or a linalg lever.
