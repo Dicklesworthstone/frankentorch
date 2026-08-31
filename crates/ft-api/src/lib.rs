@@ -57769,6 +57769,8 @@ impl FrankenTorchSession {
         F: Fn(f64) -> f64 + Sync,
     {
         use rayon::prelude::*;
+        let profile_inplace = inplace_profile_enabled();
+        let mut rayon_map_join_ns = None;
         self.validate_tensor_in_place_target(target)?;
         match self.tensor_tape.dtype(target)? {
             DType::F64 => {
@@ -57816,8 +57818,15 @@ impl FrankenTorchSession {
                     .update_tensor_values_f32_with(target, |vals| {
                         par = vals.len() >= PARALLEL_ELEMENTWISE_MIN;
                         if par {
-                            vals.par_iter_mut()
-                                .for_each(|v| *v = transform(f64::from(*v)) as f32);
+                            if profile_inplace {
+                                let started = std::time::Instant::now();
+                                vals.par_iter_mut()
+                                    .for_each(|v| *v = transform(f64::from(*v)) as f32);
+                                rayon_map_join_ns = Some(started.elapsed().as_nanos());
+                            } else {
+                                vals.par_iter_mut()
+                                    .for_each(|v| *v = transform(f64::from(*v)) as f32);
+                            }
                         } else {
                             for v in vals.iter_mut() {
                                 *v = transform(f64::from(*v)) as f32;
@@ -57838,7 +57847,18 @@ impl FrankenTorchSession {
                 )));
             }
         }
-        self.record_tensor_in_place_operation(op, target, extra);
+        let ledger_format_append_ns = self.record_tensor_in_place_operation(op, target, extra);
+        if profile_inplace {
+            self.runtime.ledger_mut().record(
+                EvidenceKind::Dispatch,
+                format!(
+                    "inplace_profile op={op} target={} rayon_map_join_ns={} ledger_format_append_ns={}",
+                    target.0,
+                    rayon_map_join_ns.map_or(0, |nanos| nanos),
+                    ledger_format_append_ns.unwrap_or(0),
+                ),
+            );
+        }
         Ok(())
     }
 
@@ -57895,7 +57915,7 @@ impl FrankenTorchSession {
         op: &'static str,
         target: TensorNodeId,
         extra: Option<String>,
-    ) {
+    ) -> Option<u128> {
         self.batch_norm1d_sum_shortcuts.remove(&target.0);
         self.batch_norm2d_f32_sum_shortcuts.remove(&target.0);
         self.group_norm_f32_sum_shortcuts.remove(&target.0);
@@ -57903,6 +57923,7 @@ impl FrankenTorchSession {
         self.avg_pool2d_sum_shortcuts.remove(&target.0);
         self.max_pool1d_sum_shortcuts.remove(&target.0);
         self.max_pool3d_sum_shortcuts.remove(&target.0);
+        let started = inplace_profile_enabled().then(std::time::Instant::now);
         let mut summary = format!("tensor_inplace_op={op} target={}", target.0);
         if let Some(extra) = extra {
             summary.push(' ');
@@ -57911,6 +57932,7 @@ impl FrankenTorchSession {
         self.runtime
             .ledger_mut()
             .record(EvidenceKind::Dispatch, summary);
+        started.map(|instant| instant.elapsed().as_nanos())
     }
 
     fn record_unary_operation(&mut self, event: &UnaryOperationEvent) {
@@ -101363,6 +101385,15 @@ fn erfinv_positive_approx(p: f64, q: f64) -> f64 {
 /// Element count above which compute-bound elementwise special functions are
 /// evaluated across the rayon pool (below it, thread overhead is not worth it).
 const PARALLEL_ELEMENTWISE_MIN: usize = 8192;
+
+/// Enables measurement-only in-place spans when set to `1`.
+///
+/// With the flag absent, no additional evidence entries or clocks are emitted. The profiled
+/// Rayon span includes the element map as well as fork/join, so it is not fork/join time alone.
+fn inplace_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FT_INPLACE_PROFILE").is_ok_and(|value| value == "1"))
+}
 
 
 /// Which branch of `apply_tensor_unary_in_place`'s F32 arm actually runs —
