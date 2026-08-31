@@ -39843,3 +39843,62 @@ tightening of that loop will move it — and it promotes the **gather inversion*
 no accumulation conflict) from "the expensive candidate" to **the only remaining one** on this
 frame. That is worth knowing before someone spends a day on it, which is the entire case for
 pre-specifying what a cheap experiment would mean in both directions.
+
+## 269. THE GATHER INVERSION IS REFUTED BEFORE BEING WRITTEN — THE SCATTER DIRECTION IS ALREADY AS FAST, AND THE f32 dinput FRAME IS NEAR ITS MEMORY FLOOR
+
+`frankentorch-hi9r6`. Arm in `91f82d84`. **Item 268's promoted candidate is dead; there is no
+remaining identified lever on this frame.**
+
+### 269a. THE PREMISE, ISOLATED WITHOUT WRITING THE KERNEL
+
+Item 268 promoted the gather inversion — compute each `dpadded` element from the contributions
+reaching it, so every output is WRITTEN ONCE rather than accumulated into nine times. That is a
+real kernel, so the premise was tested first, and the tree already contains both directions:
+`conv2d_im2col_f32` and `conv2d_col2im_f32` move the SAME 47.2M elements between the SAME two
+buffers at the SAME stencil geometry, in opposite directions. im2col writes each of its 47.2M
+outputs exactly once; col2im accumulates into 5.92M outputs nine times each. **That difference is
+exactly what the inversion proposes to buy.**
+
+fixmydocuments, 16 cores, RAYON=16, loadavg 0.38-1.47 — the quietest window this bead has had —
+arms adjacent inside each rep, min of 9, two replications:
+
+    col2im (scatter)  13.086 / 13.266 ms
+    im2col (gather)   14.328 / 13.781 ms
+    ratio             0.913x / 0.963x
+
+**The scatter is already as fast as the gather, or marginally faster.** The inversion buys nothing.
+Dead for one probe arm instead of a day of kernel work.
+
+### 269b. THE FLOOR IS NOW VISIBLE
+
+col2im moves ~213 MB (189 MB panel read, accumulating into 23.7 MB) in 13.1 ms — about **16 GB/s
+for a strided scatter**. That is a respectable fraction of what this access pattern achieves, so
+the frame is near its memory-bound floor FOR THIS ALGORITHM rather than badly implemented. Same
+window: direct dinput 16.983 / 17.117 ms against col2im 13.086 / 13.266, so the scatter is 77-78%
+of the route, consistent with 268's 84-95% on noisier hosts.
+
+### 269c. THE STATE OF conv2d_f32_masked's 2.34x, COMPLETE
+
+    forward           EXONERATED — 36% of masked kernels, but the summed lane containing it is at
+                      PARITY with PyTorch (item 267)
+    dweight           levered — streamed panel elimination, PAIRED 1.74x (item 263)
+    dinput panel      already eliminated — legacy/direct 1.79-2.71x (item 266)
+    dinput scatter    77-95% of the route, LATENCY-bound (item 268)
+      - loop tightening      NULL, pre-specified (item 268)
+      - gather inversion     REFUTED, this item
+    general-dout 3x3  REFUTED — the adjoint's 13.8x is less work, not faster work (item 265)
+
+**Four candidates measured and killed, one shipped.** What is left is not a lever on this
+algorithm: at ~16 GB/s on a 47.2M-element scatter the implementation is close to its floor, and
+the remaining distance to PyTorch is almost certainly that PyTorch does not materialise a panel at
+all. That is a different backward, not a faster version of this one, and it should be scoped as
+such rather than as another pass over these frames.
+
+### 269d. THE TRANSFERABLE PART
+
+**When a proposed rewrite's premise is "direction X is faster than direction Y", check whether the
+codebase already contains both directions doing comparable work.** This one did — im2col and
+col2im are transposes of each other over identical volume and geometry — so the premise cost one
+probe arm to test instead of a kernel to write. Three of this bead's last four candidates died
+this way, each for a single arm, and the pattern is the same every time: **find the cheapest thing
+already in the tree that embodies the claim, and measure that.**
