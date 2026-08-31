@@ -41500,3 +41500,36 @@ The transferable pair: **isolation is necessary and nowhere near sufficient** (i
 was arithmetic, not subtle. Kept default OFF rather than reverted: it is not negative, it is a
 tested gated bit-exact improvement whose lane has not been found, and the actionable follow-up is
 the GATE admitting 5 of 31, not the arm.
+
+### 291a. inv AT 42% ARM COVERAGE STILL DOES NOT MOVE — SO DILUTION WAS NOT THE EXPLANATION
+
+`frankentorch-valnx` / `frankentorch-37sxo`. Item 291 left the 2-D `dgemm_sub_into` arm OFF because
+slogdet's lane did not move, with the sentinel offering an obvious excuse: only 5 of 31 calls took
+the arm. `inv` was the pre-registered test of that excuse — it runs an O(n^3) getri tail on the same
+trailing update, where slogdet's LU is followed only by an O(n) diagonal log-product, so its
+`dgemm_sub_into` shapes should clear `TILE_2D_MIN_AREA` far more often.
+
+**CENSUS FIRST, quoted before the row was read** (n=512, both arms one invocation, guard PASS):
+
+    inv      dgemm_sub(2d,col) = (19, 45)   -> 19 of 45 calls tiled, 42%
+    slogdet  dgemm_sub(2d,col) = ( 5, 31)   ->  5 of 31 calls tiled, 16%
+
+Nearly three times the coverage. And the lane still does not move:
+
+    PAIRED (sub2D vs subCOL)   1.054 / 0.987 / 1.021 / 0.982    median 1.004x
+    A/A NULL (identical arms)  1.052 / 0.980 / 1.070            median 1.052x
+
+**The NULL's spread (0.980-1.070) is WIDER than the paired spread (0.982-1.054).** The lane's own
+window noise exceeds any effect the lever has, and the paired median is 1.004x — a null. The first
+invocation alone read 1.054x, which is above the 1.03 ship threshold and would have been a shipped
+lever on one run; the A/A null taken immediately after read 1.052x. **One reading and no null is
+indistinguishable from a win here.**
+
+So the excuse is refuted along with the lever: dilution was not why slogdet did not move. A
+bit-exact 1.28-1.40x kernel win reaching 42% of a lane's calls produces no measurable lane effect,
+which places the trailing update itself off the critical path for both ops rather than
+under-covered. The arm stays DEFAULT OFF on the evidence of two lanes, not one.
+
+Method note worth keeping: this op's A/A null is 1.052x where slogdet's was 1.014x, on the same
+host and harness within the hour. **A null is a property of the LANE AND THE WINDOW, not of the
+box** — carrying slogdet's 1.014x over to inv would have made 1.054x look like a clean 5% win.
