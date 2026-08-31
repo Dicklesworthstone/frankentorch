@@ -12,7 +12,7 @@
 //! latter with the kernel's checked/allocating contiguous-matmul wrapper.
 //!   cargo run -q --release -p ft-kernel-cpu --example gemm_microkernel_probe -- --reverse-apply 64
 use ft_core::{DType, Device, TensorMeta};
-use ft_kernel_cpu::{matmul_tensor_contiguous_f64, probe_dgemm};
+use ft_kernel_cpu::{matmul_tensor_contiguous_f64, probe_dgemm, probe_dgemm_tb};
 use std::time::Instant;
 
 #[inline(never)]
@@ -99,6 +99,31 @@ fn raw_best_ms(
     (best, c.iter().sum())
 }
 
+fn raw_tb_best_ms(
+    pool: &rayon::ThreadPool,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f64],
+    b: &[f64],
+    reps: usize,
+) -> (f64, f64) {
+    let mut c = vec![0.0; m * n];
+    for _ in 0..16 {
+        pool.install(|| probe_dgemm_tb(m, k, n, a, b, &mut c));
+    }
+
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        c.fill(0.0);
+        let start = Instant::now();
+        pool.install(|| probe_dgemm_tb(m, k, n, a, b, &mut c));
+        best = best.min(start.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(c[n - 1]);
+    }
+    (best, c.iter().sum())
+}
+
 fn wrapper_best_ms(
     pool: &rayon::ThreadPool,
     m: usize,
@@ -172,12 +197,42 @@ fn reverse_apply_probe(reps: usize) {
     );
 }
 
+fn ormqr_left_tb_probe(reps: usize) {
+    let (m, k, n) = (32usize, 512usize, 512usize);
+    let serial_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("serial rayon pool");
+    let eight_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .expect("eight-thread rayon pool");
+    let a = fill_f64(k * m, 47);
+    let b = fill_f64(k * n, 59);
+    let (serial_ms, serial_sum) = raw_tb_best_ms(&serial_pool, m, k, n, &a, &b, reps);
+    let (eight_ms, eight_sum) = raw_tb_best_ms(&eight_pool, m, k, n, &a, &b, reps);
+    assert_eq!(serial_sum.to_bits(), eight_sum.to_bits(), "TB checksums differ");
+    println!(
+        "ormqr_left_tb_raw host={} reps={reps} shape={m}x{k}x{n} raw_1t={serial_ms:.4}ms/{:.1}GFLOP/s raw_8t={eight_ms:.4}ms/{:.1}GFLOP/s 8t/1t={:.3} checksum={eight_sum:.6}",
+        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        gflops(m, k, n, serial_ms),
+        gflops(m, k, n, eight_ms),
+        eight_ms / serial_ms,
+    );
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).is_some_and(|argument| argument == "--reverse-apply") {
         let reps = argv.get(2).and_then(|argument| argument.parse().ok()).unwrap_or(64);
         assert!(reps > 0, "reverse-apply reps must be positive");
         reverse_apply_probe(reps);
+        return;
+    }
+    if argv.get(1).is_some_and(|argument| argument == "--ormqr-left-tb") {
+        let reps = argv.get(2).and_then(|argument| argument.parse().ok()).unwrap_or(64);
+        assert!(reps > 0, "ormqr-left-tb reps must be positive");
+        ormqr_left_tb_probe(reps);
         return;
     }
 

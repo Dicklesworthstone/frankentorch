@@ -31,6 +31,12 @@ pub fn probe_dgemm(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [
     gemm::dgemm(m, k, n, a, b, c);
 }
 
+/// Probe shim for the shared f64 transposed-left GEMM. `frankentorch-5rnsq`.
+#[doc(hidden)]
+pub fn probe_dgemm_tb(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    gemm::dgemm_tb(m, k, n, a, b, c);
+}
+
 pub use masked_conv2d::{
     conv2d_backward_mask_fused_f32, conv2d_backward_mask_fused_f64, masked_frame_take_ns,
     set_masked_dout_tiled,
@@ -424,7 +430,7 @@ mod gemm {
         // OUTPUT columns, so every element's k-reduction is untouched and runs in one piece.
         // Nothing is reassociated — unlike a k-split, which is why item 104 needed a private
         // constant and this needs nothing. Column windows are disjoint, so writes never race.
-        if should_parallelize_cols(m, k, n) {
+        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
             let nb = block_cols(n);
             let cp = TilePtr(c.as_mut_ptr());
             (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
@@ -1499,8 +1505,8 @@ mod gemm {
     mod tile_iso_tests {
         use super::{
             dgemm, dgemm_2d_parallel, dgemm_block, dgemm_bt_2d_parallel, dgemm_bt_block,
-            dgemm_col_parallel, sgemm, sgemm_2d_parallel, sgemm_block, sgemm_bt_2d_parallel,
-            sgemm_bt_block, sgemm_col_parallel, sgemm_reused_output,
+            dgemm_col_parallel, dgemm_tb, sgemm, sgemm_2d_parallel, sgemm_block,
+            sgemm_bt_2d_parallel, sgemm_bt_block, sgemm_col_parallel, sgemm_reused_output,
         };
 
         const SHAPES: &[(usize, usize, usize)] = &[
@@ -1641,6 +1647,37 @@ mod gemm {
                         "Householder skinny split diverged at {index} for {m}x{k}x{n}"
                     );
                 }
+            }
+
+            // ORMQR's left compact-WY route reaches the transposed-left entry for
+            // V^T C at 32x512x512. Exercise that actual operand layout separately:
+            // A is stored [k,m], so the routed call must preserve each output
+            // element's complete K accumulation exactly as the one-thread call.
+            let (m, k, n) = (32usize, 512usize, 512usize);
+            let a: Vec<f64> = (0..k * m)
+                .map(|i| ((i % 37) as f64 - 18.0) * 0.046875 + (i as f64) * 1e-7)
+                .collect();
+            let b: Vec<f64> = (0..k * n)
+                .map(|i| ((i % 41) as f64 - 20.0) * 0.0234375 - (i as f64) * 1e-7)
+                .collect();
+            let serial_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("serial rayon pool");
+            let parallel_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .expect("parallel rayon pool");
+            let mut serial = vec![0.0_f64; m * n];
+            let mut parallel = vec![0.0_f64; m * n];
+            serial_pool.install(|| dgemm_tb(m, k, n, &a, &b, &mut serial));
+            parallel_pool.install(|| dgemm_tb(m, k, n, &a, &b, &mut parallel));
+            for (index, (expected, actual)) in serial.iter().zip(&parallel).enumerate() {
+                assert_eq!(
+                    expected.to_bits(),
+                    actual.to_bits(),
+                    "Householder skinny transpose split diverged at {index}"
+                );
             }
         }
     }
