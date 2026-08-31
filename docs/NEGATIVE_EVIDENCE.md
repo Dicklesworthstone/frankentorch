@@ -39987,3 +39987,49 @@ settled.
 is not a weaker substitute for a standing — it is the only honest measurement available**, and
 continuing to chase the standing converts a solid result into a coin flip about which window you
 quote.
+
+## 272. THE f32 dinput BLOCK BUDGET IS ALREADY OPTIMAL — SWEPT BOTH WAYS, CLEAN INTERIOR MINIMUM, AND THAT IS THE FIFTH CANDIDATE KILLED ON THIS FRAME
+
+`frankentorch-hi9r6`. **A null, and a vindication of a constant nobody had checked.**
+
+### 272a. WHY THIS WAS THE NEXT CANDIDATE
+
+Items 268 and 269 put the scatter at 77-95% of the direct dinput route and killed both algorithmic
+candidates (loop tightening NULL, gather inversion REFUTED). What remained inside that frame was a
+TUNING CONSTANT: `block_rows = BUDGET_BYTES / (patch_width * 4)` with a shipped 576 KiB, giving 512
+rows at the f32 lane's `patch_width = 288`. It governs the scatter's resident working set, it was
+set by argument, and it had never been swept. `feedback_tuning_grid_missing_the_winner` is the
+reason that matters: the SVD panel width sat at 16 because its grid held {16,32,64} and never held
+8, and nb=8 then won 15/16 cells.
+
+### 272b. THE SWEEP
+
+Made drivable via `set_conv2d_dinput_budget_bytes_f32` — a parameterised entry rather than an env
+knob, so it can be swept BELOW the shipped value, which is the whole point. fixmydocuments, 16
+cores, RAYON=16, loadavg 0.13-3.51, min of 9 after discarding the first, dinput-only:
+
+    budget   block_rows   sweep 1     sweep 2
+     128 KiB        113   12.383 ms   12.947 ms
+     256 KiB        227   12.399      12.971
+     576 KiB        512   **12.011**  **12.847**   <- SHIPPED
+    1024 KiB        910   12.704      13.925
+    2048 KiB       1820   12.963      13.966
+    4096 KiB       3640   12.834      13.968
+
+**The shipped value is the minimum in BOTH sweeps**, with a real curve on either side: 1.0-3.1%
+worse below, 5.8-8.7% worse above. That is a clean interior optimum, not a flat region where the
+value happens to sit — the distinction matters, because a flat region would mean the constant is
+irrelevant rather than correct.
+
+### 272c. THE STATE OF THIS FRAME, AND WHAT A NULL LIKE THIS IS WORTH
+
+Five candidates now measured and killed on the f32 masked backward: general-dout 3x3 (265),
+another panel elimination (266), scatter loop tightening (268), gather inversion (269), and the
+block budget (272). One lever shipped: the streamed dweight, 2.4-3.0x at the kernel and 1.71-1.79x
+paired over seven windows (263, 270, 271).
+
+**A sweep that confirms the shipped value is not a wasted sweep.** It converts "nobody has checked
+this" into "checked, optimal, with the curve on both sides", and it removes the cheapest remaining
+story about the frame. The override stays so the constant can be re-swept on a DIFFERENT shape or
+host, where the optimum may well move — a 576 KiB budget is an L2 argument, and L2 is not the same
+size everywhere.

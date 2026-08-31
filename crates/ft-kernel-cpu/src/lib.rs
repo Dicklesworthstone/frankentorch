@@ -9218,12 +9218,56 @@ pub fn conv2d_backward_dinput_direct_f32(
 /// 576 KiB, so the block stays L2-resident; at f32's 4 bytes that is twice the rows the f64 path
 /// gets for the same footprint, which is the point of budgeting bytes rather than rows.
 #[must_use]
+/// Runtime override for the f32 dinput block budget; `0` means "use the shipped constant".
+///
+/// The budget is a TUNING CONSTANT that has never been swept. `block_rows` is derived from it as
+/// `BUDGET_BYTES / (patch_width * 4)` — 512 rows at the f32 lane's `patch_width = 288` — and it
+/// sets how much of the scatter's working set stays resident. Items 268 and 269 measured that
+/// scatter at 77-95% of the whole direct dinput route, so this constant governs the frame that
+/// carries the f32 deficit, and nobody has checked it is at its optimum.
+///
+/// It is an OVERRIDE rather than an env knob for the reason
+/// `feedback_tuning_grid_missing_the_winner` records: a constant you cannot drive from a
+/// measurement cannot be swept BELOW its shipped value, and that is exactly where the SVD panel
+/// width's real optimum was hiding (the grid held {16,32,64}, nb=8 won 15/16 cells).
+///
+/// SWEPT, AND THE SHIPPED VALUE IS OPTIMAL — `frankentorch-hi9r6`. fixmydocuments, 16 cores,
+/// RAYON=16, loadavg 0.13-3.51, min of 9 after discarding the first, dinput-only, two sweeps:
+///
+/// ```text
+///   budget   block_rows   sweep 1     sweep 2
+///    128 KiB        113   12.383 ms   12.947 ms
+///    256 KiB        227   12.399      12.971
+///    576 KiB        512   12.011      12.847     <- SHIPPED, minimum in BOTH
+///   1024 KiB        910   12.704      13.925
+///   2048 KiB       1820   12.963      13.966
+///   4096 KiB       3640   12.834      13.968
+/// ```
+///
+/// A clean interior minimum with a curve on both sides — 1.0-3.1% worse below, 5.8-8.7% worse
+/// above — so this is not a flat region where the value happens to sit. The constant was chosen
+/// by argument and the argument was right. **Do not re-sweep it on this shape**; the override
+/// stays so it can be re-swept cheaply on a DIFFERENT shape or host, where the optimum may move.
+static CONV2D_DINPUT_BUDGET_BYTES_F32: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the f32 dinput block budget in bytes, returning the previous value. `0` restores the
+/// shipped constant.
+#[doc(hidden)]
+pub fn set_conv2d_dinput_budget_bytes_f32(bytes: usize) -> usize {
+    CONV2D_DINPUT_BUDGET_BYTES_F32.swap(bytes, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn conv2d_dinput_block_rows_f32(patch_width: usize) -> usize {
     const BUDGET_BYTES: usize = 576 * 1024;
     if patch_width == 0 {
         return 1;
     }
-    (BUDGET_BYTES / (patch_width * size_of::<f32>())).max(1)
+    let budget = match CONV2D_DINPUT_BUDGET_BYTES_F32.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => BUDGET_BYTES,
+        value => value,
+    };
+    (budget / (patch_width * size_of::<f32>())).max(1)
 }
 
 /// [`conv2d_backward_dinput_direct_f32`] with the block width supplied, so a test can drive it.

@@ -249,6 +249,42 @@ fn main() {
         }
     }
 
+    // THE BUDGET SWEEP — `frankentorch-hi9r6`. `block_rows` is `BUDGET_BYTES / (patch_width*4)`
+    // with a shipped 576 KiB, i.e. 512 rows here. That constant governs the scatter's resident
+    // working set, and items 268/269 put the scatter at 77-95% of this route — so it governs the
+    // frame carrying the f32 deficit, and it has never been swept. Swept BELOW the shipped value
+    // as well as above, per `feedback_tuning_grid_missing_the_winner`.
+    let mut budget_rows: Vec<(usize, f64)> = Vec::new();
+    for &budget in &[128 * 1024usize, 256 * 1024, 576 * 1024, 1024 * 1024, 2048 * 1024, 4096 * 1024]
+    {
+        let previous = ft_kernel_cpu::set_conv2d_dinput_budget_bytes_f32(budget);
+        let mut best = f64::INFINITY;
+        for rep in 0..reps {
+            let start = Instant::now();
+            let r = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [true, false, false],
+            );
+            let t = start.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&r);
+            if rep > 0 {
+                best = best.min(t);
+            }
+        }
+        ft_kernel_cpu::set_conv2d_dinput_budget_bytes_f32(previous);
+        budget_rows.push((budget, best));
+    }
+    for (budget, ms) in &budget_rows {
+        let shipped = if *budget == 576 * 1024 { "  <- SHIPPED" } else { "" };
+        eprintln!(
+            "F32_DINPUT BUDGET {:>5} KiB -> block_rows {:>5}  dinput {:8.3} ms{}",
+            budget / 1024,
+            budget / (IN_CH * K * K * 4),
+            ms,
+            shipped
+        );
+    }
+
     eprintln!("F32_DINPUT forward                             {forward:8.3} ms");
     eprintln!("F32_DINPUT col2im scatter alone (upper bound) {col2im:8.3} ms");
     eprintln!("F32_DINPUT im2col gather alone (same volume)  {im2col:8.3} ms");
