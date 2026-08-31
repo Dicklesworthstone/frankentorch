@@ -449,25 +449,67 @@ fn main() {
     // panel width sat at 16 while 8 won 15 of 16 cells.
     //
     // The dweight frame is read from the entry's OWN counter, so this is not a subtraction.
+    // GATHER vs GEMM INSIDE THE dweight FRAME -- `frankentorch-06csx`.
+    //
+    // The GEMM shape probe put one thread's 188.7 MFLOP share at ~3.8 ms (49.6 GFLOP/s, which is
+    // 75% of this box's square-GEMM ceiling) against a 22.4 ms dweight frame. That says the GEMM
+    // is not the frame -- but it says it by subtracting across two measurements, which on this
+    // campaign already invented a 6 ms frame that did not exist (ledger 277a). Counters instead.
+    //
+    // Both counters are summed across rayon workers, so they are CPU time, not wall time: their
+    // RATIO is the quantity, and neither absolute should be compared to the frame.
+    {
+        let mut best_g = f64::INFINITY;
+        let mut best_m = f64::INFINITY;
+        for rep in 0..reps {
+            let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [false, true, false],
+            );
+            std::hint::black_box(&out);
+            let (g_ns, m_ns) = ft_kernel_cpu::conv2d_dweight_split_take_ns();
+            if rep > 0 {
+                best_g = best_g.min(g_ns as f64 / 1e6);
+                best_m = best_m.min(m_ns as f64 / 1e6);
+            }
+        }
+        eprintln!(
+            "F32_DWSPLIT panel gather {best_g:8.3} ms CPU   GEMM {best_m:8.3} ms CPU   gather is {:.1}% of the two",
+            100.0 * best_g / (best_g + best_m)
+        );
+    }
+
     for mb in [4usize, 8, 16, 32] {
         let previous = ft_kernel_cpu::set_conv2d_dweight_mb(mb);
         let mut best = f64::INFINITY;
+        let mut best_g = f64::INFINITY;
+        let mut best_m = f64::INFINITY;
         for rep in 0..reps {
             let _ = ft_kernel_cpu::masked_frame_take_ns();
+            let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
                 &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
                 [false, true, false],
             );
             std::hint::black_box(&out);
             let (_, w_ns, _) = ft_kernel_cpu::masked_frame_take_ns();
+            let (g_ns, m_ns) = ft_kernel_cpu::conv2d_dweight_split_take_ns();
             if rep > 0 {
                 best = best.min(w_ns as f64 / 1e6);
+                best_g = best_g.min(g_ns as f64 / 1e6);
+                best_m = best_m.min(m_ns as f64 / 1e6);
             }
         }
         ft_kernel_cpu::set_conv2d_dweight_mb(previous);
         let m_blocks = OUT_CH.div_ceil(mb);
+        // Report the gather/GEMM split PER mb. The counters say the gather is 82% of this frame,
+        // and the tiling says raising mb should cut the redundant gather proportionally -- yet the
+        // frame barely moved between mb=8 and mb=16. Both cannot be right, and the split measured
+        // at each mb says which.
         eprintln!(
-            "F32_DWMB mb={mb:2} -> m_blocks {m_blocks}   dweight frame {best:7.3} ms{}",
+            "F32_DWMB mb={mb:2} -> m_blocks {m_blocks}   dweight frame {best:7.3} ms   gather {best_g:8.3} + GEMM {best_m:7.3} ms CPU ({:.1}% gather){}",
+            100.0 * best_g / (best_g + best_m),
             if mb == 8 { "   <- SHIPPED" } else { "" }
         );
     }

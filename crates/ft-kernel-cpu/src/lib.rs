@@ -8677,6 +8677,28 @@ pub(crate) fn conv2d_dweight_streamed_f32_if_enabled(
 /// f32 ONLY for now. The f64 twin carries a byte-identical `mb` line and a global replace would
 /// have silently parameterised both; the f64 lane has not been measured and must not inherit a
 /// value chosen on f32 evidence.
+/// Wall time inside the streamed f32 dweight, split into the panel GATHER and the GEMM.
+///
+/// `frankentorch-06csx`. The GEMM shape probe measured one thread running this kernel's exact GEMM
+/// shape at 49.6 GFLOP/s, so a thread's 188.7 MFLOP share is ~3.8 ms — against a 22.4 ms dweight
+/// frame. That points at the `runs` gather, but the pointing is a CROSS-MEASUREMENT SUBTRACTION,
+/// and on this campaign a subtraction between arms already invented a 6 ms frame that did not
+/// exist (ledger 277a). So the split gets counters instead of an argument.
+///
+/// Both are summed across rayon workers, so they measure CPU time rather than wall time and their
+/// ratio is the meaningful quantity, not either absolute against the frame.
+static CONV2D_DWEIGHT_GATHER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONV2D_DWEIGHT_GEMM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drain the streamed f32 dweight's `(gather_ns, gemm_ns)`, summed over workers.
+#[doc(hidden)]
+pub fn conv2d_dweight_split_take_ns() -> (u64, u64) {
+    (
+        CONV2D_DWEIGHT_GATHER_NS.swap(0, LuOrdering::Relaxed),
+        CONV2D_DWEIGHT_GEMM_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 static CONV2D_DWEIGHT_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Set the streamed f32 dweight M-block width, returning the previous value. `0` restores the
@@ -8755,8 +8777,11 @@ fn conv2d_dweight_streamed_f32(
             let mut ptile = vec![0.0f32; krows * jn];
             let mut atile = vec![0.0f32; krows * ocn];
             let mut f0 = 0usize;
+            let mut gather_ns = 0u64;
+            let mut gemm_ns = 0u64;
             while f0 < flat {
                 let rows = krows.min(flat - f0);
+                let gather_start = std::time::Instant::now();
                 for r in 0..rows {
                     let row = f0 + r;
                     let b = row / patch_count;
@@ -8772,6 +8797,8 @@ fn conv2d_dweight_streamed_f32(
                     let src = row * out_ch + oc0;
                     atile[r * ocn..(r + 1) * ocn].copy_from_slice(&dout_flat[src..src + ocn]);
                 }
+                gather_ns += gather_start.elapsed().as_nanos() as u64;
+                let gemm_start = std::time::Instant::now();
                 gemm::sgemm_tb_add_into(
                     ocn,
                     rows,
@@ -8780,8 +8807,11 @@ fn conv2d_dweight_streamed_f32(
                     &ptile[..rows * jn],
                     &mut c,
                 );
+                gemm_ns += gemm_start.elapsed().as_nanos() as u64;
                 f0 += rows;
             }
+            CONV2D_DWEIGHT_GATHER_NS.fetch_add(gather_ns, LuOrdering::Relaxed);
+            CONV2D_DWEIGHT_GEMM_NS.fetch_add(gemm_ns, LuOrdering::Relaxed);
             ((oc0, j0), c)
         })
         .collect();
