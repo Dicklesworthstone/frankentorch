@@ -831,6 +831,33 @@ struct GridSamplePoint {
 /// Both are counted so the non-kernel backward is DECOMPOSED rather than named. The widen is
 /// already `par_iter` and its buffer-pool hook was tried and reverted (`frankentorch-ymhld`); the
 /// downcast is still a serial `.iter().map().collect()`, and pricing that asymmetry is the point.
+/// Whether the f32 fused backward narrows the incoming gradient in PARALLEL.
+///
+/// `frankentorch-t1gph`, ledger 286. The tape carries gradients in f64 and the kernel is f32, so
+/// every f32 conv2d backward converts 5.24M elements down and 5.92M back up. The WIDEN direction
+/// was parallelised long ago; the NARROW direction was left as a serial `.iter().map().collect()`.
+/// Measured in the SAME closure, the same call, the same host:
+///
+///     WIDEN     5.92M elements   par_iter   3.604 ms
+///     DOWNCAST  5.24M elements   SERIAL    14.776 ms   (16.0% of the training lane)
+///
+/// 4.1x slower for 11% fewer elements. The control is in the same measurement as the treatment,
+/// so this is not a cross-run inference.
+///
+/// BIT-EXACT: `v as f32` is a deterministic per-element conversion and `par_iter().collect()`
+/// preserves order, so every element is the same value at the same index. Identical in kind to
+/// `widen_grad_f32_to_f64`, which has been `par_iter` for exactly this reason.
+///
+/// DEFAULT OFF until it has a paired row.
+static FUSE_BWD_PARALLEL_DOWNCAST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the parallel narrow, returning the previous setting.
+#[doc(hidden)]
+pub fn set_fuse_bwd_parallel_downcast(on: bool) -> bool {
+    FUSE_BWD_PARALLEL_DOWNCAST.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 static FUSE_BWD_DOWNCAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FUSE_BWD_WIDEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6519,7 +6546,14 @@ impl FrankenTorchSession {
                     // The tape carries gradients in f64 even for an f32 op; downcast once,
                     // here, exactly as the f32 conv2d fast path does.
                     let downcast_start = std::time::Instant::now();
-                    let incoming: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                    let incoming: Vec<f32> = if FUSE_BWD_PARALLEL_DOWNCAST
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        use rayon::prelude::*;
+                        grad_outputs[0].par_iter().map(|&v| v as f32).collect()
+                    } else {
+                        grad_outputs[0].iter().map(|&v| v as f32).collect()
+                    };
                     FUSE_BWD_DOWNCAST_NS.fetch_add(
                         downcast_start.elapsed().as_nanos() as u64,
                         std::sync::atomic::Ordering::Relaxed,

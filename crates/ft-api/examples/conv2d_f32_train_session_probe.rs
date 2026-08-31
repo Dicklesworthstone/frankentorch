@@ -349,6 +349,89 @@ fn main() {
         );
     }
 
+    // PAIRED A/B for the PARALLEL NARROW -- `frankentorch-t1gph`, ledger 286.
+    //
+    // The tape is f64 and the kernel is f32, so every backward narrows 5.24M elements. The widen
+    // twin beside it is already par_iter and runs 3.604 ms on MORE elements; this serial narrow
+    // runs 14.776 ms, 16% of the training lane. The lever is the one-line symmetry fix.
+    //
+    // PREDICTION RECORDED BEFORE THE RUN: the downcast frame falls toward the widen's rate
+    // (~3-4 ms), so ~11 ms leaves a ~92 ms lane and the lane moves ~1.12x. If the frame falls but
+    // the LANE does not, that is displacement again -- this campaign has seen it three times -- and
+    // the per-frame counters will localise it rather than leave it inferred.
+    {
+        let once = |par: bool| -> (f64, f64) {
+            let prev = ft_api::set_fuse_bwd_parallel_downcast(par);
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(values.clone(), vec![BATCH, IN_CH, H, W], true)
+                .expect("leaf x");
+            let w = session
+                .tensor_variable_f32(weights.clone(), vec![OUT_CH, IN_CH, K, K], true)
+                .expect("leaf w");
+            let m = session
+                .tensor_variable_f32(mask.clone(), vec![BATCH, OUT_CH, H, W], false)
+                .expect("leaf mask");
+            let lane0 = Instant::now();
+            let out = session
+                .functional_conv2d(x, w, None, (1, 1), (1, 1))
+                .expect("conv2d");
+            let scored = session.tensor_mul(out, m).expect("mask multiply");
+            let loss = session.tensor_sum(scored).expect("sum");
+            let _ = ft_api::take_fuse_bwd_frames_ns();
+            let report = session.tensor_backward(loss).expect("backward");
+            let lane = lane0.elapsed().as_secs_f64() * 1e3;
+            let (d_ns, _) = ft_api::take_fuse_bwd_frames_ns();
+            std::hint::black_box(report.gradient(x).expect("grad").len());
+            ft_api::set_fuse_bwd_parallel_downcast(prev);
+            (lane, d_ns as f64 / 1e6)
+        };
+        let mut off_l = Vec::new();
+        let mut on_l = Vec::new();
+        let mut off_d = Vec::new();
+        let mut on_d = Vec::new();
+        let mut nulls = Vec::new();
+        for rep in 0..reps {
+            let r = if rep % 2 == 0 {
+                let a = [once(false), once(true), once(true), once(false)];
+                [a[0], a[1], a[2], a[3]]
+            } else {
+                let a = [once(true), once(false), once(false), once(true)];
+                [a[1], a[0], a[3], a[2]]
+            };
+            if rep == 0 {
+                continue;
+            }
+            off_l.push(r[0].0.min(r[3].0));
+            on_l.push(r[1].0.min(r[2].0));
+            off_d.push(r[0].1.min(r[3].1));
+            on_d.push(r[1].1.min(r[2].1));
+            nulls.push(r[0].0 / r[3].0);
+        }
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let mut ratios: Vec<f64> = off_l.iter().zip(&on_l).map(|(a, b)| a / b).collect();
+        let paired = median(&mut ratios);
+        let null = median(&mut nulls.clone());
+        let wins = off_l.iter().zip(&on_l).filter(|(o, n)| n < o).count();
+        let olm = median(&mut off_l.clone());
+        let onm = median(&mut on_l.clone());
+        let odm = median(&mut off_d.clone());
+        let ondm = median(&mut on_d.clone());
+        eprintln!(
+            "TRAIN_NARROW lane OFF (serial) {olm:8.3} ms   ON (par_iter) {onm:8.3} ms   |   downcast frame {odm:7.3} -> {ondm:7.3} ms ({:.4}x)",
+            odm / ondm
+        );
+        eprintln!(
+            "TRAIN_NARROW   marginal {:.4}x   paired {paired:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
+            olm / onm,
+            off_l.len(),
+            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+        );
+    }
+
     // PAIRED A/B for the reuse lever, alternating square, per-rep min-of-2, median of per-rep
     // ratios, A/A null from the two same-arm samples of one rep (ledger 274c/275b). Both the LANE
     // and the tensor_mul FRAME are reported: the lever removes a duplicate convolution from the
