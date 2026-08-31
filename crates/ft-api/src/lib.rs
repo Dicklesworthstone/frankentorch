@@ -121,8 +121,27 @@ const GRADIENT_WIDEN_PARALLEL_MIN: usize = 1 << 20;
 /// `f64`, and an elementwise map has no accumulation order to change. Splitting the range
 /// therefore cannot alter a single bit, which is asserted in
 /// `widen_f32_to_f64_matches_serial_bitwise` rather than assumed.
+/// Force [`widen_f32_to_f64`] PAST its size gate — the LEVER-OFF twin for the gate itself.
+///
+/// `frankentorch-dwto7`. The gate's value cannot be measured on the board: every f32 lane that
+/// reaches a widen is far above `GRADIENT_WIDEN_PARALLEL_MIN`, so a paired A/B there reads ~1.000x
+/// by construction and would say nothing. What the gate actually buys is protection BELOW it, and
+/// the only honest way to price that is to run a shape below it with the gate defeated — which is
+/// what this exists for. Mirrors `set_gradient_narrow_serial`'s role as a paired arm.
+static WIDEN_FORCE_PARALLEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force the widen parallel regardless of size, reproducing the pre-dedup ungated behaviour.
+/// Returns the previous setting.
+#[doc(hidden)]
+pub fn set_gradient_widen_force_parallel(force: bool) -> bool {
+    WIDEN_FORCE_PARALLEL.swap(force, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn widen_f32_to_f64(values: &[f32]) -> Vec<f64> {
-    if values.len() < GRADIENT_WIDEN_PARALLEL_MIN {
+    if values.len() < GRADIENT_WIDEN_PARALLEL_MIN
+        && !WIDEN_FORCE_PARALLEL.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return values.iter().map(|&v| f64::from(v)).collect();
     }
     use rayon::prelude::*;

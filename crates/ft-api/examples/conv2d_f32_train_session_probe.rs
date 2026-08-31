@@ -134,6 +134,11 @@ fn main() {
     let mut t_kernel = f64::INFINITY;
     let mut t_down = f64::INFINITY;
     let mut t_widen = f64::INFINITY;
+    let mut t_tape_loop = f64::INFINITY;
+    let mut t_tape_dispatch = f64::INFINITY;
+    let mut t_tape_sum = f64::INFINITY;
+    let mut t_tape_pad = f64::INFINITY;
+    let mut t_tape_custom = f64::INFINITY;
 
     for rep in 0..reps {
         // Leaf construction is timed separately and EXCLUDED from the lane total below, because
@@ -181,6 +186,7 @@ fn main() {
         let b0 = Instant::now();
         let report = session.tensor_backward(loss).expect("backward");
         let bwd = b0.elapsed().as_secs_f64() * 1e3;
+        let machinery = &report.telemetry.machinery;
         let (k_dout, k_dweight, k_dinput) = ft_kernel_cpu::masked_frame_take_ns();
         let kernel_ms = (k_dout + k_dweight + k_dinput) as f64 / 1e6;
         let (bw_down_ns, bw_widen_ns) = ft_api::take_fuse_bwd_frames_ns();
@@ -212,6 +218,11 @@ fn main() {
             t_kernel = t_kernel.min(kernel_ms);
             t_down = t_down.min(down_ms);
             t_widen = t_widen.min(widen_ms);
+            t_tape_loop = t_tape_loop.min(machinery.loop_ns as f64 / 1e6);
+            t_tape_dispatch = t_tape_dispatch.min(machinery.node_dispatch_ns as f64 / 1e6);
+            t_tape_sum = t_tape_sum.min(machinery.sum_dispatch_ns as f64 / 1e6);
+            t_tape_pad = t_tape_pad.min(machinery.pad_dispatch_ns as f64 / 1e6);
+            t_tape_custom = t_tape_custom.min(machinery.custom_function_dispatch_ns as f64 / 1e6);
         }
     }
 
@@ -249,6 +260,9 @@ fn main() {
         "TRAIN       REMAINDER (tape walk, dsum, pad bwd, grad alloc) {:8.3} ms  ({:5.1}% of the lane)",
         t_bwd - t_kernel - t_down - t_widen,
         100.0 * (t_bwd - t_kernel - t_down - t_widen) / total
+    );
+    eprintln!(
+        "TRAIN       TAPE counters: loop {t_tape_loop:8.3} ms | dispatch {t_tape_dispatch:8.3} ms | sum {t_tape_sum:8.3} ms | pad {t_tape_pad:8.3} ms | custom {t_tape_custom:8.3} ms"
     );
     eprintln!("TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms");
 
@@ -346,6 +360,88 @@ fn main() {
             pl - pr,
             pl - r,
             if (pl - r).abs() > 1e-9 { 100.0 * (pl - pr) / (pl - r) } else { 0.0 }
+        );
+    }
+
+    // WHAT THE WIDEN GATE BUYS -- `frankentorch-dwto7`, and it is deliberately NOT a board row.
+    //
+    // The widen dedup routed six ungated call sites onto the gated helper. Its effect exists only
+    // BELOW `GRADIENT_WIDEN_PARALLEL_MIN`, and every f32 board lane that reaches a widen is far
+    // above it (this lane's dpadded is 5,922,560 against a 1<<20 gate), so a paired A/B on the
+    // board reads ~1.000x by construction and would say nothing at all.
+    //
+    // So this measures the shape where the gate actually bites: a SMALL batch, with the gate
+    // defeated as the OFF arm. That reproduces the pre-dedup ungated behaviour exactly, and the
+    // comparison prices the protection rather than asserting it from the neighbouring
+    // compile-time note. It is a synthetic shape, it is NOT a board lane, and no board claim is
+    // made from it.
+    {
+        const SMALL_B: usize = 2; // dpadded = 2*32*34*34 = 73,984 elements, well under the gate
+        let sv: Vec<f32> = (0..SMALL_B * IN_CH * H * W)
+            .map(|i| ((i % 37) as f32) * 0.013 - 0.21)
+            .collect();
+        let sm: Vec<f32> = (0..SMALL_B * OUT_CH * H * W)
+            .map(|i| ((i % 23) as f32) * 0.019 - 0.19)
+            .collect();
+        let once = |force_par: bool| -> f64 {
+            let prev = ft_api::set_gradient_widen_force_parallel(force_par);
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(sv.clone(), vec![SMALL_B, IN_CH, H, W], true)
+                .expect("leaf x");
+            let w = session
+                .tensor_variable_f32(weights.clone(), vec![OUT_CH, IN_CH, K, K], true)
+                .expect("leaf w");
+            let m = session
+                .tensor_variable_f32(sm.clone(), vec![SMALL_B, OUT_CH, H, W], false)
+                .expect("leaf mask");
+            let t0 = Instant::now();
+            let out = session
+                .functional_conv2d(x, w, None, (1, 1), (1, 1))
+                .expect("conv2d");
+            let scored = session.tensor_mul(out, m).expect("mask multiply");
+            let loss = session.tensor_sum(scored).expect("sum");
+            let report = session.tensor_backward(loss).expect("backward");
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(report.gradient(x).expect("grad").len());
+            ft_api::set_gradient_widen_force_parallel(prev);
+            ms
+        };
+        let mut gated = Vec::new();
+        let mut ungated = Vec::new();
+        let mut nulls = Vec::new();
+        for rep in 0..reps {
+            let r = if rep % 2 == 0 {
+                let a = [once(true), once(false), once(false), once(true)];
+                [a[0], a[1], a[2], a[3]]
+            } else {
+                let a = [once(false), once(true), once(true), once(false)];
+                [a[1], a[0], a[3], a[2]]
+            };
+            if rep == 0 {
+                continue;
+            }
+            ungated.push(r[0].min(r[3]));
+            gated.push(r[1].min(r[2]));
+            nulls.push(r[0] / r[3]);
+        }
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let mut ratios: Vec<f64> = ungated.iter().zip(&gated).map(|(a, b)| a / b).collect();
+        let paired = median(&mut ratios);
+        let null = median(&mut nulls.clone());
+        let wins = ungated.iter().zip(&gated).filter(|(u, g)| g < u).count();
+        eprintln!(
+            "WIDEN_GATE small batch={SMALL_B} (widen 73,984 elems, gate 1<<20)  UNGATED {:7.3} ms   GATED {:7.3} ms",
+            median(&mut ungated.clone()),
+            median(&mut gated.clone())
+        );
+        eprintln!(
+            "WIDEN_GATE   paired {paired:.4}x (gated faster if >1)   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
+            ungated.len(),
+            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
         );
     }
 
