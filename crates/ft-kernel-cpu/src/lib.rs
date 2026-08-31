@@ -26173,6 +26173,152 @@ pub fn lu_solve_mixed_refine_contiguous_f64(
 /// Compute matrix inverse for a contiguous square f64 matrix.
 ///
 /// Uses LU factorization with partial pivoting and solves against the identity.
+/// Whether `inv` uses the identity-structure inverse instead of a dense-identity `lu_solve`.
+/// `frankentorch-37sxo`. DEFAULT OFF until it has a paired row.
+static LU_INV_IDENTITY_STRUCT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the identity-structure inverse, returning the previous setting.
+#[doc(hidden)]
+pub fn set_lu_inv_identity_struct(on: bool) -> bool {
+    LU_INV_IDENTITY_STRUCT.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Invert from an existing LU factorisation, exploiting the structure of the identity RHS.
+///
+/// `frankentorch-37sxo`. The shipping route builds a DENSE n x n identity and hands it to
+/// `lu_solve_contiguous_f64`, which knows nothing about its contents and does the full
+/// `~2n^3`. But the RHS is a permutation matrix, and that is worth roughly half the forward
+/// substitution.
+///
+/// THE STRUCTURE. `lu_solve` permutes rows first, giving `P·I`; instead take the RHS to be the
+/// PLAIN identity and permute COLUMNS at the end. With `P A = L U` we have
+/// `A^-1 = U^-1 L^-1 P`, so computing `Z = U^-1 L^-1` (RHS = I, no row permutation) leaves
+/// `A^-1[:, pivots[i]] = Z[:, i]` — a column permutation, applied once, at the end.
+///
+/// The payoff is that `L y = I` makes `y` unit-lower-triangular: `y[i][c] = 0` for `i < c`. So
+/// while reducing row panel `[k0, pe)`, every column `c >= pe` is still identically zero and
+/// contributes nothing — neither to the scalar sweep (`x -= L * 0`) nor to the trailing GEMM.
+/// Restricting the forward pass to columns `[0, pe)` therefore removes work WITHOUT removing any
+/// arithmetic that could change a result: the skipped operations are subtractions of exact zero.
+/// Averaged over the panels that is half the forward substitution.
+///
+/// The back substitution gets no such restriction — `y` is triangular but `x = U^-1 y` is dense —
+/// so this is a ~25% cut to the solve, not a halving of it.
+///
+/// PARITY. The skipped work is exactly `-= L * 0.0`, which is bitwise identity. What is NOT
+/// guaranteed bitwise is the trailing GEMM: `dgemm_sub_into` picks its column blocking from the
+/// column count via `block_cols(n)`, so passing `pe` columns instead of `n` can reassociate the
+/// per-panel sums. That is the same reassociation the blocked solve already documents against the
+/// strict column sweep (~1e-17), and dense inverse outputs are under the tolerance policy rather
+/// than bitwise parity — but it is a real difference and the test asserts a tight bound rather
+/// than claiming bit-exactness it cannot have.
+fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
+    let n = factor.n;
+    let lu = &factor.lu;
+    const NB: usize = 64;
+
+    // Z starts as the PLAIN identity: no row permutation, because the permutation is deferred to
+    // a single column pass at the end.
+    let mut x = vec![0.0f64; n * n];
+    for i in 0..n {
+        x[i * n + i] = 1.0;
+    }
+
+    let mut panel = vec![0.0f64; n * NB];
+    let mut ypanel = vec![0.0f64; NB * n];
+
+    // FORWARD: L y = I, restricted to the columns that can be nonzero.
+    let mut k0 = 0;
+    while k0 < n {
+        let pe = (k0 + NB).min(n);
+        let nb = pe - k0;
+        // Rows [k0, pe) are zero in every column c >= pe, so only columns [0, pe) carry anything.
+        let cols = pe;
+        for i in k0..pe {
+            let xi = i * n;
+            for kk in k0..i {
+                let l_ik = lu[i * n + kk];
+                if l_ik != 0.0 {
+                    let xk = kk * n;
+                    for c in 0..cols {
+                        x[xi + c] -= l_ik * x[xk + c];
+                    }
+                }
+            }
+        }
+        let m = n - pe;
+        if m > 0 {
+            let l21 = &mut panel[..m * nb];
+            for ii in 0..m {
+                let src = (pe + ii) * n + k0;
+                l21[ii * nb..ii * nb + nb].copy_from_slice(&lu[src..src + nb]);
+            }
+            // Pack only the live columns; the panel rows are strided by n in `x`.
+            let yp = &mut ypanel[..nb * cols];
+            for ii in 0..nb {
+                let src = (k0 + ii) * n;
+                yp[ii * cols..ii * cols + cols].copy_from_slice(&x[src..src + cols]);
+            }
+            gemm::dgemm_sub_into(m, nb, cols, l21, yp, &mut x, pe * n, n);
+        }
+        k0 = pe;
+    }
+
+    // BACK: U z = y, over all n columns — `y` is triangular but `z` is dense.
+    let mut peb = n;
+    while peb > 0 {
+        let k0 = peb.saturating_sub(NB);
+        let nb = peb - k0;
+        for i in (k0..peb).rev() {
+            let xi = i * n;
+            for kk in (i + 1)..peb {
+                let u_ik = lu[i * n + kk];
+                if u_ik != 0.0 {
+                    let xk = kk * n;
+                    for c in 0..n {
+                        x[xi + c] -= u_ik * x[xk + c];
+                    }
+                }
+            }
+            let diag = lu[i * n + i];
+            if diag.abs() < f64::EPSILON * 1e3 {
+                for c in 0..n {
+                    x[xi + c] = 0.0;
+                }
+            } else {
+                for c in 0..n {
+                    x[xi + c] /= diag;
+                }
+            }
+        }
+        if k0 > 0 {
+            let m = k0;
+            let u12 = &mut panel[..m * nb];
+            for ii in 0..m {
+                let src = ii * n + k0;
+                u12[ii * nb..ii * nb + nb].copy_from_slice(&lu[src..src + nb]);
+            }
+            let yp = &mut ypanel[..nb * n];
+            yp.copy_from_slice(&x[k0 * n..peb * n]);
+            gemm::dgemm_sub_into(m, nb, n, u12, yp, &mut x, 0, n);
+        }
+        peb = k0;
+    }
+
+    // A^-1[:, pivots[c]] = Z[:, c]. A COLUMN permutation, but done row by row: each row is 8n
+    // bytes and both the source and destination row stay resident while it is scattered, so this
+    // is nothing like the 8 KiB-stride column gather that item 274 removed from `lu_solve`.
+    let mut out = vec![0.0f64; n * n];
+    for i in 0..n {
+        let row = i * n;
+        for c in 0..n {
+            out[row + factor.pivots[c]] = x[row + c];
+        }
+    }
+    out
+}
+
 pub fn inv_tensor_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
@@ -26196,6 +26342,10 @@ pub fn inv_tensor_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
     let factor = lu_factor_contiguous_f64(data, meta)?;
     if (0..n).any(|i| factor.lu[i * n + i].abs() < f64::EPSILON * 1e3) {
         return Err(KernelError::SingularMatrix { size: n });
+    }
+
+    if LU_INV_IDENTITY_STRUCT.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(lu_inverse_from_factor_f64(&factor));
     }
 
     let mut identity = vec![0.0; n * n];
@@ -40174,24 +40324,25 @@ pub fn ormqr_blocked_f64(
     for (nb, vmat, tmat) in ordered {
         let nb = *nb;
         // Tᵀ when applying the reverse product.
-        let tx = if transpose {
+        let tx_owned = if transpose {
             let mut tt = vec![0.0f64; nb * nb];
             for i in 0..nb {
                 for j in 0..nb {
                     tt[i * nb + j] = tmat[j * nb + i];
                 }
             }
-            tt
+            Some(tt)
         } else {
-            tmat.clone()
+            None
         };
+        let tx: &[f64] = tx_owned.as_deref().unwrap_or(tmat.as_slice());
 
         if left {
             // C <- C - V (T (Vᵀ C)),  C is m x cc.
             let mut w1 = vec![0.0f64; nb * cc];
             gemm::dgemm_tb(nb, m, cc, vmat, c, &mut w1); // Vᵀ C
             let mut w2 = vec![0.0f64; nb * cc];
-            gemm::dgemm(nb, nb, cc, &tx, &w1, &mut w2); // T (Vᵀ C)
+            gemm::dgemm(nb, nb, cc, tx, &w1, &mut w2); // T (Vᵀ C)
             let mut upd = vec![0.0f64; m * cc];
             gemm::dgemm(m, nb, cc, vmat, &w2, &mut upd); // V (...)
             for t in 0..m * cc {
@@ -40202,7 +40353,7 @@ pub fn ormqr_blocked_f64(
             let mut w1 = vec![0.0f64; cr * nb];
             gemm::dgemm(cr, m, nb, c, vmat, &mut w1); // C V
             let mut w2 = vec![0.0f64; cr * nb];
-            gemm::dgemm(cr, nb, nb, &w1, &tx, &mut w2); // (C V) T
+            gemm::dgemm(cr, nb, nb, &w1, tx, &mut w2); // (C V) T
             let mut upd = vec![0.0f64; cr * m];
             gemm::dgemm_bt(cr, nb, m, &w2, vmat, &mut upd); // (...) Vᵀ
             for t in 0..cr * m {
@@ -49767,6 +49918,88 @@ mod tests {
                 a.to_bits(),
                 b.to_bits(),
                 "generic f32 dpadded[{index}] differs: panel {a:e} vs direct {b:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn lu_inv_identity_struct_matches_the_dense_identity_route() {
+        // `frankentorch-37sxo`. Two assertions, and the second is the one that matters.
+        //
+        // AGREEMENT with the shipping route is necessary but NOT sufficient: both routes share
+        // `lu_factor`, so a factorisation bug would corrupt them identically and they would agree
+        // beautifully on a wrong answer. So this also checks the RESIDUAL `A A^-1 = I` directly —
+        // the only assertion here that can fail when both routes are wrong together. The lesson is
+        // paid for: `Q R == A` was necessary-but-not-sufficient for the blocked QR and a sign-blind
+        // check hid a spurious reflector for a whole family.
+        //
+        // The permutation is the part most likely to be wrong, and a permutation error is INVISIBLE
+        // on a matrix whose pivot sequence happens to be the identity. So the fixture is built to
+        // pivot HEAVILY: the largest entry of each column sits far from the diagonal, which forces
+        // a long, non-trivial `pivots` and makes the deferred column permutation load-bearing. A
+        // diagonally dominant matrix would pivot not at all and would pass even with the
+        // permutation deleted outright.
+        for n in [8usize, 64, 128, 200, 256] {
+            let data: Vec<f64> = (0..n * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    // Row (j + n/2) % n carries the big entry for column j, so pivoting must move
+                    // rows around rather than leaving them in place.
+                    let heavy = if i == (j + n / 2) % n { 40.0 } else { 0.0 };
+                    heavy + ((i * 37 + j * 11) % 19) as f64 * 0.25 - 2.0
+                })
+                .collect();
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![n, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+
+            let previous = super::set_lu_inv_identity_struct(false);
+            let dense = super::inv_tensor_contiguous_f64(&data, &meta).expect("dense-identity inv");
+            super::set_lu_inv_identity_struct(true);
+            let structured = super::inv_tensor_contiguous_f64(&data, &meta).expect("structured inv");
+            super::set_lu_inv_identity_struct(previous);
+
+            assert_eq!(dense.len(), structured.len(), "length differs at n={n}");
+
+            // The skipped work is `-= L * 0.0`, bitwise identity — but the trailing GEMM takes its
+            // column blocking from the column count, so restricting the forward pass can
+            // reassociate per-panel sums. Assert a tight bound rather than a bit-exactness this
+            // cannot promise, and report how far off it actually landed.
+            let mut worst = 0.0f64;
+            for (a, b) in dense.iter().zip(&structured) {
+                let d = (a - b).abs() / (1.0 + a.abs());
+                if d > worst {
+                    worst = d;
+                }
+            }
+            assert!(
+                worst < 1e-12,
+                "structured inverse disagrees with the dense-identity route at n={n}: worst \
+                 relative difference {worst:e}"
+            );
+
+            // A A^-1 = I, computed from the STRUCTURED result. Catches a wrong pivot permutation,
+            // which agreement alone cannot.
+            let mut residual = 0.0f64;
+            for i in 0..n {
+                for j in 0..n {
+                    let mut acc = 0.0;
+                    for k in 0..n {
+                        acc += data[i * n + k] * structured[k * n + j];
+                    }
+                    let target = if i == j { 1.0 } else { 0.0 };
+                    let err = (acc - target).abs();
+                    if err > residual {
+                        residual = err;
+                    }
+                }
+            }
+            assert!(
+                residual < 1e-8,
+                "structured inverse fails A A^-1 = I at n={n}: worst entry off by {residual:e}"
             );
         }
     }
