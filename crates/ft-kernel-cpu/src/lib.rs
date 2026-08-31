@@ -39926,12 +39926,6 @@ pub fn ormqr_blocked_f64(
 
     for (nb, vmat, tmat) in ordered {
         let nb = *nb;
-        let mut vt = vec![0.0f64; nb * m];
-        for row in 0..m {
-            for col in 0..nb {
-                vt[col * m + row] = vmat[row * nb + col];
-            }
-        }
         // Tᵀ when applying the reverse product.
         let tx = if transpose {
             let mut tt = vec![0.0f64; nb * nb];
@@ -39948,7 +39942,7 @@ pub fn ormqr_blocked_f64(
         if left {
             // C <- C - V (T (Vᵀ C)),  C is m x cc.
             let mut w1 = vec![0.0f64; nb * cc];
-            gemm::dgemm(nb, m, cc, &vt, c, &mut w1); // Vᵀ C
+            gemm::dgemm_tb(nb, m, cc, vmat, c, &mut w1); // Vᵀ C
             let mut w2 = vec![0.0f64; nb * cc];
             gemm::dgemm(nb, nb, cc, &tx, &w1, &mut w2); // T (Vᵀ C)
             let mut upd = vec![0.0f64; m * cc];
@@ -39963,7 +39957,7 @@ pub fn ormqr_blocked_f64(
             let mut w2 = vec![0.0f64; cr * nb];
             gemm::dgemm(cr, nb, nb, &w1, &tx, &mut w2); // (C V) T
             let mut upd = vec![0.0f64; cr * m];
-            gemm::dgemm(cr, nb, m, &w2, &vt, &mut upd); // (...) Vᵀ
+            gemm::dgemm_bt(cr, nb, m, &w2, vmat, &mut upd); // (...) Vᵀ
             for t in 0..cr * m {
                 c[t] -= upd[t];
             }
