@@ -334,7 +334,12 @@ fn run_inv(n: usize, reps: usize) {
 
         // The identity solve exactly as `inv` issues it, so this frame is the real one and not a
         // proxy for it.
+        // Drain BOTH counter families. Draining only the forward/back pair (as this first did)
+        // leaves the permutation counter holding `inv`'s internal solve as well as the standalone
+        // one, double-counting the frame — it printed 47% of the solve at n=1024 and drove the
+        // "solve residue" to -22.6%, which is how the bug announced itself.
         let _ = ft_kernel_cpu::lu_solve_half_take_ns();
+        let _ = ft_kernel_cpu::lu_solve_perm_take_ns();
         let start = Instant::now();
         let x = ft_kernel_cpu::lu_solve_contiguous_f64(&factor, &identity, &meta).expect("lu_solve");
         let t_sol = start.elapsed().as_secs_f64() * 1e3;
@@ -411,32 +416,57 @@ fn run_perm_ab(n: usize, reps: usize) {
         .collect();
     let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
 
-    let once = |on: bool| -> (f64, f64) {
+    // Return the substitution halves alongside the permutation frame. THE DISPLACEMENT TEST: the
+    // column gather first-touches the `x` buffer in a strided pattern, so if the row-wise form
+    // merely DEFERS those cache misses into the forward substitution rather than removing the
+    // work, `fwd + back` will grow by about what `perm` sheds and the lane will not move. That is
+    // a different claim from "the lever does nothing", and only these counters separate them.
+    let once = |on: bool| -> (f64, f64, f64) {
         let previous = ft_kernel_cpu::set_lu_solve_perm_rowwise(on);
         let _ = ft_kernel_cpu::lu_solve_perm_take_ns();
+        let _ = ft_kernel_cpu::lu_solve_half_take_ns();
         let start = Instant::now();
         let a = ft_kernel_cpu::inv_tensor_contiguous_f64(&data, &meta).expect("inv");
         let ms = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&a);
         let perm = ft_kernel_cpu::lu_solve_perm_take_ns() as f64 / 1e6;
+        let (fwd, back) = ft_kernel_cpu::lu_solve_half_take_ns();
         ft_kernel_cpu::set_lu_solve_perm_rowwise(previous);
-        (ms, perm)
+        (ms, perm, (fwd + back) as f64 / 1e6)
     };
 
     let mut off_v = Vec::new();
     let mut on_v = Vec::new();
     let mut off_p = Vec::new();
     let mut on_p = Vec::new();
+    let mut off_h = Vec::new();
+    let mut on_h = Vec::new();
     let mut nulls = Vec::new();
     for rep in 0..reps {
-        let r = [once(false), once(true), once(true), once(false)];
+        // ALTERNATE THE SQUARE. A fixed OFF/ON/ON/OFF puts ON at the two MIDDLE positions every
+        // rep, so any within-rep warming or cooling lands entirely on one arm — and the A/A null,
+        // which compares the two OFF slots at positions 0 and 3, cannot see it because both of its
+        // samples sit outside the middle. That is not hypothetical: the fixed square reported a
+        // paired ratio of 1.0990x at n=1024 while the two marginal medians differed by 1.0127x.
+        // Alternating gives each arm both the outer and the inner slots equally often.
+        let r = if rep % 2 == 0 {
+            let a = [once(false), once(true), once(true), once(false)];
+            [a[0], a[1], a[2], a[3]]
+        } else {
+            let a = [once(true), once(false), once(false), once(true)];
+            [a[1], a[0], a[3], a[2]]
+        };
         if rep == 0 {
             continue;
         }
+        // r[0], r[3] are the OFF samples of this rep and r[1], r[2] the ON ones, whichever slots
+        // they actually occupied.
         off_v.push(r[0].0.min(r[3].0));
         on_v.push(r[1].0.min(r[2].0));
         off_p.push(r[0].1.min(r[3].1));
         on_p.push(r[1].1.min(r[2].1));
+        off_h.push(r[0].2.min(r[3].2));
+        on_h.push(r[1].2.min(r[2].2));
         nulls.push(r[0].0 / r[3].0);
     }
 
@@ -462,6 +492,46 @@ fn run_perm_ab(n: usize, reps: usize) {
         "PERM_AB   inv ON  (row memcpy)    {:8.3} ms   perm frame {:7.3} ms",
         median(&mut on_v.clone()),
         median(&mut on_p.clone())
+    );
+    // A median of per-rep RATIOS and a ratio of the two MARGINAL medians answer different
+    // questions, and at n=1024 they disagreed outright: 1.1230x against 101.192/101.190 = 1.0000.
+    // The paired form is the one that respects the pairing, but a disagreement that large means
+    // one of the two is being driven by the shape of the distribution rather than by the lever, so
+    // print enough to tell which. The SIGN TEST is the robust arbiter — it asks only how often ON
+    // beat OFF within a rep, and cares nothing for magnitudes or outliers.
+    let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
+    let quart = |v: &[f64], q: f64| -> f64 {
+        let mut w = v.to_vec();
+        w.sort_by(f64::total_cmp);
+        w[((w.len() - 1) as f64 * q) as usize]
+    };
+    eprintln!(
+        "PERM_AB   marginal medians {:.3} / {:.3} = {:.4}x   paired-ratio median {lane:.4}x",
+        median(&mut off_v.clone()),
+        median(&mut on_v.clone()),
+        median(&mut off_v.clone()) / median(&mut on_v.clone())
+    );
+    eprintln!(
+        "PERM_AB   OFF p25/p50/p75 {:.3}/{:.3}/{:.3}   ON p25/p50/p75 {:.3}/{:.3}/{:.3}",
+        quart(&off_v, 0.25), quart(&off_v, 0.5), quart(&off_v, 0.75),
+        quart(&on_v, 0.25), quart(&on_v, 0.5), quart(&on_v, 0.75)
+    );
+    eprintln!(
+        "PERM_AB   SIGN TEST: ON faster in {wins}/{} reps",
+        off_v.len()
+    );
+    let off_half = median(&mut off_h.clone());
+    let on_half = median(&mut on_h.clone());
+    let off_perm = median(&mut off_p.clone());
+    let on_perm = median(&mut on_p.clone());
+    eprintln!(
+        "PERM_AB   DISPLACEMENT: perm sheds {:.3} ms, fwd+back changes by {:+.3} ms  ({:.0}% of the shed cost reappears)",
+        off_perm - on_perm,
+        on_half - off_half,
+        100.0 * (on_half - off_half) / (off_perm - on_perm).max(f64::MIN_POSITIVE)
+    );
+    eprintln!(
+        "PERM_AB   fwd+back OFF {off_half:.3} ms   ON {on_half:.3} ms"
     );
     eprintln!(
         "PERM_AB   INV LANE {lane:.4}x   PERM FRAME {perm_ratio:.4}x   A/A null {null:.4} {}",

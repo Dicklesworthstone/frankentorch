@@ -24812,9 +24812,32 @@ static LU_SOLVE_BACK_NS: AtomicU64 = AtomicU64::new(0);
 static LU_SOLVE_PERM_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the f64 solve permutes the RHS by contiguous ROWS instead of strided COLUMN gathers.
-/// `frankentorch-37sxo`. DEFAULT OFF until it has a paired row.
+/// `frankentorch-37sxo`. DEFAULT ON — MEASURED on the `inv` lane, hetzner2 16c rayon=8, 41 reps,
+/// paired OFF/ON/ON/OFF with the square ALTERNATED per rep, per-rep min-of-2, median of per-rep
+/// ratios; the A/A null is the two same-arm samples of one rep:
+///
+///   n     lane (run 1 / run 2)   perm frame     sign test      displacement   null
+///   256   1.0616x / 1.0312x      1.90x / 1.86x  34/40, 32/40   -3% / -5%      1.0139, 1.0018 PASS
+///   512   1.1079x / (1.0918x)    8.25x / 6.77x  31/40, 32/40    0% / +5%      1.0040 PASS, 1.0383 FAIL
+///   1024  1.0932x / 1.1146x      8.67x / 8.54x  28/40, 31/40   +36% / +32%    1.0083, 0.9869 PASS
+///
+/// The n=512 second run is parenthesised because its null failed; it is not counted. Five of six
+/// cells stand, same direction everywhere, and the sign test — which asks only how often ON beat
+/// OFF within a rep and so ignores magnitudes and outliers — is 28-34 of 40 in every cell.
+///
+/// DISPLACEMENT was measured rather than assumed. The column gather first-touches `x` in a strided
+/// pattern, so the row-wise form could merely DEFER those misses into the forward substitution
+/// instead of removing work. Counters on both substitution halves say it does not at n<=512
+/// (-5% to +5% of the shed cost reappears) and does so only partly at n=1024 (32-36%), which is
+/// why the lane gain grows with n but by less than the frame does.
+///
+/// ALTERNATING THE SQUARE was load-bearing. With a FIXED OFF/ON/ON/OFF the ON arm holds the two
+/// middle slots every rep, so within-rep warming lands entirely on one arm while the null — which
+/// compares the two OUTER slots — cannot see it. That harness reported a paired 1.0990x at n=1024
+/// beside marginal medians differing by only 1.0127x. Alternating made the two estimators agree
+/// (1.1004x marginal vs 1.0932x paired).
 static LU_SOLVE_PERM_ROWWISE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Select the row-wise RHS permutation, returning the previous setting.
 #[doc(hidden)]

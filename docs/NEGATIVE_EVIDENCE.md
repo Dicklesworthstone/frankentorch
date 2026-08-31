@@ -40122,3 +40122,76 @@ Pass every setting the row depends on — pool width included — as ARGV, and h
 its own host, nproc, rayon width, mode and loadavg back. A knob that silently reverts to its
 default across a process boundary is the same failure class as
 `feedback_unset_knob_means_forced_off`.
+
+---
+
+## 274. `inv` is NOT mostly LU — 55-62% of it is the identity solve, and a fifth of THAT was a strided pivot permutation. SHIPPED at 1.03-1.11x
+
+`frankentorch-37sxo` (inv 3.99x slower than torch, f64 n=256). The bead's phase note reads "panel
+46%, solve 37%, trailing 12%", which are shares **of the LU**. Measuring what fraction of `inv` is
+LU at all changes the target completely — hetzner2 16c rayon=8, one estimator, one process:
+
+| n | inv | lu_factor | lu_solve (identity RHS) |
+|---|---|---|---|
+| 256  | 4.697 ms   | 37.0% | 53.3% |
+| 512  | 30.302 ms  | 32.8% | 57.5% |
+| 1024 | 106.510 ms | 32.0% | 62.1% |
+
+`inv_tensor_contiguous_f64` is `lu_factor` followed by `lu_solve` against a **dense n x n
+identity**, and that second call is the larger half. So `frankentorch-e1isq`'s panel is ~46% of
+32-37%, i.e. **~16% of `inv`** — and the frame this bead should be looking at is the solve, which
+is neither e1isq's panel nor the getrf trsm whose ~1.3x ceiling item 273 established.
+
+### 274a. The frame that was not in either substitution
+
+Instrumenting the blocked solve's two halves gave forward 36-42% and back 40-48% — summing to only
+**78-87%**. The missing fifth is the pivot permutation, and it was then COUNTED rather than
+inferred (items 266/270: a residual is not a phase). Measured directly it is **10-24% of the
+solve, its share growing with n** — the signature of an access pattern rather than of arithmetic.
+
+The permutation is `x[i] = b[pivots[i]]`, a pure ROW permutation, and `b` is row-major with
+`num_rhs` columns, so those rows are **contiguous**. The incumbent ran it as `num_rhs` independent
+COLUMN gathers: a fresh `vec![0.0; n]` per column, then a strided read and a strided write at
+stride `num_rhs * 8` bytes — 8 KiB per step at n=1024, one cache line per access for all 2n^2 of
+them. The row-wise form copies each row once, contiguously, into a reserved buffer.
+
+BIT-EXACT in the strong sense: pure data movement, no arithmetic, both forms writing exactly
+`x[i*num_rhs + rhs] = b[pivots[i]*num_rhs + rhs]`. Pinned at (n,m) = (64,1) (64,8) (256,64)
+(256,100) (300,128) — crossing the blocked gate in both directions, with a deliberately
+NON-SQUARE RHS because this is an INDEXING claim and a square one would let a transposed index
+keep the right length.
+
+| n | lane (run 1 / run 2) | perm frame | sign test | displacement | A/A null |
+|---|---|---|---|---|---|
+| 256  | 1.0616x / 1.0312x   | 1.90x / 1.86x | 34/40, 32/40 | -3% / -5%   | 1.0139, 1.0018 PASS |
+| 512  | 1.1079x / (1.0918x) | 8.25x / 6.77x | 31/40, 32/40 |  0% / +5%   | 1.0040 PASS, 1.0383 FAIL |
+| 1024 | 1.0932x / 1.1146x   | 8.67x / 8.54x | 28/40, 31/40 | +36% / +32% | 1.0083, 0.9869 PASS |
+
+The parenthesised cell had a failing null and is not counted. SHIPPED ON; suite 752+1 passed, 0
+failed with it as the default.
+
+### 274b. DISPLACEMENT is a distinct hypothesis from "no effect", and only counters separate them
+
+The column gather first-touches `x` in a strided pattern, so the row-wise form might merely DEFER
+those cache misses into the forward substitution rather than remove work — in which case the frame
+would improve 8x and the lane would not move at all. Counters on both substitution halves settle
+it: **-5% to +5% of the shed cost reappears at n<=512, and 32-36% at n=1024**. So the work is
+genuinely removed at the smaller sizes and partly displaced at the largest, which is exactly why
+the lane gain grows with n but by far less than the frame does (8.7x frame -> 1.09x lane).
+
+Always ask where a shed cost went before claiming it was eliminated.
+
+### 274c. ALTERNATE THE SQUARE — a fixed ABBA puts one arm in the middle slots forever
+
+With a fixed OFF/ON/ON/OFF, the ON arm holds the two MIDDLE positions in every rep, so any
+within-rep warming or cooling lands entirely on one arm — **and the A/A null cannot see it**,
+because the null compares the two OFF samples at the OUTER positions. That is not hypothetical:
+the fixed square reported a paired ratio of **1.0990x at n=1024 beside marginal medians differing
+by only 1.0127x**, a disagreement no passing null flagged.
+
+Alternating the square per rep (OFF/ON/ON/OFF, then ON/OFF/OFF/ON) gives each arm the outer and
+inner slots equally often, and the two estimators then agree: 1.1004x marginal against 1.0932x
+paired. **Print both estimators plus a SIGN TEST** — how often ON beat OFF within a rep, which
+ignores magnitudes and outliers entirely — and treat their disagreement as a defect in the
+harness, not as a number to choose between. Compare item 273a, where a different estimator flaw
+inverted a lever's sign outright.
