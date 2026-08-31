@@ -9,6 +9,22 @@ use std::simd::Simd;
 mod masked_conv2d;
 pub mod pool;
 
+/// Probe shim for the shared f32 transpose-GEMM. `frankentorch-06csx`.
+///
+/// `mod gemm` is private, and the microkernel's behaviour at a given SHAPE is the whole question
+/// on that bead, so a probe has to be able to call it at shapes the kernels do not currently pick.
+/// `#[doc(hidden)]`, same as the `set_*` measurement hooks throughout this file.
+#[doc(hidden)]
+pub fn probe_sgemm_tb_add_into(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    gemm::sgemm_tb_add_into(m, k, n, a, b, c);
+}
+
+/// Probe shim for the shared f32 GEMM. `frankentorch-06csx`.
+#[doc(hidden)]
+pub fn probe_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    gemm::sgemm(m, k, n, a, b, c);
+}
+
 pub use masked_conv2d::{
     conv2d_backward_mask_fused_f32, conv2d_backward_mask_fused_f64, masked_frame_take_ns,
     set_masked_dout_tiled,
