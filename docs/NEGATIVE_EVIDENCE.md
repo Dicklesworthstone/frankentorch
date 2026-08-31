@@ -41656,3 +41656,31 @@ instead of rebuilding it. **REOPEN only for a formulation that changes the RATE*
 level-3 recast (recursive or blocked panel, so the inner work becomes a real GEMM against the
 already-factored columns), not another schedule for the same scalar chain. Rescheduling a
 latency-bound loop is what these two arms were, and it is measured at 0.29x and 1.015x.
+
+### 292c. THE PANEL LANE ROW: 1.0155x INSIDE A NULL SPANNING 0.975-1.094 — QUESTION CLOSED
+
+`frankentorch-valnx`. Item 292b projected that a lane row could not resolve the level-2 panel arm
+and proposed not taking it. Taking it was the better doctrine, and the row corroborates the
+projection instead of resting on it. FT_PANELMODE swept as an ARM so both modes interleave in one
+invocation; n=512, 12 rounds, guard PASS, parity MATCH:
+
+    PAIRED (mode 2 vs mode 0)   1.034 / 1.015 / 0.973 / 1.016   median 1.0155x
+    A/A NULL (mode 0 vs mode 0) 1.094 / 0.975 / 0.997           median 0.997x
+
+The lane median lands on the isolation median at nb=128 (1.015x) almost exactly. **The first
+invocation read 1.034x, above the ship threshold** — the third time this campaign a first reading
+cleared the bar and the null erased it (290, 291a). Panel parallelization is closed: parallel-rows
+refuted in isolation (0.29x at nb=128, 0.010x at nb=16), level-2 refuted in the lane.
+
+**NEXT MECHANISM, arithmetic first.** Panel MACs over a factorisation are `(n/nb)·nb³/6 = n·nb²/6`;
+at n=512, nb=128 that predicts 1,398,101 against a measured census of 1,398,016 — an exact model,
+not a fit. The trailing update does ~`n³/3` = 44.7M MACs regardless of nb; only its k changes. At
+the measured rates (panel 0.85 GF/s, trailing ~90 GF/s), halving nb to 64 removes **2.47 ms of a
+5.7 ms lane** — more than either panel formulation could ever have returned, because it attacks the
+`nb²` term rather than the 0.85 GF/s rate. **Break-even is a trailing rate of 25.9 GF/s**: the swap
+pays unless k=64 costs that GEMM a 3.5x degradation from ~90. One unmeasured quantity decides it,
+and the existing phase counters already report both terms, so an nb sweep reads them at once.
+
+The lesson to carry: **when a phase is rate-limited and the rate will not move, change how much
+work reaches it.** Two schedules for the same scalar chain returned 0.29x and 1.015x; the blocking
+constant that decides how many MACs enter that chain was never touched.
