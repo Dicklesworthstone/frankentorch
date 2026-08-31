@@ -71,6 +71,18 @@ fn main() {
     // faster, and the 13.8x does not transfer.
     let ones_mask: Vec<f32> = vec![1.0; BATCH * OUT_CH * H * W];
     let mut fused_ones_mask = f64::INFINITY;
+    // THE ROUTE ARM — `frankentorch-hi9r6`. Item 265 left the dinput half at ~28 ms and the
+    // back-of-envelope says it is neither compute- nor bandwidth-bound: ~3.02 GFLOP in ~28 ms is
+    // ~108 GFLOP/s against an AVX2 f32 ceiling several times that, while ~45 MB of traffic in the
+    // same 28 ms is ~1.6 GB/s against a DRAM ceiling ~30x that. A phase that is at 12% of compute
+    // AND 3% of bandwidth is bound by neither, which points at the SCATTER's access pattern.
+    //
+    // This arm forces the LEGACY panel + col2im route (`conv2d_dinput_panel_legacy`) against the
+    // shipped direct one, dinput only, both inside each rep. The two share the col2im-style
+    // scatter and differ in whether a `flat x patch_width` panel is materialised first. If they
+    // land close, the panel is not the cost and the scatter is — which would say the remaining
+    // dinput lever is the scatter's memory order, not another panel-elimination.
+    let mut legacy_dinput = f64::INFINITY;
 
     let mut adjoint = f64::INFINITY;
     let mut fused_both = f64::INFINITY;
@@ -112,6 +124,16 @@ fn main() {
         let t_dw = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&d);
 
+        let previous_legacy = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
+        let start = Instant::now();
+        let f = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            [true, false, false],
+        );
+        let t_legacy = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&f);
+        ft_kernel_cpu::set_conv2d_dinput_panel_legacy(previous_legacy);
+
         let start = Instant::now();
         let e = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
             &ones, &ones_mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
@@ -127,6 +149,7 @@ fn main() {
             fused_dinput = fused_dinput.min(t_din);
             fused_dweight = fused_dweight.min(t_dw);
             fused_ones_mask = fused_ones_mask.min(t_ones_mask);
+            legacy_dinput = legacy_dinput.min(t_legacy);
         }
     }
 
@@ -135,6 +158,13 @@ fn main() {
     eprintln!("F32_DINPUT fused mask, dinput ONLY           {fused_dinput:8.3} ms");
     eprintln!("F32_DINPUT fused mask, dweight ONLY          {fused_dweight:8.3} ms");
     eprintln!("F32_DINPUT fused mask, ALL-ONES mask (separator) {fused_ones_mask:8.3} ms");
+    eprintln!("F32_DINPUT dinput ONLY, LEGACY panel+col2im route  {legacy_dinput:8.3} ms");
+    eprintln!(
+        "F32_DINPUT ROUTE: legacy / direct = {:.3}x. ~1.0 means materialising the panel is NOT \
+         the dinput cost and the SCATTER is, so the remaining lever is memory order rather than \
+         another panel elimination.",
+        legacy_dinput / fused_dinput
+    );
     eprintln!(
         "F32_DINPUT kernel-level gap (fused both - adjoint) {:8.3} ms; dinput is {:.0}% of the \
          fused entry",
