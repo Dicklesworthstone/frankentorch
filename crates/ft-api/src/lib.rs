@@ -57561,35 +57561,30 @@ impl FrankenTorchSession {
                 })?;
             }
             DType::F32 => {
-                // f32 has no in-place `_with` accessor, so keep clone -> map -> writeback,
-                // but parallelize the (compute-heavy) map. Bit-identical: par collect
-                // preserves index order.
-                //
-                // BRANCH SENTINEL, `frankentorch-f32-inplace-accessor-gap-5fxq2`. A probe measured
-                // f32 `exp_` at 10.6x the f64 twin on HALF the bytes, and 19.98 ms for 4M is
-                // serial-exp time while the f64 arm's 1.85 ms is parallel. Three passes and a
-                // dtype round trip cannot cost 10x, so which branch actually runs is a question
-                // to answer with a counter rather than by re-reading this block.
                 // ONE in-place pass, matching the F64 arm above. The old shape was
                 // `values_f32()` clone -> `par_iter().map().collect()` -> writeback, kept only
                 // because no f32 `_with` accessor existed; an in-call decomposition of `exp_` at
-                // 4,194,304 elements put **69.2% of the arm in the clone** (10.653 ms of 15.402),
-                // 20.2% in the map and 10.6% in the writeback, because the clone is a fresh 16 MB
-                // allocation paying serial first-touch page faults. That is the
-                // `project_expand_uninit_firsttouch` shape, and the fix is to not allocate at all
-                // rather than to allocate faster.
+                // 4,194,304 elements put 69.2% of the arm in the clone alone (10.653 ms of
+                // 15.402), because a fresh 16 MB allocation pays serial first-touch page faults.
+                // Ledger 289.
                 //
-                // BIT-IDENTICAL to the old shape: `*v = transform(*v as f64) as f32` is the same
-                // expression per element that the map computed, and each output depends only on
-                // its own input, so dropping the intermediate buffer cannot change a bit. The f64
-                // round trip is DELIBERATELY PRESERVED here — computing natively in f32 would
-                // change results (`add_`/`mul_` double-round the other way), and this commit is a
-                // pass-count lever, not a numerics change.
+                // BIT-IDENTICAL to that old shape: the same expression per element, and each
+                // output depends only on its own input, so dropping the intermediate buffer
+                // cannot change a bit.
+                //
+                // ⛔ THE f64 ROUND TRIP HERE IS NOT THE RESIDUAL — MEASURED AND REVERTED, ledger
+                // 289c. The obvious next lever is to compute natively in f32 for the ops where
+                // that is bit-identical (neg/abs/relu/floor/ceil/round/trunc), on the theory that
+                // widening every element blocks f32 SIMD. It was built, proven bit-exact, and it
+                // DID NOT MOVE OUR ARM: 0.620/0.644/0.638 ms before, 0.691/0.730/0.697 after, on
+                // `inplace_neg_f32`. The lane ratio "improved" 2.18x -> 1.56x only because the
+                // INCUMBENT slowed (0.295 -> 0.467 ms) — a denominator, not a lever. Do not
+                // rebuild it without a mechanism that predicts a change in the FT ABSOLUTE.
                 let mut par = false;
                 self.tensor_tape
                     .update_tensor_values_f32_with(target, |vals| {
-                        if vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-                            par = true;
+                        par = vals.len() >= PARALLEL_ELEMENTWISE_MIN;
+                        if par {
                             vals.par_iter_mut()
                                 .for_each(|v| *v = transform(f64::from(*v)) as f32);
                         } else {
