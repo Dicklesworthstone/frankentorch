@@ -59,23 +59,40 @@ fn main() {
     }
     let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
 
+    // The fine-grained panel census is OPT-IN because it costs two `Instant` pairs per COLUMN.
+    // Its own overhead therefore lands INSIDE the panel total it reports, so it is quantified
+    // below by measuring the same phase with the census off rather than hoped to be negligible.
+    ft_kernel_cpu::set_cholesky_panel_census_enabled(false);
     for _ in 0..2 {
         let _ = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("warmup");
     }
+    let mut panel_uninstrumented = f64::INFINITY;
+    for _ in 0..reps {
+        let _ = ft_kernel_cpu::cholesky_stage_take_ns();
+        let f = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("cholesky");
+        std::hint::black_box(&f);
+        let (panel, _, _, _) = ft_kernel_cpu::cholesky_stage_take_ns();
+        panel_uninstrumented = panel_uninstrumented.min(panel as f64 / 1e6);
+    }
+    ft_kernel_cpu::set_cholesky_panel_census_enabled(true);
 
     let mut best = (f64::INFINITY, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut panel_census = (0u64, 0u64, 0u64, 0u64);
     for _ in 0..reps {
         // Drain BOTH counter families so this rep's numbers cannot inherit the last rep's.
         let _ = ft_kernel_cpu::cholesky_stage_take_ns();
         let _ = ft_kernel_cpu::dgemm_sub_arm_hits_take();
+        let _ = ft_kernel_cpu::cholesky_panel_census_take();
         let started = std::time::Instant::now();
         let factor = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("cholesky");
         let wall = started.elapsed().as_secs_f64() * 1_000.0;
         std::hint::black_box(&factor);
         let (panel, trsm, trailing, zero) = ft_kernel_cpu::cholesky_stage_take_ns();
         let (tiled, col) = ft_kernel_cpu::dgemm_sub_arm_hits_take();
+        let census = ft_kernel_cpu::cholesky_panel_census_take();
         if wall < best.0 {
             best = (wall, panel, trsm, trailing, zero, tiled, col);
+            panel_census = census;
         }
     }
 
@@ -105,6 +122,51 @@ fn main() {
         "dgemm_sub_into CENSUS for this op: (tiled_2d, column_split) = ({tiled}, {col}) — \
          with the 2-D arm DEFAULT OFF, so `tiled` is expected to read 0 and `col` is the \
          trailing update's call count."
+    );
+    // ---- inside the panel -------------------------------------------------------------------
+    let (diag_ns, rows_ns, cols, macs) = panel_census;
+    let panel_ms = ms(panel);
+    let inner = ms(diag_ns) + ms(rows_ns);
+    println!("\nINSIDE THE PANEL (census ON; its own cost is quantified below)");
+    println!("  {:<26} {:>9} {:>8}", "sub-phase", "ms", "% panel");
+    println!(
+        "  {:<26} {:>9.4} {:>7.1}%",
+        "diagonal dot + sqrt",
+        ms(diag_ns),
+        100.0 * ms(diag_ns) / panel_ms
+    );
+    println!(
+        "  {:<26} {:>9.4} {:>7.1}%",
+        "sub-diagonal row dots",
+        ms(rows_ns),
+        100.0 * ms(rows_ns) / panel_ms
+    );
+    println!(
+        "  {:<26} {:>9.4} {:>7.1}%   <- residual, NOT a measured sub-phase",
+        "loop/index residual",
+        panel_ms - inner,
+        100.0 * (panel_ms - inner) / panel_ms
+    );
+    println!("  {:<26} {:>9.4} {:>7.1}%", "PANEL total", panel_ms, 100.0);
+    println!(
+        "  closure: sub-phases {inner:.4} of {panel_ms:.4} ms = {:.1}%",
+        100.0 * inner / panel_ms
+    );
+    println!(
+        "\n  columns {cols}, multiply-accumulates {macs}  ->  the panel achieves {:.2} GFLOP/s",
+        2.0 * macs as f64 / (panel_ms / 1000.0) / 1e9
+    );
+    println!(
+        "  the TRAILING update does ~n^3/3 = {:.3e} MACs in {:.4} ms  ->  {:.2} GFLOP/s",
+        f64::from(n as u32).powi(3) / 3.0,
+        ms(trailing),
+        2.0 * f64::from(n as u32).powi(3) / 3.0 / (ms(trailing) / 1000.0) / 1e9
+    );
+    println!(
+        "\nINSTRUMENT COST: the panel reads {panel_ms:.4} ms with the census ON and \
+         {panel_uninstrumented:.4} ms with it OFF ({:+.1}%). The sub-phase shares are shares of \
+         the INSTRUMENTED panel.",
+        100.0 * (panel_ms - panel_uninstrumented) / panel_uninstrumented
     );
     println!(
         "\nREADING: this names the next lever's TARGET, it does not propose one. Compare the \

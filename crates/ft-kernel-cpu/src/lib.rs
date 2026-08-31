@@ -27475,6 +27475,42 @@ static CHOLESKY_TRSM_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_TRAILING_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_ZERO_NS: AtomicU64 = AtomicU64::new(0);
 
+/// OPT-IN fine-grained census of what the Cholesky PANEL phase spends its time on.
+/// `frankentorch-valnx`.
+///
+/// The panel is 53-58% of an n=512 factorisation (ledger 292) while carrying only a few percent
+/// of its FLOPs, so the question is what the time is made of. These counters split it into the
+/// per-column DIAGONAL work (one dot, a sqrt, a store) and the per-column ROW work (one dot and a
+/// divide for each row below the diagonal), and count the multiply-accumulates so an achieved
+/// rate can be computed rather than guessed.
+///
+/// DEFAULT OFF and gated, unlike the four coarse phase counters: those cost one `Instant` pair per
+/// PANEL (four per factorisation), whereas these cost two per COLUMN — 256 per panel — which is
+/// not a price production should pay for an instrument. The probe turns them on.
+static CHOLESKY_PANEL_CENSUS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CHOLESKY_PANEL_DIAG_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_PANEL_ROWS_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_PANEL_COLS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_PANEL_MACS: AtomicU64 = AtomicU64::new(0);
+
+/// Enable the fine-grained panel census, returning the previous setting.
+#[doc(hidden)]
+pub fn set_cholesky_panel_census_enabled(on: bool) -> bool {
+    CHOLESKY_PANEL_CENSUS_ENABLED.swap(on, LuOrdering::Relaxed)
+}
+
+/// Drain the panel census: `(diagonal_ns, rows_ns, columns, multiply_accumulates)`.
+#[doc(hidden)]
+pub fn cholesky_panel_census_take() -> (u64, u64, u64, u64) {
+    (
+        CHOLESKY_PANEL_DIAG_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_PANEL_ROWS_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_PANEL_COLS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_PANEL_MACS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 /// Read and reset live blocked-Cholesky phase counters:
 /// `(panel_ns, trsm_ns, trailing_update_ns, upper_zero_ns)`.
 #[doc(hidden)]
@@ -27570,8 +27606,10 @@ pub fn cholesky_contiguous_f64(
 
         // 1. Factor the diagonal block l[jb:je, jb:je] (lower) in place.
         let panel_started = std::time::Instant::now();
+        let census = CHOLESKY_PANEL_CENSUS_ENABLED.load(LuOrdering::Relaxed);
         for jj in jb..je {
             let diagonal = jj * n;
+            let diag_started = census.then(std::time::Instant::now);
             let s = cholesky_panel_dot_sub_f64(
                 l[diagonal + jj],
                 &l[diagonal + jb..diagonal + jj],
@@ -27582,6 +27620,11 @@ pub fn cholesky_contiguous_f64(
             }
             let d = s.sqrt();
             l[jj * n + jj] = d;
+            if let Some(started) = diag_started {
+                CHOLESKY_PANEL_DIAG_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let rows_started = census.then(std::time::Instant::now);
             for ii in (jj + 1)..je {
                 let row = ii * n;
                 let t = cholesky_panel_dot_sub_f64(
@@ -27590,6 +27633,16 @@ pub fn cholesky_contiguous_f64(
                     &l[diagonal + jb..diagonal + jj],
                 );
                 l[ii * n + jj] = t / d;
+            }
+            if let Some(started) = rows_started {
+                CHOLESKY_PANEL_ROWS_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                CHOLESKY_PANEL_COLS.fetch_add(1, LuOrdering::Relaxed);
+                // Multiply-accumulates: the diagonal dot is (jj-jb) long, and each of the
+                // (je-jj-1) rows below it does another dot of the same length.
+                let len = (jj - jb) as u64;
+                let rows = (je - jj - 1) as u64;
+                CHOLESKY_PANEL_MACS.fetch_add(len * (rows + 1), LuOrdering::Relaxed);
             }
         }
 
