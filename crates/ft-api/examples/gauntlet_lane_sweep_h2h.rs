@@ -1041,7 +1041,7 @@ fn timed_conv2d(
     let forward_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-    CONV2D_SESSION_SPLIT_MS.with(|cell| cell.set((forward_ms, elapsed - forward_ms)));
+    CONV2D_SESSION_SPLIT_MS.with(|cell| cell.borrow_mut().push((forward_ms, elapsed - forward_ms)));
     let checksum = report
         .gradient(x)
         .expect("grad")
@@ -1190,7 +1190,13 @@ fn conv2d_frame_diagnostics(name: &str, ft_ms: f64) {
         );
     }
     if name == "conv2d_masked_train" {
-        let (fwd, bwd) = CONV2D_SESSION_SPLIT_MS.with(std::cell::Cell::get);
+        let (fwd, bwd) = CONV2D_SESSION_SPLIT_MS.with(|cell| {
+            let samples = cell.borrow();
+            (
+                median(samples.iter().map(|s| s.0).collect()),
+                median(samples.iter().map(|s| s.1).collect()),
+            )
+        });
         if fwd > 0.0 || bwd > 0.0 {
             println!(
                 "    session split: forward (pad + conv + fused mask + sum) {fwd:.3} ms | \
@@ -1201,7 +1207,14 @@ fn conv2d_frame_diagnostics(name: &str, ft_ms: f64) {
         }
     }
     if name == "conv2d_masked_train_kernels" {
-        let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(std::cell::Cell::get);
+        let (pad, fwd, bwd) = CONV2D_KERNELS_SPLIT_MS.with(|cell| {
+            let samples = cell.borrow();
+            (
+                median(samples.iter().map(|s| s.0).collect()),
+                median(samples.iter().map(|s| s.1).collect()),
+                median(samples.iter().map(|s| s.2).collect()),
+            )
+        });
         if fwd > 0.0 || bwd > 0.0 {
             println!(
                 "    frames: pad {pad:.3} ms | forward {fwd:.3} ms | backward {bwd:.3} ms \
@@ -1218,8 +1231,13 @@ thread_local! {
     /// forward being everything up to and including `tensor_sum` and backward being
     /// `tensor_backward` alone. Paired with the kernels-only lane's frames this separates the
     /// ~2 ms of session/tape that is now `conv2d_masked_train`'s largest unattributed frame.
-    static CONV2D_SESSION_SPLIT_MS: std::cell::Cell<(f64, f64)> =
-        const { std::cell::Cell::new((0.0, 0.0)) };
+    /// EVERY sample, not the last one. The lane's own figure is a MEDIAN over rounds, so a
+    /// frame reported from a single sample is on a different estimator and cannot be compared
+    /// with it — measured: on a worker whose load tripled mid-run the last-sample frames summed
+    /// to 156% of the lane's median. `feedback_estimator_and_provenance` is the standing rule;
+    /// this is it recurring inside a diagnostic rather than inside a claim.
+    static CONV2D_SESSION_SPLIT_MS: std::cell::RefCell<Vec<(f64, f64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1233,8 +1251,8 @@ thread_local! {
 thread_local! {
     /// `(pad_ms, forward_ms, backward_ms)` from the last `timed_conv2d_masked_train_kernels`
     /// call. See that function.
-    static CONV2D_KERNELS_SPLIT_MS: std::cell::Cell<(f64, f64, f64)> =
-        const { std::cell::Cell::new((0.0, 0.0, 0.0)) };
+    static CONV2D_KERNELS_SPLIT_MS: std::cell::RefCell<Vec<(f64, f64, f64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// f64 conv2d TRAINING step with NO session and NO tape — the kernels-only twin of
@@ -1302,7 +1320,7 @@ fn timed_conv2d_masked_train_kernels(
         mask, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO, false,
     );
     let bwd_ms = bwd_started.elapsed().as_secs_f64() * 1_000.0;
-    CONV2D_KERNELS_SPLIT_MS.with(|cell| cell.set((pad_ms, fwd_ms, bwd_ms)));
+    CONV2D_KERNELS_SPLIT_MS.with(|cell| cell.borrow_mut().push((pad_ms, fwd_ms, bwd_ms)));
 
     let mut checksum = 0.0f64;
     for bc in 0..batch * C2_CI {
