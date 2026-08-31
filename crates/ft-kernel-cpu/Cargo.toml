@@ -23,6 +23,7 @@ wide = "1.5"
 [dev-dependencies]
 insta = "1.48.0"
 proptest = "1.11.0"
+rusty-fork = "0.3.1"
 criterion = { workspace = true }
 
 [[bench]]
