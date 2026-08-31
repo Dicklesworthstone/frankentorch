@@ -41617,3 +41617,42 @@ No lever proposed. Two shapes are visible from here (parallelising independent r
 the per-column BLAS-1 with a BLAS-2/blocked panel), and both need their own measurement: the rows
 are independent but short, and item 255 priced a rayon fork on this host at ~7 us against a panel
 whose ENTIRE cost is 3.4 ms across 512 columns.
+
+### 292b. BOTH PANEL FORMULATIONS REFUTED IN ISOLATION — THE PANEL IS CHAIN-LIMITED, NOT SCHEDULE-LIMITED
+
+`frankentorch-valnx`, closing the arc from 292/292a. The panel is 53-58% of an n=512 Cholesky and
+96.5% of it is per-column sub-diagonal row dots at 0.81 GFLOP/s. The rows are independent, so
+fanning them out is the obvious lever — and the obvious lever was the one to distrust.
+
+**The hazard was arithmetic before it was measured**, and registered in the probe's source: a panel
+column carries ~2,730 MACs and ~6.7 us, while item 255 priced a rayon fork on this host at ~7 us.
+**The fork costs what the column costs.** Isolation at REAL panel shapes (nb-wide columns whose row
+count shrinks from nb-1 to 0), n=512, min of 31, three runs, bitwise identical throughout:
+
+    nb      arm 1 parallel-rows        arm 2 level-2 (4 rows/pass)
+    16      0.011 / 0.010 / 0.010      1.053 / 1.199 / 1.234
+    32      0.036 / 0.028 / 0.023      1.326 / 0.985 / 0.940
+    64      0.089 / 0.082 / 0.086      0.794 / 0.976 / 1.014
+    96      0.207 / 0.162 / 0.176      1.115 / 0.945 / 1.023
+    128     0.318 / 0.261 / 0.280      1.047 / 1.014 / 1.015
+
+**Arm 1 is a 3.5x loss at the shipped nb=128 and a 100x loss at nb=16**, worsening as nb shrinks
+exactly as predicted. **Arm 2 is flat** — 1.015x median at nb=128 — and its one promising cell
+(nb=32, 1.326x) does not replicate, which is why a single sweep is never a result.
+
+**THE RATE IS THE FINDING. Every arm sits at 0.5-0.9 GFLOP/s against the trailing update's ~90.**
+Neither dispatch nor diagonal-row traffic is the constraint: the panel is limited by the dependent
+FMA chain itself. That was the third possibility registered before the run, and it is the one that
+says neither formulation is the lever — a result, not a failure.
+
+NO LANE ROW TAKEN, and the arithmetic is why. Arm 2's 1.015x on a phase that is 53-58% of the lane
+projects to ~1.008x, against A/A nulls measured on these harnesses at 1.014x (slogdet) and 1.052x
+(inv). **A measurement that cannot resolve its own effect is not worth the window** — taking it
+would produce a null indistinguishable from the null it was compared against, and the honest
+sequence is to say so rather than to bank an unreadable row.
+
+Both arms kept at mode 0, inert and bit-exact under test, so the next reader finds this measurement
+instead of rebuilding it. **REOPEN only for a formulation that changes the RATE** — a genuine
+level-3 recast (recursive or blocked panel, so the inner work becomes a real GEMM against the
+already-factored columns), not another schedule for the same scalar chain. Rescheduling a
+latency-bound loop is what these two arms were, and it is measured at 0.29x and 1.015x.
