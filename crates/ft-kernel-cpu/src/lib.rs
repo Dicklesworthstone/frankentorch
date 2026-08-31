@@ -9284,9 +9284,21 @@ fn conv2d_backward_dinput_blocked_rows_f32(
                             // dinput route on a quiet host — so this scatter is 84-87% of the frame that carries
                             // the 2.34x. It is 160 * 1024 * 288 = 47.2M read-modify-writes at the scored shape.
                             //
-                            // CHEAP AND REFUTABLE, which is why it is first: if the scatter is bound by memory
-                            // latency on scattered RMW rather than by per-element overhead, this changes nothing
-                            // and the next candidate is the gather inversion (write each output once) instead.
+                            // MEASURED: THIS IS A NULL, AND THAT IS THE USEFUL RESULT. It was chosen as the
+                            // cheapest refutable candidate with the outcome pre-specified — "if the scatter is
+                            // bound by memory latency on scattered RMW rather than by per-element overhead,
+                            // this changes nothing". It changes nothing. hetzner2, quiet (loadavg 2.8-3.9),
+                            // direct dinput reads 26.633 / 27.422 ms after against 26.700 / 31.073 ms before.
+                            //
+                            // So the 47.2M read-modify-writes are LATENCY-bound on scattered accumulation, not
+                            // overhead-bound per element, and no amount of tightening this loop will move it.
+                            // The form is kept because it is bit-exact and no worse, and because this comment
+                            // is where the next person will look; do NOT re-try indexing tweaks here.
+                            //
+                            // THE ONLY CANDIDATE LEFT ON THIS FRAME is the gather inversion: compute each
+                            // `dpadded` element from the contributions that reach it, so every output is
+                            // WRITTEN ONCE with no accumulation conflict. That is a real kernel, not a tweak,
+                            // and this null is what promotes it from "the expensive option" to "the only one".
                             let (dst, src) = (&mut dpb[irow..irow + kw], &block[prow_off..prow_off + kw]);
                             for (d, s) in dst.iter_mut().zip(src) {
                                 *d += *s;

@@ -39799,3 +39799,47 @@ The backward at 26.7-31.1 ms is ~97 GFLOP/s against an AVX2 f32 ceiling several 
 headroom is real and it is in making the GENERAL path faster — but the three cheapest stories for
 why it is slow have now been measured and killed, so the next candidate needs an arm that isolates
 a phase INSIDE `conv2d_backward_dinput_direct_f32`, not another whole-kernel comparison.
+
+## 268. THE f32 SCATTER IS LATENCY-BOUND, NOT OVERHEAD-BOUND — THE CHEAP CANDIDATE IS A MEASURED NULL, AND THAT PROMOTES THE GATHER INVERSION TO THE ONLY REMAINING ONE
+
+`frankentorch-hi9r6`. Lever in `7df19048`; this is its price.
+
+### 268a. THE FRAME, ISOLATED
+
+Item 267 put the whole f32 deficit in the backward and asked for a phase INSIDE it.
+`conv2d_backward_dinput_blocked_rows_f32` has two: a per-row-block `sgemm`, and a scalar
+accumulate nested over `in_ch x kh x kw`. `gemm` is crate-private so the GEMM cannot be timed from
+an example, but `conv2d_col2im_f32` is public and is structurally the same scatter over the same
+total work, which bounds the frame without instrumenting shipped code:
+
+    col2im alone / direct dinput route
+      0.843x, 0.867x, 0.871x, 0.954x    quiet hosts (vmi1227854 10c, hetzner2 16c)
+      0.596x                            hz4 16c, loadavg 11.2 -> 18.0, discounted
+
+**The scatter is 84-95% of the entire direct dinput route** — 47.2M read-modify-writes at the
+scored shape. This does NOT contradict item 266: there the refuted claim was that the PANEL was
+irrelevant (legacy/direct is 1.79-2.71x, so it is not). What dominates the remainder is a separate
+question and this answers it.
+
+### 268b. THE CHEAP CANDIDATE, AND ITS PRE-SPECIFIED NULL
+
+The inner `kc` loop became a slice-wise accumulate over two disjoint slices of different buffers —
+bit-exact, identical order, only the indexing changes, but the indexed form re-derived
+non-aliasing and re-checked bounds on 47.2M elements. Chosen as the cheapest refutable candidate,
+with the outcome written down first: *"if the scatter is bound by memory latency on scattered RMW
+rather than by per-element overhead, this changes nothing."*
+
+    direct dinput, hetzner2 quiet:  26.700 / 31.073 ms BEFORE  ->  26.633 / 27.422 ms AFTER
+
+**It changes nothing.** The form is kept — bit-exact and no worse, and the comment at the site is
+where the next person will look — but it is a NULL and must not be read as a win.
+
+### 268c. WHAT THE NULL BUYS, WHICH IS THE POINT
+
+A null with a pre-specified meaning is not a wasted commit. This one says the 47.2M accumulations
+are **latency-bound on scattered read-modify-write**, not overhead-bound per element, so no
+tightening of that loop will move it — and it promotes the **gather inversion** (compute each
+`dpadded` element from the contributions reaching it, so every output is written exactly once with
+no accumulation conflict) from "the expensive candidate" to **the only remaining one** on this
+frame. That is worth knowing before someone spends a day on it, which is the entire case for
+pre-specifying what a cheap experiment would mean in both directions.
