@@ -26174,9 +26174,25 @@ pub fn lu_solve_mixed_refine_contiguous_f64(
 ///
 /// Uses LU factorization with partial pivoting and solves against the identity.
 /// Whether `inv` uses the identity-structure inverse instead of a dense-identity `lu_solve`.
-/// `frankentorch-37sxo`. DEFAULT OFF until it has a paired row.
+/// `frankentorch-37sxo`. DEFAULT ON — MEASURED. Paired, alternating square, per-rep min-of-2,
+/// median of per-rep ratios; A/A null from the two same-arm samples of one rep. The OFF arm
+/// already carries the row-wise permutation of item 274, so this is the INCREMENT on top of it.
+///
+///   host      n     reps  lane      marginal  sign test  A/A null
+///   hetzner2  256   41    1.1445x   1.2041x   37/40      0.9962 PASS
+///   hz4       256   41    1.1085x   1.1063x   39/40      1.0049 PASS
+///   hetzner2  512   41    1.1171x   1.1281x   31/40      0.9955 PASS
+///   hz4       512   41    1.0757x   1.0575x   36/40      0.9957 PASS
+///   hz4       1024  61    1.0699x   1.1134x   56/60      1.0018 PASS
+///
+/// n=1024 needed three attempts and that is worth recording rather than hiding: the first run's
+/// null FAILED (0.9082) and the second returned a sign test of exactly 20/40 — the coin-flip null
+/// — with its two estimators disagreeing (1.0352x marginal against 1.1309x paired). Neither cell
+/// was reportable. At 61 reps the same cell reads 56/60 with both estimators agreeing, so the
+/// earlier pair were noisy rather than negative. A cell whose estimators disagree is a cell to
+/// re-run, not a number to choose from.
 static LU_INV_IDENTITY_STRUCT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Select the identity-structure inverse, returning the previous setting.
 #[doc(hidden)]

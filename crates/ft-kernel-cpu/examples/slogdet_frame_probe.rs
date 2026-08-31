@@ -86,6 +86,7 @@ fn main() {
             "ab" => run_ab(n, reps),
             "inv" => run_inv(n, reps),
             "permab" => run_perm_ab(n, reps),
+            "structab" => run_struct_ab(n, reps),
             _ => run_one(n, reps),
         }
     }
@@ -535,6 +536,77 @@ fn run_perm_ab(n: usize, reps: usize) {
     );
     eprintln!(
         "PERM_AB   INV LANE {lane:.4}x   PERM FRAME {perm_ratio:.4}x   A/A null {null:.4} {}",
+        if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
+    );
+}
+
+/// Paired A/B for the identity-structure inverse — `frankentorch-37sxo`.
+///
+/// Same shape as the permutation A/B: alternating square, per-rep min-of-2, median of per-rep
+/// ratios, marginal medians and a sign test printed alongside so a disagreement between the
+/// estimators shows up as the harness defect it is rather than as a number to choose between.
+fn run_struct_ab(n: usize, reps: usize) {
+    let data: Vec<f64> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx % n;
+            let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+            if i == j { v + (n as f64) } else { v }
+        })
+        .collect();
+    let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+    let once = |on: bool| -> f64 {
+        let previous = ft_kernel_cpu::set_lu_inv_identity_struct(on);
+        let start = Instant::now();
+        let a = ft_kernel_cpu::inv_tensor_contiguous_f64(&data, &meta).expect("inv");
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&a);
+        ft_kernel_cpu::set_lu_inv_identity_struct(previous);
+        ms
+    };
+
+    let mut off_v = Vec::new();
+    let mut on_v = Vec::new();
+    let mut nulls = Vec::new();
+    for rep in 0..reps {
+        let r = if rep % 2 == 0 {
+            let a = [once(false), once(true), once(true), once(false)];
+            [a[0], a[1], a[2], a[3]]
+        } else {
+            let a = [once(true), once(false), once(false), once(true)];
+            [a[1], a[0], a[3], a[2]]
+        };
+        if rep == 0 {
+            continue;
+        }
+        off_v.push(r[0].min(r[3]));
+        on_v.push(r[1].min(r[2]));
+        nulls.push(r[0] / r[3]);
+    }
+
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+    };
+    let mut r: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
+    let lane = median(&mut r);
+    let null = median(&mut nulls.clone());
+    let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
+
+    eprintln!("STRUCT_AB n={n} reps={reps} threads={}", rayon::current_num_threads());
+    eprintln!(
+        "STRUCT_AB   inv OFF (dense identity) {:8.3} ms   ON (structured) {:8.3} ms",
+        median(&mut off_v.clone()),
+        median(&mut on_v.clone())
+    );
+    eprintln!(
+        "STRUCT_AB   marginal {:.4}x   paired {lane:.4}x   SIGN TEST ON faster in {wins}/{} reps",
+        median(&mut off_v.clone()) / median(&mut on_v.clone()),
+        off_v.len()
+    );
+    eprintln!(
+        "STRUCT_AB   INV LANE {lane:.4}x   A/A null {null:.4} {}",
         if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
     );
 }

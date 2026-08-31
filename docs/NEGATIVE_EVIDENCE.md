@@ -40195,3 +40195,67 @@ paired. **Print both estimators plus a SIGN TEST** — how often ON beat OFF wit
 ignores magnitudes and outliers entirely — and treat their disagreement as a defect in the
 harness, not as a number to choose between. Compare item 273a, where a different estimator flaw
 inverted a lever's sign outright.
+
+---
+
+## 275. The identity RHS is a permutation matrix, and half the forward substitution was subtracting exact zeros — SHIPPED at 1.07-1.14x on top of item 274
+
+`frankentorch-37sxo`. Item 274 established that `inv` is 53-62% a `lu_solve` against a **dense**
+n x n identity. `lu_solve` cannot know what is in that RHS, so it does the full `~2n^3`. But the
+RHS is a permutation matrix.
+
+`lu_solve` permutes ROWS first, producing `P·I`. Take the RHS to be the plain identity instead and
+permute COLUMNS at the end: with `P A = L U`, `A^-1 = U^-1 L^-1 P`, so computing `Z = U^-1 L^-1`
+leaves `A^-1[:, pivots[i]] = Z[:, i]`. The payoff is that `L y = I` makes `y`
+unit-lower-triangular — `y[i][c] = 0` for `i < c` — so while reducing row panel `[k0, pe)`, every
+column `c >= pe` is still identically zero and contributes to neither the scalar sweep nor the
+trailing GEMM. Restricting the forward pass to columns `[0, pe)` removes work **without removing
+any arithmetic that could change a result**: the skipped operations subtract exact zero. Averaged
+over the panels that is half the forward substitution, i.e. ~25% of the solve. The back
+substitution gets no restriction, since `y` is triangular but `Z` is dense.
+
+The deferred column permutation is applied row by row — each row is 8n bytes, and source and
+destination rows both stay resident while it is scattered — so it is nothing like the 8 KiB-stride
+column gather item 274 removed.
+
+| host | n | reps | lane | marginal | sign test | A/A null |
+|---|---|---|---|---|---|---|
+| hetzner2 | 256  | 41 | 1.1445x | 1.2041x | 37/40 | 0.9962 PASS |
+| hz4      | 256  | 41 | 1.1085x | 1.1063x | 39/40 | 1.0049 PASS |
+| hetzner2 | 512  | 41 | 1.1171x | 1.1281x | 31/40 | 0.9955 PASS |
+| hz4      | 512  | 41 | 1.0757x | 1.0575x | 36/40 | 0.9957 PASS |
+| hz4      | 1024 | 61 | 1.0699x | 1.1134x | 56/60 | 1.0018 PASS |
+
+The OFF arm already carries item 274's row-wise permutation, so this is the INCREMENT on top of it.
+SHIPPED ON; suite 753+1 passed, 0 failed.
+
+### 275a. PARITY, stated precisely rather than claimed loosely
+
+The skipped work is `-= L * 0.0`, which is bitwise identity. What is NOT bitwise is the trailing
+GEMM: `dgemm_sub_into` picks its column blocking from the column count via `block_cols(n)`, so
+passing `pe` columns instead of `n` can reassociate per-panel sums. That is the same reassociation
+the blocked solve already documents against the strict column sweep (~1e-17), and dense inverse
+outputs sit under the tolerance policy rather than bitwise parity. The test therefore asserts a
+tight bound instead of a bit-exactness it cannot have — **claiming bit-exactness and asserting a
+tolerance are different claims, and the comment must not make the stronger one**.
+
+The test also checks `A A^-1 = I` directly, because agreement with the shipping route is
+**necessary but not sufficient**: both routes share `lu_factor`, so a factorisation bug would
+corrupt them identically and they would agree beautifully on a wrong answer (compare the
+`Q R == A` lesson in the Householder family). And the fixture pivots HEAVILY — the largest entry of
+column `j` sits in row `(j + n/2) % n` — because a permutation error is INVISIBLE on a matrix whose
+pivot sequence is the identity: a diagonally dominant fixture would pass with the deferred column
+permutation deleted outright.
+
+### 275b. A cell whose estimators disagree is a cell to RE-RUN, not a number to choose from
+
+n=1024 took three attempts, recorded here rather than hidden. Run 1's A/A null FAILED (0.9082).
+Run 2's null passed but its sign test was exactly **20/40** — the coin-flip null — with its two
+estimators disagreeing, 1.0352x marginal against 1.1309x paired. Either cell could have been
+reported as "no effect at n=1024" and would have produced a plausible size-gate story (and then a
+gate validated at one size range and applied open-endedly, which is how the conv3d direct gate was
+mis-set).
+
+At 61 reps the same cell reads **56/60 with both estimators agreeing**. The first two were noisy,
+not negative. When the marginal ratio, the paired ratio and the sign test do not tell the same
+story, the honest reading is that the cell has not been measured yet.
