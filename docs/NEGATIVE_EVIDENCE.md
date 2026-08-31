@@ -39582,3 +39582,48 @@ lesson is the same one from the other side: a paired FT-vs-FT figure survives an
 incumbent because it never touches it, and that is exactly when it is worth more than a standing.
 Claim the LEVER; the standing needs a window where the incumbent holds still, and four tries did
 not produce one.
+
+## 264. MY OWN f32 dinput ROUTING FIX MEASURES A NULL — NO BOARD LANE REACHES THE ENTRY IT FIXES — AND THE WORST HONEST f32 ROW IS conv2d_f32_masked AT 2.34-2.39x
+
+`frankentorch-hi9r6`. Fix in `608c60b3`; this is its price, reported against it.
+
+### 264a. THE NULL, AND WHY
+
+`608c60b3` gave `conv2d_backward_f32`'s dinput the direct route its f64 twin takes, replacing an
+unconditional ~189 MB `dpanel` + `col2im`. Re-profiled on the same lanes, three windows, two
+drift-clean, elf `13a0a9eab3d07304`:
+
+    conv2d_f32_masked   55.766 ms BEFORE   ->   55.970 / 56.429 / 56.876 AFTER
+
+**Flat.** The reason is the one this bead keeps finding: `conv2d_f32_masked` routes through
+`try_fuse_conv2d_loss_mask` to `conv2d_backward_mask_fused_f32`, which ALREADY had the direct
+dinput. The entry I fixed — the GENERIC `conv2d_backward_f32` — has no lane on this board that
+reaches it. `conv2d_f32` takes the all-ones adjoint; `conv2d_f32_masked` takes the fused path.
+
+So this is the FOURTH instance on this bead of a change whose effect cannot be seen from the
+board, and the first where the unreachable thing is my own fix rather than something I found.
+**It is kept, not reverted**, because it removes a real disagreement — the two f32 entries chose
+different dinput routes at the same shape — and that is a correctness property independent of any
+lane. But it is worth NOTHING measurable today and must not be quoted as a win.
+
+The transferable form: **"the routine was ported but the routing was not" and "the routing was
+fixed but nothing calls it" are the same defect seen from opposite ends.** Before fixing a route,
+check which lane executes it; a fix reachable only from code no lane runs is a correctness change
+wearing a performance change's clothes.
+
+### 264b. THE WORST HONEST f32 ROW
+
+Same three windows. Both drift-clean ones agree, and on `conv2d_f32_masked` BOTH A/A gates PASS
+with parity `match`:
+
+    conv2d_f32_masked        56.429 / 23.644 = 2.39x SLOWER   PT PASS  FT PASS
+    conv2d_f32_masked        56.876 / 24.344 = 2.34x SLOWER   PT PASS  FT PASS
+
+That is the standing f32 gap and it is now the worst honest conv2d row I hold. For contrast, in
+the same windows the SUMMED f32 route is at parity or better — `conv2d_f32` reads 1.02x and 1.01x
+**FASTER** than PyTorch, both gates PASS. So f32 conv2d is not uniformly behind: the all-ones
+adjoint route has caught up, and the entire remaining deficit is the GENERIC (masked) route.
+
+That reframes the target. The gap is not "f32 is slow"; it is that the generic backward costs
+2.25-2.34x what the specialised one does, on a lane where `dweight` is excluded — so it is the
+dinput half of the fused masked path, which already has every route this dtype owns.
