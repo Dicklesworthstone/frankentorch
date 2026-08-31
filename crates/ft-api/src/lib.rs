@@ -105,9 +105,15 @@ const GRADIENT_WIDEN_PARALLEL_MIN: usize = 1 << 20;
 /// Widen an f32 buffer to f64, in parallel once it is large enough to pay for the join.
 ///
 /// Named for gradients because that is where it was measured, but it now also serves the
-/// one other numel-scaled widening site the item 69f sweep found (`stft`'s signal). Every
-/// remaining `f32 -> f64` conversion in this file is batch-, window-, index- or
-/// grid-sized and falls through the gate to the serial path.
+/// one other numel-scaled widening site the item 69f sweep found (`stft`'s signal).
+///
+/// CORRECTED, `frankentorch-dwto7`: this doc used to claim that "every remaining `f32 -> f64`
+/// conversion in this file is batch-, window-, index- or grid-sized". That was not true. A survey
+/// found NUMEL-SCALED gradient widens still spelled out by hand at
+/// `scaled_dot_product_attention` and `tensor_scaled_dot_product_attention` (dq/dk/dv),
+/// `tensor_cross_entropy` (dlogits) and `functional_conv2d_grouped` (dpadded/dweight); they are
+/// now routed here. What IS batch-, index- or grid-sized is the `usize as f64` family, which is a
+/// different conversion this helper cannot take at all.
 ///
 /// WHY THIS EXISTS. The f32 GroupNorm backward hands its gradient to the tape as a
 /// `Vec<f64>`, and did so with a serial `.iter().map(f64::from).collect()`. For the
@@ -6579,7 +6585,7 @@ impl FrankenTorchSession {
                     ];
                     if has_bias {
                         gradients.push(
-                            dbias.map(|d| d.iter().map(|&v| f64::from(v)).collect::<Vec<f64>>()),
+                            dbias.map(|d| widen_f32_to_f64(&d)),
                         );
                     }
                     // The mask does not require grad — the caller's gate guarantees it — so it
@@ -8120,9 +8126,9 @@ impl FrankenTorchSession {
                                 )
                             };
                             Ok(vec![
-                                Some(dq.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dk.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dv.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                                Some(widen_f32_to_f64(&dq)),
+                                Some(widen_f32_to_f64(&dk)),
+                                Some(widen_f32_to_f64(&dv)),
                             ])
                         },
                     );
@@ -16842,7 +16848,7 @@ impl FrankenTorchSession {
                                 logits, &ti_bwd, &dloss, b, c,
                             );
                             Ok(vec![Some(
-                                dlogits.iter().map(|&v| v as f64).collect::<Vec<f64>>(),
+                                widen_f32_to_f64(&dlogits),
                             )])
                         },
                     )?
@@ -30146,9 +30152,9 @@ impl FrankenTorchSession {
                                 )
                             };
                             Ok(vec![
-                                Some(dq.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dk.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                Some(dv.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                                Some(widen_f32_to_f64(&dq)),
+                                Some(widen_f32_to_f64(&dk)),
+                                Some(widen_f32_to_f64(&dv)),
                             ])
                         },
                     );
@@ -30888,8 +30894,8 @@ impl FrankenTorchSession {
                                         ow, sh, sw, has_bias,
                                     );
                                 let mut g = vec![
-                                    Some(dpadded.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
-                                    Some(dweight.iter().map(|&v| v as f64).collect::<Vec<f64>>()),
+                                    Some(widen_f32_to_f64(&dpadded)),
+                                    Some(widen_f32_to_f64(&dweight)),
                                 ];
                                 if has_bias {
                                     g.push(Some(
