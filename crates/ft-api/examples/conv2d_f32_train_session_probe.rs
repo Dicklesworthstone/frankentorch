@@ -101,8 +101,14 @@ fn main() {
             ft_api::set_fuse_conv2d_reuse_f32(prev);
             (gx.iter().map(|&v| v as f32).collect(), gw)
         };
+        let _ = ft_api::take_fuse_conv2d_fwd_calls();
         let (gx_off, gw_off) = run(false);
+        let (calls_off, recomp_off) = ft_api::take_fuse_conv2d_fwd_calls();
         let (gx_on, gw_on) = run(true);
+        let (calls_on, recomp_on) = ft_api::take_fuse_conv2d_fwd_calls();
+        eprintln!(
+            "TRAIN   FWD-CLOSURE  OFF calls {calls_off} recomputes {recomp_off}   ON calls {calls_on} recomputes {recomp_on}   (a recompute on the ON arm is the cached value having been consumed already)"
+        );
         let mismatches = gx_off
             .iter()
             .zip(&gx_on)

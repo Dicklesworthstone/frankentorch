@@ -40853,3 +40853,47 @@ Six shipped levers and eight refutations on this campaign were all aimed at
 upstream, in `tensor_mul`, and it was found the first time anyone timed the session instead of the
 kernel. **Probe the thing the board measures.** The FT-only session probe needs no PyTorch arm, so
 it runs on any rch worker and sidesteps the h2h drift gate entirely (282d).
+
+### 283c. THE POWERED ROW, AND THE DISPLACEMENT IS LOCALISED — my own mechanism for it is REFUTED
+
+283a reported the lane at 12/14 then 10/14 and called the displacement unexplained. Both are now
+fixed: the row is re-taken at 41 reps (40 paired samples) and the neighbouring frames are MEASURED
+rather than inferred.
+
+    hz4, rayon=16, 41 reps, alternating square, per-rep min-of-2, median of per-rep ratios
+      lane OFF (recompute)  97.628 ms      ON (reuse)  96.765 ms
+      tensor_mul frame      17.822 ms  ->   6.896 ms   (2.5842x)
+      marginal 1.0089x   paired 1.0094x   SIGN TEST 29/40   A/A null 1.0000 PASS
+
+At 40 samples the two estimators AGREE (1.0089 vs 1.0094) and the sign test is 29/40 (p~0.004),
+where the 14-sample rows had disagreed and fallen to 10/14. **The lane win is real and it is
+~1.009x** — small, because the shed time does not leave the lane:
+
+    DISPLACEMENT  mul -10.925 ms | fwd +0.021 ms | bwd +10.321 ms | lane -0.863 ms
+    frames  OFF fwd 12.197 mul 17.822 bwd 66.637    ON fwd 12.218 mul 6.896 bwd 76.958
+
+**The BACKWARD absorbs +10.321 ms of the 10.925 ms shed from the multiply**, with the forward
+unmoved. So the convolution is not eliminated, it is relocated.
+
+### 283d. AND THE OBVIOUS EXPLANATION IS WRONG — count, do not reason
+
+The natural reading, which I wrote into the code before measuring, was that the tape re-invokes the
+fused forward closure and the `precomputed.take()` makes the cached value one-shot, so the second
+call falls through to the recompute. A counter says otherwise:
+
+    FWD-CLOSURE  OFF calls 1 recomputes 1    ON calls 1 recomputes 0
+
+**The closure runs exactly ONCE in both arms and the reuse arm never falls through.** There is no
+second invocation, so the backward's extra 10.3 ms is not a re-run of the fusion.
+
+The leading hypothesis is now ALLOCATOR WARMTH: the recompute arm allocates and drops a transient
+21 MB `out` buffer inside the closure, leaving a block of exactly that size on the free list for
+the backward to reuse, while the reuse arm never creates it and the backward pays fresh mmaps and
+first-touch faults. That is the same effect measured at 20.990 vs 11.516 ms for one identical call
+in 277a. **It is recorded as a hypothesis, not banked** — the counter has already refuted one
+confident mechanism on this exact lever.
+
+The practical consequence stands either way: the lever is worth ~1.009x on the lane rather than the
+2.58x its own frame shows, it is bit-exact, and it deletes a duplicated O(n^3) convolution. If the
+allocator hypothesis holds, a backward-side buffer reuse would collect the rest of the 10.3 ms —
+that is a separate lever, on a separate frame, and it needs its own row.

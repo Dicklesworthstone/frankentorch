@@ -840,6 +840,27 @@ struct GridSamplePoint {
 static FUSE_CONV2D_REUSE_F32: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Counts invocations of the f32 fusion's forward closure, and how many of them found the
+/// precomputed value already consumed. `frankentorch-t1gph`.
+///
+/// The reuse lever sheds ~10.9 ms from `tensor_mul` and the BACKWARD gains ~10.3 ms — the
+/// convolution is being MOVED, not removed. The suspected mechanism is that the tape invokes this
+/// closure more than once and the `take()` makes the cached value one-shot, so every later call
+/// falls through to the recompute. That is an inference from two timings, and on this campaign an
+/// inferred mechanism has been wrong before, so it gets a counter.
+static FUSE_CONV2D_FWD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FUSE_CONV2D_FWD_RECOMPUTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Drain `(forward closure calls, of which fell through to a recompute)`.
+#[doc(hidden)]
+pub fn take_fuse_conv2d_fwd_calls() -> (u64, u64) {
+    (
+        FUSE_CONV2D_FWD_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        FUSE_CONV2D_FWD_RECOMPUTES.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Select the reuse path for the f32 conv2d/mask fusion, returning the previous setting.
 #[doc(hidden)]
 pub fn set_fuse_conv2d_reuse_f32(on: bool) -> bool {
@@ -6435,9 +6456,12 @@ impl FrankenTorchSession {
                     // produced; the f64 twin has always done this, and the f32 path recomputing
                     // the whole convolution here is what made `tensor_mul` cost more than the
                     // forward convolution it duplicates.
+                    FUSE_CONV2D_FWD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(scored) = precomputed.borrow_mut().take() {
                         return Ok((scored, output_shape.clone()));
                     }
+                    FUSE_CONV2D_FWD_RECOMPUTES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (padded_values, _) = ins[0];
                     let (weight_values, _) = ins[1];
                     let bias_values = if has_bias { Some(ins[2].0) } else { None };
