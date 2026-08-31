@@ -27551,9 +27551,34 @@ pub fn set_cholesky_nb(nb: usize) -> usize {
     CHOLESKY_NB.swap(nb, LuOrdering::Relaxed)
 }
 
+/// The shipped blocking width. **64, changed from 128 by the nb sweep** — `frankentorch-valnx`,
+/// ledger 292d.
+///
+/// Panel MACs over a factorisation are `n*nb^2/6` while the trailing update does `~n^3/3` whatever
+/// nb is, so halving nb cuts the panel's work FOURFOLD and only reshapes the trailing GEMM. The
+/// panel runs at ~0.85 GF/s and the trailing at 50-130, so that trade is heavily favourable until
+/// the trailing rate collapses. It does degrade — n=512 reads 62.4 GF/s at nb=128 against 35.4 at
+/// nb=64 — but nowhere near the 25.9 GF/s break-even the model derived in advance.
+///
+/// MEASURED against the shipped 128 in ALL SIX cells of a three-size, two-run sweep
+/// (thinkstation1, rayon=16, min of 9, guard PASS):
+///
+///     n=256   1.33x / 1.45x     n=512   1.27x / 1.22x     n=1024   1.39x / 1.11x
+///
+/// median 1.30x, range 1.11-1.45. **64 rather than 32 deliberately**: nb=32 posts a higher single
+/// cell (1.60x at n=512) but is far less stable across the six (1.04-1.60) and its trailing rate
+/// falls furthest at n=1024. The two runs even disagree about which of 32 and 64 wins at n<=512,
+/// so 64 is chosen for beating the incumbent EVERYWHERE rather than for topping any one cell —
+/// picking the best cell of a noisy sweep is how a gate gets fitted to one dataset (item 279).
+///
+/// NOT BIT-EXACT, and it does not need to be: blocking reassociates the trailing sums, which is
+/// precisely why this path has always been tolerance-validated rather than bitwise. Correctness
+/// across widths is pinned by reconstruction and the oracle, never by `to_bits()`.
+const CHOLESKY_NB_SHIPPED: usize = 64;
+
 fn cholesky_nb() -> usize {
     match CHOLESKY_NB.load(LuOrdering::Relaxed) {
-        0 => 128,
+        0 => CHOLESKY_NB_SHIPPED,
         v => v.max(1),
     }
 }
@@ -70424,14 +70449,16 @@ mod tests {
 
             let previous = super::set_cholesky_nb(0);
             let shipped = super::cholesky_contiguous_f64(&a, &meta, false).expect("shipped");
-            // (1) an explicit 128 is the same code path as the default 0.
-            super::set_cholesky_nb(128);
-            let explicit = super::cholesky_contiguous_f64(&a, &meta, false).expect("nb=128");
+            // (1) an explicit width equal to the shipped constant is the same code path as the
+            // default 0. Tracks the constant rather than hard-coding a number, so a future retune
+            // cannot leave this test silently comparing the default against a stale width.
+            super::set_cholesky_nb(super::CHOLESKY_NB_SHIPPED);
+            let explicit = super::cholesky_contiguous_f64(&a, &meta, false).expect("explicit nb");
             for (i, (x, y)) in explicit.factor.iter().zip(&shipped.factor).enumerate() {
                 assert_eq!(
                     x.to_bits(),
                     y.to_bits(),
-                    "n={n}: nb=128 must be bitwise identical to the default at {i}"
+                    "n={n}: an explicit CHOLESKY_NB_SHIPPED must be bitwise identical to the default at {i}"
                 );
             }
             // (2) other widths factor correctly, checked by reconstruction.
