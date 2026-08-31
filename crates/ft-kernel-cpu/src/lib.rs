@@ -8730,6 +8730,36 @@ pub fn set_conv2d_dweight_min_nb(min_nb: usize) -> usize {
     CONV2D_DWEIGHT_MIN_NB.swap(min_nb, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the streamed f32 dweight gathers with the RUN loop outside and the patch loop inside.
+///
+/// `frankentorch-06csx`. After the n-split retiling the gather is still the larger half of this
+/// frame (100.2 ms CPU against the GEMM's 75.7), so it is worth attacking directly.
+///
+/// The shipped order is patch-outer / run-inner: the DESTINATION `ptile` row is written
+/// contiguously while the SOURCE jumps `ph * pw` floats between channels, so every one of the
+/// short `kw`-length reads lands on its own cache line. That is backwards for the sizes involved —
+/// `ptile` is `rows * jn` = 256 * 18 = 18 KiB and stays in L1, while `padded` is 23.7 MiB and
+/// lives in L3. Putting the run loop OUTSIDE makes the source stream sequentially (consecutive
+/// patches in one output row differ by `sw`, so successive reads advance by one float and overlap)
+/// and moves the strided access onto the L1-resident side.
+///
+/// This is the same inversion that paid twice already on this campaign: the tiled `dout_flat`
+/// transpose (ledger 276a, 1.4473x on its frame) and the row-wise `lu_solve` RHS permutation
+/// (274). It also lets the per-patch `div`/`mod` and base-address arithmetic be hoisted out of the
+/// inner loop into a `rows`-entry table computed once per k-block, instead of being redone for
+/// every run.
+///
+/// BIT-EXACT by construction: pure data movement, identical values, only the traversal order
+/// changes. DEFAULT OFF until it has a paired row.
+static CONV2D_DWEIGHT_GATHER_RUNS_OUTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the run-outer gather order, returning the previous setting.
+#[doc(hidden)]
+pub fn set_conv2d_dweight_gather_runs_outer(on: bool) -> bool {
+    CONV2D_DWEIGHT_GATHER_RUNS_OUTER.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 static CONV2D_DWEIGHT_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Set the streamed f32 dweight M-block width, returning the previous value. `0` restores the
@@ -8839,26 +8869,56 @@ fn conv2d_dweight_streamed_f32(
             }
             let mut ptile = vec![0.0f32; krows * jn];
             let mut atile = vec![0.0f32; krows * ocn];
+            let runs_outer =
+                CONV2D_DWEIGHT_GATHER_RUNS_OUTER.load(std::sync::atomic::Ordering::Relaxed);
+            let mut origins: Vec<usize> = Vec::with_capacity(krows);
             let mut f0 = 0usize;
             let mut gather_ns = 0u64;
             let mut gemm_ns = 0u64;
             while f0 < flat {
                 let rows = krows.min(flat - f0);
                 let gather_start = std::time::Instant::now();
-                for r in 0..rows {
-                    let row = f0 + r;
-                    let b = row / patch_count;
-                    let pc = row % patch_count;
-                    let base_h = (pc / ow) * sh;
-                    let base_w = (pc % ow) * sw;
-                    let batch_off = b * in_ch * ph * pw;
-                    let prow = &mut ptile[r * jn..(r + 1) * jn];
-                    for &(ch, kr, off, len, dst) in &runs {
-                        let irow = batch_off + ch * ph * pw + (base_h + kr) * pw + base_w + off;
-                        prow[dst..dst + len].copy_from_slice(&padded[irow..irow + len]);
+                if runs_outer {
+                    // Origin of each patch, computed ONCE per k-block instead of once per (patch,
+                    // run). `irow` for a run is then `origin[r] + ch*ph*pw + kr*pw + off`, so the
+                    // div/mod and the batch offset leave the inner loop entirely.
+                    origins.clear();
+                    for r in 0..rows {
+                        let row = f0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_h = (pc / ow) * sh;
+                        let base_w = (pc % ow) * sw;
+                        origins.push(b * in_ch * ph * pw + base_h * pw + base_w);
+                        let src = row * out_ch + oc0;
+                        atile[r * ocn..(r + 1) * ocn]
+                            .copy_from_slice(&dout_flat[src..src + ocn]);
                     }
-                    let src = row * out_ch + oc0;
-                    atile[r * ocn..(r + 1) * ocn].copy_from_slice(&dout_flat[src..src + ocn]);
+                    for &(ch, kr, off, len, dst) in &runs {
+                        let fixed = ch * ph * pw + kr * pw + off;
+                        for (r, &origin) in origins.iter().enumerate() {
+                            let irow = origin + fixed;
+                            ptile[r * jn + dst..r * jn + dst + len]
+                                .copy_from_slice(&padded[irow..irow + len]);
+                        }
+                    }
+                } else {
+                    for r in 0..rows {
+                        let row = f0 + r;
+                        let b = row / patch_count;
+                        let pc = row % patch_count;
+                        let base_h = (pc / ow) * sh;
+                        let base_w = (pc % ow) * sw;
+                        let batch_off = b * in_ch * ph * pw;
+                        let prow = &mut ptile[r * jn..(r + 1) * jn];
+                        for &(ch, kr, off, len, dst) in &runs {
+                            let irow =
+                                batch_off + ch * ph * pw + (base_h + kr) * pw + base_w + off;
+                            prow[dst..dst + len].copy_from_slice(&padded[irow..irow + len]);
+                        }
+                        let src = row * out_ch + oc0;
+                        atile[r * ocn..(r + 1) * ocn].copy_from_slice(&dout_flat[src..src + ocn]);
+                    }
                 }
                 gather_ns += gather_start.elapsed().as_nanos() as u64;
                 let gemm_start = std::time::Instant::now();
@@ -50291,6 +50351,61 @@ mod tests {
                 );
             }
             assert_eq!(shipped.pivots, accum.pivots, "pivot sequence differs at n={n}");
+        }
+    }
+
+    #[test]
+    fn conv2d_dweight_gather_runs_outer_matches_the_patch_outer_order_bitwise() {
+        // `frankentorch-06csx`. Swapping the gather's loop order is PURE DATA MOVEMENT, so what
+        // must hold is an indexing identity, not a numerical one — which makes bitwise the right
+        // assertion. It is driven through the real streamed entry so the thing pinned is the
+        // kernel, not a copy of its loop.
+        //
+        // The run-outer path hoists each patch's origin into a table and reconstructs `irow` as
+        // `origin[r] + ch*ph*pw + kr*pw + off`. That refactor is where an error would hide, so the
+        // fixture makes every term matter: in_ch != out_ch so a channel-stride slip cannot cancel,
+        // kh != kw so `kr*pw` and `off` cannot be transposed unnoticed, and a batch of 2 so the
+        // per-batch offset is exercised rather than being identically zero.
+        for (batch, in_ch, out_ch, kh, kw, h, w) in
+            [(2usize, 3usize, 5usize, 2usize, 3usize, 6usize, 7usize), (1, 4, 4, 3, 3, 8, 8)]
+        {
+            let (ph, pw) = (h + kh - 1, w + kw - 1);
+            let (oh, ow) = (h, w);
+            let patch_count = oh * ow;
+            let flat = batch * patch_count;
+            let patch_width = in_ch * kh * kw;
+
+            let dout_flat: Vec<f32> = (0..flat * out_ch)
+                .map(|i| (i as f32 - 29.0) * 0.03125)
+                .collect();
+            let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+                .map(|i| (i as f32 - 41.0) * -0.0625)
+                .collect();
+
+            let previous = super::set_conv2d_dweight_gather_runs_outer(false);
+            let patch_outer = super::conv2d_dweight_streamed_f32(
+                &dout_flat, &padded, batch, in_ch, ph, pw, kh, kw, oh, ow, 1, 1, out_ch,
+            );
+            super::set_conv2d_dweight_gather_runs_outer(true);
+            let runs_outer = super::conv2d_dweight_streamed_f32(
+                &dout_flat, &padded, batch, in_ch, ph, pw, kh, kw, oh, ow, 1, 1, out_ch,
+            );
+            super::set_conv2d_dweight_gather_runs_outer(previous);
+
+            let (a, b) = (
+                patch_outer.expect("patch-outer dweight"),
+                runs_outer.expect("run-outer dweight"),
+            );
+            assert_eq!(a.len(), out_ch * patch_width, "unexpected dweight length");
+            assert_eq!(a.len(), b.len());
+            for (index, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "dW[{index}] differs at batch={batch} in_ch={in_ch} out_ch={out_ch} \
+                     k={kh}x{kw}: patch-outer {x:e} vs run-outer {y:e}"
+                );
+            }
         }
     }
 

@@ -480,6 +480,78 @@ fn main() {
         );
     }
 
+    // PAIRED ROW FOR THE RUN-OUTER GATHER -- `frankentorch-06csx`.
+    //
+    // After the n-split the gather is still the larger half of dweight (100.2 ms CPU against the
+    // GEMM's 75.7). This swaps the gather's loop order so the SOURCE streams sequentially and the
+    // strided side lands in the L1-resident `ptile` instead of in the 23.7 MiB `padded`.
+    //
+    // PREDICTION RECORDED BEFORE THE RUN: the gather counter falls and the frame follows, because
+    // the same inversion paid 1.4473x on the `dout_flat` transpose and shipped on `lu_solve`. If
+    // the gather counter does NOT move, the short `kw`-length copies are latency-bound on their
+    // own and loop order cannot help -- which is what ledger 268 already found for the dinput
+    // scatter, and would close this frame the same way.
+    {
+        let once = |on: bool| -> (f64, f64) {
+            let prev = ft_kernel_cpu::set_conv2d_dweight_gather_runs_outer(on);
+            let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
+            let start = Instant::now();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [true, true, false],
+            );
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&out);
+            let (g_ns, _) = ft_kernel_cpu::conv2d_dweight_split_take_ns();
+            ft_kernel_cpu::set_conv2d_dweight_gather_runs_outer(prev);
+            (ms, g_ns as f64 / 1e6)
+        };
+        let mut off_v = Vec::new();
+        let mut on_v = Vec::new();
+        let mut off_g = Vec::new();
+        let mut on_g = Vec::new();
+        let mut nulls = Vec::new();
+        for rep in 0..reps {
+            let r = if rep % 2 == 0 {
+                let a = [once(false), once(true), once(true), once(false)];
+                [a[0], a[1], a[2], a[3]]
+            } else {
+                let a = [once(true), once(false), once(false), once(true)];
+                [a[1], a[0], a[3], a[2]]
+            };
+            if rep == 0 {
+                continue;
+            }
+            off_v.push(r[0].0.min(r[3].0));
+            on_v.push(r[1].0.min(r[2].0));
+            off_g.push(r[0].1.min(r[3].1));
+            on_g.push(r[1].1.min(r[2].1));
+            nulls.push(r[0].0 / r[3].0);
+        }
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let mut ratios: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
+        let paired = median(&mut ratios);
+        let null = median(&mut nulls.clone());
+        let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
+        let off_m = median(&mut off_v.clone());
+        let on_m = median(&mut on_v.clone());
+        let off_gm = median(&mut off_g.clone());
+        let on_gm = median(&mut on_g.clone());
+        eprintln!(
+            "F32_GORDER fused backward  OFF patch-outer {off_m:7.3} ms (gather {off_gm:7.3} CPU)   ON run-outer {on_m:7.3} ms (gather {on_gm:7.3} CPU)"
+        );
+        eprintln!(
+            "F32_GORDER   marginal {:.4}x   paired {paired:.4}x   GATHER FRAME {:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
+            off_m / on_m,
+            off_gm / on_gm,
+            off_v.len(),
+            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+        );
+    }
+
     // PAIRED ROW FOR THE n-SPLIT TILING -- `frankentorch-06csx`.
     //
     // OFF restores the previous heuristic exactly (mb=8, min_nb=64); ON is the shipped default.
