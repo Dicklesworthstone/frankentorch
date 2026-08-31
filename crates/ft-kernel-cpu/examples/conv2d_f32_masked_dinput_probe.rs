@@ -426,6 +426,76 @@ fn main() {
         dout_build_shipped / dout_build_tiled
     );
 
+    // ---------------------------------------------------------------------------------------
+    // THE PAIRED ROW FOR THE TILED dout_flat LEVER — `frankentorch-t1gph`.
+    //
+    // The tiled build shipped on FRAME evidence (4.017 -> 2.784 ms on the build loop, bitwise
+    // identical) and I said plainly at the time that the LANE ratio was not measured. This is that
+    // measurement, against the live incumbent through the real fused entry.
+    //
+    // Same harness as the levers on x6wc3/37sxo, and the shape is not optional: OFF/ON/ON/OFF with
+    // the square ALTERNATED per rep (a fixed square parks one arm in the two middle slots forever
+    // and the A/A null, comparing the OUTER slots, is structurally blind to it — ledger 274c),
+    // per-rep min-of-2 per arm, median of per-rep ratios, and the marginal ratio plus a SIGN TEST
+    // printed beside it so estimator disagreement shows up as the harness defect it is (275b).
+    //
+    // PREDICTION, recorded before the run so it cannot be fitted afterwards: the frame is ~4 ms of
+    // a ~22.7 ms dinput-only arm and the tiling saves ~1.2 ms of it, so the entry should move
+    // ~1.05x — at or below what this harness resolves. A null here does NOT retract the frame
+    // measurement; it bounds what the frame is worth at the entry, which is the honest thing to
+    // put on the thread.
+    let mut tile_off = Vec::new();
+    let mut tile_on = Vec::new();
+    let mut tile_nulls = Vec::new();
+    {
+        let once = |tiled: bool| -> f64 {
+            let previous = ft_kernel_cpu::set_masked_dout_tiled(tiled);
+            let start = Instant::now();
+            let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                [true, true, false],
+            );
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(&out);
+            ft_kernel_cpu::set_masked_dout_tiled(previous);
+            ms
+        };
+        for rep in 0..reps {
+            let r = if rep % 2 == 0 {
+                let a = [once(false), once(true), once(true), once(false)];
+                [a[0], a[1], a[2], a[3]]
+            } else {
+                let a = [once(true), once(false), once(false), once(true)];
+                [a[1], a[0], a[3], a[2]]
+            };
+            if rep == 0 {
+                continue;
+            }
+            tile_off.push(r[0].min(r[3]));
+            tile_on.push(r[1].min(r[2]));
+            tile_nulls.push(r[0] / r[3]);
+        }
+    }
+    {
+        let median = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(f64::total_cmp);
+            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        };
+        let mut ratios: Vec<f64> = tile_off.iter().zip(&tile_on).map(|(a, b)| a / b).collect();
+        let paired = median(&mut ratios);
+        let null = median(&mut tile_nulls.clone());
+        let wins = tile_off.iter().zip(&tile_on).filter(|(o, n)| n < o).count();
+        let off_m = median(&mut tile_off.clone());
+        let on_m = median(&mut tile_on.clone());
+        eprintln!("F32_TILEAB fused backward (dinput+dweight), OFF row-gather {off_m:8.3} ms   ON tiled {on_m:8.3} ms");
+        eprintln!(
+            "F32_TILEAB   marginal {:.4}x   paired {paired:.4}x   SIGN TEST ON faster in {wins}/{} reps   A/A null {null:.4} {}",
+            off_m / on_m,
+            tile_off.len(),
+            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
+        );
+    }
+
     // `incoming * mask` in the `[flat][out_ch]` layout the fused entry forms internally, so the
     // panel-free arm consumes exactly what the shipping route consumes. `ones` stands in for
     // `incoming` here, matching the arms above.

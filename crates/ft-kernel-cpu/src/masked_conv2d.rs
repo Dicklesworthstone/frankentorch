@@ -1,6 +1,29 @@
 //! Conv2d backward with an unmaterialized elementwise upstream mask.
 
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the fused entries build `dout_flat` as a TILED transpose rather than per-row gathers.
+///
+/// `frankentorch-t1gph`. The tiled form SHIPPED on frame evidence — 4.017 -> 2.784 ms measured on
+/// the build loop itself, bitwise identical — but that is a claim about the FRAME, and it was
+/// shipped unconditionally, which left no way to A/B the entry it sits in. This toggle exists so
+/// the lane-level claim can be measured against the live incumbent instead of assumed from the
+/// frame ratio, which is the standard every other lever on this bead was held to.
+///
+/// DEFAULT ON: the tiled form is the shipped one. The row-gather arm is retained solely as the
+/// A/B incumbent and as the reference the bit-exactness test pins against.
+static MASKED_DOUT_TILED: AtomicBool = AtomicBool::new(true);
+
+/// Select the tiled `dout_flat` build, returning the previous setting.
+#[doc(hidden)]
+pub fn set_masked_dout_tiled(on: bool) -> bool {
+    MASKED_DOUT_TILED.swap(on, Ordering::Relaxed)
+}
+
+fn masked_dout_tiled() -> bool {
+    MASKED_DOUT_TILED.load(Ordering::Relaxed)
+}
 
 /// Run the generic f64 Conv2d backward after multiplying the incoming gradient
 /// and an elementwise loss mask directly into the existing GEMM input layout.
@@ -59,23 +82,38 @@ pub fn conv2d_backward_mask_fused_f64(
             // attributing that ~18 ms gap here would have been wrong by 4x — the build is 4.0 ms.
             // Item 141: a residual is not a measurement of whatever you name it.
             const PATCH_BLOCK: usize = 64;
-            flat_grad
-                .par_chunks_mut(patch_count * out_ch)
-                .enumerate()
-                .for_each(|(n, plane)| {
-                    let mut p0 = 0;
-                    while p0 < patch_count {
-                        let p1 = (p0 + PATCH_BLOCK).min(patch_count);
-                        for out_channel in 0..out_ch {
-                            let base = (n * out_ch + out_channel) * patch_count;
-                            for patch in p0..p1 {
-                                plane[patch * out_ch + out_channel] =
-                                    incoming[base + patch] * mask[base + patch];
+            if masked_dout_tiled() {
+                flat_grad
+                    .par_chunks_mut(patch_count * out_ch)
+                    .enumerate()
+                    .for_each(|(n, plane)| {
+                        let mut p0 = 0;
+                        while p0 < patch_count {
+                            let p1 = (p0 + PATCH_BLOCK).min(patch_count);
+                            for out_channel in 0..out_ch {
+                                let base = (n * out_ch + out_channel) * patch_count;
+                                for patch in p0..p1 {
+                                    plane[patch * out_ch + out_channel] =
+                                        incoming[base + patch] * mask[base + patch];
+                                }
                             }
+                            p0 = p1;
                         }
-                        p0 = p1;
-                    }
-                });
+                    });
+            } else {
+                // The row-gather incumbent, kept as the A/B arm.
+                flat_grad
+                    .par_chunks_mut(out_ch)
+                    .enumerate()
+                    .for_each(|(row, destination)| {
+                        let n = row / patch_count;
+                        let patch = row % patch_count;
+                        for (out_channel, slot) in destination.iter_mut().enumerate() {
+                            let source = (n * out_ch + out_channel) * patch_count + patch;
+                            *slot = incoming[source] * mask[source];
+                        }
+                    });
+            }
         })
     } else {
         Vec::new()
@@ -232,23 +270,38 @@ pub fn conv2d_backward_mask_fused_f32(
             // attributing that ~18 ms gap here would have been wrong by 4x — the build is 4.0 ms.
             // Item 141: a residual is not a measurement of whatever you name it.
             const PATCH_BLOCK: usize = 64;
-            flat_grad
-                .par_chunks_mut(patch_count * out_ch)
-                .enumerate()
-                .for_each(|(n, plane)| {
-                    let mut p0 = 0;
-                    while p0 < patch_count {
-                        let p1 = (p0 + PATCH_BLOCK).min(patch_count);
-                        for out_channel in 0..out_ch {
-                            let base = (n * out_ch + out_channel) * patch_count;
-                            for patch in p0..p1 {
-                                plane[patch * out_ch + out_channel] =
-                                    incoming[base + patch] * mask[base + patch];
+            if masked_dout_tiled() {
+                flat_grad
+                    .par_chunks_mut(patch_count * out_ch)
+                    .enumerate()
+                    .for_each(|(n, plane)| {
+                        let mut p0 = 0;
+                        while p0 < patch_count {
+                            let p1 = (p0 + PATCH_BLOCK).min(patch_count);
+                            for out_channel in 0..out_ch {
+                                let base = (n * out_ch + out_channel) * patch_count;
+                                for patch in p0..p1 {
+                                    plane[patch * out_ch + out_channel] =
+                                        incoming[base + patch] * mask[base + patch];
+                                }
                             }
+                            p0 = p1;
                         }
-                        p0 = p1;
-                    }
-                });
+                    });
+            } else {
+                // The row-gather incumbent, kept as the A/B arm.
+                flat_grad
+                    .par_chunks_mut(out_ch)
+                    .enumerate()
+                    .for_each(|(row, destination)| {
+                        let n = row / patch_count;
+                        let patch = row % patch_count;
+                        for (out_channel, slot) in destination.iter_mut().enumerate() {
+                            let source = (n * out_ch + out_channel) * patch_count + patch;
+                            *slot = incoming[source] * mask[source];
+                        }
+                    });
+            }
         })
     } else {
         Vec::new()
@@ -349,6 +402,61 @@ mod tests {
     /// The mask straddles every branch that matters: negative, positive, and EXACT ZERO entries,
     /// the last because a zeroed row is where a fused path is most tempted to skip work the
     /// materialised one still does.
+    #[test]
+    fn tiled_dout_flat_matches_the_row_gather_bitwise_through_the_fused_entries() {
+        // `frankentorch-t1gph`. The tiled `dout_flat` build is a TRANSPOSE, so what has to hold is
+        // an INDEXING identity, not a numerical one: identical products of identical values, only
+        // the traversal order changed. That makes bitwise the right assertion — a tolerance here
+        // would pass for a build that transposed correctly on average and wrongly in the corners.
+        //
+        // Driven through the real fused entries rather than the loop in isolation, because the
+        // loop in isolation is exactly what a probe already measured; what a test has to pin is
+        // that the ENTRY consuming it is unchanged.
+        //
+        // The shape deliberately makes `patch_count` NOT a multiple of the 64-wide patch block
+        // (5x5 = 25 patches), so the short trailing block runs; a shape that divided evenly would
+        // never execute the `p1 = min(p0 + PATCH_BLOCK, patch_count)` tail. `out_ch != in_ch` so a
+        // swapped channel index cannot cancel, and the mask carries negatives, positives and exact
+        // zeros.
+        let (batch, in_ch, out_ch, k, h, w) = (2usize, 3usize, 5usize, 3usize, 5usize, 5usize);
+        let (ph, pw) = (h + 2, w + 2);
+        let patches = h * w;
+
+        let incoming: Vec<f32> = (0..batch * out_ch * patches)
+            .map(|i| (i as f32 - 37.0) * 0.0625)
+            .collect();
+        let mask: Vec<f32> = (0..batch * out_ch * patches)
+            .map(|i| match i % 5 {
+                0 => 0.0,
+                1 => -1.5,
+                _ => (i % 7) as f32 * 0.25 - 0.5,
+            })
+            .collect();
+        let padded: Vec<f32> = (0..batch * in_ch * ph * pw)
+            .map(|i| (i as f32 - 51.0) * -0.03125)
+            .collect();
+        let weight: Vec<f32> = (0..out_ch * in_ch * k * k)
+            .map(|i| (i as f32 - 19.0) * 0.03125)
+            .collect();
+
+        let run = |tiled: bool| {
+            let previous = super::set_masked_dout_tiled(tiled);
+            let out = conv2d_backward_mask_fused_f32(
+                &incoming, &mask, &padded, &weight, batch, in_ch, ph, pw, k, k, h, w, 1, 1,
+                out_ch,
+                [true, true, true],
+            );
+            super::set_masked_dout_tiled(previous);
+            out
+        };
+
+        let (gathered_i, gathered_w, gathered_b) = run(false);
+        let (tiled_i, tiled_w, tiled_b) = run(true);
+        assert_option_bits_f32(tiled_i, gathered_i);
+        assert_option_bits_f32(tiled_w, gathered_w);
+        assert_option_bits_f32(tiled_b, gathered_b);
+    }
+
     #[test]
     fn f32_mixed_signed_mask_matches_materialized_conv2d_backward_bitwise() {
         let incoming: Vec<f32> = (0..24).map(|i| (i as f32 - 11.0) * 0.125).collect();
