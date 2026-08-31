@@ -41122,3 +41122,52 @@ routine (`feedback_attribute_the_lane_not_the_kernel`).
 narrow and a widen. This fixed one site. `project_serial_widen_vein` already records "12 of 14
 sites unharvested" for the widen direction — the narrow direction should be swept the same way,
 and that is a bead of its own, not a conv2d lever.
+
+---
+
+## 287. THE WIDEN GATE IS WORTH 1.0583x BELOW IT — priced at the shape where it bites, because the board cannot see it
+
+`frankentorch-dwto7`. Item 172c8a8b deduplicated an UNGATED `widen_grad_f32_to_f64` onto the gated
+`widen_f32_to_f64`. That change is invisible to the board: every f32 lane reaching a widen is far
+above `GRADIENT_WIDEN_PARALLEL_MIN` (this lane's dpadded is 5,922,560 against a 1<<20 gate), so a
+board A/B reads ~1.000x BY CONSTRUCTION and says nothing at all.
+
+So it was priced where it bites — batch=2, widen of 73,984 elements, with the gate DEFEATED as the
+OFF arm via `set_gradient_widen_force_parallel`, which reproduces the pre-dedup behaviour exactly:
+
+    UNGATED 3.951 ms   GATED 3.708 ms
+    paired 1.0583x (gated faster)   SIGN TEST 19/20   A/A null 0.9920 PASS
+
+**The gate is worth 1.058x at this shape and width.** Not a board row, and no board claim is drawn
+from it — it is the answer to "what did the dedup buy", which is otherwise unanswerable.
+
+**PRECISION ABOUT WHOSE NUMBER IS WHOSE.** The compile-time assert beside the narrow gate records a
+*4.3x pessimization at 64 threads*, and that is NOT what this measures: theirs is the NARROW gate
+folded down to the widen's value at 64 threads, mine is the WIDEN gate at rayon=16 on 73,984
+elements. Same family, different configuration, and 1.058x is the figure I can defend. Inheriting
+their 4.3x as support for this change would be quoting a measurement of something else.
+
+### 287a. THE NARROW LEVER'S FIFTH WINDOW, AND WHY THE BAND IS A BAND
+
+    mine        1.1695x / 1.1492x / 1.1498x / 1.1525x / 1.1603x   lane OFF 90-103 ms   load 3.8-61
+    RainyCreek  1.2415x / 1.2270x                                 lane OFF 64.4-64.8   load ~2
+
+Six windows, 120 of 120 paired wins, every A/A null passing. The two bands differ because the
+DENOMINATOR differs: the narrow frame is ~12-16 ms in both, so it is a larger FRACTION of
+RainyCreek's faster lane. **The honest figure is a load-dependent ~1.15-1.24x, not a single value** —
+quoting 1.2270x as "the" number would repeat exactly the denominator error item 280a records.
+
+### 287b. ON A SHARED CHECKOUT, `git commit` COMMITS THE WHOLE INDEX
+
+Twice this session a peer's in-flight work landed inside my commits: six `machinery` lines into
+`8cc40fcb`, then 29 lines of `ft-autograd` into `4a0a49c3` — a `.beads/`-only commit.
+
+The mechanism is not `git add <path>` being too broad. It is that **the index is shared**: when a
+peer runs `git add` on their file, the next `git commit` by ANY agent carries it, whatever that
+agent staged. `git add .beads/` was scoped correctly and still swept 29 lines of somebody else's
+crate.
+
+**Use `git commit -- <paths>` (or `git commit <paths>`), which commits those paths from the
+worktree and ignores the rest of the index; and check `git diff --cached --stat` before committing
+anyway.** `feedback_uncommitted_gets_swept` records being on the losing end of this; this is the
+causing end, and the fix is different from what that item suggests.
