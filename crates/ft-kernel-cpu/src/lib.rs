@@ -8541,6 +8541,15 @@ pub(crate) fn conv2d_dweight_streamed_f32_if_enabled(
     sw: usize,
     out_ch: usize,
 ) -> Option<Vec<f32>> {
+    // TWICE the f64 element floor, which is the SAME number of BYTES — and that is the
+    // conservative direction, not a rounding choice. The saving is a panel round trip through
+    // DRAM, so it scales with the panel's BYTES; an f32 panel of N elements is half the bytes of
+    // an f64 panel of N elements, so its crossover must sit at a HIGHER element count. Inheriting
+    // the f64 element floor verbatim would enable f32 BELOW its own crossover, which is precisely
+    // the `conv3d-direct-gate-misset-w3pol` failure — a path validated at one shape and gated
+    // open-endedly. The f64 floor is measured (item 261's 15-shape curve); this one is DERIVED,
+    // not measured, and the f32 size curve is owed before it is trusted at the boundary.
+    let floor = conv2d_dweight_stream_min_panel().saturating_mul(2);
     if !conv2d_dweight_streamed()
         || batch
             .saturating_mul(oh)
@@ -8548,7 +8557,7 @@ pub(crate) fn conv2d_dweight_streamed_f32_if_enabled(
             .saturating_mul(in_ch)
             .saturating_mul(kh)
             .saturating_mul(kw)
-            < conv2d_dweight_stream_min_panel()
+            < floor
     {
         return None;
     }
@@ -49401,8 +49410,26 @@ mod tests {
         assert_eq!(super::conv2d_dinput_block_rows(0), 1);
     }
 
+    /// Serialises the two streamed-`dweight` bit-identity tests. `frankentorch-hi9r6`.
+    ///
+    /// Both drive the SAME process-global switches (`set_conv2d_dweight_streamed`, the panel
+    /// floor) and both assert on a thread-local EXECUTION COUNTER, so run concurrently they
+    /// interleave and one test's toggle satisfies or defeats the other's sentinel. Observed: the
+    /// f64 test began failing its `count == 1` assertion the moment the f32 test was added, with
+    /// neither kernel changed.
+    ///
+    /// Worth naming rather than just fixing — this is the same defect class I flagged on
+    /// `svd_deferred_left_thread_count_bit_exact` (green alone, red in the suite, asserting
+    /// bit-identity across pools it configures itself). A test that mutates a global and asserts
+    /// on a global needs the lock; the alternative is a suite whose result depends on scheduling.
+    static CONV2D_DWEIGHT_STREAM_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise() {
+        let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
         // `frankentorch-hi9r6`. The f32 twin of the f64 bitwise check, and it needs its OWN test
         // rather than inheriting the f64 one: the claim is about `SGEMM_KC`, a DIFFERENT private
         // constant of the dependency than `DGEMM_KC`, and f32's shorter mantissa makes any
@@ -49520,6 +49547,10 @@ mod tests {
 
     #[test]
     fn conv2d_dweight_streamed_matches_the_panel_gemm_bitwise() {
+        let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
         // `frankentorch-hi9r6`. The streamed dweight splits the GEMM's `k` from OUTSIDE, which
         // is bit-exact only if the split lands on `matrixmultiply`'s own `DGEMM_KC` boundaries
         // (NEGATIVE_EVIDENCE item 97). That is a claim about a PRIVATE constant of a
