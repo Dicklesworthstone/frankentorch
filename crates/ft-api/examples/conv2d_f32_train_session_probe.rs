@@ -361,7 +361,8 @@ fn main() {
     // the per-frame counters will localise it rather than leave it inferred.
     {
         let once = |par: bool| -> (f64, f64) {
-            let prev = ft_api::set_fuse_bwd_parallel_downcast(par);
+            // The shared helper's twin takes force_SERIAL, so the sense is inverted: par => false.
+            let prev = ft_api::set_gradient_narrow_serial(!par);
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = session
                 .tensor_variable_f32(values.clone(), vec![BATCH, IN_CH, H, W], true)
@@ -383,7 +384,7 @@ fn main() {
             let lane = lane0.elapsed().as_secs_f64() * 1e3;
             let (d_ns, _) = ft_api::take_fuse_bwd_frames_ns();
             std::hint::black_box(report.gradient(x).expect("grad").len());
-            ft_api::set_fuse_bwd_parallel_downcast(prev);
+            ft_api::set_gradient_narrow_serial(prev);
             (lane, d_ns as f64 / 1e6)
         };
         let mut off_l = Vec::new();

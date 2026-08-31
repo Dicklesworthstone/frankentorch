@@ -831,43 +831,6 @@ struct GridSamplePoint {
 /// Both are counted so the non-kernel backward is DECOMPOSED rather than named. The widen is
 /// already `par_iter` and its buffer-pool hook was tried and reverted (`frankentorch-ymhld`); the
 /// downcast is still a serial `.iter().map().collect()`, and pricing that asymmetry is the point.
-/// Whether the f32 fused backward narrows the incoming gradient in PARALLEL.
-///
-/// `frankentorch-t1gph`, ledger 286. The tape carries gradients in f64 and the kernel is f32, so
-/// every f32 conv2d backward converts 5.24M elements down and 5.92M back up. The WIDEN direction
-/// was parallelised long ago; the NARROW direction was left as a serial `.iter().map().collect()`.
-/// Measured in the SAME closure, the same call, the same host:
-///
-///     WIDEN     5.92M elements   par_iter   3.604 ms
-///     DOWNCAST  5.24M elements   SERIAL    14.776 ms   (16.0% of the training lane)
-///
-/// 4.1x slower for 11% fewer elements. The control is in the same measurement as the treatment,
-/// so this is not a cross-run inference.
-///
-/// BIT-EXACT: `v as f32` is a deterministic per-element conversion and `par_iter().collect()`
-/// preserves order, so every element is the same value at the same index. Identical in kind to
-/// `widen_grad_f32_to_f64`, which has been `par_iter` for exactly this reason.
-///
-/// DEFAULT ON — MEASURED, and the accounting CLOSES. hz4, rayon=16, 21 reps, alternating square,
-/// per-rep min-of-2, median of per-rep ratios:
-///
-///     lane OFF (serial) 90.325 ms   ON (par_iter) 77.352 ms
-///     downcast frame    15.193 ->    2.023 ms   (7.5091x)
-///     marginal 1.1677x   paired 1.1695x   SIGN TEST 20/20   A/A null 0.9984 PASS
-///
-/// The frame sheds 13.17 ms and the lane gains 12.97 ms — unlike the three displacements this
-/// campaign has recorded (276b, 281, 283), the saving actually arrives. The two estimators agree
-/// and the sign test is perfect. Afterwards the narrow runs 2.023 ms for 5.24M elements against
-/// the widen's 3.604 ms for 5.92M: the same rate, symmetry restored.
-static FUSE_BWD_PARALLEL_DOWNCAST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Select the parallel narrow, returning the previous setting.
-#[doc(hidden)]
-pub fn set_fuse_bwd_parallel_downcast(on: bool) -> bool {
-    FUSE_BWD_PARALLEL_DOWNCAST.swap(on, std::sync::atomic::Ordering::Relaxed)
-}
-
 static FUSE_BWD_DOWNCAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FUSE_BWD_WIDEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6556,14 +6519,16 @@ impl FrankenTorchSession {
                     // The tape carries gradients in f64 even for an f32 op; downcast once,
                     // here, exactly as the f32 conv2d fast path does.
                     let downcast_start = std::time::Instant::now();
-                    let incoming: Vec<f32> = if FUSE_BWD_PARALLEL_DOWNCAST
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        use rayon::prelude::*;
-                        grad_outputs[0].par_iter().map(|&v| v as f32).collect()
-                    } else {
-                        grad_outputs[0].iter().map(|&v| v as f32).collect()
-                    };
+                    // Through the shared SIZE-GATED helper, not an ad-hoc par_iter. My first
+                    // version of this fix parallelised unconditionally, which is wrong for small
+                    // shapes: `GRADIENT_NARROW_PARALLEL_MIN`'s compile-time assert records that
+                    // folding the narrow's gate down to the widen's "ships a measured 4.3x
+                    // pessimization at 64 threads", because a narrow reads 8 bytes and writes 4
+                    // and so amortizes a fork/join over ~6.5x less serial work. This lane's
+                    // 5,242,880 elements clear the 1<<22 gate, so the measured win is unchanged,
+                    // and every smaller conv2d shape is now protected instead of pessimised.
+                    // `set_gradient_narrow_serial` is the paired LEVER-OFF twin.
+                    let incoming: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                     FUSE_BWD_DOWNCAST_NS.fetch_add(
                         downcast_start.elapsed().as_nanos() as u64,
                         std::sync::atomic::Ordering::Relaxed,
