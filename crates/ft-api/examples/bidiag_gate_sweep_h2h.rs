@@ -1426,6 +1426,46 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             );
         }
 
+        // CHOLESKY `dgemm_bt_sub_into` CENSUS — `frankentorch-valnx`.
+        //
+        // A dgemm_sub_into 2-D arm won its microprobe yet moved only 5 of 31 live slogdet calls,
+        // so its lane effect was indistinguishable from the A/A null. Count the actual Cholesky
+        // calls and their measured GEMM time before proposing the analogous transposed-right arm.
+        // This is one extra, explicitly instrumented FT call outside the timed estimator.
+        if ft_op == LinalgOp::Cholesky {
+            let previous = ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(true);
+            let _ = ft_kernel_cpu::dgemm_bt_sub_census_take();
+            let probe = ft_one(n, &data, arms[0], ft_op);
+            std::hint::black_box(&probe);
+            let census = ft_kernel_cpu::dgemm_bt_sub_census_take();
+            ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(previous);
+            let total_ns: u64 = census.iter().map(|entry| entry.elapsed_ns).sum();
+            let eligible_ns: u64 = census
+                .iter()
+                .filter(|entry| entry.eligible_2d)
+                .map(|entry| entry.elapsed_ns)
+                .sum();
+            eprintln!(
+                "cholesky dgemm_bt_sub census (one instrumented call): calls={} eligible_2d={} \
+                 gemm={:.3} ms eligible_gemm={:.3} ms ({:.1}%)",
+                census.len(),
+                census.iter().filter(|entry| entry.eligible_2d).count(),
+                total_ns as f64 / 1e6,
+                eligible_ns as f64 / 1e6,
+                100.0 * eligible_ns as f64 / total_ns.max(1) as f64,
+            );
+            for entry in census {
+                eprintln!(
+                    "  dgemm_bt_sub shape {}x{}x{} eligible_2d={} gemm={:.3} ms",
+                    entry.m,
+                    entry.k,
+                    entry.n,
+                    entry.eligible_2d,
+                    entry.elapsed_ns as f64 / 1e6,
+                );
+            }
+        }
+
         let (load_after, mhz_after) = provenance();
         let pt_min = pt_all.iter().copied().fold(f64::INFINITY, f64::min);
         let pt_max = pt_all.iter().copied().fold(0.0f64, f64::max);

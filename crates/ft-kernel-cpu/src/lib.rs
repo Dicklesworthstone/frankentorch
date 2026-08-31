@@ -69,9 +69,25 @@ const AVG_POOL2D_BACKWARD_SIMD_LANES: usize = 4;
 type BatchedLuPartsF64 = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
 type SvdTripleF64 = (Vec<f64>, Vec<f64>, Vec<f64>);
 
+/// One observed `dgemm_bt_sub_into` call from an explicitly enabled census.
+///
+/// The collector is disabled by default, so production calls do not pay for its timing or lock.
+/// `frankentorch-valnx` uses it to determine whether a proposed 2-D arm reaches enough of a
+/// Cholesky lane to be worth implementing.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct DgemmBtSubCensusEntry {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub eligible_2d: bool,
+    pub elapsed_ns: u64,
+}
+
 #[allow(unsafe_code, clippy::items_after_test_module)]
 mod gemm {
     use rayon::prelude::*;
+    use super::DgemmBtSubCensusEntry;
 
     // Above this many fused multiply-adds, split the GEMM across output row
     // blocks and run them on the rayon pool. `matrixmultiply` is single-threaded,
@@ -158,6 +174,25 @@ mod gemm {
     /// sweep is a gate fitted to one dataset, which is why the crossover is quoted above rather
     /// than merely asserted; item 279 records that the size curve IS the result.
     const TILE_2D_MIN_AREA: usize = 128 * 128;
+
+    /// Opt-in execution census for `dgemm_bt_sub_into`. The matching `dgemm_sub_into` sentinel
+    /// found that only 5 of 31 calls in a candidate lane reached its 2-D arm; count reach before
+    /// writing another tiling lever.
+    pub(crate) static DGEMM_BT_SUB_CENSUS_ENABLED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(crate) static DGEMM_BT_SUB_CENSUS: std::sync::Mutex<Vec<DgemmBtSubCensusEntry>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn dgemm_bt_sub_census_enabled() -> bool {
+        DGEMM_BT_SUB_CENSUS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_dgemm_bt_sub_census(entry: DgemmBtSubCensusEntry) {
+        let mut entries = DGEMM_BT_SUB_CENSUS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.push(entry);
+    }
 
     /// Whether `dgemm_sub_into` may tile BOTH output axes when the column split alone cannot
     /// fill the pool. `frankentorch-valnx`. DEFAULT OFF until it has a paired row.
@@ -606,8 +641,14 @@ mod gemm {
         let a = &a[..m * k];
         let b = &b[..n * k];
         let nb = block_cols(n);
+        let col_blocks = n.div_ceil(nb);
+        let threads = rayon::current_num_threads().max(1);
+        let eligible_2d = col_blocks < threads
+            && m >= 2 * MIN_BLOCK_ROWS
+            && m.saturating_mul(n) >= TILE_2D_MIN_AREA;
+        let census_started = dgemm_bt_sub_census_enabled().then(std::time::Instant::now);
         let cp = TilePtr(c.as_mut_ptr());
-        (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+        (0..col_blocks).into_par_iter().for_each(|blk| {
             let cp = &cp;
             let n0 = blk * nb;
             let bw = (n0 + nb).min(n) - n0;
@@ -634,6 +675,15 @@ mod gemm {
                 );
             }
         });
+        if let Some(started) = census_started {
+            record_dgemm_bt_sub_census(DgemmBtSubCensusEntry {
+                m,
+                k,
+                n,
+                eligible_2d,
+                elapsed_ns: started.elapsed().as_nanos() as u64,
+            });
+        }
     }
 
     /// Fused trailing-update: `C_sub -= A · B` (B NOT transposed, contiguous
@@ -34822,6 +34872,22 @@ pub fn dgemm_sub_arm_hits_take() -> (u64, u64) {
         gemm::DGEMM_SUB_TILE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
         gemm::DGEMM_SUB_COL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// Enable or disable collection of `dgemm_bt_sub_into` call shapes and elapsed GEMM time.
+/// Returns the previous setting. Disabled by default so this is instrumentation, not a lever.
+#[doc(hidden)]
+pub fn set_dgemm_bt_sub_census_enabled(on: bool) -> bool {
+    gemm::DGEMM_BT_SUB_CENSUS_ENABLED.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drain the opt-in `dgemm_bt_sub_into` execution census. `frankentorch-valnx`.
+#[doc(hidden)]
+pub fn dgemm_bt_sub_census_take() -> Vec<DgemmBtSubCensusEntry> {
+    let mut entries = gemm::DGEMM_BT_SUB_CENSUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *entries)
 }
 
 #[doc(hidden)]
