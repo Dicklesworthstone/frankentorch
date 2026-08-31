@@ -40719,3 +40719,74 @@ memory floor after six refutations (items 265-269, 276); dweight's GEMM half run
 box's square-GEMM ceiling; its gather half is at exactly 1x redundancy with the only reachable
 residue measured and rejected. **The remaining options are parity-breaking (split-K, panel-free) and
 both are already measured at 1.12x and 0.268x, so they are a policy question, not a lever.**
+
+---
+
+## 282. THE HEADLINE LANE DOES NOT COMPUTE A WEIGHT GRADIENT — four shipped levers are routed away from it, and the last candidate that DOES execute there is a clean null
+
+`frankentorch-t1gph`. Two results: a routing correction that changes what this bead's number means,
+and the seventh refutation on its dinput frame.
+
+### 282a. ROUTING: `conv2d_f32_masked` passes `weight_grad = false`
+
+Verified from harness source, no measurement gate required:
+
+    :2873  "conv2d_f32_masked"        -> timed_conv2d_f32(..., weight_grad = FALSE)
+    :1886  torch arm uses c2w32            (no requires_grad)
+    :2892  "conv2d_f32_masked_train"  -> timed_conv2d_f32(..., weight_grad = TRUE)
+    :1887  torch arm uses c2w32_train     (requires_grad_(True))
+
+`conv2d_backward_mask_fused_f32` builds dweight only under `output_mask[1]`, so the headline lane
+is FORWARD + DINPUT-ONLY BACKWARD and **never enters the streamed dweight at all**. Therefore the
+streamed dweight (263), the mb/min_nb sweeps (277), the f32 n-split (278, 1.5468x) and the f64
+n-split (280, 1.2299x) **cannot move this bead's headline number.** They move
+`conv2d_f32_masked_TRAIN`. Only the tiled `dout_flat` transpose (276a, 1.0401x) reaches the
+headline lane, because `dout_flat` is built whenever `output_mask[0] || output_mask[1]`.
+
+This is ledger 264's shape again — the routine was improved and the routing checked afterwards.
+**Grep the harness for the lane's own call and read its flags BEFORE optimising a frame.** The
+h2h harness already prints the sentinel that would have shown it ("streamed f32 dweight ran 96
+time(s) in the incumbent conv2d_f32_masked_train"), and it names the `_train` lane only.
+
+### 282b. Two candidates killed at zero cost, one measured
+
+* **Nested rayon in the dinput inner GEMM — REFUTED ON CONSTANTS, no code written.**
+  `should_parallelize(m, k, n)` requires `flops >= 1<<24` (16.78M) or `m >= 1024`; the dinput GEMM
+  runs at m=512, k=32, n=288 = **4.72M flops with m=512**, so it is already serial and there is no
+  nesting to remove.
+* **Anything dweight** — excluded by 282a.
+* **The scratch allocation — MEASURED, and it is a clean null.** The route parallelises over BATCH
+  and each of the 160 batch tasks calls `build_uninit(512 * 288)` = 590 KiB: 160 fresh allocations
+  per backward call, every one above glibc's 128 KiB mmap threshold, hence an mmap whose pages
+  fault on first touch inside `sgemm`'s write. Reusing one buffer per rayon worker
+  (`for_each_init`) makes that ~`threads` allocations.
+
+      OFF per-batch 11.065 ms   ON per-worker 11.111 ms
+      marginal 0.9959x   paired 1.0007x   SIGN TEST 10/20   A/A null 1.0060 PASS
+
+  **10 of 20 is the coin flip** — not a weak effect, the absence of one. glibc's free list already
+  recycles those blocks across rayon tasks, so the mmap/first-touch reasoning was simply wrong.
+  Bit-exact (pinned by a short-tail fixture built to expose stale reads), and reverted.
+
+### 282c. THE dinput FRAME IS FINISHED — seven refutations
+
+    general-dout 3x3         REFUTED (265)
+    second panel elimination REFUTED (266)
+    scatter loop tightening  NULL, pre-specified (268)
+    gather inversion         REFUTED (269)
+    block budget             SWEPT, shipped value is the interior optimum (272)
+    panel-free rewrite       REFUTED, 0.268x at rayon=16 (276)
+    per-worker scratch       NULL, 10/20 sign test (this item)
+
+At ~16 GB/s on a 47.2M-element scatter this is at its memory floor for this algorithm, and the
+allocation story was the last cheap idea. **Do not file another dinput lever.**
+
+### 282d. The number itself could not be refreshed
+
+Four attempts to certify the vs-torch standing on thinkstation1 were all voided by
+`drift_gate=LOAD-DRIFTED` (4.75->8.71, 5.50->7.05, 6.04->8.69, and 7.18->8.10 which passed the
+endpoint gate but failed the series gate at 1.358x). The cause is arithmetic: our 16 rayon threads
+plus torch's 8 ARE the rise, and the gate needs
+`start_load >= 4 * self_load * (1 - exp(-T/60))` ~ 86 at this width — unreachable on a 32-core box,
+and **waiting for a quiet host makes it strictly worse** because `start_load` falls. The banked
+2.34-2.39x therefore STANDS; the voided runs' 2.11-2.33x are not rows and must not be quoted.

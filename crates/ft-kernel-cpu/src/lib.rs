@@ -9549,35 +9549,6 @@ fn conv2d_dinput_block_rows_f32(patch_width: usize) -> usize {
     (budget / (patch_width * size_of::<f32>())).max(1)
 }
 
-/// Whether the f32 dinput route reuses one scratch block per WORKER instead of one per batch item.
-///
-/// `frankentorch-t1gph`. This route parallelises over BATCH, and each of the 160 batch tasks at the
-/// f32 lane's shape calls `build_uninit(block_rows * patch_width)` = 512 * 288 floats = 590 KiB.
-/// That is 160 fresh 590 KiB allocations per backward call, every one above glibc's 128 KiB mmap
-/// threshold — so every one is an mmap whose pages fault on FIRST TOUCH inside `sgemm`'s write.
-/// Reusing a per-worker buffer via rayon's `for_each_init` makes that roughly `threads`
-/// allocations, with the remaining batch items reusing warm pages.
-///
-/// It is the last untested candidate that actually EXECUTES on this bead's headline lane. The lane
-/// passes `weight_grad = false`, so every dweight lever (263, 277, 278, 280) is routed away from
-/// it; nested rayon in the inner GEMM was refuted on constants without writing code
-/// (`should_parallelize(512, 32, 288)` is false — 4.72M flops against a 16.78M floor and m below
-/// the 1024 tall-path row count); and the dinput frame already carries six refutations
-/// (265, 266, 268, 269, 272, 276).
-///
-/// BIT-EXACT by construction: pure buffer reuse, no arithmetic change. It relies on exactly the
-/// invariant the loop already documents — `sgemm` overwrites the prefix of every block before the
-/// scatter reads it, and short tails read only the prefix they wrote — so nothing stale is ever
-/// observed. DEFAULT OFF until it has a paired row.
-static CONV2D_DINPUT_WORKER_SCRATCH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Select the per-worker dinput scratch buffer, returning the previous setting.
-#[doc(hidden)]
-pub fn set_conv2d_dinput_worker_scratch(on: bool) -> bool {
-    CONV2D_DINPUT_WORKER_SCRATCH.swap(on, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// [`conv2d_backward_dinput_direct_f32`] with the block width supplied, so a test can drive it.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
@@ -9607,18 +9578,13 @@ fn conv2d_backward_dinput_blocked_rows_f32(
     if batch == 0 || in_ch == 0 || out_ch == 0 || patch_count == 0 || patch_width == 0 {
         return dpadded;
     }
-    let reuse_scratch = CONV2D_DINPUT_WORKER_SCRATCH.load(std::sync::atomic::Ordering::Relaxed);
     let patch_origins: Vec<(usize, usize)> = (0..patch_count)
         .map(|pc| ((pc / ow) * sh, (pc % ow) * sw))
         .collect();
     dpadded
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
-        // ONE SCRATCH BLOCK PER WORKER, not per batch item — `frankentorch-t1gph`. See
-        // `CONV2D_DINPUT_WORKER_SCRATCH`. `for_each_init` hands each rayon worker a slot it keeps
-        // across the batch items it steals, so the 590 KiB block is allocated ~`threads` times
-        // instead of `batch` times and its pages stay warm.
-        .for_each_init(Vec::<f32>::new, |worker_scratch, (b, dpb)| {
+        .for_each(|(b, dpb)| {
             let scatter = |block: &[f32], start: usize, rows: usize, dpb: &mut [f32]| {
                 for r in 0..rows {
                     let pc = start + r;
@@ -9687,43 +9653,16 @@ fn conv2d_backward_dinput_blocked_rows_f32(
             let first_rows = block_rows.min(patch_count);
             let first =
                 &dout_flat[(b * patch_count) * out_ch..(b * patch_count + first_rows) * out_ch];
-            let mut block = if reuse_scratch {
-                // Grow once per worker, then reuse. `resize` only ever extends here because
-                // `first_rows` is the largest block this call uses, so after the first batch item
-                // the buffer is already long enough and no reallocation occurs.
-                if worker_scratch.len() < first_rows * patch_width {
-                    worker_scratch.resize(first_rows * patch_width, 0.0);
-                }
-                gemm::sgemm(
-                    first_rows,
-                    out_ch,
-                    patch_width,
-                    first,
-                    weight_flat,
-                    &mut worker_scratch[..first_rows * patch_width],
-                );
-                Vec::new()
-            } else {
-                build_uninit(first_rows * patch_width, |block| {
-                    gemm::sgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
-                })
-            };
-            let owned = !reuse_scratch;
-            if owned {
-                scatter(&block, 0, first_rows, dpb);
-            } else {
-                scatter(&worker_scratch[..first_rows * patch_width], 0, first_rows, dpb);
-            }
+            let mut block = build_uninit(first_rows * patch_width, |block| {
+                gemm::sgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
+            });
+            scatter(&block, 0, first_rows, dpb);
             let mut start = first_rows;
             while start < patch_count {
                 let rows = block_rows.min(patch_count - start);
                 let a = &dout_flat
                     [(b * patch_count + start) * out_ch..(b * patch_count + start + rows) * out_ch];
-                let dp = if owned {
-                    &mut block[..rows * patch_width]
-                } else {
-                    &mut worker_scratch[..rows * patch_width]
-                };
+                let dp = &mut block[..rows * patch_width];
                 gemm::sgemm(rows, out_ch, patch_width, a, weight_flat, dp);
                 scatter(dp, start, rows, dpb);
                 start += rows;
@@ -50051,63 +49990,6 @@ mod tests {
         }
         assert_eq!(super::conv2d_dinput_group_channels(0, 4), 1);
         assert_eq!(super::conv2d_dinput_group_channels(8, 0), 1);
-    }
-
-    #[test]
-    fn conv2d_dinput_worker_scratch_matches_the_per_batch_allocation_bitwise() {
-        // `frankentorch-t1gph`. Reusing one scratch block per rayon WORKER instead of allocating
-        // one per batch item is pure buffer reuse, so bitwise is the right assertion — and the
-        // risk it carries is STALE DATA, not rounding: a reused buffer holds the previous batch
-        // item's values, and the route is only safe because `sgemm` overwrites the prefix of every
-        // block before the scatter reads it and short tails read only the prefix they wrote.
-        //
-        // The fixture is built to break that invariant if it does not hold. `patch_count` is NOT a
-        // multiple of the block width, so the final block of every batch item is a SHORT TAIL
-        // reading a buffer whose remainder still holds the previous item's numbers; and batch > 1
-        // with per-batch-distinct values means a stale read produces a WRONG answer rather than a
-        // coincidentally equal one.
-        for (batch, in_ch, out_ch, kh, kw, h, w, block_rows) in [
-            (3usize, 3usize, 5usize, 2usize, 3usize, 5usize, 7usize, 13usize),
-            (2, 4, 4, 3, 3, 6, 6, 7),
-        ] {
-            let (ph, pw) = (h + kh - 1, w + kw - 1);
-            let (oh, ow) = (h, w);
-            let flat = batch * oh * ow;
-
-            // Per-batch-distinct magnitudes: a stale block from item b-1 cannot look like item b.
-            let dout_flat: Vec<f32> = (0..flat * out_ch)
-                .map(|i| {
-                    let item = i / (oh * ow * out_ch);
-                    (i as f32 - 11.0) * 0.03125 + (item as f32) * 100.0
-                })
-                .collect();
-            let weight: Vec<f32> = (0..out_ch * in_ch * kh * kw)
-                .map(|i| (i as f32 - 7.0) * 0.0625)
-                .collect();
-
-            let previous = super::set_conv2d_dinput_worker_scratch(false);
-            let per_batch = super::conv2d_backward_dinput_blocked_rows_f32(
-                &dout_flat, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, 1, 1, out_ch,
-                block_rows,
-            );
-            super::set_conv2d_dinput_worker_scratch(true);
-            let per_worker = super::conv2d_backward_dinput_blocked_rows_f32(
-                &dout_flat, &weight, batch, in_ch, ph, pw, kh, kw, oh, ow, 1, 1, out_ch,
-                block_rows,
-            );
-            super::set_conv2d_dinput_worker_scratch(previous);
-
-            assert_eq!(per_batch.len(), per_worker.len());
-            for (index, (a, b)) in per_batch.iter().zip(&per_worker).enumerate() {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "dinput[{index}] differs at batch={batch} block_rows={block_rows} \
-                     patch_count={}: per-batch {a:e} vs per-worker {b:e}",
-                    oh * ow
-                );
-            }
-        }
     }
 
     #[test]
