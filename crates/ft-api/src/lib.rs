@@ -29393,7 +29393,6 @@ impl FrankenTorchSession {
     /// Small gradients (a bias vector is `out_ch` elements) are left to the serial path by the caller:
     /// a rayon fork costs more than the work.
     fn widen_grad_f32_to_f64(values: &[f32]) -> Vec<f64> {
-        use rayon::prelude::*;
         // POOL HOOK TRIED AND REVERTED — `frankentorch-ymhld`, measured 2026-08-20.
         //
         // This `collect` allocates ~47 MiB per backward, and a phase split named that allocation
@@ -29411,8 +29410,17 @@ impl FrankenTorchSession {
         // costing 440 MiB; this is the same result on a much larger buffer. Reverted rather than
         // shipped, and recorded here so the next person does not re-file it.
         //
-        // The PARALLEL widen below stays: that one is measured at -22.9 ms on this phase.
-        values.par_iter().map(|&v| f64::from(v)).collect()
+        // The PARALLEL widen stays: that one is measured at -22.9 ms on this phase.
+        //
+        // DELEGATES to the gated `widen_f32_to_f64` — `frankentorch-dwto7`. This function was a
+        // SECOND implementation of that helper, minus its `GRADIENT_WIDEN_PARALLEL_MIN` gate, so
+        // its six call sites (the f32 conv2d mask fusion, `functional_conv2d`, `functional_conv3d`)
+        // parallelised unconditionally. That is the same defect my own first narrow carried: right
+        // for the large lane it was measured on, wrong for every smaller shape reaching the same
+        // closure. Behaviour is unchanged above the gate — the conv2d lane's dpadded is 5,922,560
+        // elements against a 1<<20 gate — so no perf claim is made here; below it, six sites stop
+        // paying a fork/join they cannot amortise.
+        widen_f32_to_f64(values)
     }
 
     fn is_exact_all_ones_f64(values: &[f64]) -> bool {
