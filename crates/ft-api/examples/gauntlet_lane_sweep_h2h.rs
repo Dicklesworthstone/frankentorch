@@ -1244,15 +1244,6 @@ fn conv2d_frames_reset() {
 /// also the one way to guarantee it printed nothing. That is how a 50-minute wait for a
 /// contended local window became the only route to numbers that never needed the incumbent.
 fn conv2d_frame_diagnostics(name: &str, ft_ms: f64) {
-    if name == "conv2d_f32_masked_train_sumcut" {
-        let hits = CONV2D_F32_SUMCUT_HITS.with(std::cell::Cell::get);
-        println!(
-            "    sentinel: the conv2d-f32-mask SUM SHORTCUT fired {hits} time(s) in this arm. \
-             The pair prices the lever only if this is NONZERO — the two arms differ by ~1 ms on \
-             a 43 ms lane, well inside what noise could fake, so a silent never-fire would read \
-             as a small win."
-        );
-    }
     if name == "conv2d_f32_masked_train_dwpanel" {
         let calls = CONV2D_F32_STREAMED_CALLS.with(std::cell::Cell::get);
         let legacy = CONV2D_F32_LEGACY_CALLS.with(std::cell::Cell::get);
@@ -1451,29 +1442,7 @@ fn timed_conv2d_f32(
     batch: usize,
     weight_grad: bool,
 ) -> (f64, f64) {
-    timed_conv2d_f32_with(values, weights, mask, batch, weight_grad, false)
-}
-
-/// `frankentorch-qnfq8`: the same lane with the conv2d-f32-mask SUM SHORTCUT selectable.
-///
-/// The lane's loss is a plain `tensor_sum`, so its backward materialises 5.24M f64 ones (42 MB,
-/// 2.385 ms) which the fused node then narrows to f32 (1.692 ms) — 4.077 ms of a 45.604 ms lane
-/// spent carrying a constant. torch's `sum().backward()` is a stride-0 expanded view and pays
-/// neither. The shortcut hands the fused backward its scalar directly.
-fn timed_conv2d_f32_with(
-    values: &[f32],
-    weights: &[f32],
-    mask: Option<&[f32]>,
-    batch: usize,
-    weight_grad: bool,
-    sum_shortcut: bool,
-) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-    session.set_conv2d_f32_mask_sum_shortcut(sum_shortcut);
-    // EXECUTION SENTINEL. A lever that silently never fires reads as a small null, and this pair
-    // differs by ~1 ms on a 43 ms lane — well inside the range noise could fake. Counted, not
-    // inferred from the timing.
-    let sentinel = sum_shortcut;
     let x = session
         .tensor_variable_f32(values.to_vec(), vec![batch, C2_CI, C2_H, C2_W], true)
         .expect("conv2d f32 leaf");
@@ -1508,17 +1477,7 @@ fn timed_conv2d_f32_with(
         .iter()
         .map(|g| g.abs())
         .sum::<f64>();
-    if sentinel {
-        CONV2D_F32_SUMCUT_HITS.with(|cell| {
-            cell.set(cell.get() + session.conv2d_f32_mask_sum_shortcut_hits());
-        });
-    }
     (elapsed, checksum)
-}
-
-thread_local! {
-    /// `frankentorch-qnfq8`: how many times the sum shortcut fired across the sumcut lane's samples.
-    static CONV2D_F32_SUMCUT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Linear train step: `y = x @ W^T`, with the WEIGHT requiring grad — the only reason this lane
@@ -2022,10 +1981,6 @@ LANES = {
     # The same lane with the streamed f32 dweight FORCED OFF, so the pair differs in exactly one
     # thing. Same torch code under a second name = a free ~1.0 control on the window.
     "conv2d_f32_masked_train_dwpanel": (c2x32, lambda x: Fn.conv2d(x,c2w32_train,None,(1,1),(1,1))*c2m32),
-    # frankentorch-qnfq8: the sum-shortcut twin. Byte-identical torch code under a second name, so
-    # PT(sumcut)/PT(train) is a free ~1.0 control and FT(sumcut)/FT(train) prices the lever inside
-    # ONE invocation against the live incumbent.
-    "conv2d_f32_masked_train_sumcut": (c2x32, lambda x: Fn.conv2d(x,c2w32_train,None,(1,1),(1,1))*c2m32),
     # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
     # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-88d36e2f dpanel + col2im dinput.
     "conv2d_f32_masked_panel": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
@@ -3071,20 +3026,6 @@ LANES = {
                     cell.set(cell.get() + ft_kernel_cpu::take_conv2d_dweight_streamed_calls());
                 });
                 sample
-            }),
-        ),
-        (
-            // `frankentorch-qnfq8`: the SUM-SHORTCUT twin of `conv2d_f32_masked_train`. The
-            // incumbent runs byte-identical code under both names, so PT(sumcut)/PT(train) is a
-            // free ~1.0 control and the pair prices the lever against the LIVE incumbent inside
-            // one invocation.
-            //
-            // The shortcut is DEFAULT OFF in the session (it has no create_graph arm yet), so the
-            // toggled arm is this one and the incumbent arm is what production runs — the
-            // orientation `feedback_unset_knob_means_forced_off` insists on.
-            "conv2d_f32_masked_train_sumcut",
-            Box::new(|| {
-                timed_conv2d_f32_with(&c2x32, &c2w32, Some(&c2m32), C2F32_N, true, true)
             }),
         ),
         (

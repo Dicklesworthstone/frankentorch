@@ -888,23 +888,6 @@ fn conv2d_f32_mask_create_graph_gradients(
 
     Ok(gradients)
 }
-/// Registered on the f32 conv2d/loss-mask fused node so a following plain `tensor_sum` reaches a
-/// scalar-loss backward instead of materialising a per-element `dy`. `frankentorch-qnfq8`.
-///
-/// WITHOUT THIS the lane pays twice for a buffer that is entirely `1.0`: `tensor_sum`'s backward
-/// materialises 5.24M f64 ones (a 42 MB allocation, measured 2.385 ms) and the fused node's
-/// backward then NARROWS that buffer to f32 (1.692 ms) — 4.077 ms of a 45.604 ms lane, 8.9%.
-/// PyTorch's `sum().backward()` produces a stride-0 expanded view and pays neither, so this is a
-/// structural parity gap rather than a tuning question. Six ops already had this treatment
-/// (batch_norm1d/2d_f32, group_norm_f32, prelu, avg_pool1d/2d); the conv2d mask fusion did not,
-/// which is why those two frames are nonzero here and measure ZERO on the group_norm lanes.
-#[derive(Clone, Copy)]
-struct Conv2dF32MaskSumShortcut {
-    plan: Conv2dMaskPlan,
-    mask: TensorNodeId,
-    numel: usize,
-}
-
 /// Registered on the f64 grad-path output of `tensor_prelu` so an immediately
 /// following `tensor_sum` can propagate its scalar upstream value without
 /// materialising the dense all-ones PReLU output gradient.
@@ -1028,33 +1011,6 @@ pub struct FrankenTorchSession {
     max_pool1d_sum_shortcuts: BTreeMap<usize, MaxPool1dSumShortcut>,
     max_pool3d_sum_shortcuts: BTreeMap<usize, MaxPool3dSumShortcut>,
     conv2d_mask_plans: BTreeMap<usize, Conv2dMaskPlan>,
-    /// Fused conv2d-f32-mask nodes whose consumer may be a plain `tensor_sum`.
-    /// `frankentorch-qnfq8`. Keyed on the FUSED node so `tensor_sum` can find it.
-    conv2d_f32_mask_sum_shortcuts: BTreeMap<usize, Conv2dF32MaskSumShortcut>,
-    /// Whether `sum(conv2d_f32(..) * mask)` takes the scalar-loss shortcut, and how many times it
-    /// has fired. `frankentorch-qnfq8`.
-    ///
-    /// **DEFAULT OFF, for second-order correctness rather than doubt about the speed.** The
-    /// shortcut node is built with `tensor_apply_function_f32_output_borrowed_inputs`, which
-    /// registers NO create_graph arm, while the fused node it replaces carries a 279-line one.
-    /// With the shortcut live, `backward(create_graph: true)` on this loss FAILS CLOSED with
-    /// "create_graph for this custom function requires a create_graph backward" — an honest error,
-    /// never a wrong second derivative. No forward-time guard can help: `create_graph` is chosen
-    /// when `.backward()` is called, long after this node is built, and
-    /// `fuse_conv2d_loss_mask_f32` records an earlier attempt at exactly such a guard failing to
-    /// compile.
-    ///
-    /// TO SHIP IT: extract the fused node's create_graph arm into a shared function taking the
-    /// per-element upstream node, and have this shortcut broadcast its SCALAR upstream to the
-    /// output shape and call it. The broadcast costs a materialisation, but only on the
-    /// create_graph path, which is the rare one — the first-order fast path never builds it.
-    ///
-    /// SESSION-SCOPED, not a global atomic, deliberately: the sibling levers in this file use
-    /// process-wide statics, and a process-wide toggle plus `cargo test`'s parallel harness is a
-    /// race — flipping it in one test made an UNRELATED second-derivative test fail. Per-session
-    /// state cannot do that.
-    conv2d_f32_mask_sum_shortcut: bool,
-    conv2d_f32_mask_sum_shortcut_hits: u64,
 }
 
 impl std::fmt::Debug for FrankenTorchSession {
@@ -1299,9 +1255,6 @@ impl FrankenTorchSession {
             batch_norm1d_sum_shortcuts: BTreeMap::new(),
             batch_norm2d_f32_sum_shortcuts: BTreeMap::new(),
             group_norm_f32_sum_shortcuts: BTreeMap::new(),
-            conv2d_f32_mask_sum_shortcuts: BTreeMap::new(),
-            conv2d_f32_mask_sum_shortcut: false,
-            conv2d_f32_mask_sum_shortcut_hits: 0,
             prelu_sum_shortcuts: BTreeMap::new(),
             avg_pool1d_sum_shortcuts: BTreeMap::new(),
             avg_pool2d_sum_shortcuts: BTreeMap::new(),
@@ -1377,7 +1330,6 @@ impl FrankenTorchSession {
         self.batch_norm1d_sum_shortcuts.clear();
         self.batch_norm2d_f32_sum_shortcuts.clear();
         self.group_norm_f32_sum_shortcuts.clear();
-        self.conv2d_f32_mask_sum_shortcuts.clear();
         self.prelu_sum_shortcuts.clear();
         self.avg_pool1d_sum_shortcuts.clear();
         self.avg_pool2d_sum_shortcuts.clear();
@@ -6966,17 +6918,6 @@ impl FrankenTorchSession {
                 },
             )?;
         self.conv2d_mask_plans.remove(&lhs.0);
-        // `frankentorch-qnfq8`: make this node reachable from a following plain `tensor_sum`. One
-        // map insert; it changes behaviour only if a `tensor_sum` actually consumes this exact
-        // node, and the shortcut declines when the node retains grad or carries hooks.
-        self.conv2d_f32_mask_sum_shortcuts.insert(
-            fused.0,
-            Conv2dF32MaskSumShortcut {
-                plan,
-                mask: rhs,
-                numel: plan.batch * plan.out_channels * plan.output_h * plan.output_w,
-            },
-        );
         Ok(Some(fused))
     }
 
@@ -26674,9 +26615,6 @@ impl FrankenTorchSession {
         if let Some(out) = self.try_batch_norm2d_f32_sum_shortcut(input)? {
             return Ok(out);
         }
-        if let Some(out) = self.try_conv2d_f32_mask_sum_shortcut(input)? {
-            return Ok(out);
-        }
         if let Some(out) = self.try_group_norm_f32_sum_shortcut(input)? {
             return Ok(out);
         }
@@ -27329,151 +27267,6 @@ impl FrankenTorchSession {
                 input.0, source.0, out.0
             ),
         );
-        Ok(Some(out))
-    }
-
-    /// Enable or disable the conv2d-f32-mask sum shortcut for THIS session, returning the
-    /// previous setting. See the field for why it is off by default.
-    #[doc(hidden)]
-    pub fn set_conv2d_f32_mask_sum_shortcut(&mut self, on: bool) -> bool {
-        std::mem::replace(&mut self.conv2d_f32_mask_sum_shortcut, on)
-    }
-
-    /// How many times the shortcut fired in this session — an execution sentinel, because a lever
-    /// that silently never fires reads as a null.
-    #[doc(hidden)]
-    pub fn conv2d_f32_mask_sum_shortcut_hits(&self) -> u64 {
-        self.conv2d_f32_mask_sum_shortcut_hits
-    }
-
-    /// `sum(conv2d_f32(padded, w, b) * mask)` without ever materialising the per-element `dy`.
-    /// `frankentorch-qnfq8`.
-    ///
-    /// The generic route builds a 5.24M f64 buffer of ones in `tensor_sum`'s backward (42 MB,
-    /// 2.385 ms) and the fused node then narrows it to f32 (1.692 ms) — 4.077 ms of a 45.604 ms
-    /// lane. Both frames exist only to carry a constant. Here the upstream arrives as the SCALAR
-    /// `grad_outputs[0][0]`, so the f32 upstream is built directly at the size the kernel wants
-    /// and neither the f64 buffer nor the narrow ever happens.
-    ///
-    /// BIT-EXACT, and by construction rather than by tolerance: the generic path computes
-    /// `narrow(vec![g_f64; n])` and this one computes `vec![g_f64 as f32; n]`. Same value, same
-    /// per-element cast, same order — the kernel below then receives an identical `incoming`.
-    ///
-    /// Declines (returning `None`, so the generic path runs) when the node retains grad or carries
-    /// hooks, exactly as the six sibling shortcuts do: either means someone can observe the
-    /// intermediate this route never materialises.
-    fn try_conv2d_f32_mask_sum_shortcut(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<Option<TensorNodeId>, AutogradError> {
-        if !self.conv2d_f32_mask_sum_shortcut {
-            return Ok(None);
-        }
-        let Some(shortcut) = self.conv2d_f32_mask_sum_shortcuts.get(&input.0).copied() else {
-            return Ok(None);
-        };
-        if self.tensor_tape.tensor_retains_grad(input)?
-            || self.tensor_tape.tensor_has_hooks(input)?
-        {
-            return Ok(None);
-        }
-
-        // The forward value is the sum of the fused node that already exists, so this reads the
-        // computed tensor rather than recomputing the convolution.
-        let sum = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            ft_kernel_cpu::sum_tensor_contiguous_f32(tensor.contiguous_values_f32()?, tensor.meta())
-                .map_err(|error| {
-                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
-                })?
-        };
-
-        self.conv2d_f32_mask_sum_shortcut_hits += 1;
-        let Conv2dF32MaskSumShortcut { plan, mask, numel } = shortcut;
-        let has_bias = plan.bias.is_some();
-        let mut inputs = vec![plan.padded, plan.weight];
-        if let Some(bias) = plan.bias {
-            inputs.push(bias);
-        }
-        inputs.push(mask);
-        let mask_index = inputs.len() - 1;
-
-        let out = self
-            .tensor_tape
-            .apply_function_f32_output_with_create_graph_borrowed_inputs(
-            &inputs,
-            move |_ctx, _ins| Ok((vec![sum], vec![1])),
-            move |ctx, grad_outputs, borrowed| {
-                let need = ctx.needs_input_grad().to_vec();
-                let need_input = need.first().copied().unwrap_or(false);
-                let need_weight = need.get(1).copied().unwrap_or(false);
-                #[allow(clippy::cast_possible_truncation)]
-                let upstream = grad_outputs[0][0] as f32;
-                // The whole point: a constant, built once at f32 width, instead of an f64 buffer
-                // plus a narrowing pass over it.
-                let incoming = vec![upstream; numel];
-                let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                    &incoming,
-                    borrowed[mask_index].0,
-                    borrowed[0].0,
-                    borrowed[1].0,
-                    plan.batch,
-                    plan.in_channels,
-                    plan.padded_h,
-                    plan.padded_w,
-                    plan.kernel_h,
-                    plan.kernel_w,
-                    plan.output_h,
-                    plan.output_w,
-                    plan.stride_h,
-                    plan.stride_w,
-                    plan.out_channels,
-                    [need_input, need_weight, has_bias],
-                );
-                // A missing gradient stays `None`; an empty vector reads as a real gradient of the
-                // wrong shape.
-                let mut gradients = vec![
-                    dpadded.map(|d| widen_f32_to_f64(&d)),
-                    dweight.map(|d| widen_f32_to_f64(&d)),
-                ];
-                if has_bias {
-                    gradients.push(dbias.map(|d| widen_f32_to_f64(&d)));
-                }
-                // The mask does not require grad.
-                gradients.push(None);
-                Ok(gradients)
-            },
-            // SECOND-ORDER ARM. This node's output is the SCALAR sum, so its upstream arrives as a
-            // scalar node, while the shared recipe wants the per-element upstream the fused node
-            // would have received. Broadcasting the scalar reconstructs exactly that, and the
-            // materialisation happens ONLY here — the first-order fast path, which is the whole
-            // point of the shortcut, never builds it.
-            //
-            // Sharing `conv2d_f32_mask_create_graph_gradients` rather than writing a second
-            // 279-line recipe is deliberate: two copies of a second-order derivation drift, and
-            // `project_double_backward_custom_op_vein` records this campaign already paying once
-            // for a fused fast path whose second order was wrong.
-            move |ctx, grad_outs, fn_inputs, tape| {
-                let dout = tape.expand(
-                    grad_outs[0],
-                    vec![
-                        plan.batch,
-                        plan.out_channels,
-                        plan.output_h,
-                        plan.output_w,
-                    ],
-                )?;
-                conv2d_f32_mask_create_graph_gradients(
-                    ctx,
-                    &[dout],
-                    fn_inputs,
-                    tape,
-                    plan,
-                    mask_index,
-                    has_bias,
-                )
-            },
-        )?;
         Ok(Some(out))
     }
 
@@ -107938,163 +107731,6 @@ mod tests {
     /// over for exactly this reason. The transcendentals are included deliberately: `transform`
     /// still runs in f64 and narrows, so any accidental switch to a native-f32 call would show up
     /// here as a last-bit difference rather than passing quietly.
-    /// `frankentorch-qnfq8`: with the shortcut LIVE, the SECOND derivative must agree with the
-    /// generic route's.
-    ///
-    /// This test began life asserting the opposite — that `create_graph` FAILED CLOSED, because
-    /// the shortcut node had no second-order arm and the tape refused rather than returning a
-    /// first-order-only answer. It was written so it would flip to an agreement test the moment
-    /// the arm existed. It has flipped: the fused node's 279-line create_graph recipe is now the
-    /// shared `conv2d_f32_mask_create_graph_gradients`, and the shortcut reaches it by expanding
-    /// its scalar upstream to the output shape.
-    ///
-    /// Not asserted bitwise, for the reason the sibling fused/unfused test gives: the two routes
-    /// build `incoming * mask` differently and can round apart by an ulp. A missing or wrong
-    /// second-order arm is off by orders of magnitude — commonly identically zero — which is why
-    /// the non-vacuity check below matters more than the tolerance.
-    #[test]
-    fn conv2d_f32_mask_sum_shortcut_second_derivative_matches_the_generic_route() {
-        let build = |shortcut: bool| -> Vec<f64> {
-            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-            session.set_conv2d_f32_mask_sum_shortcut(shortcut);
-            let x = session
-                .tensor_variable_f32(
-                    (0..2 * 3 * 5 * 5).map(|i| (i % 9) as f32 * 0.1 - 0.3).collect(),
-                    vec![2, 3, 5, 5],
-                    true,
-                )
-                .expect("x");
-            let w = session
-                .tensor_variable_f32(
-                    (0..4 * 3 * 3 * 3).map(|i| (i % 7) as f32 * 0.05 - 0.1).collect(),
-                    vec![4, 3, 3, 3],
-                    true,
-                )
-                .expect("w");
-            let m = session
-                .tensor_variable_f32(
-                    (0..2 * 4 * 5 * 5).map(|i| (i % 11) as f32 * 0.06 - 0.2).collect(),
-                    vec![2, 4, 5, 5],
-                    false,
-                )
-                .expect("mask");
-            let out = session
-                .functional_conv2d(x, w, None, (1, 1), (1, 1))
-                .expect("conv2d");
-            let scored = session.tensor_mul(out, m).expect("mask multiply");
-            let loss = session.tensor_sum(scored).expect("sum");
-            let report = session
-                .tensor_backward_with_options(
-                    loss,
-                    BackwardOptions {
-                        create_graph: true,
-                        ..BackwardOptions::strict_default()
-                    },
-                )
-                .expect("first backward with create_graph");
-            let hits = session.conv2d_f32_mask_sum_shortcut_hits();
-            assert_eq!(
-                hits > 0,
-                shortcut,
-                "shortcut fired {hits} time(s) with the toggle {shortcut}; the two arms must take \
-                 DIFFERENT routes or this test compares a path with itself"
-            );
-            let gx = report.gradient_node(x).expect("connected f32 input gradient");
-            let g_sum = session.tensor_sum(gx).expect("reduce the first derivative");
-            let second = session.tensor_backward(g_sum).expect("second backward");
-            session.tensor_gradient(&second, w).expect("d2/dw").to_vec()
-        };
-
-        let with_shortcut = build(true);
-        let generic = build(false);
-        assert_eq!(with_shortcut.len(), generic.len());
-        for (a, b) in with_shortcut.iter().zip(&generic) {
-            let scale = a.abs().max(b.abs()).max(1.0);
-            assert!(
-                (a - b).abs() / scale < 1e-6,
-                "shortcut second derivative {a} diverges from the generic route's {b}"
-            );
-        }
-        assert!(
-            with_shortcut.iter().any(|v| v.abs() > 1e-12),
-            "the second derivative is identically zero — the missing-create_graph-arm signature, \
-             which would make the comparison above vacuous"
-        );
-    }
-
-    /// `frankentorch-qnfq8`: the conv2d-f32-mask sum shortcut must be BITWISE identical to the
-    /// generic route it replaces, and it must actually FIRE.
-    ///
-    /// Both arms run in ONE process against the live incumbent path, toggled by
-    /// `set_conv2d_f32_mask_sum_shortcut`, so this is not a comparison against a remembered
-    /// constant. The sentinel is asserted in both directions because a shortcut that silently
-    /// never fires would pass a values-only check trivially — that is exactly the failure
-    /// `feedback_sentinel_before_fixing` records.
-    #[test]
-    fn conv2d_f32_mask_sum_shortcut_is_bitwise_identical_to_the_generic_sum() {
-        const N: usize = 2;
-        const CI: usize = 3;
-        const CO: usize = 4;
-        const H: usize = 7;
-        const W: usize = 5;
-        const K: usize = 3;
-
-        let x_values: Vec<f32> = (0..N * CI * H * W)
-            .map(|i| (i % 17) as f32 * 0.05 - 0.4)
-            .collect();
-        let w_values: Vec<f32> = (0..CO * CI * K * K)
-            .map(|i| (i % 11) as f32 * 0.03 - 0.15)
-            .collect();
-        // A NON-UNIFORM mask: a constant mask would leave the upstream uniform even on the
-        // generic path and the two routes could agree for the wrong reason.
-        let m_values: Vec<f32> = (0..N * CO * H * W)
-            .map(|i| (i % 13) as f32 * 0.07 - 0.3)
-            .collect();
-
-        let run = |shortcut: bool| -> (Vec<f64>, Vec<f64>, u64) {
-            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-            session.set_conv2d_f32_mask_sum_shortcut(shortcut);
-            let x = session
-                .tensor_variable_f32(x_values.clone(), vec![N, CI, H, W], true)
-                .expect("x");
-            let w = session
-                .tensor_variable_f32(w_values.clone(), vec![CO, CI, K, K], true)
-                .expect("w");
-            let m = session
-                .tensor_variable_f32(m_values.clone(), vec![N, CO, H, W], false)
-                .expect("mask");
-            let out = session
-                .functional_conv2d(x, w, None, (1, 1), (1, 1))
-                .expect("conv2d");
-            let scored = session.tensor_mul(out, m).expect("mask multiply");
-            let loss = session.tensor_sum(scored).expect("sum");
-            let report = session.tensor_backward(loss).expect("backward");
-            let dx = report.gradient(x).expect("dx").to_vec();
-            let dw = report.gradient(w).expect("dw").to_vec();
-            let hits = session.conv2d_f32_mask_sum_shortcut_hits();
-            (dx, dw, hits)
-        };
-
-        let (dx_off, dw_off, hits_off) = run(false);
-        let (dx_on, dw_on, hits_on) = run(true);
-
-        assert_eq!(hits_off, 0, "the shortcut ran with the toggle OFF");
-        assert!(
-            hits_on > 0,
-            "the shortcut never fired with the toggle ON, so this test compared the generic \
-             route against itself and proves nothing"
-        );
-
-        assert_eq!(dx_on.len(), dx_off.len());
-        for (i, (a, b)) in dx_on.iter().zip(dx_off.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(), "dx differs at {i}: {a:?} vs {b:?}");
-        }
-        assert_eq!(dw_on.len(), dw_off.len());
-        for (i, (a, b)) in dw_on.iter().zip(dw_off.iter()).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(), "dw differs at {i}: {a:?} vs {b:?}");
-        }
-    }
-
     #[test]
     fn f32_unary_in_place_is_bitwise_identical_to_the_clone_map_writeback_shape() {
         for len in [1usize, 3, 8191, 8192, 8193, 20_000] {
