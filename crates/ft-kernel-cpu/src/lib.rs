@@ -24802,6 +24802,45 @@ pub fn lu_pivot_swap_take_ns() -> (u64, u64) {
 
 /// Read and reset the getrf phase counters: `(panel_ns, solve_ns, trailing_ns)`.
 #[doc(hidden)]
+/// Wall time in the blocked multi-RHS solve's FORWARD (`L y = Pb`) and BACK (`U x = y`) halves.
+/// `frankentorch-37sxo`: `inv` is 55-64% this solve, and the identity-structure lever only touches
+/// the forward half, so its share decides whether that lever is worth writing at all.
+static LU_SOLVE_FWD_NS: AtomicU64 = AtomicU64::new(0);
+static LU_SOLVE_BACK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall time in the f64 solve's pivot-permutation frame. `frankentorch-37sxo`.
+static LU_SOLVE_PERM_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the f64 solve permutes the RHS by contiguous ROWS instead of strided COLUMN gathers.
+/// `frankentorch-37sxo`. DEFAULT OFF until it has a paired row.
+static LU_SOLVE_PERM_ROWWISE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Select the row-wise RHS permutation, returning the previous setting.
+#[doc(hidden)]
+pub fn set_lu_solve_perm_rowwise(on: bool) -> bool {
+    LU_SOLVE_PERM_ROWWISE.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn lu_solve_perm_rowwise() -> bool {
+    LU_SOLVE_PERM_ROWWISE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drain the f64 solve's pivot-permutation frame, in nanoseconds.
+#[doc(hidden)]
+pub fn lu_solve_perm_take_ns() -> u64 {
+    LU_SOLVE_PERM_NS.swap(0, LuOrdering::Relaxed)
+}
+
+/// Drain the blocked f64 solve's forward/back split, in nanoseconds.
+#[doc(hidden)]
+pub fn lu_solve_half_take_ns() -> (u64, u64) {
+    (
+        LU_SOLVE_FWD_NS.swap(0, LuOrdering::Relaxed),
+        LU_SOLVE_BACK_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 pub fn lu_stage_take_ns() -> (u64, u64, u64) {
     (
         LU_PANEL_NS.swap(0, LuOrdering::Relaxed),
@@ -25335,20 +25374,46 @@ pub fn lu_solve_contiguous_f64(
     }
 
     let offset = b_meta.storage_offset();
-    let mut x: Vec<f64> = b_data[offset..offset + n * num_rhs].to_vec();
 
-    // Apply pivot permutation to each RHS column.
-    // pivots[i] = original row at LU position i, so we need:
-    // permuted[i] = b[pivots[i]] (reorder b to match LU row order)
-    for rhs in 0..num_rhs {
-        let mut permuted = vec![0.0; n];
+    // Apply pivot permutation: pivots[i] = original row at LU position i, so the permuted RHS is
+    // `x[i] = b[pivots[i]]` — a pure ROW permutation, and `b` is row-major with `num_rhs` columns,
+    // so each of those rows is CONTIGUOUS.
+    //
+    // The incumbent does it as `num_rhs` independent COLUMN gathers: a fresh `vec![0.0; n]` per
+    // column (so `num_rhs` allocations), then a strided read and a strided write at stride
+    // `num_rhs * 8` bytes — 8 KiB per step at n=1024, which puts every one of the 2n^2 accesses on
+    // its own cache line. MEASURED on hetzner2 at rayon=8: this frame is 13-22% of the whole
+    // blocked solve and its share GROWS with n, the signature of an access pattern rather than of
+    // arithmetic. `frankentorch-37sxo`.
+    //
+    // The row-wise form copies each row once, contiguously, into a freshly reserved buffer: one
+    // pass instead of two, `num_rhs` contiguous f64 per memcpy, no per-column allocation. It also
+    // subsumes the `.to_vec()` the incumbent needs before permuting in place.
+    //
+    // BIT-EXACT, and in the strong sense: this is pure data movement with no arithmetic at all,
+    // and both forms write exactly `x[i * num_rhs + rhs] = b[pivots[i] * num_rhs + rhs]`.
+    let perm_start = std::time::Instant::now();
+    let mut x: Vec<f64> = if lu_solve_perm_rowwise() {
+        let mut out: Vec<f64> = Vec::with_capacity(n * num_rhs);
         for i in 0..n {
-            permuted[i] = x[factor.pivots[i] * num_rhs + rhs];
+            let src = offset + factor.pivots[i] * num_rhs;
+            out.extend_from_slice(&b_data[src..src + num_rhs]);
         }
-        for i in 0..n {
-            x[i * num_rhs + rhs] = permuted[i];
+        out
+    } else {
+        let mut out: Vec<f64> = b_data[offset..offset + n * num_rhs].to_vec();
+        for rhs in 0..num_rhs {
+            let mut permuted = vec![0.0; n];
+            for i in 0..n {
+                permuted[i] = out[factor.pivots[i] * num_rhs + rhs];
+            }
+            for i in 0..n {
+                out[i * num_rhs + rhs] = permuted[i];
+            }
         }
-    }
+        out
+    };
+    LU_SOLVE_PERM_NS.fetch_add(perm_start.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
 
     // BLAS-3 BLOCKED path for the large multi-RHS regime (the n-RHS inverse and
     // big batched solves). The column-parallel path below re-streams the WHOLE LU
@@ -25369,6 +25434,7 @@ pub fn lu_solve_contiguous_f64(
         let mut ypanel = vec![0.0f64; NB * num_rhs];
 
         // FORWARD: unit-lower L · y = Pb, blocked over row panels.
+        let fwd_start = std::time::Instant::now();
         let mut k0 = 0;
         while k0 < n {
             let pe = (k0 + NB).min(n);
@@ -25399,7 +25465,10 @@ pub fn lu_solve_contiguous_f64(
             k0 = pe;
         }
 
+        LU_SOLVE_FWD_NS.fetch_add(fwd_start.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+
         // BACK: U · x = y, blocked over row panels from the bottom.
+        let back_start = std::time::Instant::now();
         let mut peb = n;
         while peb > 0 {
             let k0 = peb.saturating_sub(NB);
@@ -25439,6 +25508,7 @@ pub fn lu_solve_contiguous_f64(
             }
             peb = k0;
         }
+        LU_SOLVE_BACK_NS.fetch_add(back_start.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
         return Ok(x);
     }
 
@@ -49675,6 +49745,58 @@ mod tests {
                 b.to_bits(),
                 "generic f32 dpadded[{index}] differs: panel {a:e} vs direct {b:e}"
             );
+        }
+    }
+
+    #[test]
+    fn lu_solve_perm_rowwise_matches_the_column_gather_bitwise() {
+        // `frankentorch-37sxo`. The row-wise RHS permutation is pure data movement — no arithmetic
+        // — so "bit-exact" here is a claim about INDEXING, and indexing is exactly what a
+        // row/column mixup gets wrong while still producing a plausible-looking matrix. Hence a
+        // NON-SQUARE right-hand side (n x m, m != n) in the fixture: with m == n a transposed
+        // index would still have the right length and could pass on symmetry alone.
+        //
+        // Sizes cross the blocked gate (`num_rhs >= 64 && n >= 256`) in both directions so the
+        // blocked path and the column-parallel path below it are both covered, and m=1 pins the
+        // 1-D single-RHS shape, where `num_rhs == 1` makes the two forms look deceptively alike.
+        for (n, m) in [(64usize, 1usize), (64, 8), (256, 64), (256, 100), (300, 128)] {
+            let data: Vec<f64> = (0..n * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+                    if i == j { v + (n as f64) } else { v }
+                })
+                .collect();
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![n, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+            let factor = super::lu_factor_contiguous_f64(&data, &meta).expect("lu");
+
+            // Distinct value per (row, col) so ANY misindexing shows up rather than cancelling.
+            let b: Vec<f64> = (0..n * m).map(|k| (k % 997) as f64 * 0.37 - 11.0).collect();
+            let b_meta = ft_core::TensorMeta::from_shape(
+                vec![n, m],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+
+            let previous = super::set_lu_solve_perm_rowwise(false);
+            let shipped = super::lu_solve_contiguous_f64(&factor, &b, &b_meta).expect("column");
+            super::set_lu_solve_perm_rowwise(true);
+            let rowwise = super::lu_solve_contiguous_f64(&factor, &b, &b_meta).expect("rowwise");
+            super::set_lu_solve_perm_rowwise(previous);
+
+            assert_eq!(shipped.len(), rowwise.len(), "length differs at n={n} m={m}");
+            for (index, (a, c)) in shipped.iter().zip(&rowwise).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    c.to_bits(),
+                    "X[{index}] differs at n={n} m={m}: column {a:e} vs rowwise {c:e}"
+                );
+            }
         }
     }
 

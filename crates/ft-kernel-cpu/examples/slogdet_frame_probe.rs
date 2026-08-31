@@ -82,7 +82,12 @@ fn main() {
     let spec = if arg(1).is_empty() { "128,256,512,1024" } else { arg(1) };
     let sizes: Vec<usize> = spec.split(',').filter_map(|t| t.trim().parse().ok()).collect();
     for n in sizes {
-        if ab { run_ab(n, reps); } else { run_one(n, reps); }
+        match arg(0) {
+            "ab" => run_ab(n, reps),
+            "inv" => run_inv(n, reps),
+            "permab" => run_perm_ab(n, reps),
+            _ => run_one(n, reps),
+        }
     }
 }
 
@@ -268,5 +273,198 @@ fn run_ab(n: usize, reps: usize) {
         } else {
             "FAIL — discard this row"
         }
+    );
+}
+
+/// Where does `inv` spend its time? — `frankentorch-37sxo` (inv 3.99x slower than torch, f64 n=256).
+///
+/// The bead quotes a phase split of panel 46% / solve 37% / trailing 12%, but those are shares of
+/// the LU, and `inv` is NOT mostly LU the way `slogdet` turned out to be. Reading the kernel,
+/// `inv_tensor_contiguous_f64` is `lu_factor_contiguous_f64` followed by
+/// `lu_solve_contiguous_f64` against a DENSE n x n identity — and that second call is the larger
+/// piece by FLOP count: the factorisation is ~2n^3/3 while a forward plus a back substitution
+/// with n right-hand sides is ~2n^3. If that holds, three quarters of this op sits OUTSIDE both
+/// `frankentorch-e1isq`'s panel and the getrf trsm frame I just measured a ~1.3x ceiling on, and
+/// the bead's own scoping note ("this bead scopes to inv-specific residue") points here.
+///
+/// I am not taking the FLOP count's word for it. The blocked multi-RHS path (`num_rhs >= 64 &&
+/// n >= 256`, `frankentorch-kgs4.63`) makes the solve compute-bound and cache-blocked, so its
+/// measured share need not track its arithmetic at all. Hence this decomposition, every frame on
+/// ONE estimator in ONE process:
+///
+///   inv_tensor_contiguous_f64   the whole op
+///   lu_factor_contiguous_f64    the shared factorisation (e1isq's panel lives in here)
+///   lu_solve_contiguous_f64     the SAME identity solve `inv` performs, timed on its own
+///
+/// The three are timed adjacently inside each rep and reported as per-rep medians, so the split is
+/// a decomposition rather than a quotient of statistics taken from different populations — which
+/// is the error that produced my retracted "slogdet is 64-78% LU".
+fn run_inv(n: usize, reps: usize) {
+    let data: Vec<f64> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx % n;
+            let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+            if i == j { v + (n as f64) } else { v }
+        })
+        .collect();
+    let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+    let mut identity = vec![0.0f64; n * n];
+    for i in 0..n {
+        identity[i * n + i] = 1.0;
+    }
+
+    let mut inv_v = Vec::new();
+    let mut fac_v = Vec::new();
+    let mut sol_v = Vec::new();
+    let mut fwd_v = Vec::new();
+    let mut back_v = Vec::new();
+    let mut perm_v = Vec::new();
+
+    for rep in 0..reps {
+        let start = Instant::now();
+        let a = ft_kernel_cpu::inv_tensor_contiguous_f64(&data, &meta).expect("inv");
+        let t_inv = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&a);
+
+        let start = Instant::now();
+        let factor = ft_kernel_cpu::lu_factor_contiguous_f64(&data, &meta).expect("lu_factor");
+        let t_fac = start.elapsed().as_secs_f64() * 1e3;
+
+        // The identity solve exactly as `inv` issues it, so this frame is the real one and not a
+        // proxy for it.
+        let _ = ft_kernel_cpu::lu_solve_half_take_ns();
+        let start = Instant::now();
+        let x = ft_kernel_cpu::lu_solve_contiguous_f64(&factor, &identity, &meta).expect("lu_solve");
+        let t_sol = start.elapsed().as_secs_f64() * 1e3;
+        let (fwd_ns, back_ns) = ft_kernel_cpu::lu_solve_half_take_ns();
+        let perm_ns = ft_kernel_cpu::lu_solve_perm_take_ns();
+        std::hint::black_box(&x);
+        std::hint::black_box(&factor);
+
+        if rep > 0 {
+            inv_v.push(t_inv);
+            fac_v.push(t_fac);
+            sol_v.push(t_sol);
+            fwd_v.push(fwd_ns as f64 / 1e6);
+            back_v.push(back_ns as f64 / 1e6);
+            perm_v.push(perm_ns as f64 / 1e6);
+        }
+    }
+
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+    };
+    let inv = median(&mut inv_v);
+    let fac = median(&mut fac_v);
+    let sol = median(&mut sol_v);
+
+    eprintln!("INV n={n} reps={reps} threads={}", rayon::current_num_threads());
+    eprintln!("INV   inv_tensor_contiguous_f64  {inv:8.3} ms");
+    eprintln!("INV   lu_factor_contiguous_f64   {fac:8.3} ms  ({:5.1}% of inv)  <- e1isq's panel lives here", 100.0 * fac / inv);
+    eprintln!("INV   lu_solve (identity RHS)    {sol:8.3} ms  ({:5.1}% of inv)  <- inv-specific residue", 100.0 * sol / inv);
+    let fwd = median(&mut fwd_v);
+    let back = median(&mut back_v);
+    eprintln!(
+        "INV     forward L y = Pb        {fwd:8.3} ms  ({:5.1}% of the solve)  <- the ONLY half the identity-structure lever touches",
+        100.0 * fwd / sol
+    );
+    eprintln!("INV     back    U x = y         {back:8.3} ms  ({:5.1}% of the solve)", 100.0 * back / sol);
+    let perm = median(&mut perm_v);
+    eprintln!(
+        "INV     pivot permutation      {perm:8.3} ms  ({:5.1}% of the solve)  <- MEASURED, not inferred by subtraction",
+        100.0 * perm / sol
+    );
+    eprintln!(
+        "INV     solve residue          {:8.3} ms  ({:5.1}% of the solve)",
+        sol - fwd - back - perm,
+        100.0 * (sol - fwd - back - perm) / sol
+    );
+    eprintln!(
+        "INV   accounted {:5.1}%   unattributed {:8.3} ms",
+        100.0 * (fac + sol) / inv,
+        inv - fac - sol
+    );
+}
+
+/// Paired A/B for the row-wise RHS permutation — `frankentorch-37sxo`.
+///
+/// Same harness shape that caught the trsm lever's inverted sign: OFF/ON/ON/OFF inside each rep,
+/// first rep discarded, per-rep min-of-2 per arm, MEDIAN of the per-rep ratios, and an A/A null
+/// built from the two OFF positions of the SAME rep. A min-over-positions estimator printed a
+/// confident 18% REGRESSION for a lever that shipped at 1.035-1.058x, so the shape is not
+/// optional.
+///
+/// This times the WHOLE `inv` lane, not just `lu_solve`, because that is the figure the bead is
+/// about — and it reports the permutation frame beside it so the lane movement can be checked
+/// against the frame movement instead of taken on faith.
+fn run_perm_ab(n: usize, reps: usize) {
+    let data: Vec<f64> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx % n;
+            let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+            if i == j { v + (n as f64) } else { v }
+        })
+        .collect();
+    let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+
+    let once = |on: bool| -> (f64, f64) {
+        let previous = ft_kernel_cpu::set_lu_solve_perm_rowwise(on);
+        let _ = ft_kernel_cpu::lu_solve_perm_take_ns();
+        let start = Instant::now();
+        let a = ft_kernel_cpu::inv_tensor_contiguous_f64(&data, &meta).expect("inv");
+        let ms = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&a);
+        let perm = ft_kernel_cpu::lu_solve_perm_take_ns() as f64 / 1e6;
+        ft_kernel_cpu::set_lu_solve_perm_rowwise(previous);
+        (ms, perm)
+    };
+
+    let mut off_v = Vec::new();
+    let mut on_v = Vec::new();
+    let mut off_p = Vec::new();
+    let mut on_p = Vec::new();
+    let mut nulls = Vec::new();
+    for rep in 0..reps {
+        let r = [once(false), once(true), once(true), once(false)];
+        if rep == 0 {
+            continue;
+        }
+        off_v.push(r[0].0.min(r[3].0));
+        on_v.push(r[1].0.min(r[2].0));
+        off_p.push(r[0].1.min(r[3].1));
+        on_p.push(r[1].1.min(r[2].1));
+        nulls.push(r[0].0 / r[3].0);
+    }
+
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+    };
+    let ratios = |a: &[f64], b: &[f64]| -> f64 {
+        let mut r: Vec<f64> = a.iter().zip(b).map(|(x, y)| x / y).collect();
+        median(&mut r)
+    };
+    let lane = ratios(&off_v, &on_v);
+    let perm_ratio = ratios(&off_p, &on_p);
+    let null = median(&mut nulls.clone());
+
+    eprintln!("PERM_AB n={n} reps={reps} threads={}", rayon::current_num_threads());
+    eprintln!(
+        "PERM_AB   inv OFF (column gather) {:8.3} ms   perm frame {:7.3} ms",
+        median(&mut off_v.clone()),
+        median(&mut off_p.clone())
+    );
+    eprintln!(
+        "PERM_AB   inv ON  (row memcpy)    {:8.3} ms   perm frame {:7.3} ms",
+        median(&mut on_v.clone()),
+        median(&mut on_p.clone())
+    );
+    eprintln!(
+        "PERM_AB   INV LANE {lane:.4}x   PERM FRAME {perm_ratio:.4}x   A/A null {null:.4} {}",
+        if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
     );
 }
