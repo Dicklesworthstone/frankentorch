@@ -1170,6 +1170,14 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
     (elapsed, checksum)
 }
 
+/// Discard everything the conv2d frame accumulators have seen so far. Called once the warmup
+/// iterations are done, so the frames are medians over the same samples the lane is.
+/// `frankentorch-hi9r6`.
+fn conv2d_frames_reset() {
+    CONV2D_SESSION_SPLIT_MS.with(|cell| cell.borrow_mut().clear());
+    CONV2D_KERNELS_SPLIT_MS.with(|cell| cell.borrow_mut().clear());
+}
+
 /// The FT-side conv2d frame diagnostics, printed BEFORE the PyTorch gate.
 /// `frankentorch-hi9r6`.
 ///
@@ -3056,6 +3064,16 @@ LANES = {
         }
         std::hint::black_box(warm);
     }
+    // DROP THE WARMUP SAMPLES FROM THE FRAME ACCUMULATORS — `frankentorch-hi9r6`.
+    //
+    // The conv2d frame diagnostics accumulate on EVERY call, but the lane's own figure is a
+    // median over the TIMED samples only, and `warmup_iters` defaults to 32 against ~96 timed
+    // samples — a quarter of the population, and the cold quarter. That is a third estimator
+    // mismatch in the same instrument: on a quiet host the frames summed to 104% of their lane
+    // and looked fine; on hz4 at loadavg 32 they summed to 128%. Parts exceeding the whole is
+    // the warmup showing. Cleared here, so the frames and the lane are medians over the same
+    // population.
+    conv2d_frames_reset();
 
     let mut ft_times: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     // frankentorch-rled4: the same rounds reduced by MIN instead of median.

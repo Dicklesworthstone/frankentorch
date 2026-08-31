@@ -39492,3 +39492,5 @@ one was written correctly, reviewed as correct, and quietly consumed four fifths
 improvement it was guarding — invisibly, because the lane-level number just looked small and the
 obvious reading of a small number is "small lever". What separated the two readings was a counter
 that had been in the tree since the lever landed and that nobody, including its author, had read.
+
+`frankentorch-4zjaa` (2026-08-30): live paired SVD at n=136/256 is 1.197-1.689x SLOWER than same-invocation PyTorch 2.12.1+cpu; compact-WY form-P versus unblocked reads 0.968x/1.027x against repeated-blocked A/A 1.001x/0.974x, so the whole-op loss stands but the toggle is `NO_VERDICT`.
