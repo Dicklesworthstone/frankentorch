@@ -1187,6 +1187,15 @@ fn conv2d_frames_reset() {
 /// also the one way to guarantee it printed nothing. That is how a 50-minute wait for a
 /// contended local window became the only route to numbers that never needed the incumbent.
 fn conv2d_frame_diagnostics(name: &str, ft_ms: f64) {
+    if name == "conv2d_f32_masked_train_dwpanel" {
+        let calls = CONV2D_F32_STREAMED_CALLS.with(std::cell::Cell::get);
+        let legacy = CONV2D_F32_LEGACY_CALLS.with(std::cell::Cell::get);
+        println!(
+            "    sentinel: streamed f32 dweight ran {calls} time(s) in the incumbent \
+             conv2d_f32_masked_train and {legacy} time(s) in this forced-legacy arm. The pair \
+             prices the lever only if the first is NONZERO and the second is ZERO."
+        );
+    }
     if name == "conv2d_masked_train_dwpanel" {
         let calls = CONV2D_STREAMED_CALLS.with(std::cell::Cell::get);
         let legacy = CONV2D_LEGACY_CALLS.with(std::cell::Cell::get);
@@ -1246,6 +1255,14 @@ thread_local! {
     /// this is it recurring inside a diagnostic rather than inside a claim.
     static CONV2D_SESSION_SPLIT_MS: std::cell::RefCell<Vec<(f64, f64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Streamed-`dweight` executions in the SHIPPED f32 training lane; must be NONZERO or the
+    /// pair prices nothing. `frankentorch-0icdh`.
+    static CONV2D_F32_STREAMED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The same count for the forced-legacy f32 arm. Must be ZERO.
+    static CONV2D_F32_LEGACY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
@@ -1762,6 +1779,12 @@ c2w_train=seq(32*32*3*3).reshape(32,32,3,3).requires_grad_(True)
 # C2F32_N's comment on the Rust side. Keep this in lockstep with C2F32_N.
 c2x32=seq(160*32*32*32).reshape(160,32,32,32).float()
 c2w32=c2w.float()
+# frankentorch-0icdh: the f32 TRAINING weight. `.float()` on a grad-requiring tensor yields a
+# NON-leaf, whose .grad is not populated, so this is built as its own leaf from the same f64
+# generator and then marked -- identical bits to c2w32, but the incumbent actually computes a
+# weight gradient. Item 182 made exactly this fix for f64 and f32 never received it, which is
+# why every f32 lane on this board has been measuring a step that skips dweight entirely.
+c2w32_train=seq(32*32*3*3).reshape(32,32,3,3).float().requires_grad_(True)
 c2m32=seq(160*32*32*32).reshape(160,32,32,32).float()
 # item 144: the doubled-batch twins, same weights, same generator.
 # item 209: summed route at batch 64, where both arms clear every duration that has
@@ -1861,6 +1884,12 @@ LANES = {
     # session cost. PT(kernels)/PT(f32) is a free control that must land near 1.0.
     "conv2d_f32_kernels": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
     "conv2d_f32_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
+    # frankentorch-0icdh: the f32 TRAINING route -- c2w32_train, so BOTH arms compute dweight.
+    # This is the only f32 lane on the board that reaches the weight-gradient half at all.
+    "conv2d_f32_masked_train": (c2x32, lambda x: Fn.conv2d(x,c2w32_train,None,(1,1),(1,1))*c2m32),
+    # The same lane with the streamed f32 dweight FORCED OFF, so the pair differs in exactly one
+    # thing. Same torch code under a second name = a free ~1.0 control on the window.
+    "conv2d_f32_masked_train_dwpanel": (c2x32, lambda x: Fn.conv2d(x,c2w32_train,None,(1,1),(1,1))*c2m32),
     # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
     # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-88d36e2f dpanel + col2im dinput.
     "conv2d_f32_masked_panel": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
@@ -2842,6 +2871,49 @@ LANES = {
             // weight being frozen here exactly as it is on the f64 masked lane.
             "conv2d_f32_masked",
             Box::new(|| timed_conv2d_f32(&c2x32, &c2w32, Some(&c2m32), C2F32_N, false)),
+        ),
+        (
+            // `frankentorch-0icdh`: the f32 TRAINING route — `weight_grad = true`, so this is
+            // the ONLY f32 lane on the board that computes a weight gradient at all.
+            //
+            // WHY IT WAS MISSING, AND WHAT IT BLOCKED. Item 182 found that "every conv2d lane on
+            // the board freezes its weight, so 'the training route' has never computed a weight
+            // gradient", and fixed it for f64. f32 never received that fix: all three f32 lanes
+            // pass `false`, so `output_mask[1]` is false and `dweight` is SKIPPED. The
+            // consequence is not cosmetic — `conv2d_dweight_streamed_f32` (d620651f) is correct
+            // and bit-exact and CANNOT FIRE on this board, so a shipped f32 kernel path has no
+            // lane that reaches it. A dtype whose training half is unmeasured is a dtype whose
+            // training half is unoptimised.
+            "conv2d_f32_masked_train",
+            Box::new(|| {
+                // Drain on entry so no other lane's increments land here, then attribute on
+                // exit — the counter-leak fix from the f64 half.
+                let _ = ft_kernel_cpu::take_conv2d_dweight_streamed_calls();
+                let sample = timed_conv2d_f32(&c2x32, &c2w32, Some(&c2m32), C2F32_N, true);
+                CONV2D_F32_STREAMED_CALLS.with(|cell| {
+                    cell.set(cell.get() + ft_kernel_cpu::take_conv2d_dweight_streamed_calls());
+                });
+                sample
+            }),
+        ),
+        (
+            // The lane above with the streamed f32 dweight FORCED OFF — the incumbent arm must
+            // be what production runs, so the toggled arm is the one that departs from it
+            // (`feedback_unset_knob_means_forced_off`). BIT-IDENTICAL either way
+            // (`conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise`), so the pair can
+            // move time and cannot move a number, and PyTorch runs the SAME code under both
+            // names as a free ~1.0 control.
+            "conv2d_f32_masked_train_dwpanel",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(false);
+                let _ = ft_kernel_cpu::take_conv2d_dweight_streamed_calls();
+                let sample = timed_conv2d_f32(&c2x32, &c2w32, Some(&c2m32), C2F32_N, true);
+                CONV2D_F32_LEGACY_CALLS.with(|cell| {
+                    cell.set(cell.get() + ft_kernel_cpu::take_conv2d_dweight_streamed_calls());
+                });
+                ft_kernel_cpu::set_conv2d_dweight_streamed(previous);
+                sample
+            }),
         ),
         (
             // `frankentorch-hi9r6`: the lane above with 88d36e2f's blocked image-parallel dinput
