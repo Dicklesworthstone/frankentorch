@@ -101203,17 +101203,16 @@ fn inplace_profile_enabled() -> bool {
 /// its dispatch.
 const INPLACE_UNARY_F32_CANDIDATE_PARALLEL_MIN: usize = 1 << 20;
 
-/// Defaults to the existing elementwise cutoff.  Set `FT_INPLACE_F32_SERIAL_THRESHOLD=1` in a
-/// fresh process to evaluate the candidate cutoff above; the default-off gate preserves current
-/// behavior until an admitted paired row establishes its value.
+/// Defaults to the measured candidate cutoff. Set `FT_INPLACE_F32_SERIAL_THRESHOLD=0` in a fresh
+/// process to request the former 8,192-element cutoff for an A/B control.
 fn inplace_unary_f32_parallel_min() -> usize {
-    static CANDIDATE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *CANDIDATE_ENABLED.get_or_init(|| {
-        std::env::var("FT_INPLACE_F32_SERIAL_THRESHOLD").is_ok_and(|value| value == "1")
+    static FORMER_CUTOFF_REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORMER_CUTOFF_REQUESTED.get_or_init(|| {
+        std::env::var("FT_INPLACE_F32_SERIAL_THRESHOLD").is_ok_and(|value| value == "0")
     }) {
-        INPLACE_UNARY_F32_CANDIDATE_PARALLEL_MIN
-    } else {
         PARALLEL_ELEMENTWISE_MIN
+    } else {
+        INPLACE_UNARY_F32_CANDIDATE_PARALLEL_MIN
     }
 }
 
