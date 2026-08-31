@@ -41048,3 +41048,45 @@ Five shipped, fourteen refuted, and the dinput frame closed at its memory floor 
 those. **What remains is not a conv2d lever at all** — it is autograd machinery, which is why it
 survived a campaign aimed entirely at kernels, and it may belong to a different bead than this one.
 That is a scoping call, not a measurement one.
+
+---
+
+## 286. THE BACKWARD MACHINERY DECOMPOSED — a SERIAL f64->f32 downcast is 16% of the training lane, and its already-parallel twin proves it in the same run
+
+`frankentorch-t1gph`, following 285. All counters inside ONE call, so this is a decomposition and
+not a quotient of statistics. hz4, rayon=16, min of 9:
+
+    lane total                                  92.301 ms
+      functional_conv2d (pad+fwd)               11.888  (12.9%)
+      tensor_mul (mask, post-fusion-reuse)       6.113  ( 6.6%)
+      tensor_backward                           73.487  (79.6%)
+        conv2d fused KERNEL                     33.030  (35.8% of lane)
+        NON-kernel total                        40.457  (43.8% of lane)
+          f64->f32 DOWNCAST of incoming grad    14.776  (16.0% of lane)   SERIAL .iter().map()
+          f32->f64 WIDEN of dpadded/dweight      3.604  ( 3.9% of lane)   already par_iter
+          REMAINDER (tape, dsum, pad bwd, alloc) 22.076 (23.9% of lane)
+
+**The two conversions are an in-run controlled comparison, which is what makes this conclusive
+rather than suggestive.** They sit in the same closure, in the same call, on the same host, and
+differ only in direction and parallelism:
+
+    WIDEN     5.92M elements   par_iter   3.604 ms
+    DOWNCAST  5.24M elements   SERIAL    14.776 ms
+
+**4.1x slower for 11% FEWER elements.** No cross-run comparison, no estimator mixing, no host
+question — the control is in the same measurement as the treatment.
+
+The tape carries gradients in f64 while the f32 kernel needs f32, so every f32 conv2d backward
+pays both conversions. The widen direction was parallelised (its own comment records -22.9 ms on
+this phase) and a buffer-pool hook for it was tried and reverted (`frankentorch-ymhld`). **The
+narrow direction was left behind** — the same asymmetric-harvest shape as
+`project_asymmetric_dtype_fastpath`, one step up the stack.
+
+### 286a. WHICH FRAME IS "TOP" DEPENDS ON WHAT COUNTS AS A FRAME
+
+The REMAINDER is the larger number at 22.076 ms, but it is a BUNDLE — tape walk, `dsum` backward,
+`tensor_pad` backward and gradient allocation — and no single lever addresses it; it needs its own
+decomposition before it can be attacked. The DOWNCAST is a single named 14.776 ms frame with a
+proven-parallel twin beside it, so it is the first cheap-refutable lever even though it is not the
+largest bundle. Saying which is which matters: "the top frame is the remainder" would be true and
+useless.

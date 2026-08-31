@@ -132,6 +132,8 @@ fn main() {
     let mut t_bwd = f64::INFINITY;
     let mut t_grad = f64::INFINITY;
     let mut t_kernel = f64::INFINITY;
+    let mut t_down = f64::INFINITY;
+    let mut t_widen = f64::INFINITY;
 
     for rep in 0..reps {
         // Leaf construction is timed separately and EXCLUDED from the lane total below, because
@@ -175,11 +177,15 @@ fn main() {
         // in-context — no subtraction across two different call sites, which is the trap that
         // invented a 6 ms frame in ledger 277a.
         let _ = ft_kernel_cpu::masked_frame_take_ns();
+        let _ = ft_api::take_fuse_bwd_frames_ns();
         let b0 = Instant::now();
         let report = session.tensor_backward(loss).expect("backward");
         let bwd = b0.elapsed().as_secs_f64() * 1e3;
         let (k_dout, k_dweight, k_dinput) = ft_kernel_cpu::masked_frame_take_ns();
         let kernel_ms = (k_dout + k_dweight + k_dinput) as f64 / 1e6;
+        let (bw_down_ns, bw_widen_ns) = ft_api::take_fuse_bwd_frames_ns();
+        let down_ms = bw_down_ns as f64 / 1e6;
+        let widen_ms = bw_widen_ns as f64 / 1e6;
 
         let lane = lane_start.elapsed().as_secs_f64() * 1e3;
 
@@ -204,6 +210,8 @@ fn main() {
             t_bwd = t_bwd.min(bwd);
             t_grad = t_grad.min(grad);
             t_kernel = t_kernel.min(kernel_ms);
+            t_down = t_down.min(down_ms);
+            t_widen = t_widen.min(widen_ms);
         }
     }
 
@@ -225,9 +233,22 @@ fn main() {
         100.0 * t_kernel / total
     );
     eprintln!(
-        "TRAIN     backward NON-kernel (tape walk, dsum, grad alloc) {:8.3} ms  ({:5.1}% of the lane)  <- never attributed before",
+        "TRAIN     backward NON-kernel total {:8.3} ms  ({:5.1}% of the lane), decomposed:",
         t_bwd - t_kernel,
         100.0 * (t_bwd - t_kernel) / total
+    );
+    eprintln!(
+        "TRAIN       f64->f32 DOWNCAST of the incoming grad  {t_down:8.3} ms  ({:5.1}% of the lane)  [SERIAL .iter().map()]",
+        100.0 * t_down / total
+    );
+    eprintln!(
+        "TRAIN       f32->f64 WIDEN of dpadded/dweight       {t_widen:8.3} ms  ({:5.1}% of the lane)  [already par_iter]",
+        100.0 * t_widen / total
+    );
+    eprintln!(
+        "TRAIN       REMAINDER (tape walk, dsum, pad bwd, grad alloc) {:8.3} ms  ({:5.1}% of the lane)",
+        t_bwd - t_kernel - t_down - t_widen,
+        100.0 * (t_bwd - t_kernel - t_down - t_widen) / total
     );
     eprintln!("TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms");
 

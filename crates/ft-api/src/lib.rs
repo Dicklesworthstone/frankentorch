@@ -817,6 +817,32 @@ struct GridSamplePoint {
     x: isize,
 }
 
+/// Frames INSIDE the f32 fused backward closure, outside the kernel's own counters.
+/// `frankentorch-t1gph`, ledger 285.
+///
+/// The backward is ~79% of the training lane and only about half of it is
+/// `conv2d_backward_mask_fused_f32`; the other 39-42% of the lane had never been attributed. The
+/// closure does two whole-tensor dtype conversions around that kernel, because the tape carries
+/// gradients in f64 while the kernel is f32:
+///
+///   DOWNCAST  `grad_outputs[0]` f64 -> f32, 5.24M elements (reads 42 MB, writes 21 MB)
+///   WIDEN     `dpadded` f32 -> f64, 5.92M elements (reads 24 MB, writes 47 MB)
+///
+/// Both are counted so the non-kernel backward is DECOMPOSED rather than named. The widen is
+/// already `par_iter` and its buffer-pool hook was tried and reverted (`frankentorch-ymhld`); the
+/// downcast is still a serial `.iter().map().collect()`, and pricing that asymmetry is the point.
+static FUSE_BWD_DOWNCAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FUSE_BWD_WIDEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drain the f32 fused backward's `(downcast_ns, widen_ns)`.
+#[doc(hidden)]
+pub fn take_fuse_bwd_frames_ns() -> (u64, u64) {
+    (
+        FUSE_BWD_DOWNCAST_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        FUSE_BWD_WIDEN_NS.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// See [`FrankenTorchSession::fuse_conv2d_reuse_f32`]. `frankentorch-t1gph`. DEFAULT ON.
 ///
 /// SHIPPED ON REDUNDANCY AND DTYPE CONSISTENCY, NOT ON A LANE CLAIM. The f32 fusion recomputed a
@@ -6492,7 +6518,12 @@ impl FrankenTorchSession {
                     let need_weight = need.get(1).copied().unwrap_or(true);
                     // The tape carries gradients in f64 even for an f32 op; downcast once,
                     // here, exactly as the f32 conv2d fast path does.
+                    let downcast_start = std::time::Instant::now();
                     let incoming: Vec<f32> = grad_outputs[0].iter().map(|&v| v as f32).collect();
+                    FUSE_BWD_DOWNCAST_NS.fetch_add(
+                        downcast_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
                         &incoming,
                         borrowed[mask_index].0,
@@ -6513,6 +6544,7 @@ impl FrankenTorchSession {
                     );
                     // A missing gradient must stay `None`; an empty vector would be read as a
                     // real gradient of the wrong shape.
+                    let widen_start = std::time::Instant::now();
                     let mut gradients = vec![
                         dpadded.map(|d| Self::widen_grad_f32_to_f64(&d)),
                         dweight.map(|d| Self::widen_grad_f32_to_f64(&d)),
@@ -6524,6 +6556,10 @@ impl FrankenTorchSession {
                     }
                     // The mask does not require grad — the caller's gate guarantees it — so it
                     // gets None rather than a computed-and-discarded gradient.
+                    FUSE_BWD_WIDEN_NS.fetch_add(
+                        widen_start.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     gradients.push(None);
                     Ok(gradients)
                 },
