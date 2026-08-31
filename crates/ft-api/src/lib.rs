@@ -170,7 +170,7 @@ const _: () = assert!(
 ///
 /// WHY THIS EXISTS. Item 69 priced and removed the serial f32 -> f64 widen on the way OUT
 /// of the f32 norm backward closures. Each of those closures opens with the MIRROR of that
-/// line on the way IN — `grad_outputs[0].iter().map(|&v| v as f32).collect()` — over the
+/// line on the way IN — `narrow_f64_to_f32(grad_outputs[0])` — over the
 /// same one-element-per-input buffer, so there were always TWO serial numel-scaled
 /// materializations and item 69 removed one. For the scored `[32,64,56,56]` lane the
 /// narrow is 6,422,528 values costing **3.9 ms** serially, against an engine term that
@@ -6579,7 +6579,7 @@ impl FrankenTorchSession {
                     let weight_id = fn_inputs[1];
                     let mask_id = fn_inputs[mask_index];
                     let mut gradients: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
-                    let f32v = |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                    let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                     let f64v =
                         |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
                     // Grad NODES must live in the F64 grad-space (the regular backward and
@@ -8085,7 +8085,7 @@ impl FrankenTorchSession {
                                 )
                             } else {
                                 let dout: Vec<f32> =
-                                    grad_outputs[0].iter().map(|&v| v as f32).collect();
+                                    narrow_f64_to_f32(grad_outputs[0]);
                                 ft_kernel_cpu::sdpa_backward_f32(
                                     borrowed[0].0,
                                     borrowed[1].0,
@@ -16817,7 +16817,7 @@ impl FrankenTorchSession {
                         },
                         move |_ctx, grad_outputs, borrowed_inputs| {
                             let dloss: Vec<f32> =
-                                grad_outputs[0].iter().map(|&v| v as f32).collect();
+                                narrow_f64_to_f32(grad_outputs[0]);
                             let logits = borrowed_inputs[0].0;
                             let dlogits = ft_kernel_cpu::cross_entropy_backward_f32(
                                 logits, &ti_bwd, &dloss, b, c,
@@ -30103,7 +30103,7 @@ impl FrankenTorchSession {
                                 )
                             } else {
                                 let dout: Vec<f32> =
-                                    grad_outputs[0].iter().map(|&v| v as f32).collect();
+                                    narrow_f64_to_f32(grad_outputs[0]);
                                 ft_kernel_cpu::sdpa_backward_f32(
                                     borrowed[0].0,
                                     borrowed[1].0,
@@ -30852,7 +30852,7 @@ impl FrankenTorchSession {
                             },
                             move |_ctx, grad_outputs, borrowed| {
                                 let dout_f32: Vec<f32> =
-                                    grad_outputs[0].iter().map(|&v| v as f32).collect();
+                                    narrow_f64_to_f32(grad_outputs[0]);
                                 let pv = borrowed[0].0;
                                 let wv = borrowed[1].0;
                                 let (dpadded, dweight, dbias) =
@@ -32046,7 +32046,7 @@ impl FrankenTorchSession {
                         let weight_id = fn_inputs[1];
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
                         let f32v =
-                            |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                            |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                         let f64v =
                             |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                         // Grad NODES must live in the F64 grad-space (the regular
@@ -33072,7 +33072,7 @@ impl FrankenTorchSession {
                     // conv3d" was true and incomplete. Defensive read as in item 178.
                     move |ctx, grad_outputs, borrowed_inputs| {
                         let dout_f32: Vec<f32> =
-                            grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            narrow_f64_to_f32(grad_outputs[0]);
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
                         let need = ctx.needs_input_grad();
@@ -33124,7 +33124,7 @@ impl FrankenTorchSession {
                         let w_shape = tape.tensor(weight_id)?.meta().shape().to_vec();
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
                         let f32v =
-                            |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                            |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                         let f64v =
                             |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                         let weight64 = tape.to_f64(weight_id)?;
@@ -34139,7 +34139,7 @@ impl FrankenTorchSession {
                     },
                     move |_ctx, grad_outputs, borrowed_inputs| {
                         let dout_f32: Vec<f32> =
-                            grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            narrow_f64_to_f32(grad_outputs[0]);
                         let input_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
                         let (di, dw, db) = ft_kernel_cpu::conv_transpose2d_backward_f32(
@@ -34184,7 +34184,7 @@ impl FrankenTorchSession {
                         let weight_id = fn_inputs[1];
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
                         let f32v =
-                            |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                            |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                         let f64v =
                             |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                         let weight64 = tape.to_f64(weight_id)?;
@@ -35253,7 +35253,7 @@ impl FrankenTorchSession {
                     },
                     move |_ctx, grad_outputs, borrowed_inputs| {
                         let dout_f32: Vec<f32> =
-                            grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            narrow_f64_to_f32(grad_outputs[0]);
                         let iv = borrowed_inputs[0].0;
                         let (_, idx) = ft_kernel_cpu::max_pool2d_forward_with_indices_f32(
                             iv, b_, ch_, ih_, iw_, kh_, kw_, oh_, ow_, sh_, sw_,
@@ -35275,7 +35275,7 @@ impl FrankenTorchSession {
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None];
                         if need[0] {
                             let f32v =
-                                |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                                |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                             let f64v =
                                 |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                             let dinput = tape.apply_function(
@@ -35916,7 +35916,7 @@ impl FrankenTorchSession {
                     },
                     move |_ctx, grad_outputs, _borrowed_inputs| {
                         let dout_f32: Vec<f32> =
-                            grad_outputs[0].iter().map(|&v| v as f32).collect();
+                            narrow_f64_to_f32(grad_outputs[0]);
                         let dp = ft_kernel_cpu::avg_pool2d_backward_f32(
                             &dout_f32, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw,
                             ih_, iw_, cip,
@@ -35931,7 +35931,7 @@ impl FrankenTorchSession {
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None];
                         if need[0] {
                             let f32v =
-                                |s: &[f64]| -> Vec<f32> { s.iter().map(|&v| v as f32).collect() };
+                                |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                             let f64v =
                                 |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                             let dpadded = tape.apply_function(
