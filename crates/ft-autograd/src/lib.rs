@@ -1109,6 +1109,8 @@ pub struct TensorSchedulerTelemetry {
 /// gradients, or the deterministic scheduler contract. `sum_dispatch_ns`,
 /// `pad_dispatch_ns`, and `custom_function_dispatch_ns` are overlapping named
 /// subsets of `node_dispatch_ns` for the three frames in the f32 training lane.
+/// The `custom_function_*` detail fields are sequential subframes of the custom
+/// function subset, so they can be compared directly without cross-call timing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TensorBackwardMachineryTelemetry {
     pub setup_ns: u64,
@@ -1118,6 +1120,10 @@ pub struct TensorBackwardMachineryTelemetry {
     pub sum_dispatch_ns: u64,
     pub pad_dispatch_ns: u64,
     pub custom_function_dispatch_ns: u64,
+    pub custom_function_prepare_ns: u64,
+    pub custom_function_callback_ns: u64,
+    pub custom_function_accumulate_ns: u64,
+    pub custom_function_dependency_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15774,6 +15780,7 @@ impl TensorTape {
                     ref inputs,
                     function_id,
                 } => {
+                    let custom_prepare_started = std::time::Instant::now();
                     let input_grads = {
                         let record = self
                             .custom_functions
@@ -15782,7 +15789,19 @@ impl TensorTape {
                         let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
                         match &record.backward {
                             CustomFunctionBackward::Owned(backward_fn) => {
-                                backward_fn(&record.ctx, &grad_outputs)?
+                                machinery.custom_function_prepare_ns =
+                                    machinery.custom_function_prepare_ns.saturating_add(
+                                        u64::try_from(custom_prepare_started.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                let callback_started = std::time::Instant::now();
+                                let result = backward_fn(&record.ctx, &grad_outputs);
+                                machinery.custom_function_callback_ns =
+                                    machinery.custom_function_callback_ns.saturating_add(
+                                        u64::try_from(callback_started.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                result?
                             }
                             CustomFunctionBackward::BorrowedInputsF64(backward_fn) => {
                                 Self::assert_borrowed_versions(
@@ -15797,7 +15816,20 @@ impl TensorTape {
                                         input_node.tensor.meta().shape(),
                                     ));
                                 }
-                                backward_fn(&record.ctx, &grad_outputs, &borrowed_inputs)?
+                                machinery.custom_function_prepare_ns =
+                                    machinery.custom_function_prepare_ns.saturating_add(
+                                        u64::try_from(custom_prepare_started.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                let callback_started = std::time::Instant::now();
+                                let result =
+                                    backward_fn(&record.ctx, &grad_outputs, &borrowed_inputs);
+                                machinery.custom_function_callback_ns =
+                                    machinery.custom_function_callback_ns.saturating_add(
+                                        u64::try_from(callback_started.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                result?
                             }
                             CustomFunctionBackward::BorrowedInputsF32Output(backward_fn) => {
                                 // f32-output custom op: re-read inputs as f32; the
@@ -15815,7 +15847,20 @@ impl TensorTape {
                                         input_node.tensor.meta().shape(),
                                     ));
                                 }
-                                backward_fn(&record.ctx, &grad_outputs, &borrowed_inputs)?
+                                machinery.custom_function_prepare_ns =
+                                    machinery.custom_function_prepare_ns.saturating_add(
+                                        u64::try_from(custom_prepare_started.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                let callback_started = std::time::Instant::now();
+                                let result =
+                                    backward_fn(&record.ctx, &grad_outputs, &borrowed_inputs);
+                                machinery.custom_function_callback_ns =
+                                    machinery.custom_function_callback_ns.saturating_add(
+                                        u64::try_from(callback_started.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                result?
                             }
                         }
                     };
@@ -15832,6 +15877,7 @@ impl TensorTape {
                     for (i, maybe_grad) in input_grads.into_iter().enumerate() {
                         let input_id = inputs_snapshot[i];
                         if let Some(grad) = maybe_grad {
+                            let accumulation_started = std::time::Instant::now();
                             // The closure handed us an owned, cache-hot gradient Vec;
                             // move it into the (lazy) slot on first contribution rather
                             // than allocating a fresh buffer and copying. Bit-identical.
@@ -15840,8 +15886,19 @@ impl TensorTape {
                                 &mut grads[input_id.0],
                                 grad,
                             )?;
+                            machinery.custom_function_accumulate_ns =
+                                machinery.custom_function_accumulate_ns.saturating_add(
+                                    u64::try_from(accumulation_started.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX),
+                                );
                         }
+                        let dependency_started = std::time::Instant::now();
                         Self::complete_dependency(&mut pending, input_id, &mut queue)?;
+                        machinery.custom_function_dependency_ns =
+                            machinery.custom_function_dependency_ns.saturating_add(
+                                u64::try_from(dependency_started.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                            );
                     }
 
                     steps.push(TensorBackwardStep {

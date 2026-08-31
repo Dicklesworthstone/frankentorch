@@ -139,6 +139,10 @@ fn main() {
     let mut t_tape_sum = f64::INFINITY;
     let mut t_tape_pad = f64::INFINITY;
     let mut t_tape_custom = f64::INFINITY;
+    let mut t_tape_custom_prepare = f64::INFINITY;
+    let mut t_tape_custom_callback = f64::INFINITY;
+    let mut t_tape_custom_accumulate = f64::INFINITY;
+    let mut t_tape_custom_dependency = f64::INFINITY;
 
     for rep in 0..reps {
         // Leaf construction is timed separately and EXCLUDED from the lane total below, because
@@ -223,6 +227,14 @@ fn main() {
             t_tape_sum = t_tape_sum.min(machinery.sum_dispatch_ns as f64 / 1e6);
             t_tape_pad = t_tape_pad.min(machinery.pad_dispatch_ns as f64 / 1e6);
             t_tape_custom = t_tape_custom.min(machinery.custom_function_dispatch_ns as f64 / 1e6);
+            t_tape_custom_prepare =
+                t_tape_custom_prepare.min(machinery.custom_function_prepare_ns as f64 / 1e6);
+            t_tape_custom_callback =
+                t_tape_custom_callback.min(machinery.custom_function_callback_ns as f64 / 1e6);
+            t_tape_custom_accumulate = t_tape_custom_accumulate
+                .min(machinery.custom_function_accumulate_ns as f64 / 1e6);
+            t_tape_custom_dependency = t_tape_custom_dependency
+                .min(machinery.custom_function_dependency_ns as f64 / 1e6);
         }
     }
 
@@ -263,6 +275,9 @@ fn main() {
     );
     eprintln!(
         "TRAIN       TAPE counters: loop {t_tape_loop:8.3} ms | dispatch {t_tape_dispatch:8.3} ms | sum {t_tape_sum:8.3} ms | pad {t_tape_pad:8.3} ms | custom {t_tape_custom:8.3} ms"
+    );
+    eprintln!(
+        "TRAIN       CUSTOM detail: prepare {t_tape_custom_prepare:8.3} ms | callback {t_tape_custom_callback:8.3} ms | accumulate {t_tape_custom_accumulate:8.3} ms | dependency {t_tape_custom_dependency:8.3} ms"
     );
     eprintln!("TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms");
 
