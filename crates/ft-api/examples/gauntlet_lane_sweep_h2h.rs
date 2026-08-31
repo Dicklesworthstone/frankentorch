@@ -1315,10 +1315,27 @@ fn timed_conv2d_masked_train_kernels(
     );
     let fwd_ms = fwd_started.elapsed().as_secs_f64() * 1_000.0;
 
+    // THE SAME KERNEL THE SESSION CALLS, and getting this wrong made my own attribution lie.
+    //
+    // This twin used to call `conv2d_backward_f64(mask, ..)` — passing the mask AS the upstream
+    // gradient. The session does not do that: `try_fuse_conv2d_loss_mask` routes it to
+    // `conv2d_backward_mask_fused_f64(ones, mask, ..)`, which additionally forms the elementwise
+    // `grad_output * mask` product and builds its own `dout_flat`. Subtracting one from the other
+    // and calling the remainder "session and tape" charged a KERNEL difference to the session —
+    // the same shape of error as `copy_zeroing_ns` wrapping a GEMM
+    // (`feedback_conflated_counter_and_inflated_pair`), and it inflated the backward-side session
+    // figure this bead is now aiming a lever at.
+    //
+    // `output_mask` is `[input, weight, bias]` = `[true, true, false]`, matching the training
+    // lane's `weight_grad = true` and its absent bias. The all-ones `dout` is what a plain
+    // `tensor_sum` loss actually hands the closure.
+    let ones_dout = vec![1.0f64; batch * C2_CO * C2_H * C2_W];
     let bwd_started = Instant::now();
-    let (dpadded, _dweight, _dbias) = ft_kernel_cpu::conv2d_backward_f64(
-        mask, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO, false,
+    let (dpadded, _dweight, _dbias) = ft_kernel_cpu::conv2d_backward_mask_fused_f64(
+        &ones_dout, mask, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1,
+        C2_CO, [true, true, false],
     );
+    let dpadded = dpadded.expect("dinput requested");
     let bwd_ms = bwd_started.elapsed().as_secs_f64() * 1_000.0;
     CONV2D_KERNELS_SPLIT_MS.with(|cell| cell.borrow_mut().push((pad_ms, fwd_ms, bwd_ms)));
 

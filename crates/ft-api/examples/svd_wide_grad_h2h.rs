@@ -148,16 +148,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (batch, m, n) in cases {
         let (ft_ms, ft_sum) = run_ft(batch, m, n, full_matrices, requires_grad)?;
         let check_label = if requires_grad { "gradsum" } else { "ssum" };
-        print!("B={batch} m={m} n={n}: FT {ft_ms:.3} ms {check_label} {ft_sum:.6e}");
         if let Some((tms, tsum)) = run_pytorch(batch, m, n, full_matrices, requires_grad) {
+            let (ft_aa_ms, ft_aa_sum) = run_ft(batch, m, n, full_matrices, requires_grad)?;
+            let Some((pt_aa_ms, pt_aa_sum)) =
+                run_pytorch(batch, m, n, full_matrices, requires_grad)
+            else {
+                println!(
+                    "B={batch} m={m} n={n}: PyTorch second A/A arm unavailable"
+                );
+                continue;
+            };
             let rel = (ft_sum - tsum).abs() / (tsum.abs() + 1e-12);
+            let aa_rel = (ft_aa_sum - pt_aa_sum).abs() / (pt_aa_sum.abs() + 1e-12);
             let ratio = tms / ft_ms;
             let tag = if ratio >= 1.0 { "FASTER" } else { "SLOWER" };
             println!(
-                " | PyTorch {tms:.3} ms gradsum {tsum:.6e} rel {rel:.3e} | FT {ratio:.2}x {tag}"
+                "B={batch} m={m} n={n}: FT {ft_ms:.3} ms {check_label} {ft_sum:.6e} | \
+                 PyTorch {tms:.3} ms {check_label} {tsum:.6e} rel {rel:.3e} | \
+                 FT {ratio:.2}x {tag} | A/A FT {ft_aa_ms:.3}/{ft_ms:.3}={:.3} \
+                 PT {pt_aa_ms:.3}/{tms:.3}={:.3} second-rel {aa_rel:.3e}",
+                ft_aa_ms / ft_ms,
+                pt_aa_ms / tms,
             );
         } else {
-            println!(" | PyTorch unavailable");
+            println!("B={batch} m={m} n={n}: PyTorch unavailable");
         }
     }
     Ok(())
