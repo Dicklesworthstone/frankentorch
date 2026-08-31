@@ -34162,12 +34162,6 @@ mod bidiag {
     /// and therefore one-value-per-process and untoggleable.
     static FUSED_TRAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-    // `frankentorch-4zjaa`: keep the compact-WY expansion as the shipped route while allowing
-    // the live H2H lane to alternate it against the unblocked dorg2r expansion in one process.
-    // This changes floating-point association, so unlike the trailing-update switch above it is
-    // not a bit-exact maintenance toggle: its live parity column is load-bearing.
-    static BLOCKED_FORM_P: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
     pub(crate) fn fused_trailing_enabled() -> bool {
         FUSED_TRAILING.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -34176,30 +34170,6 @@ mod bidiag {
     /// it.
     pub(crate) fn set_fused_trailing(fused: bool) -> bool {
         FUSED_TRAILING.swap(fused, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub(crate) fn blocked_form_p_enabled() -> bool {
-        BLOCKED_FORM_P.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub(crate) fn set_blocked_form_p(blocked: bool) -> bool {
-        BLOCKED_FORM_P.swap(blocked, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub(crate) fn form_p_for_svd(
-        packed: &[f64],
-        n: usize,
-        taup: &[f64],
-        blocked: bool,
-    ) -> Vec<f64> {
-        if blocked {
-            bidiag_form_p_blocked_f64(packed, n, taup, super::svd_bidiag_block_size())
-        } else {
-            bidiag_form_p_f64(packed, n, taup)
-        }
     }
 
     #[inline]
@@ -35656,7 +35626,11 @@ fn svd_blocked_bidiag_prologue(
     // Per section 1 of the standing orders this is landed, not won, until a
     // post-fix ratio is taken in a quiet window.
     let t_formp = std::time::Instant::now();
-    let v = bidiag::form_p_for_svd(a, n, &taup, n >= 130 && bidiag::blocked_form_p_enabled());
+    let v = if n >= 130 {
+        bidiag::bidiag_form_p_blocked_f64(a, n, &taup, svd_bidiag_block_size())
+    } else {
+        bidiag::bidiag_form_p_f64(a, n, &taup)
+    };
     if track_left {
         let q = if n >= 130 {
             bidiag::bidiag_form_q_blocked_f64(a, m, n, &tauq, svd_bidiag_block_size())
@@ -36841,17 +36815,6 @@ pub fn bidiag_panel_output_blocked_set(blocked: bool) -> bool {
 #[doc(hidden)]
 pub fn bidiag_fused_trailing_set(fused: bool) -> bool {
     bidiag::set_fused_trailing(fused)
-}
-
-/// Select the SVD prologue's right-reflector expansion: `true` is the shipped compact-WY
-/// form and `false` is the former unblocked dorg2r form. Returns the previous setting.
-///
-/// `frankentorch-4zjaa` uses this only for a same-process live-incumbent H2H arm. The two
-/// forms reassociate floating-point work, so callers must validate the parity column; this is
-/// intentionally unlike the bit-exact `bidiag_fused_trailing_set` switch.
-#[doc(hidden)]
-pub fn bidiag_form_p_blocked_set(blocked: bool) -> bool {
-    bidiag::set_blocked_form_p(blocked)
 }
 
 /// The currently live bidiagonal parallel gate.
@@ -71516,40 +71479,6 @@ mod tests {
                 if took_blocked { "BLOCKED" } else { "unblocked" }
             );
         }
-    }
-
-    /// The H2H form-P arm must drive the exact prologue route it labels. Comparing only the
-    /// final singular values would be unsound because the sweep can converge to the same values
-    /// from differently rounded right reflectors.
-    #[test]
-    fn svd_prologue_form_p_toggle_selects_the_requested_expansion() {
-        let n = 136usize;
-        let mut packed = bidiag_test_matrix(n, n, 0x4F5A_0001);
-        let (_d, _e, _tauq, taup) =
-            super::bidiag::bidiag_blocked_f64(&mut packed, n, n, super::svd_bidiag_block_size());
-        let unblocked = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
-        let blocked = super::bidiag::bidiag_form_p_blocked_f64(
-            &packed,
-            n,
-            &taup,
-            super::svd_bidiag_block_size(),
-        );
-        assert_ne!(
-            unblocked, blocked,
-            "route test needs distinguishable expansions"
-        );
-
-        let observed_unblocked = super::bidiag::form_p_for_svd(&packed, n, &taup, false);
-        let observed_blocked = super::bidiag::form_p_for_svd(&packed, n, &taup, true);
-
-        assert_eq!(
-            observed_unblocked, unblocked,
-            "toggle-off must select dorg2r"
-        );
-        assert_eq!(
-            observed_blocked, blocked,
-            "toggle-on must select compact-WY"
-        );
     }
 
     /// How far apart ARE the gated helpers' two branches? —

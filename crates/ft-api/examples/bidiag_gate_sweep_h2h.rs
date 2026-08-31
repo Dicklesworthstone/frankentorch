@@ -46,7 +46,6 @@
 //! `FT_GATE_SIZES` (default `128,136,256,512`), `FT_GATE_VALUES` (default the shipped gate and
 //! always-serial), `FT_ROWDOT` (`1` = the four-row step-(12) kernel, `0` = the one-row loop it
 //! replaced), `FT_PANEL_OUTPUT` (`1` = four exact-order panel outputs, `0` = scalar),
-//! `FT_FORM_P_BLOCKED` (`1` = shipped compact-WY expansion, `0` = unblocked dorg2r),
 //! `FT_GATE_HOIST` (`1` = snapshot the gate once per panel, `0` = legacy per-reflector lookup),
 //! `FT_ROUNDS` (default 9) and `FT_H2H_WARMUP` (default 8, read by BOTH arms).
 
@@ -122,10 +121,6 @@ struct Arm {
     /// pair can move time and cannot move a number — `FT_FUSED=1,0` puts both halves in one
     /// invocation against one live incumbent.
     fused: bool,
-    /// Whether SVD's right-reflector expansion uses the shipped compact-WY form. This
-    /// reassociates work, so `FT_FORM_P_BLOCKED=1,0,1` carries its own A/A null and the live
-    /// PyTorch parity column must remain a match.
-    form_p_blocked: bool,
     /// The serial dlabrd steps keep four independent outputs in flight. This
     /// preserves each output's reduction order exactly (`frankentorch-75e38`).
     panel_output_blocked: bool,
@@ -239,11 +234,10 @@ fn arm_label(arm: Arm) -> String {
         format!("{}", arm.gate)
     };
     format!(
-        "{gate}/{}/{}/{}/{}/{}{}",
+        "{gate}/{}/{}/{}/{}{}",
         if arm.gate_hoisted { "gate-hoisted" } else { "gate-per-reflector" },
         if arm.blocked { "4row" } else { "1row" },
         if arm.fused { "fused" } else { "2pass" },
-        if arm.form_p_blocked { "formP-blocked" } else { "formP-unblocked" },
         if arm.panel_output_blocked {
             "4output"
         } else {
@@ -409,7 +403,6 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_gate_hoisted = ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(arm.gate_hoisted);
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
-    let previous_form_p = ft_kernel_cpu::bidiag_form_p_blocked_set(arm.form_p_blocked);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
@@ -456,7 +449,6 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
-        ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -490,7 +482,6 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
-        ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -582,7 +573,6 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
-    ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -671,18 +661,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // keeps measuring exactly what it measured before; `FT_FUSED=1,0` runs both halves in ONE
     // invocation against ONE live incumbent, which is the only form item 25 admits.
     let fuseds: Vec<bool> = std::env::var("FT_FUSED")
-        .unwrap_or_else(|_| "1".to_string())
-        .split(',')
-        .filter_map(|t| match t.trim() {
-            "1" => Some(true),
-            "0" => Some(false),
-            _ => None,
-        })
-        .collect();
-    // `frankentorch-4zjaa`: compare the shipped compact-WY form-P expansion with the unblocked
-    // dorg2r route in one invocation. Unlike FT_FUSED this changes rounding, so use a repeated
-    // blocked arm (for example `1,0,1`) for the A/A null and require live-Torch parity.
-    let form_p_blockeds: Vec<bool> = std::env::var("FT_FORM_P_BLOCKED")
         .unwrap_or_else(|_| "1".to_string())
         .split(',')
         .filter_map(|t| match t.trim() {
@@ -840,7 +818,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !gate_values.is_empty()
             && !rowdots.is_empty()
             && !fuseds.is_empty()
-            && !form_p_blockeds.is_empty()
             && !panel_outputs.is_empty()
             && !gate_hoists.is_empty()
             && !qtfs.is_empty(),
@@ -870,7 +847,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         gate_hoisted: true,
                                         blocked,
                                         fused,
-                                        form_p_blocked: true,
                                         panel_output_blocked,
                                         values_only: false,
                                         replay_transposed,
@@ -911,17 +887,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|arm| {
             gate_hoists.iter().map(move |&gate_hoisted| Arm {
                 gate_hoisted,
-                ..arm
-            })
-        })
-        .collect();
-    // Expand after the legacy grid so an unset knob keeps every existing arm and index exactly
-    // unchanged. The default is the shipped compact-WY route.
-    arms = arms
-        .into_iter()
-        .flat_map(|arm| {
-            form_p_blockeds.iter().map(move |&form_p_blocked| Arm {
-                form_p_blocked,
                 ..arm
             })
         })
