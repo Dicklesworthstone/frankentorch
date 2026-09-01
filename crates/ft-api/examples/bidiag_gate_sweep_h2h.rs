@@ -184,6 +184,9 @@ struct Arm {
     /// prices the new default against the OLD one inside a single invocation, with the shipped
     /// value as arm0 so the toggled arm is the one that departs from production.
     cholesky_nb: usize,
+    /// `frankentorch-valnx`: getrf blocking width; 0 = the shipped default. `FT_LUNB=0,128`
+    /// prices the new default against the OLD one, shipped value as arm0.
+    lu_nb: usize,
     /// Forced column-block WIDTH for the trailing-update GEMM; `0` = the thread-derived
     /// default (`frankentorch-rpytm`). `block_cols` divides by `rayon::current_num_threads()`,
     /// so width and thread count move together by default and a thread sweep cannot separate
@@ -274,6 +277,7 @@ fn arm_label(arm: Arm) -> String {
         + if arm.sub_tile_2d { "/sub2D" } else { "/subCOL" }
         + &format!("/panelmode{}", arm.panel_mode)
         + &(if arm.cholesky_nb == 0 { "/nbSHIPPED".to_string() } else { format!("/nb{}", arm.cholesky_nb) })
+        + &(if arm.lu_nb == 0 { "/luSHIPPED".to_string() } else { format!("/lunb{}", arm.lu_nb) })
         + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
         + &(match arm.panel_par_min {
             Some(v) => format!("/ppm{v}"),
@@ -441,6 +445,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_subtile = ft_kernel_cpu::set_dgemm_sub_tile_2d(arm.sub_tile_2d);
     let previous_panelmode = ft_kernel_cpu::set_cholesky_panel_mode(arm.panel_mode);
     let previous_cholnb = ft_kernel_cpu::set_cholesky_nb(arm.cholesky_nb);
+    let previous_lunb = ft_kernel_cpu::set_lu_nb(arm.lu_nb);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
@@ -495,6 +500,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
+        ft_kernel_cpu::set_lu_nb(previous_lunb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -534,6 +540,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
+        ft_kernel_cpu::set_lu_nb(previous_lunb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -631,6 +638,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
     ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
     ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
+    ft_kernel_cpu::set_lu_nb(previous_lunb);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -882,6 +890,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .unwrap_or_else(|| vec![0]);
+    let lunbs: Vec<usize> = std::env::var("FT_LUNB")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|v| v.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![0]);
     let ggs_arms: Vec<bool> = std::env::var("FT_GGS")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -941,6 +957,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for &sub_tile_2d in &subtiles {
                             for &panel_mode in &panelmodes {
                             for &cholesky_nb in &cholnbs {
+                            for &lu_nb in &lunbs {
                                 for &sub_cols in &subcols {
                                   for &panel_par_min in &ppms {
                                    for &tred2_par_min in &tpms {
@@ -966,6 +983,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         sub_tile_2d,
                                         panel_mode,
                                         cholesky_nb,
+                                        lu_nb,
                                         sub_cols,
                                         panel_par_min,
                                         tred2_par_min,
@@ -989,6 +1007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                    }
                                   }
                                 }
+                            }
                             }
                             }
                             }
