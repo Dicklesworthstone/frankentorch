@@ -25196,30 +25196,44 @@ pub fn lu_factor_contiguous_f64(
     data: &[f64],
     meta: &TensorMeta,
 ) -> Result<LuFactorResult, KernelError> {
-    // NB 64 -> 128. Interleaved min-of-15 ladders at THREE sizes, and 128 wins or ties at
-    // all of them:
+    // NB 128 -> 64, `frankentorch-valnx` ledger 292e. The RE-TUNE, and why the previous one is
+    // not evidence any more.
     //
-    //        n=512      n=520      n=1024
-    //   64  75.752ms   71.098ms  193.459ms   (shipped)
-    //   96  60.857ms   66.389ms  180.563ms
-    //  128  62.780ms   62.780ms  166.010ms   -> 1.213x / 1.133x / 1.165x
+    // The 64 -> 128 move recorded here measured n=512 nb=64 at 75.752 ms against nb=128 at
+    // 62.780 ms. That cell now measures **4.87 ms** — the path is ~13x faster than when the
+    // ladder ran, because it has been rebuilt underneath (recursive panel, row-accumulating
+    // TRSM, row-wise RHS permutation, parallel trailing update). **A blocking constant tuned
+    // against code that no longer exists is tuned against nothing**, and the honest response to
+    // a 13x shift is to re-run the ladder rather than to trust its ordering.
     //
-    // 64 was also a LOCAL MAXIMUM at every size - impossible for a real blocking curve.
-    // Cause is cache-set aliasing: at n=512 a row is 512*8 = 4096 bytes = exactly one page
-    // and a 64*8 = 512-byte panel stride conflicts, costing +10.7% over nb=48. At n=520
-    // (4160-byte rows, not page-aligned) the same penalty is +0.7% - a 15x reduction from
-    // changing only the alignment, which is what confirmed the mechanism.
+    // Re-measured on the current path, three sizes, two runs, min of 9, guard PASS. nb=64 beats
+    // the shipped 128 in ALL SIX cells:
     //
-    // Three sizes deliberately: geqrf's nb was tuned at n=512 alone, measured a CERTIFIED
-    // 1.223x there, and was a NULL at n=1024.
-    lu_factor_contiguous_nb_f64(data, meta, 128)
+    //        n=256           n=512           n=1024
+    //   1.576x / 1.813x  1.186x / 1.191x  1.209x / 1.284x
+    //
+    // THE OLD COMMENT'S MECHANISM SURVIVES AND STILL MATTERS. It found nb=64 to be a local
+    // maximum caused by cache-set aliasing: at n=512 a row is 512*8 = 4096 bytes = exactly one
+    // page, and a 64*8 = 512-byte panel stride conflicts; at n=520 (4160-byte rows, not
+    // page-aligned) the penalty collapsed 15x, which is what confirmed it. That effect is still
+    // visible — n=512 is the ONE size where the optimum is unstable across runs, moving among
+    // {32, 64, 96} — but 128 loses at n=512 in both runs regardless, so the aliasing changes
+    // which small nb wins, not whether a small one does.
+    //
+    // 64 rather than 96: nb=96 tops one cell but LOSES at n=1024 in the second run (0.972x).
+    // Ship the constant that wins everywhere over the one that tops a cell.
+    //
+    // Three sizes deliberately, and the reason has only got stronger: geqrf's nb was tuned at
+    // n=512 alone, measured a CERTIFIED 1.223x there, and was a NULL at n=1024.
+    lu_factor_contiguous_nb_f64(data, meta, lu_nb())
 }
 
 /// `lu_factor_contiguous_f64` with the blocking factor exposed, for sweeping.
 ///
-/// `NB` here has never been swept. It shipped at 64 - higher than the QR path's 32, whose
-/// measured optimum turned out to be 16 - and getrf is the worst remaining single-matrix
-/// loss at 14.715x (n=512) now that the Householder family is closed.
+/// Swept twice now: 64 -> 128 on the old path, then 128 -> 64 on the current one after the path
+/// got ~13x faster and inverted the ordering (`frankentorch-valnx`, ledger 292e). The standing
+/// lesson is in that reversal — re-run a blocking ladder whenever the code under it moves, because
+/// the constant encodes the code's shape and not an intrinsic property of the algorithm.
 use std::sync::atomic::{AtomicU64, Ordering as LuOrdering};
 
 /// Phase counters for `lu_factor_contiguous_nb_f64` — getrf is the worst measured
@@ -25260,6 +25274,49 @@ fn lu_panel_par_min() -> usize {
 #[doc(hidden)]
 pub fn set_lu_panel_par_min(v: usize) -> usize {
     LU_PANEL_PAR_MIN.swap(v as u64, LuOrdering::Relaxed) as usize
+}
+
+/// getrf blocking width, overridable for the nb sweep and the paired lane arm.
+/// `frankentorch-valnx`. 0 = the shipped default, so an unset knob is the shipped path.
+static LU_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The shipped getrf blocking width. **64, changed from 128** — `frankentorch-valnx`, ledger 292e.
+///
+/// The previous 128 came from a ladder that measured n=512 nb=64 at 75.752 ms against nb=128 at
+/// 62.780 ms. **That tuning is stale**: the same cell now measures 4.87 ms, ~13x faster, because
+/// the LU path has been rebuilt underneath it (recursive panel, row-accumulating TRSM, row-wise
+/// RHS permutation, parallel trailing update). A blocking constant tuned against code that no
+/// longer exists is a constant tuned against nothing.
+///
+/// RE-MEASURED on the current path, three sizes, two runs, min of 9, guard PASS — nb=64 beats the
+/// shipped 128 in ALL SIX cells:
+///
+///     n=256   1.576x / 1.813x     n=512   1.186x / 1.191x     n=1024   1.209x / 1.284x
+///
+/// WHY THE OPTIMUM IS NOT CHOLESKY'S. LU's panel is `m x nb` with m ~ n, so its MACs are
+/// ~`n^2*nb/4` — LINEAR in nb — where cholesky's `nb x nb` panel gives `n*nb^2/6`, QUADRATIC. The
+/// two ops therefore trade differently against the trailing GEMM, and 292d's cholesky move
+/// (128 -> 64) and this one land on the same number for different reasons. The measured panel rate
+/// rises to ~6 GF/s at nb=128 and falls beyond it, while the trailing time keeps dropping with
+/// larger k, which is what puts the optimum at 64-96 rather than at either extreme.
+///
+/// 64 rather than 96: nb=96 wins one cell but LOSES at n=1024 in the second run (0.972x), while
+/// nb=64 wins all six. Ship the constant that wins everywhere, not the one that tops a cell.
+///
+/// NOT BIT-EXACT — blocking reassociates, and getrf is tolerance-validated for that reason.
+const LU_NB_SHIPPED: usize = 64;
+
+/// Override the getrf blocking width; `0` restores the shipped default. Returns the previous value.
+#[doc(hidden)]
+pub fn set_lu_nb(nb: usize) -> usize {
+    LU_NB.swap(nb, LuOrdering::Relaxed)
+}
+
+fn lu_nb() -> usize {
+    match LU_NB.load(LuOrdering::Relaxed) {
+        0 => LU_NB_SHIPPED,
+        v => v.max(1),
+    }
 }
 
 static LU_PANEL_NS: AtomicU64 = AtomicU64::new(0);
