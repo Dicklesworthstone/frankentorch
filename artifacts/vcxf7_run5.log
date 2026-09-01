@@ -1,0 +1,122 @@
+  [2m2026-09-01T04:39:14.873782Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:19.924576Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at ubuntu@178.104.77.29 (0 slots remaining after reservation, speed 75.2)[0m
+    [2;3mat[0m rch/src/hook.rs:2529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:20.200282Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: 9446a95edb882e33)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:471 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:20.200313Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:493 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:24.612274Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:598 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:24.612351Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch -> /data/projects/frankentorch on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:3193 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:27.530523Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2918ms[0m
+    [2;3mat[0m rch/src/transfer.rs:3266 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:27.530555Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 5423 files, 310813 bytes in 2918ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:874 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:37.330766Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --release -j2 -p frankentorch-kernel-cpu --lib conv2d_dweight_streamed -- --nocapture[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:934 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:37.330803Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/frankentorch/.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af[0m
+    [2;3mat[0m rch/src/transfer.rs:1610 [2;3mon[0m ThreadId(1)
+
+warning: duplicated attribute
+     --> crates/ft-kernel-cpu/src/lib.rs:52290:5
+      |
+52290 |     #[test]
+      |     ^^^^^^^
+      |
+      = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: duplicated attribute
+     --> crates/ft-kernel-cpu/src/lib.rs:71645:5
+      |
+71645 |     #[test]
+      |     ^^^^^^^
+
+warning: duplicated attribute
+     --> crates/ft-kernel-cpu/src/lib.rs:71656:5
+      |
+71656 |     #[test]
+      |     ^^^^^^^
+
+warning: duplicated attribute
+     --> crates/ft-kernel-cpu/src/lib.rs:75467:5
+      |
+75467 |     #[test]
+      |     ^^^^^^^
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:8819:3
+     |
+8819 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:9867:3
+     |
+9867 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+warning: function `conv2d_dweight_streamed_matches_the_panel_gemm_bitwise` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:52368:8
+      |
+52368 |     fn conv2d_dweight_streamed_matches_the_panel_gemm_bitwise() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `cholesky_panel_modes_agree_bitwise` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:71793:8
+      |
+71793 |     fn cholesky_panel_modes_agree_bitwise() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `cholesky_blocked_phase_counters_cover_each_live_stage` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:71841:8
+      |
+71841 |     fn cholesky_blocked_phase_counters_cover_each_live_stage() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `frankentorch-kernel-cpu` (lib test) generated 9 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running unittests src/lib.rs (.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af/release/build/frankentorch-kernel-cpu/7b04664fd0519e66/out/ft_kernel_cpu-7b04664fd0519e66)
+
+running 3 tests
+test tests::conv2d_dweight_streamed_tiling_is_correct_at_every_rayon_width ... ok
+test tests::conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise ... ok
+test tests::conv2d_dweight_streamed_tiling_is_correct_at_every_rayon_width ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 768 filtered out; finished in 0.21s
+
+  [2m2026-09-01T04:39:39.239257Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 1799ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:39.277580Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1141 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:39.277615Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankentorch on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:41.220002Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1942ms (1 files, 1337 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:39:41.220024Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 1337 bytes in 1942ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1173 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (21.3s)
