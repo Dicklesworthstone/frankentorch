@@ -42327,3 +42327,57 @@ reasoning about them:
 `dgemm_bt_sub_census_take`) are the same shape and are NOT converted. No test reads them today —
 only sweeps do, one thread per process — so they are exposure, not a live defect. The helper takes
 any `(counter, owner)` pair, so each is a two-line change if one ever becomes a test's instrument.
+
+### 293g. THE CLASS IS CLOSED: EVERY DRAIN-STYLE INSTRUMENT IN ft-kernel-cpu IS THREAD-OWNED
+
+`frankentorch-ebbew`, completing what 293f named as deliberately unfinished. Those families were
+EXPOSURE rather than a live defect — no test drains them, only sweeps, one thread per process — so
+this closes the class rather than a failure, which is the cheapest moment to do it.
+
+Five more families, each with its own owner because each has its own drain accessor:
+
+    LU_SOLVE_OWNER                 lu_solve forward / back / permute timers
+    LU_INV_OWNER                   getri's two half-timers, its setup/permute extras, AND its
+                                   column census — one owner, because all three are views of the
+                                   same `lu_inverse_from_factor_f64` call
+    CHOLESKY_PANEL_CENSUS_OWNER    kept SEPARATE from CHOLESKY_STAGE_OWNER: different accessors, and
+                                   a reader of the stage timers has no business silencing the census
+    gemm::HOUSEHOLDER_SKINNY_OWNER
+    gemm::DGEMM_BT_SUB_CENSUS_OWNER
+
+**TWO SHAPES DID NOT FIT `stage_family_add`, AND THE DIFFERENCE IS THE ITEM.** The predicate was
+split out as `stage_family_records(owner)` for them:
+
+  * **The skinny-split census has no wrappable write** — the two `fetch_add`s sit beside the
+    `admitted` decision that picks the DISPATCH ROUTE. **Only the counting is owned.** Gating the
+    route on census ownership would have made an instrument silently change which code runs, which
+    is a strictly worse bug than the one being fixed and precisely the confound `geqrf_nb_sweep`
+    exists to avoid.
+  * **The `dgemm_bt_sub` census pushes into a `Mutex<Vec<_>>`**, not an atomic, so ownership is
+    tested at its one existing gate, `dgemm_bt_sub_census_enabled()` — a one-line change.
+
+**THE SECOND HALF OF EACH ASSERTION PAIR IS WHY THIS IS VERIFIABLE UNDER LOAD.** A foreign thread
+must contribute exactly zero AND each family must still record for its owner. A zero-only assertion
+is passed by an instrument that has been silently switched off — the precise risk here, since these
+counters have no enable flag and the four `*_nb_sweep` harnesses depend on them recording by
+default. 293f checked that half by RUNNING the sweeps and reading their phase columns; the host was
+under an external build at loadavg 443 when this landed, so that route was closed. **Putting the
+liveness half inside the test is what let the change be verified without a measurement window** —
+and it is the better place for it regardless, because it runs on every gate rather than when
+somebody remembers.
+
+`half_timers_and_censuses_ignore_other_threads_after_this_thread_claims_them` is kept separate from
+its stage-counter sibling: different accessors over different atomics, and one test spanning nine
+families would report "something is wrong" rather than which one.
+
+**EVIDENCE.** Three consecutive full-suite runs on hz2, default parallel runner, **768 passed /
+0 failed** each. clippy `--lib --tests`: zero findings naming any new symbol. **No measurement is
+claimed and none was taken** — the host was at loadavg 443 throughout, every build and test ran
+remotely through rch, and the sweep-harness phase-column check that 293f used is DEFERRED, not
+skipped: re-run `cholesky_nb_sweep`, `lu_nb_sweep` and `inv_nb_sweep` when the host clears and
+confirm the phase columns are populated.
+
+**WHAT IS ACTUALLY LEFT: nothing in this class.** Every `*_take_ns` and `*_census_take` accessor in
+`ft-kernel-cpu` now claims an owner, and every write site behind them is gated. The invariant to
+preserve is one line long: **a new drain-style instrument gets an owner, its accessor claims it, and
+its writes go through `stage_family_add` or `stage_family_records`.**
