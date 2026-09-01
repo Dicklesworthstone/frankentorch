@@ -1,0 +1,12 @@
+=== pooled max_pool3d duration-window refresh (torch:4) ===
+build_base=ae403006843acdae8a85e23ba9b3ad49e69ac6eb
+build_command=RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/tmp/frankentorch-torch4-maxpool3d-window-ae403006843a-TAIVOK rch --no-self-healing exec --base ae403006843acdae8a85e23ba9b3ad49e69ac6eb --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+build_worker=hz4
+build_job=j-30000682123658428
+executing_elf=/data/tmp/frankentorch-torch4-maxpool3d-window-ae403006843a-TAIVOK/release/examples/gauntlet_lane_sweep_h2h
+executing_elf_sha256=ce2e48d2736d835100742bdcc80433a26074d15ed6996cd0c6a94234ec1fb1d8
+runtime_head=b62f8acf46e860ac1daa402ef37f46a229fa31a2
+committed_source_surface_vs_build_base=UNCHANGED
+run_classification=NO_VERDICT
+reason=before duration-window entry, shared worktree gained uncommitted peer source edits in scripts/lib/loadavg_spread_verdict.sh and scripts/loadavg_spread_corpus_replay.sh; no wrapper, guard, harness, PyTorch, parity, A/A, or incumbent-bank action was taken
+incumbent_level=N/A
