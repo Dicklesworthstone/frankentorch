@@ -100,3 +100,4 @@
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"conv2d","fingerprint":"3.282520e5","incumbent_ms":3.295323,"rounds":24,"lane_count":2,"recorded_unix":1788293783}
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"conv2d_masked","fingerprint":"2.249929e4","incumbent_ms":3.226556,"rounds":24,"lane_count":2,"recorded_unix":1788293783}
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"max_pool3d","fingerprint":"1.310720e5","incumbent_ms":0.756099,"rounds":32,"lane_count":1,"recorded_unix":1788295793}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"max_pool1d_nopool","fingerprint":"2.097152e6","incumbent_ms":5.464084,"rounds":32,"lane_count":1,"recorded_unix":1788296483}
