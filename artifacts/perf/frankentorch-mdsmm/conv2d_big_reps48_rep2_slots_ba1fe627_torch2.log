@@ -1,0 +1,174 @@
+===== conv2d_big standing row — torch:2 (CreamTrout) 2026-09-01T14:53:59Z =====
+host=thinkstation1 nproc=64
+HEAD=2487ad3731e21cbf6b99e81768e690bc5f9fd549
+build_base=ba1fe6270da6b5cfa894e1c83d97bbb082689f22 (clean-overlay receipt, conv2d_twin_lanes_ba1fe627_torch3.log:209)
+harness_last_edited=ba1fe6270da6b5cfa894e1c83d97bbb082689f22
+elf_sha256=1c7bbababe8f725bfcf224abefc2e6dee4e9a292c483ee5e9708fb94920cad55
+loadavg_pre=3.42 3.01 2.72 3/8830 1859784
+run_command=scripts/measurement_window_guard.sh && PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=8 FT_H2H_LANES_EXACT=1 FT_H2H_LANES=conv2d_big,conv2d_big_masked FT_H2H_REPS=48 FT_H2H_WARMUP=16 <snapshotted-elf>   (round_warmup UNSET = 0, the board default)
+guard PASS: no peer measurement detected, loadavg 3.42/3.01/2.72 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+guard_exit=0
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=1c7bbababe8f725bfcf224abefc2e6dee4e9a292c483ee5e9708fb94920cad55
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+incumbent_rule=a delta whose incumbent arm moved (version, build, or measured time) is NOT a win
+measurement_host=thinkstation1 cpu="AMD Ryzen Threadripper PRO 5975WX 32-Cores" isa=x86_64+avx2 governor=powersave rayon_threads=8 online_cpus=64
+host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured elsewhere is not comparable to this one, A/A PASS or not
+measurement_slot=held [pid=1859960 host=thinkstation1 elf=1c7bbababe8f725b lanes=conv2d_big,conv2d_big_masked]; no other live h2h announcement
+concurrent_measurements=none ACTIVE (scanned /proc for other h2h harnesses, criterion benches and torch processes, then measured each candidate's local CPU over 300ms; this run's own incumbent child is excluded)
+concurrent_measurements_idle=2 (matched by name, burning no local CPU — shell wrappers, and rch clients whose bench runs on a remote worker; reported, not voiding): h2h-harness[1840351] 0% h2h-harness[1840352] 0%
+cpu_mhz min=1429 median=1429 max=4327 spread=3.028x; arms NOT pinned: our 64 rayon threads span every core including any parked at the floor, the incumbent's 8 land wherever the scheduler puts them, so this row's arms are NOT known to have run at comparable clocks
+allocator=system (glibc malloc) — re-run with --features fair-alloc before quoting
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+sampling=balanced-square ABBAABBA (frankentorch-xdw0h); 48 rounds, four live samples per arm per round, torch threads=8
+round_warmup=0 (FT_H2H_ROUND_WARMUP; discarded samples per lane per round, BOTH arms). 0 = the board's default: each lane's slot 0 each round arrives cold, which NEGATIVE_EVIDENCE item 147 measured at +20-30% on the summed conv2d lanes
+
+lane          FT(ms)    PT(ms)   standing            PT/FT A/A gates and ratio CI                 parity
+lane_filter="conv2d_big,conv2d_big_masked" match=exact kept=2 of the full set (frankentorch-68pwz item 58; item 226: substring is the default, FT_H2H_LANES_EXACT=1 narrows it)
+lane_count=2 rounds=48 (frankentorch-vyaia: the harness's own load scales with this product; a self-load bound quoted without it cannot be checked later)
+SLOTS lane=conv2d_big ft=[4.3311 5.2079 4.2210 4.5580] pt=[12.0509 11.0075 10.2274 11.2337]
+SLOTS lane=conv2d_big_masked ft=[7.9129 8.4587 8.7135 8.7066] pt=[10.1264 10.3435 9.5227 10.6490]
+SLOTS lane=conv2d_big ft=[3.9161 4.3236 4.0548 4.1776] pt=[9.0406 9.6694 9.6690 10.8202]
+SLOTS lane=conv2d_big_masked ft=[8.6584 9.0267 8.7364 8.7292] pt=[9.1589 10.6338 8.8330 10.1046]
+SLOTS lane=conv2d_big ft=[4.2422 4.6819 4.0271 4.8810] pt=[9.7237 11.1006 9.6235 9.8524]
+SLOTS lane=conv2d_big_masked ft=[8.0788 8.4380 8.2017 8.1890] pt=[9.1529 10.9676 11.6232 11.0328]
+SLOTS lane=conv2d_big ft=[3.9118 4.0215 3.8320 4.2991] pt=[10.3216 10.9670 9.7351 11.2272]
+SLOTS lane=conv2d_big_masked ft=[8.2976 8.7526 8.1362 8.5851] pt=[10.4106 11.9273 9.7942 11.8227]
+SLOTS lane=conv2d_big ft=[4.2015 4.2080 4.1201 4.6827] pt=[10.4530 11.2863 10.9355 11.1115]
+SLOTS lane=conv2d_big_masked ft=[8.3585 8.8531 8.1461 9.1026] pt=[10.7592 14.2867 11.1316 11.4024]
+SLOTS lane=conv2d_big ft=[4.1397 5.4231 4.4910 4.1933] pt=[11.1337 11.5123 9.5039 10.5304]
+SLOTS lane=conv2d_big_masked ft=[7.6206 8.0320 7.7574 7.8629] pt=[10.3064 10.7415 9.8269 10.8550]
+SLOTS lane=conv2d_big ft=[3.9125 4.0131 4.1537 4.3481] pt=[9.9881 9.6734 9.2243 10.6466]
+SLOTS lane=conv2d_big_masked ft=[8.0978 8.8497 8.4220 9.3528] pt=[9.3847 11.3016 9.0143 9.8715]
+SLOTS lane=conv2d_big ft=[4.3556 4.1584 4.2819 4.0520] pt=[9.9278 10.6463 9.8649 10.0768]
+SLOTS lane=conv2d_big_masked ft=[7.8741 9.0621 8.0971 9.0117] pt=[9.4289 11.2681 9.7403 11.2330]
+SLOTS lane=conv2d_big ft=[4.3417 4.5040 4.0528 3.9689] pt=[9.9634 10.3618 9.0305 10.8262]
+SLOTS lane=conv2d_big_masked ft=[8.4851 8.7866 9.2991 10.1010] pt=[10.6279 10.5923 9.2128 10.5609]
+SLOTS lane=conv2d_big ft=[4.3334 5.1090 4.6149 4.1490] pt=[9.5560 12.0499 11.2823 10.1631]
+SLOTS lane=conv2d_big_masked ft=[8.1141 11.0061 8.7747 8.7871] pt=[9.6324 10.6064 8.9860 10.4238]
+SLOTS lane=conv2d_big ft=[4.3472 4.7550 4.2260 5.2278] pt=[10.7138 10.9796 9.2606 11.8280]
+SLOTS lane=conv2d_big_masked ft=[9.1072 8.3081 8.4012 8.2539] pt=[9.9878 11.0144 9.9509 11.8254]
+SLOTS lane=conv2d_big ft=[4.2930 3.7683 3.8101 3.6445] pt=[10.2518 10.3444 10.1768 11.2667]
+SLOTS lane=conv2d_big_masked ft=[7.3109 8.1128 8.2629 8.6358] pt=[10.4381 11.1356 10.3516 11.5546]
+SLOTS lane=conv2d_big ft=[4.3255 3.8029 4.0612 3.9057] pt=[10.2867 11.1638 9.8324 10.8039]
+SLOTS lane=conv2d_big_masked ft=[8.0507 9.7451 8.9169 9.5207] pt=[10.2286 11.2627 11.5133 10.9131]
+SLOTS lane=conv2d_big ft=[4.3598 4.7635 4.1745 4.2906] pt=[9.9732 10.5008 9.6419 10.1431]
+SLOTS lane=conv2d_big_masked ft=[7.7412 8.7388 8.1499 10.4120] pt=[9.1316 10.2029 9.0327 11.8249]
+SLOTS lane=conv2d_big ft=[5.5980 4.9159 4.6321 4.9337] pt=[11.4387 12.6997 12.2991 12.7835]
+SLOTS lane=conv2d_big_masked ft=[8.7173 9.5626 9.2986 9.9421] pt=[10.9847 12.0612 11.1041 11.9820]
+SLOTS lane=conv2d_big ft=[5.0555 4.8843 4.2661 4.5917] pt=[10.1752 10.7249 12.0137 10.5499]
+SLOTS lane=conv2d_big_masked ft=[8.4413 8.7182 8.4064 8.3476] pt=[10.9710 11.0497 9.9731 10.7985]
+SLOTS lane=conv2d_big ft=[4.0106 3.7736 3.9525 3.7239] pt=[9.1026 9.6190 9.2082 9.6751]
+SLOTS lane=conv2d_big_masked ft=[8.3210 8.2303 7.4564 8.5394] pt=[9.4528 10.5502 9.4963 10.7864]
+SLOTS lane=conv2d_big ft=[4.1454 4.0756 3.8729 3.7273] pt=[10.6733 10.5390 9.7835 10.1080]
+SLOTS lane=conv2d_big_masked ft=[7.1281 7.2401 7.0623 6.9925] pt=[10.1536 11.0901 10.3805 11.7091]
+SLOTS lane=conv2d_big ft=[4.0066 4.4032 4.1603 4.5160] pt=[10.8196 10.4569 9.9679 12.5403]
+SLOTS lane=conv2d_big_masked ft=[8.4015 9.8533 7.8796 8.1169] pt=[10.6392 11.4627 10.5789 10.1217]
+SLOTS lane=conv2d_big ft=[4.0038 3.6508 4.2982 3.9048] pt=[10.4427 11.1802 11.1537 11.6703]
+SLOTS lane=conv2d_big_masked ft=[7.3689 7.6121 9.3020 8.7602] pt=[9.7743 9.9868 10.5194 11.8227]
+SLOTS lane=conv2d_big ft=[4.2457 4.2093 4.5693 6.0048] pt=[10.3234 11.0643 9.3976 11.2603]
+SLOTS lane=conv2d_big_masked ft=[8.1905 9.1685 8.4702 7.7669] pt=[11.4337 12.2857 9.7932 11.7077]
+SLOTS lane=conv2d_big ft=[3.7776 3.7121 4.1206 4.7118] pt=[9.9030 10.7160 9.9595 13.1012]
+SLOTS lane=conv2d_big_masked ft=[8.8249 10.7928 9.2106 8.7116] pt=[9.9386 11.2724 9.6558 11.1107]
+SLOTS lane=conv2d_big ft=[4.2037 4.2349 3.9303 4.2887] pt=[11.2895 10.3101 9.6539 11.2125]
+SLOTS lane=conv2d_big_masked ft=[7.8308 8.3869 7.7960 8.2446] pt=[10.0335 11.8569 10.3327 10.3621]
+SLOTS lane=conv2d_big ft=[4.0110 4.3321 5.0267 5.2596] pt=[9.2589 10.2615 9.6265 10.9520]
+SLOTS lane=conv2d_big_masked ft=[8.6178 8.5626 7.8525 8.3106] pt=[10.0539 10.9421 10.3708 11.2838]
+SLOTS lane=conv2d_big ft=[3.9405 4.0406 4.2902 4.3188] pt=[10.3194 11.7649 9.8712 10.4727]
+SLOTS lane=conv2d_big_masked ft=[9.5666 9.0066 8.1971 9.5676] pt=[9.7415 10.1070 9.3557 12.2382]
+SLOTS lane=conv2d_big ft=[4.4904 4.7624 4.4371 4.7385] pt=[9.3816 10.9592 9.8645 11.5560]
+SLOTS lane=conv2d_big_masked ft=[8.9125 9.7003 8.7950 10.1099] pt=[10.6931 11.7548 10.0880 10.8959]
+SLOTS lane=conv2d_big ft=[4.6334 4.3702 4.1683 4.7870] pt=[11.0022 11.6169 10.1097 11.0809]
+SLOTS lane=conv2d_big_masked ft=[8.4951 10.0680 9.0571 9.9142] pt=[11.2139 11.8785 10.9928 11.8772]
+SLOTS lane=conv2d_big ft=[4.6626 4.9711 4.4305 4.5481] pt=[10.4825 10.9326 10.2601 10.9341]
+SLOTS lane=conv2d_big_masked ft=[9.0033 9.7249 8.4984 8.7358] pt=[9.5005 11.1063 10.8842 12.4125]
+SLOTS lane=conv2d_big ft=[3.9974 4.7419 4.2178 4.0421] pt=[10.7817 12.3111 10.1070 12.1631]
+SLOTS lane=conv2d_big_masked ft=[9.0418 10.0227 9.0198 9.0883] pt=[11.4079 10.7565 10.6245 11.8147]
+SLOTS lane=conv2d_big ft=[4.1309 4.1083 4.1223 3.6562] pt=[10.1451 10.2542 9.9153 10.6543]
+SLOTS lane=conv2d_big_masked ft=[7.5693 8.1807 8.6341 9.7246] pt=[10.6607 11.9158 9.9794 11.9332]
+SLOTS lane=conv2d_big ft=[4.4272 4.2861 3.8267 4.2096] pt=[9.9941 10.9939 9.8681 9.9390]
+SLOTS lane=conv2d_big_masked ft=[8.0714 8.9237 7.8721 7.8409] pt=[10.3369 11.0721 9.4783 10.0961]
+SLOTS lane=conv2d_big ft=[3.8069 3.7365 3.8999 4.0113] pt=[9.4201 9.7975 10.1459 11.3317]
+SLOTS lane=conv2d_big_masked ft=[7.2042 8.3217 7.4187 7.6152] pt=[10.5557 11.2478 11.1255 10.7926]
+SLOTS lane=conv2d_big ft=[3.9975 4.2560 3.9016 4.3017] pt=[10.5178 10.8925 9.9801 10.5363]
+SLOTS lane=conv2d_big_masked ft=[8.0183 8.6469 7.8899 7.6669] pt=[10.0393 12.1742 9.9669 11.4980]
+SLOTS lane=conv2d_big ft=[3.8507 3.9857 4.1190 4.2099] pt=[11.6817 11.4051 11.3847 11.1419]
+SLOTS lane=conv2d_big_masked ft=[7.2569 8.6331 8.2192 8.7370] pt=[10.6760 11.5760 11.2092 11.6688]
+SLOTS lane=conv2d_big ft=[3.9943 4.2906 4.3969 3.8552] pt=[9.8986 11.5861 11.0229 12.3018]
+SLOTS lane=conv2d_big_masked ft=[7.6525 8.0865 8.7245 10.5941] pt=[10.0751 13.2726 11.6113 11.8064]
+SLOTS lane=conv2d_big ft=[4.2082 4.8993 4.5077 4.3742] pt=[9.4968 12.1786 9.7593 10.6957]
+SLOTS lane=conv2d_big_masked ft=[8.2906 8.5057 7.1217 7.1500] pt=[10.8023 11.1158 9.5139 11.2209]
+SLOTS lane=conv2d_big ft=[3.8683 3.5242 3.9437 3.5405] pt=[10.3443 10.4314 10.5128 12.0265]
+SLOTS lane=conv2d_big_masked ft=[8.6721 9.1357 9.2045 9.2595] pt=[10.4730 11.0540 10.1138 11.1186]
+SLOTS lane=conv2d_big ft=[4.2022 4.5064 4.1438 4.5984] pt=[9.0236 10.6433 10.2150 11.5411]
+SLOTS lane=conv2d_big_masked ft=[9.0142 10.5613 8.4848 8.8523] pt=[11.7222 12.2920 10.3414 10.2854]
+SLOTS lane=conv2d_big ft=[4.0751 5.4417 4.4100 4.1468] pt=[9.8742 10.0897 9.1558 10.0415]
+SLOTS lane=conv2d_big_masked ft=[8.1758 8.5969 7.3864 6.9843] pt=[10.3447 11.6964 10.4050 11.6962]
+SLOTS lane=conv2d_big ft=[3.8515 3.4552 4.0620 3.8701] pt=[10.8521 10.7757 10.9540 11.9263]
+SLOTS lane=conv2d_big_masked ft=[7.6078 8.5424 8.0233 9.1244] pt=[11.1119 11.1142 10.7053 14.0631]
+SLOTS lane=conv2d_big ft=[4.4133 4.5883 4.1945 4.8868] pt=[10.9129 11.0090 10.5486 10.4256]
+SLOTS lane=conv2d_big_masked ft=[9.6139 10.3540 9.1770 8.6794] pt=[10.6263 11.2365 10.9715 10.2089]
+SLOTS lane=conv2d_big ft=[3.9984 4.2817 3.8598 4.2007] pt=[9.3927 11.8771 10.3367 10.8880]
+SLOTS lane=conv2d_big_masked ft=[8.3738 7.7920 8.3378 8.8101] pt=[10.0316 11.3574 10.1424 11.0454]
+SLOTS lane=conv2d_big ft=[3.8272 3.9751 4.0768 4.3210] pt=[10.3468 11.5905 10.3047 13.5027]
+SLOTS lane=conv2d_big_masked ft=[7.5042 8.0107 7.6036 8.5413] pt=[10.5541 11.7924 10.6690 10.5848]
+SLOTS lane=conv2d_big ft=[4.1769 4.0498 3.8500 3.7718] pt=[10.5801 10.1500 9.7289 10.0145]
+SLOTS lane=conv2d_big_masked ft=[7.8495 8.9372 8.6364 8.5915] pt=[9.6746 11.0613 10.5828 10.8551]
+SLOTS lane=conv2d_big ft=[4.0308 4.0470 3.8375 3.8832] pt=[9.8325 10.4439 9.9934 10.2288]
+SLOTS lane=conv2d_big_masked ft=[8.1227 8.3236 8.6198 9.0681] pt=[10.0534 10.7634 11.0561 11.3223]
+SLOTS lane=conv2d_big ft=[4.1625 4.3137 4.2674 4.2657] pt=[10.5576 11.2190 10.1588 11.2913]
+SLOTS lane=conv2d_big_masked ft=[8.2527 9.9318 9.7146 9.6204] pt=[10.6522 11.5088 10.4034 10.8184]
+SLOTS lane=conv2d_big ft=[4.0336 4.0065 3.7540 4.5026] pt=[10.1917 10.7457 9.4275 10.5974]
+SLOTS lane=conv2d_big_masked ft=[9.2206 9.9332 8.8957 8.9396] pt=[10.0823 10.8174 10.2433 12.3585]
+SLOTS lane=conv2d_big ft=[4.2519 4.4487 4.9210 4.7936] pt=[11.5350 10.5450 9.8126 10.2169]
+SLOTS lane=conv2d_big_masked ft=[8.4865 9.4864 9.9213 9.7324] pt=[10.9599 12.0580 10.1962 12.3310]
+
+CLOCKS DURING SAMPLING (sampled once per lane per round, both arms inside the same round)
+  typical core   min 1429 median 1998 max 3434 MHz   (boost/thermal behaviour over time)
+  CROSS-CORE SPREAD at one instant   min 3.001x median 3.004x max 3.008x   (how far apart two cores were WHILE we sampled)
+  The spread is the number that decides comparability: it is what makes one arm's threads faster than the other's. Compare it against the idle snapshot in the cpu_mhz header line -- if the idle spread is large and this one is small, the cores boosted once work arrived and the clock confound did not bite.
+load_series n=50 worst_drift=1.105x endpoint_gate=PASS series_gate=PASS (frankentorch-68pwz item 49: the endpoint pair cannot see a mid-run excursion; a divergence between these two gates IS the finding)
+load_1m start=5.34 end=5.90 drift_gate=PASS (frankentorch-2h8vi; the signal is DRIFT in either direction, not level — a steady busy host is measurable, a host that moves under the measurement is not)
+self_load DIRECT=25.43 (both arms burned 200.9 CPU-seconds over window=8s at lane_count=2 rounds=48) — measured on our own /proc accounting, so a peer's compile contributes nothing to it. Compare against frankentorch-5q3io's ~+0.62, which was inferred from loadavg deltas at an unrecorded lane count (frankentorch-vyaia acceptance item 2).
+self_load rise=+0.56 (start 5.34 -> peak 5.90) over window=8s at lane_count=2 rounds=48 — loadavg is a 1-minute EWMA, so this window could show at most 12% of any sustained step (frankentorch-vyaia: measured, not assumed)
+self_load NOT INTERPRETABLE: a 8s window is shorter than the loadavg time constant, so this rise is a floor and a +0.00 is not evidence of anything. If the whole rise were ours and sustained it would imply 4.54. Re-derive the bound on a FULL sweep — the configuration every banked row and frankentorch-5q3io's stale ~+0.62 were taken under (frankentorch-vyaia).
+  conv2d_big      4.201   10.500   FT 2.50x FASTER     PT PASS [0.989,1.038] FT PASS [0.969,1.025] ratio 2.499 [2.438,2.574] match
+    slot0/median(slot1..3) = 0.967 (our arm, per-round median over 48 rounds)
+    MIN-ESTIMATOR FT 2.49x FASTER     ratio 2.486 [2.393,2.557]  PT null 1.033 FAIL  FT null 0.994 PASS  not quotable
+  conv2d_big_masked    8.443   10.766   FT 1.28x FASTER     PT PASS [0.978,1.032] FT PASS [0.958,1.010] ratio 1.275 [1.236,1.297] match
+    slot0/median(slot1..3) = 0.948 (our arm, per-round median over 48 rounds)
+    MIN-ESTIMATOR FT 1.26x FASTER     ratio 1.257 [1.217,1.287]  PT null 1.012 PASS  FT null 0.981 PASS  QUOTABLE under the min estimator
+
+Quote a lane only if both A/A gates say PASS, their point estimates are within +/-0.02 of 1.0, and parity is `match`. WIDE means the null's
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+
+buffer_pool: hits=208 misses=0 parked=64 buffers / 267.3 MiB
+
+GROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  numel=6422528  groups=32  cpg=2  spatial=3136  rayon_threads=8
+  forward_f32                 1.816 ms   schedule PARALLEL: 1024 groups; the numel-only gate (6422528 vs NORM_FWD_PARALLEL_MIN 524288) would have said PARALLEL
+  forward_f32 SERIAL         20.018 ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)
+  sum_tensor_contiguous_f32   0.554 ms
+  backward_scalar_f32         3.842 ms   (cpg==2 path, unconditionally parallel)
+  total                       6.212 ms
+  ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----
+  step min of 40               6.324 ms   comparable to the per-kernel figures above
+  step lane estimator         7.487 ms   median of 4 per round, then median over 10 rounds
+  estimator ratio             1.184x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)
+  ---- one group's reduction, sequential vs 8 accumulators (frankentorch-zv1y1) ----
+  reduce sequential           4.438 us   6272 elems, one dependency chain — what every statistic pass costs today
+  reduce 8 accumulators       0.561 us   same data, same rep, chain broken 8 ways
+  reduction headroom          7.911x  (NOT bit-exact: reassociation moves mean/rstd/output by an ULP; this prices the tolerance question, it does not answer it)
+
+MAX_POOL3D KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  input numel=1048576  output numel=131072  kernel 2x2x2 stride 2x2x2  rayon_threads=8
+  forward_with_indices_f64     0.321 ms   reads 1048576 elems, 8 comparisons per output
+  backward NONOVERLAPPING      1.257 ms   the route ft-api actually takes (kernel == stride); scatters 131072 values into a dense 1048576-element buffer
+  backward generic scatter     0.549 ms   same data, same rep, bit-identical output — what the specialisation buys
+  total on the live route      1.578 ms
+run_exit=0
+loadavg_post=5.90 3.66 2.94 3/8858 1861291
+===== end 2026-09-01T14:54:31Z =====

@@ -1,0 +1,79 @@
+===== conv2d_big standing row — torch:2 (CreamTrout) 2026-09-01T14:52:02Z =====
+host=thinkstation1 nproc=64
+HEAD=e47033caf44a8e6021ef651f1205ee3b440486e3
+build_base=ba1fe6270da6b5cfa894e1c83d97bbb082689f22 (clean-overlay receipt, conv2d_twin_lanes_ba1fe627_torch3.log:209)
+harness_last_edited=ba1fe6270da6b5cfa894e1c83d97bbb082689f22
+elf_sha256=1c7bbababe8f725bfcf224abefc2e6dee4e9a292c483ee5e9708fb94920cad55
+loadavg_pre=3.41 2.62 2.56 4/8813 1837797
+run_command=scripts/measurement_window_guard.sh && PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=8 FT_H2H_LANES_EXACT=1 FT_H2H_LANES=conv2d_big,conv2d_big_masked FT_H2H_REPS=24 FT_H2H_WARMUP=16 <snapshotted-elf>   (round_warmup UNSET = 0, the board default)
+guard PASS: no peer measurement detected, loadavg 3.41/2.60/2.55 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+guard_exit=0
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=1c7bbababe8f725bfcf224abefc2e6dee4e9a292c483ee5e9708fb94920cad55
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+incumbent_rule=a delta whose incumbent arm moved (version, build, or measured time) is NOT a win
+measurement_host=thinkstation1 cpu="AMD Ryzen Threadripper PRO 5975WX 32-Cores" isa=x86_64+avx2 governor=powersave rayon_threads=8 online_cpus=64
+host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured elsewhere is not comparable to this one, A/A PASS or not
+measurement_slot=held [pid=1837953 host=thinkstation1 elf=1c7bbababe8f725b lanes=conv2d_big,conv2d_big_masked]; no other live h2h announcement
+concurrent_measurements=none ACTIVE (scanned /proc for other h2h harnesses, criterion benches and torch processes, then measured each candidate's local CPU over 300ms; this run's own incumbent child is excluded)
+cpu_mhz min=1429 median=1429 max=4292 spread=3.003x; arms NOT pinned: our 64 rayon threads span every core including any parked at the floor, the incumbent's 8 land wherever the scheduler puts them, so this row's arms are NOT known to have run at comparable clocks
+allocator=system (glibc malloc) — re-run with --features fair-alloc before quoting
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+sampling=balanced-square ABBAABBA (frankentorch-xdw0h); 24 rounds, four live samples per arm per round, torch threads=8
+round_warmup=0 (FT_H2H_ROUND_WARMUP; discarded samples per lane per round, BOTH arms). 0 = the board's default: each lane's slot 0 each round arrives cold, which NEGATIVE_EVIDENCE item 147 measured at +20-30% on the summed conv2d lanes
+
+lane          FT(ms)    PT(ms)   standing            PT/FT A/A gates and ratio CI                 parity
+lane_filter="conv2d_big,conv2d_big_masked" match=exact kept=2 of the full set (frankentorch-68pwz item 58; item 226: substring is the default, FT_H2H_LANES_EXACT=1 narrows it)
+lane_count=2 rounds=24 (frankentorch-vyaia: the harness's own load scales with this product; a self-load bound quoted without it cannot be checked later)
+
+CLOCKS DURING SAMPLING (sampled once per lane per round, both arms inside the same round)
+  typical core   min 1429 median 2392 max 3433 MHz   (boost/thermal behaviour over time)
+  CROSS-CORE SPREAD at one instant   min 3.001x median 3.004x max 3.009x   (how far apart two cores were WHILE we sampled)
+  The spread is the number that decides comparability: it is what makes one arm's threads faster than the other's. Compare it against the idle snapshot in the cpu_mhz header line -- if the idle spread is large and this one is small, the cores boosted once work arrived and the clock confound did not bite.
+load_series n=26 worst_drift=1.000x endpoint_gate=PASS series_gate=PASS (frankentorch-68pwz item 49: the endpoint pair cannot see a mid-run excursion; a divergence between these two gates IS the finding)
+load_1m start=4.37 end=4.37 drift_gate=PASS (frankentorch-2h8vi; the signal is DRIFT in either direction, not level — a steady busy host is measurable, a host that moves under the measurement is not)
+self_load DIRECT=46.74 (both arms burned 151.4 CPU-seconds over window=3s at lane_count=2 rounds=24) — measured on our own /proc accounting, so a peer's compile contributes nothing to it. Compare against frankentorch-5q3io's ~+0.62, which was inferred from loadavg deltas at an unrecorded lane count (frankentorch-vyaia acceptance item 2).
+self_load rise=+0.00 (start 4.37 -> peak 4.37) over window=3s at lane_count=2 rounds=24 — loadavg is a 1-minute EWMA, so this window could show at most 5% of any sustained step (frankentorch-vyaia: measured, not assumed)
+self_load NOT INTERPRETABLE: a 3s window is shorter than the loadavg time constant, so this rise is a floor and a +0.00 is not evidence of anything. If the whole rise were ours and sustained it would imply 0.00. Re-derive the bound on a FULL sweep — the configuration every banked row and frankentorch-5q3io's stale ~+0.62 were taken under (frankentorch-vyaia).
+  conv2d_big      4.109    5.688   FT 1.38x FASTER     PT PASS [0.971,1.069] FT PASS [0.960,1.026] ratio 1.384 [1.307,1.414] match
+    slot0/median(slot1..3) = 0.998 (our arm, per-round median over 24 rounds)
+    MIN-ESTIMATOR FT 1.24x FASTER     ratio 1.241 [1.185,1.317]  PT null 0.991 PASS  FT null 0.997 PASS  QUOTABLE under the min estimator
+  conv2d_big_masked    8.355    5.660   FT 1.48x SLOWER     PT PASS [0.948,1.058] FT OFFSET [0.989,1.088] ratio 0.677 [0.650,0.727] match
+    NULL-FAILED: incumbent 0.983, FrankenTorch 1.055; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+      ROUNDS MAY CLEAR IT: worst null is 0.055 off 1.0 against a +/-0.02 band, which is sampling noise rather than a moving host. The null is a ratio of per-round medians, so try FT_H2H_REPS=48 (item 193c walked 16 -> 32 -> 64 to PASS at loadavg 22-35).
+    slot0/median(slot1..3) = 0.985 (our arm, per-round median over 24 rounds)
+    MIN-ESTIMATOR FT 1.53x SLOWER     ratio 0.653 [0.610,0.702]  PT null 1.047 FAIL  FT null 1.048 FAIL  not quotable
+
+Quote a lane only if both A/A gates say PASS, their point estimates are within +/-0.02 of 1.0, and parity is `match`. WIDE means the null's
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+
+buffer_pool: hits=112 misses=0 parked=64 buffers / 267.3 MiB
+
+GROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  numel=6422528  groups=32  cpg=2  spatial=3136  rayon_threads=8
+  forward_f32                 1.803 ms   schedule PARALLEL: 1024 groups; the numel-only gate (6422528 vs NORM_FWD_PARALLEL_MIN 524288) would have said PARALLEL
+  forward_f32 SERIAL         20.108 ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)
+  sum_tensor_contiguous_f32   0.640 ms
+  backward_scalar_f32         3.866 ms   (cpg==2 path, unconditionally parallel)
+  total                       6.309 ms
+  ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----
+  step min of 40               6.111 ms   comparable to the per-kernel figures above
+  step lane estimator         7.582 ms   median of 4 per round, then median over 10 rounds
+  estimator ratio             1.241x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)
+  ---- one group's reduction, sequential vs 8 accumulators (frankentorch-zv1y1) ----
+  reduce sequential           4.458 us   6272 elems, one dependency chain — what every statistic pass costs today
+  reduce 8 accumulators       0.571 us   same data, same rep, chain broken 8 ways
+  reduction headroom          7.807x  (NOT bit-exact: reassociation moves mean/rstd/output by an ULP; this prices the tolerance question, it does not answer it)
+
+MAX_POOL3D KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  input numel=1048576  output numel=131072  kernel 2x2x2 stride 2x2x2  rayon_threads=8
+  forward_with_indices_f64     0.241 ms   reads 1048576 elems, 8 comparisons per output
+  backward NONOVERLAPPING      1.399 ms   the route ft-api actually takes (kernel == stride); scatters 131072 values into a dense 1048576-element buffer
+  backward generic scatter     0.380 ms   same data, same rep, bit-identical output — what the specialisation buys
+  total on the live route      1.641 ms
+run_exit=0
+loadavg_post=4.37 2.91 2.66 2/8819 1839037
+===== end 2026-09-01T14:52:28Z =====

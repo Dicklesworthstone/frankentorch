@@ -1,0 +1,36 @@
+===== incumbent bimodality probe — torch:2 (CreamTrout) 2026-09-01T14:57:05Z =====
+host=thinkstation1 nproc=64 HEAD=2487ad3731e21cbf6b99e81768e690bc5f9fd549
+elf_sha256=1c7bbababe8f725bfcf224abefc2e6dee4e9a292c483ee5e9708fb94920cad55
+question: at FIXED FT_H2H_REPS=24, is the incumbent arm bimodal across invocations?
+protocol: 6 invocations, guard checked before EACH, same binary, same lanes, same env
+
+--- invocation 1/6  reps=24  14:57:05Z  loadavg=2.04 2.96 2.79
+guard PASS: no peer measurement detected, loadavg 2.04/2.96/2.79 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.043    6.376   FT 1.58x FASTER     PT PASS [0.939,1.124] FT PASS [0.942,1.051] ratio 1.577 [1.454,1.677] match
+  conv2d_big_masked    8.352    6.534   FT 1.28x SLOWER     PT PASS [0.937,1.033] FT OFFSET [0.898,1.016] ratio 0.782 [0.764,0.808] match
+
+--- invocation 2/6  reps=24  14:57:29Z  loadavg=4.51 3.47 2.97
+guard PASS: no peer measurement detected, loadavg 4.51/3.47/2.97 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.098    5.650   FT 1.38x FASTER     PT OFFSET [0.975,1.079] FT PASS [0.972,1.060] ratio 1.379 [1.311,1.437] match
+  conv2d_big_masked    8.112    5.947   FT 1.36x SLOWER     PT PASS [0.944,1.077] FT OFFSET [0.926,1.029] ratio 0.733 [0.704,0.788] match
+
+--- invocation 3/6  reps=24  14:57:52Z  loadavg=5.34 3.74 3.07
+guard PASS: no peer measurement detected, loadavg 5.34/3.70/3.06 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.051    5.265   FT 1.30x FASTER     PT OFFSET [0.993,1.077] FT PASS [0.962,1.047] ratio 1.300 [1.249,1.374] match
+  conv2d_big_masked    7.997    5.651   FT 1.42x SLOWER     PT PASS [0.960,1.043] FT OFFSET [0.898,1.053] ratio 0.707 [0.655,0.746] match
+
+--- invocation 4/6  reps=24  14:58:15Z  loadavg=6.75 4.17 3.23
+guard PASS: no peer measurement detected, loadavg 6.75/4.17/3.23 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.170    5.290   FT 1.27x FASTER     PT PASS [0.920,1.119] FT PASS [0.943,1.022] ratio 1.268 [1.206,1.358] match
+  conv2d_big_masked    8.213    5.407   FT 1.52x SLOWER     PT OFFSET [0.899,1.036] FT PASS [0.984,1.072] ratio 0.658 [0.605,0.697] match
+
+--- invocation 5/6  reps=24  14:58:37Z  loadavg=6.75 4.35 3.31
+guard PASS: no peer measurement detected, loadavg 6.75/4.31/3.30 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.275    5.642   FT 1.32x FASTER     PT PASS [0.953,1.064] FT PASS [0.959,1.036] ratio 1.320 [1.241,1.402] match
+  conv2d_big_masked    8.144    5.979   FT 1.36x SLOWER     PT OFFSET [0.889,1.057] FT OFFSET [0.991,1.127] ratio 0.734 [0.671,0.782] match
+
+--- invocation 6/6  reps=24  14:59:03Z  loadavg=7.36 4.67 3.44
+guard PASS: no peer measurement detected, loadavg 7.36/4.62/3.43 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.140    6.252   FT 1.51x FASTER     PT PASS [0.966,1.050] FT PASS [0.908,1.048] ratio 1.510 [1.400,1.691] match
+  conv2d_big_masked    8.204    6.576   FT 1.25x SLOWER     PT PASS [0.937,1.036] FT OFFSET [0.907,1.027] ratio 0.802 [0.745,0.850] match
+===== end 2026-09-01T14:59:27Z =====

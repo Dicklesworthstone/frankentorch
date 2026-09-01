@@ -1,0 +1,56 @@
+===== incumbent REPS ladder — torch:2 (CreamTrout) 2026-09-01T15:00:16Z =====
+host=thinkstation1 nproc=64 HEAD=2487ad3731e21cbf6b99e81768e690bc5f9fd549
+elf_sha256=1c7bbababe8f725bfcf224abefc2e6dee4e9a292c483ee5e9708fb94920cad55
+ladder=16 32 40 48 64 passes=2  (round-interleaved: for pass { for reps })
+DEFAULT_REPS=16 — the board's own default sits at the BOTTOM of this ladder
+
+--- pass 1 reps=16  15:00:16Z  loadavg=6.31 4.90 3.61
+guard PASS: no peer measurement detected, loadavg 6.31/4.90/3.61 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.421    5.500   FT 1.24x FASTER     PT FAIL [1.014,1.130] FT OFFSET [0.941,1.056] ratio 1.244 [1.183,1.282] match
+  conv2d_big_masked    9.002    5.762   FT 1.56x SLOWER     PT OFFSET [0.878,1.020] FT PASS [0.928,1.040] ratio 0.640 [0.584,0.668] match
+
+--- pass 1 reps=32  15:00:42Z  loadavg=7.67 5.30 3.78
+guard PASS: no peer measurement detected, loadavg 7.67/5.25/3.77 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.206    6.200   FT 1.47x FASTER     PT FAIL [1.000,1.113] FT PASS [0.979,1.066] ratio 1.474 [1.452,1.576] match
+  conv2d_big_masked    8.273    6.472   FT 1.28x SLOWER     PT PASS [0.923,1.061] FT PASS [0.937,1.026] ratio 0.782 [0.707,0.815] match
+
+--- pass 1 reps=40  15:01:06Z  loadavg=6.95 5.31 3.82
+guard PASS: no peer measurement detected, loadavg 6.95/5.27/3.82 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.403    5.064   FT 1.15x FASTER     PT OFFSET [0.978,1.063] FT PASS [0.963,1.023] ratio 1.150 [1.102,1.184] match
+  conv2d_big_masked    9.228    5.294   FT 1.74x SLOWER     PT PASS [0.972,1.029] FT PASS [0.966,1.044] ratio 0.574 [0.558,0.613] match
+
+--- pass 1 reps=48  15:01:31Z  loadavg=7.96 5.67 3.98
+guard PASS: no peer measurement detected, loadavg 7.96/5.67/3.98 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.101    5.262   FT 1.28x FASTER     PT FAIL [1.022,1.097] FT PASS [0.977,1.038] ratio 1.283 [1.236,1.339] match
+  conv2d_big_masked    8.348    5.604   FT 1.49x SLOWER     PT PASS [0.958,1.043] FT PASS [0.963,1.053] ratio 0.671 [0.647,0.707] match
+
+--- pass 1 reps=64  15:01:55Z  loadavg=7.25 5.70 4.04
+guard PASS: no peer measurement detected, loadavg 7.25/5.70/4.04 (spread 1.00x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_big      4.150    5.653   FT 1.36x FASTER     PT PASS [0.964,1.040] FT PASS [0.958,1.065] ratio 1.362 [1.304,1.456] match
+  conv2d_big_masked    8.493    6.095   FT 1.39x SLOWER     PT PASS [0.974,1.047] FT PASS [0.962,1.029] ratio 0.718 [0.692,0.753] match
+
+--- pass 2 reps=16  15:02:25Z  loadavg=7.59 5.92 4.16
+guard PASS: no peer measurement detected, loadavg 7.59/5.92/4.16 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.089    5.489   FT 1.34x FASTER     PT PASS [0.971,1.085] FT PASS [0.965,1.022] ratio 1.342 [1.278,1.484] match
+  conv2d_big_masked    8.093    5.894   FT 1.37x SLOWER     PT OFFSET [0.985,1.117] FT OFFSET [0.953,1.065] ratio 0.728 [0.670,0.786] match
+
+--- pass 2 reps=32  15:02:48Z  loadavg=7.18 5.96 4.22
+guard PASS: no peer measurement detected, loadavg 7.18/5.96/4.22 (spread 1.00x <= 4x, floor 8.00), iowait 0.2% <= 10%
+  conv2d_big      4.361    5.522   FT 1.27x FASTER     PT OFFSET [0.986,1.122] FT PASS [0.960,1.045] ratio 1.266 [1.217,1.307] match
+  conv2d_big_masked    8.482    5.714   FT 1.48x SLOWER     PT PASS [0.945,1.058] FT PASS [0.960,1.039] ratio 0.674 [0.642,0.691] match
+
+--- pass 2 reps=40  15:03:12Z  loadavg=8.70 6.37 4.40
+guard PASS: no peer measurement detected, loadavg 8.70/6.30/4.38 (spread 1.09x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.396    5.346   FT 1.22x FASTER     PT PASS [0.955,1.041] FT OFFSET [0.932,1.017] ratio 1.216 [1.184,1.240] match
+  conv2d_big_masked    8.754    5.550   FT 1.58x SLOWER     PT PASS [0.957,1.071] FT PASS [0.973,1.039] ratio 0.634 [0.613,0.662] match
+
+--- pass 2 reps=48  15:03:35Z  loadavg=12.69 7.55 4.84
+guard PASS: no peer measurement detected, loadavg 12.69/7.55/4.84 (spread 1.59x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_big      4.167    6.009   FT 1.44x FASTER     PT OFFSET [0.970,1.086] FT PASS [0.931,1.020] ratio 1.442 [1.290,1.530] match
+  conv2d_big_masked    8.349    6.361   FT 1.31x SLOWER     PT PASS [0.932,1.066] FT OFFSET [0.993,1.066] ratio 0.762 [0.724,0.792] match
+
+--- pass 2 reps=64  15:04:00Z  loadavg=10.85 7.52 4.91
+guard PASS: no peer measurement detected, loadavg 10.85/7.52/4.91 (spread 1.36x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_big      4.128    5.653   FT 1.37x FASTER     PT OFFSET [0.962,1.069] FT PASS [0.979,1.049] ratio 1.369 [1.320,1.478] match
+  conv2d_big_masked    8.414    6.258   FT 1.34x SLOWER     PT PASS [0.958,1.062] FT PASS [0.941,1.020] ratio 0.744 [0.712,0.776] match
+===== end 2026-09-01T15:04:31Z =====
