@@ -86,8 +86,10 @@ const INCUMBENT_THREADS: usize = 8;
 
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
-    BALANCED_SQUARE, MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, TIMED_STEPS,
-    TIMED_STEPS_MARKER, adjudicate_null, parse_sample_line, parse_timed_steps, sample_request,
+    BALANCED_SQUARE, MAX_NULL_CI_WIDTH, NULL_PERMUTATION_DRAWS, QUIT_REQUEST, READY_MARKER,
+    TIMED_STEPS,
+    TIMED_STEPS_MARKER, adjudicate_null, parse_sample_line, parse_timed_steps,
+    permutation_null_band, sample_request,
     timed_region_disagreement,
 };
 use ft_core::{DType, ExecutionMode, TensorMeta};
@@ -3426,6 +3428,10 @@ LANES = {
     // Kept as a per-round ratio and reduced by MEDIAN, deliberately: a ratio of medians across
     // rounds would let a between-round load ramp leak into it, which is exactly the failure the
     // drift-robust estimator in `scripts/h2h_slot_profile.py` exists to avoid.
+    // The run's own slots, retained so the A/A gate can calibrate itself against them
+    // (frankentorch-mdsmm.1: a fixed +/-0.02 band rejects 41% of provably clean arms).
+    let mut ft_round_slots: Vec<Vec<[f64; 4]>> = vec![Vec::with_capacity(reps); lanes.len()];
+    let mut pt_round_slots: Vec<Vec<[f64; 4]>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_slot0_ratio: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     // The incumbent's cold-slot excess, reported for the same reason ours is: the A/A null no
     // longer folds slot 0 in, so it has to be visible somewhere (frankentorch-mdsmm.1).
@@ -3707,6 +3713,14 @@ LANES = {
             // recorded slot is warm and the comparison starts at slot 0. Same rule either way:
             // FIRST WARM against LAST.
             let first_warm = usize::from(round_warmup == 0);
+            ft_round_slots[index]
+                .push([ft_slots[0], ft_slots[1], ft_slots[2], ft_slots[3]]);
+            pt_round_slots[index].push([
+                incumbent_slots[0],
+                incumbent_slots[1],
+                incumbent_slots[2],
+                incumbent_slots[3],
+            ]);
             pt_first_half[index].push(incumbent_slots[first_warm]);
             pt_second_half[index].push(incumbent_slots[3]);
             let pt_tail_median =
@@ -3994,8 +4008,39 @@ LANES = {
             median_ratio_ci(&ft_first_half[index], &ft_second_half[index]);
         let pt_null = adjudicate_null(pt_null_lo, pt_null_hi, MAX_NULL_CI_WIDTH);
         let ft_null = adjudicate_null(ft_null_lo, ft_null_hi, MAX_NULL_CI_WIDTH);
-        let pt_null_quotable = pt_null.is_quotable() && balanced_null_is_centered(pt_null_ratio);
-        let ft_null_quotable = ft_null.is_quotable() && balanced_null_is_centered(ft_null_ratio);
+        // THE POINT GATE CALIBRATES ITSELF — `frankentorch-mdsmm.1`.
+        //
+        // `balanced_null_is_centered` asks for |point-1| <= 0.02. Measured against 19,200
+        // permutations of the run's own warm slots — which have NO position effect by
+        // construction, so every excursion is a false rejection — that band rejects 41% of
+        // provably clean arms, and 0.97-1.03 rejects 27%. The permuted statistic centres at
+        // 0.9999 and spans [0.937, 1.071] at p05-p95: +/-0.02 is simply below the estimator's
+        // resolution at 24 rounds, and no host quality or window discipline can reach it.
+        //
+        // So the band comes from the data instead: permute this run's warm slots, take the
+        // 2.5/97.5 percentiles of the resulting nulls, and require the observed point to land
+        // inside. That is a 5% false-rejection rate BY CONSTRUCTION rather than one discovered
+        // afterwards, it narrows automatically as rounds increase, and it still catches a real
+        // position effect (asserted in `harness_interleave`'s tests).
+        //
+        // The fixed band is still computed and printed beside it, so rows from before this
+        // change stay readable and a reader can see both verdicts.
+        let (pt_perm_lo, pt_perm_hi) = permutation_null_band(
+            &pt_round_slots[index],
+            usize::from(round_warmup == 0),
+            NULL_PERMUTATION_DRAWS,
+        );
+        let (ft_perm_lo, ft_perm_hi) = permutation_null_band(
+            &ft_round_slots[index],
+            usize::from(round_warmup == 0),
+            NULL_PERMUTATION_DRAWS,
+        );
+        let pt_in_perm = (pt_perm_lo..=pt_perm_hi).contains(&pt_null_ratio);
+        let ft_in_perm = (ft_perm_lo..=ft_perm_hi).contains(&ft_null_ratio);
+        let pt_null_quotable = pt_null.is_quotable() && pt_in_perm;
+        let ft_null_quotable = ft_null.is_quotable() && ft_in_perm;
+        let pt_fixed_band = balanced_null_is_centered(pt_null_ratio);
+        let ft_fixed_band = balanced_null_is_centered(ft_null_ratio);
         let pt_null_label = if pt_null.is_quotable() && !pt_null_quotable {
             "OFFSET"
         } else {
@@ -4055,9 +4100,20 @@ LANES = {
             incumbent_split_ratio,
         );
         println!(
-            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} {pt_null_ratio:.3} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} {ft_null_ratio:.3} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}{}",
+            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} {pt_null_ratio:.3} perm[{pt_perm_lo:.3},{pt_perm_hi:.3}] [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} {ft_null_ratio:.3} perm[{ft_perm_lo:.3},{ft_perm_hi:.3}] [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}{}",
             pt_null_label, ft_null_label, incumbent_mode.row_tag(),
         );
+        // Legacy verdict, printed for continuity with every row banked before mdsmm.1: the fixed
+        // +/-0.02 band. It is NO LONGER the gate — it rejects 41% of provably clean arms — but a
+        // reader comparing against an older row needs to see what it would have said.
+        if pt_fixed_band != pt_null_quotable || ft_fixed_band != ft_null_quotable {
+            println!(
+                "    legacy fixed +/-{BALANCED_NULL_MAX_DEVIATION:.2} band would have said PT {} / FT {} \
+                 (superseded by the self-calibrated band; frankentorch-mdsmm.1)",
+                if pt_fixed_band { "PASS" } else { "FAIL" },
+                if ft_fixed_band { "PASS" } else { "FAIL" },
+            );
+        }
         print!(
             "{}",
             ft_api::harness_incumbent_bank::render(name, &incumbent_mode, &incumbent_records)
@@ -4081,7 +4137,7 @@ LANES = {
         }
         if !(pt_null_quotable && ft_null_quotable) {
             println!(
-                "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must be within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0 and carry a calm CI; do not quote this row"
+                "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must land inside its own permutation band and carry a calm CI; do not quote this row"
             );
             // ROUNDS ARE A LEVER ON THE NULL — `frankentorch-hi9r6`, item 206.
             //

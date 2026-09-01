@@ -188,6 +188,100 @@ impl NullVerdict {
     }
 }
 
+/// The A/A null's own resolution, measured from the run's own slots — `frankentorch-mdsmm.1`.
+///
+/// # Why a fixed band cannot work here
+///
+/// The null is a median over rounds of one warm slot divided by another. Under the hypothesis it
+/// tests — "this arm has no within-round position effect" — the warm slots of a round are
+/// EXCHANGEABLE, so permuting them destroys any position effect while preserving the lane, the
+/// host, the round-to-round variation and the heavy tail. Recomputing the statistic on permuted
+/// slots therefore samples it under the null being tested, and every excursion is a FALSE
+/// rejection by construction.
+///
+/// Measured over 864 retained slot dumps (18 guard-gated invocations, two lanes, paired and both
+/// isolation modes), the permuted statistic centres at 0.9999 and spans **[0.937, 1.071] at
+/// p05-p95**. Against that, the fixed `+/-0.02` band rejects **41% of provably clean arms**, and
+/// 0.97-1.03 rejects 27%. That is a floor no host quality and no extra rounds within a run can
+/// beat: it is the estimator's own resolution at this round count.
+///
+/// 38 of those 48 observed nulls sat inside their own permutation band, so after the slot-0 fix
+/// there is little systematic left — the residual excursions the rotors kept hitting (0.966,
+/// 1.024) are what a clean arm produces at 24 rounds.
+///
+/// # What this returns instead
+///
+/// The interval the statistic occupies when there is nothing to detect, for THIS run's rounds.
+/// A band derived from the data adapts to round count and lane noise automatically: more rounds
+/// narrows it, a noisy lane widens it, and no constant has to be chosen or defended.
+///
+/// DETERMINISTIC BY CONSTRUCTION. A gate that consults a random number generator is not a gate —
+/// the same slots must always produce the same verdict, or a row cannot be re-adjudicated. The
+/// permutation order comes from a counter-based hash of the slot values themselves, so it is
+/// reproducible from the retained dump alone, with no seed to record.
+#[must_use]
+pub fn permutation_null_band(rounds: &[[f64; 4]], first_warm: usize, draws: usize) -> (f64, f64) {
+    if rounds.is_empty() || draws == 0 {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    // Seed from the data: same slots in, same band out, forever.
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for r in rounds {
+        for v in r {
+            seed = seed.rotate_left(5) ^ v.to_bits();
+            seed = seed.wrapping_mul(0x1000_0000_01B3);
+        }
+    }
+    let mut nulls = Vec::with_capacity(draws);
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut per_round: Vec<f64> = Vec::with_capacity(rounds.len());
+    for _ in 0..draws {
+        per_round.clear();
+        for r in rounds {
+            // Shuffle the WARM slots only; slot 0 is excluded from the statistic upstream when
+            // round_warmup is 0, and is a legitimate warm sample above it.
+            let mut w: Vec<f64> = r[first_warm..].to_vec();
+            for i in (1..w.len()).rev() {
+                let j = (next() % (i as u64 + 1)) as usize;
+                w.swap(i, j);
+            }
+            let last = *w.last().expect("non-empty");
+            if last > 0.0 && w[0].is_finite() {
+                per_round.push(w[0] / last);
+            }
+        }
+        if per_round.is_empty() {
+            continue;
+        }
+        per_round.sort_by(f64::total_cmp);
+        let mid = per_round.len() / 2;
+        nulls.push(if per_round.len() % 2 == 1 {
+            per_round[mid]
+        } else {
+            f64::midpoint(per_round[mid - 1], per_round[mid])
+        });
+    }
+    if nulls.is_empty() {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    nulls.sort_by(f64::total_cmp);
+    // 2.5/97.5, i.e. a 5% false-rejection rate by construction — the number the band is CHOSEN
+    // to deliver rather than one discovered afterwards.
+    let lo = nulls[((nulls.len() as f64) * 0.025) as usize];
+    let hi = nulls[(((nulls.len() as f64) * 0.975) as usize).min(nulls.len() - 1)];
+    (lo, hi)
+}
+
+/// How many permutation draws the gate uses. 999 makes the 2.5/97.5 percentiles stable to the
+/// third decimal, and costs microseconds against a lane that takes milliseconds per sample.
+pub const NULL_PERMUTATION_DRAWS: usize = 999;
+
 /// Adjudicate an A/A null from its bootstrap CI.
 ///
 /// # Why width is checked before centring
@@ -703,6 +797,83 @@ mod tests {
     /// round counts this board uses, a calm null's CI is routinely 0.05-0.13 wide, so that rule
     /// would fail nearly every honest row. This test pins the actual contract so the next reader
     /// who conflates the two finds an assertion instead of writing a bug report.
+    /// The band must be REPRODUCIBLE from the slots alone — a gate that consults an unseeded RNG
+    /// cannot re-adjudicate a retained row.
+    #[test]
+    fn the_permutation_band_is_deterministic_for_the_same_slots() {
+        let rounds: Vec<[f64; 4]> = (0..24)
+            .map(|i| {
+                let f = f64::from(i);
+                [10.0 + f * 0.1, 5.0 + f * 0.02, 5.1 - f * 0.01, 4.9 + f * 0.03]
+            })
+            .collect();
+        let a = permutation_null_band(&rounds, 1, NULL_PERMUTATION_DRAWS);
+        let b = permutation_null_band(&rounds, 1, NULL_PERMUTATION_DRAWS);
+        assert_eq!(a.0.to_bits(), b.0.to_bits());
+        assert_eq!(a.1.to_bits(), b.1.to_bits());
+        // Different data must give a different band, or the seed is not reading the slots.
+        let mut other = rounds.clone();
+        other[0][1] *= 1.5;
+        assert_ne!(permutation_null_band(&other, 1, NULL_PERMUTATION_DRAWS), a);
+    }
+
+    /// The band must BRACKET UNITY: permuting exchangeable slots cannot create a direction.
+    /// If it did not, the gate would reject every clean arm on one side.
+    #[test]
+    fn the_permutation_band_brackets_unity_on_exchangeable_slots() {
+        let rounds: Vec<[f64; 4]> = (0..24)
+            .map(|i| {
+                let f = f64::from(i % 5);
+                [99.0, 5.0 + f * 0.1, 5.0 - f * 0.05, 5.0 + f * 0.02]
+            })
+            .collect();
+        let (lo, hi) = permutation_null_band(&rounds, 1, NULL_PERMUTATION_DRAWS);
+        assert!(lo <= 1.0 && hi >= 1.0, "band [{lo},{hi}] must contain unity");
+        // Slot 0 is 20x the warm slots here and must not reach the band at all.
+        assert!(hi < 2.0, "slot 0 leaked into the permutation band: [{lo},{hi}]");
+    }
+
+    /// MORE ROUNDS MUST NARROW IT. That is the property a fixed constant cannot have, and it is
+    /// why the gate is self-calibrating rather than a new magic number.
+    #[test]
+    fn the_permutation_band_narrows_with_more_rounds() {
+        let make = |n: i32| -> Vec<[f64; 4]> {
+            (0..n)
+                .map(|i| {
+                    let f = f64::from(i % 7) * 0.1;
+                    [9.0, 5.0 + f, 5.0 - f * 0.5, 5.0 + f * 0.25]
+                })
+                .collect()
+        };
+        let (l8, h8) = permutation_null_band(&make(8), 1, NULL_PERMUTATION_DRAWS);
+        let (l96, h96) = permutation_null_band(&make(96), 1, NULL_PERMUTATION_DRAWS);
+        assert!(
+            (h96 - l96) < (h8 - l8),
+            "96 rounds gave [{l96},{h96}], wider than 8 rounds' [{l8},{h8}]"
+        );
+    }
+
+    /// A REAL position effect must still be caught: if the last warm slot is systematically
+    /// slower, the observed null falls outside its own permutation band.
+    #[test]
+    fn a_real_position_effect_lands_outside_the_permutation_band() {
+        let rounds: Vec<[f64; 4]> = (0..24)
+            .map(|i| {
+                let f = f64::from(i % 3) * 0.01;
+                [9.0, 5.0 + f, 5.5 + f, 6.0 + f] // a monotone rise across the warm slots
+            })
+            .collect();
+        let (lo, hi) = permutation_null_band(&rounds, 1, NULL_PERMUTATION_DRAWS);
+        let observed: Vec<f64> = rounds.iter().map(|r| r[1] / r[3]).collect();
+        let mut v = observed.clone();
+        v.sort_by(f64::total_cmp);
+        let point = v[v.len() / 2];
+        assert!(
+            point < lo || point > hi,
+            "a 20% rise across the warm slots read {point} inside [{lo},{hi}]"
+        );
+    }
+
     #[test]
     fn the_reported_envelopes_are_calm_because_the_band_is_not_an_envelope_test() {
         assert_eq!(adjudicate_null(0.966, 1.018, MAX_NULL_CI_WIDTH), NullVerdict::Calm);

@@ -1,0 +1,32 @@
+A/A POINT GATE — self-calibration evidence (frankentorch-mdsmm.1 follow-up, torch:3's residual)
+generated 2026-09-01T22:49:43Z  host thinkstation1  HEAD d3985abc
+No new measurement: this reuses the 864 retained slot dumps from the mdsmm.1 sweep.
+
+mode            lane            arm   observed  perm p05  perm p50  perm p95   observed inside perm 5-95?
+------------------------------------------------------------------------------------------------
+paired          conv2d_masked   FT      1.0389    0.9531    0.9989    1.0483   yes
+paired          conv2d_masked   PT      1.0284    0.8811    1.0002    1.1336   yes
+paired          max_pool1d      FT      0.9992    0.9750    0.9988    1.0214   yes
+paired          max_pool1d      PT      1.0029    0.9535    0.9991    1.0530   yes
+incumbent-only  conv2d_masked   PT      1.0713    0.9725    0.9991    1.0247   NO
+incumbent-only  max_pool1d      PT      0.9437    0.9557    0.9978    1.0455   NO
+ft-only         conv2d_masked   FT      1.0369    0.9629    1.0011    1.0381   yes
+ft-only         max_pool1d      FT      0.9958    0.9779    1.0001    1.0223   yes
+
+OBSERVED nulls inside their own permutation 5-95 band: 38 of 48
+   (if most are inside, the slot-0 fix removed the position effect and what remains is
+    the estimator's own sampling spread — there is nothing left to fix by measuring more)
+
+FALSE-REJECTION RATE ATTRIBUTABLE TO SAMPLING ALONE
+   Every permuted null has NO position effect by construction, so each excursion is a
+   false rejection. This is the floor no band can beat without widening.
+
+   19200 permuted nulls   p01 0.8613  p05 0.9369  p50 0.9999  p95 1.0708  p99 1.1621
+
+   band                    false-reject rate (permuted)    observed reject rate
+   +/-0.02 (enforced)                             41.0%                   54.2%
+   0.97-1.03                                      27.3%                   33.3%
+   +/-0.04                                        19.2%                   22.9%
+   +/-0.05                                        14.3%                   20.8%
+   +/-0.06                                        11.5%                   12.5%
+   +/-0.08                                         7.5%                    6.2%
