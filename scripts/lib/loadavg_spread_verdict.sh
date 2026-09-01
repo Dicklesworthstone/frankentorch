@@ -26,9 +26,16 @@
 # consecutive attempts (torch:3, frankentorch-mdsmm) were refused on it, at loads quieter than
 # any window this guard has ever admitted. `1.99 / 2.93 / 26.02` is the same defect one size up.
 #
-# The fix is symmetric with the `lo` floor the limb already had: clamp BOTH ends up to FLOOR
-# before dividing, so differences among loads too small to matter cannot produce a large ratio.
-# It subsumes the old `if (lo < 0.5) lo = 0.5` — FLOOR is always >= 1.
+# The fix: the limb DOES NOT APPLY when every one of the three averages is below FLOOR. A spread
+# among loads that are all negligible is not evidence of anything. Above that the ratio applies
+# exactly as before, unchanged, including the old `lo < 0.5` clamp.
+#
+# THE FIRST SHIPPED FORM WAS DIFFERENT AND WRONG. It clamped both ends up to FLOOR and divided,
+# which turned 1.99/2.93/26.02 into 3.25x and admitted it — a host that averaged ~58% of itself in
+# the ten minutes before. `frankentorch-wzhem` names that triple as one that must stay refused, and
+# the guard-wide asymmetry says the same: over-refusing costs a tick, under-refusing costs a banked
+# ratio that is a contention artefact. Gating the limb fixes the absolutely-quiet case the bead
+# asked for WITHOUT admitting the settling case it asked to keep.
 #
 # The floor is a property of the MACHINE (nproc/8, i.e. 12.5% of it: 8 on this 64-core host, 1
 # on an 8-core box), not a number chosen to admit the windows that were refused. Choosing it
@@ -47,8 +54,14 @@ loadavg_spread_exceeds() {
             hi = a; lo = a;
             if (b > hi) hi = b; if (b < lo) lo = b;
             if (c > hi) hi = c; if (c < lo) lo = c;
-            if (lo < f) lo = f;
-            if (hi < f) hi = f;
+            if (lo < 0.5) lo = 0.5;
+            # THE FLOOR GATES WHETHER THE LIMB APPLIES AT ALL. It does not rescale the ends.
+            # Clamping BOTH ends up to f was the first shipped form and it was too permissive:
+            # 1.99/2.93/26.02 became 26.02/8 = 3.25x and was admitted, on a host that averaged
+            # ~58% of itself five to fifteen minutes earlier. frankentorch-wzhem names that exact
+            # triple as one that MUST STAY REFUSED, and the guard-wide asymmetry agrees — a false
+            # refusal costs a deferred tick, a false admission costs a banked contention artefact.
+            if (hi < f) { printf "%.2f %.2f 1.00\n", hi, lo; exit 1; }
             printf "%.2f %.2f %.2f\n", hi, lo, hi / lo;
             exit !(hi / lo > r);
         }'

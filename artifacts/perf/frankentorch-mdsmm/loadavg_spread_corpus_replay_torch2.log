@@ -1,42 +1,43 @@
-corpus replay: guard load-spread limb, pre-floor vs floored
-generated 2026-09-01T14:48:16Z  HEAD 9ae19434  host thinkstation1 nproc 64
+corpus replay: guard load-spread limb, pre-floor vs floor-GATED
+generated 2026-09-01T20:32:54Z  HEAD b62f8acf  host thinkstation1 nproc 64
 command: scripts/loadavg_spread_corpus_replay.sh
 
    0.73   2.04    3.36   old   4.60x REFUSE   new   1.00x PASS     ADMITTED               artifacts/perf/frankentorch-mdsmm/conv2d_xl_standing_guardrefusal_680a1ec1_torch3.log:4
-   3.12   2.87    9.02   old   3.14x PASS     new   1.13x PASS     same                   artifacts/frankentorch-mdsmm_repro.log:395
-   1.98   2.64    9.59   old   4.84x REFUSE   new   1.20x PASS     ADMITTED               artifacts/frankentorch-mdsmm_repro.log:393
+   3.12   2.87    9.02   old   3.14x PASS     new   3.14x PASS     same                   artifacts/frankentorch-mdsmm_repro.log:395
+   1.98   2.64    9.59   old   4.84x REFUSE   new   4.84x REFUSE   same                   artifacts/frankentorch-mdsmm_repro.log:393
   11.49  20.72   23.48   old   2.04x PASS     new   2.04x PASS     same                   artifacts/perf/purplehorse-worst-loss/svd_run1.log:6
   10.70   9.78   22.50   old   2.30x PASS     new   2.30x PASS     same                   artifacts/frankentorch-37sxo_repro.log:197
   11.92  10.03   22.78   old   2.27x PASS     new   2.27x PASS     same                   artifacts/frankentorch-stale-tuning-constants-lzku6_repro.log:275
-   1.99   2.93   26.02   old  13.08x REFUSE   new   3.25x PASS     ADMITTED               artifacts/frankentorch-mdsmm_repro.log:197
-   2.20   3.14   27.49   old  12.50x REFUSE   new   3.44x PASS     ADMITTED               artifacts/frankentorch-valnx_repro.log:242
-   2.59   3.38   29.19   old  11.27x REFUSE   new   3.65x PASS     ADMITTED               artifacts/frankentorch-valnx_repro.log:240
-   3.25   3.70   31.16   old   9.59x REFUSE   new   3.90x PASS     ADMITTED               artifacts/frankentorch-valnx_repro.log:238
-   2.44   3.59   32.96   old  13.51x REFUSE   new   4.12x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:236
-   2.44   3.78   32.86   old  13.47x REFUSE   new   4.11x REFUSE   same                   artifacts/frankentorch-mdsmm_repro.log:193
-   2.15   3.79   34.98   old  16.27x REFUSE   new   4.37x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:234
-   3.01   4.28   37.21   old  12.36x REFUSE   new   4.65x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:232
-   4.84   4.86   39.96   old   8.26x REFUSE   new   5.00x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:230
-   3.55   5.36   52.69   old  14.84x REFUSE   new   6.59x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:228
-   4.16   5.95   56.31   old  13.54x REFUSE   new   7.04x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:213
-   2.71   6.25   59.77   old  22.06x REFUSE   new   7.47x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:211
-   1.79   6.99   63.87   old  35.68x REFUSE   new   7.98x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:209
-   2.17   8.21   68.03   old  31.35x REFUSE   new   8.50x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:207
-   2.33   9.54   72.43   old  31.09x REFUSE   new   9.05x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:205
-   2.28  11.34   77.53   old  34.00x REFUSE   new   9.69x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:203
-   2.55  13.59   83.01   old  32.55x REFUSE   new  10.38x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:201
+   1.99   2.93   26.02   old  13.08x REFUSE   new  13.08x REFUSE   same                   artifacts/frankentorch-mdsmm_repro.log:197
+   2.20   3.14   27.49   old  12.50x REFUSE   new  12.50x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:242
+   2.59   3.38   29.19   old  11.27x REFUSE   new  11.27x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:240
+   3.25   3.70   31.16   old   9.59x REFUSE   new   9.59x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:238
+   2.44   3.59   32.96   old  13.51x REFUSE   new  13.51x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:236
+   2.44   3.78   32.86   old  13.47x REFUSE   new  13.47x REFUSE   same                   artifacts/frankentorch-mdsmm_repro.log:193
+   2.15   3.79   34.98   old  16.27x REFUSE   new  16.27x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:234
+   3.01   4.28   37.21   old  12.36x REFUSE   new  12.36x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:232
+   4.84   4.86   39.96   old   8.26x REFUSE   new   8.26x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:230
+   3.55   5.36   52.69   old  14.84x REFUSE   new  14.84x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:228
+   4.16   5.95   56.31   old  13.54x REFUSE   new  13.54x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:213
+   2.71   6.25   59.77   old  22.06x REFUSE   new  22.06x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:211
+   1.79   6.99   63.87   old  35.68x REFUSE   new  35.68x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:209
+   2.17   8.21   68.03   old  31.35x REFUSE   new  31.35x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:207
+   2.33   9.54   72.43   old  31.09x REFUSE   new  31.09x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:205
+   2.28  11.34   77.53   old  34.00x REFUSE   new  34.00x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:203
+   2.55  13.59   83.01   old  32.55x REFUSE   new  32.55x REFUSE   same                   artifacts/frankentorch-valnx_repro.log:201
   12.57  82.80  177.25   old  14.10x REFUSE   new  14.10x REFUSE   same                   artifacts/frankentorch-stale-tuning-constants-lzku6_repro.log:237
-   5.30 117.79  223.70   old  42.21x REFUSE   new  27.96x REFUSE   same                   artifacts/frankentorch-37sxo_repro.log:192
-   5.30 117.79  223.70   old  42.21x REFUSE   new  27.96x REFUSE   same                   artifacts/frankentorch-stale-tuning-constants-lzku6_repro.log:235
+   5.30 117.79  223.70   old  42.21x REFUSE   new  42.21x REFUSE   same                   artifacts/frankentorch-37sxo_repro.log:192
+   5.30 117.79  223.70   old  42.21x REFUSE   new  42.21x REFUSE   same                   artifacts/frankentorch-stale-tuning-constants-lzku6_repro.log:235
   21.75  93.54  261.36   old  12.02x REFUSE   new  12.02x REFUSE   same                   artifacts/frankentorch-stale-tuning-constants-lzku6_repro.log:273
   44.56 118.25  283.72   old   6.37x REFUSE   new   6.37x REFUSE   same                   artifacts/frankentorch-stale-tuning-constants-lzku6_repro.log:271
-   7.30  52.60   72.90   old   9.99x REFUSE   new   9.11x REFUSE   same                   docs/NEGATIVE_EVIDENCE.md:38559 (item 251 — THE window this limb exists for)
+   7.30  52.60   72.90   old   9.99x REFUSE   new   9.99x REFUSE   same                   docs/NEGATIVE_EVIDENCE.md:38559 (item 251 — THE window this limb exists for)
 
 corpus       29 triples (every guard loadavg line in the repo, plus item 251's)
 floor        8.00   max ratio 4x   nproc 64
-ADMITTED     6  previously refused, now admitted
-STILL REFUSED 19
+ADMITTED     1  previously refused, now admitted
+STILL REFUSED 24
 replay of the pre-floor rule against recorded verdicts: 1/1 OK (0 mismatches)
 monotonicity (new refuses a subset of old):             0 violations
 item 251's window still refused:                        yes
+wzhem split (0.73/2.04/3.36 admitted, 1.99/2.93/26.02 refused): both hold
 replay_exit=0

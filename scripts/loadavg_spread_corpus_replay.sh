@@ -82,7 +82,7 @@ TSV=0
 # The loop runs in THIS shell (`done <<< ...`, not a pipe), so the counters below survive it.
 # A `printf | while` would have counted in a subshell and reported zeros — the same shape of
 # defect as reading a guard verdict through a pipeline.
-n_total=0; n_admit=0; n_still=0; n_replay_fail=0; n_monotone_fail=0; n_251_fail=0
+n_total=0; n_admit=0; n_still=0; n_replay_fail=0; n_monotone_fail=0; n_251_fail=0; n_wzhem_fail=0
 while read -r l1 l5 l15 recorded prov; do
     [ -z "${l1:-}" ] && continue
     n_total=$((n_total + 1))
@@ -107,6 +107,15 @@ while read -r l1 l5 l15 recorded prov; do
     case "$prov" in
         *"item 251"*) [ "$new_v" = REFUSE ] || { flag=ITEM_251_REGRESSED; n_251_fail=$((n_251_fail + 1)); } ;;
     esac
+    # frankentorch-wzhem states both sides of the split it requires, by triple. Assert them here
+    # rather than eyeballing the table: the FIRST shipped form of this limb satisfied the WIN and
+    # broke the LOSE, and nothing caught it because nothing was asserting the LOSE.
+    if [ "$l1 $l5 $l15" = "0.73 2.04 3.36" ] && [ "$new_v" != PASS ]; then
+        flag=WZHEM_WIN_BROKEN; n_wzhem_fail=$((n_wzhem_fail + 1))
+    fi
+    if [ "$l1 $l5 $l15" = "1.99 2.93 26.02" ] && [ "$new_v" != REFUSE ]; then
+        flag=WZHEM_LOSE_BROKEN; n_wzhem_fail=$((n_wzhem_fail + 1))
+    fi
 
     if [ "$TSV" -eq 1 ]; then
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$l1" "$l5" "$l15" "$old_ratio" "$new_ratio" "$old_v" "$new_v" "$flag" "$prov"
@@ -126,10 +135,12 @@ echo "STILL REFUSED $n_still"
 echo "replay of the pre-floor rule against recorded verdicts: $((n_replay_fail == 0 ? 1 : 0))/1 OK ($n_replay_fail mismatches)"
 echo "monotonicity (new refuses a subset of old):             $n_monotone_fail violations"
 echo "item 251's window still refused:                        $([ "$n_251_fail" -eq 0 ] && echo yes || echo NO)"
+echo "wzhem split (0.73/2.04/3.36 admitted, 1.99/2.93/26.02 refused): $([ "$n_wzhem_fail" -eq 0 ] && echo "both hold" || echo "BROKEN")"
 
 rc=0
 [ "$n_replay_fail" -eq 0 ] || rc=1
 [ "$n_monotone_fail" -eq 0 ] || rc=1
 [ "$n_251_fail" -eq 0 ] || rc=1
+[ "$n_wzhem_fail" -eq 0 ] || rc=1
 [ "$rc" -eq 0 ] || echo "REPLAY FAILED" >&2
 exit "$rc"
