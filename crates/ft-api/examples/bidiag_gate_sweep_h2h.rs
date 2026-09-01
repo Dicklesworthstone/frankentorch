@@ -175,6 +175,10 @@ struct Arm {
     /// and cannot move a number — `FT_GGS=1,0` prices it in ONE invocation against one live
     /// incumbent. Only the eigh/eigvalsh lanes touch it.
     grouped_ggs: bool,
+    /// Whether values-only eigvalsh writes raw GGS results directly into its
+    /// required `e` workspace rather than allocating a per-reflector temporary.
+    /// `FT_EIGVALSH_GGS_REUSE_E=0,1,0` supplies legacy/candidate/legacy A/B/A.
+    eigvalsh_ggs_reuse_e: bool,
     /// Force the blocked trailing-update GEMM's column blocks to run SEQUENTIALLY
     /// (`frankentorch-rpytm`). Bit-identical either way, so this pair can move time and cannot
     /// move a number. `FT_SUBSER=0,1` prices lu_factor's only parallelism in ONE invocation.
@@ -290,6 +294,7 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
     } else {
         "/replay-rowmajor"
     } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
+        + if arm.eigvalsh_ggs_reuse_e { "/ggs-e" } else { "/ggs-vec" }
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
         + if arm.sub_tile_2d { "/sub2D" } else { "/subCOL" }
         + if arm.ormqr_subtract_parallel { "/ormqrSUBPAR" } else { "/ormqrSUBSER" }
@@ -469,6 +474,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
     let previous_eigvalsh_ggs = ft_kernel_cpu::set_eigvalsh_grouped_ggs(arm.grouped_ggs);
+    let previous_eigvalsh_ggs_reuse_e =
+        ft_kernel_cpu::set_eigvalsh_ggs_reuse_e(arm.eigvalsh_ggs_reuse_e);
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
     let previous_subtile = ft_kernel_cpu::set_dgemm_sub_tile_2d(arm.sub_tile_2d);
     let previous_ormqr_subtract =
@@ -535,6 +542,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
+        ft_kernel_cpu::set_eigvalsh_ggs_reuse_e(previous_eigvalsh_ggs_reuse_e);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_ormqr_subtract_parallel(previous_ormqr_subtract);
@@ -578,6 +586,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
         ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
+        ft_kernel_cpu::set_eigvalsh_ggs_reuse_e(previous_eigvalsh_ggs_reuse_e);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_ormqr_subtract_parallel(previous_ormqr_subtract);
@@ -692,6 +701,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
     ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
+    ft_kernel_cpu::set_eigvalsh_ggs_reuse_e(previous_eigvalsh_ggs_reuse_e);
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
     ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
     ft_kernel_cpu::set_ormqr_subtract_parallel(previous_ormqr_subtract);
@@ -1040,6 +1050,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         })
         .collect();
+    let eigvalsh_ggs_reuse_e_arms: Vec<bool> = std::env::var("FT_EIGVALSH_GGS_REUSE_E")
+        .unwrap_or_else(|_| "0".to_string())
+        .split(',')
+        .filter_map(|t| match t.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+        .collect();
     let replays: Vec<bool> = std::env::var("FT_REPLAY")
         .unwrap_or_else(|_| "1".to_string())
         .split(',')
@@ -1115,6 +1134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         values_only: false,
                                         replay_transposed,
                                         grouped_ggs,
+                                        eigvalsh_ggs_reuse_e: false,
                                         sub_serial,
                                         sub_tile_2d,
                                         ormqr_subtract_parallel,
@@ -1180,6 +1200,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 form_p_blocked,
                 ..arm
             })
+        })
+        .collect();
+    // `frankentorch-mdsmm`: retain the legacy temporary as arm0 and append the
+    // workspace-reuse candidate inside the same interleaved invocation. The
+    // candidate preserves the packed layout and the serial reflector chain.
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            eigvalsh_ggs_reuse_e_arms
+                .iter()
+                .map(move |&eigvalsh_ggs_reuse_e| Arm {
+                    eigvalsh_ggs_reuse_e,
+                    ..arm
+                })
         })
         .collect();
     // FT_VALUES_ARM=1 appends ONE extra arm running the values-only entry, with the shipped

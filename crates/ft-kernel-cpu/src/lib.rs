@@ -345,6 +345,32 @@ mod gemm {
     /// turned off" — `feedback_one_knob_is_secretly_two` in its purest form. A sweep must move this
     /// with the candidate so every width has equivalent split eligibility, and must PROVE it did
     /// with the admission census below rather than assume it.
+    /// **32, AND IT IS A COUPLING, NOT A TUNABLE** — `frankentorch-stale-tuning-constants-lzku6`
+    /// lane 4, ledger 294. It must equal the panel width the Householder ops use, which is
+    /// hard-coded 32 in three places that never consult this constant: `geqrf_blocked_f64`'s
+    /// ladder, `let nb_block = 32` in `orgqr_blocked_f64`, and
+    /// `householder_panels_from_packed_f64(.., 32)` in `ormqr_blocked_f64`.
+    ///
+    /// **No value of this constant changes a panel.** The predicate below matches `m == WIDTH` or
+    /// `k == WIDTH` EXACTLY, so any other value simply stops matching a panel that is still 32
+    /// wide and silently kills the skinny route. The bead opened this lane as "re-sweep the
+    /// width"; there is no width axis to sweep, and a ladder over it would have measured the route
+    /// being switched off at five different values.
+    ///
+    /// MEASURED (thinkstation1, rayon=16, reps=12, guard PASS, ELF de1851dcf9ee5556, interleaved
+    /// with an A/A arm). Census first — geqrf ADMITS ZERO at every size (149/165/197 rejected), so
+    /// this governs the APPLY side only; orgqr and ormqr each admit 32 calls at n>=512 and none at
+    /// n=256. Route LIVE against route DEAD:
+    ///
+    ///     n=512   orgqr  12.46 vs 21.53 ms  paired 0.575  sign 0/12  TRUSTED
+    ///             ormqr  12.59 vs 21.40 ms  paired 0.587  sign 0/12  TRUSTED
+    ///     n=1024  orgqr  paired 0.973  sign 6/12  UNRESOLVED
+    ///             ormqr  paired 1.000  sign 6/12  UNRESOLVED
+    ///
+    /// **So the route is worth ~1.7x on orgqr/ormqr at n=512 and the shipped 32 is load-bearing.**
+    ///
+    /// THE HAZARD THIS LEAVES: if anyone retunes the ops' hard-coded 32, they must move this with
+    /// it or silently lose that 1.7x. Nothing in the type system couples them.
     pub(crate) const HOUSEHOLDER_PANEL_WIDTH_SHIPPED: usize = 32;
     pub(crate) static HOUSEHOLDER_PANEL_WIDTH_OVERRIDE: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -30276,6 +30302,23 @@ pub fn set_eigvalsh_grouped_ggs(on: bool) -> bool {
     EIGVALSH_GROUPED_GGS.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether values-only TRED2 reuses the already-required `e` workspace for the
+/// per-reflector GGS results instead of allocating a temporary vector.
+///
+/// Default FALSE: this is an interleaved measurement control for
+/// `frankentorch-mdsmm`. Both paths preserve every dot-product and update order.
+static EIGVALSH_GGS_REUSE_E: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+fn eigvalsh_ggs_reuse_e() -> bool {
+    EIGVALSH_GGS_REUSE_E.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Select the values-only GGS workspace, returning the prior state for paired
+/// in-process A/B measurement.
+#[doc(hidden)]
+pub fn set_eigvalsh_ggs_reuse_e(on: bool) -> bool {
+    EIGVALSH_GGS_REUSE_E.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Optional half-bandwidth for eigvalsh's full -> band -> tridiagonal path.
 /// Zero keeps the production packed `dsytd2` route.
 static EIGVALSH_TWO_STAGE_BAND: std::sync::atomic::AtomicUsize =
@@ -31199,12 +31242,21 @@ fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
                 f = 0.0;
                 observer.finished_reflector(reflector_started);
                 let ggs_started = observer.started();
+                // `e` is overwritten for every j in 0..=l before the update.
+                // Reusing it for raw GGS results avoids one short-lived allocation and
+                // a GGS -> temporary -> e round trip without changing any dot order.
+                // Keep the legacy temporary available as the paired A/B control.
+                let reuse_e = eigvalsh_ggs_reuse_e();
+                let mut legacy_ggs = if reuse_e {
+                    Vec::new()
+                } else {
+                    vec![0.0f64; l + 1]
+                };
                 if eigvalsh_grouped_ggs() && l >= 8 {
                     // Keep each output's ascending-k sum intact while carrying
                     // four independent dependency chains. Unlike full eigh this
                     // path has no reflector/backtransform work after the
                     // reduction, so it needs its own paired verdict.
-                    let mut ggs = vec![0.0f64; l + 1];
                     let mut j0 = 0usize;
                     while j0 + 4 <= l + 1 {
                         let j3 = j0 + 3;
@@ -31231,7 +31283,11 @@ fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
                             ];
                             acc += wide::f64x4::from(quad) * wide::f64x4::splat(row_i[k]);
                         }
-                        ggs[j0..j0 + 4].copy_from_slice(&acc.to_array());
+                        if reuse_e {
+                            e[j0..j0 + 4].copy_from_slice(&acc.to_array());
+                        } else {
+                            legacy_ggs[j0..j0 + 4].copy_from_slice(&acc.to_array());
+                        }
                         j0 += 4;
                     }
                     for j in j0..=l {
@@ -31246,11 +31302,11 @@ fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
                             gg += previous_rows[lower_col_offset] * row_i_k;
                             lower_col_offset += k + 1;
                         }
-                        ggs[j] = gg;
-                    }
-                    for j in 0..=l {
-                        e[j] = ggs[j] / h;
-                        f += e[j] * row_i[j];
+                        if reuse_e {
+                            e[j] = gg;
+                        } else {
+                            legacy_ggs[j] = gg;
+                        }
                     }
                 } else {
                     for j in 0..=l {
@@ -31265,9 +31321,17 @@ fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
                             gg += previous_rows[lower_col_offset] * row_i_k;
                             lower_col_offset += k + 1;
                         }
-                        e[j] = gg / h;
-                        f += e[j] * row_i[j];
+                        if reuse_e {
+                            e[j] = gg;
+                        } else {
+                            legacy_ggs[j] = gg;
+                        }
                     }
+                }
+                for j in 0..=l {
+                    let gg = if reuse_e { e[j] } else { legacy_ggs[j] };
+                    e[j] = gg / h;
+                    f += e[j] * row_i[j];
                 }
                 observer.finished_ggs(ggs_started);
                 let update_started = observer.started();
@@ -75787,6 +75851,29 @@ mod tests {
             let grouped = super::eigvalsh_contiguous_f64(&sym, &meta).expect("grouped eigvalsh");
             super::set_eigvalsh_grouped_ggs(previous);
             assert_eq!(bits(&scalar), bits(&grouped), "n={n}");
+        }
+    }
+
+    #[test]
+    fn eigvalsh_ggs_workspace_reuse_matches_legacy_bitwise() {
+        let bits = |v: &[f64]| -> Vec<u64> { v.iter().map(|e| e.to_bits()).collect() };
+        for &n in &[9usize, 16, 33, 64] {
+            let raw = bidiag_test_matrix(n, n, 0xE162u64.wrapping_mul(n as u64 + 11));
+            let mut sym = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    sym[r * n + c] = (raw[r * n + c] + raw[c * n + r]) * 0.5;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let previous_grouped = super::set_eigvalsh_grouped_ggs(true);
+            let previous_reuse = super::set_eigvalsh_ggs_reuse_e(false);
+            let legacy = super::eigvalsh_contiguous_f64(&sym, &meta).expect("legacy eigvalsh");
+            super::set_eigvalsh_ggs_reuse_e(true);
+            let reused = super::eigvalsh_contiguous_f64(&sym, &meta).expect("reused eigvalsh");
+            super::set_eigvalsh_ggs_reuse_e(previous_reuse);
+            super::set_eigvalsh_grouped_ggs(previous_grouped);
+            assert_eq!(bits(&legacy), bits(&reused), "n={n}");
         }
     }
 
