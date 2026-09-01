@@ -1,0 +1,365 @@
+===== conv2d_f32_kernels / conv2d_f32_kernels_masked mode-conditioned standing — torch:2 (CreamTrout) 2026-09-01T19:20:23Z =====
+host=thinkstation1 nproc=64 HEAD=32dc89455493481c9ad0a070b2756ee641bc314c
+build_base=b82531b2ea8453159ec7c570ba817e5c720582b7 (clean-overlay receipt); harness source unchanged since that commit
+elf_sha256=717b8cd1633f5cd9cf1bd877500edcfd0e27fe8163faf84af0cff8614a050b6c
+incumbent=PyTorch 2.12.1+cpu, self-reported in EVERY invocation
+protocol: 10 SUCCESSFUL invocations, guard before EACH, FT_H2H_REPS=24 FT_H2H_WARMUP=16, round_warmup=0 (board default)
+lanes=conv2d_f32_kernels,conv2d_f32_kernels_masked exact; bank seeded from artifacts/perf/incumbent_bank.jsonl (79 lines) into a scratch copy, merged back after the run
+
+--- attempt 1 (run 1/10)  19:20:23Z  loadavg=16.26 18.15 16.70
+guard PASS: no peer measurement detected, loadavg 16.26/18.15/16.70 (spread 1.12x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   38.884   19.333   FT 2.01x SLOWER     PT PASS [0.906,1.310] FT PASS [0.987,1.027] ratio 0.497 [0.462,0.559] match incumbent=NO-HISTORY
+  incumbent_mode lane=conv2d_f32_kernels drawn=19.333 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    pad_ms = 4.023 of this lane's 38.884 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.40x SLOWER     ratio 0.294 [0.272,0.312]  PT null 1.266 FAIL  FT null 1.005 PASS  not quotable
+  conv2d_f32_kernels_masked   61.311   20.212   FT 3.03x SLOWER     PT PASS [0.878,1.113] FT PASS [0.981,1.019] ratio 0.330 [0.317,0.364] match incumbent=NO-HISTORY
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=20.212 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    pad_ms = 4.023 of this lane's 61.311 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 4.42x SLOWER     ratio 0.226 [0.205,0.239]  PT null 0.781 FAIL  FT null 1.002 PASS  not quotable
+
+--- attempt 2 (run 2/10)  19:21:01Z  loadavg=19.14 18.63 16.93
+guard PASS: no peer measurement detected, loadavg 19.14/18.63/16.93 (spread 1.13x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   39.758   19.652   FT 2.02x SLOWER     PT PASS [0.761,1.157] FT OFFSET [0.986,1.045] ratio 0.494 [0.424,0.538] match incumbent=SINGLE/n2
+  incumbent_mode lane=conv2d_f32_kernels drawn=19.652 ms  SINGLE LEVEL (n=2, median 19.493, range [19.333, 19.652], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 1. The bank spans 0s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.992, FrankenTorch 1.024; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.788 of this lane's 39.758 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.07x SLOWER     ratio 0.326 [0.303,0.343]  PT null 1.028 FAIL  FT null 1.010 PASS  not quotable
+  conv2d_f32_kernels_masked   61.696   20.610   FT 2.99x SLOWER     PT OFFSET [0.761,1.067] FT PASS [0.986,1.028] ratio 0.334 [0.298,0.387] match incumbent=SINGLE/n2
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=20.610 ms  SINGLE LEVEL (n=2, median 20.411, range [20.212, 20.610], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 1. The bank spans 0s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.865, FrankenTorch 1.009; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.788 of this lane's 61.696 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 4.37x SLOWER     ratio 0.229 [0.215,0.241]  PT null 0.952 FAIL  FT null 1.010 PASS  not quotable
+
+--- attempt 3 (run 3/10)  19:21:41Z  loadavg=21.30 19.26 17.20
+guard PASS: no peer measurement detected, loadavg 21.30/19.29/17.22 (spread 1.24x <= 4x, floor 8.00), iowait 2.0% <= 10%
+  conv2d_f32_kernels   37.926   25.340   FT 1.50x SLOWER     PT OFFSET [0.697,1.054] FT PASS [0.977,1.008] ratio 0.668 [0.630,0.692] match incumbent=SINGLE/n3
+  incumbent_mode lane=conv2d_f32_kernels drawn=25.340 ms  SINGLE LEVEL (n=3, median 19.652, range [19.333, 25.340], spread 1.31x) — no second level banked for this lane, so this row is comparable to the other 2. The bank spans 40s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.803, FrankenTorch 0.992; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.643 of this lane's 37.926 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 2.72x SLOWER     ratio 0.368 [0.349,0.410]  PT null 0.606 FAIL  FT null 0.992 PASS  not quotable
+  conv2d_f32_kernels_masked   60.255   24.271   FT 2.48x SLOWER     PT OFFSET [0.954,1.280] FT PASS [0.999,1.036] ratio 0.403 [0.381,0.420] match incumbent=SINGLE/n3
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=24.271 ms  SINGLE LEVEL (n=3, median 20.610, range [20.212, 24.271], spread 1.20x) — no second level banked for this lane, so this row is comparable to the other 2. The bank spans 40s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.067, FrankenTorch 1.017; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.643 of this lane's 60.255 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.20x SLOWER     ratio 0.313 [0.246,0.379]  PT null 1.055 FAIL  FT null 1.016 PASS  not quotable
+
+--- attempt 4 (run 4/10)  19:22:26Z  loadavg=19.87 19.21 17.29
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    64097  target/release/examples/headtohead /data/tmp/fm-h2h-equiv-corpus-64022.json /data/tmp/fm-h2h-equiv-r
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 4, waiting 90s (refusals are not retried silently)
+
+--- attempt 5 (run 4/10)  19:23:58Z  loadavg=10.95 16.20 16.39
+REFUSING TO MEASURE: 12 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    77114  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only edit_trace_500x1000 -
+    77133  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    77395  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    77396  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    77427  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    77448  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    77461  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    77510  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    77523  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=77388 --e
+    77546  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=77388 --e
+    77629  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=77388 --e
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 5, waiting 90s (refusals are not retried silently)
+
+--- attempt 6 (run 4/10)  19:25:30Z  loadavg=14.01 16.13 16.37
+REFUSING TO MEASURE: 12 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    77114  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only edit_trace_500x1000 -
+    104741  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    104881  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    104882  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    104902  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    104905  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    104906  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    104937  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    104969  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    104985  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    105018  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 6, waiting 90s (refusals are not retried silently)
+
+--- attempt 7 (run 4/10)  19:27:02Z  loadavg=14.83 15.57 16.13
+REFUSING TO MEASURE: 12 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    77114  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only edit_trace_500x1000 -
+    104741  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    104881  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    104882  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    104902  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    104905  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    104906  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    104937  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    104969  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    104985  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    105018  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 7, waiting 90s (refusals are not retried silently)
+
+--- attempt 8 (run 4/10)  19:28:34Z  loadavg=9.49 14.09 15.58
+REFUSING TO MEASURE: 12 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    77114  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only edit_trace_500x1000 -
+    104741  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    104881  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    104882  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    104902  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    104905  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    104906  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    104937  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    104969  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    104985  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    105018  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 8, waiting 90s (refusals are not retried silently)
+
+--- attempt 9 (run 4/10)  19:30:06Z  loadavg=8.23 12.40 14.83
+REFUSING TO MEASURE: 13 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    77114  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only edit_trace_500x1000 -
+    104741  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    104881  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    104882  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    104902  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    104905  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    104906  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    104937  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    104969  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    104985  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    105018  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    146723  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 9, waiting 90s (refusals are not retried silently)
+
+--- attempt 10 (run 4/10)  19:31:39Z  loadavg=5.58 10.56 13.96
+REFUSING TO MEASURE: 13 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    77114  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only edit_trace_500x1000 -
+    104741  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    104881  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    104882  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    104902  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    104905  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    104906  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    104937  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    104969  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    104985  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    105018  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=104876 --
+    163755  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 10, waiting 90s (refusals are not retried silently)
+
+--- attempt 11 (run 4/10)  19:33:11Z  loadavg=4.59 8.90 13.05
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    64022  node scripts/headtohead/equivalence.mjs --fm-bin target/release/examples/headtohead --only edit_trac
+    163755  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 11, waiting 90s (refusals are not retried silently)
+
+--- attempt 12 (run 4/10)  19:34:43Z  loadavg=3.25 7.41 12.12
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    202560  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 12, waiting 90s (refusals are not retried silently)
+
+--- attempt 13 (run 4/10)  19:36:15Z  loadavg=3.94 6.44 11.33
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    215350  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 13, waiting 90s (refusals are not retried silently)
+
+--- attempt 14 (run 4/10)  19:37:47Z  loadavg=9.32 7.48 11.21
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    298164  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 14, waiting 90s (refusals are not retried silently)
+
+--- attempt 15 (run 4/10)  19:39:19Z  loadavg=14.69 9.43 11.54
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    298164  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 15, waiting 90s (refusals are not retried silently)
+
+--- attempt 16 (run 4/10)  19:40:51Z  loadavg=13.91 11.08 11.96
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    315051  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 16, waiting 90s (refusals are not retried silently)
+
+--- attempt 17 (run 4/10)  19:42:24Z  loadavg=45.92 19.38 14.63
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    315051  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 45.92 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 17, waiting 90s (refusals are not retried silently)
+
+--- attempt 18 (run 4/10)  19:43:56Z  loadavg=80.90 38.71 21.99
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    333754  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 80.90 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 18, waiting 90s (refusals are not retried silently)
+
+--- attempt 19 (run 4/10)  19:45:28Z  loadavg=86.17 52.21 28.44
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    333754  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 86.17 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 19, waiting 90s (refusals are not retried silently)
+
+--- attempt 20 (run 4/10)  19:47:00Z  loadavg=66.10 55.12 31.72
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    333754  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 66.10 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 20, waiting 90s (refusals are not retried silently)
+
+--- attempt 21 (run 4/10)  19:48:32Z  loadavg=50.52 53.54 33.45
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    355634  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 50.52 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 21, waiting 90s (refusals are not retried silently)
+
+--- attempt 22 (run 4/10)  19:50:05Z  loadavg=45.92 50.78 34.30
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    355634  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 45.92 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 22, waiting 90s (refusals are not retried silently)
+
+--- attempt 23 (run 4/10)  19:51:37Z  loadavg=18.10 39.87 32.00
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    355634  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 23, waiting 90s (refusals are not retried silently)
+
+--- attempt 24 (run 4/10)  19:53:09Z  loadavg=8.02 30.95 29.57
+guard PASS: no peer measurement detected, loadavg 8.02/30.95/29.57 (spread 3.86x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_f32_kernels   36.131   28.045   FT 1.29x SLOWER     PT OFFSET [0.957,1.111] FT PASS [0.958,1.021] ratio 0.776 [0.744,0.812] match incumbent=SINGLE/n4
+  incumbent_mode lane=conv2d_f32_kernels drawn=28.045 ms  SINGLE LEVEL (n=4, median 22.496, range [19.333, 28.045], spread 1.45x) — no second level banked for this lane, so this row is comparable to the other 3. The bank spans 85s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.051, FrankenTorch 0.997; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.723 of this lane's 36.131 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 1.38x SLOWER     ratio 0.722 [0.596,0.752]  PT null 1.051 FAIL  FT null 0.978 FAIL  not quotable
+  conv2d_f32_kernels_masked   57.971   26.803   FT 2.16x SLOWER     PT PASS [0.967,1.055] FT PASS [0.974,1.014] ratio 0.462 [0.456,0.477] match incumbent=SINGLE/n4
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=26.803 ms  SINGLE LEVEL (n=4, median 22.440, range [20.212, 26.803], spread 1.33x) — no second level banked for this lane, so this row is comparable to the other 3. The bank spans 85s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    pad_ms = 3.723 of this lane's 57.971 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 2.40x SLOWER     ratio 0.417 [0.383,0.439]  PT null 1.052 FAIL  FT null 0.986 PASS  not quotable
+
+--- attempt 25 (run 5/10)  19:53:47Z  loadavg=8.81 28.28 28.72
+guard PASS: no peer measurement detected, loadavg 8.81/28.28/28.72 (spread 3.26x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   36.306   11.881   FT 3.06x SLOWER     PT FAIL [0.914,0.996] FT PASS [0.987,1.027] ratio 0.327 [0.316,0.350] match incumbent=LEVEL-A/2 n1
+  incumbent_mode lane=conv2d_f32_kernels drawn=11.881 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.63x gap:
+      level A  n=1   median   11.881  range [11.881, 11.881]  spread 1.00x   <- THIS RUN
+      level B  n=4   median   22.496  range [19.333, 28.045]  spread 1.45x   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1966s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.951, FrankenTorch 1.013; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.451 of this lane's 36.306 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.20x SLOWER     ratio 0.312 [0.297,0.336]  PT null 1.030 FAIL  FT null 1.003 PASS  not quotable
+  conv2d_f32_kernels_masked   59.745   13.609   FT 4.39x SLOWER     PT OFFSET [0.988,1.092] FT PASS [0.968,1.029] ratio 0.228 [0.220,0.238] match incumbent=LEVEL-A/2 n1
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=13.609 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.49x gap:
+      level A  n=1   median   13.609  range [13.609, 13.609]  spread 1.00x   <- THIS RUN
+      level B  n=4   median   22.440  range [20.212, 26.803]  spread 1.33x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1966s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.035, FrankenTorch 0.990; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.451 of this lane's 59.745 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 4.52x SLOWER     ratio 0.221 [0.211,0.230]  PT null 1.025 FAIL  FT null 0.989 PASS  not quotable
+
+--- attempt 26 (run 6/10)  19:54:20Z  loadavg=9.64 26.61 28.16
+guard PASS: no peer measurement detected, loadavg 9.64/26.20/28.01 (spread 2.91x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   36.026   26.109   FT 1.38x SLOWER     PT PASS [0.969,1.064] FT PASS [0.978,1.042] ratio 0.725 [0.686,0.770] match incumbent=LEVEL-B/2 n5
+  incumbent_mode lane=conv2d_f32_kernels drawn=26.109 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.63x gap:
+      level A  n=1   median   11.881  range [11.881, 11.881]  spread 1.00x
+      level B  n=5   median   25.340  range [19.333, 28.045]  spread 1.45x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1999s, but a split seen inside one session is still positive evidence of two levels.
+    pad_ms = 3.767 of this lane's 36.026 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 1.44x SLOWER     ratio 0.694 [0.684,0.713]  PT null 1.013 PASS  FT null 1.013 PASS  QUOTABLE under the min estimator
+  conv2d_f32_kernels_masked   56.976   24.677   FT 2.31x SLOWER     PT PASS [0.914,1.207] FT PASS [0.971,1.015] ratio 0.433 [0.409,0.479] match incumbent=LEVEL-B/2 n5
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=24.677 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.49x gap:
+      level A  n=1   median   13.609  range [13.609, 13.609]  spread 1.00x
+      level B  n=5   median   24.271  range [20.212, 26.803]  spread 1.33x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1999s, but a split seen inside one session is still positive evidence of two levels.
+    pad_ms = 3.767 of this lane's 56.976 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 2.54x SLOWER     ratio 0.393 [0.377,0.402]  PT null 1.036 FAIL  FT null 0.995 PASS  not quotable
+
+--- attempt 27 (run 7/10)  19:55:00Z  loadavg=8.78 24.25 27.29
+guard PASS: no peer measurement detected, loadavg 8.78/23.88/27.16 (spread 3.09x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   37.817   24.766   FT 1.53x SLOWER     PT PASS [0.867,1.193] FT PASS [0.969,1.029] ratio 0.655 [0.606,0.698] match incumbent=LEVEL-B/2 n6
+  incumbent_mode lane=conv2d_f32_kernels drawn=24.766 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.63x gap:
+      level A  n=1   median   11.881  range [11.881, 11.881]  spread 1.00x
+      level B  n=6   median   25.053  range [19.333, 28.045]  spread 1.45x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2039s, but a split seen inside one session is still positive evidence of two levels.
+    pad_ms = 4.716 of this lane's 37.817 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 2.71x SLOWER     ratio 0.368 [0.352,0.554]  PT null 1.076 FAIL  FT null 1.007 PASS  not quotable
+  conv2d_f32_kernels_masked   58.731   23.392   FT 2.51x SLOWER     PT OFFSET [0.848,1.024] FT PASS [0.978,1.027] ratio 0.398 [0.377,0.404] match incumbent=LEVEL-B/2 n6
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=23.392 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.49x gap:
+      level A  n=1   median   13.609  range [13.609, 13.609]  spread 1.00x
+      level B  n=6   median   23.831  range [20.212, 26.803]  spread 1.33x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2039s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.934, FrankenTorch 1.000; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 4.716 of this lane's 58.731 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.82x SLOWER     ratio 0.262 [0.247,0.380]  PT null 0.871 FAIL  FT null 1.005 PASS  not quotable
+
+--- attempt 28 (run 8/10)  19:55:39Z  loadavg=8.39 22.21 26.48
+guard PASS: no peer measurement detected, loadavg 8.39/22.21/26.48 (spread 3.16x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   38.317   11.765   FT 3.26x SLOWER     PT OFFSET [0.988,1.074] FT PASS [0.971,1.023] ratio 0.307 [0.300,0.318] match incumbent=LEVEL-A/2 n2
+  incumbent_mode lane=conv2d_f32_kernels drawn=11.765 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.63x gap:
+      level A  n=2   median   11.823  range [11.765, 11.881]  spread 1.01x   <- THIS RUN
+      level B  n=6   median   25.053  range [19.333, 28.045]  spread 1.45x   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2078s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.045, FrankenTorch 0.999; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.554 of this lane's 38.317 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.32x SLOWER     ratio 0.301 [0.294,0.309]  PT null 1.037 FAIL  FT null 0.966 FAIL  not quotable
+  conv2d_f32_kernels_masked   59.034   13.384   FT 4.41x SLOWER     PT PASS [0.953,1.049] FT PASS [0.987,1.013] ratio 0.227 [0.220,0.231] match incumbent=LEVEL-A/2 n2
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=13.384 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.49x gap:
+      level A  n=2   median   13.496  range [13.384, 13.609]  spread 1.02x   <- THIS RUN
+      level B  n=6   median   23.831  range [20.212, 26.803]  spread 1.33x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2078s, but a split seen inside one session is still positive evidence of two levels.
+    pad_ms = 3.554 of this lane's 59.034 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 4.87x SLOWER     ratio 0.205 [0.193,0.221]  PT null 1.001 PASS  FT null 1.002 PASS  QUOTABLE under the min estimator
+
+--- attempt 29 (run 9/10)  19:56:14Z  loadavg=9.31 20.88 25.87
+guard PASS: no peer measurement detected, loadavg 9.31/20.88/25.87 (spread 2.78x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   34.788   11.484   FT 3.03x SLOWER     PT FAIL [1.009,1.107] FT OFFSET [0.951,1.011] ratio 0.330 [0.315,0.343] match incumbent=LEVEL-A/2 n3
+  incumbent_mode lane=conv2d_f32_kernels drawn=11.484 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.63x gap:
+      level A  n=3   median   11.765  range [11.484, 11.881]  spread 1.03x   <- THIS RUN
+      level B  n=6   median   25.053  range [19.333, 28.045]  spread 1.45x   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2113s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.044, FrankenTorch 0.972; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 4.004 of this lane's 34.788 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 3.29x SLOWER     ratio 0.304 [0.291,0.317]  PT null 1.062 FAIL  FT null 0.968 FAIL  not quotable
+  conv2d_f32_kernels_masked   56.835   12.915   FT 4.40x SLOWER     PT PASS [0.946,1.037] FT PASS [0.979,1.016] ratio 0.227 [0.218,0.237] match incumbent=LEVEL-A/2 n3
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=12.915 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.49x gap:
+      level A  n=3   median   13.384  range [12.915, 13.609]  spread 1.05x   <- THIS RUN
+      level B  n=6   median   23.831  range [20.212, 26.803]  spread 1.33x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2113s, but a split seen inside one session is still positive evidence of two levels.
+    pad_ms = 4.004 of this lane's 56.835 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 4.77x SLOWER     ratio 0.210 [0.193,0.223]  PT null 0.979 FAIL  FT null 1.000 PASS  not quotable
+
+--- attempt 30 (run 10/10)  19:56:50Z  loadavg=9.51 19.71 25.30
+guard PASS: no peer measurement detected, loadavg 9.51/19.41/25.17 (spread 2.65x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32_kernels   36.069   16.660   FT 2.17x SLOWER     PT OFFSET [0.754,1.070] FT PASS [0.965,1.021] ratio 0.462 [0.431,0.562] match incumbent=LEVEL-B/2 n7
+  incumbent_mode lane=conv2d_f32_kernels drawn=16.660 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.40x gap:
+      level A  n=3   median   11.765  range [11.484, 11.881]  spread 1.03x
+      level B  n=7   median   24.766  range [16.660, 28.045]  spread 1.68x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2149s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.883, FrankenTorch 0.988; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.545 of this lane's 36.069 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 2.96x SLOWER     ratio 0.338 [0.323,0.371]  PT null 0.973 FAIL  FT null 0.982 PASS  not quotable
+  conv2d_f32_kernels_masked   57.075   21.757   FT 2.62x SLOWER     PT FAIL [0.758,0.998] FT PASS [0.970,1.012] ratio 0.381 [0.342,0.405] match incumbent=LEVEL-B/2 n7
+  incumbent_mode lane=conv2d_f32_kernels_masked drawn=21.757 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.49x gap:
+      level A  n=3   median   13.384  range [12.915, 13.609]  spread 1.05x
+      level B  n=7   median   23.392  range [20.212, 26.803]  spread 1.33x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 2149s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.828, FrankenTorch 0.991; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    pad_ms = 3.545 of this lane's 57.075 ms is a hand-rolled zero-init + SERIAL scalar copy, not kernel work. The session cost is conv2d_f32 - (this - pad_ms), NOT conv2d_f32 - this; the uncorrected subtraction has been reading NEGATIVE.
+    MIN-ESTIMATOR FT 4.13x SLOWER     ratio 0.242 [0.224,0.311]  PT null 0.661 FAIL  FT null 0.992 PASS  not quotable
+
+invocations_run=10 guard_refused=20 attempts=30
+bank_lines_added=20 (merged into artifacts/perf/incumbent_bank.jsonl after the run)
+===== end 2026-09-01T19:57:29Z =====
