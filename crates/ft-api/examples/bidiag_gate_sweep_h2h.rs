@@ -1851,11 +1851,36 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 .zip(&ft_ms[1])
                 .map(|(duplicate, original)| original / duplicate)
                 .collect();
+            // THIS LINE ADVERTISED A BAND AND COMPUTED NOTHING — frankentorch-strict-aa-gate-band-v8rpa.
+            //
+            // It said "both must be 0.970..=1.030 for certification" and then printed two numbers,
+            // leaving the reader to apply the band by eye. That is the defect the bead reports, and
+            // it is here rather than in the gauntlet harness the bead's row came from: the gauntlet
+            // never advertises 0.97-1.03 and states its own rule (|point-1| <= 0.02) in its legend.
+            //
+            // The band is computed and labelled now. It is still a REPORT, not a refusal — this is
+            // a diagnostic beside a certification the reader performs, and turning it into a
+            // process-level refusal would change the behaviour of a harness other rotations are
+            // mid-flight on. What it must not do is claim a criterion it never checks.
+            const CHOLESKY_F32_NULL_LO: f64 = 0.970;
+            const CHOLESKY_F32_NULL_HI: f64 = 1.030;
+            let shipped = median(&mut shipped_null);
+            let candidate = median(&mut candidate_null);
+            let verdict = |v: f64| {
+                if v.is_finite() && (CHOLESKY_F32_NULL_LO..=CHOLESKY_F32_NULL_HI).contains(&v) {
+                    "IN-BAND"
+                } else {
+                    "OUT-OF-BAND"
+                }
+            };
+            let both_in = verdict(shipped) == "IN-BAND" && verdict(candidate) == "IN-BAND";
             println!(
-                "  cholesky_f32 dual A/A nulls: shipped arm2/arm0 {:.3}x; candidate arm3/arm1 \
-                 {:.3}x (both must be 0.970..=1.030 for certification)",
-                median(&mut shipped_null),
-                median(&mut candidate_null),
+                "  cholesky_f32 dual A/A nulls: shipped arm2/arm0 {shipped:.3}x {}; candidate \
+                 arm3/arm1 {candidate:.3}x {} (band {CHOLESKY_F32_NULL_LO:.3}..={CHOLESKY_F32_NULL_HI:.3} \
+                 applies to these MEDIANS, not to any envelope) -> certification criterion {}",
+                verdict(shipped),
+                verdict(candidate),
+                if both_in { "MET" } else { "NOT MET" },
             );
         }
         // Same gate, different step-(12) kernel, MUST agree bit-for-bit: the four-row kernel

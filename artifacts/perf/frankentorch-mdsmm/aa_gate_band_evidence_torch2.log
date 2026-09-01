@@ -1,0 +1,31 @@
+A/A gate band — evidence for frankentorch-strict-aa-gate-band-v8rpa
+generated 2026-09-01T21:19:15Z  HEAD ccc7a78f  host thinkstation1
+
+1. WHERE THE 0.97-1.03 BAND ACTUALLY LIVES (git ls-files | xargs grep):
+   crates/ft-api/examples/bidiag_gate_sweep_h2h.rs:1856 — a PRINTED STRING in the cholesky_f32
+   dual-A/A diagnostic. Nothing computed it. It is the only occurrence in any source file.
+   The gauntlet harness (which produced the bead's row) never mentions it.
+
+2. WHAT THE GAUNTLET ACTUALLY ENFORCES:
+   adjudicate_null(lo,hi,MAX_NULL_CI_WIDTH=0.60): envelope width <= 0.60 AND envelope brackets 1.0
+   balanced_null_is_centered(point): |point - 1| <= BALANCED_NULL_MAX_DEVIATION = 0.02
+   PASS printed only when both hold. The band applies to the POINT; the envelope is a bootstrap CI.
+
+3. THE BEAD'S ROW UNDER THAT RULE:
+   PT [0.966,1.018] width 0.052 brackets 1.0 -> Calm.  FT [0.948,1.036] width 0.088 brackets 1.0 -> Calm.
+   Both are consistent with the advertised rule. Asserted in harness_interleave tests.
+
+4. WIN/LOSE SPLIT IF THE BAND WERE APPLIED TO THE ENVELOPE INSTEAD
+   (534 A/A envelopes recovered from every retained log in the repo; 280 of them PASS):
+   envelope width of PASS rows: min 0.025  p50 0.087  p90 0.179  max 0.568
+   the whole 0.970-1.030 band is 0.060 wide; the MEDIAN passing envelope is 0.087 — 1.4x the band
+   KEEP:    47 of 280 passing gates would still pass (16.8%)
+   REJECT: 233 of 280 passing gates would start failing (83.2%)
+
+   => An envelope-band rule rejects 83% of honest A/A gates. NOT ADOPTED.
+
+5. torch:3's A/A-only drift characterization is NOT_STARTED (blocked by an external
+   non-participant at 99.3% CPU), so no distribution from it exists to base a band change on.
+   artifacts/perf/frankentorch-mdsmm/aa_only_drift_characterization_blocked_external_dd4c84b7_ivorybirch.log
+
+6. TESTS (cargo test -p frankentorch-api --lib harness_interleave): 39 passed, 0 failed.

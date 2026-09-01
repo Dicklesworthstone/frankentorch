@@ -687,6 +687,37 @@ mod tests {
         );
     }
 
+
+    /// THE ENVELOPE IS NOT THE GATED QUANTITY — `frankentorch-strict-aa-gate-band-v8rpa`.
+    ///
+    /// The bead reported this exact row as a gate-integrity defect:
+    ///
+    ///     prelu_noshortcut  PT PASS [0.966,1.018]  FT PASS [0.948,1.036]
+    ///
+    /// reasoning that both envelopes leave the 0.97..=1.03 band and so both verdicts must be FAIL.
+    /// They must not. `adjudicate_null` asks two things of an ENVELOPE — that it is narrower than
+    /// `MAX_NULL_CI_WIDTH` and that it brackets unity — and both envelopes satisfy both. The
+    /// ±0.02 band is applied to the POINT ESTIMATE by the caller, which is a different number.
+    ///
+    /// Holding a bootstrap CI inside ±0.03 would be a far stricter protocol than this one: at the
+    /// round counts this board uses, a calm null's CI is routinely 0.05-0.13 wide, so that rule
+    /// would fail nearly every honest row. This test pins the actual contract so the next reader
+    /// who conflates the two finds an assertion instead of writing a bug report.
+    #[test]
+    fn the_reported_envelopes_are_calm_because_the_band_is_not_an_envelope_test() {
+        assert_eq!(adjudicate_null(0.966, 1.018, MAX_NULL_CI_WIDTH), NullVerdict::Calm);
+        assert_eq!(adjudicate_null(0.948, 1.036, MAX_NULL_CI_WIDTH), NullVerdict::Calm);
+    }
+
+    /// What DOES make an envelope fail: not bracketing unity, at any width.
+    #[test]
+    fn an_envelope_that_misses_unity_is_off_centre_however_tight() {
+        assert_eq!(adjudicate_null(1.004, 1.006, MAX_NULL_CI_WIDTH), NullVerdict::OffCentre);
+        assert_eq!(adjudicate_null(0.994, 0.996, MAX_NULL_CI_WIDTH), NullVerdict::OffCentre);
+        // ...and an envelope that brackets unity but is too wide supports no verdict at all.
+        assert_eq!(adjudicate_null(0.60, 1.30, MAX_NULL_CI_WIDTH), NullVerdict::TooWide);
+    }
+
     /// **THE DEFECT ITSELF, as a property.** Under the old rule a null centred on
     /// unity passed no matter how wide it got, so contention made the gate
     /// EASIER to pass. Widening must never improve a verdict.

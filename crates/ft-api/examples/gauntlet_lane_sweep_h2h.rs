@@ -3980,7 +3980,7 @@ LANES = {
             incumbent_split_ratio,
         );
         println!(
-            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}{}",
+            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} {pt_null_ratio:.3} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} {ft_null_ratio:.3} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}{}",
             pt_null_label, ft_null_label, incumbent_mode.row_tag(),
         );
         print!(
@@ -4113,7 +4113,12 @@ LANES = {
         );
     }
     println!(
-        "\nQuote a lane only if both A/A gates say PASS, their point estimates are within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0, and parity is `match`. WIDE means the null's\n\
+        "\nA/A columns read `<verdict> <point> [<envelope>]`. THE BAND APPLIES TO THE POINT, NOT THE ENVELOPE:\n\
+         the gate is |point-1| <= {BALANCED_NULL_MAX_DEVIATION:.2}, plus an envelope that brackets 1.0 and is at most\n\
+         {MAX_NULL_CI_WIDTH:.2} wide. An envelope wider than the point band is NORMAL and is not a gate failure — it is a\n\
+         bootstrap CI, and holding a CI inside +/-{BALANCED_NULL_MAX_DEVIATION:.2} would be a different and far stricter\n\
+         requirement than this protocol makes (frankentorch-strict-aa-gate-band-v8rpa).\n\
+         Quote a lane only if both A/A gates say PASS, their point estimates are within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0, and parity is `match`. WIDE means the null's\n\
          CI exceeded {MAX_NULL_CI_WIDTH:.2} — the sample was too noisy to support ANY verdict, so the row is\n\
          undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT\n\
          comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild."
