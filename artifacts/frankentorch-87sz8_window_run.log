@@ -1,0 +1,12 @@
+=== pooled max_pool3d duration-window refresh attempt 2 (torch:4) ===
+build_base=2f1c04bb9ac7f4e4d497721efc2d0605caf8402a
+build_command=RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/tmp/frankentorch-torch4-maxpool3d-window2-2f1c04bb9ac7-SJXMCU rch --no-self-healing exec --base 2f1c04bb9ac7f4e4d497721efc2d0605caf8402a --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+build_worker=hz4
+build_job=j-30000682123658433
+executing_elf=/data/tmp/frankentorch-torch4-maxpool3d-window2-2f1c04bb9ac7-SJXMCU/release/examples/gauntlet_lane_sweep_h2h
+executing_elf_sha256=8b8e053c76bcd9788d63f7137f0ff86dccf5dd5e9a777182b721b3517668f6d0
+runtime_head=2f1c04bb9ac7f4e4d497721efc2d0605caf8402a
+committed_source_surface_vs_build_base=UNCHANGED
+run_classification=NO_VERDICT
+reason=before duration-window entry, shared worktree gained uncommitted peer source edits in crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs; no wrapper, guard, harness, PyTorch, parity, A/A, or incumbent-bank action was taken
+incumbent_level=N/A
