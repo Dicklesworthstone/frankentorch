@@ -268,7 +268,41 @@ const C2_H: usize = 32;
 const C2_W: usize = 32;
 const C2_K: usize = 3;
 
-const LIN_B: usize = 512;
+/// The linear lanes' batches — `frankentorch-mdsmm`, sized by MEASURING the incumbent.
+///
+/// The lanes were born at a shared batch of 512, which put their incumbent arms at 1.92 ms (wide)
+/// and 6.10 ms (narrow). Item 203's sizing table is explicit about what that costs: it measured
+/// the incumbent A/A null as OFFSET at 5.08 ms and PASS only at 11.0 and 11.6, so a 1.92 ms arm is
+/// three times below anything that has ever nulled on this board. The consequence was visible the
+/// first time these lanes ran a twin sweep: the A/A nulls read OFFSET or FAIL on almost every row,
+/// so no individual row certified even though the direction was 8 of 8.
+///
+/// ONE BATCH CANNOT SIZE BOTH. At equal batch the two lanes differ 3.2x in cost, because the whole
+/// point of the pair is that they sit on opposite sides of `should_parallelize_cols` (out_features
+/// 128 vs 512). So they get separate constants, exactly as the conv family already does with
+/// `C2_N` / `C2B_N` / `C2XL_N` / `C2F32_N`.
+///
+/// MEASURED, not extrapolated — incumbent arm, 8 torch threads, median of 24 after 16 warmups:
+///
+///     batch    wide(128) sum  dense     narrow(512) sum  dense
+///       512        1.919      2.170          6.102       6.599
+///       768        2.699      2.713         10.231      10.203
+///      1024        3.755      3.616         12.700      13.688
+///      1536        5.573      5.430         17.545      19.584
+///      2048        7.106      7.226         23.448      26.188
+///      2560        8.807      8.386         28.621      28.591
+///      3072       10.085      9.793         30.388      33.790
+///
+/// Measuring mattered: the curve is steeper than linear at the low end, so extrapolating narrow
+/// from its 512 point would have predicted ~11 ms at batch 922, while 768 already reaches 10.2.
+///
+/// THE GATE STRADDLE IS PRESERVED, which is the pair's reason to exist. The column gate is
+/// `n > 4*m AND m*k*n >= 16.8M` with m=out_features, k=batch, n=in_features — batch only enters
+/// the size term, so growing it cannot move either lane across `n > 4m`. At these batches:
+/// wide 1024 > 512 ENGAGES at 402.7M; narrow 1024 > 2048 is false, so it still does not.
+const LIN_B_WIDE: usize = 3072;
+/// See [`LIN_B_WIDE`]: 768 puts the narrow lane's incumbent at 10.2 ms on both loss routes.
+const LIN_B_NARROW: usize = 768;
 const LIN_IN: usize = 1024;
 const LIN_OUT_WIDE: usize = 128;
 const LIN_OUT_NARROW: usize = 512;
@@ -1799,7 +1833,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attnq = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
     let attnk = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
     let attnv = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
-    let linx = seq(LIN_B * LIN_IN);
+    let linx_wide = seq(LIN_B_WIDE * LIN_IN);
+    let linx_narrow = seq(LIN_B_NARROW * LIN_IN);
     let linw_wide = seq(LIN_OUT_WIDE * LIN_IN);
     let linw_narrow = seq(LIN_OUT_NARROW * LIN_IN);
     let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
@@ -1906,7 +1941,9 @@ c2xlm=seq(64*32*32*32).reshape(64,32,32,32)
 attnq=seq(4*8*256*64).reshape(4,8,256,64)
 attnk=seq(4*8*256*64).reshape(4,8,256,64).requires_grad_(True)
 attnv=seq(4*8*256*64).reshape(4,8,256,64).requires_grad_(True)
-linx=seq(512*1024).reshape(512,1024)
+# frankentorch-mdsmm: separate batches, sized by measuring THIS arm. See LIN_B_WIDE.
+linx_wide=seq(3072*1024).reshape(3072,1024)
+linx_narrow=seq(768*1024).reshape(768,1024)
 linw_wide=seq(128*1024).reshape(128,1024).requires_grad_(True)
 linw_narrow=seq(512*1024).reshape(512,1024).requires_grad_(True)
 mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
@@ -2033,8 +2070,8 @@ LANES = {
     # frankentorch-hi9r6: same incumbent code under a second name, so PT(panel)/PT(base) is a free
     # ~1.0 control. Only OUR arm differs -- `_panel` runs the pre-88d36e2f dpanel + col2im dinput.
     "conv2d_f32_masked_panel": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
-    "linear_wide":   (linx, lambda x: Fn.linear(x, linw_wide)),
-    "linear_narrow": (linx, lambda x: Fn.linear(x, linw_narrow)),
+    "linear_wide":   (linx_wide, lambda x: Fn.linear(x, linw_wide)),
+    "linear_narrow": (linx_narrow, lambda x: Fn.linear(x, linw_narrow)),
     # frankentorch-58zjz: the query is the timed leaf; K and V require grad too, so the backward
     # reaches BOTH dV (the dgemm_tb entry this bead is about) and the softmax/dQ path.
     "attention": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)),
@@ -2044,8 +2081,8 @@ LANES = {
     # times. Without it the two arms measure different things and parity mismatches.
     # torch is byte-identical code under the plain and _dense names, so PT(dense)/PT(plain) is a
     # free control that prices the squaring itself rather than assuming it is free.
-    "linear_wide_dense":   (linx, lambda x: Fn.linear(x, linw_wide)**2),
-    "linear_narrow_dense": (linx, lambda x: Fn.linear(x, linw_narrow)**2),
+    "linear_wide_dense":   (linx_wide, lambda x: Fn.linear(x, linw_wide)**2),
+    "linear_narrow_dense": (linx_narrow, lambda x: Fn.linear(x, linw_narrow)**2),
     "attention_dense": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)**2),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
     # frankentorch-l2zki: NON-UNIFORM loss, the only lane here that reaches conv3d's GENERIC
@@ -3149,14 +3186,14 @@ LANES = {
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate
             // ENGAGES here (m=128, n=1024: n > 4m, and m*k*n = 67M > 16.8M).
             "linear_wide",
-            Box::new(|| timed_linear(&linx, &linw_wide, LIN_B, LIN_IN, LIN_OUT_WIDE, false)),
+            Box::new(|| timed_linear(&linx_wide, &linw_wide, LIN_B_WIDE, LIN_IN, LIN_OUT_WIDE, false)),
         ),
         (
             // The same op on the OTHER side of that gate (m=512, n=1024: n > 4m is false), so
             // item 119's path does NOT engage. Carried so the pair says where the change acts
             // rather than implying it acts everywhere.
             "linear_narrow",
-            Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW, false)),
+            Box::new(|| timed_linear(&linx_narrow, &linw_narrow, LIN_B_NARROW, LIN_IN, LIN_OUT_NARROW, false)),
         ),
         (
             "attention",
@@ -3173,11 +3210,11 @@ LANES = {
         // the only figure from these lanes that survives a bimodal incumbent.
         (
             "linear_wide_dense",
-            Box::new(|| timed_linear(&linx, &linw_wide, LIN_B, LIN_IN, LIN_OUT_WIDE, true)),
+            Box::new(|| timed_linear(&linx_wide, &linw_wide, LIN_B_WIDE, LIN_IN, LIN_OUT_WIDE, true)),
         ),
         (
             "linear_narrow_dense",
-            Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW, true)),
+            Box::new(|| timed_linear(&linx_narrow, &linw_narrow, LIN_B_NARROW, LIN_IN, LIN_OUT_NARROW, true)),
         ),
         (
             "attention_dense",
