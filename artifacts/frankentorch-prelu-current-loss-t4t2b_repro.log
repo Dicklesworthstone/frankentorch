@@ -1,0 +1,315 @@
+
+===== torch:5 prelu current-loss banked reproduction 2026-09-01T14:39:10-04:00 =====
+current_head=6abc8ecc87f3248e9e8f80b65034a4ff7c550aa5
+immutable_base=b82531b2ea8453159ec7c570ba817e5c720582b7
+source_surface_vs_base=UNCHANGED
+source_status_at_start:
+ M .beads/issues.jsonl
+ M artifacts/frankentorch-mdsmm_repro.log
+ M artifacts/frankentorch-valnx_repro.log
+?? artifacts/frankentorch-prelu-current-loss-t4t2b_repro.log
+?? artifacts/perf/frankentorch-mdsmm/conv2d_big_level_verify_torch3.log
+?? artifacts/perf/frankentorch-mdsmm/conv2d_complete_verify_torch3.log
+?? artifacts/perf/frankentorch-mdsmm/conv2d_complete_verify_torch3_patient.log
+?? artifacts/perf/frankentorch-mdsmm/conv2d_complete_verify_torch3_patient_managed.log
+?? artifacts/perf/frankentorch-mdsmm/conv2d_delta_verify_torch3.log
+?? artifacts/perf/frankentorch-mdsmm/conv2d_f32_standing_banked_b82531b2_torch2.log
+build_command=RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=<dedicated-target> rch exec --no-self-healing --base <immutable-base> --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+bank_seed=3a0083ab083278cea92a806f1726072d032795fbb71c2487972a557ab85620fa  artifacts/perf/incumbent_bank.jsonl
+bank_scratch=3a0083ab083278cea92a806f1726072d032795fbb71c2487972a557ab85620fa  /data/tmp/ft-verify-prelu-t4t2b-bank-b82531b2-torch5.jsonl
+  [2m2026-09-01T18:39:11.015344Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:22.215274Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at ubuntu@178.104.77.29 (0 slots remaining after reservation, speed 75.2)[0m
+    [2;3mat[0m rch/src/hook.rs:2529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:22.261720Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: ca04ee18ea343772)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:471 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:22.261752Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:493 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:25.041464Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:598 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:37.098741Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 134307840 bytes in 11544ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:874 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:37.125863Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:934 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:39:37.125909Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/ft-verify-prelu-t4t2b-b82531b2-torch5 -> /data/tmp/rch/frankentorch/ca04ee18ea343772/.rch-target-hz2-pool-6ea70f8026287c16373bbbc2a0b1f290[0m
+    [2;3mat[0m rch/src/transfer.rs:1610 [2;3mon[0m ThreadId(1)
+
+    Updating git repository `https://github.com/Dicklesworthstone/rust-block`
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded autocfg v1.5.0
+  Downloaded cast v0.3.0
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded aho-corasick v1.1.4
+  Downloaded cc v1.2.65
+  Downloaded anes v0.1.6
+  Downloaded criterion-plot v0.5.0
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded num-traits v0.2.19
+  Downloaded tinytemplate v1.2.1
+  Downloaded anstyle v1.0.14
+  Downloaded ciborium v0.2.2
+  Downloaded ciborium-io v0.2.2
+  Downloaded cfg-if v1.0.4
+  Downloaded same-file v1.0.6
+  Downloaded serde_core v1.0.229
+  Downloaded regex v1.12.3
+  Downloaded rawpointer v0.2.1
+  Downloaded clap_lex v1.1.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded is-terminal v0.4.17
+  Downloaded ciborium-ll v0.2.2
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded itoa v1.0.18
+  Downloaded matrixmultiply v0.3.11
+  Downloaded plotters-svg v0.3.7
+  Downloaded either v1.15.0
+  Downloaded oorandom v11.1.5
+  Downloaded bytemuck v1.25.2
+  Downloaded clap v4.6.1
+  Downloaded mimalloc v0.1.52
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded half v2.7.1
+  Downloaded once_cell v1.21.4
+  Downloaded zmij v1.0.21
+  Downloaded safe_arch v1.1.0
+  Downloaded serde_derive v1.0.229
+  Downloaded shlex v2.0.1
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded plotters-backend v0.3.7
+  Downloaded criterion v0.5.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded num-complex v0.4.6
+  Downloaded unicode-ident v1.0.24
+  Downloaded memchr v2.8.0
+  Downloaded rayon-core v1.13.0
+  Downloaded serde v1.0.229
+  Downloaded libm v0.2.16
+  Downloaded quote v1.0.45
+  Downloaded itertools v0.10.5
+  Downloaded rayon v1.12.0
+  Downloaded serde_json v1.0.151
+  Downloaded clap_builder v4.6.0
+  Downloaded plotters v0.3.7
+  Downloaded walkdir v2.5.0
+  Downloaded syn v3.0.3
+  Downloaded syn v2.0.117
+  Downloaded wide v1.6.0
+  Downloaded zerocopy v0.8.48
+  Downloaded regex-syntax v0.8.10
+  Downloaded libmimalloc-sys v0.1.49
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling syn v2.0.117
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling either v1.15.0
+   Compiling rayon-core v1.13.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling serde_core v1.0.229
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling num-complex v0.4.6
+   Compiling matrixmultiply v0.3.11
+   Compiling find-msvc-tools v0.1.9
+   Compiling libm v0.2.16
+   Compiling shlex v2.0.1
+   Compiling cc v1.2.65
+   Compiling safe_arch v1.1.0
+   Compiling rayon v1.12.0
+   Compiling half v2.7.1
+   Compiling frankentorch-core v0.1.0 (/data/tmp/rch/frankentorch/ca04ee18ea343772/crates/ft-core)
+   Compiling syn v3.0.3
+   Compiling rawpointer v0.2.1
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling wide v1.6.0
+   Compiling libmimalloc-sys v0.1.49
+   Compiling libc v0.2.185
+   Compiling serde_json v1.0.151
+   Compiling frankentorch-kernel-cpu v0.1.1 (/data/tmp/rch/frankentorch/ca04ee18ea343772/crates/ft-kernel-cpu)
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:8906:3
+     |
+8906 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:9954:3
+     |
+9954 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+warning: function `eigh_tred2_values_only_full_lower` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:31447:4
+      |
+31447 | fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling regex-syntax v0.8.10
+   Compiling clap_lex v1.1.0
+   Compiling ciborium-io v0.2.2
+   Compiling itoa v1.0.18
+   Compiling anstyle v1.0.14
+   Compiling memchr v2.8.0
+   Compiling plotters-backend v0.3.7
+   Compiling plotters-svg v0.3.7
+   Compiling frankentorch-dispatch v0.1.0 (/data/tmp/rch/frankentorch/ca04ee18ea343772/crates/ft-dispatch)
+   Compiling clap_builder v4.6.0
+   Compiling ciborium-ll v0.2.2
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling is-terminal v0.4.17
+   Compiling mimalloc v0.1.52
+   Compiling regex v1.12.3
+   Compiling ciborium v0.2.2
+   Compiling clap v4.6.1
+   Compiling frankentorch-autograd v0.1.0 (/data/tmp/rch/frankentorch/ca04ee18ea343772/crates/ft-autograd)
+   Compiling tinytemplate v1.2.1
+   Compiling plotters v0.3.7
+   Compiling frankentorch-runtime v0.1.0 (/data/tmp/rch/frankentorch/ca04ee18ea343772/crates/ft-runtime)
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling once_cell v1.21.4
+   Compiling criterion v0.5.1
+   Compiling frankentorch-api v0.1.0 (/data/tmp/rch/frankentorch/ca04ee18ea343772/crates/ft-api)
+warning: unused attribute
+   --> crates/ft-api/src/harness_incumbent_bank.rs:362:1
+    |
+362 | #[must_use]
+    | ^^^^^^^^^^^ help: remove this attribute
+    |
+note: attribute also specified here
+   --> crates/ft-api/src/harness_incumbent_bank.rs:355:1
+    |
+355 | #[must_use]
+    | ^^^^^^^^^^^
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: `frankentorch-kernel-cpu` (lib) generated 3 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu` to apply 2 suggestions)
+warning: `frankentorch-api` (lib) generated 1 warning (run `cargo fix --lib -p frankentorch-api` to apply 1 suggestion)
+warning: unused doc comment
+    --> crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs:1111:1
+     |
+1111 | / /// conv2d f32 train step — `frankentorch-hi9r6`, item 191. The dtype twin of [`timed_conv2d`],
+1112 | | /// and the only lane that can price items 179, 181, 185 and 187.
+1113 | | ///
+1114 | | /// WHY THIS LANE DID NOT EXIST UNTIL NOW. Item 185e declined to write it because the harness's
+...    |
+1163 | | /// its route from `conv2d_ones_dout_route`, so passing ones takes the same route the session's
+1164 | | /// backward takes rather than a different one.
+     | |_----------------------------------------------^
+     |   |
+     |   rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `frankentorch-api` (example "gauntlet_lane_sweep_h2h") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 4m 05s
+  [2m2026-09-01T18:43:44.152207Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 247026ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:43:44.178727Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/tmp/rch/frankentorch/ca04ee18ea343772/.rch-target-hz2-pool-6ea70f8026287c16373bbbc2a0b1f290 on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:43:47.406263Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 3227ms (8 files, 725 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T18:43:47.406294Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 8 files, 725 bytes in 3227ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1299 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (267.0s)
+[RCH] clean-overlay receipt: base=b82531b2ea8453159ec7c570ba817e5c720582b7 overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195
+build_exit=0
+9ca68bebdcb3101edb7f0afc2939f3c1fc3348be4729aaf4c4153eb3e1cba66b  /data/tmp/ft-verify-prelu-t4t2b-b82531b2-torch5/release/examples/gauntlet_lane_sweep_h2h
+run_command=up to eight guard polls over 1200s; on admission: FT_H2H_INCUMBENT_BANK=<dedicated-scratch> PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=64 FT_H2H_LANES=prelu_noshortcut FT_H2H_LANES_EXACT=1 FT_H2H_REPS=32 FT_H2H_WARMUP=32 <returned-elf>
+guard_poll=1 utc=2026-09-01T18:43:49Z
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=1 exit=1
+guard_poll=2 utc=2026-09-01T18:46:51Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2590449  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=2 exit=1
+guard_poll=3 utc=2026-09-01T18:49:53Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2726357  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=3 exit=1
+guard_poll=4 utc=2026-09-01T18:52:55Z
+REFUSING TO MEASURE: 4 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2772942  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+    2805392  jq -r .[] | select((.title|test("perf|capability|bench|throughput|latency"; "i")) or ((.labels // []
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=4 exit=1
+guard_poll=5 utc=2026-09-01T18:55:57Z
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3225315  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=5 exit=1
+guard_poll=6 utc=2026-09-01T18:59:00Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3353865  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3485054  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=6 exit=1
+guard_poll=7 utc=2026-09-01T19:02:02Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3353865  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3723181  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=7 exit=1
+guard_poll=8 utc=2026-09-01T19:04:04Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3831724  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_poll=8 exit=1
+run_exit=1
+run_classification=NO_VERDICT reason=guard refused every poll through 1200-second budget
+bank_scratch_after=3a0083ab083278cea92a806f1726072d032795fbb71c2487972a557ab85620fa  /data/tmp/ft-verify-prelu-t4t2b-bank-b82531b2-torch5.jsonl
+===== torch:5 prelu current-loss banked reproduction end 2026-09-01T15:04:06-04:00 =====

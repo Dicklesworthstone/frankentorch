@@ -153,3 +153,91 @@ warning: function `eigh_tred2_values_only_full_lower` is never used
    Compiling plotters-svg v0.3.7
    Compiling ciborium-ll v0.2.2
    Compiling clap_builder v4.6.0
+   Compiling frankentorch-dispatch v0.1.0 (/data/tmp/rch/frankentorch/84cd0e65065bd8ef/crates/ft-dispatch)
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling is-terminal v0.4.17
+   Compiling regex v1.12.3
+   Compiling frankentorch-autograd v0.1.0 (/data/tmp/rch/frankentorch/84cd0e65065bd8ef/crates/ft-autograd)
+   Compiling clap v4.6.1
+   Compiling ciborium v0.2.2
+   Compiling plotters v0.3.7
+   Compiling tinytemplate v1.2.1
+   Compiling frankentorch-runtime v0.1.0 (/data/tmp/rch/frankentorch/84cd0e65065bd8ef/crates/ft-runtime)
+   Compiling oorandom v11.1.5
+   Compiling once_cell v1.21.4
+   Compiling anes v0.1.6
+   Compiling criterion v0.5.1
+   Compiling frankentorch-api v0.1.0 (/data/tmp/rch/frankentorch/84cd0e65065bd8ef/crates/ft-api)
+warning: `frankentorch-kernel-cpu` (lib) generated 3 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 13m 26s
+  [2m2026-09-01T09:11:03.821370Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 809338ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T09:11:03.968786Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/tmp/rch/frankentorch/84cd0e65065bd8ef/.rch-target-vmi1152480-pool-f9267e1ec5d1223616a90f276787c4af on vmi1152480[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T09:11:08.823849Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 4855ms (8 files, 21311 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T09:11:08.823870Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 8 files, 21311 bytes in 4855ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1299 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1152480 (832.5s)
+[RCH] clean-overlay receipt: base=b14319921f71d16b14f1a10e577ef7987ad57e40 overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195
+5c6440d49e739755a90c7a97d0880baf01b4c88dbe1b915d3dd32b39c4a5e7d7  /data/tmp/ft-valnx-slogdet1024-b1431992/release/examples/bidiag_gate_sweep_h2h
+REFUSING TO MEASURE: 4 peer measurement process(es) are live.
+    1408573  cc -m64 /data/tmp/amgate-0332-target/debug/build/mcp-agent-mail-db/63f6acae167846a8/out/rustcrN3rX4/
+    1408579  /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unkno
+    1409441  cc -m64 /data/tmp/amgate-0332-target/debug/build/mcp-agent-mail-db/b7d8ca911e94fc14/out/rustcvAnGQB/
+    1409459  /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unkno
+REFUSING TO MEASURE: 1-minute loadavg 736.00 exceeds 35.
+REFUSING TO MEASURE: iowait 89.5% exceeds 10% — host is disk-bound.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.55 / 13.59 / 83.01 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.28 / 11.34 / 77.53 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.33 / 9.54 / 72.43 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.17 / 8.21 / 68.03 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 1.79 / 6.99 / 63.87 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.71 / 6.25 / 59.77 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 4.16 / 5.95 / 56.31 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: 12 peer measurement process(es) are live.
+    631399  node /data/projects/frankenmermaid/scripts/headtohead/mermaid_bench.mjs --only ci_docs_5000 --reps-s
+    631805  /snap/chromium/3507/usr/lib/chromium-browser/chrome --password-store --gtk-version=3 --disable-featu
+    631912  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-zygote-sandbox --no-sandbox -
+    631913  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=zygote --no-sandbox --headless=new --cras
+    631933  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=gpu-process --no-sandbox --disable-dev-sh
+    631936  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=network.mojom.
+    631938  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=utility --utility-sub-type=storage.mojom.
+    631971  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --top-chrome-webui --crashpad-ha
+    631984  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=631907 --
+    632022  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=631907 --
+    632023  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=631907 --
+    632055  /snap/chromium/3507/usr/lib/chromium-browser/chrome --type=renderer --crashpad-handler-pid=631907 --
+REFUSING TO MEASURE: loadavg 3.55 / 5.36 / 52.69 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 4.84 / 4.86 / 39.96 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 3.01 / 4.28 / 37.21 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.15 / 3.79 / 34.98 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.44 / 3.59 / 32.96 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 3.25 / 3.70 / 31.16 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.59 / 3.38 / 29.19 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 2.20 / 3.14 / 27.49 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)

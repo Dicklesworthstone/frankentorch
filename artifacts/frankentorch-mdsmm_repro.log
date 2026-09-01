@@ -410,3 +410,213 @@ n=1024  PT min 36.420 ms  median 47.214 ms  spread 1.50x  load 4.45->4.53  MHz 3
                      phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
   arm=262144/gate-hoisted/4row/fused/formP-blocked/4output/replay-T/ggs1/subPAR/subCOL/ormqrSUBSER/panelmode0/nbSHIPPED/luSHIPPED/qrSHIPPED/colsAUTO/ppmSHIPPED/tpm0/tnbSHIPPED/tsbSHIPPED/btpSERIAL/btSHIPPED/panelSHIPPED/RSHIPPED/tbSHIPPED/TSHIPPED min  313.377 ms  median  321.723 ms  PT-beside-it min   36.872 ms  paired-vs-PT FT 7.001x SLOWER  paired-vs-arm0 1.002x  branches (0, 0, 0)  dgemm_sub(2d,col) (0, 0)  ormqr_sub_hits 0  parity rel 4.59e-16 MATCH
                      phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+
+===== torch:5 strict reproduction retry 2026-09-01T07:43:44-04:00 =====
+current_head=653dc7e6ab741a1e8c49442ec4c23489c2347a41
+immutable_base=00152e2c02b1ba979f26ecac9606bf78fc2af921
+source_status_at_start:
+ M artifacts/frankentorch-mdsmm_repro.log
+ M artifacts/frankentorch-valnx_repro.log
+ M crates/ft-kernel-cpu/src/lib.rs
+?? crates/ft-kernel-cpu/examples/gemm_col_floor_ab.rs
+build_command=RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=<dedicated-target> rch exec --no-self-healing --base <immutable-base> --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --example bidiag_gate_sweep_h2h
+  [2m2026-09-01T11:43:44.278175Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:43:49.349657Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz4 at ubuntu@194.163.156.231 (0 slots remaining after reservation, speed 76.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:43:49.404033Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: 7b22c31ab8060fa6)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:471 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:43:49.404063Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:493 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:43:51.919983Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz4...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:598 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:44:11.243361Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 133724160 bytes in 18841ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:874 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:44:11.261847Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo build --release -j2 -p frankentorch-api --example bidiag_gate_sweep_h2h[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:934 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:44:11.261884Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/ft-mdsmm-profile-00152e2c02b1ba979f26ecac9606bf78fc2af921-torch5 -> /data/tmp/rch/frankentorch/7b22c31ab8060fa6/.rch-target-hz4-pool-f9267e1ec5d1223616a90f276787c4af[0m
+    [2;3mat[0m rch/src/transfer.rs:1610 [2;3mon[0m ThreadId(1)
+
+    Updating git repository `https://github.com/Dicklesworthstone/rust-block`
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cast v0.3.0
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded anstyle v1.0.14
+  Downloaded bytemuck v1.25.2
+  Downloaded anes v0.1.6
+  Downloaded autocfg v1.5.0
+  Downloaded num-complex v0.4.6
+  Downloaded is-terminal v0.4.17
+  Downloaded itoa v1.0.18
+  Downloaded ciborium-ll v0.2.2
+  Downloaded clap_lex v1.1.0
+  Downloaded plotters-svg v0.3.7
+  Downloaded plotters-backend v0.3.7
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded criterion-plot v0.5.0
+  Downloaded once_cell v1.21.4
+  Downloaded clap v4.6.1
+  Downloaded ciborium-io v0.2.2
+  Downloaded cfg-if v1.0.4
+  Downloaded same-file v1.0.6
+  Downloaded ciborium v0.2.2
+  Downloaded zmij v1.0.21
+  Downloaded quote v1.0.45
+  Downloaded oorandom v11.1.5
+  Downloaded either v1.15.0
+  Downloaded rawpointer v0.2.1
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded proc-macro2 v1.0.106
+  Downloaded serde_core v1.0.229
+  Downloaded tinytemplate v1.2.1
+  Downloaded walkdir v2.5.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded half v2.7.1
+  Downloaded matrixmultiply v0.3.11
+  Downloaded rayon-core v1.13.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded num-traits v0.2.19
+  Downloaded serde v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded itertools v0.10.5
+  Downloaded memchr v2.8.0
+  Downloaded safe_arch v1.1.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded criterion v0.5.1
+  Downloaded libm v0.2.16
+  Downloaded clap_builder v4.6.0
+  Downloaded plotters v0.3.7
+  Downloaded rayon v1.12.0
+  Downloaded regex v1.12.3
+  Downloaded serde_json v1.0.151
+  Downloaded wide v1.6.0
+  Downloaded syn v2.0.117
+  Downloaded syn v3.0.3
+  Downloaded zerocopy v0.8.48
+  Downloaded regex-syntax v0.8.10
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling syn v2.0.117
+   Compiling cfg-if v1.0.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling serde_core v1.0.229
+   Compiling bytemuck_derive v1.10.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck v1.25.2
+   Compiling num-complex v0.4.6
+   Compiling matrixmultiply v0.3.11
+   Compiling libm v0.2.16
+   Compiling safe_arch v1.1.0
+   Compiling rayon v1.12.0
+   Compiling half v2.7.1
+   Compiling frankentorch-core v0.1.0 (/data/tmp/rch/frankentorch/7b22c31ab8060fa6/crates/ft-core)
+   Compiling syn v3.0.3
+   Compiling rawpointer v0.2.1
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling wide v1.6.0
+   Compiling serde_json v1.0.151
+   Compiling libc v0.2.185
+   Compiling frankentorch-kernel-cpu v0.1.1 (/data/tmp/rch/frankentorch/7b22c31ab8060fa6/crates/ft-kernel-cpu)
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:8834:3
+     |
+8834 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:9882:3
+     |
+9882 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+   Compiling plotters-backend v0.3.7
+   Compiling itoa v1.0.18
+   Compiling anstyle v1.0.14
+   Compiling memchr v2.8.0
+   Compiling ciborium-io v0.2.2
+   Compiling clap_lex v1.1.0
+   Compiling regex-syntax v0.8.10
+warning: function `eigh_tred2_values_only_full_lower` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:31311:4
+      |
+31311 | fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling regex-automata v0.4.14
+   Compiling frankentorch-dispatch v0.1.0 (/data/tmp/rch/frankentorch/7b22c31ab8060fa6/crates/ft-dispatch)
+   Compiling clap_builder v4.6.0
+   Compiling ciborium-ll v0.2.2
+   Compiling plotters-svg v0.3.7
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling is-terminal v0.4.17
+   Compiling plotters v0.3.7
+   Compiling tinytemplate v1.2.1
+   Compiling ciborium v0.2.2
+   Compiling clap v4.6.1
+   Compiling frankentorch-autograd v0.1.0 (/data/tmp/rch/frankentorch/7b22c31ab8060fa6/crates/ft-autograd)
+   Compiling regex v1.12.3
+   Compiling frankentorch-runtime v0.1.0 (/data/tmp/rch/frankentorch/7b22c31ab8060fa6/crates/ft-runtime)
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling once_cell v1.21.4
+   Compiling criterion v0.5.1
+   Compiling frankentorch-api v0.1.0 (/data/tmp/rch/frankentorch/7b22c31ab8060fa6/crates/ft-api)
+warning: `frankentorch-kernel-cpu` (lib) generated 3 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 4m 57s
+  [2m2026-09-01T11:49:15.256490Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 303994ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:49:15.282742Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/tmp/rch/frankentorch/7b22c31ab8060fa6/.rch-target-hz4-pool-f9267e1ec5d1223616a90f276787c4af on hz4[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:49:18.077371Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2794ms (8 files, 725 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T11:49:18.077404Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 8 files, 725 bytes in 2794ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1299 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz4 (330.3s)
+[RCH] clean-overlay receipt: base=00152e2c02b1ba979f26ecac9606bf78fc2af921 overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195
+build_exit=0
+fe02eb80f5f749593d76cfb150d8828277a232f117b4ca2841b91d3ad35672a7  /data/tmp/ft-mdsmm-profile-00152e2c02b1ba979f26ecac9606bf78fc2af921-torch5/release/examples/bidiag_gate_sweep_h2h
+run_command=scripts/measurement_window_guard.sh --max-load 35 && PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=8 FT_OP=eigvalsh FT_GATE_SIZES=1024 FT_GATE_VALUES=262144,262144 FT_ROUNDS=64 FT_H2H_WARMUP=64 <returned-elf>
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2642331  /data/tmp/ft-mdsmm-ggs-653dc7e6/release/examples/bidiag_gate_sweep_h2h
+    2642489  /data/tmp/torchvenv-2121/bin/python -c  import time, torch torch.set_num_threads(8) def _mk(n, sym=F
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+run_exit=1
+===== torch:5 strict reproduction retry end 2026-09-01T07:49:21-04:00 =====
