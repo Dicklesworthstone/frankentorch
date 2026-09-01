@@ -42430,6 +42430,21 @@ From 316 with the box idling at L=5 that is **~46 minutes**; at L=2, ~60; at L=1
 `uptime` and hoping is what turns that into an afternoon — `feedback_drift_gate_measures_sweep_length`
 says pick the window by arithmetic, and this is the arithmetic for the SPREAD limb specifically.
 
+**AND THE FORMULA IS A DECAY MODEL, NOT A PROMISE — it assumes NO NEW WORK ARRIVES, and on this host
+that assumption failed within minutes.** A poller was left watching for the guard to admit. It never
+did. Fifteen minutes after the ~46-minute estimate above was computed off a falling 20.67, the box
+went the other way entirely:
+
+    06:44  20.67 / 140.16 / 305.08     <- falling, estimate computed here
+    07:00 761.74 / 707.27 / 534.92     <- a new job
+    07:12 816.61 / 823.44 / 701.53
+    03:14 832.08 / 827.86 / 721.33     <- python, rust-lld, rustfmt, rustc
+
+Thirty minutes of polling, **zero admitted windows**, nothing measured. So the ETA is worth
+computing — it stops you waiting on something that cannot happen for an hour — but it is a LOWER
+BOUND conditional on a quiet host, and a shared box is not a quiet host. Quote it as "not before
+T", never as "at T".
+
 **WHAT WAS DONE INSTEAD: the check is now one command**, `scripts/phase_column_check.sh`. It
 guards, builds through rch with the 103-refusal retry, snapshots each ELF and prints its SHA,
 re-guards **before every lane** because a window open at lane 1 can be shut by lane 4, runs all
