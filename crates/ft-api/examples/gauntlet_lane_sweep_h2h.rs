@@ -1168,7 +1168,12 @@ thread_local! {
     static CONV2D_F32_KERNELS_PAD_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
-fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f64, f64) {
+fn timed_conv2d_f32_kernels(
+    values: &[f32],
+    weights: &[f32],
+    mask: Option<&[f32]>,
+    batch: usize,
+) -> (f64, f64) {
     let ph = C2_H + 2;
     let pw = C2_W + 2;
     let started = Instant::now();
@@ -1206,7 +1211,14 @@ fn timed_conv2d_f32_kernels(values: &[f32], weights: &[f32], batch: usize) -> (f
     let _out = ft_kernel_cpu::conv2d_forward_f32(
         &padded, weights, None, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO,
     );
-    let dout = vec![1.0f32; batch * C2_CO * C2_H * C2_W];
+    // `frankentorch-mdsmm`. This lane hard-coded an all-ones `dout`, which is the blind spot in
+    // its purest form: the session lanes at least INHERIT theirs from `.sum().backward()`, while
+    // this one constructs it. For `(out * mask).sum()` the upstream gradient IS the mask, so the
+    // twin passes it straight through — no session, no tape, same kernel entry, one thing changed.
+    let dout = match mask {
+        Some(values) => values.to_vec(),
+        None => vec![1.0f32; batch * C2_CO * C2_H * C2_W],
+    };
     let (dpadded, _dweight, _dbias) = ft_kernel_cpu::conv2d_backward_f32(
         &dout, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1, C2_CO, false,
     );
@@ -1751,6 +1763,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     // item 209: the summed route at a size where BOTH arms are long enough to null.
     let c2xlx = seq(C2XL_N * C2_CI * C2_H * C2_W);
+    // `frankentorch-mdsmm`: the non-uniform upstream for `conv2d_xl`. A route census proved this
+    // fixture's `.sum().backward()` takes the all-ones fast path (2 f64 / 1 f32 hits) while a
+    // non-uniform loss takes the generic route (0 hits), so the summed lane alone scores a branch
+    // training never reaches.
+    let c2xlm = seq(C2XL_N * C2_CO * C2_H * C2_W);
     let c2bx = seq(C2B_N * C2_CI * C2_H * C2_W);
     let c2bm = seq(C2B_N * C2_CO * C2_H * C2_W);
     let attnq = seq(ATTN_B * ATTN_H * ATTN_S * ATTN_D);
@@ -1858,6 +1875,8 @@ c2m32=seq(160*32*32*32).reshape(160,32,32,32).float()
 c2xlx=seq(64*32*32*32).reshape(64,32,32,32)
 c2bx=seq(16*32*32*32).reshape(16,32,32,32)
 c2bm=seq(16*32*32*32).reshape(16,32,32,32)
+# frankentorch-mdsmm: the conv2d_xl mask. Keep in lockstep with C2XL_N on the Rust side.
+c2xlm=seq(64*32*32*32).reshape(64,32,32,32)
 attnq=seq(4*8*256*64).reshape(4,8,256,64)
 attnk=seq(4*8*256*64).reshape(4,8,256,64).requires_grad_(True)
 attnv=seq(4*8*256*64).reshape(4,8,256,64).requires_grad_(True)
@@ -1938,6 +1957,8 @@ LANES = {
     "conv2d_big":        (c2bx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
     # item 209: the summed route, long enough on BOTH arms to null.
     "conv2d_xl":         (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
+    # frankentorch-mdsmm: the non-uniform twin. PT(masked)/PT(plain) prices the mask itself.
+    "conv2d_xl_masked":  (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))*c2xlm),
     # item 212: same incumbent code under a second name -- PT(legacy)/PT(xl) is a free ~1.0
     # control. The FrankenTorch side of this name runs the pre-item-174 scatter.
     "conv2d_xl_legacy":  (c2xlx, lambda x: Fn.conv2d(x,c2w,None,(1,1),(1,1))),
@@ -1974,6 +1995,8 @@ LANES = {
     # ft_kernel_cpu directly with no session or tape, so conv2d_f32 minus conv2d_f32_kernels is the
     # session cost. PT(kernels)/PT(f32) is a free control that must land near 1.0.
     "conv2d_f32_kernels": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))),
+    # frankentorch-mdsmm: the non-uniform twin of the kernels-only lane.
+    "conv2d_f32_kernels_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
     "conv2d_f32_masked": (c2x32, lambda x: Fn.conv2d(x,c2w32,None,(1,1),(1,1))*c2m32),
     # frankentorch-0icdh: the f32 TRAINING route -- c2w32_train, so BOTH arms compute dweight.
     # This is the only f32 lane on the board that reaches the weight-gradient half at all.
@@ -2859,6 +2882,14 @@ LANES = {
             Box::new(|| timed_conv2d(&c2xlx, &c2w, None, C2XL_N, false)),
         ),
         (
+            // `frankentorch-mdsmm`: the NON-UNIFORM twin of the lane above. Identical in every
+            // respect except the loss, which is what makes the pair a measurement rather than two
+            // numbers: `conv2d_xl` is scored on the all-ones adjoints and this one is not, and
+            // PT(this)/PT(conv2d_xl) prices the mask itself as a free ~1.0 control.
+            "conv2d_xl_masked",
+            Box::new(|| timed_conv2d(&c2xlx, &c2w, Some(&c2xlm), C2XL_N, false)),
+        ),
+        (
             // item 212: the SAME lane with items 174/177's scatter collapse toggled OFF, so the
             // pair differs in exactly one thing and both halves sample the same host minute.
             // Item 25's rule is why this is a toggle and not a second binary: a cross-invocation
@@ -2994,7 +3025,14 @@ LANES = {
         ),
         (
             "conv2d_f32_kernels",
-            Box::new(|| timed_conv2d_f32_kernels(&c2x32, &c2w32, C2F32_N)),
+            Box::new(|| timed_conv2d_f32_kernels(&c2x32, &c2w32, None, C2F32_N)),
+        ),
+        (
+            // `frankentorch-mdsmm`: the NON-UNIFORM twin. Same kernel entry, same hand-rolled pad,
+            // same checksum — only the upstream gradient differs, so the pair isolates the
+            // all-ones adjoints from everything else this lane pays for.
+            "conv2d_f32_kernels_masked",
+            Box::new(|| timed_conv2d_f32_kernels(&c2x32, &c2w32, Some(&c2m32), C2F32_N)),
         ),
         (
             // The f32 GENERIC route, and the control for the row above: it shares every code path
@@ -3886,7 +3924,7 @@ LANES = {
         // The kernels-only f32 conv2d lane carries a hand-rolled pad inside its timed region that
         // the session lane does not pay in the same form. Print it beside the row so nobody
         // computes "session cost" from a subtraction that is contaminated in one direction.
-        if *name == "conv2d_f32_kernels" {
+        if *name == "conv2d_f32_kernels" || *name == "conv2d_f32_kernels_masked" {
             let pad = CONV2D_F32_KERNELS_PAD_MS.with(std::cell::Cell::get);
             if pad > 0.0 {
                 println!(
