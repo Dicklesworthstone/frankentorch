@@ -183,6 +183,9 @@ struct Arm {
     /// split alone cannot fill the pool. `FT_SUBTILE=0,1` prices it against the live incumbent
     /// inside ONE invocation.
     sub_tile_2d: bool,
+    /// `frankentorch-g0wpj`: whether ORMQR's separate direct `C -= update` pass may partition
+    /// rows across the pool. This does not change the compact-WY GEMM schedules.
+    ormqr_subtract_parallel: bool,
     /// `frankentorch-valnx`: Cholesky PANEL formulation. 0 = shipped serial per-column dots,
     /// 2 = the level-2 recast batching four rows over one pass of the diagonal row. Bit-exact
     /// either way, so the pair can move time and cannot move a number. `FT_PANELMODE=0,2`.
@@ -289,6 +292,7 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
     } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
         + if arm.sub_tile_2d { "/sub2D" } else { "/subCOL" }
+        + if arm.ormqr_subtract_parallel { "/ormqrSUBPAR" } else { "/ormqrSUBSER" }
         + &format!("/panelmode{}", arm.panel_mode)
         + &(if arm.cholesky_nb == 0 { "/nbSHIPPED".to_string() } else { format!("/nb{}", arm.cholesky_nb) })
         + &(if arm.lu_nb == 0 { "/luSHIPPED".to_string() } else { format!("/lunb{}", arm.lu_nb) })
@@ -467,6 +471,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_eigvalsh_ggs = ft_kernel_cpu::set_eigvalsh_grouped_ggs(arm.grouped_ggs);
     let previous_subser = ft_kernel_cpu::set_dgemm_sub_serial(arm.sub_serial);
     let previous_subtile = ft_kernel_cpu::set_dgemm_sub_tile_2d(arm.sub_tile_2d);
+    let previous_ormqr_subtract =
+        ft_kernel_cpu::set_ormqr_subtract_parallel(arm.ormqr_subtract_parallel);
     let previous_panelmode = ft_kernel_cpu::set_cholesky_panel_mode(arm.panel_mode);
     let previous_cholnb = ft_kernel_cpu::set_cholesky_nb(arm.cholesky_nb);
     let previous_cholnb_f32 = ft_kernel_cpu::set_cholesky_nb_f32(arm.cholesky_nb_f32);
@@ -531,6 +537,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
+        ft_kernel_cpu::set_ormqr_subtract_parallel(previous_ormqr_subtract);
         ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
         ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
@@ -573,6 +580,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
         ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
+        ft_kernel_cpu::set_ormqr_subtract_parallel(previous_ormqr_subtract);
         ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
         ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
@@ -686,6 +694,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_eigvalsh_grouped_ggs(previous_eigvalsh_ggs);
     ft_kernel_cpu::set_dgemm_sub_serial(previous_subser);
     ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
+    ft_kernel_cpu::set_ormqr_subtract_parallel(previous_ormqr_subtract);
     ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
     ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
     ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
@@ -961,6 +970,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .unwrap_or_else(|| vec![false]);
+    // `frankentorch-g0wpj`: interleave the direct post-GEMM update schedule with the shipped
+    // serial pass. This is separate from `FT_SUBTILE`, which affects only dgemm_sub_into.
+    let ormqr_subtracts: Vec<bool> = std::env::var("FT_ORMQR_SUB")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|v| v.trim().parse::<u8>().ok())
+                .map(|v| v == 1)
+                .collect()
+        })
+        .unwrap_or_else(|| vec![false]);
     // `frankentorch-valnx`: the Cholesky panel formulation, swept the same way — each value is
     // its own ARM, interleaved against the others in one invocation.
     let panelmodes: Vec<u8> = std::env::var("FT_PANELMODE")
@@ -1068,6 +1088,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for &grouped_ggs in &ggs_arms {
                             for &sub_serial in &subsers {
                             for &sub_tile_2d in &subtiles {
+                            for &ormqr_subtract_parallel in &ormqr_subtracts {
                             for &panel_mode in &panelmodes {
                             for &cholesky_nb in &cholnbs {
                             for &cholesky_nb_f32 in &cholnbs_f32 {
@@ -1096,6 +1117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         grouped_ggs,
                                         sub_serial,
                                         sub_tile_2d,
+                                        ormqr_subtract_parallel,
                                         panel_mode,
                                         cholesky_nb,
                                         cholesky_nb_f32,
@@ -1124,6 +1146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                    }
                                   }
                                 }
+                            }
                             }
                             }
                             }
@@ -1519,16 +1542,19 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         const PHASE_CALLS: usize = 3;
         let mut branches = vec![(0u64, 0u64, 0u64); arms.len()];
         let mut sub_arms = vec![(0u64, 0u64); arms.len()];
+        let mut ormqr_subtract_hits = vec![0u64; arms.len()];
         let mut phases = vec![(0u64, 0u64, 0u64); arms.len()];
         for (idx, &arm) in arms.iter().enumerate() {
             let mut samples: Vec<(u64, u64, u64)> = Vec::with_capacity(PHASE_CALLS);
             for _ in 0..PHASE_CALLS {
                 let _ = ft_kernel_cpu::bidiag_parallel_branches_take();
                 let _ = ft_kernel_cpu::dgemm_sub_arm_hits_take();
+                let _ = ft_kernel_cpu::ormqr_subtract_parallel_hits_take();
                 let _ = ft_kernel_cpu::svd_reduction_sweep_ns_take();
                 let _ = ft_one(n, &data, arm, ft_op);
                 branches[idx] = ft_kernel_cpu::bidiag_parallel_branches_take();
                 sub_arms[idx] = ft_kernel_cpu::dgemm_sub_arm_hits_take();
+                ormqr_subtract_hits[idx] = ft_kernel_cpu::ormqr_subtract_parallel_hits_take();
                 samples.push(ft_kernel_cpu::svd_reduction_sweep_ns_take());
             }
             let mut reduction: Vec<u64> = samples.iter().map(|s| s.0).collect();
@@ -1603,6 +1629,49 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             );
         }
 
+        // ORMQR PHASES — `frankentorch-g0wpj`.
+        //
+        // The H2H ORMQR loss remains 7-9x after both Householder skinny-GEMM splits shipped.
+        // Those splits already cover the two large left-apply GEMMs, so before proposing another
+        // scheduler knob, attribute the *actual* compact-WY route: panel V/T construction,
+        // workspace allocation, the three GEMMs, and the full C subtraction. This separate call
+        // is outside the timed estimator; profiling is disabled for all scored arms.
+        if ft_op == LinalgOp::Ormqr {
+            let previous = ft_kernel_cpu::set_ormqr_stage_profile_enabled(true);
+            let _ = ft_kernel_cpu::ormqr_stage_take_ns();
+            let probe = ft_one(n, &data, arms[0], ft_op);
+            std::hint::black_box(&probe);
+            let (panel, transpose, workspace, vt_c, t_w, v_w, subtract, total) =
+                ft_kernel_cpu::ormqr_stage_take_ns();
+            ft_kernel_cpu::set_ormqr_stage_profile_enabled(previous);
+            let ms = |v: u64| v as f64 / 1e6;
+            let accounted = panel + transpose + workspace + vt_c + t_w + v_w + subtract;
+            let pct = |v: u64| 100.0 * v as f64 / total.max(1) as f64;
+            eprintln!(
+                "ORMQR kernel phases (arm0, one instrumented call): panel {:.3} ms {:.0}%  \
+                 T-transpose {:.3} ms {:.0}%  workspace {:.3} ms {:.0}%  VtC {:.3} ms {:.0}%  \
+                 TW {:.3} ms {:.0}%  VW {:.3} ms {:.0}%  subtract {:.3} ms {:.0}%  \
+                 residual {:.3} ms {:.0}%  total {:.3} ms",
+                ms(panel),
+                pct(panel),
+                ms(transpose),
+                pct(transpose),
+                ms(workspace),
+                pct(workspace),
+                ms(vt_c),
+                pct(vt_c),
+                ms(t_w),
+                pct(t_w),
+                ms(v_w),
+                pct(v_w),
+                ms(subtract),
+                pct(subtract),
+                ms(total.saturating_sub(accounted)),
+                pct(total.saturating_sub(accounted)),
+                ms(total),
+            );
+        }
+
         // CHOLESKY `dgemm_bt_sub_into` CENSUS — `frankentorch-valnx`.
         //
         // A dgemm_sub_into 2-D arm won its microprobe yet moved only 5 of 31 live slogdet calls,
@@ -1672,7 +1741,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             println!(
                 "  arm={:<16} min {min:8.3} ms  median {med:8.3} ms  PT-beside-it min \
                  {:8.3} ms  paired-vs-PT {}  paired-vs-arm0 {:.3}x  branches {:?}  \
-                 dgemm_sub(2d,col) {:?}  \
+                 dgemm_sub(2d,col) {:?}  ormqr_sub_hits {}  \
                  parity rel {rel:.2e} {}",
                 arm_label(*arm, ft_op),
                 pt_ms[idx].iter().copied().fold(f64::INFINITY, f64::min),
@@ -1680,6 +1749,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 median(&mut vs_arm0),
                 branches[idx],
                 sub_arms[idx],
+                ormqr_subtract_hits[idx],
                 if rel < parity_tolerance(ft_op) { "MATCH" } else { "MISMATCH" }
             );
             let (reduction, form_pq, sweep) = phases[idx];
