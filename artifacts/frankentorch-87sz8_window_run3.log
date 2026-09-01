@@ -1,0 +1,19 @@
+=== pooled max_pool3d duration-window refresh attempt 3 (torch:4) ===
+build_base=18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e
+build_command=RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/tmp/frankentorch-torch4-maxpool3d-window3-18c330dcf4db-dVg7yk rch --no-self-healing exec --base 18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+build_worker=hz4
+build_job=j-30000682123658438
+executing_elf=/data/tmp/frankentorch-torch4-maxpool3d-window3-18c330dcf4db-dVg7yk/release/examples/gauntlet_lane_sweep_h2h
+executing_elf_sha256=51ad353baba44ef9b22be3a9eb020f6f2c271915bc17b52539c6da7bd0eab922
+runtime_head=18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e
+committed_source_surface_vs_build_base=UNCHANGED
+window_command=FT_H2H_WINDOW_WAIT=1200 PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=64 FT_H2H_LANES=max_pool3d FT_H2H_LANES_EXACT=1 FT_H2H_REPS=32 FT_H2H_WARMUP=32 scripts/h2h_window.sh <executing_elf>
+window_result=ADMITTED; wrapper-held exclusive measurement slot; internal guard PASS no peer measurement, load 8.61/4.44/4.28, spread 2.01x floor 8.00, iowait 0.0%
+runtime=PyTorch 2.12.1+cpu self-reported same invocation, threads=8; thinkstation1/5975WX/powersave/mimalloc; RAYON=64; exact lane max_pool3d; 32 rounds/32 warmup
+parity=MATCH
+load_series=1.018x PASS; endpoint=9.04->9.20 PASS; concurrent_measurements=none ACTIVE
+incumbent_mode=NO-HISTORY drawn=0.756ms; first observation for lane/shape/torch key, so one invocation short of readable
+raw_median=FT 2.503ms PT 0.756ms 3.31x slower ratio=0.302 [0.281,0.341]; A/A PT=1.083 OFFSET FT=1.005 PASS; not quotable
+raw_min=4.43x slower ratio=0.226 [0.215,0.251]; A/A PT=1.009 PASS FT=1.003 PASS; min-only candidate is not a board delta because incumbent_mode=NO-HISTORY
+run_classification=NO_VERDICT
+reason=incumbent mode NO-HISTORY plus median incumbent A/A OFFSET; no pre-fix delta or standing update
