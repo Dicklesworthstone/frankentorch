@@ -38,3 +38,4 @@
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"conv2d_masked","fingerprint":"2.249929e4","incumbent_ms":2.848075,"rounds":24,"lane_count":2,"recorded_unix":1788281731}
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"conv2d","fingerprint":"3.282520e5","incumbent_ms":2.705537,"rounds":24,"lane_count":2,"recorded_unix":1788281754}
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"conv2d_masked","fingerprint":"2.249929e4","incumbent_ms":2.994008,"rounds":24,"lane_count":2,"recorded_unix":1788281754}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"max_pool3d_nopool","fingerprint":"1.310720e5","incumbent_ms":0.870922,"rounds":32,"lane_count":1,"recorded_unix":1788286796}
