@@ -25335,6 +25335,10 @@ fn lu_inv_nb() -> usize {
 /// The two halves of `lu_inverse_from_factor_f64`, counted in the call.
 static LU_INV_FWD_NS: AtomicU64 = AtomicU64::new(0);
 static LU_INV_BACK_NS: AtomicU64 = AtomicU64::new(0);
+/// Identity materialisation (`Z = I`) and its two scratch allocations.
+static LU_INV_SETUP_NS: AtomicU64 = AtomicU64::new(0);
+/// The deferred COLUMN permutation `A^-1[:, pivots[c]] = Z[:, c]`, plus its `n*n` output alloc.
+static LU_INV_PERM_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Read and reset the getri halves: `(forward_ns, backward_ns)`.
 #[doc(hidden)]
@@ -25342,6 +25346,21 @@ pub fn lu_inverse_half_take_ns() -> (u64, u64) {
     (
         LU_INV_FWD_NS.swap(0, LuOrdering::Relaxed),
         LU_INV_BACK_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
+/// Read and reset getri's non-solve phases: `(setup_ns, permutation_ns)`.
+///
+/// These exist because lane 2's first pass called `inv_total - (fwd + back)` a "residual" and
+/// implied it was glue. **It was not**: `inv_tensor_contiguous_f64` runs getrf BEFORE getri, so
+/// that subtraction had the entire LU factorisation inside it. Counting the two real getri
+/// non-solve phases, and reading getrf from `lu_stage_take_ns` separately, is what makes the
+/// accounting close instead of hiding a known O(n^3) phase inside a word.
+#[doc(hidden)]
+pub fn lu_inverse_extra_take_ns() -> (u64, u64) {
+    (
+        LU_INV_SETUP_NS.swap(0, LuOrdering::Relaxed),
+        LU_INV_PERM_NS.swap(0, LuOrdering::Relaxed),
     )
 }
 
@@ -26844,6 +26863,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let lu = &factor.lu;
     let nb_width = lu_inv_nb();
 
+    let __t_setup = std::time::Instant::now();
     // Z starts as the PLAIN identity: no row permutation, because the permutation is deferred to
     // a single column pass at the end.
     let mut x = vec![0.0f64; n * n];
@@ -26854,6 +26874,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let mut panel = vec![0.0f64; n * nb_width];
     let mut ypanel = vec![0.0f64; nb_width * n];
 
+    LU_INV_SETUP_NS.fetch_add(__t_setup.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
     let __t_fwd = std::time::Instant::now();
     // FORWARD: L y = I, restricted to the columns that can be nonzero.
     let mut k0 = 0;
@@ -26936,6 +26957,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     }
 
     LU_INV_BACK_NS.fetch_add(__t_back.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    let __t_perm = std::time::Instant::now();
     // A^-1[:, pivots[c]] = Z[:, c]. A COLUMN permutation, but done row by row: each row is 8n
     // bytes and both the source and destination row stay resident while it is scattered, so this
     // is nothing like the 8 KiB-stride column gather that item 274 removed from `lu_solve`.
@@ -26946,6 +26968,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
             out[row + factor.pivots[c]] = x[row + c];
         }
     }
+    LU_INV_PERM_NS.fetch_add(__t_perm.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
     out
 }
 
