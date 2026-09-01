@@ -42207,3 +42207,65 @@ changes instruments the blocked-factorisation sweeps read.
   * **`--test-threads=1` proves nothing when the variable is the worker.** Quote the host and its
     width beside any suite result on this fleet, exactly as `feedback_measurement_host_identity`
     requires for perf rows. It applies to correctness gates too.
+
+### 293e. ONE COMPARISON CLOSES ebbew: PROFILING IS OWNED BY A THREAD, NOT BY THE PROCESS
+
+`frankentorch-ebbew`, the red left standing when 293d closed vcxf7. Same class as vcxf7's second
+defect — process-global instrumentation read by a test that runs beside other tests exercising the
+same kernel — in a different subsystem.
+
+    assertion `left == right` failed: left non-transpose must not materialize T^T
+      left: 40   right: 0
+
+`ormqr_stage_profile_covers_direct_compact_wy_apply` asserts that the left non-transpose route
+never materialises `T^T`. The eight `ORMQR_*_NS` counters and the enable flag were process-global,
+so while that test had profiling on, ANY concurrent test calling `ormqr_blocked_f64` with
+`transpose = true` recorded into the same counters. 30-40 ns is one small foreign call, not this
+test's own work. Green 3/3 on a 16-thread worker and red 2/2 on a 64-thread one: a wider pool fits
+more concurrent tests inside the window, which is the same host-dependence 293d indicted.
+
+**THE BEAD LISTED THREE OPTIONS AND THE ANSWER WAS NONE OF THEM.** All seventeen `fetch_add` sites
+are already gated on a single `profile` boolean computed once at the top of `ormqr_blocked_f64`, so
+**narrowing that one boolean is sufficient** — a foreign thread then reaches no counter at all:
+
+    static ORMQR_STAGE_PROFILE_OWNER: AtomicU64   // enabling thread's key, or 0 for off
+    let profile = ORMQR_STAGE_PROFILE_OWNER.load(Relaxed) == thread_measurement_key();
+
+The flag and the owner become ONE atomic, so they cannot disagree; keys are >= 1 so equality
+already excludes the disabled sentinel and one load suffices. Counters stay global and the
+seventeen sites are untouched. Thread-local counters — the bead's preferred option — would have
+been seventeen edits for the same effect, and would silently read 0 for any caller that invoked
+ORMQR from a rayon worker. None does (checked: every call site in ft-api and the tests sits in a
+sequential loop), but the narrow fix does not depend on that staying true.
+
+**THE REGRESSION TEST FOUND A SECOND RACE INSIDE A MINUTE, AND IT WAS MINE.** Owner-scoping stops
+non-profiling threads polluting; it does NOT make two PROFILING threads safe, because the owner is
+one atomic and the second test's `set(false)` on the way out stores the disabled sentinel, after
+which the first test records nothing. By adding a second profiling test I created that collision,
+and the new test failed on `own panel build was not profiled` — loud rather than silent, but a race.
+One mutex held by both closes it, the same idiom as `CONV2D_DWEIGHT_STREAM_TEST_GUARD`.
+
+`ormqr_stage_profile_ignores_other_threads_calls` creates the interference **on purpose**: a
+foreign thread doing eight transposing applies, spawned after the enable and joined before the
+drain, so its calls are inside the window by construction rather than by luck. It asserts
+`transpose == 0` **and** that this thread's own panel build and `V^T C` GEMM remain non-zero — so a
+"fix" that merely stopped recording fails it. A null-only assertion would have passed a broken
+instrument, which is how 292's instruments got into trouble in the first place.
+
+**EVIDENCE: five consecutive full-suite runs, DEFAULT parallel runner, 765 passed / 0 failed each,
+all five on hz4** — the 64-thread worker where this test failed 2/2 before the fix, and therefore
+the right place to run them. Suite count is up from 763: the two regression tests from this arc.
+
+**WHAT THIS UNBLOCKS.** The ORMQR post-lever decomposition was refused for want of trustworthy
+counters. They are trustworthy now, with one rule for the driver: **enable profiling on the thread
+that will call the kernel and drain it, and do not run two profiling drivers in one process.** A
+sweep process satisfies both by construction.
+
+**THE STANDING HAZARD, NAMED SO THE NEXT ONE IS CHEAPER.** `getrf_phase_attribution`
+(`lu_stage_take_ns`) and `cholesky_blocked_phase_counters_cover_each_live_stage`
+(`cholesky_stage_take_ns`) have the identical shape and have not fired yet — which means "not yet",
+not "immune". Neither has an enable flag to narrow, so they need the owner-key applied at the
+counter rather than at a gate. Their write sites are all on the calling thread (the rayon regions
+inside are what is being TIMED, not where the recording happens) and no caller invokes them from a
+worker, so the same fix transfers; it is not done here because those counters are read by the
+blocked-factorisation sweeps and that is a different campaign's instrument.
