@@ -42081,3 +42081,57 @@ paired certification in, which is what parked lane 1 in the first place and is u
 this. The banked figure moves from "1.228x, all six cells, block-ordered" to **"1.121x median, 9/9
 cells, interleaved, 1 of 9 TRUSTED under 293(b)"** — a smaller and much better-supported number,
 and still an uncashed one.
+
+### 293c. LANE 1 SHIPPED AND CONFIRMED FROM THE OTHER SIDE — f32 CHOLESKY NB IS 64, AND THE DEFAULT PROVABLY MOVED
+
+`frankentorch-stale-tuning-constants-lzku6` lane 1, closed end-to-end. **This supersedes 293b's
+closing line.** 293b said "it does not ship — there is no f32 cholesky h2h lane"; that was wrong
+when written. The lane had been built and the certification posted to the bead at 01:22 UTC,
+before my re-run, and I had read the bead earlier and missed it.
+
+**SHIPPED:** `CHOLESKY_NB_F32_SHIPPED` 128 -> 64 (`2aae45a1`). The certification chain is recorded
+in full on the constant itself: block-ordered sweep (all six cells, 1.228x) -> interleaved
+re-validation (9/9 cells, honest median **1.121x**, monotone size curve — 293b) -> independent
+paired live certification (dual nulls 1.007x/0.993x, 1.159x/1.160x, parity MATCH) -> the knob
+correctness test that lane found missing (`f2a850a2`).
+
+**POST-SHIP CONFIRMATION, arms reversed.** Every prior row forced both widths through the override.
+This one runs **arm0 = the shipped path with the knob UNSET** against **arm1 = the OLD default
+forced back on**, which is the only row that can show the DEFAULT moved rather than that an
+override works. Guard PASS immediately before (loadavg 3.26, iowait 0.2%), thinkstation1,
+`RAYON_NUM_THREADS=16`, PyTorch 2.12.1+cpu at 8 threads in the same invocation, n=512, 64 rounds,
+warmup 64, ELF `59bdd1f294013a2e24c49335c6bf2d07e1739628c9cbf3159ea9b43652962ba6`:
+
+    arm0  f32nbSHIPPED   min 2.253 ms   paired-vs-arm0 1.000   vs PT 5.344x slower   parity 8.41e-7 MATCH
+    arm1  f32nb128       min 2.596 ms   paired-vs-arm0 0.865   vs PT 6.038x slower   parity 6.72e-7 MATCH
+    arm2  f32nbSHIPPED   min 2.266 ms   paired-vs-arm0 0.992   vs PT 5.335x slower   parity 8.41e-7 MATCH
+    arm3  f32nb128       min 2.562 ms   paired-vs-arm0 0.861   vs PT 6.214x slower   parity 6.72e-7 MATCH
+
+    dual A/A nulls: shipped arm2/arm0 0.992x; candidate arm3/arm1 0.997x  (both inside 0.970-1.030)
+
+Both null arms pass, both 128-arms agree at 0.865 and 0.861 and sit far outside those nulls. The
+old default is **13.5-13.9% slower** than what now ships, i.e. the shipped path is 1.156x/1.161x
+faster — reproducing the pre-ship certification's 1.159x/1.160x on a different day, a different
+binary, and with the arms swapped.
+
+**THE CHECKSUMS PROVE THE DEFAULT MOVED, WITHOUT TRUSTING A LABEL.** Blocking is not bit-exact, so
+each width has its own f32 checksum. In the pre-ship row the *shipped* arm read 6.72e-7 and the
+*candidate* read 8.41e-7. Here the arm with the knob UNSET reads **8.41e-7** and the arm forced to
+128 reads **6.72e-7** — the two have exchanged places. That is a dispatch discontinuity observed
+from outside the kernel, and it cannot be produced by a mislabelled arm.
+
+**AND THE GAP TO UPSTREAM NARROWED**, which is the figure the standing directive is about: this
+lane goes from ~6.04-6.21x slower than torch to **5.33-5.34x**.
+
+**A GATE NOTE, RECORDED BECAUSE IT COST TWO RUNS.** The kernel suite is intermittently RED under
+the default parallel test runner, in the conv2d masked family —
+`conv2d_dweight_streamed_*_matches_the_panel_gemm_bitwise` on one run,
+`conv2d_backward_masked_skips_the_gemm_the_mask_declines` on the next, all green in isolation and
+all green at `--test-threads=1` (760 passed / 0 failed). The mechanism is in the source, not in the
+weather: those tests reset and then read `CONV2D_DWEIGHT_GEMMS` / `CONV2D_DPANEL_GEMMS`, which are
+**thread-local**, around a kernel whose rayon path can perform the increment on a pool thread — so
+the assertion's truth depends on pool occupancy, which depends on what other tests are running.
+**A varying failure set across runs of one binary is the tell**; it is not a flake to re-roll and
+it is not this lane's change, since a cholesky blocking constant cannot select which conv2d test
+loses that race. Filed separately, and `--test-threads=1` is the gate to quote here until it is
+fixed.
