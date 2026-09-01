@@ -42135,3 +42135,75 @@ the assertion's truth depends on pool occupancy, which depends on what other tes
 it is not this lane's change, since a cholesky blocking constant cannot select which conv2d test
 loses that race. Filed separately, and `--test-threads=1` is the gate to quote here until it is
 fixed.
+
+### 293d. THE "FLAKY TEST" WAS TWO REAL BUGS, AND MY DIAGNOSIS OF IT WAS WRONG TWICE OVER
+
+`frankentorch-vcxf7`, closed. **This corrects 293c.** That entry called the intermittent conv2d red
+a thread-local-counter race and quoted `--test-threads=1` as a clean gate. Both statements are
+wrong, and the way they were arrived at is the lesson.
+
+**HOW I GOT IT WRONG.** libtest captures test output PER THREAD, so a panic raised on a rayon
+worker prints no message into the failing test's section. I read an empty failure block plus a
+varying failure set, inferred "cross-test interference in the counters", and filed a bead on that —
+**without ever reading an assertion message.** The source says otherwise: `build_uninit` invokes
+the counting closure on the CALLING thread, so those counters were correct all along. And the
+`--test-threads=1` run was green because it landed on hz4, not because it was serialized.
+
+**Re-run with `--nocapture` and the real failure appears immediately:**
+
+    thread '<unnamed>' panicked at lib.rs:9467:52:
+    range start index 17552 out of range for slice of length 17550
+
+**DEFECT 1 — an out-of-bounds read in the streamed dweight tiling.** The grid is derived from the
+pool width: `m_blocks` is a thread-count REQUEST, `mb = ceil(out_ch/m_blocks)` is what it rounds to,
+and the blocks `mb` actually produces number `ceil(out_ch/mb)`, which can be SMALLER. The n axis
+re-derived that; the m axis did not. Trailing tiles therefore started past `out_ch`, and
+`ocn = mb.min(out_ch - oc0)` subtracts in release with no overflow check — the underflow WRAPPED,
+`min` kept `mb`, the `ocn == 0` guard never fired, and the tile read off the end of `dout_flat`.
+
+At shape (5, 7, out_ch 13, 17x19, k3x2) with 16 threads: patch_width 42, n_blocks 3, request
+ceil(16/3)=6 blocks of mb=3, but 13 channels fill only 5 — the sixth starts at oc0=15. `dout_flat`
+is 1350*13 = 17550 and the last row wants 1349*13+15 = **17552**. Both numbers in the panic are
+accounted for exactly.
+
+**THE SAME ARITHMETIC EXPLAINS THE GREEN RUNS, which is what made it convincing rather than
+plausible.** At 64 threads `m_blocks` is ceil(64/3)=22 clamped to out_ch=13, so mb=1 and every tile
+is in range. **hz2 runs 16 threads and hz4 runs 64.** The identical commit was RED on hz2 and GREEN
+on hz4, and which test it took down moved with the worker. `RAYON_NUM_THREADS` does not propagate
+through rch — probed directly: set to 7, the remote reported 64 — so the width was never under the
+observer's control either. That is the entire reason a deterministic bug read as a flake.
+
+**DEFECT 2 — a genuine cross-test race, in the ROUTE TOGGLE rather than the counters.** With the
+tiling fixed, hz4 then produced `left: (0, 1)  right: (1, 1)` on the masked skip-sentinel: the
+streamed dweight is a different kernel that never touches `CONV2D_DWEIGHT_GEMMS`, so when the
+streamed route runs the GEMM is real but uncounted. Route selection is two process-global knobs
+that the neighbouring streaming tests set for their duration; those tests serialise on
+`CONV2D_DWEIGHT_STREAM_TEST_GUARD` and the sentinel never took it.
+
+**CLOSURE EVIDENCE — five consecutive full-suite runs, DEFAULT parallel runner:**
+
+    run 1  hz2  ok      763 passed / 0 failed
+    run 2  hz2  ok      763 passed / 0 failed
+    run 3  hz2  ok      763 passed / 0 failed
+    run 4  hz4  FAILED  ormqr_stage_profile_covers_direct_compact_wy_apply
+    run 5  hz4  FAILED  ormqr_stage_profile_covers_direct_compact_wy_apply
+
+conv2d-family failures: **0 of 5**, including three consecutive greens on hz2, the worker where
+defect 1 was deterministic. The remaining red is a different subsystem — process-global ormqr stage
+counters that any concurrent ormqr call writes into, host-correlated the same way (3/3 green hz2,
+2/2 red hz4) — filed as `frankentorch-ebbew` rather than fixed here, because the candidate fix
+changes instruments the blocked-factorisation sweeps read.
+
+**THE RULES THIS PAYS FOR.**
+  * **A test binary's ambient rayon width is a property of the HOST, so a test that reads it tests
+    the host.** The regression test builds an EXPLICIT pool per width (1..32, primes included) so
+    the failing configuration is exercised anywhere. Every "bit-exact vs serial" test in this crate
+    has the same blind spot.
+  * **A varying failure set across runs of ONE binary is a signature, not noise** — and here it was
+    the signature of a config-dependent bug plus a real race, not of flakiness.
+  * **Never propose a mechanism before reading the assertion.** An empty libtest failure section
+    means the panic escaped the capture, i.e. it happened off the test thread — that fact alone was
+    a stronger clue than the theory I built without it.
+  * **`--test-threads=1` proves nothing when the variable is the worker.** Quote the host and its
+    width beside any suite result on this fleet, exactly as `feedback_measurement_host_identity`
+    requires for perf rows. It applies to correctness gates too.
