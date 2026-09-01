@@ -42465,3 +42465,40 @@ so it would not depend on a window; `stage_counters_ignore_other_threads_...` an
 `half_timers_and_censuses_ignore_other_threads_...` assert that every family still records for its
 owner, and they are green. What remains outstanding is the sweeps' own view of the phases — a
 confirmation, not the primary evidence.
+
+### 293i. THE MEASURING HARNESS CLOSED ITS OWN WINDOW — AND THE PER-LANE RE-GUARD IS WHAT CAUGHT IT
+
+`frankentorch-ebbew`. First real execution of `scripts/phase_column_check.sh`. The guard
+**admitted** — loadavg 9.33/6.83/23.44, iowait 0.2%, no peer measurement — the rch build ran, and
+then every one of the four lanes was refused:
+
+    lane 1  cholesky f64   loadavg  88.15   iowait 52.5%
+    lane 2  cholesky f32   loadavg  88.15   iowait 80.4%
+    lane 3  getrf          loadavg 109.36   iowait 57.3%
+    lane 4  getri          refused
+
+**Nothing else had started.** `rch` syncs the workspace out and retrieves artifacts back, which is
+minutes of local disk-bound work. **The script's own build closed the window it had just verified.**
+
+That is the confound this entire arc exists to eliminate — a harness perturbing the thing it is
+about to measure — and it had been built into the measuring instrument, by me, in the commit that
+introduced it. The ordering was `guard -> build -> lanes`; it is now `build -> wait for the guard to
+admit -> lanes`, so the disturbance falls OUTSIDE the measured window. The guard doubles as the
+settle detector: its iowait and spread limbs are exactly what a finished-but-still-draining artifact
+sync trips.
+
+**THE PER-LANE RE-GUARD PAID FOR ITSELF ON ITS FIRST OUTING, AGAINST ITS AUTHOR.** Without it this
+run would have produced four complete tables measured at loadavg 88-109 with iowait 52-80%, and
+they would have looked exactly like four good tables — same columns, same verdicts, same shipped
+rows. I added that check reasoning about OTHER people's builds arriving mid-run. It fired on mine.
+A gate is worth having precisely when it catches the case you did not model.
+
+**AND A DIAGNOSIS I OWE THE RECORD.** Before this run the poller was reported as wedged, on the
+grounds that all three load figures were under 35. It was not wedged: its admission test is a live
+guard call, and the guard was correctly refusing because **the spread limb is a RATIO test**
+(`load15 / load1 > 4`), not a magnitude test. At 5.71/5.35/25.06 the ratio was 4.4 — under 35 on
+every limb and still, correctly, refused. "All three are low" and "the spread has settled" are
+different claims, and only the second one admits.
+
+No measurement taken. The check is now correct and re-runnable; the host went to 48 concurrent
+rustc processes and 93% iowait minutes after the fix landed, so it waits again.
