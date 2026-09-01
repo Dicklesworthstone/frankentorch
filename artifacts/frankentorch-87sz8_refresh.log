@@ -15,3 +15,7 @@ poll=5 utc=2026-09-01T18:51:54Z guard=REFUSED peer_measurements=3
 poll=6 utc=2026-09-01T18:53:18Z guard=REFUSED peer_measurements=3
 poll=7 utc=2026-09-01T18:54:44Z guard=REFUSED peer_measurements=3
 poll=8 utc=2026-09-01T18:57:17Z guard=REFUSED peer_measurements=3
+poll=9 utc=2026-09-01T19:00:00Z guard=REFUSED peer_measurements=3
+poll=10 utc=2026-09-01T19:03:08Z guard=REFUSED peer_measurements=3
+run_classification=NO_VERDICT
+reason=guard refused throughout the full approximately 20-minute patient window; no harness process was launched; incumbent level and performance delta are N/A
