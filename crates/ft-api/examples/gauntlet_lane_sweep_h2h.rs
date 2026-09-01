@@ -3841,6 +3841,20 @@ LANES = {
         }
     }
 
+    // Loop-invariant context for the incumbent bank (`frankentorch-mdsmm`). Read once: the
+    // hostname and the clock must not vary between lanes of one invocation, or two lanes of the
+    // same run could land under different keys.
+    let incumbent_host = ft_api::harness_provenance::hostname();
+    let incumbent_bank_path = ft_api::harness_incumbent_bank::bank_path();
+    let incumbent_split_ratio = std::env::var("FT_H2H_INCUMBENT_SPLIT_RATIO")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 1.0)
+        .unwrap_or(ft_api::harness_incumbent_bank::DEFAULT_SPLIT_RATIO);
+    let run_started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
     for (index, (name, _)) in lanes.iter().enumerate() {
         let (ratio, ratio_lo, ratio_hi) = median_ratio_ci(&pt_times[index], &ft_times[index]);
         let (pt_null_ratio, pt_null_lo, pt_null_hi) =
@@ -3880,10 +3894,60 @@ LANES = {
         } else {
             "MISMATCH"
         };
-        println!(
-            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}",
-            pt_null_label, ft_null_label,
+        // WHICH INCUMBENT LEVEL DID THIS SESSION DRAW? — `frankentorch-mdsmm`.
+        //
+        // Every gate above is a WITHIN-RUN statistic, and an incumbent scaled uniformly for the
+        // whole run cancels out of all of them: the A/A null compares two positions inside one
+        // run and reads a perfect 1.000, drift sees a stable host that is stable at the wrong
+        // level, contention detection sees nothing. Measured on this lane: twenty-two
+        // invocations of one ELF split 20 at 5.06-6.38 ms and 2 at 10.50-10.86 with our arm
+        // invariant, and three `conv2d_big_masked` rows passed ALL FOUR GATES reading 0.790,
+        // 1.308 and 1.275 — the standing CHANGED SIDE. Only a between-invocation comparison can
+        // see that, so the bank is consulted here and the row carries its own comparability.
+        //
+        // It does NOT adjudicate. Item 219 called the ~6 ms level the defect on 7-vs-1 evidence
+        // and today the same lane reads 20-vs-2 the other way, so a disagreement with the
+        // majority is a NO-VERDICT. See `harness_incumbent_bank` for why that dictates the shape.
+        let incumbent_key = ft_api::harness_incumbent_bank::IncumbentKey::new(
+            &incumbent_host,
+            torch_version,
+            name,
+            pt_grad,
         );
+        let incumbent_records =
+            ft_api::harness_incumbent_bank::load_records(&incumbent_bank_path, &incumbent_key);
+        let incumbent_priors: Vec<f64> =
+            incumbent_records.iter().map(|(ms, _)| *ms).collect();
+        let incumbent_mode = ft_api::harness_incumbent_bank::classify(
+            &incumbent_priors,
+            pt_ms,
+            incumbent_split_ratio,
+        );
+        println!(
+            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}{}",
+            pt_null_label, ft_null_label, incumbent_mode.row_tag(),
+        );
+        print!(
+            "{}",
+            ft_api::harness_incumbent_bank::render(name, &incumbent_mode, &incumbent_records)
+        );
+        // Banked AFTER classifying, so a run is never compared against itself, and best-effort:
+        // an unwritable bank must not take down a measurement already paid for.
+        if let Err(error) = ft_api::harness_incumbent_bank::append(
+            &incumbent_bank_path,
+            &ft_api::harness_incumbent_bank::IncumbentRecord {
+                key: incumbent_key,
+                incumbent_ms: pt_ms,
+                rounds: reps,
+                lane_count: lanes.len(),
+                recorded_unix: run_started_unix,
+            },
+        ) {
+            println!(
+                "    incumbent_bank NOT WRITTEN ({error}) — this row was still classified against                  {} prior observation(s), but it did not add to them; the next run will not see it.",
+                incumbent_priors.len()
+            );
+        }
         if !(pt_null_quotable && ft_null_quotable) {
             println!(
                 "    NULL-FAILED: incumbent {pt_null_ratio:.3}, FrankenTorch {ft_null_ratio:.3}; each must be within +/-{BALANCED_NULL_MAX_DEVIATION:.2} of 1.0 and carry a calm CI; do not quote this row"

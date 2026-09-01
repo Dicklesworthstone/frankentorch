@@ -211,6 +211,16 @@ pub fn incumbent_provenance_block(version: &str, threads: usize) -> String {
 }
 
 /// Read the first line of a `/proc` or `/sys` file, or `"unknown"`.
+/// The machine's name, as `measurement_host_block` reports it.
+///
+/// Exposed because the incumbent bank keys on it: an incumbent level measured on one host says
+/// nothing about another, and `feedback_measurement_host_identity` records the same cell reading
+/// 1.2693x and 0.0093x on two workers with both nulls passing.
+#[must_use]
+pub fn hostname() -> String {
+    first_line_of("/proc/sys/kernel/hostname")
+}
+
 fn first_line_of(path: &str) -> String {
     std::fs::read_to_string(path).map_or_else(
         |_| "unknown".to_owned(),
@@ -573,7 +583,7 @@ fn concurrent_measurement_processes() -> Vec<(u32, &'static str, f64)> {
 /// banked row can still be placed afterwards.
 #[must_use]
 pub fn measurement_host_block(rayon_threads: usize) -> String {
-    let host = first_line_of("/proc/sys/kernel/hostname");
+    let host = hostname();
     let cpu = std::fs::read_to_string("/proc/cpuinfo").map_or_else(
         |_| "unknown".to_owned(),
         |text| {

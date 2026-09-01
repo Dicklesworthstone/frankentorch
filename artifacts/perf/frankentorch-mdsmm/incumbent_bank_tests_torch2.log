@@ -1,0 +1,19 @@
+incumbent-mode classifier — unit tests through the SHIPPING code path
+generated 2026-09-01T16:16:16Z  host thinkstation1
+command: cargo test -j2 -p frankentorch-api --lib harness_incumbent_bank -- --nocapture (via rch, remote)
+
+test harness_incumbent_bank::tests::a_last_ulp_checksum_wobble_does_not_fork_the_key ... ok
+test harness_incumbent_bank::tests::an_empty_bank_is_no_history_rather_than_an_error ... ok
+test harness_incumbent_bank::tests::a_third_level_is_flagged_by_the_level_spread_note ... ok
+test harness_incumbent_bank::tests::sanitize_strips_anything_that_could_break_the_hand_rolled_json ... ok
+test harness_incumbent_bank::tests::a_single_level_verdict_from_one_hour_of_history_says_it_is_weak ... ok
+test harness_incumbent_bank::tests::the_august_population_splits_the_same_way_with_the_majority_on_the_other_side ... ok
+test harness_incumbent_bank::tests::the_rendered_verdict_never_declares_a_level_correct ... ok
+test harness_incumbent_bank::tests::the_two_high_invocations_are_separated_from_the_twenty_low_ones ... ok
+test harness_incumbent_bank::tests::the_verdict_is_stable_across_the_whole_plausible_threshold_band ... ok
+test harness_incumbent_bank::tests::a_multi_day_bank_reports_its_span_rather_than_the_warning ... ok
+test harness_incumbent_bank::tests::the_recorded_timestamp_round_trips ... ok
+test harness_incumbent_bank::tests::an_invocation_that_draws_the_high_level_is_labelled_as_such ... ok
+test harness_incumbent_bank::tests::the_bank_round_trips_and_refuses_to_pool_across_a_shape_change ... ok
+test harness_incumbent_bank::tests::a_unimodal_population_is_not_split ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2605 filtered out; finished in 0.00s

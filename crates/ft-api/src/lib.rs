@@ -37,6 +37,12 @@ pub mod harness_provenance;
 #[doc(hidden)]
 pub mod harness_interleave;
 
+/// Which incumbent LEVEL a session drew (`frankentorch-mdsmm`). Not part of the tensor API
+/// surface; lives here because the classifier that decides a row's comparability has to be
+/// unit-tested against the measured populations rather than trusted.
+#[doc(hidden)]
+pub mod harness_incumbent_bank;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
