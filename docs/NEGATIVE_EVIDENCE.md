@@ -42405,6 +42405,16 @@ rustc jobs at 200-350% CPU each plus a `franken_networkx` pytest run. **Waiting 
 decay, without looking at what is producing it, is how an hour disappears.** Check `ps` before
 deciding whether to wait or to park.
 
+**AND THE GUARD'S LAST WORD WAS A DIFFERENT LIMB AGAIN.** The final refusal was not the spread rule
+at all:
+
+    REFUSING TO MEASURE: iowait 88.0% exceeds 10% — host is disk-bound.
+
+Nine refusals in total, and they walked across the guard's checks as the neighbouring build moved
+through its phases — ceiling satisfied throughout, then spread, then iowait. **A guard with three
+independent limbs does not fail the same way twice**, so "it refused for reason X, so wait for X to
+clear" is the wrong model; the box was simply in use, and every limb said so in turn.
+
 **WHAT WAS NOT DONE, EXPLICITLY.** `FT_GUARD_MAX_LOAD` and `FT_GUARD_MAX_LOAD_RATIO` were not
 raised. The 293 arc is about not talking a gate out of its answer, and a gate overridden to obtain
 one's own measurement is the same defect as a sweep whose ordering flatters its candidate.
