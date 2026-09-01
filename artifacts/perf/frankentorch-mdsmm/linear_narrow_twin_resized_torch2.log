@@ -1,0 +1,88 @@
+===== linear_narrow / linear_narrow_dense — sum()-loss blind-spot audit — torch:2 (CreamTrout) 2026-09-01T21:34:27Z =====
+host=thinkstation1 nproc=64 HEAD=87a7890d601c4f878115aad9ad2962f2e645c3ac
+build_base=87a7890d601c4f878115aad9ad2962f2e645c3ac (clean-overlay receipt; the RESIZED lanes)
+elf_sha256=0eae52712e68de135eefc9adf1274a8cbf8b99612803f91f869e30066a8f60c2
+incumbent=PyTorch 2.12.1+cpu, self-reported in EVERY invocation
+entry_point=scripts/h2h_window.sh (holds the window for the run's duration; 8vukf)
+protocol: 8 SUCCESSFUL invocations, FT_H2H_REPS=24 FT_H2H_WARMUP=16, round_warmup=0 (board default)
+lanes=linear_narrow,linear_narrow_dense exact, paired in ONE invocation so the inflation is a within-window ratio of ratios
+
+--- attempt 1 (run 1/8)  21:34:27Z  loadavg=6.59 5.55 4.84
+  linear_narrow    5.525   10.422   FT 1.89x FASTER     PT PASS 1.001 [0.972,1.038] FT OFFSET 1.036 [0.959,1.122] ratio 1.886 [1.786,1.970] match incumbent=NO-HISTORY
+  incumbent_mode lane=linear_narrow drawn=10.422 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    NULL-FAILED: incumbent 1.001, FrankenTorch 1.036; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.84x FASTER     ratio 1.838 [1.793,1.922]  PT null 1.010 PASS  FT null 1.015 PASS  QUOTABLE under the min estimator
+  linear_narrow_dense   12.772   10.652   FT 1.20x SLOWER     PT PASS 1.008 [0.958,1.050] FT PASS 0.992 [0.916,1.067] ratio 0.834 [0.786,0.867] match incumbent=NO-HISTORY
+  incumbent_mode lane=linear_narrow_dense drawn=10.652 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    MIN-ESTIMATOR FT 1.22x SLOWER     ratio 0.819 [0.793,0.844]  PT null 1.012 PASS  FT null 1.016 PASS  QUOTABLE under the min estimator
+
+--- attempt 2 (run 2/8)  21:35:00Z  loadavg=7.08 5.75 4.93
+  linear_narrow    5.237   10.180   FT 1.94x FASTER     PT OFFSET 1.030 [0.983,1.058] FT OFFSET 1.025 [0.939,1.092] ratio 1.944 [1.814,2.047] match incumbent=SINGLE/n2
+  incumbent_mode lane=linear_narrow drawn=10.180 ms  SINGLE LEVEL (n=2, median 10.301, range [10.180, 10.422], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 1. The bank spans 0s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.030, FrankenTorch 1.025; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.92x FASTER     ratio 1.915 [1.854,2.007]  PT null 0.984 PASS  FT null 1.030 FAIL  not quotable
+  linear_narrow_dense   12.577   10.485   FT 1.20x SLOWER     PT OFFSET 0.973 [0.947,1.004] FT OFFSET 0.966 [0.918,1.015] ratio 0.834 [0.812,0.880] match incumbent=SINGLE/n2
+  incumbent_mode lane=linear_narrow_dense drawn=10.485 ms  SINGLE LEVEL (n=2, median 10.569, range [10.485, 10.652], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 1. The bank spans 0s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.973, FrankenTorch 0.966; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.16x SLOWER     ratio 0.863 [0.836,0.887]  PT null 0.986 PASS  FT null 0.961 FAIL  not quotable
+
+--- attempt 3 (run 3/8)  21:35:27Z  loadavg=8.02 6.05 5.05
+  linear_narrow    5.244   10.350   FT 1.97x FASTER     PT PASS 0.994 [0.958,1.034] FT OFFSET 1.053 [0.965,1.152] ratio 1.974 [1.879,2.068] match incumbent=SINGLE/n3
+  incumbent_mode lane=linear_narrow drawn=10.350 ms  SINGLE LEVEL (n=3, median 10.350, range [10.180, 10.422], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 2. The bank spans 27s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.994, FrankenTorch 1.053; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.98x FASTER     ratio 1.981 [1.916,2.077]  PT null 1.001 PASS  FT null 1.041 FAIL  not quotable
+  linear_narrow_dense   11.973   10.411   FT 1.15x SLOWER     PT PASS 1.003 [0.979,1.038] FT OFFSET 0.973 [0.949,1.026] ratio 0.870 [0.839,0.896] match incumbent=SINGLE/n3
+  incumbent_mode lane=linear_narrow_dense drawn=10.411 ms  SINGLE LEVEL (n=3, median 10.485, range [10.411, 10.652], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 2. The bank spans 27s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.003, FrankenTorch 0.973; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.17x SLOWER     ratio 0.858 [0.824,0.883]  PT null 1.008 PASS  FT null 0.963 FAIL  not quotable
+
+--- attempt 4 (run 4/8)  21:35:52Z  loadavg=8.33 6.26 5.15
+  linear_narrow    5.536   10.300   FT 1.86x FASTER     PT PASS 1.005 [0.980,1.047] FT PASS 1.006 [0.972,1.081] ratio 1.860 [1.757,1.972] match incumbent=SINGLE/n4
+  incumbent_mode lane=linear_narrow drawn=10.300 ms  SINGLE LEVEL (n=4, median 10.325, range [10.180, 10.422], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 3. The bank spans 52s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    MIN-ESTIMATOR FT 1.93x FASTER     ratio 1.927 [1.834,1.996]  PT null 0.977 FAIL  FT null 1.090 FAIL  not quotable
+  linear_narrow_dense   12.513   10.607   FT 1.18x SLOWER     PT PASS 1.013 [0.980,1.038] FT FAIL 0.939 [0.910,0.983] ratio 0.848 [0.829,0.875] match incumbent=SINGLE/n4
+  incumbent_mode lane=linear_narrow_dense drawn=10.607 ms  SINGLE LEVEL (n=4, median 10.546, range [10.411, 10.652], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 3. The bank spans 52s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.013, FrankenTorch 0.939; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.22x SLOWER     ratio 0.819 [0.780,0.854]  PT null 1.014 PASS  FT null 0.968 FAIL  not quotable
+
+--- attempt 5 (run 5/8)  21:36:19Z  loadavg=7.27 6.19 5.16
+  linear_narrow    5.339   10.527   FT 1.97x FASTER     PT PASS 0.987 [0.960,1.038] FT OFFSET 1.033 [0.933,1.082] ratio 1.972 [1.839,2.032] match incumbent=SINGLE/n5
+  incumbent_mode lane=linear_narrow drawn=10.527 ms  SINGLE LEVEL (n=5, median 10.350, range [10.180, 10.527], spread 1.03x) — no second level banked for this lane, so this row is comparable to the other 4. The bank spans 79s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.987, FrankenTorch 1.033; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.96x FASTER     ratio 1.955 [1.890,2.035]  PT null 1.049 FAIL  FT null 1.006 PASS  not quotable
+  linear_narrow_dense   13.379   10.571   FT 1.27x SLOWER     PT PASS 0.985 [0.970,1.014] FT OFFSET 1.033 [0.968,1.105] ratio 0.790 [0.762,0.861] match incumbent=SINGLE/n5
+  incumbent_mode lane=linear_narrow_dense drawn=10.571 ms  SINGLE LEVEL (n=5, median 10.571, range [10.411, 10.652], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 4. The bank spans 79s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 0.985, FrankenTorch 1.033; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.23x SLOWER     ratio 0.812 [0.795,0.848]  PT null 1.006 PASS  FT null 1.030 FAIL  not quotable
+
+--- attempt 6 (run 6/8)  21:36:47Z  loadavg=8.56 6.58 5.31
+  linear_narrow    5.626   10.224   FT 1.82x FASTER     PT OFFSET 1.028 [0.989,1.066] FT PASS 0.994 [0.938,1.086] ratio 1.817 [1.768,1.865] match incumbent=SINGLE/n6
+  incumbent_mode lane=linear_narrow drawn=10.224 ms  SINGLE LEVEL (n=6, median 10.325, range [10.180, 10.527], spread 1.03x) — no second level banked for this lane, so this row is comparable to the other 5. The bank spans 107s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.028, FrankenTorch 0.994; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.82x FASTER     ratio 1.820 [1.683,1.896]  PT null 1.034 FAIL  FT null 1.003 PASS  not quotable
+  linear_narrow_dense   12.551   10.609   FT 1.18x SLOWER     PT PASS 1.019 [0.977,1.060] FT PASS 0.992 [0.950,1.046] ratio 0.845 [0.816,0.869] match incumbent=SINGLE/n6
+  incumbent_mode lane=linear_narrow_dense drawn=10.609 ms  SINGLE LEVEL (n=6, median 10.589, range [10.411, 10.652], spread 1.02x) — no second level banked for this lane, so this row is comparable to the other 5. The bank spans 107s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    MIN-ESTIMATOR FT 1.20x SLOWER     ratio 0.831 [0.799,0.855]  PT null 1.024 FAIL  FT null 0.972 FAIL  not quotable
+
+--- attempt 7 (run 7/8)  21:37:11Z  loadavg=8.48 6.72 5.40
+  linear_narrow    5.550   10.338   FT 1.86x FASTER     PT OFFSET 1.020 [0.996,1.040] FT PASS 1.020 [0.971,1.088] ratio 1.863 [1.753,1.921] match incumbent=SINGLE/n7
+  incumbent_mode lane=linear_narrow drawn=10.338 ms  SINGLE LEVEL (n=7, median 10.338, range [10.180, 10.527], spread 1.03x) — no second level banked for this lane, so this row is comparable to the other 6. The bank spans 131s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.020, FrankenTorch 1.020; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.81x FASTER     ratio 1.806 [1.751,1.879]  PT null 1.012 PASS  FT null 1.035 FAIL  not quotable
+  linear_narrow_dense   13.404   10.675   FT 1.26x SLOWER     PT PASS 1.011 [0.973,1.033] FT PASS 1.001 [0.931,1.041] ratio 0.796 [0.775,0.831] match incumbent=SINGLE/n7
+  incumbent_mode lane=linear_narrow_dense drawn=10.675 ms  SINGLE LEVEL (n=7, median 10.607, range [10.411, 10.675], spread 1.03x) — no second level banked for this lane, so this row is comparable to the other 6. The bank spans 131s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    MIN-ESTIMATOR FT 1.29x SLOWER     ratio 0.775 [0.755,0.811]  PT null 1.003 PASS  FT null 0.979 FAIL  not quotable
+
+--- attempt 8 (run 8/8)  21:37:36Z  loadavg=8.33 6.82 5.46
+  linear_narrow    5.307   10.352   FT 1.95x FASTER     PT PASS 1.010 [0.994,1.042] FT OFFSET 1.040 [0.990,1.121] ratio 1.951 [1.890,2.029] match incumbent=SINGLE/n8
+  incumbent_mode lane=linear_narrow drawn=10.352 ms  SINGLE LEVEL (n=8, median 10.344, range [10.180, 10.527], spread 1.03x) — no second level banked for this lane, so this row is comparable to the other 7. The bank spans 156s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.010, FrankenTorch 1.040; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.95x FASTER     ratio 1.947 [1.900,2.021]  PT null 1.005 PASS  FT null 1.020 PASS  QUOTABLE under the min estimator
+  linear_narrow_dense   12.499   10.587   FT 1.18x SLOWER     PT OFFSET 1.022 [0.973,1.048] FT OFFSET 0.970 [0.937,1.023] ratio 0.847 [0.822,0.875] match incumbent=SINGLE/n8
+  incumbent_mode lane=linear_narrow_dense drawn=10.587 ms  SINGLE LEVEL (n=8, median 10.597, range [10.411, 10.675], spread 1.03x) — no second level banked for this lane, so this row is comparable to the other 7. The bank spans 156s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.022, FrankenTorch 0.970; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.15x SLOWER     ratio 0.873 [0.836,0.898]  PT null 1.005 PASS  FT null 0.953 FAIL  not quotable
+
+invocations_run=8 window_busy=0 host_unfit=0 attempts=8
+bank_lines_added=16
+===== end 2026-09-01T21:38:03Z =====
