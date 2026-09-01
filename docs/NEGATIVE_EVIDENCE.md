@@ -41733,3 +41733,48 @@ not move, change how much work reaches it.** Three levers aimed at making the sl
 (2-D trailing tiles, parallel panel rows, level-2 panel recast) returned a null, 0.29x and 1.015x.
 The one that worked left every line of the slow code untouched and altered a single constant that
 decides how many operations enter it.
+
+### 292e. THE ARC PROPAGATES TO LU — AND FINDS A CONSTANT TUNED AGAINST CODE THAT NO LONGER EXISTS
+
+`frankentorch-valnx`. Applying 292d's cholesky arc to getrf. **The transferable thing was the
+method, not the constant**, and re-deriving the model per op is what stopped a regression: LU's NB
+had already been retuned 64 -> 128, so "halve it" would have restored a value the record showed
+1.213x slower.
+
+    cholesky panel is nb x nb  ->  MACs ~ n*nb^2/6   QUADRATIC in nb
+    LU       panel is m  x nb  ->  MACs ~ n^2*nb/4   LINEAR    in nb
+
+Halving cholesky's nb cuts its panel fourfold; halving LU's only halves it, and LU's panel is
+recursive and GEMM-based (2-7 GF/s, not 0.85), so it tolerates being larger. Same method, different
+law, and the laws had to be derived before the sweep to know which direction to look.
+
+**THEN THE SWEEP FOUND SOMETHING BIGGER.** The shipped 128 came from a ladder measuring n=512 nb=64
+at 75.752 ms against nb=128 at 62.780 ms. **That cell now measures 4.87 ms — the path is ~13x
+faster** (recursive panel, row-accumulating TRSM, row-wise RHS permutation, parallel trailing
+update) and the ordering inverted with it. Re-measured, three sizes, two runs, min of 9, guard PASS,
+nb=64 beats the shipped 128 in ALL SIX cells:
+
+       n=256           n=512           n=1024
+  1.576x / 1.813x  1.186x / 1.191x  1.209x / 1.284x
+
+LANE CERTIFICATION on slogdet (LU-backed, scalar pivot-order-invariant checksum), arm0 = shipped,
+both interleaved in one invocation, guard PASS, parity MATCH:
+
+    PAIRED (old nb=128 vs shipped nb=64)   0.880 / 0.862 / 0.843 / 0.855   median 0.8585 -> 1.165x
+    A/A NULL                               0.995 / 1.001 / 0.984 / 0.975   range 0.975-1.001
+
+**Every paired reading lies wholly outside the null's range** — no overlap, which is stronger than
+comparing medians. Versus torch the standing moves 5.66-6.99x SLOWER to 4.95-6.55x. The lane's
+1.165x is correctly BELOW the kernel's 1.19-1.81x, because slogdet is getrf plus a diagonal
+log-product and session work.
+
+The old comment's mechanism was PRESERVED, not deleted: nb=64 was a local maximum from cache-set
+aliasing (at n=512 a row is exactly one 4096-byte page and a 512-byte panel stride conflicts; the
+penalty collapsed 15x at n=520). That effect is still visible — n=512 is the one size whose optimum
+moves among {32,64,96} across runs — but 128 loses there in both runs, so the aliasing decides WHICH
+small nb wins, not whether one does.
+
+**THE LESSON, and it is the most reusable thing in this arc: a blocking constant encodes the shape
+of the code beneath it, not a property of the algorithm. Re-run the ladder whenever that code
+moves.** This one had drifted 13x and nobody re-ran it; the constant silently became wrong by
+1.17-1.81x. Any tuned constant with a dated measurement beside it is a candidate for the same audit.
