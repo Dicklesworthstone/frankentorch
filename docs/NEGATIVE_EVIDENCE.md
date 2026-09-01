@@ -42419,6 +42419,17 @@ clear" is the wrong model; the box was simply in use, and every limb said so in 
 raised. The 293 arc is about not talking a gate out of its answer, and a gate overridden to obtain
 one's own measurement is the same defect as a sweep whose ordering flatters its candidate.
 
+**THE ETA IS ARITHMETIC, NOT PATIENCE.** A second attempt (two more refusals, 06:42 and 06:44) had
+the CEILING limb clear — 40.82 then 23.59, under the 35 bar — while the spread limb still refused at
+13.4x. `load15` is an EWMA with a 15-minute constant, so the wait is computable rather than
+guessable: the guard admits when `load15 < 4 x load1`, i.e. after
+
+    t = 15 min x ln( (load15_now - L) / (4L - L) )     for a true settled load L
+
+From 316 with the box idling at L=5 that is **~46 minutes**; at L=2, ~60; at L=10, ~36. Reading
+`uptime` and hoping is what turns that into an afternoon — `feedback_drift_gate_measures_sweep_length`
+says pick the window by arithmetic, and this is the arithmetic for the SPREAD limb specifically.
+
 **WHAT WAS DONE INSTEAD: the check is now one command**, `scripts/phase_column_check.sh`. It
 guards, builds through rch with the 103-refusal retry, snapshots each ELF and prints its SHA,
 re-guards **before every lane** because a window open at lane 1 can be shut by lane 4, runs all
