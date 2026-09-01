@@ -311,7 +311,35 @@ mod gemm {
     // 128-column output windows. Splitting N preserves each output element's complete
     // K traversal, so it is bit-exact; the shape predicate leaves unrelated small-K
     // GEMMs on the established dispatch. `=0` is a measurement kill switch.
-    const HOUSEHOLDER_PANEL_WIDTH: usize = 32;
+    /// The exact panel width the skinny-split predicate recognises. **This is NOT the QR panel
+    /// width**: `geqrf_blocked_f64`, the public QR wrapper, `orgqr_blocked_f64` and
+    /// `ormqr_blocked_f64` each hard-code their own 32 independently. This constant only decides
+    /// which GEMM SHAPES get the special skinny parallel route.
+    ///
+    /// OVERRIDABLE BECAUSE THE SWEEP WOULD OTHERWISE BE CONFOUNDED —
+    /// `frankentorch-stale-tuning-constants-lzku6`, per torch:4's lane brief. The predicate demands
+    /// `m == WIDTH || k == WIDTH` EXACTLY, so a candidate panel width of 16 or 48 silently loses
+    /// the skinny route that b=32 enjoys, and the measurement would be "b changed AND the split
+    /// turned off" — `feedback_one_knob_is_secretly_two` in its purest form. A sweep must move this
+    /// with the candidate so every width has equivalent split eligibility, and must PROVE it did
+    /// with the admission census below rather than assume it.
+    const HOUSEHOLDER_PANEL_WIDTH_SHIPPED: usize = 32;
+    pub(crate) static HOUSEHOLDER_PANEL_WIDTH_OVERRIDE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn householder_panel_width() -> usize {
+        match HOUSEHOLDER_PANEL_WIDTH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => HOUSEHOLDER_PANEL_WIDTH_SHIPPED,
+            v => v,
+        }
+    }
+
+    /// How often the skinny split was ADMITTED and REJECTED. A sweep that cannot show equal
+    /// admission across candidate widths has not equalised eligibility, whatever it set.
+    pub(crate) static HOUSEHOLDER_SKINNY_ADMITTED: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static HOUSEHOLDER_SKINNY_REJECTED: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     const HOUSEHOLDER_SKINNY_MIN_DIM: usize = 512;
     const HOUSEHOLDER_SKINNY_MIN_FLOPS: u128 = 1 << 23;
 
@@ -324,13 +352,20 @@ mod gemm {
     }
 
     fn should_parallelize_householder_skinny(m: usize, k: usize, n: usize) -> bool {
+        let width = householder_panel_width();
         let is_panel_shape = n >= HOUSEHOLDER_SKINNY_MIN_DIM
-            && ((m == HOUSEHOLDER_PANEL_WIDTH && k >= HOUSEHOLDER_SKINNY_MIN_DIM)
-                || (k == HOUSEHOLDER_PANEL_WIDTH && m >= HOUSEHOLDER_SKINNY_MIN_DIM));
-        householder_skinny_parallel_enabled()
+            && ((m == width && k >= HOUSEHOLDER_SKINNY_MIN_DIM)
+                || (k == width && m >= HOUSEHOLDER_SKINNY_MIN_DIM));
+        let admitted = householder_skinny_parallel_enabled()
             && rayon::current_num_threads() > 1
             && is_panel_shape
-            && (m as u128) * (k as u128) * (n as u128) >= HOUSEHOLDER_SKINNY_MIN_FLOPS
+            && (m as u128) * (k as u128) * (n as u128) >= HOUSEHOLDER_SKINNY_MIN_FLOPS;
+        if admitted {
+            HOUSEHOLDER_SKINNY_ADMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            HOUSEHOLDER_SKINNY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        admitted
     }
 
     fn should_parallelize_cols(m: usize, k: usize, n: usize) -> bool {
@@ -35334,6 +35369,23 @@ pub fn set_dgemm_sub_serial(on: bool) -> bool {
 /// Select the 2-D tiled arm of `dgemm_sub_into`, returning the previous setting.
 /// `frankentorch-valnx`.
 #[doc(hidden)]
+/// Set the width the skinny-split predicate recognises; `0` restores the shipped 32.
+/// `frankentorch-stale-tuning-constants-lzku6`. A QR panel-width sweep MUST move this with its
+/// candidate, or every non-32 width is measured without the skinny route that 32 gets.
+#[doc(hidden)]
+pub fn set_householder_panel_width(width: usize) -> usize {
+    gemm::HOUSEHOLDER_PANEL_WIDTH_OVERRIDE.swap(width, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drain the skinny-split admission census as `(admitted, rejected)`.
+#[doc(hidden)]
+pub fn householder_skinny_census_take() -> (u64, u64) {
+    (
+        gemm::HOUSEHOLDER_SKINNY_ADMITTED.swap(0, std::sync::atomic::Ordering::Relaxed),
+        gemm::HOUSEHOLDER_SKINNY_REJECTED.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub fn set_dgemm_sub_tile_2d(on: bool) -> bool {
     gemm::DGEMM_SUB_TILE_2D.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
