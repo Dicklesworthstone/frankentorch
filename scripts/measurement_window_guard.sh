@@ -42,12 +42,19 @@ set -uo pipefail
 MAX_LOAD="${FT_GUARD_MAX_LOAD:-35}"
 MAX_IOWAIT="${FT_GUARD_MAX_IOWAIT:-10}"
 MAX_LOAD_RATIO="${FT_GUARD_MAX_LOAD_RATIO:-4}"
+
+# The stability limb lives in a library so the corpus replay exercises the shipping code path.
+# shellcheck source=lib/loadavg_spread_verdict.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/loadavg_spread_verdict.sh"
 while [ $# -gt 0 ]; do
     case "$1" in
         --max-load) MAX_LOAD="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+# After the arg loop: the floor's cap is derived from MAX_LOAD, so `--max-load` has to be
+# parsed before it is computed.
+SPREAD_FLOOR="${FT_GUARD_SPREAD_FLOOR:-$(loadavg_spread_floor "$MAX_LOAD")}"
 
 # A measurement is: a torch interpreter, a bench/h2h binary, or `cargo bench`. It is NOT a
 # compiler, and not a shell that happens to mention one of these words on its command line.
@@ -136,21 +143,27 @@ fi
 # is why: a run taken at 1-min 7.3 while the 5- and 15-min read 62 and 77 produced a first
 # invocation 15% off the two that followed it. The host had just come out of a load-77 period
 # and its page cache and clocks had not settled. A 1-minute average cannot see that.
+#
+# AND THE RATIO NEEDED AN ABSOLUTE FLOOR. A ratio cannot tell a storm from a rounding error.
+# `0.73 / 2.04 / 3.36` is a 4.6x spread on a host that was at most 5% busy for the whole
+# fifteen minutes, and it refused three consecutive attempts at a lane row; `1.99 / 2.93 /
+# 26.02` is the same defect one size up. Both ends are now clamped up to SPREAD_FLOOR
+# (nproc/8) before dividing, which subsumes the old `lo < 0.5` clamp. See
+# `lib/loadavg_spread_verdict.sh` for why the floor is a property of the machine rather than
+# of the windows that were refused, and `loadavg_spread_corpus_replay.sh` for what it admits.
 LOAD5="$(cut -d' ' -f2 /proc/loadavg)"
 LOAD15="$(cut -d' ' -f3 /proc/loadavg)"
-if awk -v a="$LOAD1" -v b="$LOAD5" -v c="$LOAD15" -v r="$MAX_LOAD_RATIO" '
-       BEGIN { hi = a; lo = a;
-               if (b > hi) hi = b; if (b < lo) lo = b;
-               if (c > hi) hi = c; if (c < lo) lo = c;
-               if (lo < 0.5) lo = 0.5;
-               exit !(hi / lo > r) }'; then
-    echo "REFUSING TO MEASURE: loadavg $LOAD1 / $LOAD5 / $LOAD15 spread exceeds ${MAX_LOAD_RATIO}x — the host is still settling, quiet is not stable." >&2
+SPREAD_READING="$(loadavg_spread_exceeds "$LOAD1" "$LOAD5" "$LOAD15" "$MAX_LOAD_RATIO" "$SPREAD_FLOOR")"
+SPREAD_EXCEEDS=$?
+SPREAD_RATIO="$(echo "$SPREAD_READING" | cut -d' ' -f3)"
+if [ "$SPREAD_EXCEEDS" -eq 0 ]; then
+    echo "REFUSING TO MEASURE: loadavg $LOAD1 / $LOAD5 / $LOAD15 spread ${SPREAD_RATIO}x exceeds ${MAX_LOAD_RATIO}x (floor ${SPREAD_FLOOR}) — the host is still settling, quiet is not stable." >&2
     STATUS=1
 fi
 
 if [ "$STATUS" -ne 0 ]; then
-    echo "Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)" >&2
+    echo "Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)" >&2
     exit "$STATUS"
 fi
 
-echo "guard PASS: no peer measurement detected, loadavg $LOAD1/$LOAD5/$LOAD15 (spread <= ${MAX_LOAD_RATIO}x), iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"
+echo "guard PASS: no peer measurement detected, loadavg $LOAD1/$LOAD5/$LOAD15 (spread ${SPREAD_RATIO}x <= ${MAX_LOAD_RATIO}x, floor ${SPREAD_FLOOR}), iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"

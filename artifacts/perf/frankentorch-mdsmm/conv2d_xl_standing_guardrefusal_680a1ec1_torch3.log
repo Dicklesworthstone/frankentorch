@@ -1,0 +1,6 @@
+2026-09-01T10:33:28-04:00
+claim=680a1ec18889cecf4203d6f4ad703a1be57f3c9a; base=ba1fe6270da6b5cfa894e1c83d97bbb082689f22; lanes=conv2d_xl,conv2d_xl_masked; tuple=FT_H2H_REPS=24 FT_H2H_WARMUP=16 FT_H2H_ROUND_WARMUP=1 RAYON_NUM_THREADS=8
+preflight=scripts/measurement_window_guard.sh --max-load 35
+REFUSING TO MEASURE: loadavg 0.73 / 2.04 / 3.36 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+guard_exit=1
