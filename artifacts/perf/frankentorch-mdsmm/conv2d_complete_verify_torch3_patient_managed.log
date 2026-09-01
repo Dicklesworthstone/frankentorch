@@ -1,0 +1,62 @@
+=== MANAGED PATIENT GUARDED BANKED CONV2D COMPLETE VERIFY ===
+utc=2026-09-01T18:32:35Z
+head=6abc8ecc87f3248e9e8f80b65034a4ff7c550aa5
+source_surface_vs_banked_base_5093ccf=UNCHANGED
+banked_build=RCH_REQUIRE_REMOTE=1 rch exec --no-self-healing --base 5093ccf4b2b3cf894b4a5d3bba7e7b08cb47cc0c --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h; remote=hz4; overlay_fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195; exit=0
+e024e0d6f8b61cff761566274ba87beb0c35b07618174ff6e238f930fbbd6994  /data/tmp/ft-mdsmm-conv2d-delta-rflWyI/release/examples/gauntlet_lane_sweep_h2h
+runtime_command=PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=8 FT_H2H_LANES_EXACT=1 FT_H2H_LANES=conv2d,conv2d_masked FT_H2H_REPS=24 FT_H2H_WARMUP=16 FT_H2H_ROUND_WARMUP=0 /data/tmp/ft-mdsmm-conv2d-delta-rflWyI/release/examples/gauntlet_lane_sweep_h2h
+poll_plan=1..7 every 180s; poll8 after 120s; total_budget=1200s
+poll=1 utc=2026-09-01T18:32:35Z
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=1 guard_exit=1
+poll=2 utc=2026-09-01T18:35:37Z
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=2 guard_exit=1
+poll=3 utc=2026-09-01T18:38:39Z
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2406383  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=3 guard_exit=1
+poll=4 utc=2026-09-01T18:41:41Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2406383  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2514861  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=4 guard_exit=1
+poll=5 utc=2026-09-01T18:44:43Z
+REFUSING TO MEASURE: 4 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2553051  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+    2563179  /data/projects/.scratch/blackthrush/fp-bench-uncachedlane --category io --workload csv_read_uncached
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=5 guard_exit=1
+poll=6 utc=2026-09-01T18:47:46Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2590449  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=6 guard_exit=1
+poll=7 utc=2026-09-01T18:50:48Z
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2726357  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=7 guard_exit=1
+poll=8 utc=2026-09-01T18:52:50Z
+REFUSING TO MEASURE: 4 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2772942  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+    2805392  jq -r .[] | select((.title|test("perf|capability|bench|throughput|latency"; "i")) or ((.labels // []
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+poll=8 guard_exit=1
+run_classification=NO_VERDICT; reason=guard refused every poll through full 1200-second budget
