@@ -1,0 +1,82 @@
+A/A ARM-INTERNAL DRIFT CHARACTERIZATION — frankentorch-mdsmm.1
+torch:2 (CreamTrout)  2026-09-01T21:57:28Z  host thinkstation1  HEAD c302d800
+18 guard-gated invocations (6 paired, 6 incumbent-only, 6 ft-only), 864 slot dumps,
+lanes conv2d_masked + max_pool1d, REPS=24 WARMUP=16 round_warmup=0, under scripts/h2h_window.sh.
+Isolation rows carry NO vs-PyTorch claim; bank redirected to scratch so they do not pollute it.
+
+====================================================================================================
+1. THE NULL, PER MODE / LANE / ARM  (median over rounds of mean(s0,s1)/mean(s2,s3))
+====================================================================================================
+mode            lane            arm  invs  null p50      min      max  out|.02|  out .97-1.03
+paired          conv2d_masked   FT      6    1.0753   1.0258   1.0873     6/6           5/6  
+paired          conv2d_masked   PT      6    1.2148   1.1430   1.3275     6/6           6/6  
+paired          max_pool1d      FT      6    0.9785   0.9599   0.9839     5/6           1/6  
+paired          max_pool1d      PT      6    0.9226   0.8443   1.0825     4/6           4/6  
+incumbent-only  conv2d_masked   PT      6    1.4502   1.3039   1.4944     6/6           6/6  
+incumbent-only  max_pool1d      PT      6    0.8805   0.8386   1.0965     6/6           6/6  
+ft-only         conv2d_masked   FT      6    1.1342   1.0194   1.1627     5/6           5/6  
+ft-only         max_pool1d      FT      6    0.9886   0.9618   0.9967     2/6           1/6  
+
+====================================================================================================
+2. SLOT-POSITION EFFECT  (per-slot mean, normalised to slot 0, pooled over all rounds)
+====================================================================================================
+mode            lane            arm     slot0    slot1    slot2    slot3    s3/s0   monotone?
+paired          conv2d_masked   FT     1.0000   0.9069   0.9105   0.8839   0.8839   no
+paired          conv2d_masked   PT     1.0000   1.0207   0.7295   0.9813   0.9813   no
+paired          max_pool1d      FT     1.0000   1.0247   1.0501   1.0362   1.0362   no
+paired          max_pool1d      PT     1.0000   1.0368   1.1850   1.0252   1.0252   no
+incumbent-only  conv2d_masked   PT     1.0000   0.5845   0.5871   0.5706   0.5706   no
+incumbent-only  max_pool1d      PT     1.0000   1.2327   1.2408   1.1610   1.1610   no
+ft-only         conv2d_masked   FT     1.0000   0.8394   0.8327   0.8258   0.8258   no
+ft-only         max_pool1d      FT     1.0000   1.0293   1.0280   1.0313   1.0313   no
+
+====================================================================================================
+3. TEMPORAL CLUSTERING vs ALTERNATION  (per-round null within an invocation)
+====================================================================================================
+   lag-1 autocorrelation of the per-round null. >0 = clustered (drift), <0 = alternating,
+   ~0 = independent. Pooled over invocations, per mode/lane/arm.
+mode            lane            arm  rounds   lag1 r   reading
+paired          conv2d_masked   FT      144   -0.161   alternating
+paired          conv2d_masked   PT      144    0.063   independent
+paired          max_pool1d      FT      144   -0.145   independent
+paired          max_pool1d      PT      144   -0.087   independent
+incumbent-only  conv2d_masked   PT      144   -0.088   independent
+incumbent-only  max_pool1d      PT      144    0.005   independent
+ft-only         conv2d_masked   FT      144   -0.102   independent
+ft-only         max_pool1d      FT      144   -0.065   independent
+
+====================================================================================================
+4. FALSE-ADMISSION RISK OF EACH CANDIDATE GATE
+====================================================================================================
+   An A/A null compares identical code to itself, so EVERY failure here is a false
+   REJECTION and every pass is correct-by-construction. The risk a wider band carries is
+   that it also admits a REAL position effect. Priced by asking what each band would have
+   admitted across every null measured above.
+
+   48 nulls measured. p05 0.8443  p50 1.0430  p95 1.4731  min 0.8386  max 1.4944
+
+   band                           admits  rejects    reject rate
+   +/-0.02  (enforced today)           8       40          83.3%
+   0.97-1.03  (bead's band)           14       34          70.8%
+   +/-0.05                            17       31          64.6%
+   +/-0.10                            24       24          50.0%
+
+====================================================================================================
+5. THE FIX, AND ITS WIN/LOSE SPLIT (gate-fix evidence standard)
+====================================================================================================
+   change: the A/A null's halves become FIRST WARM vs LAST, i.e. slot 1 vs slot 3 at
+   round_warmup=0 and slot 0 vs slot 3 above it. NO STANDING MOVES — the quoted ratio is
+   still the median over all four slots; only which slots the NULL compares changes.
+
+   band                        old halves {s0,s1}/{s2,s3}    first-warm vs last
+   +/-0.02 (enforced)                              83.3%                 54.2%
+   0.97-1.03 (bead's)                              70.8%                 33.3%
+   +/-0.05                                         64.6%                 20.8%
+   +/-0.10                                         50.0%                  4.2%
+
+   Every rejection above is a FALSE rejection: an A/A null compares identical code to
+   itself, so there is no true positive to trade away. The false-ADMISSION risk of the fix
+   is that a genuine early-vs-late position effect now has 2 samples behind it instead of
+   4, widening the null's own CI — which the existing MAX_NULL_CI_WIDTH=0.60 limb catches
+   as WIDE rather than admitting. The band is NOT widened, so no real effect of size >2%
+   becomes admissible that was not already.

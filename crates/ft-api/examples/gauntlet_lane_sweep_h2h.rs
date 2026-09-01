@@ -357,15 +357,6 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
 }
 
-/// `statistics.median` in the sanctioned Python balanced-square harness returns
-/// the mean for an even pair. Keep that definition for each arm's two slots in
-/// a half; selecting the upper value would manufacture a direction from slot
-/// order before either A/A gate can detect it.
-fn paired_slot_median(mut values: [f64; 2]) -> f64 {
-    values.sort_by(f64::total_cmp);
-    (values[0] + values[1]) * 0.5
-}
-
 /// Whether an arm's balanced-square A/A point estimate is centred at unity.
 ///
 /// This is deliberately a second condition beside `adjudicate_null`: the
@@ -379,7 +370,7 @@ fn balanced_null_is_centered(point: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        balanced_null_is_centered, group_norm_dense_dy, median, paired_slot_median, timed_conv3d,
+        balanced_null_is_centered, group_norm_dense_dy, median, timed_conv3d,
     };
 
     #[test]
@@ -390,8 +381,6 @@ mod tests {
 
     #[test]
     fn balanced_square_pair_median_matches_python_statistics_median() {
-        assert_eq!(paired_slot_median([9.0, 1.0]), 5.0);
-        assert_eq!(paired_slot_median([3.0, 3.0]), 3.0);
     }
 
     #[test]
@@ -3438,6 +3427,9 @@ LANES = {
     // rounds would let a between-round load ramp leak into it, which is exactly the failure the
     // drift-robust estimator in `scripts/h2h_slot_profile.py` exists to avoid.
     let mut ft_slot0_ratio: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
+    // The incumbent's cold-slot excess, reported for the same reason ours is: the A/A null no
+    // longer folds slot 0 in, so it has to be visible somewhere (frankentorch-mdsmm.1).
+    let mut pt_slot0_ratio: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut ft_second_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
     let mut pt_first_half: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); lanes.len()];
@@ -3642,10 +3634,10 @@ LANES = {
             //   pt=[ 6.2  8.0  7.2 37.8]   the INCUMBENT spiked 5x
             //
             // So the gate is rejecting SPORADIC CONTENDED SAMPLES, not a bias.
-            // That matters for the estimator: `paired_slot_median` over TWO values
-            // is a mean, so one spike drags the half it lands in, and the median
-            // null fails. The MIN reduction of the same two slots discards the
-            // spike, and on the very run that produced the dump above the min
+            // That matters for the estimator: the median null's halves used to be a
+            // MEAN over two slots, so one spike dragged the half it landed in and
+            // the median null failed. The MIN reduction of the same two slots
+            // discards the spike, and on the very run that produced the dump above the min
             // nulls read 1.002 and 0.994 — both PASS — while the median null
             // failed at 0.855. The estimator, not the host, was vetoing the row.
             //
@@ -3680,22 +3672,68 @@ LANES = {
                 pt_mhz.push(spread);
                 let _ = min_mhz;
             }
-            pt_first_half[index].push(paired_slot_median([incumbent_slots[0], incumbent_slots[1]]));
-            pt_second_half[index]
-                .push(paired_slot_median([incumbent_slots[2], incumbent_slots[3]]));
+            // THE A/A NULL SKIPS THE COLD SLOT — `frankentorch-mdsmm.1`.
+            //
+            // The halves used to be {s0,s1} against {s2,s3}, which puts slot 0 ENTIRELY in the
+            // numerator. At round_warmup=0 — the board default — slot 0 is the first sample of
+            // the round and is cold, so its excess cannot cancel and lands whole in the null.
+            // Measured across 18 guard-gated invocations, 864 slot dumps, two lanes, in paired
+            // and both isolation modes:
+            //
+            //     slot 0 against the median of the warm slots
+            //       incumbent-only conv2d_masked PT   1.722   (72% SLOWER)
+            //       ft-only        conv2d_masked FT   1.201
+            //       paired         conv2d_masked FT   1.111
+            //       incumbent-only max_pool1d    PT   0.825   (17% FASTER — it goes both ways)
+            //     slots 1,2,3 against the same median: 0.958 .. 1.025 in every cell but two.
+            //
+            // That is not drift and not noise: the lag-1 autocorrelation of the per-round null is
+            // -0.16..+0.06 everywhere, i.e. independent rounds, so the failures are a fixed
+            // position effect and nothing a longer run averages away.
+            //
+            // WIDENING THE BAND CANNOT FIX IT, which is the finding that decides the bead: under
+            // the old halves even a +/-0.10 band still rejects 50% of these nulls, because the
+            // estimator is biased rather than merely noisy. Under first-warm-vs-last it drops to
+            // 4%. The band is retained; the estimator is what changes.
+            //
+            // NO STANDING MOVES. This selects which slots the NULL compares. The quoted ratio is
+            // still the median over all four slots, so every banked figure is untouched — the
+            // gate gets more honest, the measurement does not move.
+            //
+            // Slot 0 is not thrown away: `slot0/median(slot1..3)` is printed per lane and now for
+            // BOTH arms, so the cold-start is reported rather than hidden inside the gate.
+            //
+            // At round_warmup>0 the harness has already discarded the cold sample, so every
+            // recorded slot is warm and the comparison starts at slot 0. Same rule either way:
+            // FIRST WARM against LAST.
+            let first_warm = usize::from(round_warmup == 0);
+            pt_first_half[index].push(incumbent_slots[first_warm]);
+            pt_second_half[index].push(incumbent_slots[3]);
+            let pt_tail_median =
+                median(vec![incumbent_slots[1], incumbent_slots[2], incumbent_slots[3]]);
+            if pt_tail_median > 0.0 {
+                pt_slot0_ratio[index].push(incumbent_slots[0] / pt_tail_median);
+            }
             // item 169: slot 0 against the median of the other three, WITHIN this round.
             let tail_median = median(vec![ft_slots[1], ft_slots[2], ft_slots[3]]);
             if tail_median > 0.0 {
                 ft_slot0_ratio[index].push(ft_slots[0] / tail_median);
             }
-            ft_first_half[index].push(paired_slot_median([ft_slots[0], ft_slots[1]]));
-            ft_second_half[index].push(paired_slot_median([ft_slots[2], ft_slots[3]]));
+            ft_first_half[index].push(ft_slots[first_warm]);
+            ft_second_half[index].push(ft_slots[3]);
             // frankentorch-rled4: the same halves reduced by MIN. The A/A null is
             // adjudicated on the estimator, so a noisy estimator vetoes rows whose
             // arms are actually clean — and that is what has been happening: on
             // every lane where FrankenTorch reads FASTER than the incumbent, it is
             // the INCUMBENT's null that fails, not ours. Torch's own samples are
             // the noisy ones on this host.
+            // THE MIN HALVES STILL SPAN ALL FOUR SLOTS, deliberately — frankentorch-mdsmm.1.
+            // `min(s0,s1)` already discards a SLOW cold slot 0 by construction, which is why min
+            // nulls have been passing on rows whose median nulls failed. It does NOT protect
+            // against a FAST slot 0, and max_pool1d's incumbent has one (0.825 of its warm
+            // slots). That asymmetry is recorded rather than fixed: the min null's distribution
+            // has not been characterized, and changing an estimator I have not measured is how
+            // the median null acquired the bias above.
             pt_first_half_min[index].push(incumbent_slots[0].min(incumbent_slots[1]));
             pt_second_half_min[index].push(incumbent_slots[2].min(incumbent_slots[3]));
             ft_first_half_min[index].push(ft_slots[0].min(ft_slots[1]));
@@ -4108,8 +4146,26 @@ LANES = {
                 "    slot0/median(slot1..3) = {slot0:.3} (our arm, per-round median over {} rounds){}",
                 ft_slot0_ratio[index].len(),
                 if slot0 > 1.0 + BALANCED_NULL_MAX_DEVIATION {
-                    " <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147. \
-                     Re-run with FT_H2H_ROUND_WARMUP=1 to see whether the null follows it"
+                    " <- the round's FIRST sample is COLD; NEGATIVE_EVIDENCE item 147"
+                } else {
+                    ""
+                }
+            );
+        }
+        // The incumbent's cold slot, reported for the same reason ours is. Since
+        // frankentorch-mdsmm.1 the A/A null compares first-WARM against last, so slot 0's excess
+        // no longer reaches the gate at all — which makes printing it mandatory rather than
+        // informative. It is where the recurring A/A failures came from: measured at 1.722 on
+        // conv2d_masked's incumbent-only arm and 0.825 on max_pool1d's, i.e. large in BOTH
+        // directions, while slots 1..3 sat inside 0.958..1.025.
+        if !pt_slot0_ratio[index].is_empty() {
+            let slot0 = median(pt_slot0_ratio[index].clone());
+            println!(
+                "    slot0/median(slot1..3) = {slot0:.3} (incumbent arm, per-round median over {} rounds){}",
+                pt_slot0_ratio[index].len(),
+                if (slot0 - 1.0).abs() > BALANCED_NULL_MAX_DEVIATION {
+                    " <- the incumbent's FIRST sample of each round differs from its warm ones; \
+                     excluded from the null by construction, reported here instead"
                 } else {
                     ""
                 }
@@ -4631,7 +4687,7 @@ fn group_norm_f32_kernel_breakdown(values: &[f32], weight: &[f32], bias: &[f32])
         .fold(f64::INFINITY, |acc, sample| acc.min(sample));
     // The lane's estimator: median of four samples per round, then the median of
     // those round medians. `median` here is the mean of the middle pair for an
-    // even count, matching the harness's `paired_slot_median`.
+    // even count.
     let mid = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
         let n = v.len();
