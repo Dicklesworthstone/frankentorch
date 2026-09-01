@@ -27633,6 +27633,49 @@ pub fn set_cholesky_nb(nb: usize) -> usize {
 /// across widths is pinned by reconstruction and the oracle, never by `to_bits()`.
 const CHOLESKY_NB_SHIPPED: usize = 64;
 
+/// f32 Cholesky blocking width, overridable for its own sweep. `frankentorch-valnx` /
+/// `frankentorch-stale-tuning-constants-lzku6` lane 1. 0 = the shipped default.
+///
+/// SEPARATE FROM THE f64 KNOB ON PURPOSE. The f64 twin was retuned 128 -> 64 this session at a
+/// certified 1.264x, but an f32 element is half the bytes, so the trailing GEMM's cache behaviour
+/// and the panel's rate both differ — the optimum is a property of the dtype's memory traffic, not
+/// of the algorithm, and assuming it transfers is the mistake this bead exists to stop.
+static CHOLESKY_NB_F32: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The shipped f32 blocking width. Still 128 — never swept; its f64 twin's move to 64 is
+/// EVIDENCE FOR LOOKING, not evidence for changing it.
+const CHOLESKY_NB_F32_SHIPPED: usize = 128;
+
+/// Override the f32 Cholesky blocking width; `0` restores the shipped default.
+#[doc(hidden)]
+pub fn set_cholesky_nb_f32(nb: usize) -> usize {
+    CHOLESKY_NB_F32.swap(nb, LuOrdering::Relaxed)
+}
+
+fn cholesky_nb_f32() -> usize {
+    match CHOLESKY_NB_F32.load(LuOrdering::Relaxed) {
+        0 => CHOLESKY_NB_F32_SHIPPED,
+        v => v.max(1),
+    }
+}
+
+/// Phase counters for the f32 blocked Cholesky, kept SEPARATE from the f64 ones so a process that
+/// runs both cannot conflate them — a timer bucket that wrapped two different things is exactly
+/// how ledger 277a invented a phase that did not exist.
+static CHOLESKY_F32_PANEL_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_F32_TRSM_NS: AtomicU64 = AtomicU64::new(0);
+static CHOLESKY_F32_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset the f32 blocked-Cholesky phase counters: `(panel_ns, trsm_ns, trailing_ns)`.
+#[doc(hidden)]
+pub fn cholesky_f32_stage_take_ns() -> (u64, u64, u64) {
+    (
+        CHOLESKY_F32_PANEL_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_F32_TRSM_NS.swap(0, LuOrdering::Relaxed),
+        CHOLESKY_F32_TRAIL_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 fn cholesky_nb() -> usize {
     match CHOLESKY_NB.load(LuOrdering::Relaxed) {
         0 => CHOLESKY_NB_SHIPPED,
@@ -28013,7 +28056,7 @@ pub fn cholesky_contiguous_f32(
     }
 
     let offset = meta.storage_offset();
-    const NB: usize = 128;
+    let nb_width = cholesky_nb_f32();
     let mut l = vec![0.0f32; n * n];
     for i in 0..n {
         for j in 0..=i {
@@ -28023,14 +28066,15 @@ pub fn cholesky_contiguous_f32(
 
     // Scratch reused across panels: the sub-diagonal panel L21 (m×nb), packed once
     // per panel. frankentorch-kgs4.61.
-    let mut l21 = vec![0.0f32; n * NB];
+    let mut l21 = vec![0.0f32; n * nb_width];
 
     let mut jb = 0;
     while jb < n {
-        let je = (jb + NB).min(n);
+        let je = (jb + nb_width).min(n);
         let nb = je - jb;
 
         // 1. Factor the diagonal block l[jb:je, jb:je] (lower) in place.
+        let __t_panel = std::time::Instant::now();
         for jj in jb..je {
             let mut s = l[jj * n + jj];
             for p in jb..jj {
@@ -28055,7 +28099,10 @@ pub fn cholesky_contiguous_f32(
             break;
         }
 
+        CHOLESKY_F32_PANEL_NS
+            .fetch_add(__t_panel.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
         // 2. TRSM: L21 = A21 · L11^{-T}, panel l[je:n, jb:je] in place.
+        let __t_trsm = std::time::Instant::now();
         let (head, tail) = l.split_at_mut(je * n);
         let trsm_body = |row: &mut [f32]| {
             for c in 0..nb {
@@ -28072,7 +28119,10 @@ pub fn cholesky_contiguous_f32(
             tail.chunks_mut(n).for_each(trsm_body);
         }
 
+        CHOLESKY_F32_TRSM_NS
+            .fetch_add(__t_trsm.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
         // 3. Trailing rank-nb update A22 -= L21 · L21^T, FUSED directly into l via a
+        let __t_trail = std::time::Instant::now();
         //    single accumulate-GEMM (alpha=-1, beta=1) — no temp buffer, no scalar
         //    subtract pass. Writes the full m×m rectangle; strict-upper zeroed after.
         //    frankentorch-kgs4.61.
@@ -28085,6 +28135,8 @@ pub fn cholesky_contiguous_f32(
         let l21: &[f32] = l21;
         gemm::sgemm_bt_sub_into(m, nb, m, l21, l21, &mut l, je * n + je, n);
 
+        CHOLESKY_F32_TRAIL_NS
+            .fetch_add(__t_trail.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
         jb = je;
     }
 

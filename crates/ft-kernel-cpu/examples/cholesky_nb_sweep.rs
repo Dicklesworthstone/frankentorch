@@ -56,6 +56,11 @@ fn spd(n: usize) -> Vec<f64> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let reps: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(9);
+    // arg 2 selects the dtype lane: "f32" sweeps `cholesky_contiguous_f32`, whose NB has NEVER
+    // been swept. Its f64 twin moved 128 -> 64 this session at a certified 1.264x, which is
+    // evidence for LOOKING and not evidence for changing it — an f32 element is half the bytes,
+    // so the trailing GEMM's cache behaviour and the panel's rate both differ.
+    let dtype = args.get(2).map_or("f64".to_owned(), std::clone::Clone::clone);
 
     let host = std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "unknown\n".to_owned());
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| "unknown".to_owned());
@@ -87,18 +92,44 @@ fn main() {
             if nb > n {
                 continue;
             }
-            ft_kernel_cpu::set_cholesky_nb(nb);
+            if dtype == "f32" {
+                ft_kernel_cpu::set_cholesky_nb_f32(nb);
+            } else {
+                ft_kernel_cpu::set_cholesky_nb(nb);
+            }
+            let a32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+            let meta32 = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
             for _ in 0..2 {
-                let _ = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("warm");
+                if dtype == "f32" {
+                    let _ = ft_kernel_cpu::cholesky_contiguous_f32(&a32, &meta32, false)
+                        .expect("warm f32");
+                } else {
+                    let _ = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("warm");
+                }
             }
             let mut cell = (f64::INFINITY, 0u64, 0u64, 0u64, 0u64);
             for _ in 0..reps {
                 let _ = ft_kernel_cpu::cholesky_stage_take_ns();
+                let _ = ft_kernel_cpu::cholesky_f32_stage_take_ns();
                 let started = std::time::Instant::now();
-                let f = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("chol");
-                let wall = started.elapsed().as_secs_f64() * 1_000.0;
-                std::hint::black_box(&f);
-                let (p, t, tr, z) = ft_kernel_cpu::cholesky_stage_take_ns();
+                let wall = if dtype == "f32" {
+                    let f = ft_kernel_cpu::cholesky_contiguous_f32(&a32, &meta32, false)
+                        .expect("chol f32");
+                    let w = started.elapsed().as_secs_f64() * 1_000.0;
+                    std::hint::black_box(&f);
+                    w
+                } else {
+                    let f = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("chol");
+                    let w = started.elapsed().as_secs_f64() * 1_000.0;
+                    std::hint::black_box(&f);
+                    w
+                };
+                let (p, t, tr, z) = if dtype == "f32" {
+                    let (p, t, tr) = ft_kernel_cpu::cholesky_f32_stage_take_ns();
+                    (p, t, tr, 0)
+                } else {
+                    ft_kernel_cpu::cholesky_stage_take_ns()
+                };
                 if wall < cell.0 {
                     cell = (wall, p, t, tr, z);
                 }
@@ -124,18 +155,28 @@ fn main() {
             }
         }
         ft_kernel_cpu::set_cholesky_nb(0);
+        ft_kernel_cpu::set_cholesky_nb_f32(0);
+        let a32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+        let meta32 = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
         let shipped = {
             let mut w = f64::INFINITY;
             for _ in 0..reps {
                 let started = std::time::Instant::now();
-                let f = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("chol");
-                w = w.min(started.elapsed().as_secs_f64() * 1_000.0);
-                std::hint::black_box(&f);
+                if dtype == "f32" {
+                    let f = ft_kernel_cpu::cholesky_contiguous_f32(&a32, &meta32, false)
+                        .expect("chol f32");
+                    w = w.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    std::hint::black_box(&f);
+                } else {
+                    let f = ft_kernel_cpu::cholesky_contiguous_f64(&a, &meta, false).expect("chol");
+                    w = w.min(started.elapsed().as_secs_f64() * 1_000.0);
+                    std::hint::black_box(&f);
+                }
             }
             w
         };
         println!(
-            "  BEST nb={} at {:.4} ms; SHIPPED (nb=128) {:.4} ms  ->  {:.4}x",
+            "  BEST nb={} at {:.4} ms; SHIPPED {:.4} ms  ->  {:.4}x   [dtype={dtype}]",
             best.1,
             best.0,
             shipped,
@@ -143,6 +184,7 @@ fn main() {
         );
     }
     ft_kernel_cpu::set_cholesky_nb(0);
+    ft_kernel_cpu::set_cholesky_nb_f32(0);
     println!(
         "\nREADING: a winning nb here is necessary and not sufficient — item 291 recorded a \
          bit-exact 1.28-1.40x isolation win that moved no lane. Any nb change is also NOT \
