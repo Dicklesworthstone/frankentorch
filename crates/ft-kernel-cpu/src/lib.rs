@@ -183,8 +183,15 @@ mod gemm {
     pub(crate) static DGEMM_BT_SUB_CENSUS: std::sync::Mutex<Vec<DgemmBtSubCensusEntry>> =
         std::sync::Mutex::new(Vec::new());
 
+    /// Which thread owns the `dgemm_bt_sub` census; `0` = unclaimed. `frankentorch-ebbew`.
+    pub(crate) static DGEMM_BT_SUB_CENSUS_OWNER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     fn dgemm_bt_sub_census_enabled() -> bool {
+        // This census pushes into a Mutex<Vec<_>> rather than bumping a counter, so ownership is
+        // tested at its single gate instead of at a write site. frankentorch-ebbew.
         DGEMM_BT_SUB_CENSUS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && super::stage_family_records(&DGEMM_BT_SUB_CENSUS_OWNER)
     }
 
     fn record_dgemm_bt_sub_census(entry: DgemmBtSubCensusEntry) {
@@ -351,6 +358,10 @@ mod gemm {
 
     /// How often the skinny split was ADMITTED and REJECTED. A sweep that cannot show equal
     /// admission across candidate widths has not equalised eligibility, whatever it set.
+    /// Which thread owns the skinny-split census; `0` = unclaimed, everyone counts.
+    /// `frankentorch-ebbew`. Claimed by `householder_skinny_census_take`.
+    pub(crate) static HOUSEHOLDER_SKINNY_OWNER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     pub(crate) static HOUSEHOLDER_SKINNY_ADMITTED: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     pub(crate) static HOUSEHOLDER_SKINNY_REJECTED: std::sync::atomic::AtomicU64 =
@@ -375,10 +386,14 @@ mod gemm {
             && rayon::current_num_threads() > 1
             && is_panel_shape
             && (m as u128) * (k as u128) * (n as u128) >= HOUSEHOLDER_SKINNY_MIN_FLOPS;
-        if admitted {
-            HOUSEHOLDER_SKINNY_ADMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            HOUSEHOLDER_SKINNY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Only the CENSUS is owned; `admitted` picks the ROUTE and must be computed for every
+        // thread regardless of who is counting. frankentorch-ebbew.
+        if super::stage_family_records(&HOUSEHOLDER_SKINNY_OWNER) {
+            if admitted {
+                HOUSEHOLDER_SKINNY_ADMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                HOUSEHOLDER_SKINNY_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         admitted
     }
@@ -25443,6 +25458,11 @@ pub fn lu_inv_nb() -> usize {
 }
 
 /// The two halves of `lu_inverse_from_factor_f64`, counted in the call.
+/// Which thread owns the getri phase timers AND its column census; `0` = unclaimed, everyone
+/// records. `frankentorch-ebbew`. ONE owner for both because they instrument the same call:
+/// `lu_inverse_half_take_ns`, `lu_inverse_extra_take_ns` and `lu_inverse_census_take` are three
+/// views of one `lu_inverse_from_factor_f64`, and a reader that drains one has claimed all three.
+static LU_INV_OWNER: AtomicU64 = AtomicU64::new(0);
 static LU_INV_FWD_NS: AtomicU64 = AtomicU64::new(0);
 static LU_INV_BACK_NS: AtomicU64 = AtomicU64::new(0);
 /// Identity materialisation (`Z = I`) and its two scratch allocations.
@@ -25479,6 +25499,7 @@ pub fn set_lu_inverse_census_enabled(on: bool) -> bool {
 /// Drain the getri column census: `(forward_colupd, backward_colupd, backward_zero_touch)`.
 #[doc(hidden)]
 pub fn lu_inverse_census_take() -> (u64, u64, u64) {
+    stage_family_claim(&LU_INV_OWNER);
     (
         LU_INV_FWD_COLUPD.swap(0, LuOrdering::Relaxed),
         LU_INV_BACK_COLUPD.swap(0, LuOrdering::Relaxed),
@@ -25489,6 +25510,7 @@ pub fn lu_inverse_census_take() -> (u64, u64, u64) {
 /// Read and reset the getri halves: `(forward_ns, backward_ns)`.
 #[doc(hidden)]
 pub fn lu_inverse_half_take_ns() -> (u64, u64) {
+    stage_family_claim(&LU_INV_OWNER);
     (
         LU_INV_FWD_NS.swap(0, LuOrdering::Relaxed),
         LU_INV_BACK_NS.swap(0, LuOrdering::Relaxed),
@@ -25504,6 +25526,7 @@ pub fn lu_inverse_half_take_ns() -> (u64, u64) {
 /// accounting close instead of hiding a known O(n^3) phase inside a word.
 #[doc(hidden)]
 pub fn lu_inverse_extra_take_ns() -> (u64, u64) {
+    stage_family_claim(&LU_INV_OWNER);
     (
         LU_INV_SETUP_NS.swap(0, LuOrdering::Relaxed),
         LU_INV_PERM_NS.swap(0, LuOrdering::Relaxed),
@@ -25584,6 +25607,9 @@ pub fn lu_pivot_swap_take_ns() -> (u64, u64) {
 /// Wall time in the blocked multi-RHS solve's FORWARD (`L y = Pb`) and BACK (`U x = y`) halves.
 /// `frankentorch-37sxo`: `inv` is 55-64% this solve, and the identity-structure lever only touches
 /// the forward half, so its share decides whether that lever is worth writing at all.
+/// Which thread owns the blocked multi-RHS solve's phase timers; `0` = unclaimed.
+/// `frankentorch-ebbew`. Claimed by `lu_solve_half_take_ns` and `lu_solve_perm_take_ns` alike.
+static LU_SOLVE_OWNER: AtomicU64 = AtomicU64::new(0);
 static LU_SOLVE_FWD_NS: AtomicU64 = AtomicU64::new(0);
 static LU_SOLVE_BACK_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -25631,12 +25657,14 @@ fn lu_solve_perm_rowwise() -> bool {
 /// Drain the f64 solve's pivot-permutation frame, in nanoseconds.
 #[doc(hidden)]
 pub fn lu_solve_perm_take_ns() -> u64 {
+    stage_family_claim(&LU_SOLVE_OWNER);
     LU_SOLVE_PERM_NS.swap(0, LuOrdering::Relaxed)
 }
 
 /// Drain the blocked f64 solve's forward/back split, in nanoseconds.
 #[doc(hidden)]
 pub fn lu_solve_half_take_ns() -> (u64, u64) {
+    stage_family_claim(&LU_SOLVE_OWNER);
     (
         LU_SOLVE_FWD_NS.swap(0, LuOrdering::Relaxed),
         LU_SOLVE_BACK_NS.swap(0, LuOrdering::Relaxed),
@@ -26219,7 +26247,7 @@ pub fn lu_solve_contiguous_f64(
         }
         out
     };
-    LU_SOLVE_PERM_NS.fetch_add(perm_start.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    stage_family_add(&LU_SOLVE_PERM_NS, &LU_SOLVE_OWNER, perm_start.elapsed().as_nanos() as u64);
 
     // BLAS-3 BLOCKED path for the large multi-RHS regime (the n-RHS inverse and
     // big batched solves). The column-parallel path below re-streams the WHOLE LU
@@ -26271,7 +26299,7 @@ pub fn lu_solve_contiguous_f64(
             k0 = pe;
         }
 
-        LU_SOLVE_FWD_NS.fetch_add(fwd_start.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(&LU_SOLVE_FWD_NS, &LU_SOLVE_OWNER, fwd_start.elapsed().as_nanos() as u64);
 
         // BACK: U · x = y, blocked over row panels from the bottom.
         let back_start = std::time::Instant::now();
@@ -26314,7 +26342,7 @@ pub fn lu_solve_contiguous_f64(
             }
             peb = k0;
         }
-        LU_SOLVE_BACK_NS.fetch_add(back_start.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(&LU_SOLVE_BACK_NS, &LU_SOLVE_OWNER, back_start.elapsed().as_nanos() as u64);
         return Ok(x);
     }
 
@@ -27029,7 +27057,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let mut panel = vec![0.0f64; n * nb_width];
     let mut ypanel = vec![0.0f64; nb_width * n];
 
-    LU_INV_SETUP_NS.fetch_add(__t_setup.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    stage_family_add(&LU_INV_SETUP_NS, &LU_INV_OWNER, __t_setup.elapsed().as_nanos() as u64);
     let __t_fwd = std::time::Instant::now();
     // FORWARD: L y = I, restricted to the columns that can be nonzero.
     let mut k0 = 0;
@@ -27045,7 +27073,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
                 if l_ik != 0.0 {
                     let xk = kk * n;
                     if census {
-                        LU_INV_FWD_COLUPD.fetch_add(cols as u64, LuOrdering::Relaxed);
+                        stage_family_add(&LU_INV_FWD_COLUPD, &LU_INV_OWNER, cols as u64);
                     }
                     for c in 0..cols {
                         x[xi + c] -= l_ik * x[xk + c];
@@ -27071,7 +27099,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         k0 = pe;
     }
 
-    LU_INV_FWD_NS.fetch_add(__t_fwd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    stage_family_add(&LU_INV_FWD_NS, &LU_INV_OWNER, __t_fwd.elapsed().as_nanos() as u64);
     let __t_back = std::time::Instant::now();
     // BACK: U z = y, over all n columns — `y` is triangular but `z` is dense.
     let mut peb = n;
@@ -27085,14 +27113,14 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
                 if u_ik != 0.0 {
                     let xk = kk * n;
                     if census {
-                        LU_INV_BACK_COLUPD.fetch_add(n as u64, LuOrdering::Relaxed);
+                        stage_family_add(&LU_INV_BACK_COLUPD, &LU_INV_OWNER, n as u64);
                         // A column-update is WASTED only if the source element is still zero. `y`
                         // is unit-lower-triangular, so row kk starts nonzero only in [0, kk] — but
                         // rows below have already been overwritten by a DENSE z, so this counts
                         // what is actually zero at the moment it is read, not what the structure
                         // predicted.
                         let zeros = (0..n).filter(|&c| x[xk + c] == 0.0).count() as u64;
-                        LU_INV_BACK_ZERO_TOUCH.fetch_add(zeros, LuOrdering::Relaxed);
+                        stage_family_add(&LU_INV_BACK_ZERO_TOUCH, &LU_INV_OWNER, zeros);
                     }
                     for c in 0..n {
                         x[xi + c] -= u_ik * x[xk + c];
@@ -27124,7 +27152,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         peb = k0;
     }
 
-    LU_INV_BACK_NS.fetch_add(__t_back.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    stage_family_add(&LU_INV_BACK_NS, &LU_INV_OWNER, __t_back.elapsed().as_nanos() as u64);
     let __t_perm = std::time::Instant::now();
     // A^-1[:, pivots[c]] = Z[:, c]. A COLUMN permutation, but done row by row: each row is 8n
     // bytes and both the source and destination row stay resident while it is scattered, so this
@@ -27136,7 +27164,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
             out[row + factor.pivots[c]] = x[row + c];
         }
     }
-    LU_INV_PERM_NS.fetch_add(__t_perm.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    stage_family_add(&LU_INV_PERM_NS, &LU_INV_OWNER, __t_perm.elapsed().as_nanos() as u64);
     out
 }
 
@@ -27786,6 +27814,10 @@ static CHOLESKY_ZERO_NS: AtomicU64 = AtomicU64::new(0);
 /// not a price production should pay for an instrument. The probe turns them on.
 static CHOLESKY_PANEL_CENSUS_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Which thread owns the Cholesky PANEL census; `0` = unclaimed. `frankentorch-ebbew`. Separate
+/// from `CHOLESKY_STAGE_OWNER`: the stage timers and the panel census are drained by different
+/// accessors and a reader of one has no business silencing the other.
+static CHOLESKY_PANEL_CENSUS_OWNER: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_PANEL_DIAG_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_PANEL_ROWS_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_PANEL_COLS: AtomicU64 = AtomicU64::new(0);
@@ -27800,6 +27832,7 @@ pub fn set_cholesky_panel_census_enabled(on: bool) -> bool {
 /// Drain the panel census: `(diagonal_ns, rows_ns, columns, multiply_accumulates)`.
 #[doc(hidden)]
 pub fn cholesky_panel_census_take() -> (u64, u64, u64, u64) {
+    stage_family_claim(&CHOLESKY_PANEL_CENSUS_OWNER);
     (
         CHOLESKY_PANEL_DIAG_NS.swap(0, LuOrdering::Relaxed),
         CHOLESKY_PANEL_ROWS_NS.swap(0, LuOrdering::Relaxed),
@@ -28046,8 +28079,11 @@ fn cholesky_panel_factor_f64(
         let d = s.sqrt();
         l[jj * n + jj] = d;
         if let Some(started) = diag_started {
-            CHOLESKY_PANEL_DIAG_NS
-                .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            stage_family_add(
+                &CHOLESKY_PANEL_DIAG_NS,
+                &CHOLESKY_PANEL_CENSUS_OWNER,
+                started.elapsed().as_nanos() as u64,
+            );
         }
         let rows_started = census.then(std::time::Instant::now);
         let rows = je - jj - 1;
@@ -28125,11 +28161,14 @@ fn cholesky_panel_factor_f64(
             }
         }
         if let Some(started) = rows_started {
-            CHOLESKY_PANEL_ROWS_NS
-                .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
-            CHOLESKY_PANEL_COLS.fetch_add(1, LuOrdering::Relaxed);
+            stage_family_add(
+                &CHOLESKY_PANEL_ROWS_NS,
+                &CHOLESKY_PANEL_CENSUS_OWNER,
+                started.elapsed().as_nanos() as u64,
+            );
+            stage_family_add(&CHOLESKY_PANEL_COLS, &CHOLESKY_PANEL_CENSUS_OWNER, 1);
             let macs = (jj - jb) as u64;
-            CHOLESKY_PANEL_MACS.fetch_add(macs * (rows as u64 + 1), LuOrdering::Relaxed);
+            stage_family_add(&CHOLESKY_PANEL_MACS, &CHOLESKY_PANEL_CENSUS_OWNER, macs * (rows as u64 + 1));
         }
     }
     Ok(())
@@ -35564,6 +35603,7 @@ pub fn householder_panel_width() -> usize {
 /// Drain the skinny-split admission census as `(admitted, rejected)`.
 #[doc(hidden)]
 pub fn householder_skinny_census_take() -> (u64, u64) {
+    stage_family_claim(&gemm::HOUSEHOLDER_SKINNY_OWNER);
     (
         gemm::HOUSEHOLDER_SKINNY_ADMITTED.swap(0, std::sync::atomic::Ordering::Relaxed),
         gemm::HOUSEHOLDER_SKINNY_REJECTED.swap(0, std::sync::atomic::Ordering::Relaxed),
@@ -35609,6 +35649,7 @@ pub fn set_dgemm_bt_sub_census_enabled(on: bool) -> bool {
 /// Drain the opt-in `dgemm_bt_sub_into` execution census. `frankentorch-valnx`.
 #[doc(hidden)]
 pub fn dgemm_bt_sub_census_take() -> Vec<DgemmBtSubCensusEntry> {
+    stage_family_claim(&gemm::DGEMM_BT_SUB_CENSUS_OWNER);
     let mut entries = gemm::DGEMM_BT_SUB_CENSUS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -40107,10 +40148,19 @@ fn thread_measurement_key() -> u64 {
 ///
 /// The check is one relaxed load against an RMW that was already happening, so the cost is noise.
 fn stage_family_add(counter: &AtomicU64, owner: &AtomicU64, ns: u64) {
-    let current = owner.load(LuOrdering::Relaxed);
-    if current == 0 || current == thread_measurement_key() {
+    if stage_family_records(owner) {
         counter.fetch_add(ns, LuOrdering::Relaxed);
     }
+}
+
+/// Whether the calling thread may record into a family. `0` = unclaimed, so everybody records.
+///
+/// Split out of [`stage_family_add`] for the censuses that are not a single `AtomicU64`: the
+/// `dgemm_bt_sub` census pushes into a `Mutex<Vec<_>>` and the skinny-split census sits behind its
+/// own predicate, so they need the ownership TEST rather than a counter helper.
+fn stage_family_records(owner: &AtomicU64) -> bool {
+    let current = owner.load(LuOrdering::Relaxed);
+    current == 0 || current == thread_measurement_key()
 }
 
 /// Claim a stage-counter family for the calling thread. Called by the family's drain accessor.
@@ -49207,6 +49257,98 @@ mod tests {
             bb as f64 / 1e6,
             bt as f64 / 1e6,
         );
+    }
+
+    /// The half-timers and censuses obey the same claim-point ownership — `frankentorch-ebbew`,
+    /// completing the conversion started in ledger 293f.
+    ///
+    /// SEPARATE FROM ITS STAGE-COUNTER SIBLING because these families are drained by different
+    /// accessors and own different atomics: `lu_solve` (forward/back/permute timers), `getri`
+    /// (its two half-timers, its setup/permute extras and its column census), and the Cholesky
+    /// PANEL census. A single test covering nine families would report "something is wrong"
+    /// rather than which one.
+    ///
+    /// THE SECOND HALF OF EACH PAIR IS THE POINT. Asserting only that a foreign thread contributes
+    /// zero is passed by an instrument that has been silently switched off — which is the precise
+    /// failure this conversion risked, since these counters have no enable flag and the `*_nb_sweep`
+    /// harnesses depend on them recording by default. So every family is also shown to still record
+    /// for its owner. Under load that check cannot be done by running a sweep; it belongs here.
+    #[test]
+    fn half_timers_and_censuses_ignore_other_threads_after_this_thread_claims_them() {
+        let _guard = STAGE_COUNTER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const N: usize = 96;
+
+        let diag: Vec<f64> = (0..N * N)
+            .map(|idx| {
+                let (i, j) = (idx / N, idx % N);
+                let v = (((i * 7 + j * 13) % 101) as f64 - 50.0) / 25.0;
+                if i == j { v + N as f64 } else { v }
+            })
+            .collect();
+        let mut spd = vec![0.0f64; N * N];
+        for i in 0..N {
+            for j in 0..i {
+                let v = ((i * 17 + j * 31) % 23) as f64 * 0.01 - 0.1;
+                spd[i * N + j] = v;
+                spd[j * N + i] = v;
+            }
+            spd[i * N + i] = N as f64;
+        }
+        let meta = TensorMeta::from_shape(vec![N, N], DType::F64, Device::Cpu);
+
+        // CLAIM every family under test for this thread.
+        let _ = super::lu_inverse_half_take_ns();
+        let _ = super::lu_inverse_extra_take_ns();
+        let _ = super::lu_inverse_census_take();
+        let _ = super::cholesky_panel_census_take();
+
+        let foreign = std::thread::spawn({
+            let diag = diag.clone();
+            let spd = spd.clone();
+            let meta = meta.clone();
+            move || {
+                for _ in 0..3 {
+                    let _ = super::inv_tensor_contiguous_f64(&diag, &meta).expect("foreign inv");
+                    let _ = super::cholesky_contiguous_f64(&spd, &meta, false)
+                        .expect("foreign cholesky");
+                }
+            }
+        });
+        foreign.join().expect("the foreign factorisation thread must not panic");
+
+        assert_eq!(
+            super::lu_inverse_half_take_ns(),
+            (0, 0),
+            "another thread's getri halves were attributed to this thread"
+        );
+        assert_eq!(
+            super::lu_inverse_extra_take_ns(),
+            (0, 0),
+            "another thread's getri setup/permute was attributed to this thread"
+        );
+        assert_eq!(
+            super::cholesky_panel_census_take(),
+            (0, 0, 0, 0),
+            "another thread's cholesky panel census was attributed to this thread"
+        );
+
+        // AND EACH INSTRUMENT IS STILL LIVE FOR ITS OWNER.
+        let _ = super::inv_tensor_contiguous_f64(&diag, &meta).expect("own inv");
+        let (fwd, back) = super::lu_inverse_half_take_ns();
+        assert!(fwd > 0 && back > 0, "own getri halves were not recorded: ({fwd}, {back})");
+        let (setup, perm) = super::lu_inverse_extra_take_ns();
+        assert!(setup > 0 || perm > 0, "own getri setup/permute was not recorded");
+
+        // The panel census is opt-in, so it has to be turned on to be observed at all; that is a
+        // property of the census, not of the ownership being tested.
+        let previous_census = super::set_cholesky_panel_census_enabled(true);
+        let _ = super::cholesky_panel_census_take();
+        let _ = super::cholesky_contiguous_f64(&spd, &meta, false).expect("own cholesky");
+        let (_diag_ns, _rows_ns, cols, macs) = super::cholesky_panel_census_take();
+        super::set_cholesky_panel_census_enabled(previous_census);
+        assert!(cols > 0 && macs > 0, "own cholesky panel census was not recorded");
     }
 
     /// Once a thread has DRAINED a stage-counter family, another thread's calls must not land in
