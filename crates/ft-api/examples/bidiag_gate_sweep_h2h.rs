@@ -1610,22 +1610,34 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // Its own profile is therefore required before retrying any representation/schedule
         // lever already rejected on full-eigh or two-stage storage.
         if ft_op == LinalgOp::Eigvalsh {
-            let (values, copy, reduce, ql, sort) = ft_kernel_cpu::eigvalsh_stage_profile_f64(&data, n);
+            let (values, phases) = ft_kernel_cpu::eigvalsh_stage_profile_f64(&data, n);
             std::hint::black_box(values);
-            let total = (copy + reduce + ql + sort).max(1) as f64;
+            let total =
+                (phases.pack_ns + phases.packed_tred2_ns + phases.values_ql_ns + phases.sort_ns)
+                    .max(1) as f64;
+            let reduce_total = phases.packed_tred2_ns.max(1) as f64;
             let ms = |v: u128| v as f64 / 1e6;
             let pct = |v: u128| 100.0 * v as f64 / total;
+            let reduce_pct = |v: u128| 100.0 * v as f64 / reduce_total;
             eprintln!(
                 "eigvalsh phases (same invocation, separate profiled call): pack {:.3} ms {:.0}%  \
-                 packed-tred2 {:.3} ms {:.0}%  values-QL {:.3} ms {:.0}%  sort {:.3} ms {:.0}%",
-                ms(copy),
-                pct(copy),
-                ms(reduce),
-                pct(reduce),
-                ms(ql),
-                pct(ql),
-                ms(sort),
-                pct(sort),
+                 packed-tred2 {:.3} ms {:.0}% [reflector {:.3} ms {:.0}%  \
+                 packed-ggs {:.3} ms {:.0}%  packed-update {:.3} ms {:.0}%]  \
+                 values-QL {:.3} ms {:.0}%  sort {:.3} ms {:.0}%",
+                ms(phases.pack_ns),
+                pct(phases.pack_ns),
+                ms(phases.packed_tred2_ns),
+                pct(phases.packed_tred2_ns),
+                ms(phases.reflector_ns),
+                reduce_pct(phases.reflector_ns),
+                ms(phases.ggs_ns),
+                reduce_pct(phases.ggs_ns),
+                ms(phases.packed_update_ns),
+                reduce_pct(phases.packed_update_ns),
+                ms(phases.values_ql_ns),
+                pct(phases.values_ql_ns),
+                ms(phases.sort_ns),
+                pct(phases.sort_ns),
             );
         }
 

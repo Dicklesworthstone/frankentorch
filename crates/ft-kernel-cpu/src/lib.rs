@@ -31100,13 +31100,83 @@ fn eigh_tred2_packed_full(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
 /// consumed by the full eigenvector back-transform. Keeping only the packed
 /// lower triangle halves the working set while preserving every scale, dot, and
 /// trailing-update operation in the same order over the same matrix entries.
+///
+/// The generic observer keeps the production instantiation free of clock reads:
+/// [`NoopValuesOnlyTred2Observer`] monomorphizes every hook away, while the
+/// profile-only instantiation records the three data-dependent parts of a
+/// Householder step. `frankentorch-mdsmm`.
+trait ValuesOnlyTred2Observer {
+    type Stamp;
+
+    fn started(&mut self) -> Self::Stamp;
+    fn finished_reflector(&mut self, started: Self::Stamp);
+    fn finished_ggs(&mut self, started: Self::Stamp);
+    fn finished_update(&mut self, started: Self::Stamp);
+}
+
+struct NoopValuesOnlyTred2Observer;
+
+impl ValuesOnlyTred2Observer for NoopValuesOnlyTred2Observer {
+    type Stamp = ();
+
+    #[inline]
+    fn started(&mut self) {}
+
+    #[inline]
+    fn finished_reflector(&mut self, _started: Self::Stamp) {}
+
+    #[inline]
+    fn finished_ggs(&mut self, _started: Self::Stamp) {}
+
+    #[inline]
+    fn finished_update(&mut self, _started: Self::Stamp) {}
+}
+
+#[derive(Default)]
+struct TimedValuesOnlyTred2Observer {
+    reflector_ns: u128,
+    ggs_ns: u128,
+    update_ns: u128,
+}
+
+impl ValuesOnlyTred2Observer for TimedValuesOnlyTred2Observer {
+    type Stamp = std::time::Instant;
+
+    #[inline]
+    fn started(&mut self) -> Self::Stamp {
+        std::time::Instant::now()
+    }
+
+    #[inline]
+    fn finished_reflector(&mut self, started: Self::Stamp) {
+        self.reflector_ns += started.elapsed().as_nanos();
+    }
+
+    #[inline]
+    fn finished_ggs(&mut self, started: Self::Stamp) {
+        self.ggs_ns += started.elapsed().as_nanos();
+    }
+
+    #[inline]
+    fn finished_update(&mut self, started: Self::Stamp) {
+        self.update_ns += started.elapsed().as_nanos();
+    }
+}
+
 #[allow(clippy::needless_range_loop)]
-fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
+    n: usize,
+    lower: &mut [f64],
+    d: &mut [f64],
+    e: &mut [f64],
+    observer: &mut P,
+) {
     for i in (1..n).rev() {
         let l = i - 1;
         let row_i_start = lower_packed_index(i, 0);
         let mut h = 0.0;
         let mut scale = 0.0;
+        let reflector_started = observer.started();
         if l > 0 {
             let (previous_rows, current_and_after) = lower.split_at_mut(row_i_start);
             let row_i = &mut current_and_after[..=i];
@@ -31115,6 +31185,7 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
             }
             if scale == 0.0 {
                 e[i] = row_i[l];
+                observer.finished_reflector(reflector_started);
             } else {
                 for value in &mut row_i[..=l] {
                     *value /= scale;
@@ -31126,6 +31197,8 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
                 h -= f * g;
                 row_i[l] = f - g;
                 f = 0.0;
+                observer.finished_reflector(reflector_started);
+                let ggs_started = observer.started();
                 if eigvalsh_grouped_ggs() && l >= 8 {
                     // Keep each output's ascending-k sum intact while carrying
                     // four independent dependency chains. Unlike full eigh this
@@ -31196,6 +31269,8 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
                         f += e[j] * row_i[j];
                     }
                 }
+                observer.finished_ggs(ggs_started);
+                let update_started = observer.started();
                 let hh = f / (h + h);
                 for j in 0..=l {
                     f = row_i[j];
@@ -31207,9 +31282,11 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
                         row_j[k] -= f * e[k] + gg * row_i[k];
                     }
                 }
+                observer.finished_update(update_started);
             }
         } else {
             e[i] = lower[row_i_start + l];
+            observer.finished_reflector(reflector_started);
         }
         d[i] = h;
     }
@@ -31218,6 +31295,11 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
     for i in 0..n {
         d[i] = lower[lower_packed_index(i, i)];
     }
+}
+
+fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+    let mut observer = NoopValuesOnlyTred2Observer;
+    eigh_tred2_values_only_with_observer(n, lower, d, e, &mut observer);
 }
 
 /// Eigenvalues-only tridiagonalization over the lower triangle of a row-major
@@ -33565,6 +33647,24 @@ pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f6
     Ok(d)
 }
 
+/// Stage timings for the production packed values-only eigensolver route.
+///
+/// `packed_tred2_ns` brackets the entire values-only reduction. Its three inner
+/// fields subdivide the reflector construction, packed `A*v`/`g` calculation,
+/// and packed rank-2 update respectively; their sum can be smaller because the
+/// enclosing reduction also performs loop and terminal-diagonal bookkeeping.
+#[derive(Debug, Clone, Copy, Default)]
+#[doc(hidden)]
+pub struct EigvalshStageTimings {
+    pub pack_ns: u128,
+    pub packed_tred2_ns: u128,
+    pub reflector_ns: u128,
+    pub ggs_ns: u128,
+    pub packed_update_ns: u128,
+    pub values_ql_ns: u128,
+    pub sort_ns: u128,
+}
+
 /// Profile the production packed values-only eigensolver route for a contiguous `n × n` matrix.
 ///
 /// This deliberately does not reuse [`eigh_stage_profile_f64`]: eigvalsh skips both eigenvector
@@ -33572,8 +33672,11 @@ pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f6
 /// this route never executes. The returned eigenvalues follow the same copy → packed tred2 →
 /// values-only QL → sort sequence as [`eigvalsh_contiguous_f64`]. `frankentorch-mdsmm`.
 #[doc(hidden)]
-pub fn eigvalsh_stage_profile_f64(data: &[f64], n: usize) -> (Vec<f64>, u128, u128, u128, u128) {
-    assert!(data.len() >= n * n, "stage profiler needs a contiguous n x n matrix");
+pub fn eigvalsh_stage_profile_f64(data: &[f64], n: usize) -> (Vec<f64>, EigvalshStageTimings) {
+    assert!(
+        data.len() >= n * n,
+        "stage profiler needs a contiguous n x n matrix"
+    );
     let copy_started = std::time::Instant::now();
     let mut lower = vec![0.0f64; n * (n + 1) / 2];
     for i in 0..n {
@@ -33581,19 +33684,31 @@ pub fn eigvalsh_stage_profile_f64(data: &[f64], n: usize) -> (Vec<f64>, u128, u1
         let src = i * n;
         lower[dst..=dst + i].copy_from_slice(&data[src..=src + i]);
     }
-    let copy_ns = copy_started.elapsed().as_nanos();
+    let pack_ns = copy_started.elapsed().as_nanos();
     let mut d = vec![0.0f64; n];
     let mut e = vec![0.0f64; n];
     let reduce_started = std::time::Instant::now();
-    eigh_tred2_values_only(n, &mut lower, &mut d, &mut e);
-    let reduce_ns = reduce_started.elapsed().as_nanos();
+    let mut observer = TimedValuesOnlyTred2Observer::default();
+    eigh_tred2_values_only_with_observer(n, &mut lower, &mut d, &mut e, &mut observer);
+    let packed_tred2_ns = reduce_started.elapsed().as_nanos();
     let ql_started = std::time::Instant::now();
     eigh_tql2_values_only(n, &mut d, &mut e);
-    let ql_ns = ql_started.elapsed().as_nanos();
+    let values_ql_ns = ql_started.elapsed().as_nanos();
     let sort_started = std::time::Instant::now();
     d.sort_by(f64::total_cmp);
     let sort_ns = sort_started.elapsed().as_nanos();
-    (d, copy_ns, reduce_ns, ql_ns, sort_ns)
+    (
+        d,
+        EigvalshStageTimings {
+            pack_ns,
+            packed_tred2_ns,
+            reflector_ns: observer.reflector_ns,
+            ggs_ns: observer.ggs_ns,
+            packed_update_ns: observer.update_ns,
+            values_ql_ns,
+            sort_ns,
+        },
+    )
 }
 
 fn eigh_pythag_f32(a: f32, b: f32) -> f32 {
@@ -70402,7 +70517,7 @@ mod tests {
         }
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
         let production = super::eigvalsh_contiguous_f64(&a, &meta).expect("production eigvalsh");
-        let (profiled, copy, reduce, ql, sort) = super::eigvalsh_stage_profile_f64(&a, n);
+        let (profiled, phases) = super::eigvalsh_stage_profile_f64(&a, n);
         assert_eq!(production.len(), profiled.len());
         for (index, (production, profiled)) in production.iter().zip(&profiled).enumerate() {
             assert_eq!(
@@ -70411,7 +70526,16 @@ mod tests {
                 "profiled values-only route diverged at eigenvalue {index}"
             );
         }
-        assert!(copy > 0 && reduce > 0 && ql > 0 && sort > 0, "missing profiled stage");
+        assert!(
+            phases.pack_ns > 0
+                && phases.packed_tred2_ns > 0
+                && phases.reflector_ns > 0
+                && phases.ggs_ns > 0
+                && phases.packed_update_ns > 0
+                && phases.values_ql_ns > 0
+                && phases.sort_ns > 0,
+            "missing profiled stage: {phases:?}"
+        );
     }
 
     #[test]
