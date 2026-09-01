@@ -22,6 +22,21 @@
 #
 # Usage:  scripts/measurement_window_guard.sh && <your timed run>
 #         scripts/measurement_window_guard.sh --max-load 30 && ...
+#
+# NEVER PUT THIS IN A PIPELINE. `if guard 2>&1 | head -3; then <measure>; fi` tests the PIPELINE's
+# status, which is `head`'s, which is always 0 — so the guard prints REFUSING TO MEASURE and the
+# measurement runs anyway, looking guarded. That voided a full frankentorch-g0wpj decomposition and
+# A/B beside another project's live benchmark (frankentorch-csdoc). The verdict is the EXIT CODE;
+# consume that, never the stdout:
+#
+#     guard >/dev/null 2>&1 || exit 1       # correct
+#     if guard >/dev/null 2>&1; then ...    # correct
+#     if guard 2>&1 | head -3; then ...     # SILENTLY DEFEATED
+#
+# Every scripted harness in this repo gets it right by calling the guard as a bare command; every
+# failure so far has been a hand-written one-liner. `feedback_exit_code_and_shell_traps` records
+# the same trap in the reporting case, where it merely yields a wrong number — here it yields a
+# wrong number that looks guarded, which is worse.
 set -uo pipefail
 
 MAX_LOAD="${FT_GUARD_MAX_LOAD:-35}"
