@@ -25565,9 +25565,14 @@ fn lu_trsm_row_accum() -> bool {
 static LU_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
 static LU_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Which thread owns the getrf stage counters; `0` = unclaimed, everyone records.
+/// `frankentorch-ebbew`. See [`stage_family_add`] for why the claim happens at the drain.
+static LU_STAGE_OWNER: AtomicU64 = AtomicU64::new(0);
+
 /// Read and reset the getrf phase counters: `(panel_ns, solve_ns, trailing_ns)`.
 #[doc(hidden)]
 pub fn lu_pivot_swap_take_ns() -> (u64, u64) {
+    stage_family_claim(&LU_STAGE_OWNER);
     (
         LU_PIVOT_NS.swap(0, LuOrdering::Relaxed),
         LU_SWAP_NS.swap(0, LuOrdering::Relaxed),
@@ -25639,6 +25644,7 @@ pub fn lu_solve_half_take_ns() -> (u64, u64) {
 }
 
 pub fn lu_stage_take_ns() -> (u64, u64, u64) {
+    stage_family_claim(&LU_STAGE_OWNER);
     (
         LU_PANEL_NS.swap(0, LuOrdering::Relaxed),
         LU_SOLVE_NS.swap(0, LuOrdering::Relaxed),
@@ -25675,7 +25681,7 @@ fn lu_factor_panel_recursive_f64(
                     max_row = i;
                 }
             }
-            LU_PIVOT_NS.fetch_add(__t_piv.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            stage_family_add(&LU_PIVOT_NS, &LU_STAGE_OWNER, __t_piv.elapsed().as_nanos() as u64);
             ipiv[k] = max_row;
             let __t_swap = std::time::Instant::now();
             if max_row != k {
@@ -25684,7 +25690,7 @@ fn lu_factor_panel_recursive_f64(
                     lu.swap(k * n + j, max_row * n + j);
                 }
             }
-            LU_SWAP_NS.fetch_add(__t_swap.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            stage_family_add(&LU_SWAP_NS, &LU_STAGE_OWNER, __t_swap.elapsed().as_nanos() as u64);
             let diag = lu[k * n + k];
             if diag.abs() < singular_tol {
                 for i in (k + 1)..n {
@@ -25806,7 +25812,7 @@ pub fn lu_factor_contiguous_nb_f64(
         // Every panel, including the final one with no U12/A22 work, belongs to the
         // panel stage. Commit it before the terminal exit so `lu_stage_take_ns()`
         // accounts for the complete LU factorization.
-        LU_PANEL_NS.fetch_add(__t_panel.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(&LU_PANEL_NS, &LU_STAGE_OWNER, __t_panel.elapsed().as_nanos() as u64);
         if tcols == 0 {
             break;
         }
@@ -25819,7 +25825,7 @@ pub fn lu_factor_contiguous_nb_f64(
         // frankentorch-kgs4.62.
         gemm::ltrsm_unit_lower_panel_f64(&mut lu, n, k0, pe);
 
-        LU_SOLVE_NS.fetch_add(__t_solve.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(&LU_SOLVE_NS, &LU_STAGE_OWNER, __t_solve.elapsed().as_nanos() as u64);
         let __t_trail = std::time::Instant::now();
         // --- 3. Trailing update A22 -= L21 * U12, FUSED directly into lu ---
         // Pack L21 (rows pe..n, cols k0..pe) -> contiguous [trows x kb] and U12
@@ -25841,7 +25847,7 @@ pub fn lu_factor_contiguous_nb_f64(
             u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
         }
         gemm::dgemm_sub_into(trows, kb, tcols, &l21, &u12, &mut lu, pe * n + pe, n);
-        LU_TRAIL_NS.fetch_add(__t_trail.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(&LU_TRAIL_NS, &LU_STAGE_OWNER, __t_trail.elapsed().as_nanos() as u64);
 
         k0 = pe;
     }
@@ -27758,6 +27764,9 @@ pub fn winograd_conv2d_3x3_s1_f32(
     output
 }
 
+/// Which thread owns the f64 Cholesky stage counters; `0` = unclaimed, everyone records.
+/// `frankentorch-ebbew`. See [`stage_family_add`] for why the claim happens at the drain.
+static CHOLESKY_STAGE_OWNER: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_PANEL_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_TRSM_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_TRAILING_NS: AtomicU64 = AtomicU64::new(0);
@@ -27803,6 +27812,7 @@ pub fn cholesky_panel_census_take() -> (u64, u64, u64, u64) {
 /// `(panel_ns, trsm_ns, trailing_update_ns, upper_zero_ns)`.
 #[doc(hidden)]
 pub fn cholesky_stage_take_ns() -> (u64, u64, u64, u64) {
+    stage_family_claim(&CHOLESKY_STAGE_OWNER);
     (
         CHOLESKY_PANEL_NS.swap(0, LuOrdering::Relaxed),
         CHOLESKY_TRSM_NS.swap(0, LuOrdering::Relaxed),
@@ -27924,6 +27934,10 @@ pub fn cholesky_nb_f32() -> usize {
 /// Phase counters for the f32 blocked Cholesky, kept SEPARATE from the f64 ones so a process that
 /// runs both cannot conflate them — a timer bucket that wrapped two different things is exactly
 /// how ledger 277a invented a phase that did not exist.
+/// Which thread owns the f32 Cholesky stage counters. SEPARATE from the f64 owner for the
+/// same reason the counters are separate: a shared bucket across two dtypes is how ledger
+/// 277a invented a phase that did not exist. `frankentorch-ebbew`.
+static CHOLESKY_F32_STAGE_OWNER: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_F32_PANEL_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_F32_TRSM_NS: AtomicU64 = AtomicU64::new(0);
 static CHOLESKY_F32_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
@@ -27931,6 +27945,7 @@ static CHOLESKY_F32_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
 /// Read and reset the f32 blocked-Cholesky phase counters: `(panel_ns, trsm_ns, trailing_ns)`.
 #[doc(hidden)]
 pub fn cholesky_f32_stage_take_ns() -> (u64, u64, u64) {
+    stage_family_claim(&CHOLESKY_F32_STAGE_OWNER);
     (
         CHOLESKY_F32_PANEL_NS.swap(0, LuOrdering::Relaxed),
         CHOLESKY_F32_TRSM_NS.swap(0, LuOrdering::Relaxed),
@@ -28205,9 +28220,10 @@ pub fn cholesky_contiguous_f64(
         let panel_started = std::time::Instant::now();
         cholesky_panel_factor_f64(&mut l, n, jb, je)?;
 
-        CHOLESKY_PANEL_NS.fetch_add(
+        stage_family_add(
+            &CHOLESKY_PANEL_NS,
+            &CHOLESKY_STAGE_OWNER,
             panel_started.elapsed().as_nanos() as u64,
-            LuOrdering::Relaxed,
         );
 
         let m = n - je; // trailing rows below the panel
@@ -28234,9 +28250,10 @@ pub fn cholesky_contiguous_f64(
             tail.chunks_mut(n).for_each(trsm_body);
         }
 
-        CHOLESKY_TRSM_NS.fetch_add(
+        stage_family_add(
+            &CHOLESKY_TRSM_NS,
+            &CHOLESKY_STAGE_OWNER,
             trsm_started.elapsed().as_nanos() as u64,
-            LuOrdering::Relaxed,
         );
 
         // 3. Trailing rank-nb update A22 -= L21 · L21^T, FUSED directly into l.
@@ -28255,9 +28272,10 @@ pub fn cholesky_contiguous_f64(
         }
         let l21: &[f64] = l21;
         gemm::dgemm_bt_sub_into(m, nb, m, l21, l21, &mut l, je * n + je, n);
-        CHOLESKY_TRAILING_NS.fetch_add(
+        stage_family_add(
+            &CHOLESKY_TRAILING_NS,
+            &CHOLESKY_STAGE_OWNER,
             trailing_started.elapsed().as_nanos() as u64,
-            LuOrdering::Relaxed,
         );
 
         jb = je;
@@ -28274,9 +28292,10 @@ pub fn cholesky_contiguous_f64(
         }
     }
 
-    CHOLESKY_ZERO_NS.fetch_add(
+    stage_family_add(
+        &CHOLESKY_ZERO_NS,
+        &CHOLESKY_STAGE_OWNER,
         zero_started.elapsed().as_nanos() as u64,
-        LuOrdering::Relaxed,
     );
 
     if upper {
@@ -28363,8 +28382,11 @@ pub fn cholesky_contiguous_f32(
             break;
         }
 
-        CHOLESKY_F32_PANEL_NS
-            .fetch_add(__t_panel.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(
+            &CHOLESKY_F32_PANEL_NS,
+            &CHOLESKY_F32_STAGE_OWNER,
+            __t_panel.elapsed().as_nanos() as u64,
+        );
         // 2. TRSM: L21 = A21 · L11^{-T}, panel l[je:n, jb:je] in place.
         let __t_trsm = std::time::Instant::now();
         let (head, tail) = l.split_at_mut(je * n);
@@ -28383,8 +28405,11 @@ pub fn cholesky_contiguous_f32(
             tail.chunks_mut(n).for_each(trsm_body);
         }
 
-        CHOLESKY_F32_TRSM_NS
-            .fetch_add(__t_trsm.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(
+            &CHOLESKY_F32_TRSM_NS,
+            &CHOLESKY_F32_STAGE_OWNER,
+            __t_trsm.elapsed().as_nanos() as u64,
+        );
         // 3. Trailing rank-nb update A22 -= L21 · L21^T, FUSED directly into l via a
         let __t_trail = std::time::Instant::now();
         //    single accumulate-GEMM (alpha=-1, beta=1) — no temp buffer, no scalar
@@ -28399,8 +28424,11 @@ pub fn cholesky_contiguous_f32(
         let l21: &[f32] = l21;
         gemm::sgemm_bt_sub_into(m, nb, m, l21, l21, &mut l, je * n + je, n);
 
-        CHOLESKY_F32_TRAIL_NS
-            .fetch_add(__t_trail.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+        stage_family_add(
+            &CHOLESKY_F32_TRAIL_NS,
+            &CHOLESKY_F32_STAGE_OWNER,
+            __t_trail.elapsed().as_nanos() as u64,
+        );
         jb = je;
     }
 
@@ -33496,6 +33524,37 @@ pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f6
     eigh_tql2_values_only(n, &mut d, &mut e);
     d.sort_by(f64::total_cmp);
     Ok(d)
+}
+
+/// Profile the production packed values-only eigensolver route for a contiguous `n × n` matrix.
+///
+/// This deliberately does not reuse [`eigh_stage_profile_f64`]: eigvalsh skips both eigenvector
+/// accumulations, so full-eigh's reduction/backtransform/QL split would attribute time to work
+/// this route never executes. The returned eigenvalues follow the same copy → packed tred2 →
+/// values-only QL → sort sequence as [`eigvalsh_contiguous_f64`]. `frankentorch-mdsmm`.
+#[doc(hidden)]
+pub fn eigvalsh_stage_profile_f64(data: &[f64], n: usize) -> (Vec<f64>, u128, u128, u128, u128) {
+    assert!(data.len() >= n * n, "stage profiler needs a contiguous n x n matrix");
+    let copy_started = std::time::Instant::now();
+    let mut lower = vec![0.0f64; n * (n + 1) / 2];
+    for i in 0..n {
+        let dst = lower_packed_index(i, 0);
+        let src = i * n;
+        lower[dst..=dst + i].copy_from_slice(&data[src..=src + i]);
+    }
+    let copy_ns = copy_started.elapsed().as_nanos();
+    let mut d = vec![0.0f64; n];
+    let mut e = vec![0.0f64; n];
+    let reduce_started = std::time::Instant::now();
+    eigh_tred2_values_only(n, &mut lower, &mut d, &mut e);
+    let reduce_ns = reduce_started.elapsed().as_nanos();
+    let ql_started = std::time::Instant::now();
+    eigh_tql2_values_only(n, &mut d, &mut e);
+    let ql_ns = ql_started.elapsed().as_nanos();
+    let sort_started = std::time::Instant::now();
+    d.sort_by(f64::total_cmp);
+    let sort_ns = sort_started.elapsed().as_nanos();
+    (d, copy_ns, reduce_ns, ql_ns, sort_ns)
 }
 
 fn eigh_pythag_f32(a: f32, b: f32) -> f32 {
@@ -40025,6 +40084,38 @@ fn thread_measurement_key() -> u64 {
         static THREAD_KEY: u64 = NEXT_THREAD_KEY.fetch_add(1, LuOrdering::Relaxed);
     }
     THREAD_KEY.with(|key| *key)
+}
+
+/// Record `ns` into a drain-style stage counter, but only if the calling thread OWNS that
+/// counter's family. `frankentorch-ebbew`, extended from ORMQR to the getrf and Cholesky stages.
+///
+/// # Why ownership is CLAIMED AT THE DRAIN rather than by an enable call
+///
+/// ORMQR could narrow its existing `set_ormqr_stage_profile_enabled` because it had one. These
+/// families have no enable flag: they record unconditionally and the four `*_nb_sweep` harnesses
+/// simply call `*_stage_take_ns()` around a kernel call. Requiring an explicit enable would have
+/// silently zeroed every phase column in those sweeps, which is a worse bug than the one being
+/// fixed — an instrument that reads 0 for a phase that ran is exactly item 292's trap.
+///
+/// So `0` means UNCLAIMED and everyone records, which is today's behaviour and what production and
+/// the sweeps get. A thread claims the family by DRAINING it ([`stage_family_claim`]), which is
+/// precisely the `take(); kernel(); take()` idiom every reader already uses — so the claim lands at
+/// the right instant without any caller changing. After that, concurrent threads running the same
+/// kernel record nothing, which is the whole point: `cargo test` runs tests in parallel threads of
+/// one process, and a peer test's getrf was free to add its panel time to counters another test was
+/// about to read.
+///
+/// The check is one relaxed load against an RMW that was already happening, so the cost is noise.
+fn stage_family_add(counter: &AtomicU64, owner: &AtomicU64, ns: u64) {
+    let current = owner.load(LuOrdering::Relaxed);
+    if current == 0 || current == thread_measurement_key() {
+        counter.fetch_add(ns, LuOrdering::Relaxed);
+    }
+}
+
+/// Claim a stage-counter family for the calling thread. Called by the family's drain accessor.
+fn stage_family_claim(owner: &AtomicU64) {
+    owner.store(thread_measurement_key(), LuOrdering::Relaxed);
 }
 
 /// Enable or disable profiling of `ormqr_blocked_f64`; returns the previous setting.
@@ -49118,6 +49209,103 @@ mod tests {
         );
     }
 
+    /// Once a thread has DRAINED a stage-counter family, another thread's calls must not land in
+    /// it — `frankentorch-ebbew`, extending the ORMQR fix to the getrf and Cholesky stages.
+    ///
+    /// These families have no enable flag: they record unconditionally, because the `*_nb_sweep`
+    /// harnesses just call `*_stage_take_ns()` around a kernel call. So ownership is claimed at the
+    /// DRAIN — `0` means unclaimed and everyone records, which is what production and the sweeps
+    /// keep getting — and the `take(); kernel(); take()` idiom every reader already uses puts the
+    /// claim at exactly the right instant.
+    ///
+    /// The assertion is DETERMINISTIC rather than a timing comparison: after this thread claims,
+    /// a foreign thread's factorisation must contribute EXACTLY ZERO, not merely "less". A
+    /// threshold on nanoseconds would be a flake generator, and this arc has spent enough on those.
+    /// Each family is then shown to still record for its owner, because a fix that simply stopped
+    /// recording would pass every zero-assertion here.
+    #[test]
+    fn stage_counters_ignore_other_threads_after_this_thread_claims_them() {
+        let _guard = STAGE_COUNTER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const N: usize = 96;
+
+        let diag: Vec<f64> = (0..N * N)
+            .map(|idx| {
+                let (i, j) = (idx / N, idx % N);
+                let v = (((i * 7 + j * 13) % 101) as f64 - 50.0) / 25.0;
+                if i == j { v + N as f64 } else { v }
+            })
+            .collect();
+        let mut spd = vec![0.0f64; N * N];
+        for i in 0..N {
+            for j in 0..i {
+                let v = ((i * 17 + j * 31) % 23) as f64 * 0.01 - 0.1;
+                spd[i * N + j] = v;
+                spd[j * N + i] = v;
+            }
+            spd[i * N + i] = N as f64;
+        }
+        let spd32: Vec<f32> = spd.iter().map(|&v| v as f32).collect();
+        let meta = TensorMeta::from_shape(vec![N, N], DType::F64, Device::Cpu);
+        let meta32 = TensorMeta::from_shape(vec![N, N], DType::F32, Device::Cpu);
+
+        // CLAIM all three families for this thread.
+        let _ = super::lu_stage_take_ns();
+        let _ = super::cholesky_stage_take_ns();
+        let _ = super::cholesky_f32_stage_take_ns();
+
+        // A foreign thread runs every kernel these families instrument. Spawned after the claim
+        // and joined before the drain, so its work is inside the window by construction.
+        let foreign = std::thread::spawn({
+            let diag = diag.clone();
+            let spd = spd.clone();
+            let spd32 = spd32.clone();
+            let meta = meta.clone();
+            let meta32 = meta32.clone();
+            move || {
+                for _ in 0..4 {
+                    let _ = super::lu_factor_contiguous_f64(&diag, &meta).expect("foreign getrf");
+                    let _ = super::cholesky_contiguous_f64(&spd, &meta, false)
+                        .expect("foreign cholesky");
+                    let _ = super::cholesky_contiguous_f32(&spd32, &meta32, false)
+                        .expect("foreign cholesky f32");
+                }
+            }
+        });
+        foreign.join().expect("the foreign factorisation thread must not panic");
+
+        assert_eq!(
+            super::lu_stage_take_ns(),
+            (0, 0, 0),
+            "another thread's getrf was attributed to this thread's stage counters"
+        );
+        assert_eq!(
+            super::cholesky_stage_take_ns(),
+            (0, 0, 0, 0),
+            "another thread's cholesky was attributed to this thread's stage counters"
+        );
+        assert_eq!(
+            super::cholesky_f32_stage_take_ns(),
+            (0, 0, 0),
+            "another thread's f32 cholesky was attributed to this thread's stage counters"
+        );
+
+        // AND THE INSTRUMENTS ARE STILL LIVE FOR THEIR OWNER. Without this half, silently
+        // disabling every counter would pass the three assertions above.
+        let _ = super::lu_factor_contiguous_f64(&diag, &meta).expect("own getrf");
+        let (panel, _solve, _trail) = super::lu_stage_take_ns();
+        assert!(panel > 0, "own getrf panel was not recorded");
+
+        let _ = super::cholesky_contiguous_f64(&spd, &meta, false).expect("own cholesky");
+        let (panel, _trsm, _trailing, _zero) = super::cholesky_stage_take_ns();
+        assert!(panel > 0, "own cholesky panel was not recorded");
+
+        let _ = super::cholesky_contiguous_f32(&spd32, &meta32, false).expect("own cholesky f32");
+        let (panel, _trsm, _trail) = super::cholesky_f32_stage_take_ns();
+        assert!(panel > 0, "own f32 cholesky panel was not recorded");
+    }
+
     /// Where does getrf's time go? Decides whether a recursive dgetrf2 panel is worth it.
     ///
     /// getrf is the worst measured single-matrix loss (14.715x vs torch at n=512), and
@@ -49126,6 +49314,9 @@ mod tests {
     /// BLAS-3 dgeqrt3 — but that only matters if the panel actually dominates.
     #[test]
     fn getrf_phase_attribution() {
+        let _guard = STAGE_COUNTER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for n in [512usize, 1024] {
             let a: Vec<f64> = (0..n * n)
                 .map(|idx| {
@@ -49634,6 +49825,15 @@ mod tests {
     /// One mutex, held by both, is the whole fix; it is the same idiom as
     /// `CONV2D_DWEIGHT_STREAM_TEST_GUARD`. Any future test that enables this profile must take it.
     static ORMQR_PROFILE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Held by every test that DRAINS a stage-counter family — `frankentorch-ebbew`.
+    ///
+    /// Ownership (claimed at the drain) stops a non-reading thread polluting the counters. It does
+    /// not order two READERS: both claim, and whichever claims second silently owns the counters
+    /// the first is still accumulating into. One guard across all families rather than one per
+    /// family, deliberately — these are cheap tests, and a future reader that forgets which family
+    /// it shares with is exactly the mistake this is meant to be too coarse to allow.
+    static STAGE_COUNTER_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// ORMQR profiling must be owned by the thread that enabled it — `frankentorch-ebbew`.
     ///
@@ -70042,6 +70242,37 @@ mod tests {
     }
 
     #[test]
+    fn eigvalsh_stage_profile_matches_production_values_only_route() {
+        let n = 24;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let value = ((i * 37 + j * 11 + 5) % 29) as f64 * 0.13 - 1.7;
+                a[i * n + j] = value;
+            }
+        }
+        for i in 0..n {
+            for j in 0..i {
+                let symmetric = (a[i * n + j] + a[j * n + i]) * 0.5;
+                a[i * n + j] = symmetric;
+                a[j * n + i] = symmetric;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let production = super::eigvalsh_contiguous_f64(&a, &meta).expect("production eigvalsh");
+        let (profiled, copy, reduce, ql, sort) = super::eigvalsh_stage_profile_f64(&a, n);
+        assert_eq!(production.len(), profiled.len());
+        for (index, (production, profiled)) in production.iter().zip(&profiled).enumerate() {
+            assert_eq!(
+                production.to_bits(),
+                profiled.to_bits(),
+                "profiled values-only route diverged at eigenvalue {index}"
+            );
+        }
+        assert!(copy > 0 && reduce > 0 && ql > 0 && sort > 0, "missing profiled stage");
+    }
+
+    #[test]
     fn eigh_tred2_tql2_orthonormal_and_reconstructs_24x24() {
         // Exercises the Householder/QL eigensolver at a size where the
         // tridiagonalization + shifted-QL machinery is fully engaged (small
@@ -71608,6 +71839,9 @@ mod tests {
     }
 
     fn cholesky_blocked_phase_counters_cover_each_live_stage() {
+        let _guard = STAGE_COUNTER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // n > NB makes the production path execute a panel, parallel-row TRSM,
         // trailing rank-NB update, and final strict-upper zeroing.
         let n = 192usize;
