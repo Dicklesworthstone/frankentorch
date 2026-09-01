@@ -41843,3 +41843,35 @@ each half touches, before assuming the structure is exploitable twice.
 The transferable point is not the number. **Three of this arc's redirections came from counting
 something that was about to be described instead** (291's 5-of-31, 292's cholesky-never-calls-it,
 this one). The cost of the counter is minutes; the cost of the word is a campaign.
+
+### 292h. THE getri BACKWARD IS DENSE BY NECESSITY — MY OWN STRUCTURAL HYPOTHESIS, REFUTED BY COUNT
+
+`frankentorch-stale-tuning-constants-lzku6`. Item 292g named getri's backward solve as the largest
+phase in `inv` (34-37%, twice its forward) and offered a structural reason: the forward restricts
+itself to the columns the identity can make nonzero, the backward sweeps all `n`, so the backward
+had "never been given the same restriction". **The census says that restriction does not exist.**
+
+    n=128   forward   387,008   backward   516,096  (1.33x)   zero-touch 0  (0.000%)
+    n=256 forward 1,290,176   backward 2,064,384  (1.60x)   zero-touch 0  (0.000%)
+
+**Not one backward column-update reads a source element that is still zero.** `z = U^-1 y` is
+upper-triangular times lower-triangular — a full product — so the output is dense from the first
+row. The 2x is explained, not fixable this way.
+
+**The counter had to ask "was this zero WHEN READ", not "is it structurally zero".** A structural
+argument predicts savings, because `y` is unit-lower-triangular; but the backward runs bottom-up and
+overwrites rows with a dense `z` as it goes, so a source row is already dense by the time it is
+read. Only counting at the moment of use separates those, and the structural argument alone gets it
+backwards. That distinction is the reusable part.
+
+Limits, stated: the counters cover the SCALAR triangular sweeps only, not each half's
+`dgemm_sub_into`, so the 1.33-1.60x work ratio is scalar-only and does NOT explain the ~2x time
+ratio apples-to-apples — the zero-touch result stands alone, the ratio comparison does not. And the
+zero-check is O(n) per (row, k) pair, making the census O(n^4), so n=256 is the ceiling and n=512 is
+absent by construction rather than omitted.
+
+**Fourth redirection on this campaign from counting rather than describing** (291: 5 of 31 calls;
+292: cholesky never calls `dgemm_sub_into`; 292g: my "residual" was getrf; this). The pattern is now
+strong enough to state as a rule: **when a phase split names a target, the next step is a census of
+what that phase actually touches — not a lever, and not an explanation.** Three of the four
+redirections killed a lever that would otherwise have been built.
