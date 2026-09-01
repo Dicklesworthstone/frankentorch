@@ -1,0 +1,21 @@
+=== A/A-ONLY DRIFT CHARACTERIZATION: BLOCKED PRE-FLIGHT ===
+started_utc=2026-09-01T21:07:14Z
+runtime_head=dd4c84b7e40bcadf8d861dc744692dab6246fb0c
+requested_protocol=repeated incumbent-only (FT_H2H_NO_FT_ARM) and FrankenTorch-only (FT_H2H_NO_INCUMBENT) isolated pairs under scripts/h2h_window.sh; no vs-PyTorch claim
+planned_lanes=conv2d_masked,max_pool1d; planned_controls=FT_H2H_DUMP_SLOTS with 0.97-1.03 failure distribution
+verdict=NOT_STARTED: external non-participant remained CPU-active across three spaced preflights; stock guard does not match this process name, so guard PASS is insufficient admission for a quiet-host A/A characterization.
+harness_bead=frankentorch-mdsmm.1 assignee=torch:2
+
+--- final external-process observation ---
+861201 3643 99.3 43:13 python .venv/bin/python -m pytest tests/python/ -q -p no:randomly --ignore=tests/python/test_from_scipy_bulk_parity.py --ignore=tests/python/test_hits_wellconditioned_parity.py --ignore=tests/python/test_hypothesis.py --ignore=tests/python/test_pandas_io_parity.py --ignore=tests/python/test_to_pandas_edgelist_native_parity.py
+
+--- guard observation (recorded, not treated as sufficient) ---
+guard PASS: no peer measurement detected, loadavg 8.00/8.83/7.30 (spread 1.21x <= 4x, floor 8.00), iowait 0.0% <= 10%
+guard_exit=0
+
+--- source-equivalent reused ELF ---
+built_base=18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e
+binary_surface_equivalence=PASS (dd4c84b7 has no Cargo.toml,Cargo.lock,crates,scripts delta from built base)
+elf=/data/tmp/ft-mdsmm-redispatch-18c330dc-ivorybirch/release/examples/gauntlet_lane_sweep_h2h
+elf_sha256=b394bac7c2104fcdb1c36f8312f10cb0c4ac242e35faa095084dc9219030c4d5
+completed_utc=2026-09-01T21:07:14Z
