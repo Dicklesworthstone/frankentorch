@@ -25340,6 +25340,42 @@ static LU_INV_SETUP_NS: AtomicU64 = AtomicU64::new(0);
 /// The deferred COLUMN permutation `A^-1[:, pivots[c]] = Z[:, c]`, plus its `n*n` output alloc.
 static LU_INV_PERM_NS: AtomicU64 = AtomicU64::new(0);
 
+/// OPT-IN column census for getri's two halves. `frankentorch-stale-tuning-constants-lzku6`.
+///
+/// The phase split (ledger 292g) put the BACKWARD solve at 34-37% of `inv`, roughly twice its own
+/// forward, and offered a structural explanation: the forward restricts itself to the columns the
+/// identity can make nonzero (`cols = pe`) while the backward sweeps all `n`. **That explanation is
+/// a hypothesis about whether the backward COULD be restricted, and this counts the columns instead
+/// of assuming it.** Three redirections on this campaign came from counting something that was
+/// about to be described.
+///
+/// Gated because it costs a `fetch_add` per (row, k) pair — O(nb^2) per block — which production
+/// should not pay for an instrument.
+static LU_INV_CENSUS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Column-updates performed: the sum of the inner sweep width over every (row, k) pair.
+static LU_INV_FWD_COLUPD: AtomicU64 = AtomicU64::new(0);
+static LU_INV_BACK_COLUPD: AtomicU64 = AtomicU64::new(0);
+/// How many of those column-updates touched an element that was still structurally ZERO —
+/// i.e. work the restriction could in principle have skipped.
+static LU_INV_BACK_ZERO_TOUCH: AtomicU64 = AtomicU64::new(0);
+
+/// Enable the getri column census, returning the previous setting.
+#[doc(hidden)]
+pub fn set_lu_inverse_census_enabled(on: bool) -> bool {
+    LU_INV_CENSUS_ENABLED.swap(on, LuOrdering::Relaxed)
+}
+
+/// Drain the getri column census: `(forward_colupd, backward_colupd, backward_zero_touch)`.
+#[doc(hidden)]
+pub fn lu_inverse_census_take() -> (u64, u64, u64) {
+    (
+        LU_INV_FWD_COLUPD.swap(0, LuOrdering::Relaxed),
+        LU_INV_BACK_COLUPD.swap(0, LuOrdering::Relaxed),
+        LU_INV_BACK_ZERO_TOUCH.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 /// Read and reset the getri halves: `(forward_ns, backward_ns)`.
 #[doc(hidden)]
 pub fn lu_inverse_half_take_ns() -> (u64, u64) {
@@ -26862,6 +26898,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let n = factor.n;
     let lu = &factor.lu;
     let nb_width = lu_inv_nb();
+    let census = LU_INV_CENSUS_ENABLED.load(LuOrdering::Relaxed);
 
     let __t_setup = std::time::Instant::now();
     // Z starts as the PLAIN identity: no row permutation, because the permutation is deferred to
@@ -26889,6 +26926,9 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
                 let l_ik = lu[i * n + kk];
                 if l_ik != 0.0 {
                     let xk = kk * n;
+                    if census {
+                        LU_INV_FWD_COLUPD.fetch_add(cols as u64, LuOrdering::Relaxed);
+                    }
                     for c in 0..cols {
                         x[xi + c] -= l_ik * x[xk + c];
                     }
@@ -26926,6 +26966,16 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
                 let u_ik = lu[i * n + kk];
                 if u_ik != 0.0 {
                     let xk = kk * n;
+                    if census {
+                        LU_INV_BACK_COLUPD.fetch_add(n as u64, LuOrdering::Relaxed);
+                        // A column-update is WASTED only if the source element is still zero. `y`
+                        // is unit-lower-triangular, so row kk starts nonzero only in [0, kk] — but
+                        // rows below have already been overwritten by a DENSE z, so this counts
+                        // what is actually zero at the moment it is read, not what the structure
+                        // predicted.
+                        let zeros = (0..n).filter(|&c| x[xk + c] == 0.0).count() as u64;
+                        LU_INV_BACK_ZERO_TOUCH.fetch_add(zeros, LuOrdering::Relaxed);
+                    }
                     for c in 0..n {
                         x[xi + c] -= u_ik * x[xk + c];
                     }
