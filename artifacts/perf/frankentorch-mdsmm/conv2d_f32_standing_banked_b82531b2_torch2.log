@@ -1,0 +1,386 @@
+===== conv2d_f32 / conv2d_f32_masked mode-conditioned standing — torch:2 (CreamTrout) 2026-09-01T18:23:20Z =====
+host=thinkstation1 nproc=64 HEAD=6abc8ecc87f3248e9e8f80b65034a4ff7c550aa5
+build_base=b82531b2ea8453159ec7c570ba817e5c720582b7 (clean-overlay receipt); harness source unchanged since that commit
+elf_sha256=717b8cd1633f5cd9cf1bd877500edcfd0e27fe8163faf84af0cff8614a050b6c
+incumbent=PyTorch 2.12.1+cpu, self-reported in EVERY invocation
+protocol: 10 SUCCESSFUL invocations, guard before EACH, FT_H2H_REPS=24 FT_H2H_WARMUP=16, round_warmup=0 (board default)
+lanes=conv2d_f32,conv2d_f32_masked exact; bank seeded from artifacts/perf/incumbent_bank.jsonl (57 lines) into a scratch copy, merged back after the run
+
+--- attempt 1 (run 1/10)  18:23:20Z  loadavg=2.90 4.44 4.20
+guard PASS: no peer measurement detected, loadavg 2.90/4.41/4.19 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32     37.580   12.909   FT 2.91x SLOWER     PT PASS [0.967,1.065] FT PASS [0.980,1.019] ratio 0.344 [0.330,0.357] match incumbent=NO-HISTORY
+  incumbent_mode lane=conv2d_f32 drawn=12.909 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    MIN-ESTIMATOR FT 3.09x SLOWER     ratio 0.323 [0.300,0.333]  PT null 1.015 PASS  FT null 1.007 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+  conv2d_f32_masked   59.609   13.916   FT 4.28x SLOWER     PT PASS [0.941,1.077] FT PASS [0.985,1.035] ratio 0.233 [0.222,0.255] match incumbent=NO-HISTORY
+  incumbent_mode lane=conv2d_f32_masked drawn=13.916 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    MIN-ESTIMATOR FT 4.60x SLOWER     ratio 0.218 [0.204,0.231]  PT null 1.014 PASS  FT null 1.016 PASS  not quotable — LOAD-DRIFTED (nulls passed; the host did not hold still)
+
+--- attempt 2 (run 2/10)  18:24:04Z  loadavg=4.72 4.66 4.28
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2015843  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 2, waiting 90s (refusals are not retried silently)
+
+--- attempt 3 (run 2/10)  18:25:36Z  loadavg=1.95 3.74 3.99
+guard PASS: no peer measurement detected, loadavg 1.95/3.74/3.99 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32     38.060   24.498   FT 1.55x SLOWER     PT OFFSET [0.836,1.043] FT PASS [0.981,1.024] ratio 0.644 [0.604,0.672] match incumbent=LEVEL-B/2 n1
+  incumbent_mode lane=conv2d_f32 drawn=24.498 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.90x gap:
+      level A  n=1   median   12.909  range [12.909, 12.909]  spread 1.00x
+      level B  n=1   median   24.498  range [24.498, 24.498]  spread 1.00x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 0s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.921, FrankenTorch 0.995; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.74x SLOWER     ratio 0.366 [0.350,0.586]  PT null 0.896 FAIL  FT null 1.019 PASS  not quotable
+  conv2d_f32_masked   61.089   23.368   FT 2.61x SLOWER     PT OFFSET [0.868,1.041] FT PASS [0.984,1.035] ratio 0.383 [0.367,0.398] match incumbent=LEVEL-B/2 n1
+  incumbent_mode lane=conv2d_f32_masked drawn=23.368 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.68x gap:
+      level A  n=1   median   13.916  range [13.916, 13.916]  spread 1.00x
+      level B  n=1   median   23.368  range [23.368, 23.368]  spread 1.00x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 0s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.930, FrankenTorch 1.001; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.92x SLOWER     ratio 0.255 [0.236,0.300]  PT null 0.912 FAIL  FT null 1.001 PASS  not quotable
+
+--- attempt 4 (run 3/10)  18:26:26Z  loadavg=5.48 4.43 4.21
+guard PASS: no peer measurement detected, loadavg 5.48/4.43/4.21 (spread 1.00x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_f32     38.177   26.360   FT 1.45x SLOWER     PT PASS [0.921,1.031] FT PASS [0.987,1.016] ratio 0.690 [0.672,0.704] match incumbent=LEVEL-B/2 n2
+  incumbent_mode lane=conv2d_f32 drawn=26.360 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.90x gap:
+      level A  n=1   median   12.909  range [12.909, 12.909]  spread 1.00x
+      level B  n=2   median   25.429  range [24.498, 26.360]  spread 1.08x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 142s, but a split seen inside one session is still positive evidence of two levels.
+    MIN-ESTIMATOR FT 1.57x SLOWER     ratio 0.637 [0.363,0.675]  PT null 0.970 FAIL  FT null 1.002 PASS  not quotable
+  conv2d_f32_masked   59.685   26.419   FT 2.26x SLOWER     PT OFFSET [0.845,1.245] FT PASS [0.990,1.018] ratio 0.443 [0.398,0.476] match incumbent=LEVEL-B/2 n2
+  incumbent_mode lane=conv2d_f32_masked drawn=26.419 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.68x gap:
+      level A  n=1   median   13.916  range [13.916, 13.916]  spread 1.00x
+      level B  n=2   median   24.894  range [23.368, 26.419]  spread 1.13x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 142s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.039, FrankenTorch 1.000; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.83x SLOWER     ratio 0.261 [0.242,0.393]  PT null 1.024 FAIL  FT null 1.006 PASS  not quotable
+
+--- attempt 5 (run 4/10)  18:27:18Z  loadavg=5.07 4.55 4.27
+guard PASS: no peer measurement detected, loadavg 5.07/4.55/4.27 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32     39.295   25.917   FT 1.52x SLOWER     PT OFFSET [0.815,1.018] FT PASS [0.984,1.009] ratio 0.660 [0.643,0.684] match incumbent=LEVEL-B/2 n3
+  incumbent_mode lane=conv2d_f32 drawn=25.917 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.90x gap:
+      level A  n=1   median   12.909  range [12.909, 12.909]  spread 1.00x
+      level B  n=3   median   25.917  range [24.498, 26.360]  spread 1.08x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 194s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.961, FrankenTorch 0.997; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.67x SLOWER     ratio 0.599 [0.358,0.646]  PT null 0.977 FAIL  FT null 0.994 PASS  not quotable
+  conv2d_f32_masked   61.771   24.491   FT 2.52x SLOWER     PT OFFSET [0.928,1.109] FT PASS [0.980,1.011] ratio 0.396 [0.381,0.410] match incumbent=LEVEL-B/2 n3
+  incumbent_mode lane=conv2d_f32_masked drawn=24.491 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.68x gap:
+      level A  n=1   median   13.916  range [13.916, 13.916]  spread 1.00x
+      level B  n=3   median   24.491  range [23.368, 26.419]  spread 1.13x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 194s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.054, FrankenTorch 0.990; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.01x SLOWER     ratio 0.332 [0.237,0.366]  PT null 1.056 FAIL  FT null 0.993 PASS  not quotable
+
+--- attempt 6 (run 5/10)  18:28:03Z  loadavg=6.19 4.91 4.40
+guard PASS: no peer measurement detected, loadavg 6.19/4.91/4.40 (spread 1.00x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_f32     38.353   19.538   FT 1.96x SLOWER     PT OFFSET [0.857,1.307] FT PASS [0.986,1.017] ratio 0.509 [0.451,0.561] match incumbent=LEVEL-B/2 n4
+  incumbent_mode lane=conv2d_f32 drawn=19.538 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.51x gap:
+      level A  n=1   median   12.909  range [12.909, 12.909]  spread 1.00x
+      level B  n=4   median   25.207  range [19.538, 26.360]  spread 1.35x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 239s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.040, FrankenTorch 1.007; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.97x SLOWER     ratio 0.337 [0.323,0.358]  PT null 1.097 FAIL  FT null 1.010 PASS  not quotable
+  conv2d_f32_masked   60.997   20.890   FT 2.92x SLOWER     PT OFFSET [0.815,1.099] FT PASS [0.976,1.023] ratio 0.342 [0.307,0.365] match incumbent=LEVEL-B/2 n4
+  incumbent_mode lane=conv2d_f32_masked drawn=20.890 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.50x gap:
+      level A  n=1   median   13.916  range [13.916, 13.916]  spread 1.00x
+      level B  n=4   median   23.930  range [20.890, 26.419]  spread 1.26x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 239s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.967, FrankenTorch 0.997; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 4.11x SLOWER     ratio 0.243 [0.220,0.250]  PT null 0.888 FAIL  FT null 1.005 PASS  not quotable
+
+--- attempt 7 (run 6/10)  18:28:50Z  loadavg=8.23 5.66 4.68
+guard PASS: no peer measurement detected, loadavg 8.23/5.69/4.69 (spread 1.03x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d_f32     39.243   11.881   FT 3.30x SLOWER     PT PASS [0.920,1.056] FT PASS [0.979,1.014] ratio 0.303 [0.294,0.309] match incumbent=LEVEL-A/2 n2
+  incumbent_mode lane=conv2d_f32 drawn=11.881 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.51x gap:
+      level A  n=2   median   12.395  range [11.881, 12.909]  spread 1.09x   <- THIS RUN
+      level B  n=4   median   25.207  range [19.538, 26.360]  spread 1.35x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 286s, but a split seen inside one session is still positive evidence of two levels.
+    MIN-ESTIMATOR FT 3.59x SLOWER     ratio 0.279 [0.263,0.287]  PT null 0.967 FAIL  FT null 0.992 PASS  not quotable
+  conv2d_f32_masked   63.214   13.115   FT 4.82x SLOWER     PT OFFSET [0.999,1.086] FT PASS [0.987,1.068] ratio 0.207 [0.201,0.213] match incumbent=LEVEL-A/2 n2
+  incumbent_mode lane=conv2d_f32_masked drawn=13.115 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.50x gap:
+      level A  n=2   median   13.516  range [13.115, 13.916]  spread 1.06x   <- THIS RUN
+      level B  n=4   median   23.930  range [20.890, 26.419]  spread 1.26x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 286s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.038, FrankenTorch 1.010; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 5.19x SLOWER     ratio 0.193 [0.180,0.199]  PT null 1.061 FAIL  FT null 1.001 PASS  not quotable
+
+--- attempt 8 (run 7/10)  18:29:34Z  loadavg=7.90 5.93 4.82
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 8, waiting 90s (refusals are not retried silently)
+
+--- attempt 9 (run 7/10)  18:31:06Z  loadavg=4.63 5.20 4.66
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 9, waiting 90s (refusals are not retried silently)
+
+--- attempt 10 (run 7/10)  18:32:39Z  loadavg=2.81 4.47 4.45
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 10, waiting 90s (refusals are not retried silently)
+
+--- attempt 11 (run 7/10)  18:34:11Z  loadavg=3.23 4.11 4.32
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 11, waiting 90s (refusals are not retried silently)
+
+--- attempt 12 (run 7/10)  18:35:43Z  loadavg=2.42 3.64 4.13
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 12, waiting 90s (refusals are not retried silently)
+
+--- attempt 13 (run 7/10)  18:37:15Z  loadavg=3.14 3.63 4.08
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2406383  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 13, waiting 90s (refusals are not retried silently)
+
+--- attempt 14 (run 7/10)  18:38:47Z  loadavg=6.27 4.60 4.39
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2406383  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 14, waiting 90s (refusals are not retried silently)
+
+--- attempt 15 (run 7/10)  18:40:19Z  loadavg=6.83 5.15 4.60
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2406383  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 15, waiting 90s (refusals are not retried silently)
+
+--- attempt 16 (run 7/10)  18:41:51Z  loadavg=6.98 5.61 4.81
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2406383  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2514861  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 16, waiting 90s (refusals are not retried silently)
+
+--- attempt 17 (run 7/10)  18:43:24Z  loadavg=6.17 5.67 4.91
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2531467  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 17, waiting 90s (refusals are not retried silently)
+
+--- attempt 18 (run 7/10)  18:44:56Z  loadavg=8.47 6.50 5.27
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2553051  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 18, waiting 90s (refusals are not retried silently)
+
+--- attempt 19 (run 7/10)  18:46:28Z  loadavg=7.01 6.55 5.40
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 19, waiting 90s (refusals are not retried silently)
+
+--- attempt 20 (run 7/10)  18:48:00Z  loadavg=5.59 6.25 5.41
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2590449  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 20, waiting 90s (refusals are not retried silently)
+
+--- attempt 21 (run 7/10)  18:49:32Z  loadavg=5.26 6.07 5.43
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2726357  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 21, waiting 90s (refusals are not retried silently)
+
+--- attempt 22 (run 7/10)  18:51:04Z  loadavg=6.90 6.66 5.71
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2772942  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 22, waiting 90s (refusals are not retried silently)
+
+--- attempt 23 (run 7/10)  18:52:37Z  loadavg=10.73 7.91 6.25
+REFUSING TO MEASURE: 4 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2772942  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+    2805392  jq -r .[] | select((.title|test("perf|capability|bench|throughput|latency"; "i")) or ((.labels // []
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 23, waiting 90s (refusals are not retried silently)
+
+--- attempt 24 (run 7/10)  18:54:09Z  loadavg=10.37 8.60 6.65
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    2532557  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    2901598  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 24, waiting 90s (refusals are not retried silently)
+
+--- attempt 25 (run 7/10)  18:55:41Z  loadavg=7.25 8.06 6.65
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3225315  artifacts/elf/d5pdz-driver/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/head-v3/ffs-cli --filesy
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 25, waiting 90s (refusals are not retried silently)
+
+--- attempt 26 (run 7/10)  18:57:13Z  loadavg=8.02 8.08 6.79
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3353865  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3354418  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 26, waiting 90s (refusals are not retried silently)
+
+--- attempt 27 (run 7/10)  18:58:45Z  loadavg=10.37 9.10 7.29
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3353865  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3485054  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 27, waiting 90s (refusals are not retried silently)
+
+--- attempt 28 (run 7/10)  19:00:17Z  loadavg=17.82 11.87 8.45
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3353865  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3723181  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 28, waiting 90s (refusals are not retried silently)
+
+--- attempt 29 (run 7/10)  19:01:49Z  loadavg=23.52 14.94 9.83
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3353865  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3723181  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 29, waiting 90s (refusals are not retried silently)
+
+--- attempt 30 (run 7/10)  19:03:22Z  loadavg=21.52 17.01 11.10
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3831724  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 30, waiting 90s (refusals are not retried silently)
+
+--- attempt 31 (run 7/10)  19:04:54Z  loadavg=36.01 22.49 13.54
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3935930  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 36.01 exceeds 35.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 31, waiting 90s (refusals are not retried silently)
+
+--- attempt 32 (run 7/10)  19:06:26Z  loadavg=25.86 22.48 14.40
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 32, waiting 90s (refusals are not retried silently)
+
+--- attempt 33 (run 7/10)  19:07:58Z  loadavg=23.66 22.40 15.10
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    4014207  /data/projects/.scratch/blackthrush/fp-bench-uncachedlane --category io --workload csv_read_uncached
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 33, waiting 90s (refusals are not retried silently)
+
+--- attempt 34 (run 7/10)  19:09:30Z  loadavg=23.31 23.16 16.08
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 34, waiting 90s (refusals are not retried silently)
+
+--- attempt 35 (run 7/10)  19:11:02Z  loadavg=14.69 20.44 15.81
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 35, waiting 90s (refusals are not retried silently)
+
+--- attempt 36 (run 7/10)  19:12:35Z  loadavg=16.72 19.87 16.05
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 36, waiting 90s (refusals are not retried silently)
+
+--- attempt 37 (run 7/10)  19:14:07Z  loadavg=14.90 18.19 15.80
+guard PASS: no peer measurement detected, loadavg 14.90/18.19/15.80 (spread 1.22x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_f32     38.955   25.417   FT 1.53x SLOWER     PT OFFSET [0.860,1.136] FT PASS [0.987,1.018] ratio 0.652 [0.588,0.714] match incumbent=LEVEL-B/2 n5
+  incumbent_mode lane=conv2d_f32 drawn=25.417 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.51x gap:
+      level A  n=2   median   12.395  range [11.881, 12.909]  spread 1.09x
+      level B  n=5   median   25.417  range [19.538, 26.360]  spread 1.35x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 330s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.027, FrankenTorch 1.008; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.66x SLOWER     ratio 0.376 [0.363,0.581]  PT null 1.039 FAIL  FT null 1.005 PASS  not quotable
+  conv2d_f32_masked   62.093   24.102   FT 2.58x SLOWER     PT OFFSET [0.865,1.028] FT PASS [0.993,1.025] ratio 0.388 [0.372,0.395] match incumbent=LEVEL-B/2 n5
+  incumbent_mode lane=conv2d_f32_masked drawn=24.102 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.50x gap:
+      level A  n=2   median   13.516  range [13.115, 13.916]  spread 1.06x
+      level B  n=5   median   24.102  range [20.890, 26.419]  spread 1.26x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 330s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.952, FrankenTorch 1.006; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.67x SLOWER     ratio 0.272 [0.249,0.359]  PT null 0.869 FAIL  FT null 1.004 PASS  not quotable
+
+--- attempt 38 (run 8/10)  19:15:01Z  loadavg=16.08 18.23 15.97
+guard PASS: no peer measurement detected, loadavg 16.08/18.23/15.97 (spread 1.14x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_f32     39.307   12.011   FT 3.27x SLOWER     PT OFFSET [0.936,1.053] FT PASS [0.995,1.030] ratio 0.306 [0.291,0.327] match incumbent=LEVEL-A/2 n3
+  incumbent_mode lane=conv2d_f32 drawn=12.011 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.51x gap:
+      level A  n=3   median   12.011  range [11.881, 12.909]  spread 1.09x   <- THIS RUN
+      level B  n=5   median   25.417  range [19.538, 26.360]  spread 1.35x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 3057s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.024, FrankenTorch 1.012; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.54x SLOWER     ratio 0.282 [0.263,0.294]  PT null 0.986 PASS  FT null 1.019 PASS  QUOTABLE under the min estimator
+  conv2d_f32_masked   63.162   13.529   FT 4.67x SLOWER     PT OFFSET [0.999,1.085] FT PASS [0.976,1.027] ratio 0.214 [0.207,0.220] match incumbent=LEVEL-A/2 n3
+  incumbent_mode lane=conv2d_f32_masked drawn=13.529 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.50x gap:
+      level A  n=3   median   13.529  range [13.115, 13.916]  spread 1.06x   <- THIS RUN
+      level B  n=5   median   24.102  range [20.890, 26.419]  spread 1.26x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 3057s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.051, FrankenTorch 1.003; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 4.89x SLOWER     ratio 0.205 [0.195,0.211]  PT null 1.014 PASS  FT null 1.003 PASS  QUOTABLE under the min estimator
+
+--- attempt 39 (run 9/10)  19:15:48Z  loadavg=19.72 18.78 16.26
+guard PASS: no peer measurement detected, loadavg 19.72/18.78/16.26 (spread 1.21x <= 4x, floor 8.00), iowait 0.3% <= 10%
+  conv2d_f32     42.217   23.134   FT 1.82x SLOWER     PT OFFSET [0.789,1.155] FT PASS [0.965,1.039] ratio 0.548 [0.502,0.615] match incumbent=LEVEL-B/2 n6
+  incumbent_mode lane=conv2d_f32 drawn=23.134 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.51x gap:
+      level A  n=3   median   12.011  range [11.881, 12.909]  spread 1.09x
+      level B  n=6   median   24.957  range [19.538, 26.360]  spread 1.35x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 3104s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.965, FrankenTorch 1.014; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.95x SLOWER     ratio 0.339 [0.317,0.394]  PT null 0.962 FAIL  FT null 1.017 PASS  not quotable
+  conv2d_f32_masked   67.057   25.060   FT 2.68x SLOWER     PT OFFSET [0.895,1.074] FT PASS [0.951,1.035] ratio 0.374 [0.360,0.403] match incumbent=LEVEL-B/2 n6
+  incumbent_mode lane=conv2d_f32_masked drawn=25.060 ms  LEVEL B OF 2 — the banked population for this lane splits at a 1.50x gap:
+      level A  n=3   median   13.529  range [13.115, 13.916]  spread 1.06x
+      level B  n=6   median   24.296  range [20.890, 26.419]  spread 1.26x   <- THIS RUN
+    This row is comparable ONLY to rows that drew level B. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 3104s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.979, FrankenTorch 0.996; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.02x SLOWER     ratio 0.331 [0.265,0.358]  PT null 0.976 FAIL  FT null 0.997 PASS  not quotable
+
+--- attempt 40 (run 10/10)  19:16:39Z  loadavg=18.85 18.49 16.28
+guard PASS: no peer measurement detected, loadavg 18.85/18.49/16.28 (spread 1.16x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d_f32     42.330   12.711   FT 3.33x SLOWER     PT PASS [0.942,1.109] FT FAIL [0.913,0.993] ratio 0.300 [0.288,0.312] match incumbent=LEVEL-A/2 n4
+  incumbent_mode lane=conv2d_f32 drawn=12.711 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.51x gap:
+      level A  n=4   median   12.361  range [11.881, 12.909]  spread 1.09x   <- THIS RUN
+      level B  n=6   median   24.957  range [19.538, 26.360]  spread 1.35x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 3154s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.003, FrankenTorch 0.948; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 3.67x SLOWER     ratio 0.272 [0.257,0.284]  PT null 1.013 PASS  FT null 0.965 FAIL  not quotable
+  conv2d_f32_masked   66.709   13.370   FT 4.99x SLOWER     PT PASS [0.915,1.075] FT PASS [0.977,1.045] ratio 0.200 [0.195,0.208] match incumbent=LEVEL-A/2 n4
+  incumbent_mode lane=conv2d_f32_masked drawn=13.370 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.50x gap:
+      level A  n=4   median   13.449  range [13.115, 13.916]  spread 1.06x   <- THIS RUN
+      level B  n=6   median   24.296  range [20.890, 26.419]  spread 1.26x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 3154s, but a split seen inside one session is still positive evidence of two levels.
+    MIN-ESTIMATOR FT 5.23x SLOWER     ratio 0.191 [0.183,0.198]  PT null 1.020 PASS  FT null 1.007 PASS  QUOTABLE under the min estimator
+
+invocations_run=10 guard_refused=30 attempts=40
+bank_lines_added=20 (merged into artifacts/perf/incumbent_bank.jsonl after the run)
+===== end 2026-09-01T19:17:22Z =====
