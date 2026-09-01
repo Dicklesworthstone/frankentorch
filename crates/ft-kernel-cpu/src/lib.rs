@@ -39971,6 +39971,41 @@ pub struct QrStageProfile {
     pub used_blocked_path: bool,
 }
 
+/// Opt-in stage counters for the direct compact-WY ORMQR route. Disabled by default: the
+/// timestamps exist to identify a remaining loss mechanism, not to tax production dispatch.
+static ORMQR_STAGE_PROFILE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static ORMQR_PANEL_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_T_TRANSPOSE_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_WORKSPACE_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_VT_C_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_T_W_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_V_W_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_SUBTRACT_NS: AtomicU64 = AtomicU64::new(0);
+static ORMQR_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Enable or disable profiling of `ormqr_blocked_f64`; returns the previous setting.
+#[doc(hidden)]
+pub fn set_ormqr_stage_profile_enabled(on: bool) -> bool {
+    ORMQR_STAGE_PROFILE_ENABLED.swap(on, LuOrdering::Relaxed)
+}
+
+/// Read and reset direct compact-WY ORMQR stages:
+/// `(panel_build, t_transpose, workspace, vt_c, t_w, v_w, subtract, total)` in nanoseconds.
+#[doc(hidden)]
+pub fn ormqr_stage_take_ns() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        ORMQR_PANEL_BUILD_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_T_TRANSPOSE_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_WORKSPACE_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_VT_C_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_T_W_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_V_W_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_SUBTRACT_NS.swap(0, LuOrdering::Relaxed),
+        ORMQR_TOTAL_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 /// Compute the QR decomposition of an (m x n) matrix via Householder reflections.
 ///
 /// Returns `(Q, R)` such that `A = Q @ R`:
@@ -41647,7 +41682,16 @@ pub fn ormqr_blocked_f64(
     if k == 0 || m == 0 || cr == 0 || cc == 0 {
         return;
     }
+    let profile = ORMQR_STAGE_PROFILE_ENABLED.load(LuOrdering::Relaxed);
+    let total_started = profile.then(std::time::Instant::now);
+    let panel_started = profile.then(std::time::Instant::now);
     let panels = householder_panels_from_packed_f64(packed, tau, m, n, k, 32);
+    if let Some(started) = panel_started {
+        ORMQR_PANEL_BUILD_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            LuOrdering::Relaxed,
+        );
+    }
 
     // REVERSE iff left != transpose; see the table above.
     let reverse = left != transpose;
@@ -41660,6 +41704,7 @@ pub fn ormqr_blocked_f64(
     for (nb, vmat, tmat) in ordered {
         let nb = *nb;
         // Tᵀ when applying the reverse product.
+        let transpose_started = profile.then(std::time::Instant::now);
         let tx_owned = if transpose {
             let mut tt = vec![0.0f64; nb * nb];
             for i in 0..nb {
@@ -41671,31 +41716,120 @@ pub fn ormqr_blocked_f64(
         } else {
             None
         };
+        if let Some(started) = transpose_started {
+            ORMQR_T_TRANSPOSE_NS.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                LuOrdering::Relaxed,
+            );
+        }
         let tx: &[f64] = tx_owned.as_deref().unwrap_or(tmat.as_slice());
 
         if left {
             // C <- C - V (T (Vᵀ C)),  C is m x cc.
+            let workspace_started = profile.then(std::time::Instant::now);
             let mut w1 = vec![0.0f64; nb * cc];
+            if let Some(started) = workspace_started {
+                ORMQR_WORKSPACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
+            let vt_c_started = profile.then(std::time::Instant::now);
             gemm::dgemm_tb(nb, m, cc, vmat, c, &mut w1); // Vᵀ C
+            if let Some(started) = vt_c_started {
+                ORMQR_VT_C_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let workspace_started = profile.then(std::time::Instant::now);
             let mut w2 = vec![0.0f64; nb * cc];
+            if let Some(started) = workspace_started {
+                ORMQR_WORKSPACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
+            let t_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm(nb, nb, cc, tx, &w1, &mut w2); // T (Vᵀ C)
+            if let Some(started) = t_w_started {
+                ORMQR_T_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let workspace_started = profile.then(std::time::Instant::now);
             let mut upd = vec![0.0f64; m * cc];
+            if let Some(started) = workspace_started {
+                ORMQR_WORKSPACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
+            let v_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm(m, nb, cc, vmat, &w2, &mut upd); // V (...)
+            if let Some(started) = v_w_started {
+                ORMQR_V_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let subtract_started = profile.then(std::time::Instant::now);
             for t in 0..m * cc {
                 c[t] -= upd[t];
             }
+            if let Some(started) = subtract_started {
+                ORMQR_SUBTRACT_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
         } else {
             // C <- C - ((C V) T) Vᵀ,  C is cr x m.
+            let workspace_started = profile.then(std::time::Instant::now);
             let mut w1 = vec![0.0f64; cr * nb];
+            if let Some(started) = workspace_started {
+                ORMQR_WORKSPACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
+            let vt_c_started = profile.then(std::time::Instant::now);
             gemm::dgemm(cr, m, nb, c, vmat, &mut w1); // C V
+            if let Some(started) = vt_c_started {
+                ORMQR_VT_C_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let workspace_started = profile.then(std::time::Instant::now);
             let mut w2 = vec![0.0f64; cr * nb];
+            if let Some(started) = workspace_started {
+                ORMQR_WORKSPACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
+            let t_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm(cr, nb, nb, &w1, tx, &mut w2); // (C V) T
+            if let Some(started) = t_w_started {
+                ORMQR_T_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let workspace_started = profile.then(std::time::Instant::now);
             let mut upd = vec![0.0f64; cr * m];
+            if let Some(started) = workspace_started {
+                ORMQR_WORKSPACE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
+            let v_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm_bt(cr, nb, m, &w2, vmat, &mut upd); // (...) Vᵀ
+            if let Some(started) = v_w_started {
+                ORMQR_V_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            let subtract_started = profile.then(std::time::Instant::now);
             for t in 0..cr * m {
                 c[t] -= upd[t];
             }
+            if let Some(started) = subtract_started {
+                ORMQR_SUBTRACT_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
         }
+    }
+    if let Some(started) = total_started {
+        ORMQR_TOTAL_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
     }
 }
 
@@ -49345,6 +49479,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The ORMQR profiler must follow the direct compact-WY apply, not QR's reverse-Q profiler:
+    /// a left application has a panel build, three GEMMs, workspace allocation, subtraction, and
+    /// a total that encloses them. This is a mechanism sentinel, not a timing assertion.
+    #[test]
+    fn ormqr_stage_profile_covers_direct_compact_wy_apply() {
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 24;
+        let a: Vec<f64> = (0..M * N)
+            .map(|i| ((i as f64) * 0.031).sin() + if i % (N + 1) == 0 { 3.0 } else { 0.0 })
+            .collect();
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+        let mut c: Vec<f64> = (0..M * W).map(|i| ((i as f64) * 0.019).cos()).collect();
+        let c0 = c.clone();
+
+        let previous = super::set_ormqr_stage_profile_enabled(true);
+        let _ = super::ormqr_stage_take_ns();
+        super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut c, M, W, true, false);
+        let (panel, transpose, workspace, vt_c, t_w, v_w, subtract, total) =
+            super::ormqr_stage_take_ns();
+        super::set_ormqr_stage_profile_enabled(previous);
+
+        assert!(panel > 0, "panel construction was not profiled");
+        assert_eq!(transpose, 0, "left non-transpose must not materialize T^T");
+        assert!(workspace > 0, "workspace allocation was not profiled");
+        assert!(vt_c > 0 && t_w > 0 && v_w > 0, "one of ORMQR's three GEMMs was not profiled");
+        assert!(subtract > 0, "C -= update was not profiled");
+        assert!(
+            total >= panel + workspace + vt_c + t_w + v_w + subtract,
+            "total must enclose the named ORMQR stages"
+        );
+        assert!(
+            c.iter().zip(&c0).any(|(after, before)| after != before),
+            "ORMQR fixture did not execute"
+        );
     }
 
     #[test]
@@ -76918,6 +77089,31 @@ mod tests {
     /// "counted somewhere else" sitting among zeros meaning "skipped".
     #[test]
     fn conv2d_backward_masked_skips_the_gemm_the_mask_declines() {
+        // TAKE THE STREAMING GUARD, AND PIN THE TOGGLE THIS TEST'S EXPECTATIONS DESCRIBE.
+        // `frankentorch-vcxf7`.
+        //
+        // The counts below are the PANEL route's GEMMs. `conv2d_dweight_streamed_*` is a different
+        // kernel that does not touch `CONV2D_DWEIGHT_GEMMS` at all, so whenever the streamed route
+        // runs, the `[true, true, false]` case reads (0, 1) instead of (1, 1) — a real observation,
+        // on hz4, of exactly that:
+        //
+        //     assertion `left == right` failed: f64 mask [true, true, false]
+        //       left: (0, 1)   right: (1, 1)
+        //
+        // The route is chosen by two PROCESS-GLOBAL knobs, and the neighbouring streaming tests
+        // set both (`set_conv2d_dweight_streamed(true)`, min panel 0) for their duration. Cargo
+        // runs tests in parallel threads of ONE process, so this test could observe a toggle that
+        // belongs to another test — and it does not otherwise take the mutex those tests use.
+        //
+        // So: the same guard they hold, and an explicit pin rather than a dependence on ambient
+        // state. Pinning is not a narrowing of what is asserted — the streamed route has no
+        // sentinel to assert ON, which is a coverage gap recorded on the bead, not something this
+        // test could have covered either way.
+        let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let restore_stream = super::set_conv2d_dweight_streamed(false);
+
         let (batch, in_ch, ph, pw) = (2usize, 3usize, 9usize, 10usize);
         let (kh, kw, oh, ow, sh, sw, out_ch) =
             (3usize, 3usize, 7usize, 8usize, 1usize, 1usize, 4usize);
@@ -76971,6 +77167,7 @@ mod tests {
                 "f32 mask {mask:?}: (dweight, dpanel) GEMM executions"
             );
         }
+        super::set_conv2d_dweight_streamed(restore_stream);
 
         // And the sentinel must be able to see a GEMM at all — a counter wired to nothing would
         // pass every assertion above.
