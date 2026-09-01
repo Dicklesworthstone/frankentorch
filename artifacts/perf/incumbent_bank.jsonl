@@ -271,3 +271,9 @@
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_narrow_dense","fingerprint":"6.799153e7","incumbent_ms":10.552867,"rounds":24,"lane_count":2,"recorded_unix":1788301816}
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_narrow","fingerprint":"2.009349e6","incumbent_ms":10.498157,"rounds":24,"lane_count":2,"recorded_unix":1788301843}
 {"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_narrow_dense","fingerprint":"6.799153e7","incumbent_ms":10.560416,"rounds":24,"lane_count":2,"recorded_unix":1788301843}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_wide","fingerprint":"1.997829e6","incumbent_ms":11.329536,"rounds":24,"lane_count":2,"recorded_unix":1788303438}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_wide_dense","fingerprint":"6.802653e7","incumbent_ms":11.320198,"rounds":24,"lane_count":2,"recorded_unix":1788303438}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_wide","fingerprint":"1.997829e6","incumbent_ms":10.975702,"rounds":24,"lane_count":2,"recorded_unix":1788303561}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_wide_dense","fingerprint":"6.802653e7","incumbent_ms":10.793279,"rounds":24,"lane_count":2,"recorded_unix":1788303561}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_wide","fingerprint":"1.997829e6","incumbent_ms":11.743545,"rounds":24,"lane_count":2,"recorded_unix":1788303651}
+{"host":"thinkstation1","torch":"2.12.1+cpu","lane":"linear_wide_dense","fingerprint":"6.802653e7","incumbent_ms":11.944030,"rounds":24,"lane_count":2,"recorded_unix":1788303651}
