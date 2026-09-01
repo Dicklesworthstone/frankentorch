@@ -1,0 +1,122 @@
+===== conv2d_big under the incumbent-mode check — torch:2 (CreamTrout) 2026-09-01T16:44:30Z =====
+host=thinkstation1 nproc=64 HEAD=b82531b2ea8453159ec7c570ba817e5c720582b7
+elf_sha256=717b8cd1633f5cd9cf1bd877500edcfd0e27fe8163faf84af0cff8614a050b6c
+bank=artifacts/perf/incumbent_bank.jsonl (committed, so it spans SESSIONS — the effect is between-session)
+protocol: 12 invocations, guard before EACH, FT_H2H_REPS=24 FT_H2H_WARMUP=16, round_warmup=0 (board default)
+lanes=conv2d_big,conv2d_big_masked exact
+
+--- invocation 1/12  16:44:30Z  loadavg=6.46 16.03 13.76
+guard PASS: no peer measurement detected, loadavg 6.46/16.03/13.76 (spread 2.00x <= 4x, floor 8.00), iowait 1.5% <= 10%
+  conv2d_big      4.287    5.877   FT 1.37x FASTER     PT OFFSET [0.949,1.100] FT PASS [0.934,1.068] ratio 1.371 [1.271,1.434] match incumbent=LEVEL-A/2 n11
+  incumbent_mode lane=conv2d_big drawn=5.877 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.40x gap:
+      level A  n=11  median    5.782  range [5.301, 7.674]  spread 1.45x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+      level B  n=2   median   10.977  range [10.744, 11.210]  spread 1.04x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 351s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.051, FrankenTorch 1.002; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.34x FASTER     ratio 1.337 [1.246,1.449]  PT null 1.013 PASS  FT null 1.005 PASS  QUOTABLE under the min estimator
+  conv2d_big_masked    8.803    5.991   FT 1.47x SLOWER     PT OFFSET [0.911,1.014] FT PASS [0.935,1.021] ratio 0.681 [0.655,0.729] match incumbent=LEVEL-A/2 n11
+  incumbent_mode lane=conv2d_big_masked drawn=5.991 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.44x gap:
+      level A  n=11  median    5.979  range [5.522, 7.733]  spread 1.40x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+      level B  n=2   median   11.406  range [11.109, 11.703]  spread 1.05x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 351s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.959, FrankenTorch 0.988; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.53x SLOWER     ratio 0.655 [0.611,0.697]  PT null 1.000 PASS  FT null 0.990 PASS  QUOTABLE under the min estimator
+
+--- invocation 2/12  16:44:57Z  loadavg=9.62 16.03 13.82
+guard PASS: no peer measurement detected, loadavg 9.62/16.03/13.82 (spread 1.67x <= 4x, floor 8.00), iowait 1.5% <= 10%
+  conv2d_big      4.418    5.821   FT 1.32x FASTER     PT OFFSET [0.986,1.134] FT PASS [0.950,1.048] ratio 1.318 [1.237,1.389] match incumbent=LEVEL-A/2 n12
+  incumbent_mode lane=conv2d_big drawn=5.821 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.40x gap:
+      level A  n=12  median    5.802  range [5.301, 7.674]  spread 1.45x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+      level B  n=2   median   10.977  range [10.744, 11.210]  spread 1.04x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1297s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.063, FrankenTorch 0.996; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.22x FASTER     ratio 1.222 [1.153,1.281]  PT null 1.091 FAIL  FT null 1.007 PASS  not quotable
+  conv2d_big_masked    8.845    5.773   FT 1.53x SLOWER     PT PASS [0.939,1.068] FT OFFSET [0.885,1.034] ratio 0.653 [0.624,0.705] match incumbent=LEVEL-A/2 n12
+  incumbent_mode lane=conv2d_big_masked drawn=5.773 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.44x gap:
+      level A  n=12  median    5.961  range [5.522, 7.733]  spread 1.40x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+      level B  n=2   median   11.406  range [11.109, 11.703]  spread 1.05x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1297s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 1.012, FrankenTorch 0.962; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.63x SLOWER     ratio 0.612 [0.568,0.638]  PT null 0.987 PASS  FT null 0.960 FAIL  not quotable
+
+--- invocation 3/12  16:45:18Z  loadavg=10.01 15.69 13.75
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    10815  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    10818  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 3 skipped, not retried silently
+
+--- invocation 4/12  16:45:20Z  loadavg=9.69 15.53 13.71
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    10815  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    10818  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 4 skipped, not retried silently
+
+--- invocation 5/12  16:45:23Z  loadavg=9.69 15.53 13.71
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    10815  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    10818  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 5 skipped, not retried silently
+
+--- invocation 6/12  16:45:25Z  loadavg=10.12 15.52 13.72
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    10815  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    10818  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 6 skipped, not retried silently
+
+--- invocation 7/12  16:45:27Z  loadavg=10.12 15.52 13.72
+guard PASS: no peer measurement detected, loadavg 10.12/15.52/13.72 (spread 1.53x <= 4x, floor 8.00), iowait 1.6% <= 10%
+  conv2d_big      4.739    6.017   FT 1.27x FASTER     PT PASS [0.941,1.037] FT PASS [0.965,1.018] ratio 1.270 [1.226,1.312] match incumbent=LEVEL-A/2 n13
+  incumbent_mode lane=conv2d_big drawn=6.017 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.40x gap:
+      level A  n=13  median    5.821  range [5.301, 7.674]  spread 1.45x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+      level B  n=2   median   10.977  range [10.744, 11.210]  spread 1.04x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1318s, but a split seen inside one session is still positive evidence of two levels.
+    MIN-ESTIMATOR FT 1.21x FASTER     ratio 1.211 [1.153,1.259]  PT null 1.014 PASS  FT null 0.985 PASS  QUOTABLE under the min estimator
+  conv2d_big_masked    9.258    6.253   FT 1.48x SLOWER     PT OFFSET [0.908,1.033] FT OFFSET [0.974,1.079] ratio 0.675 [0.641,0.700] match incumbent=LEVEL-A/2 n13
+  incumbent_mode lane=conv2d_big_masked drawn=6.253 ms  LEVEL A OF 2 — the banked population for this lane splits at a 1.44x gap:
+      level A  n=13  median    5.979  range [5.522, 7.733]  spread 1.40x   <- THIS RUN   [LEVEL SPREAD EXCEEDS THE GAP — suspect a third level]
+      level B  n=2   median   11.406  range [11.109, 11.703]  spread 1.05x
+    This row is comparable ONLY to rows that drew level A. NEITHER LEVEL IS KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so a disagreement with the majority is a NO-VERDICT, not a correction. A standing whose SIGN differs between the levels must not be banked from one invocation. The bank spans 1318s, but a split seen inside one session is still positive evidence of two levels.
+    NULL-FAILED: incumbent 0.972, FrankenTorch 1.032; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.58x SLOWER     ratio 0.634 [0.589,0.667]  PT null 1.012 PASS  FT null 1.022 FAIL  not quotable
+
+--- invocation 8/12  16:45:54Z  loadavg=10.70 15.21 13.66
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    24439  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    24655  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 8 skipped, not retried silently
+
+--- invocation 9/12  16:45:56Z  loadavg=10.24 15.04 13.62
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    24439  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    24655  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 9 skipped, not retried silently
+
+--- invocation 10/12  16:45:58Z  loadavg=10.24 15.04 13.62
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    24439  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    24655  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 10 skipped, not retried silently
+
+--- invocation 11/12  16:46:00Z  loadavg=9.82 14.88 13.57
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    24439  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    24655  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 11 skipped, not retried silently
+
+--- invocation 12/12  16:46:03Z  loadavg=9.82 14.88 13.57
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    24439  perf stat -e instructions,page-faults -x, /data/projects/.scratch/blackthrush/fp-bench-default-ee4de
+    24655  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — invocation 12 skipped, not retried silently
+
+bank lines for these lanes: 30
+===== end 2026-09-01T16:46:05Z =====
