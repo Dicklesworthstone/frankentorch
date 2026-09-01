@@ -84,6 +84,24 @@ mapfile -t HITS < <(
             # reported the very thing that had just told it to measure. Excluded by name.
             # (No apostrophes in this block: it lives inside a single-quoted awk program.)
             if (args ~ /franken_feed[.]sh/) next;
+            # A SEARCH TOOL IS NOT A MEASUREMENT, and it cannot be excluded by `comm`.
+            # Observed 2026-09-01: a long-lived log-monitoring
+            #   ugrep ... -E --line-buffered "V3 BUILD JOB RAN|...|ffs-mounted-kernel-bench$|rwx"
+            # was reported as a live peer measurement for tens of minutes. It matched because the
+            # ARGS_PATTERN word `bench` appears in the REGEX IT IS SEARCHING FOR -- exactly the
+            # franken_feed case above, with a different carrier.
+            #
+            # `grep` is already in COMM_EXCLUDE and did not help: on this box grep IS ugrep, and
+            # **ugrep overwrites its own process name with its version**, so its `comm` reads
+            # `2.1.251`. Any comm-based exclusion misses it. Match the INVOKED EXECUTABLE in argv
+            # instead, with or without a path.
+            #
+            # This cannot cause a false NEGATIVE -- a search tool is not a benchmark -- so it is
+            # a safe exclusion under this file`s own rule that over-matching is the safe
+            # direction. It is deliberately a short list of search/monitor tools, not a general
+            # CPU threshold: a peer between phases at the instant of the check burns no CPU, and
+            # missing THAT costs a banked ratio.
+            if (args ~ /^([^ ]*\/)?(ugrep|ripgrep|rg|ag|ack|fd|find|tail|less|watch)( |$)/) next;
             if (comm ~ excl) next;
             # REMOTE WORK DOES NOT CONTEND HERE. On this host `cargo` on PATH is an rch
             # offload shim, so a plain `cargo test`/`cargo bench` — and anything spawned

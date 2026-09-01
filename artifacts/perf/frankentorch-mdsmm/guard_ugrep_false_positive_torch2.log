@@ -1,0 +1,33 @@
+guard false-positive evidence — a SEARCH TOOL counted as a peer measurement
+captured 2026-09-01T19:04:28Z on thinkstation1
+
+guard output:
+REFUSING TO MEASURE: 3 peer measurement process(es) are live.
+    2199963  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3831724  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+REFUSING TO MEASURE: 1-minute loadavg 37.96 exceeds 35.
+REFUSING TO MEASURE: iowait 47.1% exceeds 10% — host is disk-bound.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_exit=1
+
+the matching processes, with comm and measured CPU:
+  pid=2001749 comm=zsh cpu_over_1s=0% args=/usr/bin/zsh -c source /home/ubuntu/.claude/shell-snapshots/snapshot-zsh-1788053481748-6mx
+  pid=2199884 comm=zsh cpu_over_1s=0% args=/usr/bin/zsh -c source /home/ubuntu/.claude/shell-snapshots/snapshot-zsh-1788053756672-gbm
+  pid=2199963 comm=2.1.251 cpu_over_1s=0% args=ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.h
+  pid=3805369 comm=rustc cpu_over_1s=99% args=/home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/bin/rustc --cr
+  pid=3826280 comm=python cpu_over_1s=19% args=/data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --catego
+  pid=3831724 comm=ffs-mounted-ker cpu_over_1s=17% args=artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --files
+
+===== AFTER THE FIX, same instant, same live processes =====
+2026-09-01T19:05:24Z
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    3826280  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    3965620  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_exit=1
+
+ugrep processes still live on the box (should NOT appear above):
+1883192 2.1.251         ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --
+2199963 2.1.251         ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --
+3490324 2.1.251         ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --
