@@ -1,0 +1,13 @@
+=== BANKED MODE-CONDITIONED MAX_POOL1D REFRESH VERIFY ===
+utc=2026-09-01T20:02:59Z
+head=51da596150597a9d082067547e3d09f07c0f8afd
+banked_harness_surface_vs_5093ccf=UNCHANGED; current_guard=e320cc56
+banked_build=RCH_REQUIRE_REMOTE=1 rch exec --no-self-healing --base 5093ccf4b2b3cf894b4a5d3bba7e7b08cb47cc0c --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h; remote=hz4; overlay_fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195; exit=0
+e024e0d6f8b61cff761566274ba87beb0c35b07618174ff6e238f930fbbd6994  /data/tmp/ft-mdsmm-conv2d-delta-rflWyI/release/examples/gauntlet_lane_sweep_h2h
+runtime_command=PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=64 FT_H2H_LANES_EXACT=1 FT_H2H_LANES=max_pool1d FT_H2H_REPS=32 FT_H2H_WARMUP=32 FT_H2H_ROUND_WARMUP=0 /data/tmp/ft-mdsmm-conv2d-delta-rflWyI/release/examples/gauntlet_lane_sweep_h2h
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    453101  artifacts/elf/cljvq/ffs-mounted-kernel-bench --ffs-cli artifacts/elf/cljvq/ffs-cli --filesystem btrf
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+guard_exit=1
+run_classification=NO_VERDICT; reason=pre-run guard refused real FrankenFS ffs-mounted-kernel-bench peer; runtime not launched
+classification_utc=utc=2026-09-01T20:03:22Z
