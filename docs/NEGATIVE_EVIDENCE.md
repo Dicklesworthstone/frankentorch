@@ -41778,3 +41778,31 @@ small nb wins, not whether one does.
 of the code beneath it, not a property of the algorithm. Re-run the ladder whenever that code
 moves.** This one had drifted 13x and nobody re-ran it; the constant silently became wrong by
 1.17-1.81x. Any tuned constant with a dated measurement beside it is a candidate for the same audit.
+
+### 292f. lzku6 LANE 2: A CENSUS RE-POINTED THE LANE, AND getri's NB TURNED OUT NOT TO BE STALE
+
+`frankentorch-stale-tuning-constants-lzku6`. Lane 2 was opened against `lu_solve_contiguous_f64`'s
+NB=64, to be certified on slogdet. **Both were wrong, and one census run said so**: neither slogdet
+nor inv executes `lu_solve` — its in-call counters read 0.0000 ms for both. slogdet is LU plus an
+O(n) diagonal log-product; `inv` runs `lu_inverse_from_factor_f64`, a different function with its
+own NB; `lu_solve` serves `linalg.solve`. **Third time on this campaign that a census before the
+work changed which code was the subject** (291: 5 of 31 calls qualified; 292: cholesky never calls
+`dgemm_sub_into`).
+
+Swept the constant `inv` actually runs. Three sizes, two runs, min of 9, guard PASS, both halves
+counted. Best rival nb=32 vs the incumbent 64:
+
+    n=256   0.838x / 1.102x   <- LOSS
+    n=512   1.031x / 1.158x
+    n=1024  1.202x / 0.990x   <- LOSS
+
+**Two of six cells lost: the all-cells rule fails and nothing ships.** The n=256 INCUMBENT cell also
+read 2.4821 and 3.2581 ms across the two runs — a 1.31x swing on identical code — so the four wins
+are shakier than they look. **Not every tuned constant is stale**, and a bead that can only return
+wins is not a filter. Two shipped (292d cholesky 1.264x, 292e getrf 1.165x), one null here.
+
+**THE COUNTERS FOUND A BETTER TARGET THAN THE CONSTANT.** getri's residual — identity setup,
+allocation, and the final column permutation, i.e. everything outside the two triangular solves — is
+~55% of the call at n=256 and ~45% at n=512/1024, LARGER than either solve half at every size, with
+the forward solve the smallest term throughout. Unattributed until now. That is the standing lesson
+of phase-counting a lane you only meant to tune: the decomposition outlives the sweep.
