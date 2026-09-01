@@ -1504,12 +1504,21 @@ fn timed_conv2d_f32(
 /// A no-grad weight would skip `dweight` entirely and measure the wrong half, which is why
 /// `requires_grad` is true on both arms — the same reason `prelu` and `group_norm` carry
 /// grad-requiring parameters.
+/// `dense` selects the loss: `false` is `sum(out)`, `true` is `sum(out*out)`.
+///
+/// WHY THE PAIR EXISTS — `frankentorch-mdsmm`. `sum(out)` makes the incoming gradient exactly
+/// all `+1.0`, which is a legitimate case (`loss.backward()` on a summed output) but is not what
+/// training does, and on this board it has hidden real gaps: the conv family's summed lanes were
+/// inflated 1.51x-1.95x against their non-uniform twins, and conv3d's standing changed SIGN.
+/// Linear's dweight is the most-executed backward in the library and has only ever had the
+/// summed route, so whether that route flatters it has never been measurable.
 fn timed_linear(
     values: &[f64],
     weight: &[f64],
     batch: usize,
     in_f: usize,
     out_f: usize,
+    dense: bool,
 ) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
@@ -1520,7 +1529,14 @@ fn timed_linear(
         .expect("linear weight");
     let started = Instant::now();
     let out = session.functional_linear(x, w, None).expect("linear");
-    let loss = session.tensor_sum(out).expect("sum");
+    // Squared BEFORE the sum, matching `timed_op_sq`, so the incumbent's `**2` closure times the
+    // same work and parity holds.
+    let summand = if dense {
+        session.tensor_mul(out, out).expect("square")
+    } else {
+        out
+    };
+    let loss = session.tensor_sum(summand).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     let checksum = report
@@ -1549,7 +1565,10 @@ thread_local! {
 /// The timed region matches every other lane on this board: forward, loss sum, backward, with the
 /// leaves built OUTSIDE the timer. The checksum is the query gradient, which is the leaf the
 /// incumbent arm also differentiates, so the two sides are compared on the same tensor.
-fn timed_attention(query: &[f64], key: &[f64], value: &[f64]) -> (f64, f64) {
+/// `dense` selects the loss, exactly as `timed_linear` does and for the same reason: attention's
+/// dV is one of the `dgemm_tb` entries `frankentorch-58zjz` added lanes for, and the lane it added
+/// only reaches the all-ones route.
+fn timed_attention(query: &[f64], key: &[f64], value: &[f64], dense: bool) -> (f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let shape = vec![ATTN_B, ATTN_H, ATTN_S, ATTN_D];
     let q = session
@@ -1568,7 +1587,14 @@ fn timed_attention(query: &[f64], key: &[f64], value: &[f64]) -> (f64, f64) {
         .expect("scaled_dot_product_attention");
     let forward_ms = forward_started.elapsed().as_secs_f64() * 1_000.0;
     let loss_started = Instant::now();
-    let loss = session.tensor_sum(out).expect("sum");
+    // The square is inside the LOSS frame, not the forward one: it is part of building the loss,
+    // and putting it in `forward_ms` would misattribute it in the split this lane reports.
+    let summand = if dense {
+        session.tensor_mul(out, out).expect("square")
+    } else {
+        out
+    };
+    let loss = session.tensor_sum(summand).expect("sum");
     let loss_sum_ms = loss_started.elapsed().as_secs_f64() * 1_000.0;
     let backward_started = Instant::now();
     let report = session.tensor_backward(loss).expect("backward");
@@ -2012,6 +2038,15 @@ LANES = {
     # frankentorch-58zjz: the query is the timed leaf; K and V require grad too, so the backward
     # reaches BOTH dV (the dgemm_tb entry this bead is about) and the softmax/dQ path.
     "attention": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)),
+    # frankentorch-mdsmm: incumbent twins for the three 58zjz lanes. SQUARED here for the same
+    # reason every other _dense lane on this board is: the serve loop does fn(x).sum().backward(),
+    # so returning the square makes this arm's loss sum(out*out) and matches the work the FT arm
+    # times. Without it the two arms measure different things and parity mismatches.
+    # torch is byte-identical code under the plain and _dense names, so PT(dense)/PT(plain) is a
+    # free control that prices the squaring itself rather than assuming it is free.
+    "linear_wide_dense":   (linx, lambda x: Fn.linear(x, linw_wide)**2),
+    "linear_narrow_dense": (linx, lambda x: Fn.linear(x, linw_narrow)**2),
+    "attention_dense": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)**2),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
     # frankentorch-l2zki: NON-UNIFORM loss, the only lane here that reaches conv3d's GENERIC
     # backward. The `*c3m` sits inside the lane's own fn, so `run`'s `fn(x).sum()` becomes
@@ -3114,18 +3149,39 @@ LANES = {
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate
             // ENGAGES here (m=128, n=1024: n > 4m, and m*k*n = 67M > 16.8M).
             "linear_wide",
-            Box::new(|| timed_linear(&linx, &linw_wide, LIN_B, LIN_IN, LIN_OUT_WIDE)),
+            Box::new(|| timed_linear(&linx, &linw_wide, LIN_B, LIN_IN, LIN_OUT_WIDE, false)),
         ),
         (
             // The same op on the OTHER side of that gate (m=512, n=1024: n > 4m is false), so
             // item 119's path does NOT engage. Carried so the pair says where the change acts
             // rather than implying it acts everywhere.
             "linear_narrow",
-            Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW)),
+            Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW, false)),
         ),
         (
             "attention",
-            Box::new(|| timed_attention(&attnq, &attnk, &attnv)),
+            Box::new(|| timed_attention(&attnq, &attnk, &attnv, false)),
+        ),
+        // frankentorch-mdsmm: the NON-UNIFORM twins for the three lanes `frankentorch-58zjz`
+        // added. Those lanes end in `tensor_sum(out)`, so their upstream gradient is exactly all
+        // `+1.0` and they only ever price the all-ones route. On the conv family that route
+        // flattered us by 1.51x-1.95x and on conv3d it changed the SIGN of the standing, so
+        // whether it flatters the most-executed backward in the library is worth one row each.
+        //
+        // Registered as a PAIR with the plain lane in the same invocation. The inflation is a
+        // ratio of ratios, so it is invariant to the incumbent level the session draws — which is
+        // the only figure from these lanes that survives a bimodal incumbent.
+        (
+            "linear_wide_dense",
+            Box::new(|| timed_linear(&linx, &linw_wide, LIN_B, LIN_IN, LIN_OUT_WIDE, true)),
+        ),
+        (
+            "linear_narrow_dense",
+            Box::new(|| timed_linear(&linx, &linw_narrow, LIN_B, LIN_IN, LIN_OUT_NARROW, true)),
+        ),
+        (
+            "attention_dense",
+            Box::new(|| timed_attention(&attnq, &attnk, &attnv, true)),
         ),
         (
             "conv3d",
