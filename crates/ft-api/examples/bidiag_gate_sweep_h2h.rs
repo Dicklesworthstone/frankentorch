@@ -1584,7 +1584,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         //
         // This is a SEPARATE profiled call, not the timed one — the phase split is FT-internal
         // either way, and the timed arms above are what the vs-PT column is built from.
-        if matches!(ft_op, LinalgOp::Eigh | LinalgOp::Eigvalsh) {
+        if ft_op == LinalgOp::Eigh {
             let mut sym = vec![0.0f64; n * n];
             for r in 0..n {
                 for c in 0..n {
@@ -1600,6 +1600,32 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 ms(reduce),
                 ms(back),
                 ms(tql2)
+            );
+        }
+
+        // EIGVALSH PHASES — `frankentorch-mdsmm`.
+        //
+        // The values-only route is not full eigh without a result: it packs only the lower
+        // triangle, omits both eigenvector accumulations, then runs values-only QL and sort.
+        // Its own profile is therefore required before retrying any representation/schedule
+        // lever already rejected on full-eigh or two-stage storage.
+        if ft_op == LinalgOp::Eigvalsh {
+            let (values, copy, reduce, ql, sort) = ft_kernel_cpu::eigvalsh_stage_profile_f64(&data, n);
+            std::hint::black_box(values);
+            let total = (copy + reduce + ql + sort).max(1) as f64;
+            let ms = |v: u128| v as f64 / 1e6;
+            let pct = |v: u128| 100.0 * v as f64 / total;
+            eprintln!(
+                "eigvalsh phases (same invocation, separate profiled call): pack {:.3} ms {:.0}%  \
+                 packed-tred2 {:.3} ms {:.0}%  values-QL {:.3} ms {:.0}%  sort {:.3} ms {:.0}%",
+                ms(copy),
+                pct(copy),
+                ms(reduce),
+                pct(reduce),
+                ms(ql),
+                pct(ql),
+                ms(sort),
+                pct(sort),
             );
         }
 
