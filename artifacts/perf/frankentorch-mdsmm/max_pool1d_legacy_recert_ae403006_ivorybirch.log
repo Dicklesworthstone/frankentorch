@@ -1,0 +1,22 @@
+=== DURATION-EXCLUSIVE H2H RECERTIFICATION: MAX_POOL1D LEGACY ROW ===
+started_utc=2026-09-01T20:30:15Z
+runtime_head=ae403006843acdae8a85e23ba9b3ad49e69ac6eb
+banked_clean_overlay_base=ecd7f791020e966ae5601183c57df19f5278ab71
+banked_build_command=RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/tmp/ft-mdsmm-recert-ecd7f791-ivorybirch rch exec --no-self-healing --base ecd7f791020e966ae5601183c57df19f5278ab71 --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+banked_build_remote_worker=hz4
+banked_build_exit=0
+binary_surface_equivalence=PASS (runtime_head differs only outside Cargo.toml,Cargo.lock,crates/)
+elf=/data/tmp/ft-mdsmm-recert-ecd7f791-ivorybirch/release/examples/gauntlet_lane_sweep_h2h
+elf_sha256=1a6d6726631ebbc159c20e8e9cbff648a8aefe642e13c8025db7bf7af204ee8d
+would_be_runtime_command=FT_H2H_WINDOW_WAIT=60 PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python RAYON_NUM_THREADS=64 FT_H2H_LANES_EXACT=1 FT_H2H_LANES=max_pool1d FT_H2H_REPS=32 FT_H2H_WARMUP=32 FT_H2H_ROUND_WARMUP=0 scripts/h2h_window.sh /data/tmp/ft-mdsmm-recert-ecd7f791-ivorybirch/release/examples/gauntlet_lane_sweep_h2h
+--- admission transcript ---
+guard PASS: no peer measurement detected, loadavg 3.52/3.92/6.46 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+guard_exit=0
+ 328551  276727    2965  799 /data/tmp/cargo-target/debug/build/frankensearch-quill-gauntlet/cb050b814fba148f/out/frankensearch_quill_gauntlet-cb050b814fba148f
+pre_admission_h2h_observer=REFUSE: the immediately preceding wrapper-held conv2d run observed PID 328551 as a non-participating h2h-harness consuming local CPU. It remains live above. The duration lock cannot exclude a process that does not adopt it; starting max_pool1d would knowingly produce a contaminated row.
+runtime_not_started=yes
+incumbent_level=N/A (no same-invocation incumbent sample was taken)
+dual_A/A=N/A (runtime not started)
+parity=N/A (runtime not started)
+verdict=NO_VERDICT (known live non-participating H2H peer; no sampled row)
+completed_utc=2026-09-01T20:31:20Z
