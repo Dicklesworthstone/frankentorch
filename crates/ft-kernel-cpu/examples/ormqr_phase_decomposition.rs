@@ -84,7 +84,7 @@ fn main() {
 
         let previous = ft_kernel_cpu::set_ormqr_stage_profile_enabled(true);
         let mut totals: Vec<f64> = Vec::with_capacity(reps);
-        let mut acc = [0.0f64; 7];
+        let mut phase_totals: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); 7];
         for _ in 0..reps {
             let mut c = c0.clone();
             let _ = ft_kernel_cpu::ormqr_stage_take_ns();
@@ -94,17 +94,24 @@ fn main() {
             std::hint::black_box(&c);
             let ms = |v: u64| v as f64 / 1e6;
             totals.push(ms(total));
-            for (slot, value) in acc
+            for (slot, value) in phase_totals
                 .iter_mut()
                 .zip([panel, transpose, workspace, vt_c, t_w, v_w, subtract])
             {
-                *slot += ms(value);
+                slot.push(ms(value));
             }
         }
         ft_kernel_cpu::set_ormqr_stage_profile_enabled(previous);
 
+        // MEDIAN-VS-MEDIAN, not mean-vs-median. The first version of this file summed MEAN phase
+        // times and compared them against the MEDIAN total, so UNATTRIBUTED went NEGATIVE
+        // (-0.3%, -7.3%) whenever the totals were right-skewed — the phases legitimately summed to
+        // more than the median. That is estimator-mixing of exactly the kind
+        // `feedback_estimator_and_provenance` forbids ("NEVER subtract a min from a median and
+        // call it a phase"), and it made the one line whose job is to prove the accounting CLOSES
+        // the least trustworthy line in the table.
         let total_med = median(&mut totals);
-        let mean_total: f64 = acc.iter().sum::<f64>() / reps as f64;
+        let phase_sum: f64 = phase_totals.iter_mut().map(|v| median(v)).sum();
         let names = [
             "panel build",
             "T transpose",
@@ -116,11 +123,11 @@ fn main() {
         ];
         println!("\nn={n}  left apply, non-transpose  —  median total {total_med:.4} ms");
         println!("  {:>12} {:>10} {:>8}", "phase", "ms/call", "share");
-        for (name, value) in names.iter().zip(acc.iter()) {
-            let per_call = value / reps as f64;
+        for (name, samples) in names.iter().zip(phase_totals.iter_mut()) {
+            let per_call = median(samples);
             println!("  {name:>12} {per_call:>10.4} {:>7.1}%", 100.0 * per_call / total_med);
         }
-        let unattributed = total_med - mean_total;
+        let unattributed = total_med - phase_sum;
         println!(
             "  {:>12} {unattributed:>10.4} {:>7.1}%   <- allocation, panel collection, loop \
              overhead. A decomposition whose parts do not add up has not found the op yet (292g).",
