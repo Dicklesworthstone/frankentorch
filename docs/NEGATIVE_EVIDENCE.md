@@ -42381,3 +42381,51 @@ confirm the phase columns are populated.
 `ft-kernel-cpu` now claims an owner, and every write site behind them is gated. The invariant to
 preserve is one line long: **a new drain-style instrument gets an owner, its accessor claims it, and
 its writes go through `stage_family_add` or `stage_family_records`.**
+
+### 293h. NO WINDOW, SO NO ROW — AND "THE LOAD IS LOW" IS NOT "THE GUARD WILL PASS"
+
+`frankentorch-ebbew`. The phase-column check deferred by 293g was attempted and **not taken**. That
+is the result; recording it is the point, because the alternative on offer was a caveated table.
+
+**THE GUARD REFUSED ON THE SPREAD RULE, NOT THE CEILING.** At the moment the host was called idle,
+the ceiling was satisfied with room to spare and the check still failed:
+
+    REFUSING TO MEASURE: loadavg 5.30 / 115.88 / 222.51 spread exceeds 4x
+
+`--max-load 35` was never the binding constraint. `FT_GUARD_MAX_LOAD_RATIO` is: the 15-minute
+average still carried a finished external build, and a 1-minute average of 5 against a 15-minute
+average of 222 is a host that has *stopped* being busy, not one that *is* quiet. **A 15-minute mean
+needs roughly 15 minutes to forget an hour-long build**, so after any large external job the guard
+keeps refusing well past the point where `uptime` looks fine and every instinct says go. Seven
+consecutive refusals over thirteen minutes here.
+
+And the load then went back UP — 5 → 19 → 26 — because the box was not draining at all: `ps` showed
+another attended session's wave-3 build, `mcp_agent_mail_cli`, `beads_rust` and `fsqlite_core`
+rustc jobs at 200-350% CPU each plus a `franken_networkx` pytest run. **Waiting for a number to
+decay, without looking at what is producing it, is how an hour disappears.** Check `ps` before
+deciding whether to wait or to park.
+
+**WHAT WAS NOT DONE, EXPLICITLY.** `FT_GUARD_MAX_LOAD` and `FT_GUARD_MAX_LOAD_RATIO` were not
+raised. The 293 arc is about not talking a gate out of its answer, and a gate overridden to obtain
+one's own measurement is the same defect as a sweep whose ordering flatters its candidate.
+
+**WHAT WAS DONE INSTEAD: the check is now one command**, `scripts/phase_column_check.sh`. It
+guards, builds through rch with the 103-refusal retry, snapshots each ELF and prints its SHA,
+re-guards **before every lane** because a window open at lane 1 can be shut by lane 4, runs all
+four lanes at the host's 16-thread optimum, and prints a PHASE-COLUMN VERDICT naming each family
+populated or ZERO. It exits non-zero on a refusal and on any zeroed family.
+
+**THE DETECTOR IS FALSIFIABLE, WHICH IS THE ONLY REASON TO TRUST IT.** Validated against
+transcripts already captured, not against new runs: the real f32 transcript reads `populated (3
+incumbent rows)`; deliberately including the legitimately-zero `zero` column reports `ZERO PHASES in
+3 of 12 cells: col7 col7 col7`; the getrf and getri field maps each flag a deliberately shifted
+column; and a file with no incumbent row reports `NO INCUMBENT ROW PARSED` rather than passing. That
+last case matters most — **if a peer changes a sweep's table layout, the check says it could not
+parse instead of silently reporting OK**, which is the failure mode a column-position parser
+otherwise has by construction.
+
+**THE HALF THAT WAS NEVER BLOCKED.** 293g moved instrument liveness into the test suite precisely
+so it would not depend on a window; `stage_counters_ignore_other_threads_...` and
+`half_timers_and_censuses_ignore_other_threads_...` assert that every family still records for its
+owner, and they are green. What remains outstanding is the sweeps' own view of the phases — a
+confirmation, not the primary evidence.
