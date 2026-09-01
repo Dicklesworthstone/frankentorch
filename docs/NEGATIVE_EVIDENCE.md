@@ -41875,3 +41875,40 @@ absent by construction rather than omitted.
 strong enough to state as a rule: **when a phase split names a target, the next step is a census of
 what that phase actually touches — not a lever, and not an explanation.** Three of the four
 redirections killed a lever that would otherwise have been built.
+
+### 292i. TWELVE KERNEL CELLS WON AND THE LANE SAID 8% SLOWER — geqrf b=64 REFUTED AT THE GATE
+
+`frankentorch-stale-tuning-constants-lzku6`. The strongest sweep evidence this campaign has
+produced, overturned by the one gate that outranks it.
+
+The sweep had b=64 beating the incumbent 32 in **all twelve cells** (three sizes, four passes,
+median ~1.17x, min 1.018x), with the confound instrumented and PROVEN moot (the skinny-split
+predicate reads 0 admitted at every width — dead code for geqrf shapes), the edge-of-grid trap
+self-caught by extending past 64 and finding 96/128/192 worse, and a model that predicted the
+crossover rather than being fitted to it.
+
+The paired lane certification, n=256, arm0 = shipped, interleaved, guard PASS, parity 3.20e-13:
+
+    PAIRED (candidate b=64 vs shipped 32)   0.967 / 0.915 / 0.905 / 0.926   median 0.9205
+    A/A NULL                                0.986 / 0.996 / 1.001 / 0.992   range 0.986-1.001
+
+**~8% SLOWER, with all four readings wholly outside the null.** A clean refutation, not a wash.
+The arm reached the lane (3.572-4.036 shipped vs 3.962-4.343 candidate), so this is not a lever
+that failed to fire.
+
+**A 25-POINT ISOLATION-TO-LANE SWING (+17% -> -8%).** Item 217 records a 5.7x standalone ladder
+becoming a 1.118x regression; this is the same shape with the sign flipping on evidence that had
+every quality marker: twelve cells, four passes, three sizes, an interior optimum, a pre-registered
+model, a confound instrumented and dismissed by count. **All of that is compatible with being wrong
+in situ.** The sweep called `geqrf_blocked_nb_f64` directly; the lane runs it through the session
+with its allocation and cache state around it. Which of those explains the inversion is NOT
+established, and naming an unmeasured mechanism is the error 292g caught one lane earlier.
+
+The rule this arc has now paid for three times over: **a kernel sweep, however many cells it wins,
+is a hypothesis about the lane. Only the lane is the result.** Cholesky's and getrf's sweeps
+survived their certifications (292d, 292e); this one did not, and the difference was visible
+nowhere except at the gate.
+
+Default stays 32. The knob and the `FT_QRNB` lane arm ship anyway so the next attempt starts from
+the instrument rather than rebuilding it — and per torch:4's brief only geqrf's literal is
+parameterised; the QR wrapper, orgqr and ormqr keep their own independent 32s.
