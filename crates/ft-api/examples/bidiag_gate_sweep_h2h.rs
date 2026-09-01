@@ -198,6 +198,9 @@ struct Arm {
     /// `frankentorch-valnx`: getrf blocking width; 0 = the shipped default. `FT_LUNB=0,128`
     /// prices the new default against the OLD one, shipped value as arm0.
     lu_nb: usize,
+    /// `frankentorch-stale-tuning-constants-lzku6`: geqrf panel width; 0 = shipped. `FT_QRNB=0,64`
+    /// prices the swept candidate against the incumbent, shipped value as arm0.
+    geqrf_nb: usize,
     /// Forced column-block WIDTH for the trailing-update GEMM; `0` = the thread-derived
     /// default (`frankentorch-rpytm`). `block_cols` divides by `rayon::current_num_threads()`,
     /// so width and thread count move together by default and a thread sweep cannot separate
@@ -289,6 +292,7 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
         + &format!("/panelmode{}", arm.panel_mode)
         + &(if arm.cholesky_nb == 0 { "/nbSHIPPED".to_string() } else { format!("/nb{}", arm.cholesky_nb) })
         + &(if arm.lu_nb == 0 { "/luSHIPPED".to_string() } else { format!("/lunb{}", arm.lu_nb) })
+        + &(if arm.geqrf_nb == 0 { "/qrSHIPPED".to_string() } else { format!("/qrnb{}", arm.geqrf_nb) })
         + &(if op == LinalgOp::CholeskyF32 {
             if arm.cholesky_nb_f32 == 0 {
                 "/f32nbSHIPPED".to_string()
@@ -467,6 +471,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_cholnb = ft_kernel_cpu::set_cholesky_nb(arm.cholesky_nb);
     let previous_cholnb_f32 = ft_kernel_cpu::set_cholesky_nb_f32(arm.cholesky_nb_f32);
     let previous_lunb = ft_kernel_cpu::set_lu_nb(arm.lu_nb);
+    let previous_qrnb = ft_kernel_cpu::set_geqrf_nb(arm.geqrf_nb);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
     let previous_tpm = ft_kernel_cpu::set_tred2_par_min_l(arm.tred2_par_min);
@@ -530,6 +535,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
         ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
         ft_kernel_cpu::set_lu_nb(previous_lunb);
+        ft_kernel_cpu::set_geqrf_nb(previous_qrnb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -571,6 +577,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
         ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
         ft_kernel_cpu::set_lu_nb(previous_lunb);
+        ft_kernel_cpu::set_geqrf_nb(previous_qrnb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -683,6 +690,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
     ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
     ft_kernel_cpu::set_lu_nb(previous_lunb);
+    ft_kernel_cpu::set_geqrf_nb(previous_qrnb);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
@@ -995,6 +1003,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .unwrap_or_else(|| vec![0]);
+    let qrnbs: Vec<usize> = std::env::var("FT_QRNB")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|v| v.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![0]);
     let ggs_arms: Vec<bool> = std::env::var("FT_GGS")
         .unwrap_or_else(|_| "0".to_string())
         .split(',')
@@ -1056,6 +1072,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for &cholesky_nb in &cholnbs {
                             for &cholesky_nb_f32 in &cholnbs_f32 {
                             for &lu_nb in &lunbs {
+                            for &geqrf_nb in &qrnbs {
                                 for &sub_cols in &subcols {
                                   for &panel_par_min in &ppms {
                                    for &tred2_par_min in &tpms {
@@ -1083,6 +1100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         cholesky_nb,
                                         cholesky_nb_f32,
                                         lu_nb,
+                                        geqrf_nb,
                                         sub_cols,
                                         panel_par_min,
                                         tred2_par_min,
@@ -1106,6 +1124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                    }
                                   }
                                 }
+                            }
                             }
                             }
                             }

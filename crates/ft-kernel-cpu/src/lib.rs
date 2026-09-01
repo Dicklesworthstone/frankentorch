@@ -41261,6 +41261,35 @@ fn qr_householder_panel_blocked(
 /// is the bar the geqrf goldens already use (1e-11 vs torch).
 ///
 /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+/// geqrf panel width, overridable for its paired lane certification.
+/// `frankentorch-stale-tuning-constants-lzku6`. 0 = the shipped default.
+///
+/// SCOPED TO geqrf DELIBERATELY. torch:4's lane brief established that `NB=32` is FOUR independent
+/// literals — this call, the public QR wrapper, `orgqr_blocked_f64` and `ormqr_blocked_f64` — and
+/// that their arithmetic differs (orgqr/ormqr change the T-multiply and GEMM geometry as
+/// ~2n^3 + b*n^2, a different tradeoff from geqrf's). Only geqrf has been swept, so only geqrf is
+/// parameterised. Assuming the others transfer is the mistake this whole bead exists to prevent.
+///
+/// NOT the same thing as `HOUSEHOLDER_PANEL_WIDTH`, which is a skinny-split SHAPE PREDICATE and
+/// whose admission census reads 0 at every width for geqrf — dead code on this path.
+static GEQRF_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The shipped geqrf panel width.
+const GEQRF_NB_SHIPPED: usize = 32;
+
+/// Override the geqrf panel width; `0` restores the shipped default.
+#[doc(hidden)]
+pub fn set_geqrf_nb(nb: usize) -> usize {
+    GEQRF_NB.swap(nb, LuOrdering::Relaxed)
+}
+
+fn geqrf_nb() -> usize {
+    match GEQRF_NB.load(LuOrdering::Relaxed) {
+        0 => GEQRF_NB_SHIPPED,
+        v => v.max(1),
+    }
+}
+
 pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) {
     // nb=32 (unchanged), leaf 8 -> 2. Interleaved min-of-7 ladders at BOTH n=512 and
     // n=1024, because the two constants behave differently:
@@ -41283,7 +41312,7 @@ pub fn geqrf_blocked_f64(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>) 
     // `trailing_R` is invariant across leaf, so the knob moves only the term it should.
     //
     // Applied to geqrf ONLY; `tensor_linalg_qr` keeps its own constants.
-    geqrf_blocked_nb_f64(a, m, n, 32, 2, None)
+    geqrf_blocked_nb_f64(a, m, n, geqrf_nb(), 2, None)
 }
 
 /// `geqrf_blocked_f64` with the panel width exposed and optional stage timings.
