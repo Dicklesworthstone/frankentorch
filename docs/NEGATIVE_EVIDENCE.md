@@ -42502,3 +42502,66 @@ different claims, and only the second one admits.
 
 No measurement taken. The check is now correct and re-runnable; the host went to 48 concurrent
 rustc processes and 93% iowait minutes after the fix landed, so it waits again.
+
+### 293j. THE DEFERRED CHECK, TAKEN: ALL FOUR FAMILIES POPULATED — THE OWNERSHIP CONVERSION SILENCED NOTHING
+
+`frankentorch-ebbew`, closed on evidence. Ledger 293e-g converted every drain-style instrument in
+`ft-kernel-cpu` to thread-owned counters, and the failure mode of that change was never a crash: it
+was a table of ZEROES, an instrument reading 0 for a phase that demonstrably ran. The regression
+tests assert liveness per family on every gate; **this is the sweeps' own view, on a real host,
+through the real harness.**
+
+`scripts/phase_column_check.sh`, thinkstation1, `RAYON_NUM_THREADS=16`, reps=12, HEAD `00152e2c`,
+tree clean. Build remote via rch, ELFs pinned `01aabc87de62307e` / `1bba43a268a1a07a` /
+`5fa73205a85d66a3`. Guard admitted after 1230 s of the script's own settle wait at loadavg
+6.27/4.75/17.36. Incumbent-row phases, in ms:
+
+    cholesky f64    median    panel     TRSM    trail     zero
+      n=256        1.1250   0.5249   0.2413   0.2258   0.0209
+      n=512        4.6862   0.9170   0.9486   1.3773   0.0488
+      n=1024      15.8591   2.0875   2.0082   6.5518   0.5090
+
+    cholesky f32    median    panel     TRSM    trail
+      n=256        0.6839   0.0848   0.2544   0.1943
+      n=512        2.5396   0.2134   0.6411   1.1429
+      n=1024       8.6688   0.5723   1.8103   4.4701
+
+    getrf           median    panel    solve    trail
+      n=256        1.1108   0.4698   0.3255   0.2193
+      n=512        5.1633   1.9417   1.0201   1.2148
+      n=1024      17.6098   7.1505   2.7738   6.3503
+
+    getri (inv)     median  forward backward
+      n=256        3.1967   0.4269   0.9679
+      n=512       12.4915   1.8179   3.4170
+      n=1024      55.1694   8.4848  15.2903
+
+**PHASE-COLUMN VERDICT: populated in all four families, three incumbent rows each, every asserted
+cell non-zero.** The thread-owned conversion did not silence a single instrument. The f32 `zero`
+column reads 0.0000 by construction — that lane has no upper-zeroing phase — which is why the
+checker excludes it rather than asserting it; asserting it would have manufactured a failure, and
+including it deliberately is one of the negative cases the detector was validated against.
+
+**AND THE PHASES STILL ACCOUNT FOR THE WALL TIME**, which is the property that makes them worth
+having: cholesky f64 at n=1024 sums 2.09+2.01+6.55+0.51 = 11.16 of 15.86 ms, and getrf sums
+7.15+2.77+6.35 = 16.28 of 17.61. A counter that had gone thread-local-and-lost would not merely
+read low, it would read zero; a counter that had gone global-and-polluted would read HIGH. Neither
+happened.
+
+**THE FOURTH LANE WAS REFUSED FIRST, BY A LIMB NOBODY HAD SEEN FIRE.** getri was skipped on the run
+proper — not for load and not for iowait:
+
+    REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+        1375204  /data/tmp/ft-mdsmm-stage-00152/release/examples/bidiag_gate_sweep_h2h
+        1375214  /data/tmp/torchvenv-2121/bin/python -c import time, torch ...
+
+A peer's live h2h lane with its torch arm, i.e. exactly what item 241 built that limb for. It was
+re-run against the same pinned ELF thirty seconds after the peer finished, and reported populated.
+**Three limbs of that guard have now each refused this one check at least once** — ceiling, spread,
+iowait, and now peer-measurement — which is the strongest argument available that the gate is not
+decorative.
+
+**COST OF THE HONEST ROUTE, recorded so the next person can price it.** Five attempts across the
+session: three found no window at all, one was closed by the harness's own build (293i), and the
+fifth landed. Nothing was measured under a forced gate and no `FT_GUARD_*` variable was ever raised.
+The check is now one command and it takes about twenty minutes wall-clock on an admitted host.
