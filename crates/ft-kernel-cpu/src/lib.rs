@@ -70820,6 +70820,87 @@ mod tests {
         }
     }
 
+    /// The f32 twin of `cholesky_nb_knob_is_neutral_at_default_and_correct_elsewhere`, and it was
+    /// MISSING while an f32 NB sweep was already driving the knob.
+    ///
+    /// `set_cholesky_nb_f32` shipped as an instrument under
+    /// `frankentorch-stale-tuning-constants-lzku6` lane 1 with the f64 test left as the only
+    /// coverage — so every width that lane measured was a width nothing had checked, and a sweep
+    /// reporting 1.19-1.23x for nb=64 could have been reporting the speed of a wrong
+    /// factorisation. The two obligations are the f64 ones:
+    ///
+    /// 1. `set_cholesky_nb_f32(0)` must reproduce the shipped path BITWISE. A knob that moves the
+    ///    default is a silent reblocking of every caller.
+    /// 2. Other widths must still factor. nb changes the blocking, which REASSOCIATES the trailing
+    ///    sums, so they are checked by RECONSTRUCTION and never by `to_bits()`.
+    ///
+    /// The tolerance is NOT the f64 test's `1e-8`. An f32 mantissa is 24 bits, so a length-`n`
+    /// accumulation carries relative error on the order of `n * 2^-24`; at n=300 that is ~2e-5
+    /// before any blocking effect. `2e-4` relative leaves an order of magnitude of headroom and
+    /// still fails a factorisation that is actually wrong — reusing the f64 number here would have
+    /// produced a test that fails on correct output, which is worse than no test.
+    #[test]
+    fn cholesky_nb_f32_knob_is_neutral_at_default_and_correct_elsewhere() {
+        for n in [96usize, 192, 300] {
+            let mut a = vec![0.0f32; n * n];
+            for i in 0..n {
+                for j in 0..i {
+                    let v = ((i * 13 + j * 29) % 19) as f32 * 0.01 - 0.08;
+                    a[i * n + j] = v;
+                    a[j * n + i] = v;
+                }
+                a[i * n + i] = n as f32;
+            }
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+
+            let previous = super::set_cholesky_nb_f32(0);
+            let shipped = super::cholesky_contiguous_f32(&a, &meta, false).expect("shipped f32");
+            // (1) an explicit width equal to the shipped constant is the same code path as the
+            // default 0. Tracks the constant rather than hard-coding a number, so a future retune
+            // cannot leave this test silently comparing the default against a stale width.
+            super::set_cholesky_nb_f32(super::CHOLESKY_NB_F32_SHIPPED);
+            let explicit =
+                super::cholesky_contiguous_f32(&a, &meta, false).expect("explicit nb f32");
+            for (i, (x, y)) in explicit.iter().zip(&shipped).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "n={n}: an explicit CHOLESKY_NB_F32_SHIPPED must be bitwise identical to the \
+                     default at {i}"
+                );
+            }
+            // (2) other widths factor correctly, checked by reconstruction. 64 is here because it
+            // is the width the lane-1 sweep proposes; 16/32/96 straddle it on both sides.
+            for nb in [16usize, 32, 64, 96] {
+                super::set_cholesky_nb_f32(nb);
+                let l = super::cholesky_contiguous_f32(&a, &meta, false).expect("nb f32");
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        assert_eq!(
+                            l[i * n + j],
+                            0.0,
+                            "n={n} nb={nb} f32 upper triangle not zeroed"
+                        );
+                    }
+                }
+                for i in 0..n.min(32) {
+                    for j in 0..=i.min(31) {
+                        let mut acc = 0.0f32;
+                        for k in 0..=j {
+                            acc += l[i * n + k] * l[j * n + k];
+                        }
+                        let want = a[i * n + j];
+                        assert!(
+                            (acc - want).abs() <= 2e-4 * want.abs().max(1.0),
+                            "n={n} nb={nb} f32 reconstruction failed at ({i},{j}): {acc} vs {want}"
+                        );
+                    }
+                }
+            }
+            super::set_cholesky_nb_f32(previous);
+        }
+    }
+
     fn cholesky_panel_modes_agree_bitwise() {
         for n in [130usize, 192, 259] {
             let mut a = vec![0.0f64; n * n];
