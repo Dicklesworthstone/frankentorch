@@ -210,6 +210,21 @@ mod gemm {
     pub(crate) static DGEMM_SUB_COL_HITS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
+    /// Whether `dgemm_bt_sub_into` may tile BOTH output axes when the column split alone cannot
+    /// fill the pool. DEFAULT OFF until it has a paired Cholesky lane row.
+    pub(crate) static DGEMM_BT_SUB_TILE_2D: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn dgemm_bt_sub_tile_2d() -> bool {
+        DGEMM_BT_SUB_TILE_2D.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many `dgemm_bt_sub_into` calls took the 2-D arm, and how many the column split.
+    /// The counters prove that an isolation result actually exercised the proposed path.
+    pub(crate) static DGEMM_BT_SUB_TILE_HITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static DGEMM_BT_SUB_COL_HITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
         rayon::current_num_threads() > 1
@@ -683,33 +698,70 @@ mod gemm {
             && m.saturating_mul(n) >= TILE_2D_MIN_AREA;
         let census_started = dgemm_bt_sub_census_enabled().then(std::time::Instant::now);
         let cp = TilePtr(c.as_mut_ptr());
-        (0..col_blocks).into_par_iter().for_each(|blk| {
-            let cp = &cp;
-            let n0 = blk * nb;
-            let bw = (n0 + nb).min(n) - n0;
-            // SAFETY: a is m*k; b[n0*k..] holds bw rows of k (B^T via rsb=1,csb=k).
-            // Output window row i col (n0+j) -> c_off + i*ldc + n0 + j; column
-            // windows are disjoint across blocks so writes never race. beta=1
-            // accumulates into the existing C; alpha=-1 subtracts the product.
-            unsafe {
-                dgemm_mm(
-                    m,
-                    k,
-                    bw,
-                    -1.0,
-                    a.as_ptr(),
-                    k as isize,
-                    1,
-                    b.as_ptr().add(n0 * k),
-                    1,
-                    k as isize,
-                    1.0,
-                    cp.0.add(c_off + n0),
-                    ldc as isize,
-                    1,
-                );
-            }
-        });
+        if dgemm_bt_sub_tile_2d() && eligible_2d {
+            let (mb2, nb2) = tile_shape(m, n);
+            DGEMM_BT_SUB_TILE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (0..n.div_ceil(nb2)).into_par_iter().for_each(|j_blk| {
+                let cp = &cp;
+                let j0 = j_blk * nb2;
+                let bj = (j0 + nb2).min(n) - j0;
+                (0..m.div_ceil(mb2)).into_par_iter().for_each(|i_blk| {
+                    let i0 = i_blk * mb2;
+                    let bi = (i0 + mb2).min(m) - i0;
+                    // SAFETY: A is [m,k] and this tile starts at row i0. B is [n,k],
+                    // so B^T's j0-th column window starts at b.add(j0*k) with rsb=1,
+                    // csb=k. C tiles are disjoint rectangles, and K is deliberately whole:
+                    // every output element therefore keeps the column arm's exact reduction.
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            bj,
+                            -1.0,
+                            a.as_ptr().add(i0 * k),
+                            k as isize,
+                            1,
+                            b.as_ptr().add(j0 * k),
+                            1,
+                            k as isize,
+                            1.0,
+                            cp.0.add(c_off + i0 * ldc + j0),
+                            ldc as isize,
+                            1,
+                        );
+                    }
+                });
+            });
+        } else {
+            DGEMM_BT_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (0..col_blocks).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                // SAFETY: a is m*k; b[n0*k..] holds bw rows of k (B^T via rsb=1,csb=k).
+                // Output window row i col (n0+j) -> c_off + i*ldc + n0 + j; column
+                // windows are disjoint across blocks so writes never race. beta=1
+                // accumulates into the existing C; alpha=-1 subtracts the product.
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0 * k),
+                        1,
+                        k as isize,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            });
+        }
         if let Some(started) = census_started {
             record_dgemm_bt_sub_census(DgemmBtSubCensusEntry {
                 m,
@@ -9107,7 +9159,19 @@ fn conv2d_dweight_streamed_f32(
     };
     let mb = out_ch.div_ceil(m_blocks);
     let nb = patch_width.div_ceil(n_blocks);
-    let n_blocks = patch_width.div_ceil(nb);
+    // RE-DERIVE BOTH BLOCK COUNTS FROM THE BLOCK SIZES — `frankentorch-vcxf7`. `m_blocks` is a
+    // REQUEST (a thread-count heuristic); `mb` is what that request rounds to; and the number of
+    // blocks `mb` actually produces is `ceil(out_ch/mb)`, which can be SMALLER. The n axis always
+    // did this re-derivation and the m axis did not, so the m axis could emit trailing tiles whose
+    // `oc0` starts past `out_ch` — and since `ocn = mb.min(out_ch - oc0)` subtracts in release
+    // without an overflow check, that underflow WRAPPED to a huge `usize`, `min` kept `mb`, and
+    // the tile read off the end of `dout_flat`.
+    //
+    // It fired at rayon widths where `threads.div_ceil(n_blocks)` does not divide `out_ch`: at 16
+    // threads with out_ch=13, patch_width=42 the request is 6 blocks of 3, but 13 channels only
+    // fill 5 of them, and the sixth starts at 15.
+    let m_blocks = out_ch.div_ceil(mb.max(1));
+    let n_blocks = patch_width.div_ceil(nb.max(1));
     let krows = SGEMM_KC;
 
     let results: Vec<((usize, usize), Vec<f32>)> = (0..m_blocks * n_blocks)
@@ -9354,7 +9418,13 @@ fn conv2d_dweight_streamed_f64(
     };
     let mb = out_ch.div_ceil(m_blocks);
     let nb = patch_width.div_ceil(n_blocks);
-    let n_blocks = patch_width.div_ceil(nb);
+    // RE-DERIVE BOTH BLOCK COUNTS FROM THE BLOCK SIZES — `frankentorch-vcxf7`; see the f32 twin
+    // in `conv2d_dweight_streamed_f32` for the full mechanism. `m_blocks` is a request, `mb` is
+    // what it rounds to, and `ceil(out_ch/mb)` is how many blocks that actually produces. Only the
+    // n axis re-derived, so the m axis could emit a trailing tile starting past `out_ch`, whose
+    // `out_ch - oc0` wrapped in release and read off the end of `dout_flat`.
+    let m_blocks = out_ch.div_ceil(mb.max(1));
+    let n_blocks = patch_width.div_ceil(nb.max(1));
 
     // ONE `DGEMM_KC` block per call, which is both the cleanest form of the bit-exactness
     // argument — `matrixmultiply` does exactly one k-block, so there is no internal fold to
@@ -35454,6 +35524,22 @@ pub fn dgemm_sub_arm_hits_take() -> (u64, u64) {
     )
 }
 
+/// Enable or disable `dgemm_bt_sub_into`'s 2-D tile arm. DEFAULT OFF: this is a measured
+/// candidate, not a scheduling policy. Returns the previous setting.
+#[doc(hidden)]
+pub fn set_dgemm_bt_sub_tile_2d(on: bool) -> bool {
+    gemm::DGEMM_BT_SUB_TILE_2D.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drain `dgemm_bt_sub_into`'s arm counts as `(tiled_2d, column_split)`.
+#[doc(hidden)]
+pub fn dgemm_bt_sub_arm_hits_take() -> (u64, u64) {
+    (
+        gemm::DGEMM_BT_SUB_TILE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+        gemm::DGEMM_BT_SUB_COL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Enable or disable collection of `dgemm_bt_sub_into` call shapes and elapsed GEMM time.
 /// Returns the previous setting. Disabled by default so this is instrumentation, not a lever.
 #[doc(hidden)]
@@ -50660,6 +50746,56 @@ mod tests {
         }
     }
 
+    /// `dgemm_bt_sub_into` is Cholesky's trailing update, with B stored as [n,k] and read
+    /// transposed. Its 2-D arm has the same only-safe partition as `dgemm_sub_into`: K stays
+    /// whole inside one `dgemm_mm`, and the M/N tiles are disjoint C rectangles. This compares
+    /// their bits through a strided C window, so a wrong B offset or a tile crossing a row stride
+    /// cannot hide behind a contiguous fixture.
+    #[test]
+    fn dgemm_bt_sub_into_2d_tile_matches_the_column_split_bitwise() {
+        for &(m, k, n) in &[
+            (64_usize, 64_usize, 64_usize),
+            (128, 64, 128),
+            (192, 64, 192),
+            (320, 64, 320),
+            (256, 32, 128),
+            (128, 96, 320),
+            (200, 48, 136),
+        ] {
+            let a: Vec<f64> = (0..m * k).map(|i| (i % 97) as f64 * 0.011 - 0.5).collect();
+            // Unlike dgemm_sub_into, B is [n,k]; `dgemm_bt_sub_into` reads it as B^T.
+            let b: Vec<f64> = (0..n * k).map(|i| (i % 89) as f64 * 0.013 - 0.4).collect();
+            let ldc = n + 7;
+            let c_off = 2 * ldc + 3;
+            let c_len = c_off + (m - 1) * ldc + n + 11;
+            let base: Vec<f64> = (0..c_len).map(|i| (i % 71) as f64 * 0.02 - 0.7).collect();
+
+            let previous = crate::set_dgemm_bt_sub_tile_2d(false);
+            let mut off = base.clone();
+            crate::gemm::dgemm_bt_sub_into(m, k, n, &a, &b, &mut off, c_off, ldc);
+            crate::set_dgemm_bt_sub_tile_2d(true);
+            let mut on = base.clone();
+            crate::gemm::dgemm_bt_sub_into(m, k, n, &a, &b, &mut on, c_off, ldc);
+            crate::set_dgemm_bt_sub_tile_2d(previous);
+
+            assert_eq!(off.len(), on.len());
+            for (i, (x, y)) in off.iter().zip(&on).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "({m},{k},{n}) differs at flat index {i}: {x:?} vs {y:?}"
+                );
+            }
+            assert!(
+                off.iter().zip(&base).any(|(x, y)| x.to_bits() != y.to_bits()),
+                "({m},{k},{n}) left C untouched, so the bitwise check proves nothing"
+            );
+            for i in 0..c_off {
+                assert_eq!(on[i].to_bits(), base[i].to_bits(), "wrote before the window");
+            }
+        }
+    }
+
     /// Build the four operands and the C tile for a fused-trailing-update case.
     ///
     /// `c` is oversized and the update targets a STRIDED window at `c_off` with row stride
@@ -51537,6 +51673,103 @@ mod tests {
     }
 
     #[test]
+    /// The streamed dweight tiling must be correct at EVERY rayon width, not at this machine's.
+    /// `frankentorch-vcxf7`.
+    ///
+    /// WHY THIS EXISTS AND WHY IT IS SHAPED LIKE THIS. The neighbouring bitwise tests read the
+    /// pool width from `rayon::current_num_threads()`, so what they cover is a property of the
+    /// HOST. The m-axis block count was derived from a thread-count request and never re-derived
+    /// from the block size it rounded to, which emitted a trailing tile starting past `out_ch`
+    /// whenever `threads.div_ceil(n_blocks)` did not divide it; `ocn = mb.min(out_ch - oc0)` then
+    /// wrapped in release and read off the end of `dout_flat`. At 16 threads with out_ch=13 and
+    /// patch_width=42 the request was 6 blocks of 3 while 13 channels fill only 5.
+    ///
+    /// So the bug was invisible on a worker whose width happened to divide and fatal on one whose
+    /// width did not — which is how it survived as an "intermittent" red that changed which test
+    /// it took down depending on which build worker the job landed on.
+    ///
+    /// The sweep therefore drives an EXPLICIT pool per width instead of trusting the ambient one:
+    /// inside `install`, `rayon::current_num_threads()` reports that pool's size, so the exact
+    /// branch is exercised deterministically on any host. Widths include primes and values that
+    /// divide neither `out_ch` nor `patch_width`, because those are the ones that break.
+    #[test]
+    fn conv2d_dweight_streamed_tiling_is_correct_at_every_rayon_width() {
+        let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        // out_ch=13 / patch_width=42 is the cell that actually failed; the others straddle
+        // out_ch below and at the 8-row block, and a strided, non-square kernel.
+        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 3] = [
+            (5, 7, 13, 17, 19, 3, 2, 1, 1),
+            (9, 3, 8, 12, 14, 2, 3, 1, 2),
+            (6, 1, 3, 20, 18, 3, 3, 1, 1),
+        ];
+        for (batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw) in shapes {
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+                .map(|i| ((i % 37) as f64) * 0.013 - 0.21)
+                .collect();
+            let padded32: Vec<f32> = padded.iter().map(|&v| v as f32).collect();
+            let weight_flat: Vec<f64> = (0..out_ch * in_ch * kh * kw)
+                .map(|i| ((i % 11) as f64) * 0.0625 - 0.3125)
+                .collect();
+            let weight32: Vec<f32> = weight_flat.iter().map(|&v| v as f32).collect();
+            // NON-UNIFORM, or the all-ones adjoint fast path replaces the GEMM being tested.
+            let dout: Vec<f64> = (0..batch * out_ch * oh * ow)
+                .map(|i| ((i % 23) as f64) * 0.019 - 0.19)
+                .collect();
+            let dout32: Vec<f32> = dout.iter().map(|&v| v as f32).collect();
+
+            let floor = super::set_conv2d_dweight_stream_min_panel(0);
+            let previous = super::set_conv2d_dweight_streamed(false);
+            let (_, panel_dweight, _) = super::conv2d_backward_f64(
+                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, false,
+            );
+            let (_, panel_dweight32, _) = super::conv2d_backward_f32(
+                &dout32, &padded32, &weight32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
+                out_ch, false,
+            );
+            super::set_conv2d_dweight_streamed(true);
+
+            for width in [1usize, 2, 3, 5, 6, 7, 8, 11, 13, 16, 17, 24, 32] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(width)
+                    .build()
+                    .expect("build a pool of the requested width");
+                let (dw64, dw32) = pool.install(|| {
+                    let (_, a, _) = super::conv2d_backward_f64(
+                        &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
+                        sw, out_ch, false,
+                    );
+                    let (_, b, _) = super::conv2d_backward_f32(
+                        &dout32, &padded32, &weight32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
+                        sw, out_ch, false,
+                    );
+                    (a, b)
+                });
+                for (index, (a, b)) in panel_dweight.iter().zip(&dw64).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "f64 dweight[{index}] differs at width {width}, shape {batch}/{in_ch}/{out_ch}"
+                    );
+                }
+                for (index, (a, b)) in panel_dweight32.iter().zip(&dw32).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "f32 dweight[{index}] differs at width {width}, shape {batch}/{in_ch}/{out_ch}"
+                    );
+                }
+            }
+            super::set_conv2d_dweight_streamed(previous);
+            super::set_conv2d_dweight_stream_min_panel(floor);
+        }
+    }
+
     fn conv2d_dweight_streamed_matches_the_panel_gemm_bitwise() {
         let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
             .lock()
