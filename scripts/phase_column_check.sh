@@ -19,7 +19,10 @@
 # WHAT IT REFUSES TO DO. It does not override the guard. If `measurement_window_guard.sh` says no,
 # this exits non-zero and prints why; a window that has to be forced is not a window, and the whole
 # 293 arc is about not talking a gate out of its answer. It re-guards before EVERY lane, because a
-# window that was open at lane 1 may be shut by lane 4.
+# window that was open at lane 1 may be shut by lane 4 — and on the first real run, the thing that
+# shut it was THIS SCRIPT'S OWN BUILD. Hence the order below: build first, then wait for the guard.
+# That per-lane re-guard is what caught it; without it, four tables measured at loadavg 88-109 with
+# iowait 52-80%% would have looked exactly like four good tables.
 #
 #   scripts/phase_column_check.sh [reps]     # default 12 (even, and >= the sign test's floor of 6)
 #
@@ -47,20 +50,28 @@ say "host=$(cat /etc/hostname 2>/dev/null | tr -d '\n')  nproc=$(nproc)  rayon=$
 say "HEAD=$(git rev-parse --short HEAD 2>/dev/null)  tree_dirty=$(git status --porcelain crates/ | wc -l)"
 say ""
 
-# ---------------------------------------------------------------- guard, first and unforced
-if ! "$GUARD" --max-load 35 2>&1 | tee -a "$LOG"; then
-    say ""
-    say "NO WINDOW — nothing measured, nothing to report. This is a result, not a failure:"
-    say "  re-run when the 1-minute load is under ~35 AND the 1/5/15 spread has settled."
-    say "  Do NOT pass FT_GUARD_MAX_LOAD or FT_GUARD_MAX_LOAD_RATIO to get past this."
-    exit 1
-fi
-say ""
-
 # ---------------------------------------------------------------- build remotely, snapshot, pin
 # `feedback_snapshot_binary_before_measuring`: peers rebuild the shared target dir mid-session, so
 # the ELF is copied aside and its SHA recorded. `feedback_rch_only_never_local`: builds go remote.
-say "BUILD (rch, remote-required; retrying only on the 103 admission refusal)"
+# BUILD FIRST, GUARD AFTER — and this ordering is the whole point, learned the hard way.
+#
+# The first version of this script guarded, THEN built. It passed the guard at loadavg 9.33 with
+# iowait 0.2%, ran the rch build, and then refused ALL FOUR lanes:
+#
+#     lane 1   loadavg  88.15   iowait 52.5%
+#     lane 2   loadavg  88.15   iowait 80.4%
+#     lane 3   loadavg 109.36   iowait 57.3%
+#
+# Nothing else had started. `rch` syncs the workspace out and retrieves artifacts back, which is
+# minutes of local disk-bound work — **the script's own build closed the window it had just
+# verified**. A harness that perturbs the thing it is about to measure is the confound this entire
+# arc exists to eliminate, and it had been built into the measuring instrument.
+#
+# So the build happens BEFORE any admission decision, and the guard is asked only once the build's
+# own disturbance has drained. The guard is its own settle detector: its iowait and spread limbs are
+# exactly what a finished-but-still-draining artifact sync trips.
+say "BUILD (rch, remote-required; retrying only on the 103 admission refusal) — BEFORE the guard,"
+say "      because the build's own disk traffic is what closed the window on the first attempt."
 BUILT=0
 for attempt in 1 2 3 4 5 6; do
     RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
@@ -79,6 +90,25 @@ for e in cholesky_nb_sweep lu_nb_sweep inv_nb_sweep; do
     cp "target/release/examples/$e" "$OUT_DIR/$e.bin" || exit 2
     say "  ELF $e $(sha256sum "$OUT_DIR/$e.bin" | cut -c1-16)"
 done
+say ""
+
+# ---------------------------------------------------------------- NOW ask for a window
+say "WAITING FOR A WINDOW (the guard is the settle detector; never overridden)"
+ADMITTED=0
+waited=0
+while [ $waited -lt "${FT_PHASE_CHECK_WAIT_S:-1800}" ]; do
+    if "$GUARD" --max-load 35 >> "$LOG" 2>&1; then ADMITTED=1; break; fi
+    sleep 30
+    waited=$((waited+30))
+done
+if [ $ADMITTED -eq 0 ]; then
+    say "  no window within ${waited}s — loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
+    say ""
+    say "NO WINDOW — nothing measured, nothing to report. This is a result, not a failure."
+    say "  Do NOT pass FT_GUARD_MAX_LOAD or FT_GUARD_MAX_LOAD_RATIO to get past this."
+    exit 1
+fi
+say "  admitted after ${waited}s — loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
 say ""
 
 # ---------------------------------------------------------------- lanes
