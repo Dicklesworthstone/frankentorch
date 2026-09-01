@@ -174,3 +174,371 @@ REFUSING TO MEASURE: 6 peer measurement process(es) are live.
 Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
 GUARD REFUSED — attempt 11, waiting 60s (refusals are not retried silently)
 ===== end (run stopped to unblock torch:4's board refresh; 3 invocations banked, 11 further attempts guard-refused) 2026-09-01T17:07:37Z =====
+===== conv2d / conv2d_masked mode-conditioned standing — torch:2 (CreamTrout) 2026-09-01T17:09:14Z =====
+host=thinkstation1 nproc=64 HEAD=65cfac8e5b30764b87dcad398182b61879174379
+build_base=b82531b2ea8453159ec7c570ba817e5c720582b7 (clean-overlay receipt); harness source unchanged since that commit
+elf_sha256=717b8cd1633f5cd9cf1bd877500edcfd0e27fe8163faf84af0cff8614a050b6c
+incumbent=PyTorch 2.12.1+cpu, self-reported in EVERY invocation
+protocol: 7 SUCCESSFUL invocations, guard before EACH, FT_H2H_REPS=24 FT_H2H_WARMUP=16, round_warmup=0 (board default)
+lanes=conv2d,conv2d_masked exact; bank seeded from artifacts/perf/incumbent_bank.jsonl (40 lines) into a scratch copy, merged back after the run
+
+--- attempt 1 (run 1/7)  17:09:14Z  loadavg=5.27 5.37 7.40
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 1, waiting 90s (refusals are not retried silently)
+
+--- attempt 2 (run 1/7)  17:10:46Z  loadavg=5.05 5.33 7.19
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 2, waiting 90s (refusals are not retried silently)
+
+--- attempt 3 (run 1/7)  17:12:18Z  loadavg=5.48 5.40 7.04
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 3, waiting 90s (refusals are not retried silently)
+
+--- attempt 4 (run 1/7)  17:13:50Z  loadavg=4.06 4.90 6.70
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 4, waiting 90s (refusals are not retried silently)
+
+--- attempt 5 (run 1/7)  17:15:22Z  loadavg=3.42 4.48 6.38
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 5, waiting 90s (refusals are not retried silently)
+
+--- attempt 6 (run 1/7)  17:16:54Z  loadavg=4.97 4.74 6.29
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 6, waiting 90s (refusals are not retried silently)
+
+--- attempt 7 (run 1/7)  17:18:26Z  loadavg=3.76 4.40 6.02
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 7, waiting 90s (refusals are not retried silently)
+
+--- attempt 8 (run 1/7)  17:19:59Z  loadavg=4.21 4.36 5.85
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 8, waiting 90s (refusals are not retried silently)
+
+--- attempt 9 (run 1/7)  17:21:31Z  loadavg=4.31 4.34 5.70
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 9, waiting 90s (refusals are not retried silently)
+
+--- attempt 10 (run 1/7)  17:23:03Z  loadavg=7.90 5.43 5.94
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 10, waiting 90s (refusals are not retried silently)
+
+--- attempt 11 (run 1/7)  17:24:35Z  loadavg=5.02 5.20 5.82
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1001670  python3 scripts/iowait_population_probe.py --label organic_peer_io_bench --samples 40 --json docs/ev
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 11, waiting 90s (refusals are not retried silently)
+
+--- attempt 12 (run 1/7)  17:26:07Z  loadavg=4.22 4.92 5.66
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 12, waiting 90s (refusals are not retried silently)
+
+--- attempt 13 (run 1/7)  17:27:39Z  loadavg=7.47 5.66 5.84
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1100641  python3 scripts/iowait_population_probe.py --label organic_peer_io_bench --samples 40 --json docs/ev
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 13, waiting 90s (refusals are not retried silently)
+
+--- attempt 14 (run 1/7)  17:29:12Z  loadavg=6.40 5.74 5.85
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1137365  python3 scripts/iowait_population_probe.py --label organic_peer_io_bench --samples 40 --json docs/ev
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 14, waiting 90s (refusals are not retried silently)
+
+--- attempt 15 (run 1/7)  17:30:44Z  loadavg=9.02 6.93 6.27
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 15, waiting 90s (refusals are not retried silently)
+
+--- attempt 16 (run 1/7)  17:32:16Z  loadavg=10.89 7.78 6.61
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 16, waiting 90s (refusals are not retried silently)
+
+--- attempt 17 (run 1/7)  17:33:48Z  loadavg=8.06 7.64 6.67
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 17, waiting 90s (refusals are not retried silently)
+
+--- attempt 18 (run 1/7)  17:35:20Z  loadavg=7.17 7.58 6.75
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 18, waiting 90s (refusals are not retried silently)
+
+--- attempt 19 (run 1/7)  17:36:52Z  loadavg=4.31 6.58 6.47
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 19, waiting 90s (refusals are not retried silently)
+
+--- attempt 20 (run 1/7)  17:38:24Z  loadavg=4.25 5.99 6.27
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 20, waiting 90s (refusals are not retried silently)
+
+--- attempt 21 (run 1/7)  17:39:57Z  loadavg=4.19 5.64 6.13
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 21, waiting 90s (refusals are not retried silently)
+
+--- attempt 22 (run 1/7)  17:41:29Z  loadavg=3.71 5.05 5.87
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 22, waiting 90s (refusals are not retried silently)
+
+--- attempt 23 (run 1/7)  17:43:01Z  loadavg=3.50 4.64 5.64
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1483445  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 23, waiting 90s (refusals are not retried silently)
+
+--- attempt 24 (run 1/7)  17:44:33Z  loadavg=4.05 4.60 5.53
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 24, waiting 90s (refusals are not retried silently)
+
+--- attempt 25 (run 1/7)  17:46:05Z  loadavg=3.57 4.31 5.34
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 25, waiting 90s (refusals are not retried silently)
+
+--- attempt 26 (run 1/7)  17:47:37Z  loadavg=2.35 3.73 5.04
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1582144  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 26, waiting 90s (refusals are not retried silently)
+
+--- attempt 27 (run 1/7)  17:49:09Z  loadavg=2.89 3.73 4.93
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 27, waiting 90s (refusals are not retried silently)
+
+--- attempt 28 (run 1/7)  17:50:42Z  loadavg=2.00 3.20 4.62
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 28, waiting 90s (refusals are not retried silently)
+
+--- attempt 29 (run 1/7)  17:52:14Z  loadavg=2.18 2.88 4.37
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1604129  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 29, waiting 90s (refusals are not retried silently)
+
+--- attempt 30 (run 1/7)  17:53:46Z  loadavg=4.44 3.56 4.47
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 30, waiting 90s (refusals are not retried silently)
+
+--- attempt 31 (run 1/7)  17:55:18Z  loadavg=3.16 3.43 4.34
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 31, waiting 90s (refusals are not retried silently)
+
+--- attempt 32 (run 1/7)  17:56:50Z  loadavg=3.34 3.25 4.17
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1641950  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 32, waiting 90s (refusals are not retried silently)
+
+--- attempt 33 (run 1/7)  17:58:22Z  loadavg=2.59 3.02 4.01
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 33, waiting 90s (refusals are not retried silently)
+
+--- attempt 34 (run 1/7)  17:59:54Z  loadavg=2.03 2.70 3.80
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 34, waiting 90s (refusals are not retried silently)
+
+--- attempt 35 (run 1/7)  18:01:27Z  loadavg=3.58 2.93 3.76
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1667871  /data/projects/.scratch/blackthrush/fp-bench-default-ee4def703 --category io --workload csv_read --s
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 35, waiting 90s (refusals are not retried silently)
+
+--- attempt 36 (run 1/7)  18:02:59Z  loadavg=2.90 2.89 3.67
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 36, waiting 90s (refusals are not retried silently)
+
+--- attempt 37 (run 1/7)  18:04:31Z  loadavg=2.08 2.59 3.49
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 37, waiting 90s (refusals are not retried silently)
+
+--- attempt 38 (run 1/7)  18:06:03Z  loadavg=3.65 2.80 3.46
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 38, waiting 90s (refusals are not retried silently)
+
+--- attempt 39 (run 1/7)  18:07:35Z  loadavg=2.17 2.54 3.30
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    347065  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 39, waiting 90s (refusals are not retried silently)
+
+--- attempt 40 (run 1/7)  18:09:07Z  loadavg=3.12 2.67 3.27
+guard PASS: no peer measurement detected, loadavg 3.12/2.67/3.27 (spread 1.00x <= 4x, floor 8.00), iowait 1.6% <= 10%
+  conv2d          2.606    3.014   FT 1.16x FASTER     PT OFFSET [0.942,1.185] FT OFFSET [0.959,1.076] ratio 1.156 [1.036,1.229] match incumbent=SINGLE/n4
+  incumbent_mode lane=conv2d drawn=3.014 ms  SINGLE LEVEL (n=4, median 2.828, range [2.653, 3.014], spread 1.14x) — no second level banked for this lane, so this row is comparable to the other 3. The bank spans 46s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.021, FrankenTorch 1.022; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.15x SLOWER     ratio 0.868 [0.802,0.964]  PT null 1.044 FAIL  FT null 1.036 FAIL  not quotable
+  conv2d_masked    4.846    3.305   FT 1.47x SLOWER     PT PASS [0.985,1.113] FT OFFSET [0.878,1.055] ratio 0.682 [0.618,0.721] match incumbent=SINGLE/n4
+  incumbent_mode lane=conv2d_masked drawn=3.305 ms  SINGLE LEVEL (n=4, median 3.071, range [2.848, 3.305], spread 1.16x) — no second level banked for this lane, so this row is comparable to the other 3. The bank spans 46s — under an hour, so these are ONE session's draws, and a single-level verdict from them is WEAK: the level this lane sits at has been observed to differ BETWEEN sessions, which a bank this narrow cannot see.
+    NULL-FAILED: incumbent 1.018, FrankenTorch 0.963; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.87x SLOWER     ratio 0.535 [0.453,0.606]  PT null 1.188 FAIL  FT null 0.968 FAIL  not quotable
+
+--- attempt 41 (run 2/7)  18:09:36Z  loadavg=4.54 3.07 3.39
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    1753107  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 41, waiting 90s (refusals are not retried silently)
+
+--- attempt 42 (run 2/7)  18:11:08Z  loadavg=5.50 3.69 3.58
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    1753107  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 42, waiting 90s (refusals are not retried silently)
+
+--- attempt 43 (run 2/7)  18:12:40Z  loadavg=5.26 4.12 3.74
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+    1753107  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 43, waiting 90s (refusals are not retried silently)
+
+--- attempt 44 (run 2/7)  18:14:12Z  loadavg=2.97 3.58 3.58
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    1753107  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1815463  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 44, waiting 90s (refusals are not retried silently)
+
+--- attempt 45 (run 2/7)  18:15:44Z  loadavg=3.49 3.73 3.64
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    1753107  /data/projects/frankenpandas/.venv-oracle/bin/python benches/vs_pandas_harness.py --category io --wo
+    1815463  ugrep -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclud
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 45, waiting 90s (refusals are not retried silently)
+
+--- attempt 46 (run 2/7)  18:17:17Z  loadavg=3.10 3.53 3.58
+guard PASS: no peer measurement detected, loadavg 3.10/3.53/3.58 (spread 1.00x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d          2.573    3.079   FT 1.20x FASTER     PT OFFSET [0.960,1.303] FT PASS [0.954,1.075] ratio 1.197 [1.063,1.298] match incumbent=SINGLE/n5
+  incumbent_mode lane=conv2d drawn=3.079 ms  SINGLE LEVEL (n=5, median 2.950, range [2.653, 3.079], spread 1.16x) — no second level banked for this lane, so this row is comparable to the other 4. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.119, FrankenTorch 0.995; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.12x SLOWER     ratio 0.890 [0.788,1.192]  PT null 1.191 FAIL  FT null 0.993 PASS  not quotable
+  conv2d_masked    4.811    3.025   FT 1.59x SLOWER     PT OFFSET [0.847,1.035] FT OFFSET [0.901,1.068] ratio 0.629 [0.569,0.711] match incumbent=SINGLE/n5
+  incumbent_mode lane=conv2d_masked drawn=3.025 ms  SINGLE LEVEL (n=5, median 3.025, range [2.848, 3.305], spread 1.16x) — no second level banked for this lane, so this row is comparable to the other 4. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.919, FrankenTorch 0.964; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.96x SLOWER     ratio 0.510 [0.413,0.614]  PT null 0.988 PASS  FT null 0.976 FAIL  not quotable
+
+--- attempt 47 (run 3/7)  18:17:38Z  loadavg=5.14 3.96 3.72
+guard PASS: no peer measurement detected, loadavg 5.14/3.96/3.72 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d          2.477    2.878   FT 1.16x FASTER     PT FAIL [1.016,1.208] FT PASS [0.927,1.035] ratio 1.162 [1.046,1.262] match incumbent=SINGLE/n6
+  incumbent_mode lane=conv2d drawn=2.878 ms  SINGLE LEVEL (n=6, median 2.914, range [2.653, 3.079], spread 1.16x) — no second level banked for this lane, so this row is comparable to the other 5. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.108, FrankenTorch 0.989; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.17x SLOWER     ratio 0.852 [0.788,0.970]  PT null 1.219 FAIL  FT null 0.967 FAIL  not quotable
+  conv2d_masked    4.676    3.187   FT 1.47x SLOWER     PT FAIL [0.850,0.983] FT PASS [0.939,1.076] ratio 0.681 [0.623,0.727] match incumbent=SINGLE/n6
+  incumbent_mode lane=conv2d_masked drawn=3.187 ms  SINGLE LEVEL (n=6, median 3.087, range [2.848, 3.305], spread 1.16x) — no second level banked for this lane, so this row is comparable to the other 5. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.925, FrankenTorch 0.999; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.91x SLOWER     ratio 0.523 [0.475,0.616]  PT null 0.853 FAIL  FT null 1.044 FAIL  not quotable
+
+--- attempt 48 (run 4/7)  18:18:05Z  loadavg=6.57 4.39 3.87
+guard PASS: no peer measurement detected, loadavg 6.57/4.63/3.95 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d          2.521    3.433   FT 1.36x FASTER     PT OFFSET [0.899,1.045] FT OFFSET [0.928,1.019] ratio 1.362 [1.256,1.448] match incumbent=SINGLE/n7
+  incumbent_mode lane=conv2d drawn=3.433 ms  SINGLE LEVEL (n=7, median 2.950, range [2.653, 3.433], spread 1.29x) — no second level banked for this lane, so this row is comparable to the other 6. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.931, FrankenTorch 0.976; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.05x FASTER     ratio 1.052 [0.931,1.342]  PT null 0.906 FAIL  FT null 1.005 PASS  not quotable
+  conv2d_masked    4.792    3.413   FT 1.40x SLOWER     PT PASS [0.928,1.109] FT OFFSET [0.975,1.120] ratio 0.712 [0.641,0.804] match incumbent=SINGLE/n7
+  incumbent_mode lane=conv2d_masked drawn=3.413 ms  SINGLE LEVEL (n=7, median 3.148, range [2.848, 3.413], spread 1.20x) — no second level banked for this lane, so this row is comparable to the other 6. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.995, FrankenTorch 1.051; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.73x SLOWER     ratio 0.578 [0.493,0.648]  PT null 1.118 FAIL  FT null 1.053 FAIL  not quotable
+
+--- attempt 49 (run 5/7)  18:18:26Z  loadavg=8.10 4.95 4.07
+guard PASS: no peer measurement detected, loadavg 8.10/4.95/4.07 (spread 1.01x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d          3.065    3.534   FT 1.15x FASTER     PT OFFSET [0.971,1.260] FT PASS [0.960,1.066] ratio 1.153 [1.099,1.222] match incumbent=SINGLE/n8
+  incumbent_mode lane=conv2d drawn=3.534 ms  SINGLE LEVEL (n=8, median 2.982, range [2.653, 3.534], spread 1.33x) — no second level banked for this lane, so this row is comparable to the other 7. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.117, FrankenTorch 1.018; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.07x SLOWER     ratio 0.935 [0.881,1.052]  PT null 1.162 FAIL  FT null 1.010 PASS  not quotable
+  conv2d_masked    5.655    3.763   FT 1.50x SLOWER     PT PASS [0.909,1.101] FT OFFSET [0.904,1.021] ratio 0.666 [0.615,0.752] match incumbent=SINGLE/n8
+  incumbent_mode lane=conv2d_masked drawn=3.763 ms  SINGLE LEVEL (n=8, median 3.168, range [2.848, 3.763], spread 1.32x) — no second level banked for this lane, so this row is comparable to the other 7. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.004, FrankenTorch 0.936; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.03x SLOWER     ratio 0.493 [0.460,0.579]  PT null 1.110 FAIL  FT null 0.944 FAIL  not quotable
+
+--- attempt 50 (run 6/7)  18:18:52Z  loadavg=9.17 5.44 4.25
+REFUSING TO MEASURE: 2 peer measurement process(es) are live.
+    1922207  /data/tmp/ft-mdsmm-conv2d-delta-rflWyI/release/examples/gauntlet_lane_sweep_h2h
+    1922227  /data/tmp/torchvenv-2121/bin/python -c  import time, torch import torch.nn.functional as Fn # franke
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)
+GUARD REFUSED — attempt 50, waiting 90s (refusals are not retried silently)
+
+--- attempt 51 (run 6/7)  18:20:24Z  loadavg=6.74 5.63 4.43
+guard PASS: no peer measurement detected, loadavg 6.74/5.55/4.41 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+  conv2d          2.402    2.347   FT 1.02x SLOWER     PT OFFSET [0.955,1.149] FT OFFSET [0.914,1.048] ratio 0.977 [0.923,1.066] match incumbent=SINGLE/n9
+  incumbent_mode lane=conv2d drawn=2.347 ms  SINGLE LEVEL (n=9, median 2.950, range [2.347, 3.534], spread 1.51x) — no second level banked for this lane, so this row is comparable to the other 8. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.033, FrankenTorch 0.979; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.26x SLOWER     ratio 0.793 [0.747,0.837]  PT null 1.136 FAIL  FT null 0.993 PASS  not quotable
+  conv2d_masked    4.525    2.693   FT 1.68x SLOWER     PT OFFSET [0.898,1.046] FT PASS [0.914,1.063] ratio 0.595 [0.551,0.661] match incumbent=SINGLE/n9
+  incumbent_mode lane=conv2d_masked drawn=2.693 ms  SINGLE LEVEL (n=9, median 3.148, range [2.693, 3.763], spread 1.40x) — no second level banked for this lane, so this row is comparable to the other 8. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.955, FrankenTorch 0.985; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.21x SLOWER     ratio 0.452 [0.414,0.494]  PT null 0.980 FAIL  FT null 0.985 PASS  not quotable
+
+--- attempt 52 (run 7/7)  18:20:46Z  loadavg=6.83 5.74 4.50
+guard PASS: no peer measurement detected, loadavg 6.83/5.74/4.50 (spread 1.00x <= 4x, floor 8.00), iowait 0.1% <= 10%
+  conv2d          2.718    3.007   FT 1.11x FASTER     PT PASS [0.900,1.122] FT PASS [0.902,1.040] ratio 1.106 [1.025,1.230] match incumbent=SINGLE/n10
+  incumbent_mode lane=conv2d drawn=3.007 ms  SINGLE LEVEL (n=10, median 2.979, range [2.347, 3.534], spread 1.51x) — no second level banked for this lane, so this row is comparable to the other 9. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.22x SLOWER     ratio 0.817 [0.766,1.050]  PT null 0.970 FAIL  FT null 0.969 FAIL  not quotable
+  conv2d_masked    5.012    3.163   FT 1.58x SLOWER     PT OFFSET [0.964,1.123] FT OFFSET [0.934,1.075] ratio 0.631 [0.592,0.674] match incumbent=SINGLE/n10
+  incumbent_mode lane=conv2d_masked drawn=3.163 ms  SINGLE LEVEL (n=10, median 3.155, range [2.693, 3.763], spread 1.40x) — no second level banked for this lane, so this row is comparable to the other 9. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.042, FrankenTorch 1.040; each must be within +/-0.02 of 1.0 and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 2.13x SLOWER     ratio 0.469 [0.424,0.532]  PT null 1.156 FAIL  FT null 1.023 FAIL  not quotable
+
+invocations_run=7 guard_refused=45 attempts=52
+bank_lines_added=14 (merged into artifacts/perf/incumbent_bank.jsonl after the run)
+===== end 2026-09-01T18:21:08Z =====
