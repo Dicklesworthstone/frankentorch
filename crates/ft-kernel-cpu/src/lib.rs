@@ -27796,15 +27796,45 @@ const CHOLESKY_NB_SHIPPED: usize = 64;
 /// f32 Cholesky blocking width, overridable for its own sweep. `frankentorch-valnx` /
 /// `frankentorch-stale-tuning-constants-lzku6` lane 1. 0 = the shipped default.
 ///
-/// SEPARATE FROM THE f64 KNOB ON PURPOSE. The f64 twin was retuned 128 -> 64 this session at a
-/// certified 1.264x, but an f32 element is half the bytes, so the trailing GEMM's cache behaviour
-/// and the panel's rate both differ — the optimum is a property of the dtype's memory traffic, not
-/// of the algorithm, and assuming it transfers is the mistake this bead exists to stop.
+/// SEPARATE FROM THE f64 KNOB ON PURPOSE. The f64 twin was retuned 128 -> 64 at a certified
+/// 1.264x, but an f32 element is half the bytes, so the trailing GEMM's cache behaviour and the
+/// panel's rate both differ — the optimum is a property of the dtype's memory traffic, not of the
+/// algorithm, and assuming it transfers is the mistake this bead exists to stop. The f32 optimum
+/// was then MEASURED and landed on 64 as well; a re-derivation agreeing with the f64 result is
+/// not the same thing as having inherited it, and getrf's optimum went the other way for exactly
+/// this kind of reason.
 static CHOLESKY_NB_F32: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The shipped f32 blocking width. Still 128 — never swept; its f64 twin's move to 64 is
-/// EVIDENCE FOR LOOKING, not evidence for changing it.
-const CHOLESKY_NB_F32_SHIPPED: usize = 128;
+/// The shipped f32 blocking width. **128 -> 64**, `frankentorch-stale-tuning-constants-lzku6`
+/// lane 1, ledger 293b. This is the first constant in the arc to pass every gate the arc asks
+/// for, and each one caught something the previous one could not.
+///
+/// 1. **KERNEL SWEEP** (292d-era harness): nb=64 beat the shipped 128 in all six cells, median
+///    1.228x. Necessary, and on its own worth very little — the same evidence shape gave geqrf
+///    b=64 twelve cells out of twelve and a lane that then read 8% SLOWER (292i).
+/// 2. **INTERLEAVED RE-VALIDATION** (293a instrument, ledger 293b): three guard-passed passes,
+///    nine cells, nb=64 above 1.0 in 9 of 9 with the estimators agreeing in 8 of 9 and sign tests
+///    of 20/20 at n=256 and n=512. It also DEFLATED the claim — median 1.228x -> **1.121x** — and
+///    produced a monotone size curve (1.23x / 1.12x / 1.08x) where the block-ordered sweep had no
+///    trend at all. The direction is the sweep's; the magnitude here is the honest one.
+/// 3. **PAIRED LIVE CERTIFICATION**, independently run (Codex, base 1b00ff9d, ELF
+///    ee5856354585ad6e, n=512, 64 rounds, four interleaved arms beside PyTorch 2.12.1+cpu). First
+///    attempt returned NO_VERDICT — the candidate's A/A null read 1.089 and FAILED — and was
+///    retained as invalid evidence rather than dropped. The retry certified: **dual A/A nulls
+///    1.007x and 0.993x both inside 0.970-1.030**, candidate-vs-shipped **1.159x and 1.160x on
+///    both arm pairs**, parity MATCH at 6.72e-7 / 8.41e-7 against a 1e-5 threshold. Arm mins
+///    2.610/2.617 ms shipped against 2.288/2.321 ms candidate.
+/// 4. **CORRECTNESS**: `cholesky_nb_f32_knob_is_neutral_at_default_and_correct_elsewhere`, added
+///    in the same lane after it turned out the f32 knob had NO test at all while a sweep was
+///    already driving it.
+///
+/// **ISOLATION AND LANE AGREE HERE, WHICH IS THE WHOLE POINT.** Interleaved isolation at n=512
+/// read 1.12-1.19x across three passes; the live lane at n=512 read 1.159x/1.160x. That agreement
+/// is exactly what geqrf lacked, and it is why this ships and geqrf's b=64 did not.
+///
+/// NOT BIT-EXACT across widths — blocking reassociates the trailing sums. The knob test gates the
+/// change by reconstruction at 2e-4 relative, and the lane gates it against live torch at 1e-5.
+const CHOLESKY_NB_F32_SHIPPED: usize = 64;
 
 /// Override the f32 Cholesky blocking width; `0` restores the shipped default.
 #[doc(hidden)]
