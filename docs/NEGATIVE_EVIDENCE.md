@@ -41806,3 +41806,40 @@ allocation, and the final column permutation, i.e. everything outside the two tr
 ~55% of the call at n=256 and ~45% at n=512/1024, LARGER than either solve half at every size, with
 the forward solve the smallest term throughout. Unattributed until now. That is the standing lesson
 of phase-counting a lane you only meant to tune: the decomposition outlives the sweep.
+
+### 292g. I CALLED A SUBTRACTION A RESIDUAL AND IT CONTAINED getrf — inv's REAL residual is 2%
+
+`frankentorch-stale-tuning-constants-lzku6`. Lane 2 reported an `inv` "residual" of ~45-55%,
+computed as `wall - (getri_fwd + getri_back)` and described as identity setup, allocation and the
+final permutation. **`inv_tensor_contiguous_f64` runs getrf BEFORE getri**, so that subtraction had
+the entire LU factorisation inside it — a known, already-counted O(n^3) phase, hidden inside a word
+that implied glue. Item 277a records a 6 ms frame invented exactly this way; this is the same error,
+committed by me one lane later, and caught only because the arc's next step is always to count.
+
+**A subtraction is a phase only if you know what is inside it.** Counting all seven, three passes,
+three sizes, min-of-9, guard-polled through an external all-core burst:
+
+    phase (% of call)     n=256      n=512     n=1024
+    getrf panel        14.8-15.4  15.2-18.2  15.2-16.5
+    getrf solve        11.4-12.8   6.7-9.2    5.4-5.9
+    getrf trailing      8.9-11.9  13.0-15.9  13.8-16.0
+    getri setup         3.7-4.7    2.8-4.8    2.2-3.5
+    getri forward      15.5-16.5  17.9-19.6  17.9-20.7
+    getri backward     37.3-37.5  34.8-35.8  34.2-36.7
+    getri permutation   1.9-2.2    1.9-2.7    3.4-4.0
+    residual            2.1-2.2    1.7-2.0    2.1-2.8
+    CLOSURE            97.8-97.9  98.0-98.3  97.2-97.9
+
+**The real residual is ~2%, not ~50%**, and the setup and permutation I had named as the target are
+2-5% each — nowhere near a lever. getrf is ~35% and getri ~58% at every size.
+
+WHAT THE SPLIT ACTUALLY NAMES: **getri's BACKWARD solve at 34-37%, the largest single phase in
+`inv`, roughly TWICE its own forward (16-21%)**. The asymmetry has a structural candidate: the
+forward exploits the identity's column structure (the restriction shipped under 37sxo) while the
+backward runs `U x = y` over all n columns, because `y` is triangular but `x` is dense. One half was
+optimised and the other never was. Not yet a lever — the next step is a census of how many columns
+each half touches, before assuming the structure is exploitable twice.
+
+The transferable point is not the number. **Three of this arc's redirections came from counting
+something that was about to be described instead** (291's 5-of-31, 292's cholesky-never-calls-it,
+this one). The cost of the counter is minutes; the cost of the word is a campaign.
