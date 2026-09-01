@@ -42565,3 +42565,74 @@ decorative.
 session: three found no window at all, one was closed by the harness's own build (293i), and the
 fifth landed. Nothing was measured under a forced gate and no `FT_GUARD_*` variable was ever raised.
 The check is now one command and it takes about twenty minutes wall-clock on an admitted host.
+
+### 294. LANE 4 IS NOT A WIDTH SWEEP: HOUSEHOLDER_PANEL_WIDTH IS A COUPLING, AND IT IS LOAD-BEARING
+
+`frankentorch-stale-tuning-constants-lzku6` lane 4. The bead opened it as "a width chosen for the
+old routing is a width chosen for deleted code" — re-sweep it. **That framing does not survive
+reading the constant, and the honest outcome is NO CHANGE plus a documented hazard.**
+
+**THE MECHANISM MODEL, BEFORE ANY MEASUREMENT.** `HOUSEHOLDER_PANEL_WIDTH` is not a panel width. It
+is one term of an exact-match DISPATCH predicate:
+
+    admitted = n >= 512 && ((m == WIDTH && k >= 512) || (k == WIDTH && m >= 512))
+               && threads > 1 && m*k*n >= 2^23
+
+and the panel width the Householder ops actually use is hard-coded **32 in three separate places
+that never consult it**: `geqrf_blocked_f64`'s ladder, `let nb_block = 32` in `orgqr_blocked_f64`,
+and `householder_panels_from_packed_f64(.., 32)` in `ormqr_blocked_f64`. **So no value of this
+constant changes any panel.** Setting it to 48 does not make a 48-wide panel; it makes `m == WIDTH`
+stop matching a panel that is still 32 wide, which silently DISABLES the skinny route. There is no
+optimum along this axis — the constant has two states, "equals the ops' 32" and "does not". A width
+ladder would have measured the route being switched off at five different values and reported the
+shape of nothing.
+
+**WHY THE PRIOR PANEL REFUTATIONS DO NOT TRANSFER.** 291/291a (eigh backtransform column-split
+0.925x, row-split 0.947x) and 292b (both cholesky panel formulations refuted) were attempts to
+PARALLELISE A PANEL COMPUTATION, and both failed because the panel is chain-limited: the work per
+fork is the same order as the fork. Nothing here is a panel computation. This is a dispatch choice
+between two ways of running an already-parallel GEMM on shapes with >= 2^23 FMAs, where "too little
+work per task" is not available as a failure mode. Their evidence neither supports nor refutes it.
+
+**THE CENSUS RE-POINTED THE LANE, EXACTLY AS IN LANE 2** — and a census is a COUNT, so it is valid
+under any host load and was run first, unguarded:
+
+    n=256    geqrf 0/149     orgqr 0/24      ormqr 0/24       <- NOTHING admits
+    n=512    geqrf 0/165     orgqr 32/16     ormqr 32/16
+    n=1024   geqrf 0/197     orgqr 32/32     ormqr 32/32
+
+**geqrf ADMITS ZERO AT EVERY SIZE.** The constant governs the APPLY side only. That also retires a
+worry from the geqrf panel-width sweep, which carefully moved this width with its candidate to
+avoid `feedback_one_knob_is_secretly_two`: correct discipline, but a no-op — geqrf never reaches
+the route to lose it.
+
+**THE ROUTE A/B** (thinkstation1, rayon=16, reps=12, guard PASS 3.65/3.32/8.60 before and
+3.82/3.57/8.39 after, ELF `de1851dcf9ee5556`, HEAD `4653e6b4`). Arms are route LIVE (width unset,
+= the shipped 32) against route DEAD (width 9973, which no dimension here can equal, so the route
+is unreachable without touching any other dispatch decision) — an in-process interleavable toggle,
+where the `FT_HOUSEHOLDER_SKINNY_GEMM` env switch is a `OnceLock` and could only have given a
+cross-process A/B:
+
+    n=512   orgqr  LIVE 12.4604  DEAD 21.5304 ms  paired 0.5752  marginal 0.5787  0/12  TRUSTED
+            ormqr  LIVE 12.5907  DEAD 21.4008 ms  paired 0.5874  marginal 0.5883  0/12  TRUSTED
+            A/A arms 0.9707 and 1.0532, both coin flips — the harness was resolving
+    n=1024  orgqr  paired 0.9730  6/12  UNRESOLVED (incumbent spread 2.02x)
+            ormqr  paired 0.9996  6/12  UNRESOLVED (incumbent spread 1.51x)
+
+**The route is worth ~1.7x on orgqr and ormqr at n=512, and the shipped 32 is load-bearing.** At
+n=1024 it is a null and the host could not have resolved one anyway — the incumbent's own spread
+was 1.51-2.02x, far above any plausible effect, which is condition (b) of ledger 293 doing its job
+rather than a finding about the route.
+
+**NO LANE CERTIFICATION WAS RUN, AND NONE IS OWED, because nothing is being shipped.** The arc
+requires a paired lane row before CHANGING a default; the outcome here is that the default is
+correct. The 1.7x is an isolation figure describing what we would LOSE by breaking the coupling —
+it is not a speedup available to anyone, and must never be quoted as one.
+
+**WHAT THE LANE ACTUALLY PRODUCED: a hazard, now documented on the constant.** If anyone retunes
+the ops' hard-coded 32 — and lane 4 was opened precisely because someone might — they must move
+this constant with it or silently lose 1.7x on orgqr/ormqr at n=512. Nothing in the type system
+couples them, and the loss would be invisible: no test fails, no counter reads zero, the census
+just quietly goes to 0 admitted. A grep for `HOUSEHOLDER_PANEL_WIDTH` from the next person changing
+a Householder panel width is the whole defence, which is why the coupling is now written where they
+will be standing.
