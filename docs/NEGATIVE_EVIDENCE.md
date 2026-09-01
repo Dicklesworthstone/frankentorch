@@ -42636,3 +42636,73 @@ couples them, and the loss would be invisible: no test fails, no counter reads z
 just quietly goes to 0 admitted. A grep for `HOUSEHOLDER_PANEL_WIDTH` from the next person changing
 a Householder panel width is the whole defence, which is why the coupling is now written where they
 will be standing.
+
+### 295. LANE 5: MIN_BLOCK_COLS IS ONE KNOB WITH FOUR ROLES; THE ONE SEPARABLE ROLE IS A 7.2% WIN AT EXACTLY ONE SHAPE
+
+`frankentorch-stale-tuning-constants-lzku6` lane 5, the last. Honest null on the default, with a
+mechanism confirmed and an `UNBUILT` marker retired.
+
+**MECHANISM MODEL: FOUR ROLES, NOT ONE.** `MIN_BLOCK_COLS = 128` is
+  1. a 2-D tiling admission gate, `n >= 2 * MIN_BLOCK_COLS`, in six GEMM entries;
+  2. a column-parallel admission gate, `n >= 4 * MIN_BLOCK_COLS`, in `should_parallelize_cols`;
+  3. a floor on block width in `block_cols`;
+  4. a floor on the 2-D grid's column dimension in `tile_shape`.
+
+A ladder over the constant moves all four at once and measures their mixture —
+`feedback_one_knob_is_secretly_two` in a worse form than the case that named it, where decoupling a
+1-D `mb` sweep from thread occupancy turned a NULL into a shipped 1.5468x.
+
+**WHY LANE 4's FINDING DOES NOT TRANSFER, which is the question worth asking.** Lane 4 concluded
+`HOUSEHOLDER_PANEL_WIDTH` has NO free axis: pinned by exact-match to a 32 hard-coded elsewhere,
+changing no computation, able only to switch a route off. **This is the opposite pathology.**
+MIN_BLOCK_COLS genuinely changes the computation — tile widths, therefore tile counts — so the axis
+is real; what it lacks is SEPARABILITY. Lane 4's answer was "there is nothing to sweep"; lane 5's is
+"there is something to sweep and it must be swept one role at a time". Carrying lane 4's conclusion
+across would have skipped a real lever, and the two lanes are a useful pair precisely because the
+same symptom (a constant that resists sweeping) had opposite causes.
+
+**ROLE 4 ALREADY HAD A DECOUPLED LEVER, BUILT AND NEVER MEASURED.**
+`set_gemm_tile_col_floor_adaptive` (item 170) lowers only `tile_shape`'s floor, to
+`MIN_BLOCK_COLS_ADAPTIVE = 32`, touching neither gate nor `block_cols`. Its own doc said UNBUILT and
+that the sign was open: narrower strips give the pool more to steal, but each strip re-reads the
+whole `A` panel and `project_gemm_bandwidth_vein` records this family as DRAM-bound in exactly that
+way. Lane 5's job was to measure it.
+
+**CENSUS FIRST, AND IT MATCHED THE ARITHMETIC EXACTLY.** A counter added inside `tile_shape` itself
+reports `(calls, floor_bound)` — floor_bound being the calls where the thread-aware split
+`n.div_ceil(q)` came out narrower than the floor, the only population the toggle can move. Driven
+through the REAL caller, `conv2d_backward_masked_f64` with a dweight-only mask, at the scored conv2d
+shape:
+
+    n=288   calls=1  floor_bound=1        n=432   calls=1  floor_bound=1
+    n=360   calls=1  floor_bound=1        n=1152  calls=0  floor_bound=0
+
+The n=1152 control is inert for a STRONGER reason than predicted: not "reaches the grid but does not
+bind" but "never reaches the 2-D grid at all". Prediction and observation agree on the conclusion
+and differ on the route, which is worth writing down rather than smoothing over.
+
+**THE A/B** (thinkstation1, rayon=16, reps=12, guard PASS 2.43/3.20/5.27, ELF `1e6905c6f4c00445`,
+floor 128 against floor 32, interleaved with an A/A arm). Bit-exactness CHECKED, not inherited from
+the doc: **0 differing elements at every shape.**
+
+    n=288  distortion 1.78x   paired 1.0716  marginal 1.0829  12/12  p=0.0005  TRUSTED WIN
+    n=360  distortion 1.42x   paired 1.0519  marginal 1.0460   8/12            UNRESOLVED
+    n=432  distortion 1.19x   paired 1.0231  marginal 1.0325   7/12            UNRESOLVED
+    A/A arms 1.0023, 1.0462, 0.9994
+
+where distortion is `MIN_BLOCK_COLS / n.div_ceil(q)` — how hard the floor overrides the thread-aware
+split. **The effect tracks the distortion monotonically and vanishes with it.** That is the model
+predicting the ORDERING of three effects, not just their sign, and it is the strongest part of this
+result.
+
+**IT DOES NOT SHIP.** One TRUSTED cell of three is not the all-cells rule, and at n=360 the A/A
+control read 1.0462 against a 1.0519 effect — that cell is below this host's floor, not merely
+unproven. Chasing a friendlier shape (n=260 would distort 1.97x) is precisely the "fitting the
+constant to the friendliest dataset" the arc forbids, so it was not done. No paired lane
+certification was run because there is nothing to certify.
+
+**WHAT THE LANE PRODUCED:** the `UNBUILT` marker on item 170 is retired and replaced with data, the
+census instrument is permanent, and the finding is scoped honestly — the adaptive floor is worth
+~7% at the shapes the floor distorts hardest and nothing at the rest, which is a narrow population
+to change a global default for. **All five lanes of lzku6 are now closed: two ships (292d, 292e),
+one ship at lane 1 (f32 cholesky, 293c), and two honest nulls with mechanisms (294, 295).**

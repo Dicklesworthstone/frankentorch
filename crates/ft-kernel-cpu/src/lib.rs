@@ -1603,10 +1603,33 @@ mod gemm {
     /// item 170 — only consulted when the toggle is on.
     const MIN_BLOCK_COLS_ADAPTIVE: usize = 32;
 
+    /// Census of the 2-D tile grid's COLUMN FLOOR — `frankentorch-stale-tuning-constants-lzku6`
+    /// lane 5. `CALLS` counts every `tile_shape`, `BOUND` counts the subset where the thread-aware
+    /// split `n.div_ceil(q)` came out NARROWER than `MIN_BLOCK_COLS`, i.e. where the floor is the
+    /// binding constraint and therefore where relaxing it could change anything at all.
+    ///
+    /// Lane 2 and lane 4 both turned on a census: `lu_solve`'s NB governed an op nothing executed,
+    /// and `HOUSEHOLDER_PANEL_WIDTH` was never admitted in geqrf. Asking "where does this actually
+    /// bind" BEFORE sweeping is the cheapest step in the arc and has now re-pointed two lanes.
+    pub(crate) static GEMM_TILE_FLOOR_OWNER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static GEMM_TILE_FLOOR_CALLS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static GEMM_TILE_FLOOR_BOUND: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     fn tile_shape(m: usize, n: usize) -> (usize, usize) {
         let threads = rayon::current_num_threads().max(1);
         let (p, q) = tile_grid(threads);
         let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
+        // Census BEFORE the floor is applied: is the thread-aware split the binding constraint, or
+        // is the floor? Only the latter population can respond to the adaptive toggle.
+        if super::stage_family_records(&GEMM_TILE_FLOOR_OWNER) {
+            GEMM_TILE_FLOOR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.div_ceil(q) < MIN_BLOCK_COLS {
+                GEMM_TILE_FLOOR_BOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // item 170: `MIN_BLOCK_COLS` is a floor on block WIDTH and therefore a ceiling on block
         // COUNT. When the thread-aware split is narrower than the floor, the floor wins and the
         // grid can produce fewer tiles than there are threads. OFF by default; see
@@ -5807,7 +5830,30 @@ pub fn sdpa_br_current(seq_q: usize, num_bh: usize) -> usize {
 }
 
 /// Let the 2-D GEMM tile grid's COLUMN floor adapt when `MIN_BLOCK_COLS` would starve the pool —
-/// `frankentorch-hi9r6`, item 170. UNBUILT, and OFF by default, so no shipping row moves.
+/// `frankentorch-hi9r6`, item 170. **MEASURED and still OFF by default** —
+/// `frankentorch-stale-tuning-constants-lzku6` lane 5, ledger 295. It is no longer UNBUILT.
+///
+/// Driven through the real caller (`conv2d_backward_masked_f64`, dweight-only mask) at 16 threads,
+/// interleaved with an A/A arm, guard PASS, ELF `1e6905c6f4c00445`. The census inside `tile_shape`
+/// confirms the floor binds exactly where the arithmetic says — `floor_bound=1` at n=288/360/432,
+/// and `calls=0` at n=1152, which never reaches the 2-D grid at all:
+///
+///     n=288  distortion 1.78x   paired 1.0716  12/12  p=0.0005  TRUSTED WIN
+///     n=360  distortion 1.42x   paired 1.0519   8/12            UNRESOLVED (A/A 1.0462)
+///     n=432  distortion 1.19x   paired 1.0231   7/12            UNRESOLVED
+///
+/// where distortion is `MIN_BLOCK_COLS / n.div_ceil(q)`, how far the floor overrides the
+/// thread-aware split. **The effect tracks the distortion monotonically and vanishes with it**,
+/// which is the mechanism confirming itself rather than a number.
+///
+/// STILL OFF, because one TRUSTED cell of three is not the arc's all-cells rule, and at n=360 the
+/// A/A control (1.0462) was almost the size of the effect (1.0519) — that cell is below this
+/// host's floor, not merely unproven. Bit-exactness was CHECKED rather than inherited from the
+/// paragraph below: 0 differing elements at every shape.
+///
+/// Turning it on would need an all-cells TRUSTED win plus a paired lane certification, and the
+/// honest reading is that the win is confined to shapes the floor distorts hardest, which is a
+/// narrow population to change a global default for.
 ///
 /// `tile_shape` computes `nb = n.div_ceil(q).max(MIN_BLOCK_COLS)`, and that `.max()` is a floor
 /// on the block WIDTH which acts as a CEILING on the block COUNT. At conv2d's dweight shape —
@@ -35777,6 +35823,20 @@ pub fn householder_panel_width() -> usize {
         0 => gemm::HOUSEHOLDER_PANEL_WIDTH_SHIPPED,
         v => v,
     }
+}
+
+/// Drain the 2-D tile-grid column-floor census as `(calls, floor_bound)`.
+///
+/// `floor_bound` is the subset of `tile_shape` calls where the thread-aware column split was
+/// NARROWER than `MIN_BLOCK_COLS`, so the floor — not the pool — decided the tile width. That is
+/// the only population `set_gemm_tile_col_floor_adaptive` can move.
+#[doc(hidden)]
+pub fn gemm_tile_floor_census_take() -> (u64, u64) {
+    stage_family_claim(&gemm::GEMM_TILE_FLOOR_OWNER);
+    (
+        gemm::GEMM_TILE_FLOOR_CALLS.swap(0, LuOrdering::Relaxed),
+        gemm::GEMM_TILE_FLOOR_BOUND.swap(0, LuOrdering::Relaxed),
+    )
 }
 
 /// Drain the skinny-split admission census as `(admitted, rejected)`.
