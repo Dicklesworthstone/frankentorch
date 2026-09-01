@@ -131,6 +131,37 @@ if [ "${#HITS[@]}" -gt 0 ]; then
     STATUS=1
 fi
 
+# THE WINDOW MUST STAY EXCLUSIVE FOR THE DURATION, NOT JUST AT ADMISSION — frankentorch-8vukf.
+#
+# Everything else in this file is a snapshot: it answers "is the host quiet right now" and cannot
+# see a peer that starts one second later. The bead records that race — this guard admitted at
+# poll 2, and DURING the admitted run an `h2h-harness` peer appeared at 283% CPU. The harness
+# detected it and called both rows unquotable; load-series and drift stayed PASS throughout.
+#
+# `scripts/h2h_window.sh` holds an flock for the LIFETIME of a measurement. Probing it here is what
+# makes that binding on callers who never change their scripts: every runner in this repo already
+# does `guard && <measure>`, so a held window now refuses them for its whole duration.
+#
+# The probe acquires and immediately releases. That is deliberate — it tests the lock rather than
+# holding it, and this script must not still own the window when the measurement it gates starts.
+# There is an unavoidable gap between this probe and that measurement; closing THAT is what
+# `h2h_window.sh` is for, and why the guard is not the whole answer.
+#
+# FT_H2H_WINDOW_OWNED means the caller is already inside `h2h_window.sh`, i.e. the window we would
+# find held is our own. Skipping the limb there is not a loophole: something is holding the window
+# for this measurement, which is exactly what the limb is checking for.
+WINDOW_LOCK="${FT_H2H_WINDOW_LOCK:-/data/tmp/ft-h2h-window.lock}"
+if [ -z "${FT_H2H_WINDOW_OWNED:-}" ] && [ -e "$WINDOW_LOCK" ] && command -v flock >/dev/null 2>&1; then
+    if ! flock -n "$WINDOW_LOCK" -c true >/dev/null 2>&1; then
+        echo "REFUSING TO MEASURE: the H2H window is held for the duration of another measurement." >&2
+        if [ -s "${WINDOW_LOCK}.holder" ]; then
+            echo "    holder: $(cat "${WINDOW_LOCK}.holder" 2>/dev/null)" >&2
+        fi
+        echo "    Take the window with: scripts/h2h_window.sh <your measurement>" >&2
+        STATUS=1
+    fi
+fi
+
 LOAD1="$(cut -d' ' -f1 /proc/loadavg)"
 if awk -v l="$LOAD1" -v m="$MAX_LOAD" 'BEGIN { exit !(l > m) }'; then
     echo "REFUSING TO MEASURE: 1-minute loadavg $LOAD1 exceeds $MAX_LOAD." >&2

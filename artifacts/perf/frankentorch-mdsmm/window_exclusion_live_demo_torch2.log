@@ -1,0 +1,25 @@
+===== live exclusion demo — torch:2 (CreamTrout) 2026-09-01T20:15:59Z =====
+host=thinkstation1 HEAD=ff164fea79406b39aed1c84e9057a48c67cfe20c
+elf_sha256=717b8cd1633f5cd9cf1bd877500edcfd0e27fe8163faf84af0cff8614a050b6c
+sampler:  scripts/h2h_window.sh <elf>   (conv2d/conv2d_masked, REPS=24)
+intruder: the same command with FULL admission, launched WHILE the sampler is mid-sample
+note: the sampler skips admission (FT_H2H_WINDOW_NO_GUARD=1) so it holds the window even on a busy host; exclusion is the property under test, not row quality
+
+sampler holds the window: yes
+holder record: pid=720004 user=ubuntu host=thinkstation1 started=2026-09-01T20:15:59Z cmd=/data/tmp/claude-1000/-data-projects-frankentorch/18b196b1-7fe4-47c1-9ae7-f3dfe6c07d52/scratchpad/h2h_banked.elf
+
+--- intruder attempts to start, mid-sample ---
+H2H WINDOW BUSY — refusing to start; another measurement holds the window.
+    holder: pid=720004 user=ubuntu host=thinkstation1 started=2026-09-01T20:15:59Z cmd=/data/tmp/claude-1000/-data-projects-frankentorch/18b196b1-7fe4-47c1-9ae7-f3dfe6c07d52/scratchpad/h2h_banked.elf
+    lock: /data/tmp/ft-h2h-window.lock   waited: 0s   (set FT_H2H_WINDOW_WAIT=<seconds> to queue)
+intruder_rc=75  (75 = refused because the window was held)
+
+--- sampler outcome ---
+sampler_rc=0  (75=busy 76=host unfit, else the harness's own code)
+measurement_slot=held [pid=720014 host=thinkstation1 elf=717b8cd1633f5cd9 lanes=conv2d,conv2d_masked]; no other live h2h announcement
+concurrent_measurements=1 DETECTED: h2h-harness[328551] 103% — another process was sampling inside this window AND burning local CPU, so BOTH runs' arms are contended and NEITHER is quotable however its gates read. The drift gate cannot see this: it measures stability, and a uniformly overloaded host is stable.
+  conv2d          2.601    3.295   FT 1.27x FASTER     PT OFFSET FT PASS ratio 1.267 match incumbent=SINGLE/n13
+  conv2d_masked    4.695    3.227   FT 1.46x SLOWER     PT OFFSET FT PASS ratio 0.687 match incumbent=SINGLE/n13
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+===== end 2026-09-01T20:16:24Z =====

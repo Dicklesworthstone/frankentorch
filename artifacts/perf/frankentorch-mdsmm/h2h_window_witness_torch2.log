@@ -1,0 +1,16 @@
+exclusive-window regression witness — frankentorch-8vukf
+generated 2026-09-01T20:16:39Z on thinkstation1  HEAD ff164fea
+command: scripts/h2h_window_witness.sh
+
+exclusive-window witness  lock=/data/tmp/ft-h2h-window-witness.733430.lock
+  PASS  1. would-be starter refused rc=75 and the holder is NAMED
+  PASS  2. guard refuses while the window is held, and says why
+  PASS  3. a caller inside h2h_window.sh is not refused by its own lock
+  PASS  4. SIGKILLing the holder releases the window (no stale lock, no reaper needed)
+  PASS  5. 8 concurrent starters -> exactly 1 acquired, 7 refused rc=75
+  PASS  6. the wrapped command's exit code passes through
+  PASS  7. guard refusal inside the lock returns 76, not 75
+  PASS  8. a refused admission releases the window
+
+witness PASS: the window is exclusive for the DURATION of sampling, in both directions.
+witness_exit=0
