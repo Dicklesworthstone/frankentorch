@@ -1,0 +1,16 @@
+  [2m2026-09-01T14:02:36.099763Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+Error: git rev-parse --verify --end-of-options a4178a4f1b96e1f0fd32c991069d291c0129ec23^{commit} failed: fatal: Needed a single revision
+
+===== retry with repository-resolved base =====
+  [2m2026-09-01T14:02:45.053407Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+[RCH] remote required; refusing local fallback (no admissible workers: critical_pressure=1,insufficient_slots=1,insufficient_total_slots=10) — retryable
+
+===== bounded strict retry after 30s =====
+  [2m2026-09-01T14:03:44.250192Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+[RCH] remote required; refusing local fallback (no admissible workers: critical_pressure=1,insufficient_slots=1,insufficient_total_slots=10) — retryable
