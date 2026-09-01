@@ -42005,3 +42005,79 @@ A block-ordered sweep had no way to say either thing.
 
 No lever, no default change, no numbers banked. This is the instrument, and it is what makes the
 remaining lanes (`HOUSEHOLDER_PANEL_WIDTH`, `MIN_BLOCK_COLS`) worth running at all.
+
+### 293b. THE f32 CHOLESKY SWEEP RE-RUN INTERLEAVED: DIRECTION SURVIVES 9/9, MAGNITUDE DEFLATES 1.228x -> 1.121x, AND THE GATE FROM 293 TURNS OUT TO BE MIS-SPECIFIED
+
+`frankentorch-stale-tuning-constants-lzku6`, lane 1 re-measured on the 293a instrument. This was
+chosen as the stress test because lane 1's numbers came off the block-ordered harness and its
+direction had been independently reproduced by a second party — so the instrument had to either
+re-validate it with trustworthy statistics or catch it the way it caught geqrf.
+
+**It did both, on different quantities.**
+
+Three passes, guard PASS immediately before each (`measurement_window_guard.sh`, loadavg
+1.03-1.49, iowait 0.1%), thinkstation1, `RAYON_NUM_THREADS=16`, ELF
+`30af912874b5648e9db6fc3d633f19018c25bc6d57935208cb4203856da4c324` built remotely on hz4 from
+`aa75ad12`. nb=64 against the shipped f32 nb=128, PAIRED / sign test:
+
+               pass A (12)      pass B (12)      pass C (20)     median
+    n=256    1.1290  11/12    1.3084  12/12    1.2283  20/20     1.2283
+    n=512    1.0929  11/12    1.1209  12/12    1.1857  20/20     1.1209
+    n=1024   1.0720   9/12    1.0957   8/12    1.0768  13/20     1.0768
+
+**Direction: 9 of 9 cells above 1.0, and the estimators agree in 8 of 9** (the exception is pass B
+at n=1024, paired 1.0957 against marginal 0.9910). **Magnitude: the block-ordered sweep's median
+was 1.228x; interleaved it is 1.121x.** So 293's suspicion about cholesky and getrf — "the sweep
+numbers were likely inflated the same way and merely had enough margin to survive" — is confirmed
+on the one lane where it could be tested: about ten points of the claimed effect were ordering.
+
+**AND A COHERENT SIZE CURVE APPEARS WHERE THERE WAS NONE.** Interleaved, the effect falls
+monotonically in n — 1.23x, 1.12x, 1.08x. The block-ordered sweep read 1.204/1.313, 1.251/1.255,
+1.020/1.177: no trend, and its weakest cell was the middle one. A monotone curve is what the panel
+model predicts (item 279), and getting one out of the new instrument is independent evidence that
+the ordering was the noise source.
+
+**THE FINDING THAT MATTERS MORE: CONDITION (b) IS THE WRONG STATISTIC, AND I HAVE NOT CHANGED IT.**
+
+293(b) gates on the incumbent's WITHIN-RUN spread, defined as max/min of its per-rep times. Two
+defects, both visible in this run:
+
+  1. **It is an extreme-value statistic, so it GROWS WITH REP COUNT.** Going from 12 reps to 20 at
+     n=512 took the sign test from 11/12 to **20/20** and the gate from 0.351 to **0.531**. The
+     evidence got stronger and the bar rose to meet it. A gate that more replication cannot
+     satisfy is not measuring what it was meant to measure.
+  2. **It compares a PAIRED effect against an UNPAIRED noise.** max/min of absolute per-rep times
+     is exactly the drift that interleaving was mandated to cancel; the paired ratio has already
+     removed it. Gating the paired estimate on the unpaired spread discards the benefit of the
+     design 293 itself required.
+
+The paired null is sitting right there in every table. Worst control deviation per cell (A/A arm
+and the `*` knob-control), against the effect:
+
+    pass A   n=256  ctrl 2.3%  eff 12.9%   n=512  ctrl 9.3%  eff  9.3%   n=1024  ctrl 0.5%  eff 7.2%
+    pass B   n=256  ctrl 16.7% eff 30.8%   n=512  ctrl 8.0%  eff 12.1%   n=1024  ctrl 3.4%  eff 9.6%
+    pass C   n=256  ctrl 7.9%  eff 22.8%   n=512  ctrl 4.0%  eff 18.6%   n=1024  ctrl 10.5% eff 7.7%
+
+Under 293(b) as written, **1 of 9 cells is TRUSTED**. Against the controls, 7 of 9 clear — the two
+that do not being n=512 pass A (a tie) and n=1024 pass C, where the A/A control itself missed by
+10.5%.
+
+**I did not change the gate.** Moving an acceptance criterion after seeing the numbers, in the
+direction that would pass my own result, is the exact failure this whole arc exists to prevent —
+and 293 is a rule other agents are working to. It is filed as the next lane, with the argument
+above as its brief, and it needs approval before any cell in this table is re-read.
+
+**A CORRECTNESS GAP FOUND ON THE WAY, AND CLOSED.** `set_cholesky_nb_f32` shipped in lane 1 as an
+instrument with **no neutrality or reconstruction test at all** — the existing
+`cholesky_nb_knob_is_neutral_at_default_and_correct_elsewhere` covers only f64. So every width lane
+1 measured was a width nothing had checked, and this table could have been reporting the speed of a
+wrong factorisation. The f32 twin now exists, at `2e-4` relative rather than the f64 test's `1e-8`
+(a 24-bit mantissa carries ~`n*2^-24` over a length-`n` accumulation; reusing the f64 tolerance
+would have produced a test that fails on correct output). Kernel suite **760 passed / 0 failed**,
+up one.
+
+**SHIP DECISION UNCHANGED: IT DOES NOT SHIP.** There is still no f32 cholesky h2h lane to run a
+paired certification in, which is what parked lane 1 in the first place and is untouched by any of
+this. The banked figure moves from "1.228x, all six cells, block-ordered" to **"1.121x median, 9/9
+cells, interleaved, 1 of 9 TRUSTED under 293(b)"** — a smaller and much better-supported number,
+and still an uncashed one.
