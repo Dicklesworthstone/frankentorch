@@ -40435,6 +40435,46 @@ pub fn ormqr_stage_take_ns() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     )
 }
 
+/// Candidate: FUSE ORMQR's final `C -= V*(T V^T C)` into `dgemm_sub_into` instead of materialising
+/// `upd` and walking it. `frankentorch-g0wpj`. DEFAULT OFF until it has a paired lane row.
+///
+/// THE SAME SWAP IS ALREADY SHIPPED ONE FUNCTION AWAY. geqrf's trailing update records it in
+/// source: "`dgemm_sub_into` (alpha=-1/beta=1 into strided C) WON 1.082x by removing the `upd`
+/// buffer and its scatter pass. The asymmetry is the point: strided OUTPUT avoids a materialised
+/// buffer for free; strided INPUT defeats the packing the microkernel depends on." ORMQR never
+/// got it — it still allocates `m*cc` per panel (2 MB at n=512, 8 MB at n=1024, once per panel
+/// for 16 and 32 panels), writes it, then reads it back to subtract.
+///
+/// DISTINCT FROM THE TWO THINGS ALREADY REFUTED ON THIS BEAD. torch:4's NO_VERDICT arm
+/// PARALLELISED the subtract pass that this DELETES, and their release note says not to retry
+/// that. geqrf's refuted `rt`/`vt` removals were INPUT staging, which the comment above
+/// distinguishes explicitly.
+///
+/// EXPECTED BIT-EXACT, and the test gates on `to_bits` rather than a tolerance: `dgemm_sub_into`
+/// hands each column block to ONE `dgemm_mm` call with `alpha = -1.0` accumulating into `C`, so
+/// every element's k-reduction happens whole in the same order and the final combine is `c - ab`
+/// — exactly the `c[t] -= upd[t]` it replaces.
+static ORMQR_FUSED_SUBTRACT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static ORMQR_FUSED_SUBTRACT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Enable or disable the fused ORMQR update; returns the previous setting.
+#[doc(hidden)]
+pub fn set_ormqr_fused_subtract(on: bool) -> bool {
+    ORMQR_FUSED_SUBTRACT.swap(on, LuOrdering::Relaxed)
+}
+
+fn ormqr_fused_subtract() -> bool {
+    ORMQR_FUSED_SUBTRACT.load(LuOrdering::Relaxed)
+}
+
+/// Drain the number of ORMQR panel applies that took the FUSED update. A candidate arm reporting
+/// zero hits measured the shipped path twice — `feedback_unset_knob_means_forced_off`.
+#[doc(hidden)]
+pub fn ormqr_fused_subtract_hits_take() -> u64 {
+    ORMQR_FUSED_SUBTRACT_HITS.swap(0, LuOrdering::Relaxed)
+}
+
 /// Enable or disable the candidate parallel direct-update pass in ORMQR. Default OFF: this is a
 /// measured scheduling arm, not production policy. Each row block owns disjoint `C` elements, so
 /// every subtraction remains the same one-operation update as the serial loop.
@@ -42224,6 +42264,19 @@ pub fn ormqr_blocked_f64(
             if let Some(started) = t_w_started {
                 ORMQR_T_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
+            if ormqr_fused_subtract() {
+                // FUSED: C -= V * W in one pass. No `upd` allocation, no write, no read-back,
+                // no separate subtract. Timed as V_W because that is the GEMM it fuses into;
+                // SUBTRACT stays zero, which is the honest attribution — the phase is gone, not
+                // fast. `frankentorch-g0wpj`.
+                ORMQR_FUSED_SUBTRACT_HITS.fetch_add(1, LuOrdering::Relaxed);
+                let v_w_started = profile.then(std::time::Instant::now);
+                gemm::dgemm_sub_into(m, nb, cc, vmat, &w2, c, 0, cc);
+                if let Some(started) = v_w_started {
+                    ORMQR_V_W_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                }
+            } else {
             let workspace_started = profile.then(std::time::Instant::now);
             let mut upd = vec![0.0f64; m * cc];
             if let Some(started) = workspace_started {
@@ -42244,6 +42297,7 @@ pub fn ormqr_blocked_f64(
                     started.elapsed().as_nanos() as u64,
                     LuOrdering::Relaxed,
                 );
+            }
             }
         } else {
             // C <- C - ((C V) T) Vᵀ,  C is cr x m.
@@ -42272,6 +42326,17 @@ pub fn ormqr_blocked_f64(
             gemm::dgemm(cr, nb, nb, &w1, tx, &mut w2); // (C V) T
             if let Some(started) = t_w_started {
                 ORMQR_T_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+            }
+            if ormqr_fused_subtract() {
+                // FUSED right route: C -= W * V^T, same argument as the left. g0wpj.
+                ORMQR_FUSED_SUBTRACT_HITS.fetch_add(1, LuOrdering::Relaxed);
+                let v_w_started = profile.then(std::time::Instant::now);
+                gemm::dgemm_bt_sub_into(cr, nb, m, &w2, vmat, c, 0, m);
+                if let Some(started) = v_w_started {
+                    ORMQR_V_W_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                }
+                continue;
             }
             let workspace_started = profile.then(std::time::Instant::now);
             let mut upd = vec![0.0f64; cr * m];
@@ -50191,6 +50256,70 @@ mod tests {
             "every candidate all-four-case invocation must reach the parallel update"
         );
         super::set_ormqr_subtract_parallel(previous);
+    }
+
+    /// The FUSED ORMQR update must be BIT-IDENTICAL to materialise-then-subtract, in all four
+    /// cases — `frankentorch-g0wpj`.
+    ///
+    /// Bit-exactness is the gate here, not a tolerance, and the argument is specific:
+    /// `dgemm_sub_into` hands each column block to ONE `dgemm_mm` call with `alpha = -1.0`
+    /// accumulating into `C`, so every element's k-reduction happens whole and in the same order
+    /// as the `dgemm` it replaces; the final combine is `c - ab`, which is exactly the
+    /// `c[t] -= upd[t]` that was there before. One rounding either way.
+    ///
+    /// If that argument were wrong the difference would be invisible to a tolerance test on a
+    /// well-conditioned fixture, which is why this compares `to_bits` on all four routes rather
+    /// than a residual. `project_differential_parity` records a whole family whose checks were
+    /// sign-blind for exactly that reason.
+    ///
+    /// THE HIT COUNTER IS ASSERTED, not assumed. A candidate arm that silently never fires
+    /// measures the shipped path twice and reports a null — `feedback_unset_knob_means_forced_off`
+    /// records a geqrf lane reading 13.630x against a true 7.002x for precisely that.
+    #[test]
+    fn ormqr_fused_subtract_matches_materialised_bitwise() {
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 24;
+        let a: Vec<f64> = (0..M * N)
+            .map(|i| ((i as f64) * 0.031).sin() + if i % (N + 1) == 0 { 3.0 } else { 0.0 })
+            .collect();
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+
+        let previous = super::set_ormqr_fused_subtract(false);
+        for &(left, transpose) in &[(true, false), (true, true), (false, false), (false, true)] {
+            let (cr, cc) = if left { (M, W) } else { (W, M) };
+            let initial: Vec<f64> = (0..cr * cc)
+                .map(|idx| ((idx as f64) * 0.037).sin() - 0.25)
+                .collect();
+
+            super::set_ormqr_fused_subtract(false);
+            let mut materialised = initial.clone();
+            super::ormqr_blocked_f64(
+                &packed, &tau, M, N, N, &mut materialised, cr, cc, left, transpose,
+            );
+
+            super::set_ormqr_fused_subtract(true);
+            let _ = super::ormqr_fused_subtract_hits_take();
+            let mut fused = initial;
+            super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut fused, cr, cc, left, transpose);
+            let hits = super::ormqr_fused_subtract_hits_take();
+            super::set_ormqr_fused_subtract(false);
+
+            assert!(
+                hits > 0,
+                "the fused arm never fired at left={left}, transpose={transpose} — the candidate \
+                 would have measured the shipped path twice"
+            );
+            for (idx, (x, y)) in materialised.iter().zip(&fused).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "fused ORMQR update differs at left={left}, transpose={transpose}, \
+                     index={idx}: materialised {x:e} vs fused {y:e}"
+                );
+            }
+        }
+        super::set_ormqr_fused_subtract(previous);
     }
 
     /// Only one thread at a time may OWN the ORMQR stage profile — `frankentorch-ebbew`.
