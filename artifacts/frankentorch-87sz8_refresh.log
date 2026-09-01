@@ -1,0 +1,11 @@
+=== max_pool3d fixed-guard board refresh (torch:4) ===
+build_base=6abc8ecc87f3248e9e8f80b65034a4ff7c550aa5
+build_command=RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_VISIBILITY=summary RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/tmp/frankentorch-torch4-maxpool3d-6abc8ecc87f3-4KcRit rch --no-self-healing exec --base 6abc8ecc87f3248e9e8f80b65034a4ff7c550aa5 --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+build_worker=ovh-a
+build_job=j-30000682123658377
+executing_elf=/data/tmp/frankentorch-torch4-maxpool3d-6abc8ecc87f3-4KcRit/release/examples/gauntlet_lane_sweep_h2h
+executing_elf_sha256=cd8171cc080e4812ac048057397ec838e7163b388bf48c2bd9a99dd38c38359c
+row_plan=seed a first incumbent observation, then run one same-level conditioned row only after guard admission
+guard_plan=poll inline every approximately 180 seconds for at most 1200 seconds; never use a refused guard as fallback permission
+poll=1 utc=2026-09-01T18:43:51Z guard=REFUSED peer_measurements=2
+poll=2 utc=2026-09-01T18:46:29Z guard=REFUSED peer_measurements=2
