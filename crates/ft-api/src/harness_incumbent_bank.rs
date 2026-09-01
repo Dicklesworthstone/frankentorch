@@ -261,7 +261,7 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
                 level.max,
                 level.spread(),
                 level.n.saturating_sub(1),
-                span_caveat(records)
+                format!("{}{}", span_caveat(records, false), concurrent_writer_note(records))
             );
         }
         ModeReport::Split {
@@ -303,7 +303,7 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
                  a disagreement with the majority is a NO-VERDICT, not a correction. A standing \
                  whose SIGN differs between the levels must not be banked from one invocation.{}",
                 if *drawn == 0 { "A" } else { "B" },
-                span_caveat(records)
+                format!("{}{}", span_caveat(records, true), concurrent_writer_note(records))
             );
         }
     }
@@ -353,15 +353,56 @@ pub fn history_span_seconds(records: &[(f64, u64)]) -> u64 {
 
 /// The sentence that qualifies a SINGLE-level verdict by how much time the bank covers.
 #[must_use]
-pub fn span_caveat(records: &[(f64, u64)]) -> String {
+/// The sentence that qualifies a verdict by how much time the bank covers.
+///
+/// `found_split` matters: a bank narrower than an hour weakens a SINGLE-level verdict, because
+/// one session cannot see a between-session difference. It does NOT weaken a SPLIT — having seen
+/// two levels inside one hour is positive evidence that there are two, whatever the span. Saying
+/// "weak evidence" on a split would be exactly backwards.
+#[must_use]
+pub fn span_caveat(records: &[(f64, u64)], found_split: bool) -> String {
     let span = history_span_seconds(records);
-    if span < 3_600 {
+    if span >= 3_600 {
+        return format!(" The bank spans {:.1} days.", span as f64 / 86_400.0);
+    }
+    if found_split {
         format!(
-            " The bank spans {span}s — under an hour, so these are ONE session's draws and a              SINGLE-level verdict from them is weak evidence: the level this lane sits at has              been observed to differ BETWEEN sessions, which a bank this narrow cannot see."
+            " The bank spans {span}s, but a split seen inside one session is still positive \
+             evidence of two levels."
         )
     } else {
-        format!(" The bank spans {:.1} days.", span as f64 / 86_400.0)
+        format!(
+            " The bank spans {span}s — under an hour, so these are ONE session's draws, and a \
+             single-level verdict from them is WEAK: the level this lane sits at has been \
+             observed to differ BETWEEN sessions, which a bank this narrow cannot see."
+        )
     }
+}
+
+/// Two observations of one lane at the same second can only come from TWO harness processes
+/// running at once — one process writes one record per lane per invocation.
+///
+/// FOUND BY ACCIDENT, ON THE FIRST LIVE RUN. Invocation 5 of the conv2d_big re-run banked two
+/// records per lane at one timestamp, and both the pair already banked (7.611 / 7.733 ms) and
+/// the pair that run measured (7.674 / 7.673) sat ~25% above the level-A cluster the eight
+/// surrounding invocations produced (5.30-6.19). The guard had PASSED: it checks once, before
+/// the run, and cannot serialise a fleet — its own header says so. The bank therefore sees a
+/// class of contamination the guard structurally cannot, and saying so costs nothing.
+#[must_use]
+pub fn concurrent_writer_note(records: &[(f64, u64)]) -> String {
+    let mut stamps: Vec<u64> = records.iter().map(|(_, t)| *t).filter(|t| *t > 0).collect();
+    stamps.sort_unstable();
+    let collisions = stamps.windows(2).filter(|w| w[0] == w[1]).count();
+    if collisions == 0 {
+        return String::new();
+    }
+    format!(
+        "\n    CONCURRENT WRITER: {collisions} banked observation(s) for this lane share a \
+         timestamp with another. One process writes one record per lane per invocation, so a \
+         collision means TWO harnesses measured at once — which the guard cannot see, because it \
+         checks once before the run. Those observations are contended and any level boundary \
+         drawn through them is suspect."
+    )
 }
 
 fn match_line(line: &str, key: &IncumbentKey) -> Option<(f64, u64)> {
@@ -625,14 +666,14 @@ mod tests {
         assert!(matches!(report, ModeReport::Single { .. }));
         let text = render("conv2d_big", &report, &records);
         assert!(text.contains("ONE session's draws"), "{text}");
-        assert!(text.contains("weak evidence"), "{text}");
+        assert!(text.contains("single-level verdict from them is WEAK"), "{text}");
     }
 
     /// A bank that spans real time reports the span instead of the warning.
     #[test]
     fn a_multi_day_bank_reports_its_span_rather_than_the_warning() {
         let records = [(5.6, 1_788_000_000), (5.7, 1_788_000_000 + 3 * 86_400)];
-        let note = span_caveat(&records);
+        let note = span_caveat(&records, false);
         assert!(note.contains("spans 3.0 days"), "{note}");
         assert!(!note.contains("weak evidence"));
     }
@@ -659,6 +700,51 @@ mod tests {
         .expect("temp dir is writable");
         assert_eq!(load_records(&path, &key), vec![(5.5, 1_788_123_456)]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A split must NOT be called weak just because it was seen inside one session — seeing two
+    /// levels is positive evidence of two levels however fast it happened. Getting this backwards
+    /// is what the first live run printed.
+    #[test]
+    fn a_split_inside_one_session_is_not_called_weak_evidence() {
+        let records: Vec<(f64, u64)> = [5.5, 5.6, 11.2]
+            .iter()
+            .enumerate()
+            .map(|(i, ms)| (*ms, 1_788_000_000 + i as u64 * 30))
+            .collect();
+        let split = span_caveat(&records, true);
+        assert!(split.contains("positive evidence of two levels"), "{split}");
+        assert!(!split.contains("WEAK"), "{split}");
+        let single = span_caveat(&records, false);
+        assert!(single.contains("WEAK"), "{single}");
+    }
+
+    /// Two records for one lane at one second can only be two concurrent harnesses. The guard
+    /// cannot see this — it checks once, before the run — so the bank has to.
+    #[test]
+    fn two_observations_at_one_timestamp_are_reported_as_a_concurrent_writer() {
+        let clean = [(5.5, 1_788_000_000), (5.6, 1_788_000_030)];
+        assert_eq!(concurrent_writer_note(&clean), "");
+
+        let contended = [
+            (5.5, 1_788_000_000),
+            (7.611, 1_788_000_108),
+            (7.674, 1_788_000_108),
+            (5.6, 1_788_000_140),
+        ];
+        let note = concurrent_writer_note(&contended);
+        assert!(note.contains("CONCURRENT WRITER: 1"), "{note}");
+        assert!(note.contains("TWO harnesses measured at once"), "{note}");
+        assert!(render("conv2d_big", &classify(&[5.5, 7.611, 7.674], 5.6, DEFAULT_SPLIT_RATIO), &contended)
+            .contains("CONCURRENT WRITER"));
+    }
+
+    /// A record written with no timestamp (an older bank line) must not be read as a collision
+    /// with every other such record, or an upgraded bank screams contention on every lane.
+    #[test]
+    fn missing_timestamps_are_not_counted_as_collisions() {
+        let legacy = [(5.5, 0), (5.6, 0), (5.7, 0)];
+        assert_eq!(concurrent_writer_note(&legacy), "");
     }
 
     #[test]
