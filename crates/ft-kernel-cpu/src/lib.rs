@@ -39973,8 +39973,30 @@ pub struct QrStageProfile {
 
 /// Opt-in stage counters for the direct compact-WY ORMQR route. Disabled by default: the
 /// timestamps exist to identify a remaining loss mechanism, not to tax production dispatch.
-static ORMQR_STAGE_PROFILE_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+///
+/// PROFILING IS OWNED BY ONE THREAD, NOT BY THE PROCESS — `frankentorch-ebbew`. This holds the
+/// [`thread_measurement_key`] of the thread that turned profiling on, or `0` for off, so the
+/// enable flag and the owner are ONE atomic and cannot disagree.
+///
+/// It has to be per-thread because the counters below are process-global and `cargo test` runs
+/// tests in parallel threads of ONE process. While a profiling test had the old plain bool on,
+/// any OTHER test calling `ormqr_blocked_f64` recorded into the same counters, and the assertion
+/// that the left non-transpose path never materialises `T^T` read 30-40 ns of somebody else's
+/// transposing call instead of its own 0:
+///
+///     assertion `left == right` failed: left non-transpose must not materialize T^T
+///       left: 40   right: 0
+///
+/// Green 3/3 on a 16-thread worker and red 2/2 on a 64-thread one, which is what a wider pool
+/// buys you: more concurrent tests inside the window.
+///
+/// THE COUNTERS THEMSELVES ARE LEFT GLOBAL AND UNCHANGED, and that is deliberate. Every write
+/// site is already gated on the single `profile` boolean computed once at the top of
+/// `ormqr_blocked_f64`, so narrowing THAT is sufficient — no other thread reaches a `fetch_add`
+/// at all. Making the counters thread-local instead would have been 17 call-site edits for the
+/// same effect, and would silently read 0 for any caller that ever invokes ORMQR from a rayon
+/// worker; none does today, but the narrow fix does not care either way.
+static ORMQR_STAGE_PROFILE_OWNER: AtomicU64 = AtomicU64::new(0);
 static ORMQR_PANEL_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 static ORMQR_T_TRANSPOSE_NS: AtomicU64 = AtomicU64::new(0);
 static ORMQR_WORKSPACE_NS: AtomicU64 = AtomicU64::new(0);
@@ -39984,10 +40006,37 @@ static ORMQR_V_W_NS: AtomicU64 = AtomicU64::new(0);
 static ORMQR_SUBTRACT_NS: AtomicU64 = AtomicU64::new(0);
 static ORMQR_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Default-OFF isolation switch for ORMQR's direct `C -= update` pass.  The three compact-WY
+/// GEMMs have their own scheduling gates; this is deliberately separate because ORMQR does not
+/// use `dgemm_sub_into` for its final update.
+static ORMQR_SUBTRACT_PARALLEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static ORMQR_SUBTRACT_PARALLEL_HITS: AtomicU64 = AtomicU64::new(0);
+const ORMQR_SUBTRACT_PARALLEL_MIN_AREA: usize = 128 * 128;
+
+/// A small non-zero id unique to the calling thread, stable for that thread's lifetime.
+///
+/// `frankentorch-ebbew`. `ThreadId::as_u64` is unstable, so ids are handed out lazily from a
+/// counter the first time a thread asks. Zero is reserved to mean "nobody", which lets an owner
+/// and an on/off flag share one atomic.
+fn thread_measurement_key() -> u64 {
+    static NEXT_THREAD_KEY: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static THREAD_KEY: u64 = NEXT_THREAD_KEY.fetch_add(1, LuOrdering::Relaxed);
+    }
+    THREAD_KEY.with(|key| *key)
+}
+
 /// Enable or disable profiling of `ormqr_blocked_f64`; returns the previous setting.
+///
+/// Enabling binds profiling to the CALLING thread, so a concurrently running test that also uses
+/// ORMQR cannot write into the counters this thread is about to drain — see
+/// [`ORMQR_STAGE_PROFILE_OWNER`]. Restoring a previously-`true` value re-binds to whichever thread
+/// does the restoring, which is the same thread in every caller this crate has.
 #[doc(hidden)]
 pub fn set_ormqr_stage_profile_enabled(on: bool) -> bool {
-    ORMQR_STAGE_PROFILE_ENABLED.swap(on, LuOrdering::Relaxed)
+    let owner = if on { thread_measurement_key() } else { 0 };
+    ORMQR_STAGE_PROFILE_OWNER.swap(owner, LuOrdering::Relaxed) != 0
 }
 
 /// Read and reset direct compact-WY ORMQR stages:
@@ -40004,6 +40053,43 @@ pub fn ormqr_stage_take_ns() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         ORMQR_SUBTRACT_NS.swap(0, LuOrdering::Relaxed),
         ORMQR_TOTAL_NS.swap(0, LuOrdering::Relaxed),
     )
+}
+
+/// Enable or disable the candidate parallel direct-update pass in ORMQR. Default OFF: this is a
+/// measured scheduling arm, not production policy. Each row block owns disjoint `C` elements, so
+/// every subtraction remains the same one-operation update as the serial loop.
+#[doc(hidden)]
+pub fn set_ormqr_subtract_parallel(on: bool) -> bool {
+    ORMQR_SUBTRACT_PARALLEL.swap(on, LuOrdering::Relaxed)
+}
+
+/// Drain the number of ORMQR direct-update calls that took the candidate parallel arm.
+#[doc(hidden)]
+pub fn ormqr_subtract_parallel_hits_take() -> u64 {
+    ORMQR_SUBTRACT_PARALLEL_HITS.swap(0, LuOrdering::Relaxed)
+}
+
+fn ormqr_subtract_update(c: &mut [f64], upd: &[f64], rows: usize, cols: usize) {
+    debug_assert_eq!(c.len(), rows * cols);
+    debug_assert_eq!(upd.len(), rows * cols);
+    let parallel = ORMQR_SUBTRACT_PARALLEL.load(LuOrdering::Relaxed)
+        && rayon::current_num_threads() > 1
+        && rows.saturating_mul(cols) >= ORMQR_SUBTRACT_PARALLEL_MIN_AREA;
+    if parallel {
+        let row_block = rows.div_ceil(rayon::current_num_threads().max(1)).max(1);
+        ORMQR_SUBTRACT_PARALLEL_HITS.fetch_add(1, LuOrdering::Relaxed);
+        c.par_chunks_mut(row_block * cols)
+            .zip(upd.par_chunks(row_block * cols))
+            .for_each(|(dst, delta)| {
+                for (dst, delta) in dst.iter_mut().zip(delta) {
+                    *dst -= *delta;
+                }
+            });
+    } else {
+        for (dst, delta) in c.iter_mut().zip(upd) {
+            *dst -= *delta;
+        }
+    }
 }
 
 /// Compute the QR decomposition of an (m x n) matrix via Householder reflections.
@@ -41682,7 +41768,13 @@ pub fn ormqr_blocked_f64(
     if k == 0 || m == 0 || cr == 0 || cc == 0 {
         return;
     }
-    let profile = ORMQR_STAGE_PROFILE_ENABLED.load(LuOrdering::Relaxed);
+    // Only the thread that ENABLED profiling records. Every stage timer below hangs off this one
+    // boolean, so this single comparison is the whole of `frankentorch-ebbew`'s fix: a concurrent
+    // test's ORMQR call now reaches no `fetch_add` at all, rather than adding its transpose time
+    // to counters another thread is about to drain.
+    // ONE load: keys are always >= 1, so equality already excludes the disabled sentinel 0, and a
+    // second load could read a different value than the first.
+    let profile = ORMQR_STAGE_PROFILE_OWNER.load(LuOrdering::Relaxed) == thread_measurement_key();
     let total_started = profile.then(std::time::Instant::now);
     let panel_started = profile.then(std::time::Instant::now);
     let panels = householder_panels_from_packed_f64(packed, tau, m, n, k, 32);
@@ -41704,24 +41796,24 @@ pub fn ormqr_blocked_f64(
     for (nb, vmat, tmat) in ordered {
         let nb = *nb;
         // Tᵀ when applying the reverse product.
-        let transpose_started = profile.then(std::time::Instant::now);
         let tx_owned = if transpose {
+            let transpose_started = profile.then(std::time::Instant::now);
             let mut tt = vec![0.0f64; nb * nb];
             for i in 0..nb {
                 for j in 0..nb {
                     tt[i * nb + j] = tmat[j * nb + i];
                 }
             }
+            if let Some(started) = transpose_started {
+                ORMQR_T_TRANSPOSE_NS.fetch_add(
+                    started.elapsed().as_nanos() as u64,
+                    LuOrdering::Relaxed,
+                );
+            }
             Some(tt)
         } else {
             None
         };
-        if let Some(started) = transpose_started {
-            ORMQR_T_TRANSPOSE_NS.fetch_add(
-                started.elapsed().as_nanos() as u64,
-                LuOrdering::Relaxed,
-            );
-        }
         let tx: &[f64] = tx_owned.as_deref().unwrap_or(tmat.as_slice());
 
         if left {
@@ -41766,9 +41858,7 @@ pub fn ormqr_blocked_f64(
                 ORMQR_V_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let subtract_started = profile.then(std::time::Instant::now);
-            for t in 0..m * cc {
-                c[t] -= upd[t];
-            }
+            ormqr_subtract_update(c, &upd, m, cc);
             if let Some(started) = subtract_started {
                 ORMQR_SUBTRACT_NS.fetch_add(
                     started.elapsed().as_nanos() as u64,
@@ -41817,9 +41907,7 @@ pub fn ormqr_blocked_f64(
                 ORMQR_V_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let subtract_started = profile.then(std::time::Instant::now);
-            for t in 0..cr * m {
-                c[t] -= upd[t];
-            }
+            ormqr_subtract_update(c, &upd, cr, m);
             if let Some(started) = subtract_started {
                 ORMQR_SUBTRACT_NS.fetch_add(
                     started.elapsed().as_nanos() as u64,
@@ -49481,11 +49569,147 @@ mod tests {
         }
     }
 
+    /// The candidate ORMQR direct-update schedule partitions only independent row ranges.  It
+    /// must therefore preserve every `f64` bit for both sides and both reflector orders; unlike a
+    /// GEMM K-split, it never changes an accumulation.
+    #[test]
+    fn ormqr_parallel_direct_update_matches_serial_all_four_cases_bit_exact() {
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 128;
+        let a: Vec<f64> = (0..M * N)
+            .map(|idx| {
+                let i = (idx / N) as f64;
+                let j = (idx % N) as f64;
+                (i * 0.23).sin() + (j * 0.19).cos() + if idx % (N + 1) == 0 { 3.0 } else { 0.0 }
+            })
+            .collect();
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+
+        let previous = super::set_ormqr_subtract_parallel(false);
+        let _ = super::ormqr_subtract_parallel_hits_take();
+        for &transpose in &[false, true] {
+            for &left in &[false, true] {
+                let (cr, cc) = if left { (M, W) } else { (W, M) };
+                let initial: Vec<f64> = (0..cr * cc)
+                    .map(|idx| ((idx as f64) * 0.037).sin() - 0.25)
+                    .collect();
+                let mut serial = initial.clone();
+                super::ormqr_blocked_f64(
+                    &packed, &tau, M, N, N, &mut serial, cr, cc, left, transpose,
+                );
+                super::set_ormqr_subtract_parallel(true);
+                let mut parallel = initial;
+                super::ormqr_blocked_f64(
+                    &packed, &tau, M, N, N, &mut parallel, cr, cc, left, transpose,
+                );
+                super::set_ormqr_subtract_parallel(false);
+                for (idx, (serial, parallel)) in serial.iter().zip(&parallel).enumerate() {
+                    assert_eq!(
+                        serial.to_bits(),
+                        parallel.to_bits(),
+                        "ORMQR direct update differed at left={left}, transpose={transpose}, index={idx}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            super::ormqr_subtract_parallel_hits_take(),
+            4,
+            "every candidate all-four-case invocation must reach the parallel update"
+        );
+        super::set_ormqr_subtract_parallel(previous);
+    }
+
+    /// Only one thread at a time may OWN the ORMQR stage profile — `frankentorch-ebbew`.
+    ///
+    /// Scoping the profile to its enabling thread stops a non-profiling test polluting the
+    /// counters, which was the reported defect. It does NOT make two PROFILING threads safe:
+    /// the owner is one atomic, so a second profiling test's `set(..., false)` on the way out
+    /// stores the disabled sentinel and the first test's remaining calls then record nothing.
+    /// That failure mode is loud rather than silent — counts read 0, and both tests assert their
+    /// own stages are non-zero — but it is still a race, and it is one this test file created by
+    /// having two profiling tests at all.
+    ///
+    /// One mutex, held by both, is the whole fix; it is the same idiom as
+    /// `CONV2D_DWEIGHT_STREAM_TEST_GUARD`. Any future test that enables this profile must take it.
+    static ORMQR_PROFILE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// ORMQR profiling must be owned by the thread that enabled it — `frankentorch-ebbew`.
+    ///
+    /// WHAT THIS PINS, AND WHY THE NEIGHBOURING TEST COULD NOT. The stage counters are
+    /// process-global and `cargo test` runs tests in parallel threads of one process, so while
+    /// `ormqr_stage_profile_covers_direct_compact_wy_apply` had profiling on, any other test
+    /// calling `ormqr_blocked_f64` recorded into the same counters. Its
+    /// `assert_eq!(transpose, 0)` — the assertion that the left non-transpose path never
+    /// materialises `T^T` — then read somebody else's transposing call:
+    ///
+    ///     assertion `left == right` failed: left non-transpose must not materialize T^T
+    ///       left: 40   right: 0
+    ///
+    /// That was green 3/3 on a 16-thread worker and red 2/2 on a 64-thread one, i.e. it depended
+    /// on how many other tests fit inside the window. This test does not depend on that: it
+    /// creates the interference ON PURPOSE and joins it before draining, so every foreign call is
+    /// guaranteed to have happened while profiling was enabled. Before the fix it fails every
+    /// time; after it, the foreign thread reaches no counter at all.
+    #[test]
+    fn ormqr_stage_profile_ignores_other_threads_calls() {
+        let _guard = ORMQR_PROFILE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        const M: usize = 160;
+        const N: usize = 32;
+        const W: usize = 24;
+        let a: Vec<f64> = (0..M * N)
+            .map(|i| ((i as f64) * 0.031).sin() + if i % (N + 1) == 0 { 3.0 } else { 0.0 })
+            .collect();
+        let (packed, tau) = super::geqrf_blocked_f64(&a, M, N);
+
+        let previous = super::set_ormqr_stage_profile_enabled(true);
+        let _ = super::ormqr_stage_take_ns();
+
+        // A FOREIGN THREAD doing the one thing this profile must never attribute to us: a
+        // TRANSPOSING apply, which is the only route that materialises T^T. Spawned after the
+        // enable and joined before the drain, so its calls are inside the window by construction
+        // rather than by luck.
+        let foreign = std::thread::spawn({
+            let packed = packed.clone();
+            let tau = tau.clone();
+            move || {
+                for round in 0..8 {
+                    let mut d: Vec<f64> =
+                        (0..M * W).map(|i| ((i as f64 + round as f64) * 0.017).sin()).collect();
+                    super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut d, M, W, true, true);
+                }
+            }
+        });
+        foreign.join().expect("the foreign ORMQR thread must not panic");
+
+        let mut c: Vec<f64> = (0..M * W).map(|i| ((i as f64) * 0.019).cos()).collect();
+        super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut c, M, W, true, false);
+        let (panel, transpose, _workspace, vt_c, _t_w, _v_w, _subtract, _total) =
+            super::ormqr_stage_take_ns();
+        super::set_ormqr_stage_profile_enabled(previous);
+
+        assert_eq!(
+            transpose, 0,
+            "a transposing ORMQR on another thread was attributed to this thread's profile"
+        );
+        // And the profile is still LIVE on this thread — a fix that simply stopped recording
+        // would pass the assertion above while destroying the instrument.
+        assert!(panel > 0, "own panel build was not profiled");
+        assert!(vt_c > 0, "own V^T C GEMM was not profiled");
+    }
+
     /// The ORMQR profiler must follow the direct compact-WY apply, not QR's reverse-Q profiler:
     /// a left application has a panel build, three GEMMs, workspace allocation, subtraction, and
     /// a total that encloses them. This is a mechanism sentinel, not a timing assertion.
     #[test]
     fn ormqr_stage_profile_covers_direct_compact_wy_apply() {
+        // Both profiling tests hold this; see ORMQR_PROFILE_TEST_GUARD.
+        let _guard = ORMQR_PROFILE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         const M: usize = 160;
         const N: usize = 32;
         const W: usize = 24;
