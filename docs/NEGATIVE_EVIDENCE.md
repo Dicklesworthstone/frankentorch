@@ -41912,3 +41912,46 @@ nowhere except at the gate.
 Default stays 32. The knob and the `FT_QRNB` lane arm ship anyway so the next attempt starts from
 the instrument rather than rebuilding it — and per torch:4's brief only geqrf's literal is
 parameterised; the QR wrapper, orgqr and ormqr keep their own independent 32s.
+
+### 293. WHEN CAN AN ISOLATION SWEEP BE TRUSTED? TWO CONDITIONS, BOTH VIOLATED BY MY OWN SWEEPS
+
+`frankentorch-stale-tuning-constants-lzku6`, answering why geqrf b=64 won 12/12 kernel cells and
+lost the lane by 8% (292i) while cholesky (292d) and getrf (292e) carried.
+
+**The lane was not the problem. My harness was.** Two defects, both visible in the sweep's own
+output before any new measurement was taken:
+
+1. **BLOCK ORDERING.** All three sweeps run `for b { for rep }`, so the incumbent is measured FIRST
+   in every pass and drift over the pass is confounded with the candidate. The lane harness
+   interleaves arms within each round and takes per-round paired ratios, which cancels exactly that.
+2. **EFFECT SMALLER THAN NOISE.** The incumbent cell varied 1.34-1.47x ACROSS passes at every size
+   while the measured effect was 1.17-1.24x — effect/noise 0.36, 0.52, 0.72, all below 1. The lane's
+   incumbent spread was 1.130x.
+
+Re-run interleaved, same shapes and widths, order reversed on odd reps:
+
+    n=256  pass1  paired 1.0059  marginal 0.9177  sign 11/21  within-run spread 1.795x  DISAGREE
+           pass2  paired 0.9672  marginal 0.9582  sign  9/21  within-run spread 1.592x
+    n=512  pass1  paired 1.0956  marginal 1.1311  sign 21/21  within-run spread 1.339x
+           pass2  paired 1.0154  marginal 1.0741  sign 13/21  within-run spread 1.802x  DISAGREE
+
+**At n=256 interleaved isolation says b=64 is NOT a win** (sign tests 11/21 and 9/21 — coin flips),
+landing beside the LANE's 0.92x rather than the block sweep's 1.17x. The lane was right.
+
+**THE SHARPEST NUMBER IS THE INCUMBENT'S WITHIN-RUN SPREAD: 1.59-1.80x at n=256.** A measurement
+whose baseline moves 1.8x cannot resolve a 1.1x effect in ANY harness, however many passes are
+averaged. n=256 was "the cell with the most to gain" and therefore the cell I certified at — and it
+is the worst place on the curve to trust a sweep.
+
+**THE RULE, worth more than the lane it came from. An isolation sweep is trustworthy only when:**
+  (a) arms are INTERLEAVED per rep with alternating order — block ordering confounds drift with the
+      candidate, and every sweep in this repo written as `for candidate { for rep }` has this;
+  (b) the effect EXCEEDS the incumbent's WITHIN-RUN spread, which must be measured and printed, not
+      assumed;
+  (c) the SIGN TEST supports it — 9-13 of 21 is a coin flip whatever the median says;
+  (d) both estimators agree, since paired and marginal disagreeing is itself the finding.
+
+Cholesky's and getrf's sweeps share defect (a). **Their LANE CERTIFICATIONS are what make those
+levers trustworthy, not their sweeps** — the sweep numbers were likely inflated the same way and
+merely had enough margin to survive. That is the strongest possible argument for the arc's ordering:
+the gate is not a formality on top of a good sweep, it is the only step that was ever sound.
