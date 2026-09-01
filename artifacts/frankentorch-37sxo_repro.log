@@ -1,0 +1,214 @@
+  [2m2026-09-01T04:46:41.000092Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:46:50.902569Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at ubuntu@178.104.77.29 (0 slots remaining after reservation, speed 75.2)[0m
+    [2;3mat[0m rch/src/hook.rs:2529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:46:51.052691Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: 6af39a5d52b744e4)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:471 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:46:51.052725Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:493 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:46:53.776553Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:598 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:47:04.668440Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 104581120 bytes in 10096ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:874 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:47:04.863982Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo build --release -j2 -p frankentorch-api --example bidiag_gate_sweep_h2h[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:934 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:47:04.864025Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/ft-37sxo-inv256-aa75ad12 -> /data/tmp/rch/frankentorch/6af39a5d52b744e4/.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af[0m
+    [2;3mat[0m rch/src/transfer.rs:1610 [2;3mon[0m ThreadId(1)
+
+    Updating git repository `https://github.com/Dicklesworthstone/rust-block`
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bytemuck v1.25.2
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded anstyle v1.0.14
+  Downloaded cast v0.3.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded anes v0.1.6
+  Downloaded cfg-if v1.0.4
+  Downloaded oorandom v11.1.5
+  Downloaded autocfg v1.5.0
+  Downloaded ciborium v0.2.2
+  Downloaded num-traits v0.2.19
+  Downloaded ciborium-ll v0.2.2
+  Downloaded tinytemplate v1.2.1
+  Downloaded same-file v1.0.6
+  Downloaded ciborium-io v0.2.2
+  Downloaded clap_lex v1.1.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded half v2.7.1
+  Downloaded is-terminal v0.4.17
+  Downloaded plotters-svg v0.3.7
+  Downloaded rawpointer v0.2.1
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded plotters-backend v0.3.7
+  Downloaded walkdir v2.5.0
+  Downloaded zmij v1.0.21
+  Downloaded criterion-plot v0.5.0
+  Downloaded itoa v1.0.18
+  Downloaded num-complex v0.4.6
+  Downloaded quote v1.0.45
+  Downloaded either v1.15.0
+  Downloaded once_cell v1.21.4
+  Downloaded clap v4.6.1
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded proc-macro2 v1.0.106
+  Downloaded serde_derive v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded matrixmultiply v0.3.11
+  Downloaded memchr v2.8.0
+  Downloaded rayon-core v1.13.0
+  Downloaded serde_core v1.0.229
+  Downloaded safe_arch v1.1.0
+  Downloaded serde v1.0.229
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded plotters v0.3.7
+  Downloaded criterion v0.5.1
+  Downloaded itertools v0.10.5
+  Downloaded rayon v1.12.0
+  Downloaded regex v1.12.3
+  Downloaded serde_json v1.0.151
+  Downloaded syn v2.0.117
+  Downloaded wide v1.6.0
+  Downloaded clap_builder v4.6.0
+  Downloaded libm v0.2.16
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v3.0.3
+  Downloaded regex-syntax v0.8.10
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling syn v2.0.117
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling serde_core v1.0.229
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling num-complex v0.4.6
+   Compiling matrixmultiply v0.3.11
+   Compiling libm v0.2.16
+   Compiling safe_arch v1.1.0
+   Compiling rayon v1.12.0
+   Compiling half v2.7.1
+   Compiling frankentorch-core v0.1.0 (/data/tmp/rch/frankentorch/6af39a5d52b744e4/crates/ft-core)
+   Compiling syn v3.0.3
+   Compiling serde v1.0.229
+   Compiling rawpointer v0.2.1
+   Compiling zmij v1.0.21
+   Compiling serde_derive v1.0.229
+   Compiling wide v1.6.0
+   Compiling serde_json v1.0.151
+   Compiling libc v0.2.185
+   Compiling frankentorch-kernel-cpu v0.1.1 (/data/tmp/rch/frankentorch/6af39a5d52b744e4/crates/ft-kernel-cpu)
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:8767:3
+     |
+8767 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:9797:3
+     |
+9797 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+   Compiling ciborium-io v0.2.2
+   Compiling clap_lex v1.1.0
+   Compiling regex-syntax v0.8.10
+warning: function `eigh_tred2_values_only_full_lower` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:31062:4
+      |
+31062 | fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling plotters-backend v0.3.7
+   Compiling itoa v1.0.18
+   Compiling anstyle v1.0.14
+   Compiling memchr v2.8.0
+   Compiling frankentorch-dispatch v0.1.0 (/data/tmp/rch/frankentorch/6af39a5d52b744e4/crates/ft-dispatch)
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling regex-automata v0.4.14
+   Compiling ciborium-ll v0.2.2
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling is-terminal v0.4.17
+   Compiling ciborium v0.2.2
+   Compiling regex v1.12.3
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling frankentorch-autograd v0.1.0 (/data/tmp/rch/frankentorch/6af39a5d52b744e4/crates/ft-autograd)
+   Compiling tinytemplate v1.2.1
+   Compiling frankentorch-runtime v0.1.0 (/data/tmp/rch/frankentorch/6af39a5d52b744e4/crates/ft-runtime)
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling once_cell v1.21.4
+   Compiling criterion v0.5.1
+   Compiling frankentorch-api v0.1.0 (/data/tmp/rch/frankentorch/6af39a5d52b744e4/crates/ft-api)
+warning: `frankentorch-kernel-cpu` (lib) generated 3 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 4m 01s
+  [2m2026-09-01T04:51:07.853968Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 242989ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:51:07.943235Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/tmp/rch/frankentorch/6af39a5d52b744e4/.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:51:10.606148Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2662ms (8 files, 21299 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:51:10.606168Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 8 files, 21299 bytes in 2662ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1299 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (261.4s)
+[RCH] clean-overlay receipt: base=aa75ad128631e55e9271aadce4c52cb7c0434b72 overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195
+REFUSING TO MEASURE: loadavg 5.30 / 117.79 / 223.70 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: 1-minute loadavg 117.47 exceeds 35.
+REFUSING TO MEASURE: iowait 17.3% exceeds 10% — host is disk-bound.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+guard PASS: no peer measurement detected, loadavg 10.70/9.78/22.50 (spread <= 4x), iowait 0.5% <= 10%
+measurement=Inv; estimator=min over 64 rounds, every arm AND the incumbent sampled once per round, arm order reversed on odd rounds, first round discarded; every ratio is the median of the PAIRED per-round ratio
+elf_sha256=e1ddc894908e8d81669ae213289f0df9e89b8248147ac89116c1d818606653cc
+rayon_threads=8 warmup=64 (both arms)  default_gate=262144
+fixture=_mk DEFAULT: 3*I + low-rank; 495/512 singular values EQUAL at n=512 — QR sweep is invisible on it (FT_FIXTURE=generic selects the generic-spectrum matrix)
+arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): ["262144/gate-hoisted/4row/fused/formP-blocked/4output/replay-T/ggs1/subPAR/subCOL/panelmode0/nbSHIPPED/luSHIPPED/qrSHIPPED/colsAUTO/ppmSHIPPED/tpm0/tnbSHIPPED/tsbSHIPPED/btpSERIAL/btSHIPPED/panelSHIPPED/RSHIPPED/tbSHIPPED/TSHIPPED", "262144/gate-hoisted/4row/fused/formP-blocked/4output/replay-T/ggs1/subPAR/subCOL/panelmode0/nbSHIPPED/luSHIPPED/qrSHIPPED/colsAUTO/ppmSHIPPED/tpm0/tnbSHIPPED/tsbSHIPPED/btpSERIAL/btSHIPPED/panelSHIPPED/RSHIPPED/tbSHIPPED/TSHIPPED"]
+null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's noise, and no effect below that is readable
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+incumbent=PyTorch 2.12.1+cpu (self-reported, same invocation)
+incumbent threads=8 (self-reported)
+LU phases (arm0, one instrumented call): panel 0.382 ms 42%  solve 0.258 ms 28%  trailing 0.230 ms 25%  pivot 0.033 ms 4%  swap 0.006 ms 1%
+
+n=256  PT min 0.782 ms  median 0.970 ms  spread 2.09x  load 10.41->10.41  MHz 3433/3424  iowait 0 jiffies
+  arm=262144/gate-hoisted/4row/fused/formP-blocked/4output/replay-T/ggs1/subPAR/subCOL/panelmode0/nbSHIPPED/luSHIPPED/qrSHIPPED/colsAUTO/ppmSHIPPED/tpm0/tnbSHIPPED/tsbSHIPPED/btpSERIAL/btSHIPPED/panelSHIPPED/RSHIPPED/tbSHIPPED/TSHIPPED min    2.130 ms  median    3.289 ms  PT-beside-it min    0.862 ms  paired-vs-PT FT 3.261x SLOWER  paired-vs-arm0 1.000x  branches (0, 0, 0)  dgemm_sub(2d,col) (0, 21)  parity rel 4.18e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%
+  arm=262144/gate-hoisted/4row/fused/formP-blocked/4output/replay-T/ggs1/subPAR/subCOL/panelmode0/nbSHIPPED/luSHIPPED/qrSHIPPED/colsAUTO/ppmSHIPPED/tpm0/tnbSHIPPED/tsbSHIPPED/btpSERIAL/btSHIPPED/panelSHIPPED/RSHIPPED/tbSHIPPED/TSHIPPED min    2.123 ms  median    3.204 ms  PT-beside-it min    0.782 ms  paired-vs-PT FT 3.339x SLOWER  paired-vs-arm0 1.003x  branches (0, 0, 0)  dgemm_sub(2d,col) (0, 21)  parity rel 4.18e-12 MATCH
+                     phases (ours only, median of 3 instrumented calls): reduction 0.000 ms 0%  form_p/q 0.000 ms 0%  QR sweep 0.000 ms 0%

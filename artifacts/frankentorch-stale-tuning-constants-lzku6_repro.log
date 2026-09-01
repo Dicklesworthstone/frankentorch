@@ -1,0 +1,306 @@
+  [2m2026-09-01T04:43:21.856684Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:27.130636Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at ubuntu@178.104.77.29 (0 slots remaining after reservation, speed 75.2)[0m
+    [2;3mat[0m rch/src/hook.rs:2529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:27.354539Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: f3c0834ccf057a97)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:471 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:27.354573Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:493 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:30.063309Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:598 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:41.474621Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 104652800 bytes in 9907ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:874 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:41.576549Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo build --release -j2 -p frankentorch-kernel-cpu --example dgemm_bt_sub_tile_cholesky_sweep[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:934 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:43:41.576611Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/ft-lzku6-bt-tile-3ebbd4d1ea171b8f7994e9fa4e7df7596fa0c794 -> /data/tmp/rch/frankentorch/f3c0834ccf057a97/.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af[0m
+    [2;3mat[0m rch/src/transfer.rs:1610 [2;3mon[0m ThreadId(1)
+
+    Updating git repository `https://github.com/Dicklesworthstone/rust-block`
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded anes v0.1.6
+  Downloaded autocfg v1.5.0
+  Downloaded bit-vec v0.8.0
+  Downloaded bitflags v2.11.1
+  Downloaded anstyle v1.0.14
+  Downloaded either v1.15.0
+  Downloaded bytemuck v1.25.2
+  Downloaded itertools v0.10.5
+  Downloaded aho-corasick v1.1.4
+  Downloaded half v2.7.1
+  Downloaded is-terminal v0.4.17
+  Downloaded insta v1.48.0
+  Downloaded oorandom v11.1.5
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded errno v0.3.14
+  Downloaded matrixmultiply v0.3.11
+  Downloaded plotters-svg v0.3.7
+  Downloaded rand_xorshift v0.4.0
+  Downloaded walkdir v2.5.0
+  Downloaded fastrand v2.4.1
+  Downloaded num-complex v0.4.6
+  Downloaded quick-error v1.2.3
+  Downloaded serde v1.0.229
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded ciborium-io v0.2.2
+  Downloaded fnv v1.0.7
+  Downloaded getrandom v0.3.4
+  Downloaded getrandom v0.4.2
+  Downloaded num-traits v0.2.19
+  Downloaded plotters-backend v0.3.7
+  Downloaded ciborium-ll v0.2.2
+  Downloaded criterion v0.5.1
+  Downloaded tempfile v3.27.0
+  Downloaded tinytemplate v1.2.1
+  Downloaded wait-timeout v0.2.1
+  Downloaded clap_lex v1.1.0
+  Downloaded rawpointer v0.2.1
+  Downloaded rusty-fork v0.3.1
+  Downloaded same-file v1.0.6
+  Downloaded unarray v0.1.4
+  Downloaded cfg-if v1.0.4
+  Downloaded proc-macro2 v1.0.106
+  Downloaded cast v0.3.0
+  Downloaded criterion-plot v0.5.0
+  Downloaded itoa v1.0.18
+  Downloaded rand_core v0.9.5
+  Downloaded quote v1.0.45
+  Downloaded rand_chacha v0.9.0
+  Downloaded clap v4.6.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded ciborium v0.2.2
+  Downloaded console v0.16.3
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded once_cell v1.21.4
+  Downloaded similar v2.7.0
+  Downloaded zmij v1.0.21
+  Downloaded rayon-core v1.13.0
+  Downloaded serde_core v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde_derive v1.0.229
+  Downloaded memchr v2.8.0
+  Downloaded clap_builder v4.6.0
+  Downloaded safe_arch v1.1.0
+  Downloaded rand v0.9.4
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded rayon v1.12.0
+  Downloaded regex v1.12.3
+  Downloaded proptest v1.11.0
+  Downloaded serde_json v1.0.151
+  Downloaded libm v0.2.16
+  Downloaded plotters v0.3.7
+  Downloaded syn v3.0.3
+  Downloaded wide v1.6.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling libc v0.2.185
+   Compiling cfg-if v1.0.4
+   Compiling syn v2.0.117
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.229
+   Compiling getrandom v0.3.4
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.2
+   Compiling rustix v1.1.4
+   Compiling getrandom v0.4.2
+   Compiling crossbeam-epoch v0.9.18
+   Compiling syn v3.0.3
+   Compiling half v2.7.1
+   Compiling rayon-core v1.13.0
+   Compiling bitflags v2.11.1
+   Compiling serde v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling either v1.15.0
+   Compiling zmij v1.0.21
+   Compiling linux-raw-sys v0.12.1
+   Compiling serde_derive v1.0.229
+   Compiling rand_core v0.9.5
+   Compiling crossbeam-deque v0.8.6
+   Compiling serde_json v1.0.151
+   Compiling fastrand v2.4.1
+   Compiling regex-syntax v0.8.10
+   Compiling tempfile v3.27.0
+   Compiling matrixmultiply v0.3.11
+   Compiling anstyle v1.0.14
+   Compiling itoa v1.0.18
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.0
+   Compiling ciborium-io v0.2.2
+   Compiling memchr v2.8.0
+   Compiling libm v0.2.16
+   Compiling ciborium-ll v0.2.2
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling rayon v1.12.0
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling safe_arch v1.1.0
+   Compiling num-complex v0.4.6
+   Compiling wait-timeout v0.2.1
+   Compiling cast v0.3.0
+   Compiling quick-error v1.2.3
+   Compiling rawpointer v0.2.1
+   Compiling fnv v1.0.7
+   Compiling bit-vec v0.8.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling bit-set v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling criterion-plot v0.5.0
+   Compiling frankentorch-core v0.1.0 (/data/tmp/rch/frankentorch/f3c0834ccf057a97/crates/ft-core)
+   Compiling wide v1.6.0
+   Compiling rand_chacha v0.9.0
+   Compiling regex v1.12.3
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling tinytemplate v1.2.1
+   Compiling ciborium v0.2.2
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling console v0.16.3
+   Compiling is-terminal v0.4.17
+   Compiling similar v2.7.0
+   Compiling oorandom v11.1.5
+   Compiling unarray v0.1.4
+   Compiling anes v0.1.6
+   Compiling criterion v0.5.1
+   Compiling insta v1.48.0
+   Compiling proptest v1.11.0
+   Compiling frankentorch-kernel-cpu v0.1.1 (/data/tmp/rch/frankentorch/f3c0834ccf057a97/crates/ft-kernel-cpu)
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:8819:3
+     |
+8819 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:9867:3
+     |
+9867 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+warning: function `eigh_tred2_values_only_full_lower` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:31162:4
+      |
+31162 | fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `frankentorch-kernel-cpu` (lib) generated 3 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 2m 07s
+  [2m2026-09-01T04:45:50.554229Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 128977ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:45:50.824560Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/tmp/rch/frankentorch/f3c0834ccf057a97/.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:45:53.366202Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2541ms (8 files, 9101 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T04:45:53.366222Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 8 files, 9101 bytes in 2541ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1299 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (148.1s)
+[RCH] clean-overlay receipt: base=3ebbd4d1ea171b8f7994e9fa4e7df7596fa0c794 overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195
+REFUSING TO MEASURE: loadavg 5.30 / 117.79 / 223.70 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 12.57 / 82.80 / 177.25 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+PROV host=thinkstation1 nproc=64 rayon=16 reps=6 loadavg=11.80,82.80,177.25
+METHOD (dgemm_bt_sub_into 2-D tile in blocked f64 Cholesky): arms INTERLEAVED within every rep, order REVERSED on odd reps, per-rep min of 2, PAIRED = median of per-rep ratios. Ledger 293 — a block-ordered sweep confounds drift with the candidate, and that is how geqrf b=64 won 12/12 cells and lost its lane 8%.
+GATE: a cell is TRUSTED only if (b) the effect exceeds the incumbent's within-run spread, (c) the exact two-sided sign test clears p<0.05 — which at 6 reps means at least 6 of 6 in one direction — and (d) the two estimators agree within 0.05. Anything else prints UNRESOLVED with the arithmetic that failed.
+CONTROLS: every table carries an A/A arm (the incumbent, duplicated) and, where the candidate grid contains the shipped width, a `*` arm running that width through the KNOB against the incumbent's unset path. Both should read ~1.0x on a coin-flip sign test; how far they miss is this harness's own floor on the day, and no candidate row means more than that floor allows.
+READING: a TRUSTED WIN here is NECESSARY AND NOT SUFFICIENT — ledger 291 has a bit-exact 1.28-1.40x isolation win that moved no lane, and 292i has one that inverted. Ship only after an all-cells win AND a paired lane certification. Blocking changes are NOT bit-exact (they reassociate): gate on reconstruction and the oracle, never to_bits().
+INCUMBENT: dgemm_bt_sub_into column split, tile toggle OFF (the shipped default). \
+         CANDIDATE: same dgemm_mm calls with K whole, partitioned only into disjoint M/N tiles.
+SENTINEL: each fastest sample prints the dgemm_bt_sub_into tile/column split. A candidate \
+         with zero tile hits aborts; any residual column calls remain visible rather than being \
+         silently counted as candidate work.
+
+n=256  incumbent WITHIN-RUN spread 1.1988-1.4999 ms = 1.251x (IQR 1.145x)
+                  arm    median     panel      TRSM     trail      zero    tile  column   admit    PAIRED    MARGIN     SIGN        p  VERDICT
+    shipped(tile=OFF)    1.3698    0.4083    0.2776    0.3866    0.0565       0       3      0%         -         -        -        -  incumbent
+       bt-2d(tile=ON)    1.1506    0.4055    0.2772    0.2703    0.0573       2       1     67%    1.1304    1.1905      6/6   0.0312  UNRESOLVED: effect 0.1304 <= incumbent spread 0.2512; estimators disagree by 0.0601
+        A/A(tile=OFF)    1.3050    0.4077    0.2788    0.3594    0.0542       0       3      0%    1.0149    1.0497      5/6   0.2188  UNRESOLVED: effect 0.0149 <= incumbent spread 0.2512; sign test p=0.2188
+
+n=512  incumbent WITHIN-RUN spread 4.3030-5.1695 ms = 1.201x (IQR 1.049x)
+                  arm    median     panel      TRSM     trail      zero    tile  column   admit    PAIRED    MARGIN     SIGN        p  VERDICT
+    shipped(tile=OFF)    4.6973    0.8127    0.7497    2.2296    0.2215       0       7      0%         -         -        -        -  incumbent
+       bt-2d(tile=ON)    3.8758    0.8948    0.7643    1.4231    0.1972       6       1     86%    1.2109    1.2120      6/6   0.0312  TRUSTED WIN
+        A/A(tile=OFF)    4.6802    0.8206    0.7775    2.2068    0.2233       0       7      0%    1.0013    1.0037      4/6   0.6875  UNRESOLVED: effect 0.0013 <= incumbent spread 0.2014; sign test p=0.6875
+
+n=1024  incumbent WITHIN-RUN spread 10.8934-15.8183 ms = 1.452x (IQR 1.197x)
+                  arm    median     panel      TRSM     trail      zero    tile  column   admit    PAIRED    MARGIN     SIGN        p  VERDICT
+    shipped(tile=OFF)   13.6642    1.6404    2.0542    5.9266    0.5146       0      15      0%         -         -        -        -  incumbent
+       bt-2d(tile=ON)   11.0714    1.7604    1.9135    4.8849    0.5126      14       1     93%    1.1539    1.2342      6/6   0.0312  UNRESOLVED: effect 0.1539 <= incumbent spread 0.4521; estimators disagree by 0.0803
+        A/A(tile=OFF)   13.3631    1.6437    1.9505    6.0738    0.4654       0      15      0%    1.0245    1.0225      4/6   0.6875  UNRESOLVED: effect 0.0245 <= incumbent spread 0.4521; sign test p=0.6875
+
+READING: a trusted isolation win is necessary, not sufficient. This arm stays DEFAULT \
+         OFF unless it also survives the paired live-PyTorch Cholesky lane with valid dual nulls.
+REFUSING TO MEASURE: 1-minute loadavg 44.56 exceeds 35.
+REFUSING TO MEASURE: loadavg 44.56 / 118.25 / 283.72 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+REFUSING TO MEASURE: loadavg 21.75 / 93.54 / 261.36 spread exceeds 4x — the host is still settling, quiet is not stable.
+Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT)
+guard PASS: no peer measurement detected, loadavg 11.92/10.03/22.78 (spread <= 4x), iowait 0.2% <= 10%
+PROV host=thinkstation1 nproc=64 rayon=16 reps=6 loadavg=11.92,10.03,22.78
+METHOD (dgemm_bt_sub_into 2-D tile in blocked f64 Cholesky): arms INTERLEAVED within every rep, order REVERSED on odd reps, per-rep min of 2, PAIRED = median of per-rep ratios. Ledger 293 — a block-ordered sweep confounds drift with the candidate, and that is how geqrf b=64 won 12/12 cells and lost its lane 8%.
+GATE: a cell is TRUSTED only if (b) the effect exceeds the incumbent's within-run spread, (c) the exact two-sided sign test clears p<0.05 — which at 6 reps means at least 6 of 6 in one direction — and (d) the two estimators agree within 0.05. Anything else prints UNRESOLVED with the arithmetic that failed.
+CONTROLS: every table carries an A/A arm (the incumbent, duplicated) and, where the candidate grid contains the shipped width, a `*` arm running that width through the KNOB against the incumbent's unset path. Both should read ~1.0x on a coin-flip sign test; how far they miss is this harness's own floor on the day, and no candidate row means more than that floor allows.
+READING: a TRUSTED WIN here is NECESSARY AND NOT SUFFICIENT — ledger 291 has a bit-exact 1.28-1.40x isolation win that moved no lane, and 292i has one that inverted. Ship only after an all-cells win AND a paired lane certification. Blocking changes are NOT bit-exact (they reassociate): gate on reconstruction and the oracle, never to_bits().
+INCUMBENT: dgemm_bt_sub_into column split, tile toggle OFF (the shipped default). \
+         CANDIDATE: same dgemm_mm calls with K whole, partitioned only into disjoint M/N tiles.
+SENTINEL: each fastest sample prints the dgemm_bt_sub_into tile/column split. A candidate \
+         with zero tile hits aborts; any residual column calls remain visible rather than being \
+         silently counted as candidate work.
+
+n=256  incumbent WITHIN-RUN spread 1.0858-1.5812 ms = 1.456x (IQR 1.120x)
+                  arm    median     panel      TRSM     trail      zero    tile  column   admit    PAIRED    MARGIN     SIGN        p  VERDICT
+    shipped(tile=OFF)    1.3578    0.4123    0.2673    0.3018    0.0479       0       3      0%         -         -        -        -  incumbent
+       bt-2d(tile=ON)    1.2543    0.5136    0.2776    0.1700    0.0277       2       1     67%    1.0795    1.0825      5/6   0.2188  UNRESOLVED: effect 0.0795 <= incumbent spread 0.4562; sign test p=0.2188
+        A/A(tile=OFF)    1.3757    0.5289    0.3383    0.2490    0.0236       0       3      0%    0.9758    0.9870      1/6   0.2188  UNRESOLVED: effect 0.0242 <= incumbent spread 0.4562; sign test p=0.2188
+
+n=512  incumbent WITHIN-RUN spread 4.0042-5.1259 ms = 1.280x (IQR 1.101x)
+                  arm    median     panel      TRSM     trail      zero    tile  column   admit    PAIRED    MARGIN     SIGN        p  VERDICT
+    shipped(tile=OFF)    4.9965    0.8295    0.7460    1.9219    0.1865       0       7      0%         -         -        -        -  incumbent
+       bt-2d(tile=ON)    3.9149    1.0253    0.7187    1.3397    0.1947       6       1     86%    1.2216    1.2763      6/6   0.0312  UNRESOLVED: effect 0.2216 <= incumbent spread 0.2801; estimators disagree by 0.0547
+        A/A(tile=OFF)    4.3993    1.0585    0.8461    1.9636    0.1857       0       7      0%    1.0306    1.1358      4/6   0.6875  UNRESOLVED: effect 0.0306 <= incumbent spread 0.2801; sign test p=0.6875; estimators disagree by 0.1051
+
+n=1024  incumbent WITHIN-RUN spread 14.4692-19.4848 ms = 1.347x (IQR 1.082x)
+                  arm    median     panel      TRSM     trail      zero    tile  column   admit    PAIRED    MARGIN     SIGN        p  VERDICT
+    shipped(tile=OFF)   18.3577    2.0664    2.3980    7.2779    0.4781       0      15      0%         -         -        -        -  incumbent
+       bt-2d(tile=ON)   13.9173    1.8510    2.2393    4.8785    0.5197      14       1     93%    1.3427    1.3191      6/6   0.0312  UNRESOLVED: effect 0.3427 <= incumbent spread 0.3466
+        A/A(tile=OFF)   17.6876    1.9663    2.5263    9.2899    0.5996       0      15      0%    0.9902    1.0379      3/6   1.0000  UNRESOLVED: effect 0.0098 <= incumbent spread 0.3466; sign test p=1.0000
+
+READING: a trusted isolation win is necessary, not sufficient. This arm stays DEFAULT \
+         OFF unless it also survives the paired live-PyTorch Cholesky lane with valid dual nulls.
