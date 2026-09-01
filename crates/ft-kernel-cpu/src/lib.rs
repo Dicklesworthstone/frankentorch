@@ -12355,6 +12355,7 @@ fn conv2d_backward_height1_ones_dout_f64(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    stage_family_add(&CONV2D_ONES_PATH_HITS, &CONV2D_ONES_PATH_OWNER, 1);
     let patch_width = in_ch * kw;
     let flat = batch * ow;
 
@@ -12603,6 +12604,27 @@ enum ConvOnesRoute {
     ThreeByThreeStride1,
 }
 
+/// Census of the conv2d ALL-ONES fast paths ACTUALLY EXECUTING — `frankentorch-mdsmm`.
+///
+/// Counted at the entry of each all-ones backward, not at the route predicate. Three of the four
+/// callers evaluate `conv2d_ones_dout_route` BEFORE their `dout_is_all_ones` check, so a counter
+/// inside the selector would measure shape ELIGIBILITY and report the fast path on non-uniform
+/// losses that never take it. AGENTS.md's rule is to prove which path EXECUTES; this counts the
+/// path, not the predicate.
+static CONV2D_ONES_PATH_OWNER: AtomicU64 = AtomicU64::new(0);
+static CONV2D_ONES_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Drain the all-ones fast-path execution census.
+///
+/// A lane whose `.sum().backward()` reports a NON-ZERO count here, and zero on a non-uniform loss,
+/// is being scored on a branch training never reaches — which is exactly what
+/// `frankentorch-mdsmm` exists to find.
+#[doc(hidden)]
+pub fn conv2d_ones_path_census_take() -> u64 {
+    stage_family_claim(&CONV2D_ONES_PATH_OWNER);
+    CONV2D_ONES_PATH_HITS.swap(0, LuOrdering::Relaxed)
+}
+
 #[inline]
 fn conv2d_ones_dout_route(
     ph: usize,
@@ -12747,6 +12769,7 @@ fn conv2d_backward_height1_ones_dout_f32(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    stage_family_add(&CONV2D_ONES_PATH_HITS, &CONV2D_ONES_PATH_OWNER, 1);
     let patch_width = in_ch * kw;
     let flat = batch * ow;
 
@@ -12924,6 +12947,7 @@ fn conv2d_backward_3x3_stride1_ones_dout_f32(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    stage_family_add(&CONV2D_ONES_PATH_HITS, &CONV2D_ONES_PATH_OWNER, 1);
     let kh = 3usize;
     let kw = 3usize;
     let patch_width = in_ch * kh * kw;
@@ -13028,6 +13052,7 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
     out_ch: usize,
     has_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    stage_family_add(&CONV2D_ONES_PATH_HITS, &CONV2D_ONES_PATH_OWNER, 1);
     let (dpadded, dweight, dbias) = conv2d_backward_3x3_stride1_ones_dout_masked_f64(
         padded,
         weight_flat,
@@ -13065,6 +13090,7 @@ fn conv2d_backward_3x3_stride1_ones_dout_masked_f64(
     out_ch: usize,
     output_mask: [bool; 3],
 ) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
+    stage_family_add(&CONV2D_ONES_PATH_HITS, &CONV2D_ONES_PATH_OWNER, 1);
     let kh = 3usize;
     let kw = 3usize;
     let patch_width = in_ch * kh * kw;
@@ -50211,6 +50237,11 @@ mod tests {
     /// GEMM K-split, it never changes an accumulation.
     #[test]
     fn ormqr_parallel_direct_update_matches_serial_all_four_cases_bit_exact() {
+        // Drives `set_ormqr_subtract_parallel`, another process-global ORMQR toggle: same guard.
+        let _guard = ORMQR_PROFILE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
         const M: usize = 160;
         const N: usize = 32;
         const W: usize = 128;
@@ -50277,6 +50308,14 @@ mod tests {
     /// records a geqrf lane reading 13.630x against a true 7.002x for precisely that.
     #[test]
     fn ormqr_fused_subtract_matches_materialised_bitwise() {
+        // The fused toggle is PROCESS-GLOBAL, so this test must hold the same guard the other
+        // ORMQR tests do. Without it, flipping the toggle here made
+        // `ormqr_stage_profile_covers_direct_compact_wy_apply` read a zero subtract phase and
+        // `ormqr_parallel_direct_update_...` see 3 of 4 cases take the fused route instead. Same
+        // defect class as frankentorch-vcxf7's second half, introduced by me and caught by the gate.
+        let _guard = ORMQR_PROFILE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         const M: usize = 160;
         const N: usize = 32;
         const W: usize = 24;
