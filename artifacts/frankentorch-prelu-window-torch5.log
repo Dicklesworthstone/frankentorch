@@ -1,0 +1,317 @@
+===== torch:5 PReLU window verification =====
+started=2026-09-01T16:44:38-04:00
+head=18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e
+prior_elf=9ca68bebdcb3101edb7f0afc2939f3c1fc3348be4729aaf4c4153eb3e1cba66b invalid_at_head=1 reason=harness_source_changed
+target_dir=/data/tmp/ft-verify-prelu-window-18c330dcf4db-Ge2jHp
+bank_scratch=/data/tmp/ft-verify-prelu-window-bank-18c330dcf4db-d48FGN.jsonl
+9d7c12036bd31cc9fc4dab361e62629a50951774ce58c37a1c203cd585fa84e6  artifacts/perf/incumbent_bank.jsonl
+9d7c12036bd31cc9fc4dab361e62629a50951774ce58c37a1c203cd585fa84e6  /data/tmp/ft-verify-prelu-window-bank-18c330dcf4db-d48FGN.jsonl
+build_command=RCH_REQUIRE_REMOTE=1 rch exec --no-self-healing --base 18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e --clean-overlay --no-overlay -- cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+  [2m2026-09-01T20:44:38.324606Z[0m [32m INFO[0m [1;32mrch::self_healing[0m[32m: [32mCLI self-healing overrides active, [1;32moverrides[0m[32m: ["--no-self-healing"][0m
+    [2;3mat[0m rch/src/main.rs:2005 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:43.398634Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz4 at ubuntu@194.163.156.231 (6 slots remaining after reservation, speed 76.5)[0m
+    [2;3mat[0m rch/src/hook.rs:2529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:43.457375Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: 26edad967301f125)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:471 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:43.457399Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:493 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:45.820670Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz4...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:598 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:56.640109Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 0 files, 134737920 bytes in 10295ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:874 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:56.667244Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo build --release -j2 -p frankentorch-api --features fair-alloc --example gauntlet_lane_sweep_h2h[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:934 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:44:56.667278Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/ft-verify-prelu-window-18c330dcf4db-Ge2jHp -> /data/tmp/rch/frankentorch/26edad967301f125/.rch-target-hz4-pool-6ea70f8026287c16373bbbc2a0b1f290[0m
+    [2;3mat[0m rch/src/transfer.rs:1610 [2;3mon[0m ThreadId(1)
+
+    Updating git repository `https://github.com/Dicklesworthstone/rust-block`
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bytemuck v1.25.2
+  Downloaded autocfg v1.5.0
+  Downloaded cfg-if v1.0.4
+  Downloaded ciborium-ll v0.2.2
+  Downloaded cast v0.3.0
+  Downloaded plotters-backend v0.3.7
+  Downloaded clap_lex v1.1.0
+  Downloaded is-terminal v0.4.17
+  Downloaded mimalloc v0.1.52
+  Downloaded plotters-svg v0.3.7
+  Downloaded oorandom v11.1.5
+  Downloaded itoa v1.0.18
+  Downloaded rawpointer v0.2.1
+  Downloaded ciborium-io v0.2.2
+  Downloaded either v1.15.0
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded once_cell v1.21.4
+  Downloaded same-file v1.0.6
+  Downloaded zmij v1.0.21
+  Downloaded walkdir v2.5.0
+  Downloaded tinytemplate v1.2.1
+  Downloaded criterion-plot v0.5.0
+  Downloaded ciborium v0.2.2
+  Downloaded shlex v2.0.1
+  Downloaded anstyle v1.0.14
+  Downloaded num-complex v0.4.6
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded cc v1.2.65
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded quote v1.0.45
+  Downloaded anes v0.1.6
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded serde_core v1.0.229
+  Downloaded half v2.7.1
+  Downloaded matrixmultiply v0.3.11
+  Downloaded num-traits v0.2.19
+  Downloaded unicode-ident v1.0.24
+  Downloaded clap v4.6.1
+  Downloaded serde_derive v1.0.229
+  Downloaded proc-macro2 v1.0.106
+  Downloaded rayon-core v1.13.0
+  Downloaded safe_arch v1.1.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded serde v1.0.229
+  Downloaded aho-corasick v1.1.4
+  Downloaded itertools v0.10.5
+  Downloaded memchr v2.8.0
+  Downloaded criterion v0.5.1
+  Downloaded plotters v0.3.7
+  Downloaded regex v1.12.3
+  Downloaded serde_json v1.0.151
+  Downloaded clap_builder v4.6.0
+  Downloaded rayon v1.12.0
+  Downloaded wide v1.6.0
+  Downloaded libm v0.2.16
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded syn v3.0.3
+  Downloaded regex-syntax v0.8.10
+  Downloaded libmimalloc-sys v0.1.49
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling syn v2.0.117
+   Compiling cfg-if v1.0.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling serde_core v1.0.229
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling num-complex v0.4.6
+   Compiling matrixmultiply v0.3.11
+   Compiling libm v0.2.16
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.65
+   Compiling safe_arch v1.1.0
+   Compiling rayon v1.12.0
+   Compiling half v2.7.1
+   Compiling frankentorch-core v0.1.0 (/data/tmp/rch/frankentorch/26edad967301f125/crates/ft-core)
+   Compiling syn v3.0.3
+   Compiling serde v1.0.229
+   Compiling rawpointer v0.2.1
+   Compiling zmij v1.0.21
+   Compiling serde_derive v1.0.229
+   Compiling wide v1.6.0
+   Compiling libmimalloc-sys v0.1.49
+   Compiling libc v0.2.185
+   Compiling serde_json v1.0.151
+   Compiling frankentorch-kernel-cpu v0.1.1 (/data/tmp/rch/frankentorch/26edad967301f125/crates/ft-kernel-cpu)
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:8906:3
+     |
+8906 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: the `must_use` attribute cannot be used on statics
+    --> crates/ft-kernel-cpu/src/lib.rs:9954:3
+     |
+9954 | #[must_use]
+     |   ^^^^^^^^
+     |
+     = help: the `must_use` attribute can be applied to data types, functions, and traits
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+warning: function `eigh_tred2_values_only_full_lower` is never used
+     --> crates/ft-kernel-cpu/src/lib.rs:31447:4
+      |
+31447 | fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling itoa v1.0.18
+   Compiling ciborium-io v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling memchr v2.8.0
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.0
+   Compiling regex-syntax v0.8.10
+   Compiling frankentorch-dispatch v0.1.0 (/data/tmp/rch/frankentorch/26edad967301f125/crates/ft-dispatch)
+   Compiling regex-automata v0.4.14
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling ciborium-ll v0.2.2
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling is-terminal v0.4.17
+   Compiling mimalloc v0.1.52
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling regex v1.12.3
+   Compiling frankentorch-autograd v0.1.0 (/data/tmp/rch/frankentorch/26edad967301f125/crates/ft-autograd)
+   Compiling frankentorch-runtime v0.1.0 (/data/tmp/rch/frankentorch/26edad967301f125/crates/ft-runtime)
+   Compiling oorandom v11.1.5
+   Compiling once_cell v1.21.4
+   Compiling anes v0.1.6
+   Compiling criterion v0.5.1
+   Compiling frankentorch-api v0.1.0 (/data/tmp/rch/frankentorch/26edad967301f125/crates/ft-api)
+warning: unused attribute
+   --> crates/ft-api/src/harness_incumbent_bank.rs:362:1
+    |
+362 | #[must_use]
+    | ^^^^^^^^^^^ help: remove this attribute
+    |
+note: attribute also specified here
+   --> crates/ft-api/src/harness_incumbent_bank.rs:355:1
+    |
+355 | #[must_use]
+    | ^^^^^^^^^^^
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: `frankentorch-kernel-cpu` (lib) generated 3 warnings (run `cargo fix --lib -p frankentorch-kernel-cpu` to apply 2 suggestions)
+warning: `frankentorch-api` (lib) generated 1 warning (run `cargo fix --lib -p frankentorch-api` to apply 1 suggestion)
+warning: unused doc comment
+    --> crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs:1111:1
+     |
+1111 | / /// conv2d f32 train step — `frankentorch-hi9r6`, item 191. The dtype twin of [`timed_conv2d`],
+1112 | | /// and the only lane that can price items 179, 181, 185 and 187.
+1113 | | ///
+1114 | | /// WHY THIS LANE DID NOT EXIST UNTIL NOW. Item 185e declined to write it because the harness's
+...    |
+1163 | | /// its route from `conv2d_ones_dout_route`, so passing ones takes the same route the session's
+1164 | | /// backward takes rather than a different one.
+     | |_----------------------------------------------^
+     |   |
+     |   rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `frankentorch-api` (example "gauntlet_lane_sweep_h2h") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 5m 02s
+  [2m2026-09-01T20:50:00.507469Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 303840ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1066 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:50:00.534050Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/tmp/rch/frankentorch/26edad967301f125/.rch-target-hz4-pool-6ea70f8026287c16373bbbc2a0b1f290 on hz4[0m
+    [2;3mat[0m rch/src/transfer.rs:3943 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:50:02.929710Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2395ms (8 files, 725 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3998 [2;3mon[0m ThreadId(1)
+
+  [2m2026-09-01T20:50:02.929728Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 8 files, 725 bytes in 2395ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1299 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz4 (321.2s)
+[RCH] clean-overlay receipt: base=18c330dcf4db8cc4ad8c4fca5add9391fa6f6a7e overlay-fingerprint=fe0d5151031be8fda7951fe7fe1f42f7ce344018fdb3ed21e6ada866b230b195
+build_exit=0
+4f8eec636098b1e39bf79166ffef3f5c809206e2a1158220d8a70de0d3dce94b  /data/tmp/ft-verify-prelu-window-18c330dcf4db-Ge2jHp/release/examples/gauntlet_lane_sweep_h2h
+run_started=2026-09-01T16:51:05-04:00
+run_command=scripts/h2h_window.sh <ELF>; wait=1800; exact_lane=prelu_noshortcut; reps=32; warmup=32; round_warmup=0; rayon=64
+4f8eec636098b1e39bf79166ffef3f5c809206e2a1158220d8a70de0d3dce94b  /data/tmp/ft-verify-prelu-window-18c330dcf4db-Ge2jHp/release/examples/gauntlet_lane_sweep_h2h
+guard PASS: no peer measurement detected, loadavg 5.62/4.73/4.41 (spread 1.00x <= 4x, floor 8.00), iowait 0.0% <= 10%
+/data/tmp/torchvenv-2121/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=4f8eec636098b1e39bf79166ffef3f5c809206e2a1158220d8a70de0d3dce94b
+incumbent=PyTorch 2.12.1+cpu (self-reported by the arm, same invocation), threads=8
+incumbent_rule=a delta whose incumbent arm moved (version, build, or measured time) is NOT a win
+measurement_host=thinkstation1 cpu="AMD Ryzen Threadripper PRO 5975WX 32-Cores" isa=x86_64+avx2 governor=powersave rayon_threads=64 online_cpus=64
+host_rule=both arms are sampled in ONE invocation on THIS machine; a row measured elsewhere is not comparable to this one, A/A PASS or not
+measurement_slot=held [pid=1233543 host=thinkstation1 elf=4f8eec636098b1e3 lanes=prelu_noshortcut]; no other live h2h announcement
+concurrent_measurements=none ACTIVE (scanned /proc for other h2h harnesses, criterion benches and torch processes, then measured each candidate's local CPU over 300ms; this run's own incumbent child is excluded)
+concurrent_measurements_idle=3 (matched by name, burning no local CPU — shell wrappers, and rch clients whose bench runs on a remote worker; reported, not voiding): criterion-bench[1055977] 0% h2h-harness[1234351] 0% h2h-harness[1234358] 0%
+cpu_mhz min=1429 median=1429 max=4292 spread=3.004x; arms NOT pinned: our 64 rayon threads span every core including any parked at the floor, the incumbent's 8 land wherever the scheduler puts them, so this row's arms are NOT known to have run at comparable clocks
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+sampling=balanced-square ABBAABBA (frankentorch-xdw0h); 32 rounds, four live samples per arm per round, torch threads=8
+round_warmup=0 (FT_H2H_ROUND_WARMUP; discarded samples per lane per round, BOTH arms). 0 = the board's default: each lane's slot 0 each round arrives cold, which NEGATIVE_EVIDENCE item 147 measured at +20-30% on the summed conv2d lanes
+
+lane          FT(ms)    PT(ms)   standing            PT/FT A/A gates and ratio CI                 parity
+lane_filter="prelu_noshortcut" match=exact kept=1 of the full set (frankentorch-68pwz item 58; item 226: substring is the default, FT_H2H_LANES_EXACT=1 narrows it)
+lane_count=1 rounds=32 (frankentorch-vyaia: the harness's own load scales with this product; a self-load bound quoted without it cannot be checked later)
+
+CLOCKS DURING SAMPLING (sampled once per lane per round, both arms inside the same round)
+  typical core   min 1429 median 1911 max 3432 MHz   (boost/thermal behaviour over time)
+  CROSS-CORE SPREAD at one instant   min 1.700x median 3.004x max 3.007x   (how far apart two cores were WHILE we sampled)
+  The spread is the number that decides comparability: it is what makes one arm's threads faster than the other's. Compare it against the idle snapshot in the cpu_mhz header line -- if the idle spread is large and this one is small, the cores boosted once work arrived and the clock confound did not bite.
+load_series n=34 worst_drift=1.044x endpoint_gate=PASS series_gate=PASS (frankentorch-68pwz item 49: the endpoint pair cannot see a mid-run excursion; a divergence between these two gates IS the finding)
+load_1m start=6.40 end=6.36 drift_gate=PASS (frankentorch-2h8vi; the signal is DRIFT in either direction, not level — a steady busy host is measurable, a host that moves under the measurement is not)
+self_load DIRECT=32.92 (both arms burned 401.3 CPU-seconds over window=12s at lane_count=1 rounds=32) — measured on our own /proc accounting, so a peer's compile contributes nothing to it. Compare against frankentorch-5q3io's ~+0.62, which was inferred from loadavg deltas at an unrecorded lane count (frankentorch-vyaia acceptance item 2).
+self_load rise=+0.00 (start 6.40 -> peak 6.40) over window=12s at lane_count=1 rounds=32 — loadavg is a 1-minute EWMA, so this window could show at most 18% of any sustained step (frankentorch-vyaia: measured, not assumed)
+self_load NOT INTERPRETABLE: a 12s window is shorter than the loadavg time constant, so this rise is a floor and a +0.00 is not evidence of anything. If the whole rise were ours and sustained it would imply 0.00. Re-derive the bound on a FULL sweep — the configuration every banked row and frankentorch-5q3io's stale ~+0.62 were taken under (frankentorch-vyaia).
+  prelu_noshortcut   11.547   17.502   FT 1.52x FASTER     PT PASS [0.966,1.018] FT PASS [0.948,1.036] ratio 1.516 [1.476,1.561] match incumbent=NO-HISTORY
+  incumbent_mode lane=prelu_noshortcut drawn=17.502 ms  NO HISTORY — first observation for this lane, shape and torch build. This row's incumbent has nothing to be compared against, so the row is ONE INVOCATION SHORT OF READABLE however its nulls read.
+    slot0/median(slot1..3) = 0.979 (our arm, per-round median over 32 rounds)
+    MIN-ESTIMATOR FT 1.57x FASTER     ratio 1.572 [1.516,1.639]  PT null 0.993 PASS  FT null 0.990 PASS  QUOTABLE under the min estimator
+
+Quote a lane only if both A/A gates say PASS, their point estimates are within +/-0.02 of 1.0, and parity is `match`. WIDE means the null's
+CI exceeded 0.60 — the sample was too noisy to support ANY verdict, so the row is
+undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+
+buffer_pool: hits=0 misses=0 parked=16 buffers / 512.0 MiB
+
+GROUP_NORM f32 KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  numel=6422528  groups=32  cpg=2  spatial=3136  rayon_threads=64
+  forward_f32                 1.198 ms   schedule PARALLEL: 1024 groups; the numel-only gate (6422528 vs NORM_FWD_PARALLEL_MIN 524288) would have said PARALLEL
+  forward_f32 SERIAL         20.811 ms   same kernel, schedule forced off, interleaved rep-by-rep (sentinel for the _serialfwd lane)
+  sum_tensor_contiguous_f32   0.790 ms
+  backward_scalar_f32         1.868 ms   (cpg==2 path, unconditionally parallel)
+  total                       3.855 ms
+  ---- same three kernels, one timed step, two estimators (frankentorch-59kjf) ----
+  step min of 40               3.880 ms   comparable to the per-kernel figures above
+  step lane estimator         4.679 ms   median of 4 per round, then median over 10 rounds
+  estimator ratio             1.206x  (lane estimator / min; if this alone reaches ~2.4x the lane's missing 57% is the ESTIMATOR, not allocation)
+  ---- one group's reduction, sequential vs 8 accumulators (frankentorch-zv1y1) ----
+  reduce sequential           4.759 us   6272 elems, one dependency chain — what every statistic pass costs today
+  reduce 8 accumulators       0.571 us   same data, same rep, chain broken 8 ways
+  reduction headroom          8.335x  (NOT bit-exact: reassociation moves mean/rstd/output by an ULP; this prices the tolerance question, it does not answer it)
+
+MAX_POOL3D KERNEL BREAKDOWN (FrankenTorch-internal attribution, min of 9; NOT a ratio)
+  input numel=1048576  output numel=131072  kernel 2x2x2 stride 2x2x2  rayon_threads=64
+  forward_with_indices_f64     0.678 ms   reads 1048576 elems, 8 comparisons per output
+  backward NONOVERLAPPING      0.590 ms   the route ft-api actually takes (kernel == stride); scatters 131072 values into a dense 1048576-element buffer
+  backward generic scatter     0.876 ms   same data, same rep, bit-identical output — what the specialisation buys
+  total on the live route      1.268 ms
+run_exit=0
+run_finished=2026-09-01T16:52:03-04:00
+b7cd0046f981097852a47919ed6849741dc01d41ecd7d273de5b1352ce2feec3  /data/tmp/ft-verify-prelu-window-bank-18c330dcf4db-d48FGN.jsonl
+classification=NO_VERDICT reason=incumbent=NO-HISTORY; the bank contains no prior comparable prelu_noshortcut observation, so the session's raw direction cannot validate, refute, or be compared with a historical standing
+gates=guard_PASS, exclusive_window_PASS, concurrent_measurements_none_ACTIVE, live_incumbent_same_invocation_PASS, PT_AA_PASS, FT_AA_PASS, parity_match, load_series_PASS
