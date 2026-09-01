@@ -1,0 +1,29 @@
+=== A/A ADJUDICATION-ONLY CORRECTION: frankentorch-strict-aa-gate-band-v8rpa ===
+adjudicated_utc=2026-09-01T21:23:01Z
+adjudicator_head=35321a706f030206bdfcb5edca724757329aa20d
+adjudicator_commit=fix(measure): show the number the A/A band is applied to, and make bidiag compute the band it advertised [skip ci]
+scope=log work only; no measurement, build, ELF execution, or input data changed
+
+ADVERTISED GAUNTLET RULE (35321a70): for each A/A arm, the envelope must bracket 1.0 and be at most 0.60 wide; the separately computed point estimate must satisfy |point-1| <= 0.02. The point band is NOT an envelope requirement.
+
+SOURCE LOG: artifacts/perf/frankentorch-mdsmm/conv2d_complete_recert_redispatch_18c330dc_ivorybirch.log
+source_log_sha256=06a11d2255667c59c33e41586073ef18dce73e80b81a33d6759304c225297ae1
+source_commit=0196d8e2c7df62d0b4da58bd7c71880bfe60c8b8
+
+conv2d_masked raw standing=FT 1.50x SLOWER ratio 0.665 [0.624,0.748] parity=match incumbent=SINGLE/n15
+PT: point=0.949 -> FAIL (distance 0.051 > 0.02); envelope=[0.874,1.069], width=0.195, brackets_1=true -> CALM
+FT: point=0.943 -> FAIL (distance 0.057 > 0.02); envelope=[0.908,1.007], width=0.099, brackets_1=true -> CALM
+conv2d_masked advertised_rule_verdict=NO_VERDICT (both point estimates fail; original reason incorrectly treated envelopes as part of the point band)
+
+conv2d plain control: PT point=0.968 -> FAIL (distance 0.032); FT point=1.004 -> PASS; both envelopes are CALM. It remains NO_VERDICT because the incumbent point fails.
+
+SOURCE LOG: artifacts/perf/frankentorch-mdsmm/max_pool1d_legacy_recert_redispatch_a00af8ab_ivorybirch.log
+source_log_sha256=0fb8d056151716ea34eb128d05f71dd7dbcc776f8094c12770eb97ac20d513fa
+source_commit=0196d8e2c7df62d0b4da58bd7c71880bfe60c8b8
+
+max_pool1d raw standing=FT 1.24x FASTER ratio 1.238 [1.136,1.300] parity=match incumbent=NO-HISTORY
+PT: point=0.966 -> FAIL (distance 0.034 > 0.02); envelope=[0.912,1.053], width=0.141, brackets_1=true -> CALM
+FT: point=0.975 -> FAIL (distance 0.025 > 0.02); envelope=[0.950,1.012], width=0.062, brackets_1=true -> CALM
+max_pool1d advertised_rule_verdict=NO_VERDICT (both point estimates fail; independently, NO-HISTORY means no incumbent-level comparability)
+
+CORRECTED CONCLUSION: v8rpa invalidates the prior envelope-based explanation, not either NO_VERDICT. The original data, provenance, raw ratios, parity, and incumbent designations are unchanged. No raw standing becomes quotable.
