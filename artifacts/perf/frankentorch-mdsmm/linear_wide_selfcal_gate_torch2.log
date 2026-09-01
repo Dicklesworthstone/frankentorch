@@ -1,0 +1,185 @@
+===== linear_wide / linear_wide_dense — sum()-loss blind-spot audit — torch:2 (CreamTrout) 2026-09-01T23:12:11Z =====
+host=thinkstation1 nproc=64 HEAD=f6e7c08e379e2bcbe384e9307b9d63d11fe23177
+build_base=4608af6700dd645647758bcfacc5012d49903f68 (clean-overlay; SELF-CALIBRATED A/A point gate)
+elf_sha256=a2a5e2eb65002fa5c53c806921e2e79403c25abb43165e3a5d69b79490fbf061
+incumbent=PyTorch 2.12.1+cpu, self-reported in EVERY invocation
+entry_point=scripts/h2h_window.sh (holds the window for the run's duration; 8vukf)
+protocol: 20 SUCCESSFUL invocations, FT_H2H_REPS=24 FT_H2H_WARMUP=16, round_warmup=0 (board default)
+lanes=linear_wide,linear_wide_dense exact, paired in ONE invocation so the inflation is a within-window ratio of ratios
+
+--- attempt 1 (run 1/20)  23:12:11Z  loadavg=6.03 14.02 11.25
+  linear_wide     8.725   10.717   FT 1.23x FASTER     PT PASS 1.000 perm[0.948,1.055] [0.942,1.051] FT OFFSET 1.071 perm[0.954,1.053] [0.930,1.175] ratio 1.228 [1.168,1.267] match incumbent=SINGLE/n32
+  incumbent_mode lane=linear_wide drawn=10.717 ms  SINGLE LEVEL (n=32, median 10.897, range [10.507, 12.254], spread 1.17x) — no second level banked for this lane, so this row is comparable to the other 31. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.000, FrankenTorch 1.071; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.22x FASTER     ratio 1.217 [1.185,1.280]  PT null 0.993 PASS  FT null 1.004 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   11.932   10.864   FT 1.10x SLOWER     PT PASS 1.020 perm[0.950,1.053] [0.953,1.055] FT PASS 0.987 perm[0.914,1.083] [0.856,1.064] ratio 0.911 [0.838,0.954] match incumbent=SINGLE/n32
+  incumbent_mode lane=linear_wide_dense drawn=10.864 ms  SINGLE LEVEL (n=32, median 10.861, range [10.560, 12.225], spread 1.16x) — no second level banked for this lane, so this row is comparable to the other 31. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.08x SLOWER     ratio 0.924 [0.879,0.968]  PT null 1.045 FAIL  FT null 1.023 FAIL  not quotable
+
+--- attempt 2 (run 2/20)  23:12:41Z  loadavg=7.63 13.63 11.20
+  linear_wide     8.573   12.488   FT 1.46x FASTER     PT PASS 1.007 perm[0.930,1.077] [0.951,1.073] FT PASS 1.025 perm[0.950,1.053] [0.943,1.139] ratio 1.457 [1.383,1.512] match incumbent=SINGLE/n33
+  incumbent_mode lane=linear_wide drawn=12.488 ms  SINGLE LEVEL (n=33, median 10.898, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 32. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.47x FASTER     ratio 1.475 [1.407,1.522]  PT null 0.971 FAIL  FT null 1.055 FAIL  not quotable
+  linear_wide_dense   12.056   12.523   FT 1.04x FASTER     PT PASS 0.991 perm[0.954,1.046] [0.905,1.016] FT OFFSET 1.058 perm[0.961,1.039] [0.913,1.124] ratio 1.039 [0.953,1.087] match incumbent=SINGLE/n33
+  incumbent_mode lane=linear_wide_dense drawn=12.523 ms  SINGLE LEVEL (n=33, median 10.864, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 32. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.991, FrankenTorch 1.058; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.06x FASTER     ratio 1.063 [1.032,1.118]  PT null 1.031 FAIL  FT null 0.970 FAIL  not quotable
+
+--- attempt 3 (run 3/20)  23:13:17Z  loadavg=8.36 13.15 11.13
+  linear_wide     8.558   11.288   FT 1.32x FASTER     PT PASS 0.977 perm[0.915,1.093] [0.923,1.039] FT PASS 0.973 perm[0.932,1.071] [0.906,1.086] ratio 1.319 [1.250,1.389] match incumbent=SINGLE/n34
+  incumbent_mode lane=linear_wide drawn=11.288 ms  SINGLE LEVEL (n=34, median 10.900, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 33. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.31x FASTER     ratio 1.306 [1.247,1.364]  PT null 1.002 PASS  FT null 0.998 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   11.677   11.008   FT 1.06x SLOWER     PT PASS 0.987 perm[0.925,1.085] [0.924,1.078] FT PASS 1.037 perm[0.940,1.061] [0.962,1.163] ratio 0.943 [0.894,1.002] match incumbent=SINGLE/n34
+  incumbent_mode lane=linear_wide_dense drawn=11.008 ms  SINGLE LEVEL (n=34, median 10.888, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 33. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.03x SLOWER     ratio 0.974 [0.909,1.009]  PT null 1.028 FAIL  FT null 1.066 FAIL  not quotable
+
+--- attempt 4 (run 4/20)  23:13:44Z  loadavg=9.02 12.90 11.10
+  linear_wide     8.537   10.614   FT 1.24x FASTER     PT PASS 0.980 perm[0.905,1.110] [0.920,1.016] FT PASS 0.994 perm[0.947,1.056] [0.933,1.096] ratio 1.243 [1.209,1.324] match incumbent=SINGLE/n35
+  incumbent_mode lane=linear_wide drawn=10.614 ms  SINGLE LEVEL (n=35, median 10.898, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 34. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.24x FASTER     ratio 1.240 [1.176,1.304]  PT null 1.058 FAIL  FT null 1.033 FAIL  not quotable
+  linear_wide_dense   11.151   10.715   FT 1.04x SLOWER     PT PASS 0.962 perm[0.935,1.068] [0.925,1.064] FT PASS 0.952 perm[0.946,1.055] [0.863,1.020] ratio 0.961 [0.904,1.010] match incumbent=SINGLE/n35
+  incumbent_mode lane=linear_wide_dense drawn=10.715 ms  SINGLE LEVEL (n=35, median 10.864, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 34. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.03x SLOWER     ratio 0.967 [0.912,0.987]  PT null 1.006 PASS  FT null 0.977 FAIL  not quotable
+
+--- attempt 5 (run 5/20)  23:14:12Z  loadavg=9.73 12.67 11.08
+  linear_wide     8.774   11.387   FT 1.30x FASTER     PT PASS 1.020 perm[0.944,1.058] [0.976,1.070] FT PASS 1.012 perm[0.967,1.036] [0.917,1.080] ratio 1.298 [1.249,1.353] match incumbent=SINGLE/n36
+  incumbent_mode lane=linear_wide drawn=11.387 ms  SINGLE LEVEL (n=36, median 10.900, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 35. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.25x FASTER     ratio 1.246 [1.200,1.294]  PT null 1.029 FAIL  FT null 0.958 FAIL  not quotable
+  linear_wide_dense   11.803   11.306   FT 1.04x SLOWER     PT PASS 1.003 perm[0.941,1.061] [0.955,1.073] FT PASS 0.977 perm[0.970,1.030] [0.935,1.025] ratio 0.958 [0.906,0.996] match incumbent=SINGLE/n36
+  incumbent_mode lane=linear_wide_dense drawn=11.306 ms  SINGLE LEVEL (n=36, median 10.888, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 35. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.10x SLOWER     ratio 0.907 [0.888,0.931]  PT null 0.998 PASS  FT null 0.995 PASS  QUOTABLE under the min estimator
+
+--- attempt 6 (run 6/20)  23:14:40Z  loadavg=10.15 12.47 11.07
+  linear_wide     8.771   11.045   FT 1.26x FASTER     PT PASS 1.016 perm[0.895,1.117] [0.949,1.069] FT PASS 1.019 perm[0.928,1.074] [0.938,1.121] ratio 1.259 [1.193,1.317] match incumbent=SINGLE/n37
+  incumbent_mode lane=linear_wide drawn=11.045 ms  SINGLE LEVEL (n=37, median 10.903, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 36. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.23x FASTER     ratio 1.229 [1.148,1.290]  PT null 1.037 FAIL  FT null 1.018 PASS  not quotable
+  linear_wide_dense   12.156   10.910   FT 1.11x SLOWER     PT PASS 1.008 perm[0.945,1.054] [0.982,1.037] FT PASS 0.991 perm[0.947,1.053] [0.924,1.084] ratio 0.898 [0.860,0.919] match incumbent=SINGLE/n37
+  incumbent_mode lane=linear_wide_dense drawn=10.910 ms  SINGLE LEVEL (n=37, median 10.910, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 36. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.09x SLOWER     ratio 0.914 [0.883,0.944]  PT null 0.995 PASS  FT null 0.936 FAIL  not quotable
+
+--- attempt 7 (run 7/20)  23:15:09Z  loadavg=10.10 12.25 11.04
+  linear_wide     8.473   10.657   FT 1.26x FASTER     PT PASS 1.028 perm[0.926,1.076] [0.999,1.065] FT PASS 0.989 perm[0.962,1.039] [0.955,1.052] ratio 1.258 [1.192,1.297] match incumbent=SINGLE/n38
+  incumbent_mode lane=linear_wide drawn=10.657 ms  SINGLE LEVEL (n=38, median 10.900, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 37. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.25x FASTER     ratio 1.254 [1.209,1.277]  PT null 1.014 PASS  FT null 0.987 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   12.110   11.108   FT 1.09x SLOWER     PT PASS 0.987 perm[0.927,1.075] [0.952,1.049] FT PASS 1.031 perm[0.951,1.051] [0.939,1.084] ratio 0.917 [0.874,0.975] match incumbent=SINGLE/n38
+  incumbent_mode lane=linear_wide_dense drawn=11.108 ms  SINGLE LEVEL (n=38, median 10.911, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 37. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.07x SLOWER     ratio 0.936 [0.894,0.973]  PT null 0.995 PASS  FT null 1.045 FAIL  not quotable
+
+--- attempt 8 (run 8/20)  23:15:38Z  loadavg=10.62 12.18 11.05
+  linear_wide     8.906   10.881   FT 1.22x FASTER     PT PASS 1.010 perm[0.917,1.090] [0.939,1.052] FT PASS 1.035 perm[0.937,1.069] [0.926,1.126] ratio 1.222 [1.165,1.278] match incumbent=SINGLE/n39
+  incumbent_mode lane=linear_wide drawn=10.881 ms  SINGLE LEVEL (n=39, median 10.898, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 38. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.23x FASTER     ratio 1.228 [1.192,1.274]  PT null 1.023 FAIL  FT null 1.051 FAIL  not quotable
+  linear_wide_dense   12.085   10.967   FT 1.10x SLOWER     PT PASS 0.982 perm[0.937,1.054] [0.947,1.039] FT PASS 0.992 perm[0.956,1.045] [0.905,1.061] ratio 0.907 [0.881,0.937] match incumbent=SINGLE/n39
+  incumbent_mode lane=linear_wide_dense drawn=10.967 ms  SINGLE LEVEL (n=39, median 10.911, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 38. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.13x SLOWER     ratio 0.884 [0.837,0.918]  PT null 1.007 PASS  FT null 1.010 PASS  QUOTABLE under the min estimator
+
+--- attempt 9 (run 9/20)  23:16:10Z  loadavg=10.49 11.97 11.02
+  linear_wide     8.301   10.745   FT 1.29x FASTER     PT PASS 1.065 perm[0.863,1.155] [0.959,1.189] FT OFFSET 0.897 perm[0.917,1.101] [0.840,1.094] ratio 1.294 [1.210,1.356] match incumbent=SINGLE/n40
+  incumbent_mode lane=linear_wide drawn=10.745 ms  SINGLE LEVEL (n=40, median 10.897, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 39. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.065, FrankenTorch 0.897; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.27x FASTER     ratio 1.272 [1.223,1.315]  PT null 0.993 PASS  FT null 0.969 FAIL  not quotable
+  linear_wide_dense   11.807   10.764   FT 1.10x SLOWER     PT PASS 1.042 perm[0.944,1.060] [0.966,1.107] FT PASS 0.964 perm[0.938,1.066] [0.864,1.094] ratio 0.912 [0.863,0.952] match incumbent=SINGLE/n40
+  incumbent_mode lane=linear_wide_dense drawn=10.764 ms  SINGLE LEVEL (n=40, median 10.911, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 39. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.07x SLOWER     ratio 0.938 [0.894,0.976]  PT null 1.024 FAIL  FT null 0.989 PASS  not quotable
+
+--- attempt 10 (run 10/20)  23:16:36Z  loadavg=10.54 11.87 11.01
+  linear_wide     9.100   11.062   FT 1.22x FASTER     PT PASS 0.995 perm[0.948,1.058] [0.965,1.031] FT PASS 0.993 perm[0.928,1.065] [0.917,1.052] ratio 1.216 [1.178,1.272] match incumbent=SINGLE/n41
+  incumbent_mode lane=linear_wide drawn=11.062 ms  SINGLE LEVEL (n=41, median 10.898, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 40. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.22x FASTER     ratio 1.216 [1.177,1.260]  PT null 0.982 PASS  FT null 1.015 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   12.249   11.201   FT 1.09x SLOWER     PT PASS 1.023 perm[0.938,1.059] [0.977,1.069] FT PASS 1.012 perm[0.947,1.058] [0.913,1.074] ratio 0.914 [0.884,0.951] match incumbent=SINGLE/n41
+  incumbent_mode lane=linear_wide_dense drawn=11.201 ms  SINGLE LEVEL (n=41, median 10.911, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 40. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.12x SLOWER     ratio 0.896 [0.859,0.947]  PT null 1.029 FAIL  FT null 1.033 FAIL  not quotable
+
+--- attempt 11 (run 11/20)  23:17:05Z  loadavg=15.95 13.02 11.42
+  linear_wide     8.793   12.417   FT 1.41x FASTER     PT PASS 1.002 perm[0.944,1.056] [0.959,1.042] FT PASS 0.928 perm[0.920,1.091] [0.825,1.005] ratio 1.412 [1.354,1.450] match incumbent=SINGLE/n42
+  incumbent_mode lane=linear_wide drawn=12.417 ms  SINGLE LEVEL (n=42, median 10.900, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 41. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.47x FASTER     ratio 1.466 [1.395,1.505]  PT null 1.020 FAIL  FT null 0.990 PASS  not quotable
+  linear_wide_dense   12.192   12.409   FT 1.02x FASTER     PT PASS 1.028 perm[0.963,1.042] [0.957,1.062] FT PASS 0.999 perm[0.926,1.074] [0.943,1.122] ratio 1.018 [0.985,1.074] match incumbent=SINGLE/n42
+  incumbent_mode lane=linear_wide_dense drawn=12.409 ms  SINGLE LEVEL (n=42, median 10.924, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 41. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.09x FASTER     ratio 1.090 [1.030,1.136]  PT null 1.005 PASS  FT null 0.989 PASS  QUOTABLE under the min estimator
+
+--- attempt 12 (run 12/20)  23:17:41Z  loadavg=18.31 13.97 11.80
+REFUSING TO MEASURE: 1 peer measurement process(es) are live.
+h2h_window: window ACQUIRED but the HOST is not measurable; releasing without running.
+  -> HOST UNFIT (guard refused inside the window), waiting 90s
+
+--- attempt 13 (run 12/20)  23:19:14Z  loadavg=25.74 16.56 12.86
+  linear_wide     9.065   10.953   FT 1.21x FASTER     PT FAIL 0.957 perm[0.904,1.104] [0.928,0.998] FT PASS 1.037 perm[0.942,1.068] [0.899,1.126] ratio 1.208 [1.145,1.256] match incumbent=SINGLE/n43
+  incumbent_mode lane=linear_wide drawn=10.953 ms  SINGLE LEVEL (n=43, median 10.903, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 42. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.957, FrankenTorch 1.037; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.15x FASTER     ratio 1.150 [1.126,1.219]  PT null 1.027 FAIL  FT null 1.044 FAIL  not quotable
+  linear_wide_dense   12.007   11.015   FT 1.09x SLOWER     PT PASS 1.054 perm[0.942,1.060] [0.992,1.091] FT PASS 1.032 perm[0.946,1.060] [0.978,1.085] ratio 0.917 [0.902,0.944] match incumbent=SINGLE/n43
+  incumbent_mode lane=linear_wide_dense drawn=11.015 ms  SINGLE LEVEL (n=43, median 10.937, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 42. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.12x SLOWER     ratio 0.891 [0.862,0.918]  PT null 1.061 FAIL  FT null 1.022 FAIL  not quotable
+
+--- attempt 14 (run 13/20)  23:19:43Z  loadavg=20.49 16.17 12.85
+  linear_wide     8.439   10.521   FT 1.25x FASTER     PT PASS 1.018 perm[0.949,1.053] [0.983,1.040] FT PASS 0.992 perm[0.959,1.037] [0.897,1.054] ratio 1.247 [1.155,1.282] match incumbent=SINGLE/n44
+  incumbent_mode lane=linear_wide drawn=10.521 ms  SINGLE LEVEL (n=44, median 10.900, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 43. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.22x FASTER     ratio 1.216 [1.169,1.244]  PT null 0.980 PASS  FT null 0.992 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   11.835   10.788   FT 1.10x SLOWER     PT PASS 0.996 perm[0.960,1.042] [0.977,1.031] FT PASS 1.015 perm[0.962,1.037] [0.966,1.068] ratio 0.912 [0.887,0.945] match incumbent=SINGLE/n44
+  incumbent_mode lane=linear_wide_dense drawn=10.788 ms  SINGLE LEVEL (n=44, median 10.924, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 43. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.10x SLOWER     ratio 0.906 [0.880,0.929]  PT null 0.995 PASS  FT null 1.024 FAIL  not quotable
+
+--- attempt 15 (run 14/20)  23:20:13Z  loadavg=18.78 16.18 12.96
+  linear_wide     8.168   12.432   FT 1.52x FASTER     PT PASS 1.012 perm[0.925,1.083] [0.983,1.040] FT PASS 0.994 perm[0.962,1.039] [0.937,1.086] ratio 1.522 [1.460,1.601] match incumbent=SINGLE/n45
+  incumbent_mode lane=linear_wide drawn=12.432 ms  SINGLE LEVEL (n=45, median 10.903, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 44. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.50x FASTER     ratio 1.498 [1.439,1.570]  PT null 0.999 PASS  FT null 1.018 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   11.303   12.205   FT 1.08x FASTER     PT PASS 1.029 perm[0.954,1.052] [0.993,1.077] FT PASS 1.038 perm[0.946,1.053] [0.986,1.074] ratio 1.080 [1.034,1.132] match incumbent=SINGLE/n45
+  incumbent_mode lane=linear_wide_dense drawn=12.205 ms  SINGLE LEVEL (n=45, median 10.937, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 44. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.09x FASTER     ratio 1.086 [1.072,1.119]  PT null 1.023 FAIL  FT null 1.012 PASS  not quotable
+
+--- attempt 16 (run 15/20)  23:20:48Z  loadavg=15.86 15.74 12.93
+  linear_wide     8.565   11.144   FT 1.30x FASTER     PT PASS 0.996 perm[0.938,1.070] [0.946,1.040] FT OFFSET 0.910 perm[0.913,1.101] [0.843,1.052] ratio 1.301 [1.227,1.344] match incumbent=SINGLE/n46
+  incumbent_mode lane=linear_wide drawn=11.144 ms  SINGLE LEVEL (n=46, median 10.918, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 45. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 0.996, FrankenTorch 0.910; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.27x FASTER     ratio 1.270 [1.204,1.332]  PT null 1.062 FAIL  FT null 0.987 PASS  not quotable
+  linear_wide_dense   11.763   11.049   FT 1.06x SLOWER     PT PASS 0.978 perm[0.968,1.038] [0.928,1.018] FT PASS 0.971 perm[0.931,1.066] [0.905,1.097] ratio 0.939 [0.874,0.998] match incumbent=SINGLE/n46
+  incumbent_mode lane=linear_wide_dense drawn=11.049 ms  SINGLE LEVEL (n=46, median 10.952, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 45. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.06x SLOWER     ratio 0.947 [0.901,1.002]  PT null 0.959 FAIL  FT null 1.043 FAIL  not quotable
+
+--- attempt 17 (run 16/20)  23:21:18Z  loadavg=14.56 15.43 12.91
+  linear_wide     8.832   10.829   FT 1.23x FASTER     PT FAIL 1.045 perm[0.894,1.116] [1.002,1.072] FT PASS 1.017 perm[0.934,1.072] [0.947,1.117] ratio 1.226 [1.202,1.272] match incumbent=SINGLE/n47
+  incumbent_mode lane=linear_wide drawn=10.829 ms  SINGLE LEVEL (n=47, median 10.903, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 46. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.045, FrankenTorch 1.017; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.23x FASTER     ratio 1.228 [1.174,1.291]  PT null 1.061 FAIL  FT null 1.033 FAIL  not quotable
+  linear_wide_dense   11.938   10.899   FT 1.10x SLOWER     PT PASS 0.977 perm[0.905,1.107] [0.920,1.050] FT PASS 0.980 perm[0.940,1.065] [0.921,1.064] ratio 0.913 [0.856,0.935] match incumbent=SINGLE/n47
+  incumbent_mode lane=linear_wide_dense drawn=10.899 ms  SINGLE LEVEL (n=47, median 10.937, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 46. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.11x SLOWER     ratio 0.905 [0.863,0.937]  PT null 1.029 FAIL  FT null 1.018 PASS  not quotable
+
+--- attempt 18 (run 17/20)  23:21:47Z  loadavg=13.29 15.02 12.86
+  linear_wide     8.175   11.028   FT 1.35x FASTER     PT PASS 0.991 perm[0.934,1.071] [0.959,1.051] FT PASS 0.984 perm[0.962,1.043] [0.922,1.050] ratio 1.349 [1.265,1.401] match incumbent=SINGLE/n48
+  incumbent_mode lane=linear_wide drawn=11.028 ms  SINGLE LEVEL (n=48, median 10.918, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 47. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.23x FASTER     ratio 1.228 [1.201,1.294]  PT null 0.982 PASS  FT null 1.006 PASS  QUOTABLE under the min estimator
+  linear_wide_dense   11.428   10.854   FT 1.05x SLOWER     PT PASS 1.049 perm[0.929,1.080] [0.987,1.096] FT OFFSET 1.037 perm[0.966,1.036] [0.971,1.111] ratio 0.950 [0.911,0.983] match incumbent=SINGLE/n48
+  incumbent_mode lane=linear_wide_dense drawn=10.854 ms  SINGLE LEVEL (n=48, median 10.924, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 47. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.049, FrankenTorch 1.037; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.04x SLOWER     ratio 0.958 [0.917,1.001]  PT null 1.021 FAIL  FT null 1.012 PASS  not quotable
+
+--- attempt 19 (run 18/20)  23:22:15Z  loadavg=13.36 14.85 12.87
+  linear_wide     9.047   11.096   FT 1.23x FASTER     PT PASS 1.022 perm[0.927,1.079] [0.966,1.062] FT PASS 1.020 perm[0.938,1.070] [0.931,1.081] ratio 1.226 [1.178,1.305] match incumbent=SINGLE/n49
+  incumbent_mode lane=linear_wide drawn=11.096 ms  SINGLE LEVEL (n=49, median 10.934, range [10.507, 12.488], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 48. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.22x FASTER     ratio 1.225 [1.190,1.278]  PT null 0.970 FAIL  FT null 0.957 FAIL  not quotable
+  linear_wide_dense   12.453   11.138   FT 1.12x SLOWER     PT PASS 1.009 perm[0.938,1.066] [0.956,1.056] FT PASS 1.038 perm[0.929,1.076] [0.936,1.152] ratio 0.894 [0.857,0.927] match incumbent=SINGLE/n49
+  incumbent_mode lane=linear_wide_dense drawn=11.138 ms  SINGLE LEVEL (n=49, median 10.937, range [10.560, 12.523], spread 1.19x) — no second level banked for this lane, so this row is comparable to the other 48. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.14x SLOWER     ratio 0.879 [0.852,0.938]  PT null 0.955 FAIL  FT null 1.010 PASS  not quotable
+
+--- attempt 20 (run 19/20)  23:22:45Z  loadavg=13.72 14.80 12.91
+  linear_wide    11.253   13.078   FT 1.16x FASTER     PT PASS 1.046 perm[0.935,1.067] [0.955,1.195] FT PASS 1.059 perm[0.903,1.112] [0.966,1.133] ratio 1.162 [1.083,1.246] match incumbent=SINGLE/n50
+  incumbent_mode lane=linear_wide drawn=13.078 ms  SINGLE LEVEL (n=50, median 10.936, range [10.507, 13.078], spread 1.24x) — no second level banked for this lane, so this row is comparable to the other 49. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.23x FASTER     ratio 1.230 [1.165,1.258]  PT null 1.014 PASS  FT null 1.045 FAIL  not quotable
+  linear_wide_dense   15.437   13.196   FT 1.17x SLOWER     PT PASS 0.995 perm[0.945,1.064] [0.911,1.061] FT PASS 0.970 perm[0.918,1.083] [0.870,1.100] ratio 0.855 [0.833,0.897] match incumbent=SINGLE/n50
+  incumbent_mode lane=linear_wide_dense drawn=13.196 ms  SINGLE LEVEL (n=50, median 10.952, range [10.560, 13.196], spread 1.25x) — no second level banked for this lane, so this row is comparable to the other 49. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.11x SLOWER     ratio 0.904 [0.850,0.959]  PT null 1.008 PASS  FT null 0.973 FAIL  not quotable
+
+--- attempt 21 (run 20/20)  23:23:20Z  loadavg=19.09 15.87 13.33
+  linear_wide    10.389   12.012   FT 1.16x FASTER     PT PASS 0.978 perm[0.941,1.063] [0.928,1.037] FT PASS 0.973 perm[0.917,1.099] [0.873,1.101] ratio 1.156 [1.095,1.265] match incumbent=SINGLE/n51
+  incumbent_mode lane=linear_wide drawn=12.012 ms  SINGLE LEVEL (n=51, median 10.939, range [10.507, 13.078], spread 1.24x) — no second level banked for this lane, so this row is comparable to the other 50. The bank spans 0.1 days.
+    MIN-ESTIMATOR FT 1.18x FASTER     ratio 1.182 [1.142,1.262]  PT null 1.033 FAIL  FT null 1.023 FAIL  not quotable
+  linear_wide_dense   13.806   12.229   FT 1.13x SLOWER     PT PASS 1.008 perm[0.954,1.048] [0.950,1.076] FT FAIL 0.876 perm[0.897,1.107] [0.782,0.929] ratio 0.886 [0.832,0.918] match incumbent=SINGLE/n51
+  incumbent_mode lane=linear_wide_dense drawn=12.229 ms  SINGLE LEVEL (n=51, median 10.966, range [10.560, 13.196], spread 1.25x) — no second level banked for this lane, so this row is comparable to the other 50. The bank spans 0.1 days.
+    NULL-FAILED: incumbent 1.008, FrankenTorch 0.876; each must land inside its own permutation band and carry a calm CI; do not quote this row
+    MIN-ESTIMATOR FT 1.01x SLOWER     ratio 0.989 [0.936,1.017]  PT null 0.973 FAIL  FT null 0.933 FAIL  not quotable
+
+invocations_run=20 window_busy=0 host_unfit=1 attempts=21
+bank_lines_added=40
+===== end 2026-09-01T23:23:49Z =====
