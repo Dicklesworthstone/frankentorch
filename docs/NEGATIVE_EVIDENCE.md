@@ -41955,3 +41955,53 @@ Cholesky's and getrf's sweeps share defect (a). **Their LANE CERTIFICATIONS are 
 levers trustworthy, not their sweeps** — the sweep numbers were likely inflated the same way and
 merely had enough margin to survive. That is the strongest possible argument for the arc's ordering:
 the gate is not a formality on top of a good sweep, it is the only step that was ever sound.
+
+### 293a. THE RULE IS NOW THE INSTRUMENT — ALL FOUR nb SWEEPS CONVERTED TO INTERLEAVED ARMS
+
+`frankentorch-stale-tuning-constants-lzku6`. Item 293 stated when an isolation sweep can be
+trusted. A rule that lives only in a ledger gets re-broken by the next sweep somebody writes, so
+this converts the four harnesses that had the defect — `cholesky_nb_sweep`, `lu_nb_sweep`,
+`inv_nb_sweep`, `geqrf_nb_sweep` — onto one shared instrument,
+`crates/ft-kernel-cpu/examples/interleaved/mod.rs`, that enforces it.
+
+**(a) is structural, not a convention.** `interleaved::run` owns the rep loop and hands the ARM
+INDEX out to the caller. A sweep can no longer be written `for candidate { for rep }`, because the
+only way to take a sample is from inside a round the module is driving. Order reverses on odd
+rounds; each arm's round figure is the min of two samples; the reported effect is the median of
+per-round PAIRED ratios.
+
+**(b), (c), (d) print with their arithmetic.** Every row carries PAIRED, MARGINAL, the sign test as
+`wins/n` with an EXACT two-sided binomial p, and a verdict. A cell that fails any condition prints
+`UNRESOLVED:` followed by the term that failed — `effect 0.1725 <= incumbent spread 0.2329`, not a
+number with a caveat somewhere else. The incumbent's within-run spread is measured and printed as
+the gate above every table.
+
+**Three hazards closed on the way.**
+  * `reps_for()` rounds the rep count UP TO EVEN — at an odd count the forward order runs one more
+    time than the reversed one and the alternation is left half-applied — and floors it at 6,
+    below which an exact sign test cannot reach p<0.05 at all (5 of 5 is p=0.0625). The first
+    smoke run at reps=3 printed a table on which no cell could ever have been TRUSTED.
+  * **Every table now carries TWO controls**, not one: the A/A arm (the incumbent duplicated,
+    placed last so the reversal gives it maximum position contrast) and, where the candidate grid
+    contains the shipped width, a `*` arm running that width THROUGH THE KNOB against the
+    incumbent's unset path. The second one prices knob neutrality and position bias together.
+  * The incumbent arm is the shipped path with its knob UNSET, and its width is READ BACK from the
+    kernel (`cholesky_nb`, `cholesky_nb_f32`, `lu_nb`, `lu_inv_nb`, `householder_panel_width`, all
+    newly `pub` + `#[doc(hidden)]`) rather than written as a literal. `lu_nb_sweep`'s own header
+    called the shipped getrf width 128 for a session after 292e moved it to 64 — the bead's subject
+    matter happening to the bead's own instrument.
+
+**IT REPRODUCES 293'S FINDING ON FIRST CONTACT.** thinkstation1, `RAYON_NUM_THREADS=16`, reps=6,
+ELF `1c1f36e3d68a915d`, geqrf n=1024 — **not a banked row** (peers active, load 3.4, no drift
+guard); it is a behaviour check on the instrument:
+
+    b=64   PAIRED 1.1725  MARGINAL 1.2248  SIGN 6/6  p=0.0312
+           UNRESOLVED: effect 0.1725 <= incumbent spread 0.2329; estimators disagree by 0.0523
+
+That is the block-ordered sweep's exact claim — every rep won, ~1.17x — and the harness now refuses
+it, for the reason the lane refused it. At n=512 in the same run the A/A control itself read 0.7703
+at 0/6, which says plainly that nothing at that size was measurable on that host at that moment.
+A block-ordered sweep had no way to say either thing.
+
+No lever, no default change, no numbers banked. This is the instrument, and it is what makes the
+remaining lanes (`HOUSEHOLDER_PANEL_WIDTH`, `MIN_BLOCK_COLS`) worth running at all.
