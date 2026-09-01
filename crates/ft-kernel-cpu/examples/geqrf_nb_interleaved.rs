@@ -40,7 +40,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     if n == 0 {
         return f64::NAN;
     }
-    if n % 2 == 1 { v[n / 2] } else { f64::midpoint(v[n / 2 - 1], v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        f64::midpoint(v[n / 2 - 1], v[n / 2])
+    }
 }
 
 fn time_once(a: &[f64], n: usize, b: usize) -> f64 {
@@ -64,7 +68,10 @@ fn main() {
         "PROV host={} rayon={} n={n} reps={reps} loadavg={}",
         host.trim(),
         rayon::current_num_threads(),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     println!(
         "PREDICTION REGISTERED: if BLOCK ORDERING explains the isolation-to-lane inversion, the \
@@ -84,7 +91,8 @@ fn main() {
         std::hint::black_box(time_once(&a, n, 64));
     }
 
-    let (mut base, mut cand, mut ratios, mut null_ratios) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut base, mut cand, mut ratios, mut null_ratios) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for rep in 0..reps {
         // ALTERNATE the order so neither width sits permanently in the warmer slot.
         let (b32, b64) = if rep % 2 == 0 {
@@ -115,7 +123,11 @@ fn main() {
     );
 
     println!("\nINTERLEAVED (arms alternate within each rep)");
-    println!("  b=32 median {:.4} ms   b=64 median {:.4} ms", median(base), median(cand));
+    println!(
+        "  b=32 median {:.4} ms   b=64 median {:.4} ms",
+        median(base),
+        median(cand)
+    );
     println!("  PAIRED   (median of per-rep ratios, b32/b64)  {paired:.4}x");
     println!("  MARGINAL (ratio of medians)                   {marginal:.4}x");
     println!("  SIGN TEST b=64 faster in {wins} of {reps} reps");

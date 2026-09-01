@@ -323,7 +323,7 @@ mod gemm {
     /// turned off" — `feedback_one_knob_is_secretly_two` in its purest form. A sweep must move this
     /// with the candidate so every width has equivalent split eligibility, and must PROVE it did
     /// with the admission census below rather than assume it.
-    const HOUSEHOLDER_PANEL_WIDTH_SHIPPED: usize = 32;
+    pub(crate) const HOUSEHOLDER_PANEL_WIDTH_SHIPPED: usize = 32;
     pub(crate) static HOUSEHOLDER_PANEL_WIDTH_OVERRIDE: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
@@ -25360,7 +25360,12 @@ pub fn set_lu_inv_nb(nb: usize) -> usize {
     LU_INV_NB.swap(nb, LuOrdering::Relaxed)
 }
 
-fn lu_inv_nb() -> usize {
+/// The blocking width `lu_inverse_from_factor_f64` will actually use — the override if one is
+/// set, otherwise the shipped default. A sweep must LABEL its incumbent arm from this rather
+/// than from a literal in its own source: `lu_nb_sweep`'s header called the shipped getrf width
+/// 128 for a whole session after ledger 292e moved it to 64.
+#[doc(hidden)]
+pub fn lu_inv_nb() -> usize {
     match LU_INV_NB.load(LuOrdering::Relaxed) {
         0 => LU_INV_NB_SHIPPED,
         v => v.max(1),
@@ -25441,7 +25446,9 @@ pub fn set_lu_nb(nb: usize) -> usize {
     LU_NB.swap(nb, LuOrdering::Relaxed)
 }
 
-fn lu_nb() -> usize {
+/// The blocking width `lu_factor_contiguous_f64` will actually use. See [`lu_inv_nb`].
+#[doc(hidden)]
+pub fn lu_nb() -> usize {
     match LU_NB.load(LuOrdering::Relaxed) {
         0 => LU_NB_SHIPPED,
         v => v.max(1),
@@ -27753,7 +27760,9 @@ pub fn cholesky_stage_take_ns() -> (u64, u64, u64, u64) {
 /// validated by reconstruction and the oracle, never by `to_bits()`.
 static CHOLESKY_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Override the Cholesky blocking width; `0` restores the shipped 128. Returns the previous value.
+/// Override the Cholesky blocking width; `0` restores the shipped default. Returns the previous
+/// value. The default is 64 as of ledger 292e, not the 128 this line used to name — read it back
+/// with [`cholesky_nb`] rather than trusting any literal.
 #[doc(hidden)]
 pub fn set_cholesky_nb(nb: usize) -> usize {
     CHOLESKY_NB.swap(nb, LuOrdering::Relaxed)
@@ -27803,7 +27812,9 @@ pub fn set_cholesky_nb_f32(nb: usize) -> usize {
     CHOLESKY_NB_F32.swap(nb, LuOrdering::Relaxed)
 }
 
-fn cholesky_nb_f32() -> usize {
+/// The blocking width `cholesky_contiguous_f32` will actually use. See [`lu_inv_nb`].
+#[doc(hidden)]
+pub fn cholesky_nb_f32() -> usize {
     match CHOLESKY_NB_F32.load(LuOrdering::Relaxed) {
         0 => CHOLESKY_NB_F32_SHIPPED,
         v => v.max(1),
@@ -27827,7 +27838,9 @@ pub fn cholesky_f32_stage_take_ns() -> (u64, u64, u64) {
     )
 }
 
-fn cholesky_nb() -> usize {
+/// The blocking width `cholesky_contiguous_f64` will actually use. See [`lu_inv_nb`].
+#[doc(hidden)]
+pub fn cholesky_nb() -> usize {
     match CHOLESKY_NB.load(LuOrdering::Relaxed) {
         0 => CHOLESKY_NB_SHIPPED,
         v => v.max(1),
@@ -35375,6 +35388,18 @@ pub fn set_dgemm_sub_serial(on: bool) -> bool {
 #[doc(hidden)]
 pub fn set_householder_panel_width(width: usize) -> usize {
     gemm::HOUSEHOLDER_PANEL_WIDTH_OVERRIDE.swap(width, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The width the skinny-split predicate will actually recognise — the override if one is set,
+/// otherwise the shipped default. A sweep must LABEL its incumbent arm from this rather than from
+/// a literal in its own source. See [`lu_inv_nb`].
+#[doc(hidden)]
+#[must_use]
+pub fn householder_panel_width() -> usize {
+    match gemm::HOUSEHOLDER_PANEL_WIDTH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => gemm::HOUSEHOLDER_PANEL_WIDTH_SHIPPED,
+        v => v,
+    }
 }
 
 /// Drain the skinny-split admission census as `(admitted, rejected)`.
