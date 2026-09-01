@@ -118,3 +118,51 @@ run cancels out of it exactly.
 5. **The conv3d row banked earlier today is corroborated, not impeached.** Its incumbent read
    5.907 / 6.034 ms; today's full board reads conv3d PT 6.229 ms. Both low mode, so that row was
    not taken in the rare one. Its inflation finding (1.940x) is mode-invariant regardless.
+
+---
+
+## CORRECTION, same session: the high mode is not "the rare one"
+
+Section 4 above called the ~10.5-11 ms mode the rare one and item 203's figures the anomaly.
+That is wrong outside today's window, and the record that corrects it is on this same lane.
+
+`feedback_aa_null_blind_to_scaled_incumbent` documents item 219, 2026-08-19, on
+`conv2d_big_masked` / `conv2d_big_masked_train`: **seven invocations at PT 11.4-12.0 ms and a
+single anomalous one at 6.075 ms**, with the ~11-12 ms level treated — correctly, on that
+evidence — as the norm and the ~6 ms invocation as the defect. Item 203's 11.019 / 11.590 and
+item 209's 10.5 / 11.0 are the same level.
+
+Today the prevalence is INVERTED: 20 invocations at 5.06-6.38 ms and 2 at 10.50-10.86.
+
+    session        ~6 ms mode    ~11 ms mode
+    2026-08-19          1              7        (item 219, and 6 ms called the defect)
+    2026-09-01         20              2        (today)
+
+So this is not a rare lottery around a true value. **The incumbent arm for this lane has two
+stable levels a factor of ~1.85-2x apart, each has been the dominant mode in a different
+session, and nothing in the harness's provenance distinguishes them.** Which one is "correct"
+is not established by anything measured here, and I am not asserting it.
+
+Our own arm moved too between those sessions, but for a reason the campaign can account for:
+conv2d_big_masked read FT 27.9 ms at item 209 and 8.3-8.7 ms today, a 3.3x that the shipped conv
+levers plausibly explain. The incumbent's 2x has no such account — it is the same PyTorch
+2.12.1+cpu on the same host.
+
+What this changes, and what it does not:
+
+  - The conclusion that **no conv2d_big standing ratio is bankable** is unchanged, and
+    strengthened: the sign does not depend on a 9%-frequency fluke, it depends on which of two
+    persistent levels the incumbent is sitting at this week.
+  - "~9% of invocations" is a TODAY figure and must not be quoted as a general rate. In August
+    the same figure would have read ~12% the other way.
+  - The claim that item 203's sizing table "sits in the rare high mode" is withdrawn. It sits in
+    the mode that was normal when it was taken.
+  - The **inflation result is untouched** — 1.856-2.043 across six invocations spanning both
+    levels is precisely a measurement that does not care which level the incumbent sits at, and
+    that is why it was the thing banked.
+  - The conv3d corroboration is untouched: that row and today's full board were both taken in
+    the same session and the same level.
+
+The open question is no longer "what caused two odd invocations today". It is **what makes this
+host's PyTorch sit at one of two levels for a whole session**, and that is a bigger question
+than this bead.
