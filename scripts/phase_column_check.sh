@@ -16,6 +16,11 @@
 # remembering six steps is a check that gets skipped, or worse, performed with one step missing —
 # `feedback_measurement_host_identity` exists because a row was once banked without its host.
 #
+# IT HOLDS THE WINDOW, it does not merely check it (frankentorch-8vukf). Each lane runs through
+# `scripts/h2h_window.sh`, which takes an flock, admits inside it, and keeps it for the lane's
+# duration — so a peer cannot start inside a lane's sampling interval the way one did in 8vukf's
+# repro. The per-lane re-guard described below still happens; it happens inside the lock now.
+#
 # WHAT IT REFUSES TO DO. It does not override the guard. If `measurement_window_guard.sh` says no,
 # this exits non-zero and prints why; a window that has to be forced is not a window, and the whole
 # 293 arc is about not talking a gate out of its answer. It re-guards before EVERY lane, because a
@@ -37,6 +42,7 @@ THREADS="${FT_PHASE_CHECK_THREADS:-16}"
 OUT_DIR="${FT_PHASE_CHECK_OUT:-/data/tmp/ft-phase-column-check}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GUARD="$REPO_ROOT/scripts/measurement_window_guard.sh"
+WINDOW="$REPO_ROOT/scripts/h2h_window.sh"
 
 cd "$REPO_ROOT" || exit 2
 mkdir -p "$OUT_DIR"
@@ -125,18 +131,39 @@ lane () {
     local label="$1" bin="$2" arg="$3" fields="$4"
     say ""
     say "########## $label ##########"
-    if ! "$GUARD" --max-load 35 >> "$LOG" 2>&1; then
-        say "  GUARD REFUSED before this lane — SKIPPED (the window shut mid-run)"
+    say "  loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
+    local out="$OUT_DIR/${label// /_}_$STAMP.out"
+    # THE WINDOW IS HELD FOR THE LANE, NOT CHECKED BEFORE IT — frankentorch-8vukf.
+    #
+    # This used to re-guard and then run the binary, which is admission-only: the guard answers
+    # "is the host quiet right now" and cannot see a peer that starts one second later. 8vukf
+    # records exactly that — a guard-admitted conv2d run with an h2h peer appearing at 283% CPU
+    # mid-sample, both arms contended, drift and load-series PASS throughout.
+    #
+    # `h2h_window.sh` acquires an flock, THEN runs the guard inside it, then runs the lane — so
+    # the per-lane re-guard this script has always done is preserved (it is the reason the first
+    # real run caught its own build shutting the window), and the window now stays held for the
+    # lane's whole duration. `--max-load 35` is dropped because it was always the guard's own
+    # default; FT_GUARD_MAX_LOAD says the same thing explicitly through the wrapper.
+    #
+    # shellcheck disable=SC2086
+    FT_GUARD_MAX_LOAD=35 RAYON_NUM_THREADS="$THREADS" \
+        "$WINDOW" "$bin" $REPS $arg > "$out" 2>&1
+    local rc=$?
+    cat "$out" >> "$LOG"
+    # 75 = a peer holds the window, 76 = the window was ours but the host is unfit. Both mean
+    # NOTHING WAS MEASURED, which is a skip and not a lane error — conflating them would report a
+    # busy host as a broken instrument, and this script exists to tell those apart.
+    if [ $rc -eq 75 ] || [ $rc -eq 76 ]; then
+        if [ $rc -eq 75 ]; then
+            say "  WINDOW BUSY (a peer measurement holds it) — SKIPPED"
+        else
+            say "  GUARD REFUSED inside the window — SKIPPED (the window shut mid-run)"
+        fi
         VERDICT_LINES+=("$label: SKIPPED (no window)")
         INCOMPLETE=1
         return
     fi
-    say "  loadavg $(cut -d' ' -f1-3 /proc/loadavg)"
-    local out="$OUT_DIR/${label// /_}_$STAMP.out"
-    # shellcheck disable=SC2086
-    RAYON_NUM_THREADS="$THREADS" "$bin" $REPS $arg > "$out" 2>&1
-    local rc=$?
-    cat "$out" >> "$LOG"
     if [ $rc -ne 0 ]; then
         say "  lane exited rc=$rc"
         VERDICT_LINES+=("$label: ERROR rc=$rc")

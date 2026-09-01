@@ -1,0 +1,12 @@
+phase_column_check.sh lane-wiring smoke — frankentorch-8vukf adoption
+generated 2026-09-01T20:24:29Z on thinkstation1  HEAD ecd7f791
+tests the exact invocation form lane() now uses, with a stub binary, so the wiring is checked
+without paying for the script's four-binary rch build.
+
+  PASS  1. lane invocation passes args and RAYON_NUM_THREADS through, rc=0
+  PASS  2. a lane's own non-zero exit passes through as itself
+  PASS  3. a held window gives 75 (lane() -> SKIPPED, not ERROR)
+  PASS  4. an unfit host gives 76 (lane() -> SKIPPED, not ERROR)
+
+phase-lane wiring smoke PASS
+smoke_exit=0

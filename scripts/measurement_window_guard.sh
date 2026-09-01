@@ -20,7 +20,25 @@
 #
 # DELETION CONDITION: delete this when `acquire_build_slot` works, and use the slot instead.
 #
-# Usage:  scripts/measurement_window_guard.sh && <your timed run>
+# THE ENTRY POINT FOR A MEASUREMENT IS NOT THIS SCRIPT — it is
+#
+#     scripts/h2h_window.sh <your timed run>
+#
+# which takes an flock, runs THIS guard inside it, and holds the window for the run's whole
+# duration. Use that, and drop any separate `guard &&` prefix.
+#
+# WHY THE OLD PATTERN IS NOT ENOUGH (frankentorch-8vukf). `guard && <run>` is an ADMISSION check:
+# it answers "is the host quiet right now" and cannot see a peer that starts one second later.
+# 8vukf's repro is exactly that — this guard admitted at poll 2, and DURING the admitted run an
+# h2h peer appeared at 283% CPU; both arms were contended while load-series and drift stayed PASS.
+# It also leaves a gap of its own: two callers can both pass admission and only then race, so the
+# loser had already decided the host was quiet. `h2h_window.sh` acquires first and admits second,
+# which closes both.
+#
+# Usage, still supported and still correct as far as it goes — it now also refuses for the
+# DURATION of a peer's run, because of the window limb below:
+#
+#         scripts/measurement_window_guard.sh && <your timed run>
 #         scripts/measurement_window_guard.sh --max-load 30 && ...
 #
 # NEVER PUT THIS IN A PIPELINE. `if guard 2>&1 | head -3; then <measure>; fi` tests the PIPELINE's
