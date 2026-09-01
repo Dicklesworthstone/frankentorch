@@ -9,3 +9,4 @@ row_plan=seed a first incumbent observation, then run one same-level conditioned
 guard_plan=poll inline every approximately 180 seconds for at most 1200 seconds; never use a refused guard as fallback permission
 poll=1 utc=2026-09-01T18:43:51Z guard=REFUSED peer_measurements=2
 poll=2 utc=2026-09-01T18:46:29Z guard=REFUSED peer_measurements=2
+poll=3 utc=2026-09-01T18:48:47Z guard=REFUSED peer_measurements=3
