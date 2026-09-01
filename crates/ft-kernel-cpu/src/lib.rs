@@ -25306,6 +25306,45 @@ static LU_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 /// NOT BIT-EXACT — blocking reassociates, and getrf is tolerance-validated for that reason.
 const LU_NB_SHIPPED: usize = 64;
 
+/// getri (`lu_inverse_from_factor_f64`) blocking width, overridable for its sweep.
+/// `frankentorch-stale-tuning-constants-lzku6` lane 2. 0 = the shipped default.
+///
+/// SEPARATE FROM getrf's KNOB. The census that opened this lane found that `inv` does NOT go
+/// through `lu_solve_contiguous_f64` — neither does slogdet — so the constant `inv` actually
+/// executes is THIS one, and it is a different function with a different blocking tradeoff from
+/// the factorisation's. Re-tuning the wrong constant would have measured nothing, which is ledger
+/// 292's finding restated.
+static LU_INV_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The shipped getri blocking width. Still 64 — this lane measures whether it should stay.
+const LU_INV_NB_SHIPPED: usize = 64;
+
+/// Override the getri blocking width; `0` restores the shipped default.
+#[doc(hidden)]
+pub fn set_lu_inv_nb(nb: usize) -> usize {
+    LU_INV_NB.swap(nb, LuOrdering::Relaxed)
+}
+
+fn lu_inv_nb() -> usize {
+    match LU_INV_NB.load(LuOrdering::Relaxed) {
+        0 => LU_INV_NB_SHIPPED,
+        v => v.max(1),
+    }
+}
+
+/// The two halves of `lu_inverse_from_factor_f64`, counted in the call.
+static LU_INV_FWD_NS: AtomicU64 = AtomicU64::new(0);
+static LU_INV_BACK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset the getri halves: `(forward_ns, backward_ns)`.
+#[doc(hidden)]
+pub fn lu_inverse_half_take_ns() -> (u64, u64) {
+    (
+        LU_INV_FWD_NS.swap(0, LuOrdering::Relaxed),
+        LU_INV_BACK_NS.swap(0, LuOrdering::Relaxed),
+    )
+}
+
 /// Override the getrf blocking width; `0` restores the shipped default. Returns the previous value.
 #[doc(hidden)]
 pub fn set_lu_nb(nb: usize) -> usize {
@@ -26803,7 +26842,7 @@ pub fn set_lu_inv_identity_struct(on: bool) -> bool {
 fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let n = factor.n;
     let lu = &factor.lu;
-    const NB: usize = 64;
+    let nb_width = lu_inv_nb();
 
     // Z starts as the PLAIN identity: no row permutation, because the permutation is deferred to
     // a single column pass at the end.
@@ -26812,13 +26851,14 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         x[i * n + i] = 1.0;
     }
 
-    let mut panel = vec![0.0f64; n * NB];
-    let mut ypanel = vec![0.0f64; NB * n];
+    let mut panel = vec![0.0f64; n * nb_width];
+    let mut ypanel = vec![0.0f64; nb_width * n];
 
+    let __t_fwd = std::time::Instant::now();
     // FORWARD: L y = I, restricted to the columns that can be nonzero.
     let mut k0 = 0;
     while k0 < n {
-        let pe = (k0 + NB).min(n);
+        let pe = (k0 + nb_width).min(n);
         let nb = pe - k0;
         // Rows [k0, pe) are zero in every column c >= pe, so only columns [0, pe) carry anything.
         let cols = pe;
@@ -26852,10 +26892,12 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         k0 = pe;
     }
 
+    LU_INV_FWD_NS.fetch_add(__t_fwd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+    let __t_back = std::time::Instant::now();
     // BACK: U z = y, over all n columns — `y` is triangular but `z` is dense.
     let mut peb = n;
     while peb > 0 {
-        let k0 = peb.saturating_sub(NB);
+        let k0 = peb.saturating_sub(nb_width);
         let nb = peb - k0;
         for i in (k0..peb).rev() {
             let xi = i * n;
@@ -26893,6 +26935,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         peb = k0;
     }
 
+    LU_INV_BACK_NS.fetch_add(__t_back.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
     // A^-1[:, pivots[c]] = Z[:, c]. A COLUMN permutation, but done row by row: each row is 8n
     // bytes and both the source and destination row stay resident while it is scattered, so this
     // is nothing like the 8 KiB-stride column gather that item 274 removed from `lu_solve`.

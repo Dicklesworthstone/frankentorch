@@ -38,7 +38,7 @@
 //! it: at n=256 two arms timed 1.32x apart produced identical singular-value sums, because the QR
 //! sweep converges to the same rounded values from slightly different bidiagonal input.
 //!
-//! Run (must be local; rch workers have no PyTorch):
+//! Run (build remotely, then run the returned ELF locally; rch workers have no PyTorch):
 //! ```text
 //! RAYON_NUM_THREADS=8 PYTORCH_PYTHON=/data/tmp/torchvenv-2121/bin/python \
 //!   cargo run --release -p frankentorch-api --example bidiag_gate_sweep_h2h
@@ -49,6 +49,10 @@
 //! `FT_FORM_P_BLOCKED` (`1` = shipped compact-WY expansion, `0` = unblocked dorg2r),
 //! `FT_GATE_HOIST` (`1` = snapshot the gate once per panel, `0` = legacy per-reflector lookup),
 //! `FT_ROUNDS` (default 9) and `FT_H2H_WARMUP` (default 8, read by BOTH arms).
+//! `FT_OP=cholesky_f32` requires `FT_CHOLNBF32=shipped,candidate` and expands that pair to
+//! `shipped,candidate,shipped,candidate`: the two duplicate arms provide one A/A null for each
+//! NB. It uses the same SPD fixture cast to f32 on both sides and accepts f32 checksum parity at
+//! `1e-5` relative error.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
@@ -76,6 +80,9 @@ enum LinalgOp {
     Ormqr,
     /// Cholesky of an SPD matrix. Unique factorisation, so parity is unambiguous.
     Cholesky,
+    /// Native f32 Cholesky of an SPD matrix. This is deliberately a separate lane: f32
+    /// factorises in its input dtype and needs its own parity tolerance and NB control.
+    CholeskyF32,
     /// slogdet — computed via LU, so it prices the LU path with a SCALAR checksum that is
     /// invariant to pivot order. Chosen over plain `det` because the SPD fixture's
     /// determinant (~n^n) is not representable in f64 at n=512.
@@ -184,6 +191,10 @@ struct Arm {
     /// prices the new default against the OLD one inside a single invocation, with the shipped
     /// value as arm0 so the toggled arm is the one that departs from production.
     cholesky_nb: usize,
+    /// `frankentorch-stale-tuning-constants-lzku6`: f32 Cholesky blocking width; `0` is the
+    /// shipped f32 default (128). Kept independent from the f64 knob because the two dtypes
+    /// have different panel and trailing-update traffic.
+    cholesky_nb_f32: usize,
     /// `frankentorch-valnx`: getrf blocking width; 0 = the shipped default. `FT_LUNB=0,128`
     /// prices the new default against the OLD one, shipped value as arm0.
     lu_nb: usize,
@@ -250,7 +261,7 @@ struct Arm {
     eigvalsh_two_stage_band: Option<usize>,
 }
 
-fn arm_label(arm: Arm) -> String {
+fn arm_label(arm: Arm, op: LinalgOp) -> String {
     let gate = if arm.gate == u64::MAX {
         "SERIAL".to_string()
     } else {
@@ -278,6 +289,15 @@ fn arm_label(arm: Arm) -> String {
         + &format!("/panelmode{}", arm.panel_mode)
         + &(if arm.cholesky_nb == 0 { "/nbSHIPPED".to_string() } else { format!("/nb{}", arm.cholesky_nb) })
         + &(if arm.lu_nb == 0 { "/luSHIPPED".to_string() } else { format!("/lunb{}", arm.lu_nb) })
+        + &(if op == LinalgOp::CholeskyF32 {
+            if arm.cholesky_nb_f32 == 0 {
+                "/f32nbSHIPPED".to_string()
+            } else {
+                format!("/f32nb{}", arm.cholesky_nb_f32)
+            }
+        } else {
+            String::new()
+        })
         + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
         + &(match arm.panel_par_min {
             Some(v) => format!("/ppm{v}"),
@@ -445,6 +465,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_subtile = ft_kernel_cpu::set_dgemm_sub_tile_2d(arm.sub_tile_2d);
     let previous_panelmode = ft_kernel_cpu::set_cholesky_panel_mode(arm.panel_mode);
     let previous_cholnb = ft_kernel_cpu::set_cholesky_nb(arm.cholesky_nb);
+    let previous_cholnb_f32 = ft_kernel_cpu::set_cholesky_nb_f32(arm.cholesky_nb_f32);
     let previous_lunb = ft_kernel_cpu::set_lu_nb(arm.lu_nb);
     let previous_subcols = ft_kernel_cpu::set_dgemm_sub_block_cols(arm.sub_cols);
     let previous_ppm = arm.panel_par_min.map(ft_kernel_cpu::set_lu_panel_par_min);
@@ -464,9 +485,16 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         arm.eigh_bt_par_min
     });
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-    let x = session
-        .tensor_variable(data.to_vec(), vec![n, n], false)
-        .expect("svd leaf");
+    let x = if op == LinalgOp::CholeskyF32 {
+        let values: Vec<f32> = data.iter().map(|&value| value as f32).collect();
+        session
+            .tensor_variable_f32(values, vec![n, n], false)
+            .expect("cholesky f32 leaf")
+    } else {
+        session
+            .tensor_variable(data.to_vec(), vec![n, n], false)
+            .expect("linalg f64 leaf")
+    };
     // ORGQR IS TIMED SEPARATELY, because its input must be produced OUTSIDE the clock.
     // `tensor_geqrf` is itself a measured 226x defect; timing it here would drown the very
     // thing this lane exists to isolate. The incumbent does the same -- its geqrf runs at
@@ -500,6 +528,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
+        ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
         ft_kernel_cpu::set_lu_nb(previous_lunb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
@@ -540,6 +569,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
         ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
         ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
+        ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
         ft_kernel_cpu::set_lu_nb(previous_lunb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
         if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
@@ -603,6 +633,11 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 let d = session.tensor_diagonal(l, 0).expect("diag");
                 session.tensor_abs(d).expect("abs")
             }
+            LinalgOp::CholeskyF32 => {
+                let l = session.tensor_linalg_cholesky(x, false).expect("cholesky f32");
+                let d = session.tensor_diagonal(l, 0).expect("diag f32");
+                session.tensor_abs(d).expect("abs f32")
+            }
             LinalgOp::Qr => {
                 let (_q, r) = session.tensor_linalg_qr(x, false).expect("qr");
                 let d = session.tensor_diagonal(r, 0).expect("diag");
@@ -620,11 +655,19 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         }
     };
     let ms = started.elapsed().as_secs_f64() * 1e3;
-    let sum: f64 = session
-        .tensor_values(sv)
-        .expect("singular values")
-        .iter()
-        .sum();
+    let sum: f64 = if op == LinalgOp::CholeskyF32 {
+        session
+            .tensor_values_f32(sv)
+            .expect("cholesky f32 values")
+            .into_iter()
+            .sum::<f32>() as f64
+    } else {
+        session
+            .tensor_values(sv)
+            .expect("linalg f64 values")
+            .iter()
+            .sum()
+    };
     ft_kernel_cpu::bidiag_parallel_gate_set(previous_gate);
     ft_kernel_cpu::bidiag_parallel_gate_hoisted_set(previous_gate_hoisted);
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
@@ -638,6 +681,7 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_dgemm_sub_tile_2d(previous_subtile);
     ft_kernel_cpu::set_cholesky_panel_mode(previous_panelmode);
     ft_kernel_cpu::set_cholesky_nb(previous_cholnb);
+    ft_kernel_cpu::set_cholesky_nb_f32(previous_cholnb_f32);
     ft_kernel_cpu::set_lu_nb(previous_lunb);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
     if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
@@ -699,18 +743,55 @@ fn ratio_label(ratio: f64) -> String {
     }
 }
 
+fn parity_tolerance(op: LinalgOp) -> f64 {
+    if op == LinalgOp::CholeskyF32 {
+        1e-5
+    } else {
+        1e-9
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // FT_OP selects WHICH dense-linalg op both arms run. Parse it before constructing the arm
+    // grid: the f32 Cholesky lane owns its four-arm (A/B/A/B) certification layout rather than
+    // inheriting irrelevant bidiagonal gate values.
+    let op = std::env::var("FT_OP").unwrap_or_else(|_| "svd".to_owned());
+    let ft_op = match op.as_str() {
+        "svd" => LinalgOp::Svd,
+        "svdvals" => LinalgOp::Svdvals,
+        "eigh" => LinalgOp::Eigh,
+        "eigvalsh" => LinalgOp::Eigvalsh,
+        "qr" => LinalgOp::Qr,
+        "geqrf" => LinalgOp::Geqrf,
+        "orgqr" => LinalgOp::Orgqr,
+        "ormqr" => LinalgOp::Ormqr,
+        "cholesky" => LinalgOp::Cholesky,
+        "cholesky_f32" => LinalgOp::CholeskyF32,
+        "slogdet" => LinalgOp::Slogdet,
+        "matrix_exp" => LinalgOp::MatrixExp,
+        "inv" => LinalgOp::Inv,
+        "lu_factor" => LinalgOp::LuFactor,
+        other => panic!(
+            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|cholesky_f32|slogdet|matrix_exp|inv|lu_factor"
+        ),
+    };
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let sizes: Vec<usize> = std::env::var("FT_GATE_SIZES")
         .unwrap_or_else(|_| "128,136,256,512".to_string())
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
         .collect();
-    let gate_values: Vec<u64> = std::env::var("FT_GATE_VALUES")
-        .unwrap_or_else(|_| format!("262144,{}", u64::MAX))
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
+    let gate_values: Vec<u64> = if ft_op == LinalgOp::CholeskyF32 {
+        // Cholesky does not read this SVD gate. One stable value avoids multiplying the f32
+        // A/B/A/B certification quartet by an unrelated default control.
+        vec![262_144]
+    } else {
+        std::env::var("FT_GATE_VALUES")
+            .unwrap_or_else(|_| format!("262144,{}", u64::MAX))
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .collect()
+    };
     let rowdots: Vec<bool> = std::env::var("FT_ROWDOT")
         .unwrap_or_else(|_| "1".to_string())
         .split(',')
@@ -890,6 +971,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .unwrap_or_else(|| vec![0]);
+    let cholnbs_f32: Vec<usize> = if ft_op == LinalgOp::CholeskyF32 {
+        let requested: Vec<usize> = std::env::var("FT_CHOLNBF32")
+            .expect("FT_OP=cholesky_f32 requires FT_CHOLNBF32=shipped,candidate")
+            .split(',')
+            .filter_map(|v| v.trim().parse::<usize>().ok())
+            .collect();
+        assert!(
+            requested.len() == 2 && requested[0] != requested[1],
+            "FT_CHOLNBF32 must contain exactly two distinct widths: shipped,candidate"
+        );
+        // Two duplicate-arm controls are part of this lane's contract. The round-order reversal
+        // below interleaves all four arms and each is paired with a live Torch sample.
+        vec![requested[0], requested[1], requested[0], requested[1]]
+    } else {
+        vec![0]
+    };
     let lunbs: Vec<usize> = std::env::var("FT_LUNB")
         .ok()
         .map(|raw| {
@@ -957,6 +1054,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for &sub_tile_2d in &subtiles {
                             for &panel_mode in &panelmodes {
                             for &cholesky_nb in &cholnbs {
+                            for &cholesky_nb_f32 in &cholnbs_f32 {
                             for &lu_nb in &lunbs {
                                 for &sub_cols in &subcols {
                                   for &panel_par_min in &ppms {
@@ -983,6 +1081,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         sub_tile_2d,
                                         panel_mode,
                                         cholesky_nb,
+                                        cholesky_nb_f32,
                                         lu_nb,
                                         sub_cols,
                                         panel_par_min,
@@ -1007,6 +1106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                    }
                                   }
                                 }
+                            }
                             }
                             }
                             }
@@ -1057,6 +1157,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         values_arm.values_only = true;
         arms.push(values_arm);
     }
+    if ft_op == LinalgOp::CholeskyF32 {
+        assert_eq!(
+            arms.len(),
+            4,
+            "f32 Cholesky certification is exactly shipped/candidate/shipped/candidate; \
+             unset unrelated FT_* sweep controls"
+        );
+    }
     let rounds: usize = std::env::var("FT_ROUNDS")
         .ok()
         .and_then(|t| t.trim().parse().ok())
@@ -1093,24 +1201,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DIFFERENT matrix than our arm sees, and the parity checksum would compare two answers to
     // two different questions. `(A + A.T) * 0.5` on both sides is what makes the row mean
     // anything.
-    let ft_op = match op.as_str() {
-        "svd" => LinalgOp::Svd,
-        "svdvals" => LinalgOp::Svdvals,
-        "eigh" => LinalgOp::Eigh,
-        "eigvalsh" => LinalgOp::Eigvalsh,
-        "qr" => LinalgOp::Qr,
-        "geqrf" => LinalgOp::Geqrf,
-        "orgqr" => LinalgOp::Orgqr,
-        "ormqr" => LinalgOp::Ormqr,
-        "cholesky" => LinalgOp::Cholesky,
-        "slogdet" => LinalgOp::Slogdet,
-        "matrix_exp" => LinalgOp::MatrixExp,
-        "inv" => LinalgOp::Inv,
-        "lu_factor" => LinalgOp::LuFactor,
-        other => panic!(
-            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp|inv"
-        ),
-    };
     let (py_fn, sym) = match op.as_str() {
         "svd" => ("torch.linalg.svd(A)[1]", false),
         "svdvals" => ("torch.linalg.svdvals(A)", false),
@@ -1146,6 +1236,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // mismatch. That is why this op was chosen over ldl_factor, whose Bunch-Kaufman
         // pivoting may legitimately differ and would make the parity column unreadable.
         "cholesky" => ("torch.linalg.cholesky(A).diagonal().abs()", false),
+        // f32 has a native FrankenTorch no-grad kernel and Torch is deliberately handed the
+        // same f32 leaf. Reusing the f64 SPD fixture and casting once before either timer keeps
+        // the matrix construction out of the lane while making the input bits identical.
+        "cholesky_f32" => ("torch.linalg.cholesky(A).diagonal().abs()", false),
         // slogdet: exercises the LU path with a SCALAR, pivot-order-invariant checksum.
         // See the Rust arm for why this was chosen over lu_factor and over plain det.
         "slogdet" => ("torch.linalg.slogdet(A)[1].abs().reshape(1)", false),
@@ -1159,7 +1253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Rust arm for why the fixture is scaled by 1/n.
         "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
         other => panic!(
-            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|slogdet|matrix_exp"
+            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|cholesky_f32|slogdet|matrix_exp|inv|lu_factor"
         ),
     };
     let lanes: Vec<(usize, String)> = sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
@@ -1177,6 +1271,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("torch.geqrf({mk}({n}, False))")
             } else if op == "cholesky" || op == "slogdet" || op == "inv" || op == "lu_factor" {
                 format!("_spd({n}, {mk})")
+            } else if op == "cholesky_f32" {
+                format!("_spd({n}, {mk}).to(torch.float32)")
             } else if op == "matrix_exp" {
                 format!("_expm_fixture({n}, {mk})")
             } else if op == "ormqr" {
@@ -1279,7 +1375,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
     );
     println!(
         "arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): {:?}",
-        arms.iter().map(|a| arm_label(*a)).collect::<Vec<_>>()
+        arms.iter().map(|a| arm_label(*a, ft_op)).collect::<Vec<_>>()
     );
     println!(
         "null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's \
@@ -1339,6 +1435,7 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             }
             d
         } else if ft_op == LinalgOp::Cholesky
+            || ft_op == LinalgOp::CholeskyF32
             || ft_op == LinalgOp::Slogdet
             || ft_op == LinalgOp::Inv
             || ft_op == LinalgOp::LuFactor
@@ -1558,13 +1655,13 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                  {:8.3} ms  paired-vs-PT {}  paired-vs-arm0 {:.3}x  branches {:?}  \
                  dgemm_sub(2d,col) {:?}  \
                  parity rel {rel:.2e} {}",
-                arm_label(*arm),
+                arm_label(*arm, ft_op),
                 pt_ms[idx].iter().copied().fold(f64::INFINITY, f64::min),
                 ratio_label(median(&mut vs_pt)),
                 median(&mut vs_arm0),
                 branches[idx],
                 sub_arms[idx],
-                if rel < 1e-9 { "MATCH" } else { "MISMATCH" }
+                if rel < parity_tolerance(ft_op) { "MATCH" } else { "MISMATCH" }
             );
             let (reduction, form_pq, sweep) = phases[idx];
             let total = (reduction + form_pq + sweep).max(1) as f64;
@@ -1579,6 +1676,27 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 100.0 * sweep as f64 / total
             );
         }
+        if ft_op == LinalgOp::CholeskyF32 {
+            assert_eq!(arms.len(), 4, "f32 Cholesky certification requires exactly A/B/A/B arms");
+            assert_eq!(arms[0].cholesky_nb_f32, arms[2].cholesky_nb_f32);
+            assert_eq!(arms[1].cholesky_nb_f32, arms[3].cholesky_nb_f32);
+            let mut shipped_null: Vec<f64> = ft_ms[2]
+                .iter()
+                .zip(&ft_ms[0])
+                .map(|(duplicate, original)| original / duplicate)
+                .collect();
+            let mut candidate_null: Vec<f64> = ft_ms[3]
+                .iter()
+                .zip(&ft_ms[1])
+                .map(|(duplicate, original)| original / duplicate)
+                .collect();
+            println!(
+                "  cholesky_f32 dual A/A nulls: shipped arm2/arm0 {:.3}x; candidate arm3/arm1 \
+                 {:.3}x (both must be 0.970..=1.030 for certification)",
+                median(&mut shipped_null),
+                median(&mut candidate_null),
+            );
+        }
         // Same gate, different step-(12) kernel, MUST agree bit-for-bit: the four-row kernel
         // preserves each row's own summation order. An assertion rather than a print because it
         // is the only thing standing between an index bug in that kernel and a silently wrong
@@ -1591,8 +1709,8 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                         ft_sum[j].to_bits(),
                         "n={n}: {} and {} differ, but the step-(12) kernels are supposed to be \
                          bit-identical",
-                        arm_label(*a),
-                        arm_label(*b)
+                        arm_label(*a, ft_op),
+                        arm_label(*b, ft_op)
                     );
                 }
             }
