@@ -42269,3 +42269,61 @@ counter rather than at a gate. Their write sites are all on the calling thread (
 inside are what is being TIMED, not where the recording happens) and no caller invokes them from a
 worker, so the same fix transfers; it is not done here because those counters are read by the
 blocked-factorisation sweeps and that is a different campaign's instrument.
+
+### 293f. THE SAME OWNERSHIP, A DIFFERENT CLAIM POINT: getrf AND CHOLESKY STAGE COUNTERS
+
+`frankentorch-ebbew`, second half, extending 293e from ORMQR to the two families named there as
+the standing hazard — `getrf_phase_attribution` and
+`cholesky_blocked_phase_counters_cover_each_live_stage`, which had the identical shape and had not
+fired **yet**.
+
+**THE MECHANISM COULD NOT BE COPIED, AND THAT IS THE ITEM.** 293e narrowed ORMQR's existing
+`set_ormqr_stage_profile_enabled` to the enabling thread. These families have **no enable flag**:
+they record unconditionally, because the four `*_nb_sweep` harnesses simply call
+`*_stage_take_ns()` around a kernel call and read the phase columns. Adding an enable requirement
+would have silently zeroed every one of those columns — **an instrument reading 0 for a phase that
+demonstrably ran is a worse defect than the race being fixed**, and is item 292's trap exactly.
+
+So ownership is **claimed at the DRAIN**:
+
+    fn stage_family_add(counter, owner, ns)  // records iff owner == 0 (unclaimed) or owner == me
+    fn stage_family_claim(owner)             // called by the family's *_take_ns() accessor
+
+`0` means unclaimed and everyone records — today's behaviour, which production and the sweeps keep
+— and a thread claims a family by draining it. That is precisely the `take(); kernel(); take()`
+idiom every existing reader already uses, so **the claim lands at the right instant without a
+single caller changing a line**. After it, a concurrent thread running the same kernel records
+nothing. Twelve write sites (getrf panel/pivot/swap/solve/trailing, cholesky f64
+panel/TRSM/trailing/zero, cholesky f32 panel/TRSM/trailing), four drain accessors, three owners —
+f32's kept separate from f64's for the same reason its counters are, since a bucket shared across
+two dtypes is how ledger 277a invented a phase that did not exist. One relaxed load against an RMW
+that was already happening.
+
+**SERIALIZATION, as for ORMQR.** `STAGE_COUNTER_TEST_GUARD` is held by both draining tests.
+Ownership stops a non-reading thread polluting; it does not order two READERS, since both claim and
+the second silently owns counters the first is still accumulating into. One guard across all
+families rather than one per family — a future reader that forgets which family it shares with is
+the mistake this is meant to be too coarse to allow.
+
+**THE REGRESSION TEST ASSERTS ZERO, NOT "LESS".** After this thread claims, a foreign thread running
+four rounds of getrf, cholesky and cholesky-f32 must contribute exactly `(0,0,0)`, `(0,0,0,0)` and
+`(0,0,0)`. A nanosecond threshold would be a flake generator and this arc has spent enough on those.
+It then asserts each family still records for its OWNER — **without that half, silently disabling
+every counter would pass every zero-assertion**, which is the failure mode this whole change is
+designed to avoid.
+
+**EVIDENCE.** Five consecutive full-suite runs, default parallel runner, **767 passed / 0 failed**
+each (up from 765; one of the two additions is this change's regression test, the other a peer's).
+clippy `--lib --tests`: no findings naming any new symbol. And the check that actually mattered —
+**the sweeps still report their phases**, verified by running the rebuilt harnesses rather than by
+reasoning about them:
+
+    cholesky f64 n=512  panel 0.9851  TRSM 1.3556  trail 3.3736  zero 0.3221
+    cholesky f32 n=512  panel 0.2398  TRSM 2.4846  trail 1.3990
+    getrf        n=512  panel 2.3301  solve 1.5117  trail 1.8862
+
+**WHAT IS LEFT.** `lu_solve_half_take_ns`, `lu_inverse_half_take_ns` and the census drains
+(`lu_inverse_census_take`, `householder_skinny_census_take`, `cholesky_panel_census_take`,
+`dgemm_bt_sub_census_take`) are the same shape and are NOT converted. No test reads them today —
+only sweeps do, one thread per process — so they are exposure, not a live defect. The helper takes
+any `(counter, owner)` pair, so each is a two-line change if one ever becomes a test's instrument.
