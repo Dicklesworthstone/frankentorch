@@ -8,10 +8,10 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-ft-api = { path = "../crates/ft-api" }
-ft-core = { path = "../crates/ft-core" }
-ft-dispatch = { path = "../crates/ft-dispatch" }
-ft-kernel-cpu = { path = "../crates/ft-kernel-cpu" }
+ft-api = { package = "frankentorch-api", path = "../crates/ft-api" }
+ft-core = { package = "frankentorch-core", path = "../crates/ft-core" }
+ft-dispatch = { package = "frankentorch-dispatch", path = "../crates/ft-dispatch" }
+ft-kernel-cpu = { package = "frankentorch-kernel-cpu", path = "../crates/ft-kernel-cpu" }
 ft-serialize = { path = "../crates/ft-serialize" }
 libfuzzer-sys = "0.4.7"
 
