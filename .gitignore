@@ -157,6 +157,9 @@ artifacts/perf/**/*.data.old
 # Ad-hoc compiled probe binary that lands at the repo root (e.g. building a
 # probe example without --target-dir); a ~4MB ELF, never a tracked artifact.
 /probe
+# rustc metadata leftovers from the same root probe compiles
+# (`libprobe.rmeta`, `libprobe_*_linux.rmeta`, …). Normal builds stay in target/.
+/*.rmeta
 # br doctor per-run artifacts
 .doctor/
 
