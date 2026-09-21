@@ -196,11 +196,7 @@
       "parameter_keys": ["encoder.bias", "encoder.weight"],
       "persistent_buffer_keys": ["encoder.running_mean"],
       "non_persistent_buffer_keys": ["encoder.scratch"],
-      "expected_state_keys": [
-        "encoder.bias",
-        "encoder.running_mean",
-        "encoder.weight"
-      ],
+      "expected_state_keys": ["encoder.bias", "encoder.running_mean", "encoder.weight"],
       "strict": {
         "expect_pass": true,
         "expected_reason_code": "nn_state_state_export_ok"
@@ -301,23 +297,10 @@
       "operation": "state_export",
       "module_path": "root.block",
       "state_key_kind": "state_dict",
-      "parameter_keys": [
-        "encoder.weight",
-        "encoder.weight",
-        "decoder.weight"
-      ],
-      "persistent_buffer_keys": [
-        "encoder.running_mean"
-      ],
-      "non_persistent_buffer_keys": [
-        "encoder.tmp",
-        "encoder.tmp"
-      ],
-      "expected_state_keys": [
-        "decoder.weight",
-        "encoder.running_mean",
-        "encoder.weight"
-      ],
+      "parameter_keys": ["encoder.weight", "encoder.weight", "decoder.weight"],
+      "persistent_buffer_keys": ["encoder.running_mean"],
+      "non_persistent_buffer_keys": ["encoder.tmp", "encoder.tmp"],
+      "expected_state_keys": ["decoder.weight", "encoder.running_mean", "encoder.weight"],
       "strict": {
         "expect_pass": true,
         "expected_reason_code": "nn_state_state_export_ok"
@@ -337,17 +320,10 @@
       "operation": "state_export",
       "module_path": "root",
       "state_key_kind": "buffer",
-      "parameter_keys": [
-        "head.weight"
-      ],
+      "parameter_keys": ["head.weight"],
       "persistent_buffer_keys": [],
-      "non_persistent_buffer_keys": [
-        "head.scratch",
-        "head.dropout_mask"
-      ],
-      "expected_state_keys": [
-        "head.weight"
-      ],
+      "non_persistent_buffer_keys": ["head.scratch", "head.dropout_mask"],
+      "expected_state_keys": ["head.weight"],
       "strict": {
         "expect_pass": true,
         "expected_reason_code": "nn_state_state_export_ok"
@@ -367,17 +343,9 @@
       "operation": "state_export",
       "module_path": "root.deep",
       "state_key_kind": "state_dict",
-      "parameter_keys": [
-        "layer2.bias",
-        "layer1.weight",
-        "layer2.weight"
-      ],
-      "persistent_buffer_keys": [
-        "layer1.running_var"
-      ],
-      "non_persistent_buffer_keys": [
-        "layer1.tmp"
-      ],
+      "parameter_keys": ["layer2.bias", "layer1.weight", "layer2.weight"],
+      "persistent_buffer_keys": ["layer1.running_var"],
+      "non_persistent_buffer_keys": ["layer1.tmp"],
       "expected_state_keys": [
         "layer1.running_var",
         "layer1.weight",
@@ -425,10 +393,7 @@
       "module_path": "root.decoder",
       "state_key_kind": "training_mode",
       "initial_training": true,
-      "training_transitions": [
-        false,
-        true
-      ],
+      "training_transitions": [false, true],
       "expected_training_flag": true,
       "strict": {
         "expect_pass": true,
@@ -450,12 +415,7 @@
       "module_path": "root.encoder",
       "state_key_kind": "training_mode",
       "initial_training": true,
-      "training_transitions": [
-        false,
-        true,
-        false,
-        false
-      ],
+      "training_transitions": [false, true, false, false],
       "expected_training_flag": false,
       "strict": {
         "expect_pass": true,
@@ -476,9 +436,7 @@
       "operation": "load_state",
       "module_path": "root",
       "state_key_kind": "state_dict",
-      "missing_keys": [
-        "encoder.layer0.weight"
-      ],
+      "missing_keys": ["encoder.layer0.weight"],
       "strict": {
         "expect_pass": false,
         "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
@@ -498,9 +456,7 @@
       "operation": "load_state",
       "module_path": "root",
       "state_key_kind": "state_dict",
-      "unexpected_keys": [
-        "head.extra_bias"
-      ],
+      "unexpected_keys": ["head.extra_bias"],
       "strict": {
         "expect_pass": false,
         "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
@@ -542,14 +498,8 @@
       "operation": "prefix_normalization",
       "module_path": "root",
       "state_key_kind": "state_dict",
-      "prefix_keys": [
-        "module.encoder.weight",
-        "module.encoder.bias"
-      ],
-      "expected_canonical_keys": [
-        "module.encoder.bias",
-        "module.encoder.weight"
-      ],
+      "prefix_keys": ["module.encoder.weight", "module.encoder.bias"],
+      "expected_canonical_keys": ["module.encoder.bias", "module.encoder.weight"],
       "allow_prefix_normalization": false,
       "strict": {
         "expect_pass": true,
@@ -572,15 +522,8 @@
       "operation": "prefix_normalization",
       "module_path": "root",
       "state_key_kind": "state_dict",
-      "prefix_keys": [
-        "module.encoder.weight",
-        "decoder.bias",
-        "module.decoder.bias"
-      ],
-      "expected_canonical_keys": [
-        "decoder.bias",
-        "encoder.weight"
-      ],
+      "prefix_keys": ["module.encoder.weight", "decoder.bias", "module.decoder.bias"],
+      "expected_canonical_keys": ["decoder.bias", "encoder.weight"],
       "allow_prefix_normalization": true,
       "strict": {
         "expect_pass": true,
@@ -603,14 +546,8 @@
       "operation": "prefix_normalization",
       "module_path": "root",
       "state_key_kind": "state_dict",
-      "prefix_keys": [
-        "module.head.weight",
-        "head.weight",
-        "module.head.weight"
-      ],
-      "expected_canonical_keys": [
-        "head.weight"
-      ],
+      "prefix_keys": ["module.head.weight", "head.weight", "module.head.weight"],
+      "expected_canonical_keys": ["head.weight"],
       "allow_prefix_normalization": true,
       "strict": {
         "expect_pass": true,
@@ -633,14 +570,8 @@
       "operation": "prefix_normalization",
       "module_path": "root",
       "state_key_kind": "state_dict",
-      "prefix_keys": [
-        "encoder.weight",
-        "decoder.bias"
-      ],
-      "expected_canonical_keys": [
-        "decoder.bias",
-        "encoder.weight"
-      ],
+      "prefix_keys": ["encoder.weight", "decoder.bias"],
+      "expected_canonical_keys": ["decoder.bias", "encoder.weight"],
       "allow_prefix_normalization": true,
       "strict": {
         "expect_pass": true,
@@ -769,12 +700,8 @@
       "module_path": "root",
       "state_key_kind": "assign",
       "assign_flag": true,
-      "missing_keys": [
-        "trunk.weight"
-      ],
-      "unexpected_keys": [
-        "aux.bias"
-      ],
+      "missing_keys": ["trunk.weight"],
+      "unexpected_keys": ["aux.bias"],
       "strict": {
         "expect_pass": false,
         "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
@@ -796,9 +723,7 @@
       "state_key_kind": "state_dict",
       "parameter_keys": [],
       "persistent_buffer_keys": [],
-      "non_persistent_buffer_keys": [
-        "scratch"
-      ],
+      "non_persistent_buffer_keys": ["scratch"],
       "expected_state_keys": [],
       "strict": {
         "expect_pass": true,

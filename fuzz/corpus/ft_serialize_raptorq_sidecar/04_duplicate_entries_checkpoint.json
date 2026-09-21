@@ -1,1 +1,9 @@
-{"schema_version":1,"mode":"strict","entries":[{"node_id":2,"value":1.25,"grad":null},{"node_id":2,"value":1.25,"grad":0.5}],"source_hash":"det64:0000000000000000"}
+{
+  "schema_version": 1,
+  "mode": "strict",
+  "entries": [
+    { "node_id": 2, "value": 1.25, "grad": null },
+    { "node_id": 2, "value": 1.25, "grad": 0.5 }
+  ],
+  "source_hash": "det64:0000000000000000"
+}

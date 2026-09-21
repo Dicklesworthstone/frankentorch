@@ -1,1 +1,12 @@
-{"schema_version":1,"source_hash":"det64:0123456789abcdef","symbol_size":64,"source_symbol_count":3,"repair_symbol_count":11,"constraints_symbol_count":2,"seed":5063807044013876305,"object_id_high":5063804597319128159,"object_id_low":4921962563676855365,"repair_manifest":[{"esi":3,"degree":2,"bytes":64}]}
+{
+  "schema_version": 1,
+  "source_hash": "det64:0123456789abcdef",
+  "symbol_size": 64,
+  "source_symbol_count": 3,
+  "repair_symbol_count": 11,
+  "constraints_symbol_count": 2,
+  "seed": 5063807044013876305,
+  "object_id_high": 5063804597319128159,
+  "object_id_low": 4921962563676855365,
+  "repair_manifest": [{ "esi": 3, "degree": 2, "bytes": 64 }]
+}
