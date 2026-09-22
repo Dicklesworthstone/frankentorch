@@ -6,6 +6,8 @@
 use std::fmt;
 use std::simd::Simd;
 
+#[cfg(target_arch = "x86_64")]
+mod dynamic_int8_x86;
 mod masked_conv2d;
 pub mod pool;
 
@@ -44724,9 +44726,17 @@ pub fn quantize_rows_i8(x: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
     assert_eq!(x.len(), m * k, "x length must equal m*k");
     let mut x_i8 = vec![0i8; m * k];
     let mut a_scales = vec![0f32; m];
+    #[cfg(target_arch = "x86_64")]
+    let quantizer = dynamic_int8_x86::RowQuantizer::detect();
     let quant_row = |dst: &mut [i8], a_scale: &mut f32, row: &[f32]| {
         let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
         let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        #[cfg(target_arch = "x86_64")]
+        if let Some(quantizer) = quantizer {
+            quantizer.quantize(dst, row, scale);
+            *a_scale = scale;
+            return;
+        }
         for (d, &v) in dst.iter_mut().zip(row.iter()) {
             *d = round_ties_even_f32(v / scale).clamp(-127.0, 127.0) as i8;
         }
@@ -44825,6 +44835,13 @@ pub fn linear_int8_dynamic_f32(
 
     // Per-row dynamic quantization of the activations.
     let (x_i8, a_scales) = quantize_rows_i8(x, m, k);
+
+    #[cfg(target_arch = "x86_64")]
+    if let Some(out) = dynamic_int8_x86::try_linear(
+        &x_i8, &a_scales, k, w_i8, w_scales, n, bias,
+    ) {
+        return out;
+    }
 
     // i32-accumulate GEMM + dequant + bias, parallel over output rows. The inner
     // dot product dispatches to a hand-written SIMD kernel (aarch64 SDOT / x86
