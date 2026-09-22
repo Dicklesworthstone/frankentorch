@@ -1,0 +1,156 @@
+name: Dynamic int8 exact parity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/dynamic_int8_exact.yml'
+      - 'crates/ft-kernel-cpu/src/dynamic_int8_x86.rs'
+      - 'crates/ft-kernel-cpu/tests/dynamic_int8_exact.rs'
+  workflow_dispatch:
+
+# Candidate preparation creates only unreferenced Git blobs. It never changes
+# a branch, commits, pushes, opens a PR, or enables the candidate in production.
+# A maintainer must review native test results and explicitly commit the blobs.
+permissions:
+  contents: write
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target_int8_review
+      CARGO_BUILD_JOBS: '2'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-31
+          components: rustfmt
+      - name: Verify anchored source and prepare artifact collection
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD:crates/ft-kernel-cpu/src/lib.rs)" = 38651e5abef0f71dbcbdef547224a336753e6771
+          mkdir -p artifacts/int8_native
+          rustfmt --edition 2024 crates/ft-kernel-cpu/src/dynamic_int8_x86.rs crates/ft-kernel-cpu/tests/dynamic_int8_exact.rs
+          cat > "$RUNNER_TEMP/copy-test.py" <<'PY'
+          import json, pathlib, shutil, sys
+          records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.startswith('{')]
+          matches = [r['executable'] for r in records if r.get('reason') == 'compiler-artifact' and r.get('target', {}).get('name') == sys.argv[2] and r.get('executable')]
+          if len(matches) != 1:
+              raise SystemExit(f'Expected one test executable, found: {matches}')
+          shutil.copy2(matches[0], sys.argv[3])
+          PY
+      - name: Build and run independent baseline regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p frankentorch-kernel-cpu --test dynamic_int8_exact -- --nocapture
+          cargo test --locked -p frankentorch-kernel-cpu --test dynamic_int8_exact --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          python3 "$RUNNER_TEMP/copy-test.py" "$RUNNER_TEMP/build.jsonl" dynamic_int8_exact artifacts/int8_native/baseline_debug
+      - name: Apply reviewed candidate wiring to the anchored worktree only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/int8-wiring.patch" <<'PATCH'
+          diff --git a/crates/ft-kernel-cpu/src/lib.rs b/crates/ft-kernel-cpu/src/lib.rs
+          --- a/crates/ft-kernel-cpu/src/lib.rs
+          +++ b/crates/ft-kernel-cpu/src/lib.rs
+          @@ -6,6 +6,8 @@
+           use std::fmt;
+           use std::simd::Simd;
+           
+          +#[cfg(target_arch = "x86_64")]
+          +mod dynamic_int8_x86;
+           mod masked_conv2d;
+           pub mod pool;
+           
+          @@ -44725,6 +44727,14 @@
+               let mut x_i8 = vec![0i8; m * k];
+               let mut a_scales = vec![0f32; m];
+          +    #[cfg(target_arch = "x86_64")]
+          +    let quantizer = dynamic_int8_x86::RowQuantizer::detect();
+               let quant_row = |dst: &mut [i8], a_scale: &mut f32, row: &[f32]| {
+                   let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
+                   let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+          +        #[cfg(target_arch = "x86_64")]
+          +        if let Some(quantizer) = quantizer {
+          +            quantizer.quantize(dst, row, scale);
+          +            *a_scale = scale;
+          +            return;
+          +        }
+                   for (d, &v) in dst.iter_mut().zip(row.iter()) {
+          @@ -44827,6 +44837,13 @@
+               // Per-row dynamic quantization of the activations.
+               let (x_i8, a_scales) = quantize_rows_i8(x, m, k);
+           
+          +    #[cfg(target_arch = "x86_64")]
+          +    if let Some(out) = dynamic_int8_x86::try_linear(
+          +        &x_i8, &a_scales, k, w_i8, w_scales, n, bias,
+          +    ) {
+          +        return out;
+          +    }
+          +
+               // i32-accumulate GEMM + dequant + bias, parallel over output rows. The inner
+               // dot product dispatches to a hand-written SIMD kernel (aarch64 SDOT / x86
+               // AVX-512-VNNI), bit-identical to the scalar sum but using the int8
+          PATCH
+          git apply --recount --check "$RUNNER_TEMP/int8-wiring.patch"
+          git apply --recount "$RUNNER_TEMP/int8-wiring.patch"
+          git diff --check
+          git diff --stat
+      - name: Build and run candidate debug and release regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p frankentorch-kernel-cpu --test dynamic_int8_exact -- --nocapture
+          cargo test --locked -p frankentorch-kernel-cpu --test dynamic_int8_exact --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          python3 "$RUNNER_TEMP/copy-test.py" "$RUNNER_TEMP/build.jsonl" dynamic_int8_exact artifacts/int8_native/candidate_debug
+          cargo test --locked --release -p frankentorch-kernel-cpu --test dynamic_int8_exact -- --nocapture
+          cargo test --locked --release -p frankentorch-kernel-cpu --test dynamic_int8_exact --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          python3 "$RUNNER_TEMP/copy-test.py" "$RUNNER_TEMP/build.jsonl" dynamic_int8_exact artifacts/int8_native/candidate_release
+          cargo test --locked -p frankentorch-kernel-cpu --lib dynamic_int8_x86::tests -- --nocapture
+          cargo test --locked -p frankentorch-kernel-cpu --lib --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          python3 "$RUNNER_TEMP/copy-test.py" "$RUNNER_TEMP/build.jsonl" ft_kernel_cpu artifacts/int8_native/candidate_unit_debug
+      - name: Publish reviewed source blobs without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          files = [
+              'crates/ft-kernel-cpu/src/lib.rs',
+              'crates/ft-kernel-cpu/src/dynamic_int8_x86.rs',
+              'crates/ft-kernel-cpu/tests/dynamic_int8_exact.rs',
+          ]
+          manifest = {'tested_parent': os.environ['GITHUB_SHA'], 'source_blobs': {}, 'executables': {}}
+          for name in files:
+              data = pathlib.Path(name).read_bytes()
+              payload = json.dumps({'content': base64.b64encode(data).decode('ascii'), 'encoding': 'base64'}).encode()
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs',
+                  data=payload,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'},
+                  method='POST',
+              )
+              with urllib.request.urlopen(request) as response:
+                  sha = json.load(response)['sha']
+              manifest['source_blobs'][name] = sha
+              print('CANDIDATE_BLOB ' + name + ' ' + sha)
+          for binary in pathlib.Path('artifacts/int8_native').glob('*'):
+              if binary.is_file():
+                  manifest['executables'][binary.name] = hashlib.sha256(binary.read_bytes()).hexdigest()
+          pathlib.Path('artifacts/int8_native/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-int8-native-tests
+          path: artifacts/int8_native
+          if-no-files-found: error
+          retention-days: 7
