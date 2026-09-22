@@ -54,6 +54,8 @@ jobs:
           cargo test --locked --release -p frankentorch-kernel-cpu --test dynamic_int8_exact -- --nocapture
           cargo test --locked --release -p frankentorch-kernel-cpu --test dynamic_int8_exact --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
           python3 "$RUNNER_TEMP/copy-test.py" "$RUNNER_TEMP/build.jsonl" dynamic_int8_exact artifacts/int8_native/baseline_release
+          cargo test --locked -p frankentorch-kernel-cpu --lib --no-run --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          python3 "$RUNNER_TEMP/copy-test.py" "$RUNNER_TEMP/build.jsonl" ft_kernel_cpu artifacts/int8_native/baseline_unit_debug
       - name: Apply reviewed candidate wiring to the anchored worktree only
         shell: bash
         run: |

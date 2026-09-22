@@ -129,8 +129,7 @@ fn weights(n: usize, k: usize) -> Vec<i8> {
                 0 => -128,
                 1 => 127,
                 2 => 0,
-                _ => i8::try_from(i16::try_from((i * 29 + 7) % 256).unwrap() - 128)
-                    .unwrap(),
+                _ => i8::try_from(i16::try_from((i * 29 + 7) % 256).unwrap() - 128).unwrap(),
             }
         })
         .collect()

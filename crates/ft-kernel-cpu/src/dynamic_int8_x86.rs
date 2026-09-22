@@ -13,6 +13,10 @@ use std::arch::x86_64::*;
 // scalar tail partial, weight sum, correction, and final signed result.
 // Wider inputs retain the incumbent dispatch rather than entering this kernel.
 const MAX_EXACT_K: usize = (i32::MAX as usize) / (255 * 128);
+// The per-call weight-sum prepass loses badly on one-/three-row calls in
+// paired native measurements. Keep their incumbent dot dispatch; activation
+// quantization remains independently accelerated.
+const MIN_ROWS_FOR_PRECOMPUTE: usize = 8;
 const NR: usize = 4;
 
 #[derive(Clone, Copy)]
@@ -76,7 +80,11 @@ pub(super) fn try_linear(
     bias: Option<&[f32]>,
 ) -> Option<Vec<f32>> {
     let m = a_scales.len();
-    if m == 0 || n == 0 || !(64..=MAX_EXACT_K).contains(&k) || !vnni_available() {
+    if m < MIN_ROWS_FOR_PRECOMPUTE
+        || n == 0
+        || !(64..=MAX_EXACT_K).contains(&k)
+        || !vnni_available()
+    {
         return None;
     }
     // These checks make the safe internal API independently sound, even if a
@@ -261,14 +269,20 @@ mod tests {
     }
 
     #[test]
-    fn detected_dispatch_is_exercised_and_wider_k_is_declined() {
+    fn detected_dispatch_and_fallback_boundaries() {
         if !require_vnni() {
             return;
         }
         assert!(RowQuantizer::detect().is_some());
-        let result = try_linear(&[1; 64], &[1.0], 64, &[1; 256], &[1.0; 4], 4, None);
-        assert_eq!(result, Some(vec![64.0; 4]));
+        for rows in 1..MIN_ROWS_FOR_PRECOMPUTE {
+            assert!(try_linear(
+                &vec![1; rows * 64], &vec![1.0; rows], 64,
+                &[1; 256], &[1.0; 4], 4, None,
+            ).is_none());
+        }
+        let result = try_linear(&[1; 512], &[1.0; 8], 64, &[1; 256], &[1.0; 4], 4, None);
+        assert_eq!(result, Some(vec![64.0; 32]));
         // The bound is checked before allocation/shape validation or raw loads.
-        assert!(try_linear(&[], &[1.0], MAX_EXACT_K + 1, &[], &[1.0], 1, None).is_none());
+        assert!(try_linear(&[], &[1.0; 8], MAX_EXACT_K + 1, &[], &[1.0], 1, None).is_none());
     }
 }
