@@ -225,3 +225,56 @@ fn linear_matches_independent_oracle_across_tiles_and_minilm_shapes() {
 fn linear_rejects_malformed_bias_before_dispatch() {
     let _ = linear_int8_dynamic_f32(&[1.0; 64], 1, 64, &[1; 256], &[1.0; 4], 4, Some(&[]));
 }
+
+/// Compare release executables in alternating baseline/candidate order. This
+/// measures the public LINEAR call, not whole-model or CASS wall-clock speed.
+#[test]
+#[ignore = "manual release-mode microbenchmark, not a correctness timing gate"]
+fn linear_microbenchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    requested_vnni_coverage_must_be_available();
+    let threads: usize = std::env::var("FT_INT8_BENCH_THREADS")
+        .map_or(Ok(12), |value| value.parse())
+        .expect("FT_INT8_BENCH_THREADS must be a positive integer");
+    assert!(threads > 0);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+        .install(|| {
+            for (m, k, n) in [
+                (1, 384, 384),
+                (3, 384, 384),
+                (8, 384, 384),
+                (32, 384, 384),
+                (128, 384, 384),
+                (128, 384, 1536),
+                (128, 1536, 384),
+            ] {
+                let x = activations(m, k);
+                let w = weights(n, k);
+                let scales = vec![0.001_937_5; n];
+                let bias = vec![0.000_37; n];
+                let expected = reference_linear(&x, m, k, &w, &scales, n, Some(&bias));
+                let warm = linear_int8_dynamic_f32(&x, m, k, &w, &scales, n, Some(&bias));
+                assert_bits(&warm, &expected, "microbenchmark fixture");
+                let digest = warm.iter().fold(0_u64, |hash, value| {
+                    hash.rotate_left(7) ^ u64::from(value.to_bits())
+                });
+                for _ in 0..4 {
+                    black_box(linear_int8_dynamic_f32(&x, m, k, &w, &scales, n, Some(&bias)));
+                }
+                let calls = 20;
+                let start = Instant::now();
+                for _ in 0..calls {
+                    black_box(linear_int8_dynamic_f32(&x, m, k, &w, &scales, n, Some(&bias)));
+                }
+                let elapsed_ns = start.elapsed().as_nanos();
+                println!(
+                    "INT8_TIMING m={m} k={k} n={n} threads={threads} calls={calls} elapsed_ns={elapsed_ns} digest={digest:016x}"
+                );
+            }
+        });
+}
