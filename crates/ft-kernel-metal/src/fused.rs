@@ -926,9 +926,14 @@ impl<'a> Batch<'a> {
 
     /// Commit the command buffer and block until the GPU finishes — the single
     /// CPU↔GPU sync for every op encoded since [`new`](Batch::new).
-    pub fn finish(self) {
-        self.cmd.commit();
-        self.cmd.wait_until_completed();
+    ///
+    /// # Errors
+    /// [`Error::CommandBuffer`] when the command buffer ended in any state but
+    /// `Completed` (e.g. aborted by a GPU restart). The output tensors of this
+    /// batch then hold whatever the GPU wrote before it stopped and must not be
+    /// read; re-encode the batch from its inputs instead.
+    pub fn finish(self) -> Result<(), Error> {
+        crate::submit_and_wait(self.cmd)
     }
 }
 
@@ -1111,8 +1116,7 @@ impl EncoderGpu {
             )));
         }
         let mel_gpu = GpuTensor::upload(mel, t_in, stem.n_mels)?;
-        let x;
-        {
+        let x = with_attempts(|| {
             let b = Batch::new()?;
             let c1 = b.im2col(&mel_gpu, 3, 1, 1);
             let h1 = b.matmul_bias_w16(&c1, &stem.conv1_wt, Some(&stem.conv1_b));
@@ -1122,9 +1126,10 @@ impl EncoderGpu {
             let g2 = b.gelu(&h2);
             // pos_emb rows are a contiguous prefix, so the elementwise add over
             // g2's length reads exactly rows 0..t2 of the embedding.
-            x = b.add(&g2, &stem.pos_emb);
-            b.finish();
-        }
+            let x = b.add(&g2, &stem.pos_emb);
+            b.finish()?;
+            Ok(x)
+        })?;
         let seq = x.rows;
         debug_assert_eq!(seq, t2);
         let out = self.forward_stack(x)?;
@@ -1162,30 +1167,58 @@ impl EncoderGpu {
             .filter(|c| *c >= 1)
             .unwrap_or(8);
         for layers in self.layers.chunks(chunk) {
-            let b = Batch::new()?;
-            // Chunk-local intermediates stay alive until this chunk's `finish`,
-            // then drop — releasing their buffers before the next chunk encodes.
-            let mut keep: Vec<GpuTensor> = Vec::with_capacity(layers.len() * 12);
-            for l in layers {
-                let n1 = b.layernorm(&x, &l.ln1_g, &l.ln1_b, LN_EPS);
-                let q = b.matmul_bias_w16(&n1, &l.wq, Some(&l.bq));
-                let k = b.matmul_bias_w16(&n1, &l.wk, None);
-                let v = b.matmul_bias_w16(&n1, &l.wv, Some(&l.bv));
-                let attn = b.mha(&q, &k, &v, self.n_heads);
-                let ao = b.matmul_bias_w16(&attn, &l.wo, Some(&l.bo));
-                let x1 = b.add(&x, &ao);
-                let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
-                let fc = b.matmul_bias_w16(&n2, &l.w1, Some(&l.b1));
-                let g = b.gelu(&fc);
-                let proj = b.matmul_bias_w16(&g, &l.w2, Some(&l.b2));
-                let x2 = b.add(&x1, &proj);
-                keep.extend([n1, q, k, v, attn, ao, x1, n2, fc, g, proj]);
-                let prev = std::mem::replace(&mut x, x2);
-                keep.push(prev);
-            }
-            b.finish();
+            // The chunk only reads `x` and writes fresh buffers, so a failed
+            // command buffer is re-encoded from the same `x`.
+            x = with_attempts(|| {
+                let b = Batch::new()?;
+                // Chunk-local intermediates stay alive until this chunk's
+                // `finish`, then drop — releasing their buffers before the next
+                // chunk encodes.
+                let mut keep: Vec<GpuTensor> = Vec::with_capacity(layers.len() * 12);
+                let mut out: Option<GpuTensor> = None;
+                for l in layers {
+                    let xin = out.as_ref().unwrap_or(&x);
+                    let n1 = b.layernorm(xin, &l.ln1_g, &l.ln1_b, LN_EPS);
+                    let q = b.matmul_bias_w16(&n1, &l.wq, Some(&l.bq));
+                    let k = b.matmul_bias_w16(&n1, &l.wk, None);
+                    let v = b.matmul_bias_w16(&n1, &l.wv, Some(&l.bv));
+                    let attn = b.mha(&q, &k, &v, self.n_heads);
+                    let ao = b.matmul_bias_w16(&attn, &l.wo, Some(&l.bo));
+                    let x1 = b.add(xin, &ao);
+                    let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
+                    let fc = b.matmul_bias_w16(&n2, &l.w1, Some(&l.b1));
+                    let g = b.gelu(&fc);
+                    let proj = b.matmul_bias_w16(&g, &l.w2, Some(&l.b2));
+                    let x2 = b.add(&x1, &proj);
+                    keep.extend([n1, q, k, v, attn, ao, x1, n2, fc, g, proj]);
+                    if let Some(prev) = out.replace(x2) {
+                        keep.push(prev);
+                    }
+                }
+                b.finish()?;
+                out.ok_or_else(|| Error::Kernel("empty encoder layer chunk".into()))
+            })?;
         }
         Ok(x.download())
+    }
+}
+
+/// Run one command buffer's worth of work, re-encoding it after a failed
+/// command buffer up to [`crate::COMMAND_BUFFER_ATTEMPTS`] times in total.
+/// `encode` must rebuild the batch from inputs it does not write.
+fn with_attempts<T>(mut encode: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+    let mut failed = 0;
+    loop {
+        match encode() {
+            Err(Error::CommandBuffer(state)) => {
+                failed += 1;
+                if failed >= crate::COMMAND_BUFFER_ATTEMPTS {
+                    return Err(Error::CommandBuffer(state));
+                }
+                crate::retry_backoff(failed);
+            }
+            other => return other,
+        }
     }
 }
 
@@ -1225,7 +1258,7 @@ mod tests {
         );
         let ge = b.gelu(&mm);
         let sm = b.softmax(&mm);
-        b.finish(); // commit + wait, THEN read results back
+        b.finish().unwrap(); // commit + wait, THEN read results back
         let (mm_o, ln_o, ge_o, sm_o) = (mm.download(), ln.download(), ge.download(), sm.download());
 
         // CPU refs.
@@ -1319,7 +1352,7 @@ mod tests {
             let out = GpuTensor::new_uninit(&b.p.device, m, n);
             let dims = b.u32buf(&[m as u32, k as u32, n as u32, 1]);
             b.matmul_bias_w16_with(&ga, &gw, Some(&gb), kernel, &out, &dims, &gb.buf);
-            b.finish();
+            b.finish().unwrap();
             out.download()
         };
         let sgh = run(W16Kernel::Sgh);
@@ -1350,7 +1383,7 @@ mod tests {
         let gv = GpuTensor::upload(&v, seq, d).unwrap();
         let b = Batch::new().unwrap();
         let o = b.mha(&gq, &gk, &gv, nh);
-        b.finish();
+        b.finish().unwrap();
         approx(&o.download(), &cpu_mha(&q, &k, &v, seq, d, nh), 1e-3, "mha");
     }
 
@@ -1370,7 +1403,7 @@ mod tests {
         let gv = GpuTensor::upload(&v, seq, d).unwrap();
         let b = Batch::new().unwrap();
         let o = b.mha(&gq, &gk, &gv, nh);
-        b.finish();
+        b.finish().unwrap();
         approx(
             &o.download(),
             &cpu_mha(&q, &k, &v, seq, d, nh),
@@ -1481,5 +1514,142 @@ mod tests {
         let want = cpu_add(&x1, &proj);
 
         approx(&got, &want, 2e-2, "encoder_layer");
+    }
+
+    /// A two-layer encoder with a conv stem (`n_mels = 8`, `d = 16`, 4 heads):
+    /// `forward_from_mel` submits one stem command buffer, then one for the
+    /// layer chunk.
+    fn small_encoder_with_stem() -> EncoderGpu {
+        let (d, nh, dff, n_mels, n_ctx_cap) = (16usize, 4usize, 32usize, 8usize, 16usize);
+        let mk = |n: usize, s: f32, o: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i % 13) as f32) * s - o).collect()
+        };
+        let ones = vec![1.0f32; d];
+        let zeros = vec![0.0f32; d];
+        let w = [
+            mk(d * d, 0.03, 0.2),
+            mk(d * d, 0.02, 0.15),
+            mk(d * d, 0.025, 0.18),
+            mk(d * d, 0.02, 0.16),
+            mk(d * dff, 0.02, 0.15),
+            mk(dff * d, 0.02, 0.15),
+        ];
+        let (bq, bv, bo, b2) = (
+            mk(d, 0.01, 0.05),
+            mk(d, 0.01, 0.04),
+            mk(d, 0.01, 0.03),
+            mk(d, 0.01, 0.03),
+        );
+        let b1 = mk(dff, 0.005, 0.02);
+        let layer = || LayerWeightsRef {
+            ln1_g: &ones,
+            ln1_b: &zeros,
+            wq: &w[0],
+            bq: &bq,
+            wk: &w[1],
+            wv: &w[2],
+            bv: &bv,
+            wo: &w[3],
+            bo: &bo,
+            ln2_g: &ones,
+            ln2_b: &zeros,
+            w1: &w[4],
+            b1: &b1,
+            w2: &w[5],
+            b2: &b2,
+        };
+        let mut enc = EncoderGpu::new(d, nh, dff, &[layer(), layer()]).unwrap();
+        let (conv1_wt, conv2_wt) = (mk(n_mels * 3 * d, 0.02, 0.1), mk(d * 3 * d, 0.01, 0.06));
+        let (conv1_b, conv2_b) = (mk(d, 0.01, 0.02), mk(d, 0.01, 0.03));
+        let pos_emb = mk(n_ctx_cap * d, 0.005, 0.03);
+        enc.attach_stem(
+            &StemWeightsRef {
+                conv1_wt: &conv1_wt,
+                conv1_b: &conv1_b,
+                conv2_wt: &conv2_wt,
+                conv2_b: &conv2_b,
+                pos_emb: &pos_emb,
+            },
+            n_mels,
+            n_ctx_cap,
+        )
+        .unwrap();
+        enc
+    }
+
+    fn small_mel() -> (Vec<f32>, usize) {
+        let t_in = 20usize;
+        let mel = (0..t_in * 8)
+            .map(|i| ((i % 17) as f32) * 0.07 - 0.5)
+            .collect();
+        (mel, t_in)
+    }
+
+    /// Fail the first `faults` submissions of `run` (each failed buffer leaves
+    /// its outputs unwritten, as an aborted one does) and require the result
+    /// to be bit-identical to `clean` and every failure to be counted.
+    fn assert_rerun_is_identical(clean: &[f32], what: &str, run: impl Fn() -> Vec<f32>) {
+        for faults in 1..crate::COMMAND_BUFFER_ATTEMPTS {
+            let before = crate::command_buffer_failures();
+            crate::fault::arm(faults);
+            let got = run();
+            crate::fault::arm(0);
+            assert_eq!(got.len(), clean.len(), "{what}: output length");
+            let differing = got
+                .iter()
+                .zip(clean)
+                .filter(|(g, c)| g.to_bits() != c.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{what}: {faults} failed command buffer(s) changed the output"
+            );
+            assert!(
+                crate::command_buffer_failures() >= before + u64::from(faults),
+                "{what}: the {faults} injected failure(s) were not counted"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_command_buffers_are_rerun_to_bit_identical_output_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let enc = small_encoder_with_stem();
+        let (mel, t_in) = small_mel();
+        // The stem batch is the first submission of `forward_from_mel`.
+        let (clean, rows) = enc.forward_from_mel(&mel, t_in).unwrap();
+        assert!(
+            clean.iter().any(|v| *v != 0.0),
+            "reference output is all zero"
+        );
+        assert_rerun_is_identical(&clean, "stem", || {
+            let (out, got_rows) = enc.forward_from_mel(&mel, t_in).unwrap();
+            assert_eq!(got_rows, rows);
+            out
+        });
+        // `forward` has no stem: its first submission is the layer chunk.
+        let x: Vec<f32> = (0..10 * 16)
+            .map(|i| ((i % 11) as f32) * 0.05 - 0.3)
+            .collect();
+        let clean = enc.forward(&x, 10).unwrap();
+        assert_rerun_is_identical(&clean, "stack", || enc.forward(&x, 10).unwrap());
+    }
+
+    #[test]
+    fn command_buffer_failing_every_attempt_is_an_error_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let enc = small_encoder_with_stem();
+        let (mel, t_in) = small_mel();
+        crate::fault::arm(crate::COMMAND_BUFFER_ATTEMPTS);
+        let result = enc.forward_from_mel(&mel, t_in);
+        crate::fault::arm(0);
+        assert_eq!(
+            result.map(|(out, _)| out.len()),
+            Err(Error::CommandBuffer(crate::CommandBufferState::NotEnqueued))
+        );
     }
 }

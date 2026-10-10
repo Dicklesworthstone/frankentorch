@@ -24,7 +24,7 @@ fn bench_shape_w16(m: usize, k: usize, n: usize, reps: usize) {
     // Warmup + one-element validation (f16-rounded weights).
     let b = Batch::new().expect("batch");
     let out = b.matmul_bias_w16(&ga, &gw, Some(&gb));
-    b.finish();
+    b.finish().expect("command buffer");
     let got = out.download();
     let mut want = bias[0];
     for e in 0..k {
@@ -46,7 +46,7 @@ fn bench_shape_w16(m: usize, k: usize, n: usize, reps: usize) {
         let t = std::time::Instant::now();
         let b = Batch::new().expect("batch");
         let _out = b.matmul_bias_w16(&ga, &gw, Some(&gb));
-        b.finish();
+        b.finish().expect("command buffer");
         let ms = t.elapsed().as_secs_f64() * 1e3;
         best_ms = best_ms.min(ms);
         total_ms += ms;
@@ -72,7 +72,7 @@ fn bench_shape(m: usize, k: usize, n: usize, reps: usize) {
     // Warmup (also validates one output element against a CPU dot).
     let b = Batch::new().expect("batch");
     let out = b.matmul_bias(&ga, &gw, Some(&gb));
-    b.finish();
+    b.finish().expect("command buffer");
     let got = out.download();
     let mut want = bias[0];
     for e in 0..k {
@@ -92,7 +92,7 @@ fn bench_shape(m: usize, k: usize, n: usize, reps: usize) {
         let t = std::time::Instant::now();
         let b = Batch::new().expect("batch");
         let _out = b.matmul_bias(&ga, &gw, Some(&gb));
-        b.finish();
+        b.finish().expect("command buffer");
         let ms = t.elapsed().as_secs_f64() * 1e3;
         best_ms = best_ms.min(ms);
         total_ms += ms;

@@ -68,7 +68,7 @@ fn main() {
         let g = b.gelu(&fc);
         let proj = b.matmul_bias(&g, &w2, Some(&b2));
         let _x2 = b.add(&x1, &proj);
-        b.finish();
+        b.finish().expect("command buffer");
         best_all = best_all.min(t.elapsed().as_secs_f64() * 1e3);
     }
     println!(
@@ -84,7 +84,7 @@ fn main() {
             let t = std::time::Instant::now();
             let b = Batch::new().unwrap();
             let _o = f(&b);
-            b.finish();
+            b.finish().expect("command buffer");
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
         println!("  {label:<28} best {best:8.2} ms");
@@ -98,7 +98,7 @@ fn main() {
     let k = b.matmul_bias(&n1, &wk, None);
     let vv = b.matmul_bias(&n1, &wv, Some(&bv));
     let fc = b.matmul_bias(&n1, &w1, Some(&b1));
-    b.finish();
+    b.finish().expect("command buffer");
 
     println!("per-op (separate sync each):");
     let mut sum = 0.0;
