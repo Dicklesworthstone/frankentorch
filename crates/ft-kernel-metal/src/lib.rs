@@ -119,7 +119,19 @@ pub fn command_buffer_failures() -> u64 {
 /// resident inputs on the recovered GPU gives bit-identical results, because
 /// these kernels have no data-dependent scheduling. Waits between attempts
 /// grow from 50 ms so a recovery in progress can finish.
+///
+/// A thread whose last operation used up all its attempts makes one attempt
+/// per operation, without waiting, until one of its command buffers completes
+/// again, so a GPU that stays down costs each later call one failed submission
+/// rather than four and 1.05 s of waits.
 pub const COMMAND_BUFFER_ATTEMPTS: u32 = 4;
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// Set when an operation on this thread used up its attempts; cleared when
+    /// a command buffer this thread submitted completes.
+    static GPU_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Commit `cmd`, wait for it, and report its terminal state. The single
 /// submission point for the command buffers whose outputs callers read back.
@@ -134,10 +146,61 @@ pub(crate) fn submit_and_wait(cmd: &metal::CommandBufferRef) -> Result<(), Error
     }
     let state: CommandBufferState = cmd.status().into();
     if state == CommandBufferState::Completed {
+        GPU_DOWN.with(|down| down.set(false));
         Ok(())
     } else {
         COMMAND_BUFFER_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(Error::CommandBuffer(state))
+    }
+}
+
+/// Run one GPU operation: `encode_and_submit` encodes a command buffer from
+/// inputs it does not write, submits it through [`submit_and_wait`], and reads
+/// its outputs only when that succeeds. After a failed command buffer the
+/// operation is re-run, 50, 200 and 800 ms apart, up to
+/// [`COMMAND_BUFFER_ATTEMPTS`] times in all; then the error is returned.
+///
+/// The re-runs are for a GPU that recovers. One that stays down (macOS keeps
+/// restarting it, or has revoked this process's GPU access after repeated
+/// faults) would otherwise cost every later operation four failed submissions
+/// and 1.05 s of waits before its caller falls back to the CPU, and a
+/// franken_whisper large-v3-turbo window whose encoder falls back to the CPU
+/// still submits about ninety Metal GEMMs from its decoding thread (measured
+/// on jfk.wav). So once an operation on this thread has used up its attempts,
+/// the thread's later operations make one attempt each, without waiting,
+/// until one of its command buffers completes again. The memory is per
+/// thread: it needs no synchronization, each thread pays the full attempts at
+/// most once per outage, and one thread's state never changes what another
+/// observes.
+#[cfg(target_os = "macos")]
+pub(crate) fn with_command_buffer_attempts<T>(
+    mut encode_and_submit: impl FnMut() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut failed = 0;
+    loop {
+        // The attempt's command buffer and encoders are autoreleased objects,
+        // and a thread without a pool keeps them until it exits. A buffer
+        // that was never committed (an injected fault) never completes, so
+        // it keeps one of its queue's 64 slots until released, and once the
+        // slots are used up the queue blocks every caller, on any thread.
+        // Draining a pool per attempt releases them when the attempt ends;
+        // what the attempt returns is owned, not autoreleased.
+        match objc::rc::autoreleasepool(&mut encode_and_submit) {
+            Err(Error::CommandBuffer(state)) => {
+                failed += 1;
+                let attempts = if GPU_DOWN.with(std::cell::Cell::get) {
+                    1
+                } else {
+                    COMMAND_BUFFER_ATTEMPTS
+                };
+                if failed >= attempts {
+                    GPU_DOWN.with(|down| down.set(true));
+                    return Err(Error::CommandBuffer(state));
+                }
+                retry_backoff(failed);
+            }
+            other => return other,
+        }
     }
 }
 
@@ -153,18 +216,27 @@ pub(crate) fn retry_backoff(failed: u32) {
 /// submitted from the arming thread are not committed. Thread-local, so
 /// parallel tests cannot consume each other's faults, and nothing is armed
 /// unless a test calls [`inject_command_buffer_faults`].
+///
+/// Compiled only into this crate's own tests and builds with debug assertions
+/// (`cargo test`, `cargo build`). A release build has no seam: `take` is a
+/// constant `false` and nothing can arm a fault. The gate is a cfg rather than
+/// a Cargo feature because a dependent naming a feature fails to resolve
+/// against a sibling checkout that predates it.
 #[cfg(target_os = "macos")]
 pub(crate) mod fault {
+    #[cfg(any(test, debug_assertions))]
     thread_local! {
         static PENDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     /// Arm `n` faults on this thread.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn arm(n: u32) {
         PENDING.with(|p| p.set(n));
     }
 
     /// Consume one armed fault, if any.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn take() -> bool {
         PENDING.with(|p| {
             let n = p.get();
@@ -174,20 +246,43 @@ pub(crate) mod fault {
             n > 0
         })
     }
+
+    /// Faults still armed on this thread.
+    #[cfg(test)]
+    pub(crate) fn pending() -> u32 {
+        PENDING.with(std::cell::Cell::get)
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    pub(crate) const fn take() -> bool {
+        false
+    }
 }
 
 /// Test seam (not for production use): the next `n` command buffers that
 /// [`sgemm`] or the fused encoder submit from the calling thread end without
 /// running and report `NotEnqueued`, leaving their outputs unwritten, as a GPU
-/// restart leaves aborted work. `0` disarms. A no-op off macOS, where nothing
-/// is submitted. Always compiled rather than feature-gated so a dependent's
-/// tests need no feature that an older sibling checkout would lack.
+/// restart leaves aborted work. `0` disarms.
+///
+/// Returns whether the seam exists in this build: only with debug assertions
+/// on macOS. A release build compiles it out, so this arms nothing and returns
+/// `false`; a dependent's test must check the result rather than assume its
+/// faults were injected. To exercise it from a release-profile test run, pass
+/// `--config 'profile.release.package.ft-kernel-metal.debug-assertions=true'`.
+/// The function itself always exists, so a dependent's tests build against
+/// any checkout of this crate that has it, without naming a Cargo feature.
 #[doc(hidden)]
-pub fn inject_command_buffer_faults(n: u32) {
-    #[cfg(target_os = "macos")]
-    fault::arm(n);
-    #[cfg(not(target_os = "macos"))]
-    let _ = n;
+pub fn inject_command_buffer_faults(n: u32) -> bool {
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    {
+        fault::arm(n);
+        true
+    }
+    #[cfg(not(all(target_os = "macos", any(test, debug_assertions))))]
+    {
+        let _ = n;
+        false
+    }
 }
 
 /// GPU-resident fused encoder ops (macOS only): keeps activations on the GPU and
@@ -330,9 +425,8 @@ kernel void matmul_tiled(
 
         // Inputs are read-only to the kernel and every output element is
         // rewritten, so a failed command buffer is re-run from the same
-        // buffers (see `COMMAND_BUFFER_ATTEMPTS`).
-        let mut failed = 0;
-        loop {
+        // buffers (see `with_command_buffer_attempts`).
+        super::with_command_buffer_attempts(|| {
             let cmd = ctx.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&ctx.pso);
@@ -343,17 +437,8 @@ kernel void matmul_tiled(
             let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
             enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
             enc.end_encoding();
-            match super::submit_and_wait(cmd) {
-                Ok(()) => break,
-                Err(error) => {
-                    failed += 1;
-                    if failed >= super::COMMAND_BUFFER_ATTEMPTS {
-                        return Err(error);
-                    }
-                    super::retry_backoff(failed);
-                }
-            }
-        }
+            super::submit_and_wait(cmd)
+        })?;
 
         // Unified memory: read the result straight out of the shared buffer.
         let out = unsafe { std::slice::from_raw_parts(bc.contents() as *const f32, m * n) };
@@ -392,7 +477,8 @@ pub fn is_available() -> bool {
 /// overwritten on success and left untouched on error. Returns
 /// [`Error::Unavailable`] if there's no GPU (callers should fall back to a CPU
 /// kernel), [`Error::Kernel`] on a shape error, or [`Error::CommandBuffer`] when
-/// the GPU did not complete the work in [`COMMAND_BUFFER_ATTEMPTS`] tries.
+/// the GPU did not complete the work in its attempts (see
+/// [`COMMAND_BUFFER_ATTEMPTS`]).
 pub fn sgemm(
     a: &[f32],
     b: &[f32],
@@ -488,6 +574,95 @@ mod tests {
             Err(Error::CommandBuffer(CommandBufferState::NotEnqueued))
         );
         assert!(got.iter().all(|v| v.is_nan()), "a failed sgemm wrote c");
+    }
+
+    /// After an operation on this thread used up its attempts, later ones
+    /// make a single attempt (no re-run, so no waits) until a command buffer
+    /// completes; then the re-runs are back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_thread_whose_gpu_stayed_down_stops_retrying_until_a_buffer_completes_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let (m, k, n) = (65, 33, 129);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32) * 0.1 - 0.5).collect();
+        let mut clean = vec![0.0f32; m * n];
+        sgemm(&a, &b, &mut clean, m, k, n).unwrap();
+        let down = Err(Error::CommandBuffer(CommandBufferState::NotEnqueued));
+
+        // The GPU goes down: one operation uses up all its attempts.
+        fault::arm(COMMAND_BUFFER_ATTEMPTS);
+        let mut got = vec![f32::NAN; m * n];
+        assert_eq!(sgemm(&a, &b, &mut got, m, k, n), down);
+        assert_eq!(fault::pending(), 0);
+
+        // Each later operation on this thread tries once: of two armed
+        // faults it consumes one and reports the failure.
+        for _ in 0..3 {
+            fault::arm(2);
+            assert_eq!(sgemm(&a, &b, &mut got, m, k, n), down);
+            assert_eq!(fault::pending(), 1, "a re-run after the GPU stayed down");
+        }
+        fault::arm(0);
+        assert!(got.iter().all(|v| v.is_nan()), "a failed sgemm wrote c");
+
+        // A command buffer that completes restores the re-runs.
+        sgemm(&a, &b, &mut got, m, k, n).unwrap();
+        fault::arm(1);
+        let mut rerun = vec![f32::NAN; m * n];
+        assert_eq!(sgemm(&a, &b, &mut rerun, m, k, n), Ok(()));
+        assert_eq!(fault::pending(), 0);
+        for (what, out) in [("recovered", &got), ("re-run", &rerun)] {
+            let differing = out
+                .iter()
+                .zip(&clean)
+                .filter(|(g, c)| g.to_bits() != c.to_bits())
+                .count();
+            assert_eq!(differing, 0, "{what} output differs from the clean run");
+        }
+    }
+
+    /// An injected failure must not keep its slot in the command queue. A
+    /// queue blocks `commandBuffer` while 64 of its buffers are uncompleted,
+    /// and an injected fault leaves its buffer uncommitted, which never
+    /// completes; unless each attempt's buffer is released when the attempt
+    /// ends, the 65th injected failure leaves every later caller of that
+    /// queue, on any thread, blocked for good.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_command_buffers_do_not_keep_command_queue_slots_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (m, k, n) = (8, 8, 8);
+            let (a, b) = (vec![1.0f32; m * k], vec![1.0f32; k * n]);
+            let mut c = vec![0.0f32; m * n];
+            // Three times the queue's 64 uncompleted buffers.
+            fault::arm(3 * 64 + COMMAND_BUFFER_ATTEMPTS);
+            let mut failed_calls = 0;
+            while fault::pending() > 0 {
+                if sgemm(&a, &b, &mut c, m, k, n).is_err() {
+                    failed_calls += 1;
+                }
+            }
+            fault::arm(0);
+            let clean = sgemm(&a, &b, &mut c, m, k, n);
+            let _ = done_tx.send((failed_calls, clean, c));
+        });
+        let (failed_calls, clean, c) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("sgemm blocked: failed command buffers used up the command queue");
+        assert_eq!(
+            failed_calls,
+            1 + 3 * 64,
+            "one exhausted call, then one attempt each"
+        );
+        assert_eq!(clean, Ok(()));
+        assert!(c.iter().all(|v| *v == 8.0), "{c:?}");
     }
 
     #[cfg(not(target_os = "macos"))]

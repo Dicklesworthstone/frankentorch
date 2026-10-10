@@ -1116,7 +1116,9 @@ impl EncoderGpu {
             )));
         }
         let mel_gpu = GpuTensor::upload(mel, t_in, stem.n_mels)?;
-        let x = with_attempts(|| {
+        // The batch only reads `mel_gpu` and the weights and writes fresh
+        // buffers, so a failed command buffer is re-encoded from them.
+        let x = crate::with_command_buffer_attempts(|| {
             let b = Batch::new()?;
             let c1 = b.im2col(&mel_gpu, 3, 1, 1);
             let h1 = b.matmul_bias_w16(&c1, &stem.conv1_wt, Some(&stem.conv1_b));
@@ -1169,7 +1171,7 @@ impl EncoderGpu {
         for layers in self.layers.chunks(chunk) {
             // The chunk only reads `x` and writes fresh buffers, so a failed
             // command buffer is re-encoded from the same `x`.
-            x = with_attempts(|| {
+            x = crate::with_command_buffer_attempts(|| {
                 let b = Batch::new()?;
                 // Chunk-local intermediates stay alive until this chunk's
                 // `finish`, then drop — releasing their buffers before the next
@@ -1200,25 +1202,6 @@ impl EncoderGpu {
             })?;
         }
         Ok(x.download())
-    }
-}
-
-/// Run one command buffer's worth of work, re-encoding it after a failed
-/// command buffer up to [`crate::COMMAND_BUFFER_ATTEMPTS`] times in total.
-/// `encode` must rebuild the batch from inputs it does not write.
-fn with_attempts<T>(mut encode: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
-    let mut failed = 0;
-    loop {
-        match encode() {
-            Err(Error::CommandBuffer(state)) => {
-                failed += 1;
-                if failed >= crate::COMMAND_BUFFER_ATTEMPTS {
-                    return Err(Error::CommandBuffer(state));
-                }
-                crate::retry_backoff(failed);
-            }
-            other => return other,
-        }
     }
 }
 
@@ -1644,12 +1627,43 @@ mod tests {
         }
         let enc = small_encoder_with_stem();
         let (mel, t_in) = small_mel();
+        let down = Err(Error::CommandBuffer(crate::CommandBufferState::NotEnqueued));
         crate::fault::arm(crate::COMMAND_BUFFER_ATTEMPTS);
         let result = enc.forward_from_mel(&mel, t_in);
         crate::fault::arm(0);
+        assert_eq!(result.map(|(out, _)| out.len()), down);
+
+        // The GPU stayed down: the next forward's stem batch tries once (of
+        // two armed faults it consumes one), and so does the stack's.
+        crate::fault::arm(2);
+        let result = enc.forward_from_mel(&mel, t_in);
+        assert_eq!(crate::fault::pending(), 1, "the stem batch was re-run");
+        crate::fault::arm(0);
+        assert_eq!(result.map(|(out, _)| out.len()), down);
+        let x: Vec<f32> = (0..10 * 16)
+            .map(|i| ((i % 11) as f32) * 0.05 - 0.3)
+            .collect();
+        crate::fault::arm(2);
+        let result = enc.forward(&x, 10);
+        assert_eq!(crate::fault::pending(), 1, "the layer chunk was re-run");
+        crate::fault::arm(0);
+        assert_eq!(result.map(|out| out.len()), down);
+
+        // Once a command buffer completes, a failed one is re-run again.
+        let clean = enc.forward(&x, 10).unwrap();
+        crate::fault::arm(1);
+        let rerun = enc.forward(&x, 10);
+        crate::fault::arm(0);
+        assert_eq!(rerun.as_ref().map(Vec::len), Ok(clean.len()));
         assert_eq!(
-            result.map(|(out, _)| out.len()),
-            Err(Error::CommandBuffer(crate::CommandBufferState::NotEnqueued))
+            rerun
+                .unwrap()
+                .iter()
+                .zip(&clean)
+                .filter(|(g, c)| g.to_bits() != c.to_bits())
+                .count(),
+            0,
+            "the re-run after recovery differs from the clean forward"
         );
     }
 }
