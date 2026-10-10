@@ -149,25 +149,22 @@ pub(crate) fn retry_backoff(failed: u32) {
     std::thread::sleep(std::time::Duration::from_millis(50u64 << (2 * step)));
 }
 
-/// Fault injection for [`submit_and_wait`] (this crate's tests and the
-/// `fault-injection` feature only): the next `n` command buffers submitted
-/// from the arming thread are not committed. Thread-local, so parallel tests
-/// cannot consume each other's faults.
+/// Fault injection for [`submit_and_wait`]: the next `n` command buffers
+/// submitted from the arming thread are not committed. Thread-local, so
+/// parallel tests cannot consume each other's faults, and nothing is armed
+/// unless a test calls [`inject_command_buffer_faults`].
 #[cfg(target_os = "macos")]
 pub(crate) mod fault {
-    #[cfg(any(test, feature = "fault-injection"))]
     thread_local! {
         static PENDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     /// Arm `n` faults on this thread.
-    #[cfg(any(test, feature = "fault-injection"))]
     pub(crate) fn arm(n: u32) {
         PENDING.with(|p| p.set(n));
     }
 
     /// Consume one armed fault, if any.
-    #[cfg(any(test, feature = "fault-injection"))]
     pub(crate) fn take() -> bool {
         PENDING.with(|p| {
             let n = p.get();
@@ -177,19 +174,15 @@ pub(crate) mod fault {
             n > 0
         })
     }
-
-    #[cfg(not(any(test, feature = "fault-injection")))]
-    pub(crate) const fn take() -> bool {
-        false
-    }
 }
 
-/// Test seam for dependents (feature `fault-injection`): the next `n` command
-/// buffers that [`sgemm`] or the fused encoder submit from the calling thread
-/// end without running and report `NotEnqueued`, leaving their outputs
-/// unwritten, as a GPU restart leaves aborted work. `0` disarms. A no-op off
-/// macOS, where nothing is submitted.
-#[cfg(feature = "fault-injection")]
+/// Test seam (not for production use): the next `n` command buffers that
+/// [`sgemm`] or the fused encoder submit from the calling thread end without
+/// running and report `NotEnqueued`, leaving their outputs unwritten, as a GPU
+/// restart leaves aborted work. `0` disarms. A no-op off macOS, where nothing
+/// is submitted. Always compiled rather than feature-gated so a dependent's
+/// tests need no feature that an older sibling checkout would lack.
+#[doc(hidden)]
 pub fn inject_command_buffer_faults(n: u32) {
     #[cfg(target_os = "macos")]
     fault::arm(n);

@@ -18,9 +18,3 @@ objc = "0.2.7"
 half = { version = "2.7", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-
-[features]
-# Test seam for dependents' tests: `inject_command_buffer_faults(n)` makes the
-# next `n` command buffers submitted from the calling thread end without running,
-# the way a GPU restart aborts in-flight work. Never enable it in a shipped build.
-fault-injection = []
