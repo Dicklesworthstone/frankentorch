@@ -1,0 +1,114 @@
+name: Pre-publication dependency packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/registry-dependency-packages.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE'
+      - 'crates/ft-core/**'
+      - 'crates/ft-kernel-cpu/**'
+      - 'crates/ft-kernel-metal/**'
+  workflow_dispatch:
+
+# Build source packages, never publish them or provide registry credentials.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PACKAGE_FAMILY: torch
+
+jobs:
+  packages:
+    name: Torch publication closure (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source
+          persist-credentials: false
+      - name: Read the pinned shared packager and reviewed source contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Dicklesworthstone/franken_whisper
+          ref: a06e241565ac9fab83e5715ec52e6685504a18b3
+          path: tools
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/package_registry_dependencies.py
+            /scripts/test_registry_dependencies.py
+            /scripts/verify_registry_archives.py
+            /scripts/registry-source-contract.json
+            /rust-toolchain.toml
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Test the packaging driver independently of registry publication
+        run: python3 -m unittest discover -s tools/scripts -p 'test_registry_dependencies.py' -v
+      - name: Install the consumer's committed Rust toolchain
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = arm64; fi
+          toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("tools/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          { uname -a; python3 --version; rustc +"$toolchain" --version --verbose; cargo +"$toolchain" --version --verbose; } > "$RUNNER_TEMP/dependency-host.txt"
+      - name: Test and package the complete unpublished family together
+        run: |
+          python3 tools/scripts/package_registry_dependencies.py \
+            --repo "$GITHUB_WORKSPACE/source" --family "$PACKAGE_FAMILY" \
+            --expected-revision "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/dependency-bundle" \
+            --without-workspace-overrides --cargo-command cargo --jobs 2
+      - name: Require complete source-package evidence
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys
+          sys.path.insert(0, 'tools/scripts')
+          from package_registry_dependencies import FAMILIES
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dependency-bundle'
+          report = json.loads((root / 'dependency-package-receipt.json').read_text())
+          expected = set(FAMILIES[os.environ['PACKAGE_FAMILY']][1])
+          if (report.get('status') != 'dependency_packages_verified'
+                  or report.get('published') is not False
+                  or report.get('source_revision') != os.environ['GITHUB_SHA']
+                  or report.get('repository') != 'https://github.com/' + os.environ['GITHUB_REPOSITORY']
+                  or any(report.get(p) != 'pass' for p in ('resolution', 'unit_tests', 'package_verification'))
+                  or set(report.get('artifacts', {})) != expected):
+              raise SystemExit('Incomplete or wrong-source dependency package evidence')
+          if hashlib.sha256((root / 'source/Cargo.lock').read_bytes()).hexdigest() != report.get('lock_sha256'):
+              raise SystemExit('Family lock changed after verification')
+          for record in report['artifacts'].values():
+              artifact = (root / record['artifact']).resolve()
+              if not artifact.is_relative_to(root.resolve()):
+                  raise SystemExit('Artifact path escapes bundle')
+              if hashlib.sha256(artifact.read_bytes()).hexdigest() != record['archive_sha256']:
+                  raise SystemExit('Package changed after verification')
+          print('Source packages verified on this host; nothing published. Native Metal certification remains separate.')
+          PY
+      - name: Retain package artifacts and failure evidence, never Cargo credentials
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: torch-dependency-packages-${{ matrix.os }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/dependency-host.txt
+            ${{ runner.temp }}/dependency-bundle/*.json
+            ${{ runner.temp }}/dependency-bundle/*.stdout
+            ${{ runner.temp }}/dependency-bundle/*.stderr
+            ${{ runner.temp }}/dependency-bundle/source/Cargo.toml
+            ${{ runner.temp }}/dependency-bundle/source/Cargo.lock
+            ${{ runner.temp }}/dependency-bundle/source/rust-toolchain.toml
+            ${{ runner.temp }}/dependency-bundle/target/package/*.crate
