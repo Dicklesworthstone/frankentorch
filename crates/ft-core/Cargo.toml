@@ -1,6 +1,6 @@
 [package]
 name = "frankentorch-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license-file = "LICENSE"
 description = "Memory-safe tensor types and scalar semantics for FrankenTorch"

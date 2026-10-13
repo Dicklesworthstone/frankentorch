@@ -23,9 +23,9 @@ license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/frankentorch"
 
 [workspace.dependencies]
-ft-core = { package = "frankentorch-core", version = "0.1.0", path = "crates/ft-core" }
+ft-core = { package = "frankentorch-core", version = "=0.1.1", path = "crates/ft-core" }
 ft-dispatch = { package = "frankentorch-dispatch", version = "0.1.0", path = "crates/ft-dispatch" }
-ft-kernel-cpu = { package = "frankentorch-kernel-cpu", version = "0.1.0", path = "crates/ft-kernel-cpu" }
+ft-kernel-cpu = { package = "frankentorch-kernel-cpu", version = "=0.1.2", path = "crates/ft-kernel-cpu" }
 ft-autograd = { package = "frankentorch-autograd", version = "0.1.0", path = "crates/ft-autograd" }
 ft-device = { path = "crates/ft-device" }
 ft-serialize = { path = "crates/ft-serialize" }

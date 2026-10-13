@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "frankentorch-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "half",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "frankentorch-kernel-cpu"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "criterion",
  "frankentorch-core",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "ft-kernel-metal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-graphics-types",
  "foreign-types",

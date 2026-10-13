@@ -1,6 +1,7 @@
 [package]
 name = "ft-kernel-metal"
-version = "0.1.0"
+# Includes the October 10 command-buffer failure/retry correction.
+version = "0.1.1"
 edition = "2024"
 license-file = "../../LICENSE"
 description = "Metal GPU compute kernels for FrankenTorch (macOS / Apple Silicon). Safe API; all unsafe Metal FFI is contained here. No-op stub on non-macOS targets."
