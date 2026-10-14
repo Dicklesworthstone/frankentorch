@@ -1,12 +1,18 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::fmt;
 
-use ft_core::{Device, ScalarTensor};
+use ft_core::{DenseTensor, Device, ScalarTensor, TensorMeta};
+
+thread_local! {
+    static ACTIVE_DEVICE_STACK: RefCell<Vec<Device>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceError {
     Mismatch { expected: Device, actual: Device },
+    EmptyDeviceCheck,
 }
 
 impl fmt::Display for DeviceError {
@@ -14,6 +20,9 @@ impl fmt::Display for DeviceError {
         match self {
             Self::Mismatch { expected, actual } => {
                 f.write_str(device_mismatch_message(*expected, *actual))
+            }
+            Self::EmptyDeviceCheck => {
+                f.write_str("device check requires at least one tensor metadata entry")
             }
         }
     }
@@ -25,8 +34,13 @@ fn device_mismatch_message(expected: Device, actual: Device) -> &'static str {
     match (expected, actual) {
         (Device::Cpu, Device::Cpu) => "device mismatch: expected Cpu, got Cpu",
         (Device::Cpu, Device::Cuda) => "device mismatch: expected Cpu, got Cuda",
+        (Device::Cpu, Device::Metal) => "device mismatch: expected Cpu, got Metal",
         (Device::Cuda, Device::Cpu) => "device mismatch: expected Cuda, got Cpu",
         (Device::Cuda, Device::Cuda) => "device mismatch: expected Cuda, got Cuda",
+        (Device::Cuda, Device::Metal) => "device mismatch: expected Cuda, got Metal",
+        (Device::Metal, Device::Cpu) => "device mismatch: expected Metal, got Cpu",
+        (Device::Metal, Device::Cuda) => "device mismatch: expected Metal, got Cuda",
+        (Device::Metal, Device::Metal) => "device mismatch: expected Metal, got Metal",
     }
 }
 
@@ -35,19 +49,25 @@ pub struct DeviceGuard {
     device: Device,
 }
 
+impl Default for DeviceGuard {
+    fn default() -> Self {
+        Self::new(current_device())
+    }
+}
+
 impl DeviceGuard {
     #[must_use]
-    pub fn new(device: Device) -> Self {
+    pub const fn new(device: Device) -> Self {
         Self { device }
     }
 
     #[must_use]
-    pub fn device(&self) -> Device {
+    pub const fn device(&self) -> Device {
         self.device
     }
 
-    pub fn ensure_tensor_device(&self, tensor: &ScalarTensor) -> Result<(), DeviceError> {
-        let actual = tensor.meta().device();
+    pub fn ensure_meta_device(&self, meta: &TensorMeta) -> Result<(), DeviceError> {
+        let actual = meta.device();
         if actual != self.device {
             return Err(DeviceError::Mismatch {
                 expected: self.device,
@@ -56,11 +76,60 @@ impl DeviceGuard {
         }
         Ok(())
     }
+
+    pub fn ensure_dense_tensor_device(&self, tensor: &DenseTensor) -> Result<(), DeviceError> {
+        self.ensure_meta_device(tensor.meta())
+    }
+
+    pub fn ensure_tensor_device(&self, tensor: &ScalarTensor) -> Result<(), DeviceError> {
+        self.ensure_meta_device(tensor.meta())
+    }
 }
 
-pub fn ensure_same_device(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<Device, DeviceError> {
-    let lhs_device = lhs.meta().device();
-    let rhs_device = rhs.meta().device();
+/// Returns the currently active thread-local device (defaults to [`Device::Cpu`]).
+#[must_use]
+pub fn current_device() -> Device {
+    ACTIVE_DEVICE_STACK
+        .with(|stack| stack.borrow().last().copied())
+        .unwrap_or(Device::Cpu)
+}
+
+/// Returns a [`DeviceGuard`] bound to [`current_device()`].
+#[must_use]
+pub fn active_device_guard() -> DeviceGuard {
+    DeviceGuard::new(current_device())
+}
+
+struct ScopedDeviceStackGuard;
+
+impl Drop for ScopedDeviceStackGuard {
+    fn drop(&mut self) {
+        ACTIVE_DEVICE_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// Executes `f` with `device` pushed onto the thread-local active device guard stack.
+///
+/// Even if `f` panics, the guard is popped when unwinding.
+pub fn with_device_guard<R>(device: Device, f: impl FnOnce(DeviceGuard) -> R) -> R {
+    ACTIVE_DEVICE_STACK.with(|stack| {
+        stack.borrow_mut().push(device);
+    });
+    let _pop_on_drop = ScopedDeviceStackGuard;
+    f(DeviceGuard::new(device))
+}
+
+pub fn ensure_matches_active_device(meta: &TensorMeta) -> Result<Device, DeviceError> {
+    let guard = active_device_guard();
+    guard.ensure_meta_device(meta)?;
+    Ok(guard.device())
+}
+
+pub fn ensure_same_meta_device(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<Device, DeviceError> {
+    let lhs_device = lhs.device();
+    let rhs_device = rhs.device();
     if lhs_device != rhs_device {
         return Err(DeviceError::Mismatch {
             expected: lhs_device,
@@ -68,6 +137,31 @@ pub fn ensure_same_device(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<Devi
         });
     }
     Ok(lhs_device)
+}
+
+pub fn ensure_same_dense_device(
+    lhs: &DenseTensor,
+    rhs: &DenseTensor,
+) -> Result<Device, DeviceError> {
+    ensure_same_meta_device(lhs.meta(), rhs.meta())
+}
+
+pub fn ensure_same_device_slice(metas: &[&TensorMeta]) -> Result<Device, DeviceError> {
+    let Some((&first, rest)) = metas.split_first() else {
+        return Err(DeviceError::EmptyDeviceCheck);
+    };
+    let expected = first.device();
+    for &meta in rest {
+        let actual = meta.device();
+        if actual != expected {
+            return Err(DeviceError::Mismatch { expected, actual });
+        }
+    }
+    Ok(expected)
+}
+
+pub fn ensure_same_device(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<Device, DeviceError> {
+    ensure_same_meta_device(lhs.meta(), rhs.meta())
 }
 
 #[cfg(test)]
@@ -433,5 +527,87 @@ mod tests {
                 "../../../artifacts/optimization/golden_outputs/ft_device_guard_pass23.txt"
             )
         );
+    }
+
+    #[test]
+    fn dense_tensor_and_metal_device_guard_and_scoped_stack_work() {
+        use super::{
+            active_device_guard, current_device, ensure_matches_active_device,
+            ensure_same_dense_device, ensure_same_device_slice, ensure_same_meta_device,
+            with_device_guard,
+        };
+        use ft_core::{DenseTensor, TensorMeta};
+
+        assert_eq!(current_device(), Device::Cpu);
+        assert_eq!(Device::parse("metal"), Some(Device::Metal));
+        assert_eq!(Device::parse("MPS:0"), Some(Device::Metal));
+        assert_eq!(Device::Metal.to_string(), "metal");
+        assert!(Device::Metal.is_metal());
+        assert!(Device::Metal.is_accelerator());
+
+        let cpu_dense = DenseTensor::from_contiguous_values(vec![1.0, 2.0], vec![2], Device::Cpu)
+            .expect("cpu dense tensor");
+        let metal_dense =
+            DenseTensor::from_contiguous_values(vec![3.0, 4.0], vec![2], Device::Metal)
+                .expect("metal dense tensor");
+
+        let metal_guard = DeviceGuard::new(Device::Metal);
+        assert_eq!(metal_guard.ensure_dense_tensor_device(&metal_dense), Ok(()));
+        assert_eq!(
+            metal_guard.ensure_dense_tensor_device(&cpu_dense),
+            Err(DeviceError::Mismatch {
+                expected: Device::Metal,
+                actual: Device::Cpu,
+            })
+        );
+        assert_eq!(
+            ensure_same_dense_device(&metal_dense, &metal_dense),
+            Ok(Device::Metal)
+        );
+        assert_eq!(
+            ensure_same_dense_device(&cpu_dense, &metal_dense),
+            Err(DeviceError::Mismatch {
+                expected: Device::Cpu,
+                actual: Device::Metal,
+            })
+        );
+        assert_eq!(
+            ensure_same_meta_device(cpu_dense.meta(), metal_dense.meta()),
+            Err(DeviceError::Mismatch {
+                expected: Device::Cpu,
+                actual: Device::Metal,
+            })
+        );
+        assert_eq!(
+            ensure_same_device_slice(&[]),
+            Err(DeviceError::EmptyDeviceCheck)
+        );
+        let m1 = TensorMeta::from_shape(vec![2], DType::F32, Device::Metal);
+        let m2 = TensorMeta::from_shape(vec![2, 2], DType::F32, Device::Metal);
+        assert_eq!(ensure_same_device_slice(&[&m1, &m2]), Ok(Device::Metal));
+
+        with_device_guard(Device::Metal, |guard| {
+            assert_eq!(guard.device(), Device::Metal);
+            assert_eq!(current_device(), Device::Metal);
+            assert_eq!(active_device_guard().device(), Device::Metal);
+            assert_eq!(
+                ensure_matches_active_device(metal_dense.meta()),
+                Ok(Device::Metal)
+            );
+            assert_eq!(
+                ensure_matches_active_device(cpu_dense.meta()),
+                Err(DeviceError::Mismatch {
+                    expected: Device::Metal,
+                    actual: Device::Cpu,
+                })
+            );
+
+            with_device_guard(Device::Cuda, |inner| {
+                assert_eq!(inner.device(), Device::Cuda);
+                assert_eq!(current_device(), Device::Cuda);
+            });
+            assert_eq!(current_device(), Device::Metal);
+        });
+        assert_eq!(current_device(), Device::Cpu);
     }
 }

@@ -13,6 +13,7 @@ name = "ft_dispatch"
 
 [dependencies]
 ft-core = { workspace = true }
+ft-device = { workspace = true }
 ft-kernel-cpu = { workspace = true }
 
 [dev-dependencies]

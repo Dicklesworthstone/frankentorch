@@ -11,6 +11,11 @@ use ft_core::{
     BFloat16, DType, Device, ExecutionMode, Float16, ScalarTensor, TensorCompatError, TensorMeta,
     TensorStorage,
 };
+pub use ft_device::{
+    DeviceError, DeviceGuard, active_device_guard, current_device, ensure_matches_active_device,
+    ensure_same_dense_device, ensure_same_device, ensure_same_device_slice,
+    ensure_same_meta_device, with_device_guard,
+};
 use ft_kernel_cpu::{
     KernelError,
     // --- f64 scalar ops ---
@@ -1347,11 +1352,11 @@ fn ensure_tensor_meta_compatible(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(
             },
         )));
     }
-    if lhs.device() != rhs.device() {
+    if let Err(DeviceError::Mismatch { expected, actual }) = ensure_same_meta_device(lhs, rhs) {
         return Err(DispatchError::Kernel(KernelError::Incompatible(
             TensorCompatError::DeviceMismatch {
-                lhs: lhs.device(),
-                rhs: rhs.device(),
+                lhs: expected,
+                rhs: actual,
             },
         )));
     }

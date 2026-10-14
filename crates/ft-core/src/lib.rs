@@ -176,6 +176,61 @@ impl DType {
 pub enum Device {
     Cpu,
     Cuda,
+    Metal,
+}
+
+impl Device {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_cpu(self) -> bool {
+        matches!(self, Self::Cpu)
+    }
+
+    #[must_use]
+    pub const fn is_cuda(self) -> bool {
+        matches!(self, Self::Cuda)
+    }
+
+    #[must_use]
+    pub const fn is_metal(self) -> bool {
+        matches!(self, Self::Metal)
+    }
+
+    #[must_use]
+    pub const fn is_accelerator(self) -> bool {
+        matches!(self, Self::Cuda | Self::Metal)
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        let base = trimmed
+            .split_once(':')
+            .map_or(trimmed, |(prefix, _)| prefix);
+        if base.eq_ignore_ascii_case("cpu") {
+            Some(Self::Cpu)
+        } else if base.eq_ignore_ascii_case("cuda") {
+            Some(Self::Cuda)
+        } else if base.eq_ignore_ascii_case("metal") || base.eq_ignore_ascii_case("mps") {
+            Some(Self::Metal)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

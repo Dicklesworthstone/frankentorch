@@ -62,6 +62,11 @@ use ft_core::{
     Float16, SparseCOOTensor, SparseCSRTensor, SparseTensorError, TensorCompatError, TensorMeta,
     TensorStorage, contiguous_strides,
 };
+pub use ft_device::{
+    DeviceError, DeviceGuard, active_device_guard, current_device, ensure_matches_active_device,
+    ensure_same_dense_device, ensure_same_device, ensure_same_device_slice,
+    ensure_same_meta_device, with_device_guard,
+};
 use ft_dispatch::{
     ComparisonDispatchDecision, ComparisonOp, UnaryDispatchDecision, UnaryOp,
     dispatch_keyset_for_single_tensor_meta, dispatch_scalar_comparison, dispatch_scalar_unary,
@@ -58801,6 +58806,77 @@ impl FrankenTorchSession {
 
     pub fn tensor_is_cuda(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
         Ok(self.tensor_device(node)? == Device::Cuda)
+    }
+
+    pub fn tensor_is_metal(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        Ok(self.tensor_device(node)? == Device::Metal)
+    }
+
+    #[must_use]
+    pub fn current_device(&self) -> Device {
+        ft_device::current_device()
+    }
+
+    #[must_use]
+    pub fn active_device_guard(&self) -> ft_device::DeviceGuard {
+        ft_device::active_device_guard()
+    }
+
+    pub fn with_device_guard<R>(
+        &mut self,
+        device: Device,
+        f: impl FnOnce(&mut Self, ft_device::DeviceGuard) -> R,
+    ) -> R {
+        ft_device::with_device_guard(device, |guard| f(self, guard))
+    }
+
+    pub fn ensure_tensor_device_guard(
+        &self,
+        node: TensorNodeId,
+        guard: ft_device::DeviceGuard,
+    ) -> Result<(), AutogradError> {
+        let tensor = self.tensor_tape.tensor(node)?;
+        guard.ensure_dense_tensor_device(tensor).map_err(|err| {
+            match err {
+                ft_device::DeviceError::Mismatch { expected, actual } => {
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                        ft_kernel_cpu::KernelError::Incompatible(
+                            ft_core::TensorCompatError::DeviceMismatch {
+                                lhs: expected,
+                                rhs: actual,
+                            },
+                        ),
+                    ))
+                }
+                ft_device::DeviceError::EmptyDeviceCheck => {
+                    Self::incompatible_tensor_args("device check requires at least one tensor")
+                }
+            }
+        })
+    }
+
+    pub fn ensure_same_tensor_device(
+        &self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<Device, AutogradError> {
+        let lhs_tensor = self.tensor_tape.tensor(lhs)?;
+        let rhs_tensor = self.tensor_tape.tensor(rhs)?;
+        ft_device::ensure_same_dense_device(lhs_tensor, rhs_tensor).map_err(|err| match err {
+            ft_device::DeviceError::Mismatch { expected, actual } => {
+                AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::Incompatible(
+                        ft_core::TensorCompatError::DeviceMismatch {
+                            lhs: expected,
+                            rhs: actual,
+                        },
+                    ),
+                ))
+            }
+            ft_device::DeviceError::EmptyDeviceCheck => {
+                Self::incompatible_tensor_args("device check requires at least one tensor")
+            }
+        })
     }
 
     pub fn tensor_is_pinned(&self, _node: TensorNodeId) -> Result<bool, AutogradError> {
@@ -173163,4 +173239,29 @@ mod tests {
              signature, and it would make the comparison above vacuous"
         );
     }
+
+    #[test]
+    fn session_device_guard_and_metal_queries_work() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let y = s.tensor_variable(vec![3.0, 4.0], vec![2], false).unwrap();
+
+        assert!(s.tensor_is_cpu(x).unwrap());
+        assert!(!s.tensor_is_cuda(x).unwrap());
+        assert!(!s.tensor_is_metal(x).unwrap());
+        assert_eq!(s.current_device(), Device::Cpu);
+        assert_eq!(s.ensure_same_tensor_device(x, y).unwrap(), Device::Cpu);
+        assert_eq!(
+            s.ensure_tensor_device_guard(x, s.active_device_guard()),
+            Ok(())
+        );
+
+        s.with_device_guard(Device::Metal, |sess, guard| {
+            assert_eq!(guard.device(), Device::Metal);
+            assert_eq!(sess.current_device(), Device::Metal);
+            assert!(sess.ensure_tensor_device_guard(x, guard).is_err());
+        });
+        assert_eq!(s.current_device(), Device::Cpu);
+    }
 }
+

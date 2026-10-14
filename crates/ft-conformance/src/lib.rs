@@ -10918,8 +10918,9 @@ fn parse_dtype(raw: &str) -> Result<DType, String> {
 
 fn parse_device(raw: &str) -> Result<Device, String> {
     match raw {
-        "Cpu" | "CPU" => Ok(Device::Cpu),
-        "Cuda" | "CUDA" => Ok(Device::Cuda),
+        "Cpu" | "CPU" | "cpu" => Ok(Device::Cpu),
+        "Cuda" | "CUDA" | "cuda" => Ok(Device::Cuda),
+        "Metal" | "METAL" | "metal" | "Mps" | "MPS" | "mps" => Ok(Device::Metal),
         _ => Err(format!("unsupported device '{}'", bounded_parse_token(raw))),
     }
 }
