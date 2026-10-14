@@ -632,8 +632,7 @@ fn conv2d_f32_mask_create_graph_gradients(
     let mask_id = fn_inputs[mask_index];
     let mut gradients: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
     let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
-    let f64v =
-        |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
+    let f64v = |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| f64::from(v)).collect() };
     // Grad NODES must live in the F64 grad-space (the regular backward and
     // tensor_values/autograd_grad are F64). apply_function infers output dtype
     // from its inputs, so feeding the F32 nodes directly would make the grad
@@ -684,21 +683,11 @@ fn conv2d_f32_mask_create_graph_gradients(
                 let (wv, ws) = ins[1];
                 c.save_for_backward(
                     dv.to_vec(),
-                    vec![
-                        plan.batch,
-                        plan.out_channels,
-                        plan.output_h,
-                        plan.output_w,
-                    ],
+                    vec![plan.batch, plan.out_channels, plan.output_h, plan.output_w],
                 );
                 c.save_for_backward(wv.to_vec(), ws.to_vec());
-                let zp = vec![
-                    0.0_f32;
-                    plan.batch
-                        * plan.in_channels
-                        * plan.padded_h
-                        * plan.padded_w
-                ];
+                let zp =
+                    vec![0.0_f32; plan.batch * plan.in_channels * plan.padded_h * plan.padded_w];
                 let (dp, _, _) = ft_kernel_cpu::conv2d_backward_f32(
                     &f32v(dv),
                     &zp,
@@ -718,12 +707,7 @@ fn conv2d_f32_mask_create_graph_gradients(
                 );
                 Ok((
                     f64v(&dp),
-                    vec![
-                        plan.batch,
-                        plan.in_channels,
-                        plan.padded_h,
-                        plan.padded_w,
-                    ],
+                    vec![plan.batch, plan.in_channels, plan.padded_h, plan.padded_w],
                 ))
             },
             move |c, gouts| {
@@ -784,12 +768,7 @@ fn conv2d_f32_mask_create_graph_gradients(
                 let (pv, ps) = ins[1];
                 c.save_for_backward(
                     dv.to_vec(),
-                    vec![
-                        plan.batch,
-                        plan.out_channels,
-                        plan.output_h,
-                        plan.output_w,
-                    ],
+                    vec![plan.batch, plan.out_channels, plan.output_h, plan.output_w],
                 );
                 c.save_for_backward(pv.to_vec(), ps.to_vec());
                 let zw = vec![0.0_f32; weight_shape.iter().product::<usize>()];
@@ -832,13 +811,8 @@ fn conv2d_f32_mask_create_graph_gradients(
                     plan.stride_w,
                     plan.out_channels,
                 );
-                let zp = vec![
-                    0.0_f32;
-                    plan.batch
-                        * plan.in_channels
-                        * plan.padded_h
-                        * plan.padded_w
-                ];
+                let zp =
+                    vec![0.0_f32; plan.batch * plan.in_channels * plan.padded_h * plan.padded_w];
                 let (grad_padded, _, _) = ft_kernel_cpu::conv2d_backward_f32(
                     &f32v(dv),
                     &zp,
@@ -888,8 +862,7 @@ fn conv2d_f32_mask_create_graph_gradients(
             },
             move |_c, incoming| {
                 let plane = plan.output_h * plan.output_w;
-                let mut grad_dout =
-                    vec![0.0_f64; plan.batch * plan.out_channels * plane];
+                let mut grad_dout = vec![0.0_f64; plan.batch * plan.out_channels * plane];
                 for n in 0..plan.batch {
                     for channel in 0..plan.out_channels {
                         let base = (n * plan.out_channels + channel) * plane;
@@ -6812,8 +6785,8 @@ impl FrankenTorchSession {
         // `RefCell<Option<..>>` because the closure is `Fn`, not `FnOnce`, and the value is
         // consumed on the single forward call the tape makes; a later re-entry (create_graph
         // replay) finds `None` and falls through to the recompute, which is the same answer.
-        let precomputed: std::cell::RefCell<Option<Vec<f32>>> = std::cell::RefCell::new(
-            if self.fuse_conv2d_reuse_f32() {
+        let precomputed: std::cell::RefCell<Option<Vec<f32>>> =
+            std::cell::RefCell::new(if self.fuse_conv2d_reuse_f32() {
                 let conv_output = self.tensor_tape.values_f32_borrowed(lhs)?;
                 let mask = self.tensor_tape.values_f32_borrowed(rhs)?;
                 Some(
@@ -6825,8 +6798,7 @@ impl FrankenTorchSession {
                 )
             } else {
                 None
-            },
-        );
+            });
         let fused = self
             .tensor_tape
             .apply_function_f32_output_with_create_graph_borrowed_inputs(
@@ -6841,8 +6813,7 @@ impl FrankenTorchSession {
                     if let Some(scored) = precomputed.borrow_mut().take() {
                         return Ok((scored, output_shape.clone()));
                     }
-                    FUSE_CONV2D_FWD_RECOMPUTES
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    FUSE_CONV2D_FWD_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (padded_values, _) = ins[0];
                     let (weight_values, _) = ins[1];
                     let bias_values = if has_bias { Some(ins[2].0) } else { None };
@@ -6914,9 +6885,7 @@ impl FrankenTorchSession {
                         dweight.map(|d| Self::widen_grad_f32_to_f64(&d)),
                     ];
                     if has_bias {
-                        gradients.push(
-                            dbias.map(|d| widen_f32_to_f64(&d)),
-                        );
+                        gradients.push(dbias.map(|d| widen_f32_to_f64(&d)));
                     }
                     // The mask does not require grad — the caller's gate guarantees it — so it
                     // gets None rather than a computed-and-discarded gradient.
@@ -8164,8 +8133,7 @@ impl FrankenTorchSession {
                                     causal,
                                 )
                             } else {
-                                let dout: Vec<f32> =
-                                    narrow_f64_to_f32(grad_outputs[0]);
+                                let dout: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                                 ft_kernel_cpu::sdpa_backward_f32(
                                     borrowed[0].0,
                                     borrowed[1].0,
@@ -16896,15 +16864,12 @@ impl FrankenTorchSession {
                             Ok((loss, vec![b]))
                         },
                         move |_ctx, grad_outputs, borrowed_inputs| {
-                            let dloss: Vec<f32> =
-                                narrow_f64_to_f32(grad_outputs[0]);
+                            let dloss: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                             let logits = borrowed_inputs[0].0;
                             let dlogits = ft_kernel_cpu::cross_entropy_backward_f32(
                                 logits, &ti_bwd, &dloss, b, c,
                             );
-                            Ok(vec![Some(
-                                widen_f32_to_f64(&dlogits),
-                            )])
+                            Ok(vec![Some(widen_f32_to_f64(&dlogits))])
                         },
                     )?
                 } else {
@@ -30190,8 +30155,7 @@ impl FrankenTorchSession {
                                     causal,
                                 )
                             } else {
-                                let dout: Vec<f32> =
-                                    narrow_f64_to_f32(grad_outputs[0]);
+                                let dout: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                                 ft_kernel_cpu::sdpa_backward_f32(
                                     borrowed[0].0,
                                     borrowed[1].0,
@@ -30939,8 +30903,7 @@ impl FrankenTorchSession {
                                 Ok((out, vec![b_, ch, oh, ow]))
                             },
                             move |_ctx, grad_outputs, borrowed| {
-                                let dout_f32: Vec<f32> =
-                                    narrow_f64_to_f32(grad_outputs[0]);
+                                let dout_f32: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                                 let pv = borrowed[0].0;
                                 let wv = borrowed[1].0;
                                 let (dpadded, dweight, dbias) =
@@ -32133,8 +32096,7 @@ impl FrankenTorchSession {
                         let padded_id = fn_inputs[0];
                         let weight_id = fn_inputs[1];
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
-                        let f32v =
-                            |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+                        let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                         let f64v =
                             |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                         // Grad NODES must live in the F64 grad-space (the regular
@@ -33159,8 +33121,7 @@ impl FrankenTorchSession {
                     // first-order backwards and item 195 wired only f64, so "I fixed
                     // conv3d" was true and incomplete. Defensive read as in item 178.
                     move |ctx, grad_outputs, borrowed_inputs| {
-                        let dout_f32: Vec<f32> =
-                            narrow_f64_to_f32(grad_outputs[0]);
+                        let dout_f32: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                         let padded_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
                         let need = ctx.needs_input_grad();
@@ -33211,8 +33172,7 @@ impl FrankenTorchSession {
                         let weight_id = fn_inputs[1];
                         let w_shape = tape.tensor(weight_id)?.meta().shape().to_vec();
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
-                        let f32v =
-                            |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+                        let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                         let f64v =
                             |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                         let weight64 = tape.to_f64(weight_id)?;
@@ -34226,8 +34186,7 @@ impl FrankenTorchSession {
                         Ok((out, vec![b_, oc_, oh_, ow_]))
                     },
                     move |_ctx, grad_outputs, borrowed_inputs| {
-                        let dout_f32: Vec<f32> =
-                            narrow_f64_to_f32(grad_outputs[0]);
+                        let dout_f32: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                         let input_values = borrowed_inputs[0].0;
                         let weight_values = borrowed_inputs[1].0;
                         let (di, dw, db) = ft_kernel_cpu::conv_transpose2d_backward_f32(
@@ -34271,8 +34230,7 @@ impl FrankenTorchSession {
                         let input_id = fn_inputs[0];
                         let weight_id = fn_inputs[1];
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None; fn_inputs.len()];
-                        let f32v =
-                            |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+                        let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                         let f64v =
                             |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                         let weight64 = tape.to_f64(weight_id)?;
@@ -35340,8 +35298,7 @@ impl FrankenTorchSession {
                         Ok((out, vec![b_, ch_, oh_, ow_]))
                     },
                     move |_ctx, grad_outputs, borrowed_inputs| {
-                        let dout_f32: Vec<f32> =
-                            narrow_f64_to_f32(grad_outputs[0]);
+                        let dout_f32: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                         let iv = borrowed_inputs[0].0;
                         let (_, idx) = ft_kernel_cpu::max_pool2d_forward_with_indices_f32(
                             iv, b_, ch_, ih_, iw_, kh_, kw_, oh_, ow_, sh_, sw_,
@@ -35362,8 +35319,7 @@ impl FrankenTorchSession {
                         let input64 = tape.to_f64(fn_inputs[0])?;
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None];
                         if need[0] {
-                            let f32v =
-                                |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+                            let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                             let f64v =
                                 |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                             let dinput = tape.apply_function(
@@ -36003,8 +35959,7 @@ impl FrankenTorchSession {
                         Ok((out, vec![b_, ch_, oh_, ow_]))
                     },
                     move |_ctx, grad_outputs, _borrowed_inputs| {
-                        let dout_f32: Vec<f32> =
-                            narrow_f64_to_f32(grad_outputs[0]);
+                        let dout_f32: Vec<f32> = narrow_f64_to_f32(grad_outputs[0]);
                         let dp = ft_kernel_cpu::avg_pool2d_backward_f32(
                             &dout_f32, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw,
                             ih_, iw_, cip,
@@ -36018,8 +35973,7 @@ impl FrankenTorchSession {
                         let dout_id = grad_outs[0];
                         let mut grads: Vec<Option<TensorNodeId>> = vec![None];
                         if need[0] {
-                            let f32v =
-                                |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
+                            let f32v = |s: &[f64]| -> Vec<f32> { narrow_f64_to_f32(s) };
                             let f64v =
                                 |s: &[f32]| -> Vec<f64> { s.iter().map(|&v| v as f64).collect() };
                             let dpadded = tape.apply_function(
@@ -58836,23 +58790,21 @@ impl FrankenTorchSession {
         guard: ft_device::DeviceGuard,
     ) -> Result<(), AutogradError> {
         let tensor = self.tensor_tape.tensor(node)?;
-        guard.ensure_dense_tensor_device(tensor).map_err(|err| {
-            match err {
-                ft_device::DeviceError::Mismatch { expected, actual } => {
-                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                        ft_kernel_cpu::KernelError::Incompatible(
-                            ft_core::TensorCompatError::DeviceMismatch {
-                                lhs: expected,
-                                rhs: actual,
-                            },
-                        ),
-                    ))
-                }
+        guard
+            .ensure_dense_tensor_device(tensor)
+            .map_err(|err| match err {
+                ft_device::DeviceError::Mismatch { expected, actual } => AutogradError::Dispatch(
+                    ft_dispatch::DispatchError::Kernel(ft_kernel_cpu::KernelError::Incompatible(
+                        ft_core::TensorCompatError::DeviceMismatch {
+                            lhs: expected,
+                            rhs: actual,
+                        },
+                    )),
+                ),
                 ft_device::DeviceError::EmptyDeviceCheck => {
                     Self::incompatible_tensor_args("device check requires at least one tensor")
                 }
-            }
-        })
+            })
     }
 
     pub fn ensure_same_tensor_device(
@@ -58863,16 +58815,14 @@ impl FrankenTorchSession {
         let lhs_tensor = self.tensor_tape.tensor(lhs)?;
         let rhs_tensor = self.tensor_tape.tensor(rhs)?;
         ft_device::ensure_same_dense_device(lhs_tensor, rhs_tensor).map_err(|err| match err {
-            ft_device::DeviceError::Mismatch { expected, actual } => {
-                AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                    ft_kernel_cpu::KernelError::Incompatible(
-                        ft_core::TensorCompatError::DeviceMismatch {
-                            lhs: expected,
-                            rhs: actual,
-                        },
-                    ),
-                ))
-            }
+            ft_device::DeviceError::Mismatch { expected, actual } => AutogradError::Dispatch(
+                ft_dispatch::DispatchError::Kernel(ft_kernel_cpu::KernelError::Incompatible(
+                    ft_core::TensorCompatError::DeviceMismatch {
+                        lhs: expected,
+                        rhs: actual,
+                    },
+                )),
+            ),
             ft_device::DeviceError::EmptyDeviceCheck => {
                 Self::incompatible_tensor_args("device check requires at least one tensor")
             }
@@ -101298,7 +101248,6 @@ fn inplace_unary_f32_parallel_min() -> usize {
     }
 }
 
-
 /// Which branch of `apply_tensor_unary_in_place`'s F32 arm actually runs —
 /// `frankentorch-f32-inplace-accessor-gap-5fxq2`.
 ///
@@ -102048,6 +101997,696 @@ fn upper_bound_f32(sorted: &[f32], value: f32, n: usize) -> usize {
         }
     }
     lo
+}
+
+/// Shared execution context backing ergonomic [`Tensor`] handles.
+#[derive(Clone, Debug)]
+pub struct TensorContext {
+    session: std::rc::Rc<std::cell::RefCell<FrankenTorchSession>>,
+    last_report: std::rc::Rc<std::cell::RefCell<Option<TensorBackwardReport>>>,
+}
+
+impl TensorContext {
+    #[must_use]
+    pub fn new(mode: ExecutionMode) -> Self {
+        Self::from_session(FrankenTorchSession::new(mode))
+    }
+
+    #[must_use]
+    pub fn strict() -> Self {
+        Self::new(ExecutionMode::Strict)
+    }
+
+    #[must_use]
+    pub fn hardened() -> Self {
+        Self::new(ExecutionMode::Hardened)
+    }
+
+    #[must_use]
+    pub fn from_session(session: FrankenTorchSession) -> Self {
+        Self {
+            session: std::rc::Rc::new(std::cell::RefCell::new(session)),
+            last_report: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        }
+    }
+
+    pub fn with_session<R>(&self, f: impl FnOnce(&FrankenTorchSession) -> R) -> R {
+        let borrow = self.session.borrow();
+        f(&borrow)
+    }
+
+    pub fn with_session_mut<R>(&self, f: impl FnOnce(&mut FrankenTorchSession) -> R) -> R {
+        let mut borrow = self.session.borrow_mut();
+        f(&mut borrow)
+    }
+
+    #[must_use]
+    pub fn wrap(&self, node_id: TensorNodeId) -> Tensor {
+        Tensor {
+            ctx: self.clone(),
+            node_id,
+        }
+    }
+
+    pub fn tensor(
+        &self,
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<Tensor, AutogradError> {
+        let node_id = self
+            .session
+            .borrow_mut()
+            .tensor_variable(values, shape, requires_grad)?;
+        Ok(self.wrap(node_id))
+    }
+
+    pub fn tensor_f32(
+        &self,
+        values: Vec<f32>,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<Tensor, AutogradError> {
+        let node_id =
+            self.session
+                .borrow_mut()
+                .tensor_variable_f32(values, shape, requires_grad)?;
+        Ok(self.wrap(node_id))
+    }
+
+    #[must_use]
+    pub fn from_storage(&self, storage: DenseTensor, requires_grad: bool) -> Tensor {
+        let node_id = self
+            .session
+            .borrow_mut()
+            .tensor_variable_from_storage(storage, requires_grad);
+        self.wrap(node_id)
+    }
+
+    pub fn zeros(&self, shape: Vec<usize>, requires_grad: bool) -> Result<Tensor, AutogradError> {
+        let node_id = self
+            .session
+            .borrow_mut()
+            .tensor_zeros(shape, requires_grad)?;
+        Ok(self.wrap(node_id))
+    }
+
+    pub fn ones(&self, shape: Vec<usize>, requires_grad: bool) -> Result<Tensor, AutogradError> {
+        let node_id = self
+            .session
+            .borrow_mut()
+            .tensor_ones(shape, requires_grad)?;
+        Ok(self.wrap(node_id))
+    }
+
+    pub fn scalar(&self, value: f64, requires_grad: bool) -> Result<Tensor, AutogradError> {
+        let node_id = self
+            .session
+            .borrow_mut()
+            .tensor_scalar(value, requires_grad)?;
+        Ok(self.wrap(node_id))
+    }
+}
+
+impl FrankenTorchSession {
+    /// Convert this session into a shared [`TensorContext`] for ergonomic [`Tensor`] operations.
+    #[must_use]
+    pub fn into_context(self) -> TensorContext {
+        TensorContext::from_session(self)
+    }
+}
+
+/// Ergonomic session-bound tensor handle supporting Rust operator traits (`+`, `-`, `*`, `/`, `-x`)
+/// and fluent method chaining (`.matmul()`, `.relu()`, `.sigmoid()`, `.tanh()`, `.sum()`, `.mean()`,
+/// `.reshape()`, `.transpose()`, `.backward()`, `.grad()`).
+#[derive(Clone, Debug)]
+pub struct Tensor {
+    ctx: TensorContext,
+    node_id: TensorNodeId,
+}
+
+impl Tensor {
+    #[must_use]
+    pub const fn node_id(&self) -> TensorNodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub const fn context(&self) -> &TensorContext {
+        &self.ctx
+    }
+
+    pub fn shape(&self) -> Result<Vec<usize>, AutogradError> {
+        self.ctx.session.borrow().tensor_shape(self.node_id)
+    }
+
+    pub fn dtype(&self) -> Result<DType, AutogradError> {
+        self.ctx.session.borrow().tensor_dtype(self.node_id)
+    }
+
+    pub fn device(&self) -> Result<Device, AutogradError> {
+        self.ctx.session.borrow().tensor_device(self.node_id)
+    }
+
+    pub fn requires_grad(&self) -> Result<bool, AutogradError> {
+        self.ctx.session.borrow().tensor_requires_grad(self.node_id)
+    }
+
+    pub fn values(&self) -> Result<Vec<f64>, AutogradError> {
+        self.ctx.session.borrow().tensor_values(self.node_id)
+    }
+
+    pub fn values_f32(&self) -> Result<Vec<f32>, AutogradError> {
+        self.ctx.session.borrow().tensor_values_f32(self.node_id)
+    }
+
+    pub fn item(&self) -> Result<f64, AutogradError> {
+        self.ctx.session.borrow().tensor_item(self.node_id)
+    }
+
+    pub fn to_dtype(&self, dtype: DType) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_to_dtype(self.node_id, dtype)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    pub fn try_add(&self, other: &Self) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_add(self.node_id, other.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    pub fn try_sub(&self, other: &Self) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_sub(self.node_id, other.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    pub fn try_mul(&self, other: &Self) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_mul(self.node_id, other.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    pub fn try_div(&self, other: &Self) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_div(self.node_id, other.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    pub fn try_neg(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_neg(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    fn scalar_matching(&self, scalar: f64) -> Result<Self, AutogradError> {
+        let dtype = self.dtype()?;
+        let mut sess = self.ctx.session.borrow_mut();
+        let node_id = match dtype {
+            DType::F32 => {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = scalar as f32;
+                sess.tensor_variable_f32(vec![v], vec![1], false)?
+            }
+            DType::F64 => sess.tensor_variable(vec![scalar], vec![1], false)?,
+            other => {
+                let raw = sess.tensor_variable(vec![scalar], vec![1], false)?;
+                sess.tensor_to_dtype(raw, other)?
+            }
+        };
+        Ok(self.ctx.wrap(node_id))
+    }
+
+    pub fn try_add_scalar(&self, scalar: f64) -> Result<Self, AutogradError> {
+        let rhs = self.scalar_matching(scalar)?;
+        self.try_add(&rhs)
+    }
+
+    pub fn try_sub_scalar(&self, scalar: f64) -> Result<Self, AutogradError> {
+        let rhs = self.scalar_matching(scalar)?;
+        self.try_sub(&rhs)
+    }
+
+    pub fn try_mul_scalar(&self, scalar: f64) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_mul_scalar(self.node_id, scalar)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    pub fn try_div_scalar(&self, scalar: f64) -> Result<Self, AutogradError> {
+        let rhs = self.scalar_matching(scalar)?;
+        self.try_div(&rhs)
+    }
+
+    pub fn try_matmul(&self, other: &Self) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_matmul(self.node_id, other.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn matmul(&self, other: &Self) -> Self {
+        self.try_matmul(other)
+            .expect("Tensor::matmul failed on incompatible shapes/dtypes")
+    }
+
+    pub fn try_relu(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_relu(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn relu(&self) -> Self {
+        self.try_relu().expect("Tensor::relu failed")
+    }
+
+    pub fn try_sigmoid(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_sigmoid(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn sigmoid(&self) -> Self {
+        self.try_sigmoid().expect("Tensor::sigmoid failed")
+    }
+
+    pub fn try_tanh(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_tanh(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn tanh(&self) -> Self {
+        self.try_tanh().expect("Tensor::tanh failed")
+    }
+
+    pub fn try_gelu(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_gelu(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn gelu(&self) -> Self {
+        self.try_gelu().expect("Tensor::gelu failed")
+    }
+
+    pub fn try_silu(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_silu(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn silu(&self) -> Self {
+        self.try_silu().expect("Tensor::silu failed")
+    }
+
+    pub fn try_sum(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_sum(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn sum(&self) -> Self {
+        self.try_sum().expect("Tensor::sum failed")
+    }
+
+    pub fn try_mean(&self) -> Result<Self, AutogradError> {
+        let id = self.ctx.session.borrow_mut().tensor_mean(self.node_id)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn mean(&self) -> Self {
+        self.try_mean().expect("Tensor::mean failed")
+    }
+
+    pub fn try_reshape(&self, new_shape: Vec<usize>) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_reshape(self.node_id, new_shape)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Self {
+        self.try_reshape(new_shape).expect("Tensor::reshape failed")
+    }
+
+    pub fn try_transpose(&self, dim0: usize, dim1: usize) -> Result<Self, AutogradError> {
+        let id = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_transpose(self.node_id, dim0, dim1)?;
+        Ok(self.ctx.wrap(id))
+    }
+
+    #[must_use]
+    pub fn transpose(&self, dim0: usize, dim1: usize) -> Self {
+        self.try_transpose(dim0, dim1)
+            .expect("Tensor::transpose failed")
+    }
+
+    pub fn try_backward(&self) -> Result<TensorBackwardReport, AutogradError> {
+        let report = self
+            .ctx
+            .session
+            .borrow_mut()
+            .tensor_backward(self.node_id)?;
+        *self.ctx.last_report.borrow_mut() = Some(report.clone());
+        Ok(report)
+    }
+
+    pub fn backward(&self) -> TensorBackwardReport {
+        self.try_backward().expect("Tensor::backward failed")
+    }
+
+    pub fn try_grad(&self) -> Result<Option<Vec<f64>>, AutogradError> {
+        if let Some(grad) = self
+            .ctx
+            .session
+            .borrow()
+            .tensor_accumulated_gradient(self.node_id)?
+        {
+            return Ok(Some(grad));
+        }
+        Ok(self
+            .ctx
+            .last_report
+            .borrow()
+            .as_ref()
+            .and_then(|report| report.gradient(self.node_id).map(<[f64]>::to_vec)))
+    }
+
+    #[must_use]
+    pub fn grad(&self) -> Option<Vec<f64>> {
+        self.try_grad().ok().flatten()
+    }
+
+    pub fn zero_grad(&self) -> Result<(), AutogradError> {
+        self.ctx.session.borrow_mut().tensor_zero_grad(self.node_id)
+    }
+}
+
+impl std::ops::Add<&Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: &Tensor) -> Self::Output {
+        self.try_add(rhs).expect("Tensor + Tensor failed")
+    }
+}
+
+impl std::ops::Add<Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: Tensor) -> Self::Output {
+        (&self).add(&rhs)
+    }
+}
+
+impl std::ops::Add<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: &Tensor) -> Self::Output {
+        (&self).add(rhs)
+    }
+}
+
+impl std::ops::Add<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: Tensor) -> Self::Output {
+        self.add(&rhs)
+    }
+}
+
+impl std::ops::Add<f64> for &Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: f64) -> Self::Output {
+        self.try_add_scalar(rhs).expect("Tensor + f64 failed")
+    }
+}
+
+impl std::ops::Add<f64> for Tensor {
+    type Output = Tensor;
+
+    fn add(self, rhs: f64) -> Self::Output {
+        (&self).add(rhs)
+    }
+}
+
+impl std::ops::Add<&Tensor> for f64 {
+    type Output = Tensor;
+
+    fn add(self, rhs: &Tensor) -> Self::Output {
+        rhs.try_add_scalar(self).expect("f64 + Tensor failed")
+    }
+}
+
+impl std::ops::Add<Tensor> for f64 {
+    type Output = Tensor;
+
+    fn add(self, rhs: Tensor) -> Self::Output {
+        self.add(&rhs)
+    }
+}
+
+impl std::ops::Sub<&Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: &Tensor) -> Self::Output {
+        self.try_sub(rhs).expect("Tensor - Tensor failed")
+    }
+}
+
+impl std::ops::Sub<Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: Tensor) -> Self::Output {
+        (&self).sub(&rhs)
+    }
+}
+
+impl std::ops::Sub<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: &Tensor) -> Self::Output {
+        (&self).sub(rhs)
+    }
+}
+
+impl std::ops::Sub<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: Tensor) -> Self::Output {
+        self.sub(&rhs)
+    }
+}
+
+impl std::ops::Sub<f64> for &Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: f64) -> Self::Output {
+        self.try_sub_scalar(rhs).expect("Tensor - f64 failed")
+    }
+}
+
+impl std::ops::Sub<f64> for Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: f64) -> Self::Output {
+        (&self).sub(rhs)
+    }
+}
+
+impl std::ops::Sub<&Tensor> for f64 {
+    type Output = Tensor;
+
+    fn sub(self, rhs: &Tensor) -> Self::Output {
+        let lhs = rhs
+            .scalar_matching(self)
+            .expect("f64 - Tensor scalar failed");
+        lhs.try_sub(rhs).expect("f64 - Tensor failed")
+    }
+}
+
+impl std::ops::Sub<Tensor> for f64 {
+    type Output = Tensor;
+
+    fn sub(self, rhs: Tensor) -> Self::Output {
+        self.sub(&rhs)
+    }
+}
+
+impl std::ops::Mul<&Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: &Tensor) -> Self::Output {
+        self.try_mul(rhs).expect("Tensor * Tensor failed")
+    }
+}
+
+impl std::ops::Mul<Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: Tensor) -> Self::Output {
+        (&self).mul(&rhs)
+    }
+}
+
+impl std::ops::Mul<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: &Tensor) -> Self::Output {
+        (&self).mul(rhs)
+    }
+}
+
+impl std::ops::Mul<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: Tensor) -> Self::Output {
+        self.mul(&rhs)
+    }
+}
+
+impl std::ops::Mul<f64> for &Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: f64) -> Self::Output {
+        self.try_mul_scalar(rhs).expect("Tensor * f64 failed")
+    }
+}
+
+impl std::ops::Mul<f64> for Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: f64) -> Self::Output {
+        (&self).mul(rhs)
+    }
+}
+
+impl std::ops::Mul<&Tensor> for f64 {
+    type Output = Tensor;
+
+    fn mul(self, rhs: &Tensor) -> Self::Output {
+        rhs.try_mul_scalar(self).expect("f64 * Tensor failed")
+    }
+}
+
+impl std::ops::Mul<Tensor> for f64 {
+    type Output = Tensor;
+
+    fn mul(self, rhs: Tensor) -> Self::Output {
+        self.mul(&rhs)
+    }
+}
+
+impl std::ops::Div<&Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: &Tensor) -> Self::Output {
+        self.try_div(rhs).expect("Tensor / Tensor failed")
+    }
+}
+
+impl std::ops::Div<Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: Tensor) -> Self::Output {
+        (&self).div(&rhs)
+    }
+}
+
+impl std::ops::Div<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: &Tensor) -> Self::Output {
+        (&self).div(rhs)
+    }
+}
+
+impl std::ops::Div<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: Tensor) -> Self::Output {
+        self.div(&rhs)
+    }
+}
+
+impl std::ops::Div<f64> for &Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: f64) -> Self::Output {
+        self.try_div_scalar(rhs).expect("Tensor / f64 failed")
+    }
+}
+
+impl std::ops::Div<f64> for Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: f64) -> Self::Output {
+        (&self).div(rhs)
+    }
+}
+
+impl std::ops::Div<&Tensor> for f64 {
+    type Output = Tensor;
+
+    fn div(self, rhs: &Tensor) -> Self::Output {
+        let lhs = rhs
+            .scalar_matching(self)
+            .expect("f64 / Tensor scalar failed");
+        lhs.try_div(rhs).expect("f64 / Tensor failed")
+    }
+}
+
+impl std::ops::Div<Tensor> for f64 {
+    type Output = Tensor;
+
+    fn div(self, rhs: Tensor) -> Self::Output {
+        self.div(&rhs)
+    }
+}
+
+impl std::ops::Neg for &Tensor {
+    type Output = Tensor;
+
+    fn neg(self) -> Self::Output {
+        self.try_neg().expect("-Tensor failed")
+    }
+}
+
+impl std::ops::Neg for Tensor {
+    type Output = Tensor;
+
+    fn neg(self) -> Self::Output {
+        (&self).neg()
+    }
 }
 
 #[cfg(test)]
@@ -107859,7 +108498,11 @@ mod tests {
                 .collect();
 
             #[allow(clippy::type_complexity)]
-            let ops: [(&str, fn(&mut FrankenTorchSession, TensorNodeId), fn(f64) -> f64); 4] = [
+            let ops: [(
+                &str,
+                fn(&mut FrankenTorchSession, TensorNodeId),
+                fn(f64) -> f64,
+            ); 4] = [
                 ("neg_", |s, t| s.tensor_neg_(t).expect("neg_"), |v| -v),
                 ("abs_", |s, t| s.tensor_abs_(t).expect("abs_"), f64::abs),
                 ("exp_", |s, t| s.tensor_exp_(t).expect("exp_"), f64::exp),
@@ -107929,10 +108572,26 @@ mod tests {
                 fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId),
                 fn(f32, f32) -> f32,
             ); 4] = [
-                ("add_", |s, t, o| s.tensor_add_(t, o).expect("add_"), |a, b| a + b),
-                ("sub_", |s, t, o| s.tensor_sub_(t, o).expect("sub_"), |a, b| a - b),
-                ("mul_", |s, t, o| s.tensor_mul_(t, o).expect("mul_"), |a, b| a * b),
-                ("div_", |s, t, o| s.tensor_div_(t, o).expect("div_"), |a, b| a / b),
+                (
+                    "add_",
+                    |s, t, o| s.tensor_add_(t, o).expect("add_"),
+                    |a, b| a + b,
+                ),
+                (
+                    "sub_",
+                    |s, t, o| s.tensor_sub_(t, o).expect("sub_"),
+                    |a, b| a - b,
+                ),
+                (
+                    "mul_",
+                    |s, t, o| s.tensor_mul_(t, o).expect("mul_"),
+                    |a, b| a * b,
+                ),
+                (
+                    "div_",
+                    |s, t, o| s.tensor_div_(t, o).expect("div_"),
+                    |a, b| a / b,
+                ),
             ];
 
             for (name, apply, op) in ops {
@@ -108003,7 +108662,7 @@ mod tests {
     /// backward` describes. Asserted at the ft-core layer, where the counter lives.
     #[test]
     fn f32_in_place_transform_bumps_the_tensor_version() {
-        use ft_core::{Device, DenseTensor};
+        use ft_core::{DenseTensor, Device};
         let mut tensor =
             DenseTensor::from_contiguous_values_f32(vec![1.0f32, 2.0, 3.0], vec![3], Device::Cpu)
                 .expect("tensor");
@@ -173263,5 +173922,119 @@ mod tests {
         });
         assert_eq!(s.current_device(), Device::Cpu);
     }
-}
 
+    #[test]
+    fn ergonomic_tensor_ops_and_chaining_work() {
+        let ctx = crate::TensorContext::strict();
+        let a = ctx
+            .tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let b = ctx
+            .tensor(vec![0.5, 1.5, 2.5, 3.5], vec![2, 2], true)
+            .unwrap();
+
+        let c = ((&a + &b) * 2.0 - 1.0) / 2.0;
+        let d = (-&c).relu().sigmoid().tanh().reshape(vec![4]).sum();
+        let _report = d.backward();
+
+        assert_eq!(a.shape().unwrap(), vec![2, 2]);
+        assert_eq!(a.dtype().unwrap(), DType::F64);
+        assert_eq!(a.device().unwrap(), Device::Cpu);
+        assert!(a.requires_grad().unwrap());
+        assert_eq!(a.grad().unwrap().len(), 4);
+        assert_eq!(b.grad().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn ergonomic_tensor_trains_mlp_with_operator_syntax() {
+        let ctx = crate::TensorContext::strict();
+        let x = ctx
+            .tensor(vec![1.0, 2.0, -1.0, 0.5], vec![2, 2], false)
+            .unwrap();
+        let target = ctx.tensor(vec![1.0, -1.0], vec![2, 1], false).unwrap();
+
+        let w1 = ctx
+            .tensor(vec![0.5, -0.25, 0.25, 0.75], vec![2, 2], true)
+            .unwrap();
+        let b1 = ctx.tensor(vec![0.1, -0.1], vec![1, 2], true).unwrap();
+        let w2 = ctx.tensor(vec![0.6, -0.4], vec![2, 1], true).unwrap();
+        let b2 = ctx.tensor(vec![0.05], vec![1, 1], true).unwrap();
+
+        // Forward pass with fluent chaining and operator overloads:
+        // hidden = (x @ w1 + b1).relu()
+        // pred = hidden @ w2 + b2
+        // loss = ((pred - target) * (pred - target)).mean()
+        let hidden = (x.matmul(&w1) + &b1).relu();
+        let pred = hidden.matmul(&w2) + &b2;
+        let diff = &pred - &target;
+        let loss1 = (&diff * &diff).mean();
+        let loss1_val = loss1.item().unwrap();
+        loss1.backward();
+
+        let gw1 = w1.grad().expect("w1 grad");
+        let gb1 = b1.grad().expect("b1 grad");
+        let gw2 = w2.grad().expect("w2 grad");
+        let gb2 = b2.grad().expect("b2 grad");
+
+        let lr = 0.1;
+        let w1_step = ctx
+            .tensor(
+                w1.values()
+                    .unwrap()
+                    .iter()
+                    .zip(&gw1)
+                    .map(|(w, g)| w - lr * g)
+                    .collect(),
+                vec![2, 2],
+                true,
+            )
+            .unwrap();
+        let b1_step = ctx
+            .tensor(
+                b1.values()
+                    .unwrap()
+                    .iter()
+                    .zip(&gb1)
+                    .map(|(b, g)| b - lr * g)
+                    .collect(),
+                vec![1, 2],
+                true,
+            )
+            .unwrap();
+        let w2_step = ctx
+            .tensor(
+                w2.values()
+                    .unwrap()
+                    .iter()
+                    .zip(&gw2)
+                    .map(|(w, g)| w - lr * g)
+                    .collect(),
+                vec![2, 1],
+                true,
+            )
+            .unwrap();
+        let b2_step = ctx
+            .tensor(
+                b2.values()
+                    .unwrap()
+                    .iter()
+                    .zip(&gb2)
+                    .map(|(b, g)| b - lr * g)
+                    .collect(),
+                vec![1, 1],
+                true,
+            )
+            .unwrap();
+
+        let hidden2 = (x.matmul(&w1_step) + &b1_step).relu();
+        let pred2 = hidden2.matmul(&w2_step) + &b2_step;
+        let diff2 = &pred2 - &target;
+        let loss2 = (&diff2 * &diff2).mean();
+        let loss2_val = loss2.item().unwrap();
+
+        assert!(
+            loss2_val < loss1_val,
+            "expected gradient step to reduce MLP loss: before={loss1_val}, after={loss2_val}"
+        );
+    }
+}

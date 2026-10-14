@@ -62,40 +62,59 @@ Rigorous upstream coverage audit against PyTorch 2.x stable API.
 - laguerre_polynomial_l (1)
 - legendre_polynomial_p (1)
 
-## Explicit Out-of-Scope (wontfix)
+## Workspace Crates (13 Total)
+
+| Crate | Package Name | Role | Status |
+|---|---|---|---|
+| `ft-core` | `frankentorch-core` | Core tensor types, 8 storage `DType`s, `Shape`, `Stride`, `TensorMeta`, `Device` | 100% |
+| `ft-device` | `ft-device` | Device enumeration (`Cpu`, `Cuda`, `Metal`), `DeviceGuard`, thread-local device affinity | 100% |
+| `ft-dispatch` | `frankentorch-dispatch` | Dispatch keyset model, schema routing, CPU + Metal backend selection | 100% |
+| `ft-kernel-cpu` | `frankentorch-kernel-cpu` | SIMD/rayon CPU kernels for elementwise, reduction, linalg, conv, norm, matmul | 100% |
+| `ft-kernel-metal` | `ft-kernel-metal` | Metal GPU compute shaders and command buffer execution (`Device::Metal`) | 100% |
+| `ft-autograd` | `frankentorch-autograd` | Deterministic Autograd Contract (DAC), dependency-driven backward scheduler, custom `FunctionCtx` | 100% |
+| `ft-api` | `frankentorch-api` | 970+ `FrankenTorchSession` ops + ergonomic `Tensor` / `TensorContext` (`std::ops` + fluent chaining) | 100% |
+| `ft-nn` | `ft-nn` | 155 neural network modules, `QuantizedLinear`, losses, containers, initialization | 100% |
+| `ft-optim` | `ft-optim` | 14 optimizers (including `Adam`, `AdamW`, `SGD`, `Muon`, `SparseAdam`) + 15 LR schedulers | 100% |
+| `ft-data` | `ft-data` | Typed `DenseTensor` `DataItem`, `TensorDataset`, `DataLoader`, samplers, transforms | 100% |
+| `ft-serialize` | `ft-serialize` | All-dtype `FTSV` native state dicts, `TypedStateEntry`, SafeTensors, sequential ONNX export, RaptorQ sidecars | 100% |
+| `ft-runtime` | `frankentorch-runtime` | Spec §6 Bayesian `DecisionController`, `asupersync::Cx` integration, 4-panel `FrankenTuiCockpit` | 100% |
+| `ft-conformance` | `ft-conformance` | Differential PyTorch oracle harness, metamorphic fuzz suite, Phase 2C & Perf SLO validators | 100% |
+
+## Explicit Out-of-Scope (wontfix for V1 CPU+Metal)
 
 | Feature | Bead | Reason |
 |---------|------|--------|
-| CUDA/GPU backend | c3d | CPU-first Rust port |
-| Distributed (DDP/FSDP) | 82b | CPU-first Rust port |
-| TorchScript/JIT | 8zy | CPU-first Rust port |
+| CUDA backend execution | c3d | V1 targets CPU + Metal (`Device::Metal`) |
+| Distributed (DDP/FSDP) | 82b | Single-node V1 scope |
+| TorchScript/JIT | 8zy | Eager-mode V1 scope |
 
 ## Coverage Evidence
 
 ### Code Statistics
-- ft-api: 88,917 LOC, 970 tensor_* functions
-- ft-nn: 31,349 LOC, 149 module structs
+- ft-api: 174,000+ LOC, 970+ `tensor_*` functions + ergonomic `Tensor` handle wrapper
+- ft-kernel-cpu: 53,000+ LOC
+- ft-conformance: 42,500+ LOC, 31 fixture files
+- ft-nn: 31,349 LOC, 155 module structs
 - ft-autograd: 24,170 LOC
-- ft-kernel-cpu: 13,681 LOC
-- ft-optim: 10,362 LOC, 13 optimizers + 15 schedulers
-- ft-conformance: 42,448 LOC, 31 fixture files
+- ft-optim: 10,362 LOC, 14 optimizers + 15 schedulers
+- ft-serialize, ft-data, ft-runtime, ft-device, ft-dispatch, ft-kernel-metal, ft-core: full workspace coverage
 
 ### Test Totals
-- 2500+ tests passing
+- 2500+ unit, conformance, and metamorphic property tests passing
 - All tests run in both strict and hardened modes
-- PyTorch oracle conformance via actual python3 calls
+- PyTorch oracle conformance via differential fixtures
 
 ### What IS Covered (examples)
 
 **Tensor creation:** zeros, ones, empty, full, arange, linspace, logspace, eye, rand, randn, randint, randperm
 
-**Math ops:** add, sub, mul, div, matmul, bmm, mm, einsum, dot, abs, exp, log, sin, cos, tan, sinh, cosh, tanh, sqrt, pow, etc.
+**Math ops:** add, sub, mul, div, matmul, bmm, mm, einsum, dot, abs, exp, log, sin, cos, tan, sinh, cosh, tanh, sqrt, pow, etc. (plus `std::ops::{Add, Sub, Mul, Div, Neg}` on `Tensor`)
 
 **Shape ops:** reshape, view, squeeze, unsqueeze, transpose, permute, cat, stack, split, chunk, flatten, unflatten
 
 **Reductions:** sum, mean, std, var, min, max, argmin, argmax, prod, norm, all, any
 
-**Linear algebra:** svd, qr, cholesky, eigh, det, slogdet, inv, pinv, solve, lstsq, matrix_power, matrix_rank
+**Linear algebra:** svd, qr, geqrf, orgqr, ormqr, cholesky, eigh, lu_factor, lu_solve, det, slogdet, inv, pinv, solve, lstsq, matrix_power, matrix_rank
 
 **NN functional:** conv1d/2d/3d, all pooling variants, all activations, all normalizations, dropout, embedding, linear, attention
 
@@ -111,14 +130,14 @@ Rigorous upstream coverage audit against PyTorch 2.x stable API.
 
 ## Next Steps
 
-All parity gaps closed. Coverage is 100% for CPU eager-mode PyTorch API.
+All V1 CPU+Metal parity gaps closed across all 13 workspace crates.
 
 Remaining out-of-scope items (by design):
-- CUDA/GPU backend (CPU-first Rust port)
+- CUDA GPU backend (V1 targets CPU + Metal)
 - Distributed training (DDP/FSDP)
 - TorchScript/JIT compilation
 
 ---
-Generated: 2026-05-25
+Generated: 2026-10-14
 Parity audit complete
-Audit agent: Opus
+

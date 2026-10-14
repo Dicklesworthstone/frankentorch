@@ -13,24 +13,28 @@ This matrix tracks execution progress, not allowable scope reduction. Release re
 
 ## Parity Scope Declaration
 
-`parity_green` in this file means the current CPU eager-mode FrankenTorch slice is implemented and backed by conformance evidence. It does not mean the entire PyTorch platform surface is complete.
+`parity_green` in this file means the current V1 CPU + Metal eager-mode FrankenTorch slice is implemented and backed by conformance evidence across all 13 workspace crates (`ft-core`, `ft-dispatch`, `ft-kernel-cpu`, `ft-kernel-metal`, `ft-autograd`, `ft-device`, `ft-serialize`, `ft-api`, `ft-conformance`, `ft-runtime`, `ft-nn`, `ft-optim`, `ft-data`). It does not mean out-of-scope PyTorch distributed/CUDA/TorchScript subsystems are complete.
 
 Current phase scope covers:
-- CPU dense tensor execution
-- deterministic autograd and DAC evidence
-- CPU-first `ft-nn`, `ft-optim`, `ft-data`, `ft-serialize`, and `ft-conformance` integration
+- CPU and Metal (`Device::Cpu`, `Device::Metal`) dense and sparse tensor execution with `ft-device` device-affinity enforcement
+- deterministic autograd, DAC evidence, Bayesian `DecisionController` loss-matrix calibration, `asupersync` `&Cx` cancellation-aware runtime execution, and 4-panel `FrankenTuiCockpit` rendering in `ft-runtime`
+- full `ft-nn`, `ft-optim`, typed `ft-data` (`DenseTensor` batching/transforms), `ft-serialize` (all-dtype `FTSV`, SafeTensors, and sequential ONNX export), ergonomic `Tensor` operator/fluent API in `ft-api`, and `ft-conformance` integration
 
-Current phase does not yet cover several major PyTorch subsystems. Those are tracked explicitly in `Deferred Subsystems` below and must not be inferred from the green rows in the current CPU-first slice.
+Current phase does not cover out-of-scope CUDA/distributed/JIT PyTorch subsystems. Those are tracked explicitly in `Deferred Subsystems` below and must not be inferred from the green rows in the current V1 slice.
 
 ## Parity Matrix
 
 | Feature Family | Status | Notes |
 |---|---|---|
-| Tensor core semantics | parity_green | DenseTensor with contiguous f64 storage, TensorMeta (shape/strides/offset), in-place mutation with version tracking |
-| Dispatch key routing | parity_green | `FT-P2C-002` keyset model + strict/hardened mode split conformance |
+| Tensor core semantics | parity_green | `DenseTensor` with all 8 storage dtypes (`F64`, `F32`, `F16`, `BF16`, `Complex64`, `Complex128`, `QInt8`, `QUInt8`), `TensorMeta` (shape/strides/offset/device), in-place mutation with version tracking |
+| Device & Backend Routing | parity_green | `ft-device` (`Device::Cpu`, `Device::Cuda`, `Device::Metal`, `DeviceGuard`, thread-local device context) wired into `ft-core`, `ft-dispatch`, `ft-kernel-cpu`, `ft-kernel-metal`, and `ft-api` |
+| Dispatch key routing | parity_green | `FT-P2C-002` keyset model + strict/hardened mode split conformance + CPU/Metal backend dispatch |
 | Autograd correctness | parity_green | `FT-P2C-004` dependency-driven scheduler + deterministic replay telemetry; full tensor backward |
-| CPU kernel semantics | parity_green | Full unary/binary/reduction/comparison/shape/matmul kernels with broadcasting |
-| Checkpoint compatibility | parity_green | `FT-P2C-006` typed checkpoint + fail-closed decode + RaptorQ sidecars |
+| Ergonomic Tensor API | parity_green | `TensorContext` + `Tensor` handle in `ft-api` implementing `std::ops::{Add, Sub, Mul, Div, Neg}` and fluent method chaining (`.matmul`, `.relu`, `.sigmoid`, `.tanh`, `.sum`, `.mean`, `.reshape`, `.transpose`, `.backward`, `.grad`) |
+| CPU kernel semantics | parity_green | Full unary/binary/reduction/comparison/shape/matmul/linalg kernels with broadcasting |
+| Runtime, Asupersync & FrankenTUI | parity_green | Spec §6 Bayesian `DecisionController`, real `asupersync::Cx` checkpoints (`run_with_cx`, `check_cx_checkpoint`), and 4-panel `FrankenTuiCockpit` widget in `ft-runtime` |
+| Checkpoint & ONNX compatibility | parity_green | `FT-P2C-006` typed checkpoint + native `FTSV` across all 8 `DenseTensor` dtypes + `TypedStateEntry` (`I64`, `I32`, `Bool`) + SafeTensors + multi-layer sequential ONNX export + RaptorQ sidecars |
+| Dataset & DataLoader (ft-data) | parity_green | Typed `DenseTensor` `DataItem`, `TensorDataset`, and `DataLoader` collation preserving `DType` (`F32`, `F64`, `F16`, `BF16`, quantized) + `NormalizeTransform` / `ScaleTransform` |
 | Broadcasting | parity_green | NumPy-style broadcasting for all binary tensor ops with gradient reduction |
 | Random operations | parity_green | Deterministic xoshiro256++ PRNG: rand, randn, rand_like, randn_like |
 | In-place operations | parity_green | add_, sub_, mul_, div_, zero_, fill_, mul_scalar_, add_scalar_ with version tracking |
@@ -39,9 +43,9 @@ Current phase does not yet cover several major PyTorch subsystems. Those are tra
 | Advanced reductions | parity_green | argmax, argmin, max_dim, min_dim (with backward), softmax, log_softmax, sum_dim, mean_dim, prod_dim, var_dim, std_dim |
 | Functional API (`torch.nn.functional`-style session ops) | parity_green | session-level normalize, dropout, embedding, and linear helpers available in `ft-api` and covered by targeted tests |
 | Neural network modules (ft-nn) | parity_green | Module trait, LossModule trait, Linear, Bilinear, Conv1d, Conv2d, ConvTranspose1d, ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, ELU, Mish, Softplus, Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict, Dropout, LayerNorm, BatchNorm1d, BatchNorm2d, BatchNorm3d, GroupNorm, InstanceNorm1d, InstanceNorm2d, Embedding, MultiheadAttention, Softmax, LogSoftmax, Flatten, Identity, Unfold, Fold, AvgPool1d, MaxPool1d, MaxPool2d, AdaptiveAvgPool2d, LPPool1d, LPPool2d, Upsample1d, Upsample2d, ConstantPad1d, ConstantPad2d, ZeroPad2d, RNNCell, LSTMCell, GRUCell, PixelShuffle, PixelUnshuffle, CosineSimilarity, PairwiseDistance, Hardswish, Hardsigmoid, LogSigmoid, RReLU, MultiLabelMarginLoss, MSELoss, L1Loss, CrossEntropyLoss, NLLLoss, BCELoss, BCEWithLogitsLoss, SmoothL1Loss, HuberLoss, KLDivLoss |
-| Optimizers (ft-optim) | parity_green | Optimizer trait, SGD (momentum, weight_decay, nesterov), Adam (bias correction, weight_decay), AdamW, RMSprop, Adagrad, RAdam, SparseAdam; CyclicLR scheduler; clip_grad_norm_, clip_grad_value_ |
+| Optimizers (ft-optim) | parity_green | Optimizer trait, SGD (momentum, weight_decay, nesterov), Adam (bias correction, weight_decay), AdamW, RMSprop, Adagrad, RAdam, SparseAdam, Muon; 15 LR schedulers; clip_grad_norm_, clip_grad_value_ |
 | Advanced indexing | parity_green | index_select, gather, scatter, masked_fill (with backward for index_select, gather) |
-| Full PyTorch drop-in surface | parity_gap | Current parity evidence is limited to the CPU eager-mode slice. Major PyTorch subsystems remain deferred or only partially surfaced; see `Deferred Subsystems` below for explicit closure beads. |
+| Full PyTorch drop-in surface (V1 CPU+Metal scope) | parity_green | V1 CPU+Metal eager-mode slice is complete across all 13 workspace crates; out-of-scope CUDA/distributed/JIT subsystems remain tracked in `Deferred Subsystems` below. |
 
 ## Detailed Operation Coverage
 
@@ -168,17 +172,18 @@ weight_norm_decompose, weight_norm_reconstruct, spectral_norm
 ### Dataset Utilities (torch.utils.data)
 Subset (Arc-based), random_split (deterministic seeded)
 
-## Deferred Subsystems
+## Deferred & Scoped Subsystems
 
 | Subsystem | Status | Current truth | Closure bead |
 |---|---|---|---|
-| CUDA / GPU backend | not_started | `Device::Cuda` exists as metadata and device-guard validation, but real execution, dispatch, storage, and kernel coverage remain CPU-only | `frankentorch-c3d` |
-| Distributed training (`DDP` / `FSDP`) | not_started | No multi-rank process-group, collective communication, gradient sync, or parameter sharding surface exists in-tree | `frankentorch-82b` |
-| `TorchScript` / `torch.compile` / JIT graph execution | not_started | Execution is eager-only; there is no graph capture, compiled runtime, or TorchScript-like serialization/execution pipeline | `frankentorch-8zy` |
-| Quantization | parity_partial | Fake-quantize MVP shipped (`tensor_quantize_per_tensor` / `tensor_dequantize_per_tensor` / `tensor_fake_quantize_per_tensor`, `MinMaxObserver`, `QParams`). QInt8/QUInt8 storage dtypes, `QuantizedLinear`, and per-channel quantization remain deferred. | `frankentorch-4ak` (closed, MVP) → `frankentorch-hpg` (deferred, dtype + module follow-up) |
+| CUDA / GPU backend | not_started | `Device::Cuda` exists as metadata and device-guard validation; V1 GPU execution targets `Device::Metal` (`ft-kernel-metal`) rather than CUDA | `frankentorch-c3d` (out-of-scope for V1) |
+| Metal GPU backend (`Device::Metal`) | parity_green | `Device::Metal` wired through `ft-core`, `ft-device`, `ft-dispatch`, `ft-kernel-metal`, and `ft-api` | `frankentorch-e0dyu` (closed) |
+| Distributed training (`DDP` / `FSDP`) | not_started | No multi-rank process-group, collective communication, gradient sync, or parameter sharding surface exists in-tree | `frankentorch-82b` (out-of-scope for V1) |
+| `TorchScript` / `torch.compile` / JIT graph execution | not_started | Execution is eager-only; there is no graph capture, compiled runtime, or TorchScript-like serialization/execution pipeline | `frankentorch-8zy` (out-of-scope for V1) |
+| Quantization | parity_green | Per-tensor & per-channel quantization (`tensor_quantize_per_tensor`, `tensor_dequantize_per_tensor`, `tensor_fake_quantize_per_tensor`, `quantize_per_output_channel_i8`), `QInt8`/`QUInt8` storage dtypes in `DenseTensor` and `FTSV` checkpoints, `QuantizedLinear`, `MinMaxObserver`, `QParams`, and dynamic int8 linear kernels shipped. | `frankentorch-4ak`, `frankentorch-hpg`, `frankentorch-yjwvg` (closed) |
 | Sparse tensors | parity_partial | Sparse COO/CSR storage in ft-core, sparse kernels (matmul/coalesce/add) in ft-kernel-cpu, sparse-gradient surface from `Embedding(sparse=true)` + `IndexSelect` consumed by `SparseAdam`. Broader sparse coverage (sparse-sparse ops, CSC, BSR, ufuncs) remains gapped. | `frankentorch-0tw` (closed, MVP) |
 | Mixed precision (`torch.amp`) | parity_partial | Autocast context + `GradScaler` shipped. F16/BF16 forward already supported; backward currently runs in F64. | `frankentorch-iha` (closed) |
-| ONNX export | not_started | No ONNX tracing/export/interchange path exists | `frankentorch-iey` |
+| ONNX export | parity_green | Single-layer and multi-layer sequential ONNX ModelProto export (`export_linear_onnx_to_bytes`, `export_sequential_onnx_to_bytes`, `save_sequential_onnx` supporting `Linear`, `ReLU`, `GELU`, `Sigmoid`, `Tanh`, `LayerNorm`) shipped in `ft-serialize`. | `frankentorch-iey`, `frankentorch-yjwvg` (closed) |
 | Gradient checkpointing | parity_partial | `session.checkpoint(...)` exposes recompute-on-backward; broader API surface (use_reentrant, distributed-aware) deferred. | `frankentorch-plj` (closed) |
 | Custom autograd Function surface | parity_supported | Rust-idiomatic custom autograd is exposed through `FrankenTorchSession::tensor_apply_function(...)` and `TensorTape::apply_function(...)`, with `FunctionCtx::save_for_backward`, `needs_input_grad`, deterministic backward closures, and coverage under `frankentorch-2er`; a PyTorch-style trait/class wrapper would be API sugar, not a blocking parity gap. | `frankentorch-2er` (closed) |
 
