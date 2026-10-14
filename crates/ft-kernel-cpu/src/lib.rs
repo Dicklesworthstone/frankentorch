@@ -78168,6 +78168,12 @@ mod tests {
         let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // This sentinel is specifically about the two legacy panel GEMMs. The
+        // production dinput route may legitimately bypass the dpanel GEMM via
+        // the direct blocked kernel, so pin the panel route just as we pin the
+        // streamed-dweight route. Otherwise a faster, bit-identical route turns
+        // "skipped" into an ambiguous zero and makes this test schedule/host dependent.
+        let restore_dinput = super::set_conv2d_dinput_panel_legacy(true);
         let restore_stream = super::set_conv2d_dweight_streamed(false);
 
         let (batch, in_ch, ph, pw) = (2usize, 3usize, 9usize, 10usize);
@@ -78224,6 +78230,7 @@ mod tests {
             );
         }
         super::set_conv2d_dweight_streamed(restore_stream);
+        super::set_conv2d_dinput_panel_legacy(restore_dinput);
 
         // And the sentinel must be able to see a GEMM at all — a counter wired to nothing would
         // pass every assertion above.
