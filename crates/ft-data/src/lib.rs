@@ -45,11 +45,14 @@ fn dataloader_error(reason: &'static str) -> AutogradError {
 /// A single data sample returned by a `Dataset`.
 ///
 /// Each item consists of named tensors (e.g., "input" and "target").
-/// The tensors are represented as flat f64 vectors with associated shapes.
+/// Tensors may be stored either as legacy flat `f64` vectors with shapes or as
+/// typed `ft_core::DenseTensor` values preserving their exact `DType` and `Device`.
 #[derive(Debug, Clone)]
 pub struct DataItem {
     /// Named tensor data: (name, values, shape).
     pub tensors: Vec<(String, Vec<f64>, Vec<usize>)>,
+    /// Named typed `DenseTensor` entries preserving `DType` (`F32`, `F16`, `BF16`, `F64`, etc.) and `Device`.
+    pub dense_tensors: Vec<(String, ft_core::DenseTensor)>,
 }
 
 impl DataItem {
@@ -65,6 +68,7 @@ impl DataItem {
                 ("input".to_string(), input_values, input_shape),
                 ("target".to_string(), target_values, target_shape),
             ],
+            dense_tensors: Vec::new(),
         }
     }
 
@@ -72,7 +76,44 @@ impl DataItem {
     pub fn single(name: &str, values: Vec<f64>, shape: Vec<usize>) -> Self {
         Self {
             tensors: vec![(name.to_string(), values, shape)],
+            dense_tensors: Vec::new(),
         }
+    }
+
+    /// Create a data item from named typed `DenseTensor` values.
+    #[must_use]
+    pub fn from_dense_tensors(dense_tensors: Vec<(String, ft_core::DenseTensor)>) -> Self {
+        Self {
+            tensors: Vec::new(),
+            dense_tensors,
+        }
+    }
+
+    /// Create a data item with a single typed `DenseTensor`.
+    #[must_use]
+    pub fn single_dense(name: &str, tensor: ft_core::DenseTensor) -> Self {
+        Self {
+            tensors: Vec::new(),
+            dense_tensors: vec![(name.to_string(), tensor)],
+        }
+    }
+
+    /// Create a data item with a typed `DenseTensor` input-target pair.
+    #[must_use]
+    pub fn input_target_dense(input: ft_core::DenseTensor, target: ft_core::DenseTensor) -> Self {
+        Self {
+            tensors: Vec::new(),
+            dense_tensors: vec![("input".to_string(), input), ("target".to_string(), target)],
+        }
+    }
+
+    /// Look up a typed `DenseTensor` by name.
+    #[must_use]
+    pub fn dense_tensor(&self, name: &str) -> Option<&ft_core::DenseTensor> {
+        self.dense_tensors
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t)
     }
 }
 
@@ -130,6 +171,12 @@ impl TensorDataset {
         Self { items, columns }
     }
 
+    /// Create a new `TensorDataset` from typed `DenseTensor` data items.
+    #[must_use]
+    pub fn from_dense_items(items: Vec<DataItem>) -> Self {
+        Self::new(items)
+    }
+
     /// Create from parallel vectors of inputs and targets.
     ///
     /// Each input/target pair becomes one `DataItem` with "input" and "target" tensors.
@@ -149,6 +196,25 @@ impl TensorDataset {
             .collect();
         let columns = build_tensor_dataset_columns(&items);
         Self { items, columns }
+    }
+
+    /// Create from parallel vectors of typed `DenseTensor` inputs and targets.
+    #[must_use]
+    pub fn from_dense_inputs_targets(
+        inputs: Vec<ft_core::DenseTensor>,
+        targets: Vec<ft_core::DenseTensor>,
+    ) -> Self {
+        assert_eq!(
+            inputs.len(),
+            targets.len(),
+            "inputs and targets must have same length"
+        );
+        let items: Vec<DataItem> = inputs
+            .into_iter()
+            .zip(targets)
+            .map(|(input, target)| DataItem::input_target_dense(input, target))
+            .collect();
+        Self::new(items)
     }
 }
 
@@ -176,6 +242,9 @@ impl Dataset for TensorDataset {
 
 fn build_tensor_dataset_columns(items: &[DataItem]) -> Option<Vec<TensorDatasetColumn>> {
     let first = items.first()?;
+    if !first.dense_tensors.is_empty() {
+        return None;
+    }
     let mut columns = Vec::with_capacity(first.tensors.len());
     for (name, values, shape) in &first.tensors {
         let sample_numel =
@@ -192,7 +261,7 @@ fn build_tensor_dataset_columns(items: &[DataItem]) -> Option<Vec<TensorDatasetC
     }
 
     for item in items {
-        if item.tensors.len() != columns.len() {
+        if !item.dense_tensors.is_empty() || item.tensors.len() != columns.len() {
             return None;
         }
         for ((name, values, shape), column) in item.tensors.iter().zip(columns.iter_mut()) {
@@ -932,6 +1001,231 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
     }
 }
 
+fn stack_dense_tensors(
+    tensors: &[&ft_core::DenseTensor],
+) -> Result<ft_core::DenseTensor, AutogradError> {
+    use ft_core::{BFloat16, Complex64, Complex128, DType, DenseTensor, Float16, TensorMeta};
+
+    let (&first, rest) = tensors
+        .split_first()
+        .ok_or_else(|| dataloader_error("DataLoader: cannot stack empty dense tensor batch"))?;
+    let first_meta = first.meta();
+    let first_shape = first_meta.shape();
+    let dtype = first_meta.dtype();
+    let device = first_meta.device();
+    let sample_numel =
+        checked_shape_numel(first_shape, "DataLoader: sample shape volume overflow")?;
+
+    for &t in rest {
+        if t.meta().shape() != first_shape {
+            return Err(dataloader_error(
+                "DataLoader: tensor shapes differ across samples in batch",
+            ));
+        }
+        if t.meta().dtype() != dtype {
+            return Err(dataloader_error(
+                "DataLoader: tensor dtypes differ across samples in batch",
+            ));
+        }
+        if t.meta().device() != device {
+            return Err(dataloader_error(
+                "DataLoader: tensor devices differ across samples in batch",
+            ));
+        }
+        if t.meta().quantization() != first_meta.quantization() {
+            return Err(dataloader_error(
+                "DataLoader: quantized tensor metadata differs across samples in batch",
+            ));
+        }
+    }
+
+    let batch_size = tensors.len();
+    let batch_numel = checked_mul(batch_size, sample_numel, "DataLoader: batch size overflow")?;
+    let mut batched_shape = Vec::with_capacity(1 + first_shape.len());
+    batched_shape.push(batch_size);
+    batched_shape.extend_from_slice(first_shape);
+
+    match dtype {
+        DType::F64 => {
+            let mut values = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let sample_vals = t.contiguous_values().map_err(AutogradError::from)?;
+                if sample_vals.len() != sample_numel {
+                    return Err(dataloader_error(
+                        "DataLoader: sample values length does not match declared tensor shape",
+                    ));
+                }
+                values.extend_from_slice(&sample_vals);
+            }
+            let meta = TensorMeta::from_shape(batched_shape, DType::F64, device);
+            DenseTensor::from_storage(meta, values).map_err(AutogradError::from)
+        }
+        DType::F32 => {
+            let mut values = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let sample_vals = t.contiguous_values_f32().map_err(AutogradError::from)?;
+                if sample_vals.len() != sample_numel {
+                    return Err(dataloader_error(
+                        "DataLoader: sample values length does not match declared tensor shape",
+                    ));
+                }
+                values.extend_from_slice(&sample_vals);
+            }
+            let meta = TensorMeta::from_shape(batched_shape, DType::F32, device);
+            DenseTensor::from_storage_f32(meta, values).map_err(AutogradError::from)
+        }
+        DType::F16 => {
+            let mut values: Vec<Float16> = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let sample_vals = t.contiguous_values_f16().map_err(AutogradError::from)?;
+                if sample_vals.len() != sample_numel {
+                    return Err(dataloader_error(
+                        "DataLoader: sample values length does not match declared tensor shape",
+                    ));
+                }
+                values.extend_from_slice(&sample_vals);
+            }
+            let meta = TensorMeta::from_shape(batched_shape, DType::F16, device);
+            DenseTensor::from_storage_f16(meta, values).map_err(AutogradError::from)
+        }
+        DType::BF16 => {
+            let mut values: Vec<BFloat16> = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let sample_vals = t.contiguous_values_bf16().map_err(AutogradError::from)?;
+                if sample_vals.len() != sample_numel {
+                    return Err(dataloader_error(
+                        "DataLoader: sample values length does not match declared tensor shape",
+                    ));
+                }
+                values.extend_from_slice(&sample_vals);
+            }
+            let meta = TensorMeta::from_shape(batched_shape, DType::BF16, device);
+            DenseTensor::from_storage_bf16(meta, values).map_err(AutogradError::from)
+        }
+        DType::Complex64 => {
+            let mut values: Vec<Complex64> = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let sample_vals = t
+                    .contiguous_values_complex64()
+                    .map_err(AutogradError::from)?;
+                if sample_vals.len() != sample_numel {
+                    return Err(dataloader_error(
+                        "DataLoader: sample values length does not match declared tensor shape",
+                    ));
+                }
+                values.extend_from_slice(&sample_vals);
+            }
+            let meta = TensorMeta::from_shape(batched_shape, DType::Complex64, device);
+            DenseTensor::from_storage_complex64(meta, values).map_err(AutogradError::from)
+        }
+        DType::Complex128 => {
+            let mut values: Vec<Complex128> = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let sample_vals = t
+                    .contiguous_values_complex128()
+                    .map_err(AutogradError::from)?;
+                if sample_vals.len() != sample_numel {
+                    return Err(dataloader_error(
+                        "DataLoader: sample values length does not match declared tensor shape",
+                    ));
+                }
+                values.extend_from_slice(&sample_vals);
+            }
+            let meta = TensorMeta::from_shape(batched_shape, DType::Complex128, device);
+            DenseTensor::from_storage_complex128(meta, values).map_err(AutogradError::from)
+        }
+        DType::QInt8 => {
+            let mut values: Vec<i8> = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let raw = t
+                    .typed_storage()
+                    .as_qint8()
+                    .ok_or_else(|| dataloader_error("DataLoader: QInt8 storage mismatch"))?;
+                let offset = t.meta().storage_offset();
+                let end = offset
+                    .checked_add(sample_numel)
+                    .ok_or_else(|| dataloader_error("DataLoader: storage offset overflow"))?;
+                if !t.meta().is_contiguous() || end > raw.len() {
+                    return Err(dataloader_error(
+                        "DataLoader: QInt8 tensor must be contiguous",
+                    ));
+                }
+                values.extend_from_slice(&raw[offset..end]);
+            }
+            match first_meta.quantization() {
+                Some(params) => match params.axis() {
+                    None => DenseTensor::from_contiguous_values_qint8(
+                        values,
+                        batched_shape,
+                        device,
+                        params.scale(),
+                        params.zero_point(),
+                    )
+                    .map_err(AutogradError::from),
+                    Some(axis) => DenseTensor::from_contiguous_values_qint8_per_channel(
+                        values,
+                        batched_shape,
+                        device,
+                        params.scales(),
+                        params.zero_points().to_vec(),
+                        axis + 1,
+                    )
+                    .map_err(AutogradError::from),
+                },
+                None => Err(dataloader_error(
+                    "DataLoader: QInt8 tensor missing quantization metadata",
+                )),
+            }
+        }
+        DType::QUInt8 => {
+            let mut values: Vec<u8> = Vec::with_capacity(batch_numel);
+            for &t in tensors {
+                let raw = t
+                    .typed_storage()
+                    .as_quint8()
+                    .ok_or_else(|| dataloader_error("DataLoader: QUInt8 storage mismatch"))?;
+                let offset = t.meta().storage_offset();
+                let end = offset
+                    .checked_add(sample_numel)
+                    .ok_or_else(|| dataloader_error("DataLoader: storage offset overflow"))?;
+                if !t.meta().is_contiguous() || end > raw.len() {
+                    return Err(dataloader_error(
+                        "DataLoader: QUInt8 tensor must be contiguous",
+                    ));
+                }
+                values.extend_from_slice(&raw[offset..end]);
+            }
+            match first_meta.quantization() {
+                Some(params) => match params.axis() {
+                    None => DenseTensor::from_contiguous_values_quint8(
+                        values,
+                        batched_shape,
+                        device,
+                        params.scale(),
+                        params.zero_point(),
+                    )
+                    .map_err(AutogradError::from),
+                    Some(axis) => DenseTensor::from_contiguous_values_quint8_per_channel(
+                        values,
+                        batched_shape,
+                        device,
+                        params.scales(),
+                        params.zero_points().to_vec(),
+                        axis + 1,
+                    )
+                    .map_err(AutogradError::from),
+                },
+                None => Err(dataloader_error(
+                    "DataLoader: QUInt8 tensor missing quantization metadata",
+                )),
+            }
+        }
+        DType::I64 | DType::I32 | DType::Bool => Err(dataloader_error(
+            "DataLoader: integer/bool tensors cannot be stored in DenseTensor",
+        )),
+    }
+}
+
 /// Collate a batch of `DataItem`s into a single `Batch` with stacked tensors.
 ///
 /// All items must have the same number of tensors with the same names and shapes.
@@ -947,7 +1241,8 @@ fn collate(
     }
 
     let num_tensors = samples[0].tensors.len();
-    let mut batch_tensors = Vec::with_capacity(num_tensors);
+    let num_dense_tensors = samples[0].dense_tensors.len();
+    let mut batch_tensors = Vec::with_capacity(num_tensors + num_dense_tensors);
 
     for tensor_idx in 0..num_tensors {
         let (ref name, _, ref first_shape) = samples[0].tensors[tensor_idx];
@@ -1011,6 +1306,29 @@ fn collate(
         batch_tensors.push((name.clone(), tensor));
     }
 
+    for dense_idx in 0..num_dense_tensors {
+        let (ref name, ref first_tensor) = samples[0].dense_tensors[dense_idx];
+        let mut refs = Vec::with_capacity(samples.len());
+        refs.push(first_tensor);
+        for sample in samples.iter().skip(1) {
+            if sample.dense_tensors.len() != num_dense_tensors {
+                return Err(dataloader_error(
+                    "DataLoader: samples have different numbers of dense tensors",
+                ));
+            }
+            let (ref s_name, ref s_tensor) = sample.dense_tensors[dense_idx];
+            if s_name != name {
+                return Err(dataloader_error(
+                    "DataLoader: tensor names differ across samples in batch",
+                ));
+            }
+            refs.push(s_tensor);
+        }
+        let stacked = stack_dense_tensors(&refs)?;
+        let node = session.tensor_variable_from_storage(stacked, false);
+        batch_tensors.push((name.clone(), node));
+    }
+
     Ok(Batch {
         tensors: batch_tensors,
     })
@@ -1031,7 +1349,8 @@ fn collate_tensor_dataset_items(
         .get(indices[0])
         .ok_or_else(|| dataloader_error("DataLoader: sampler index out of range for dataset"))?;
     let num_tensors = first.tensors.len();
-    let mut batch_tensors = Vec::with_capacity(num_tensors);
+    let num_dense_tensors = first.dense_tensors.len();
+    let mut batch_tensors = Vec::with_capacity(num_tensors + num_dense_tensors);
 
     for tensor_idx in 0..num_tensors {
         let (ref name, ref first_values, ref first_shape) = first.tensors[tensor_idx];
@@ -1087,6 +1406,32 @@ fn collate_tensor_dataset_items(
 
         let tensor = session.tensor_variable(batched_values, batched_shape, false)?;
         batch_tensors.push((name.clone(), tensor));
+    }
+
+    for dense_idx in 0..num_dense_tensors {
+        let (ref name, ref first_tensor) = first.dense_tensors[dense_idx];
+        let mut refs = Vec::with_capacity(indices.len());
+        refs.push(first_tensor);
+        for &sample_index in indices.iter().skip(1) {
+            let sample = items.get(sample_index).ok_or_else(|| {
+                dataloader_error("DataLoader: sampler index out of range for dataset")
+            })?;
+            if sample.dense_tensors.len() != num_dense_tensors {
+                return Err(dataloader_error(
+                    "DataLoader: samples have different numbers of dense tensors",
+                ));
+            }
+            let (ref s_name, ref s_tensor) = sample.dense_tensors[dense_idx];
+            if s_name != name {
+                return Err(dataloader_error(
+                    "DataLoader: tensor names differ across samples in batch",
+                ));
+            }
+            refs.push(s_tensor);
+        }
+        let stacked = stack_dense_tensors(&refs)?;
+        let node = session.tensor_variable_from_storage(stacked, false);
+        batch_tensors.push((name.clone(), node));
     }
 
     Ok(Batch {
@@ -1273,6 +1618,43 @@ impl Transform for NormalizeTransform {
                 }
             }
         }
+        for (name, tensor) in &mut item.dense_tensors {
+            if name == &self.tensor_name && !self.mean.is_empty() && tensor.meta().is_contiguous() {
+                let channels = self.mean.len();
+                let shape = tensor.meta().shape().to_vec();
+                let channel_count_matches = shape
+                    .first()
+                    .copied()
+                    .is_some_and(|first| first.cmp(&channels).is_eq());
+                if !channel_count_matches {
+                    continue;
+                }
+                let dtype = tensor.meta().dtype();
+                let mut vals = tensor.typed_storage().to_f64_vec();
+                let offset = tensor.meta().storage_offset();
+                let numel = tensor.meta().numel();
+                if offset + numel <= vals.len() && numel % channels == 0 {
+                    let mut slice_vals = vals.drain(offset..offset + numel).collect::<Vec<f64>>();
+                    let channel_size = numel / channels;
+                    for c in 0..channels {
+                        let m = self.mean[c];
+                        let s = self.std[c];
+                        for i in 0..channel_size {
+                            let idx = c * channel_size + i;
+                            slice_vals[idx] = (slice_vals[idx] - m) / s;
+                        }
+                    }
+                    if let Ok(f64_t) = ft_core::DenseTensor::from_contiguous_values(
+                        slice_vals,
+                        shape,
+                        tensor.meta().device(),
+                    ) && let Ok(converted) = f64_t.to_dtype(dtype)
+                    {
+                        *tensor = converted;
+                    }
+                }
+            }
+        }
         item
     }
 }
@@ -1325,6 +1707,28 @@ impl Transform for ScaleTransform {
             if name == &self.tensor_name {
                 for v in values.iter_mut() {
                     *v *= self.factor;
+                }
+            }
+        }
+        for (name, tensor) in &mut item.dense_tensors {
+            if name == &self.tensor_name && tensor.meta().is_contiguous() {
+                let dtype = tensor.meta().dtype();
+                let shape = tensor.meta().shape().to_vec();
+                let device = tensor.meta().device();
+                let mut vals = tensor.typed_storage().to_f64_vec();
+                let offset = tensor.meta().storage_offset();
+                let numel = tensor.meta().numel();
+                if offset + numel <= vals.len() {
+                    let mut slice_vals = vals.drain(offset..offset + numel).collect::<Vec<f64>>();
+                    for v in &mut slice_vals {
+                        *v *= self.factor;
+                    }
+                    if let Ok(f64_t) =
+                        ft_core::DenseTensor::from_contiguous_values(slice_vals, shape, device)
+                        && let Ok(converted) = f64_t.to_dtype(dtype)
+                    {
+                        *tensor = converted;
+                    }
                 }
             }
         }
@@ -3176,5 +3580,104 @@ mod tests {
         // PyTorch requires random_split lengths to exhaust the dataset.
         let ds = make_dataset(20, 1);
         random_split(ds, &[5, 5], 42);
+    }
+
+    #[test]
+    fn dataloader_collates_typed_dense_tensors_preserving_dtype() {
+        use ft_core::{BFloat16, DType, DenseTensor, Device, Float16};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let inputs = vec![
+            DenseTensor::from_contiguous_values_f32(vec![1.0_f32, 2.0], vec![2], Device::Cpu)
+                .unwrap(),
+            DenseTensor::from_contiguous_values_f32(vec![3.0_f32, 4.0], vec![2], Device::Cpu)
+                .unwrap(),
+        ];
+        let targets = vec![
+            DenseTensor::from_contiguous_values_f16(
+                vec![Float16::from_f32(0.5)],
+                vec![1],
+                Device::Cpu,
+            )
+            .unwrap(),
+            DenseTensor::from_contiguous_values_f16(
+                vec![Float16::from_f32(1.5)],
+                vec![1],
+                Device::Cpu,
+            )
+            .unwrap(),
+        ];
+
+        let ds = TensorDataset::from_dense_inputs_targets(inputs, targets);
+        assert_eq!(ds.len(), 2);
+        assert_eq!(
+            ds.get(0).dense_tensor("input").unwrap().meta().dtype(),
+            DType::F32
+        );
+        assert_eq!(
+            ds.get(0).dense_tensor("target").unwrap().meta().dtype(),
+            DType::F16
+        );
+
+        let mut loader = DataLoader::new(&ds, DataLoaderConfig::new(2));
+        let batch = loader.next_batch(&mut session).unwrap().unwrap();
+        let input_id = batch.input().unwrap();
+        let target_id = batch.target().unwrap();
+
+        assert_eq!(session.tensor_dtype(input_id).unwrap(), DType::F32);
+        assert_eq!(session.tensor_shape(input_id).unwrap(), vec![2, 2]);
+        assert_eq!(
+            session.tensor_values_f32(input_id).unwrap(),
+            vec![1.0_f32, 2.0, 3.0, 4.0]
+        );
+
+        assert_eq!(session.tensor_dtype(target_id).unwrap(), DType::F16);
+        assert_eq!(session.tensor_shape(target_id).unwrap(), vec![2, 1]);
+        assert_eq!(
+            session
+                .tensor_to_sparse_coo(target_id)
+                .unwrap()
+                .values()
+                .typed_storage()
+                .to_f64_vec(),
+            vec![0.5, 1.5]
+        );
+
+        let bf16_items = vec![
+            DataItem::single_dense(
+                "emb",
+                DenseTensor::from_contiguous_values_bf16(
+                    vec![BFloat16::from_f32(2.0), BFloat16::from_f32(-4.0)],
+                    vec![2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+            ),
+            DataItem::single_dense(
+                "emb",
+                DenseTensor::from_contiguous_values_bf16(
+                    vec![BFloat16::from_f32(6.0), BFloat16::from_f32(8.0)],
+                    vec![2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+            ),
+        ];
+        let bf16_ds = TensorDataset::from_dense_items(bf16_items);
+        let scaled_ds =
+            TransformDataset::new(bf16_ds, Box::new(ScaleTransform::new("emb", 0.5).unwrap()));
+        let mut bf16_loader = DataLoader::new(&scaled_ds, DataLoaderConfig::new(2));
+        let bf16_batch = bf16_loader.next_batch(&mut session).unwrap().unwrap();
+        let emb_id = bf16_batch.get("emb").unwrap();
+        assert_eq!(session.tensor_dtype(emb_id).unwrap(), DType::BF16);
+        assert_eq!(
+            session
+                .tensor_to_sparse_coo(emb_id)
+                .unwrap()
+                .values()
+                .typed_storage()
+                .to_f64_vec(),
+            vec![1.0, -2.0, 3.0, 4.0]
+        );
     }
 }

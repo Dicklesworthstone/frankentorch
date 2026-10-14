@@ -1299,6 +1299,26 @@ impl DenseTensor {
         Self::from_typed_storage(meta, TensorStorage::QUInt8(Arc::new(storage)))
     }
 
+    pub fn from_storage_complex64(
+        meta: TensorMeta,
+        storage: Vec<Complex64>,
+    ) -> Result<Self, DenseTensorError> {
+        if meta.dtype() != DType::Complex64 {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
+        }
+        Self::from_typed_storage(meta, TensorStorage::Complex64(Arc::new(storage)))
+    }
+
+    pub fn from_storage_complex128(
+        meta: TensorMeta,
+        storage: Vec<Complex128>,
+    ) -> Result<Self, DenseTensorError> {
+        if meta.dtype() != DType::Complex128 {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
+        }
+        Self::from_typed_storage(meta, TensorStorage::Complex128(Arc::new(storage)))
+    }
+
     pub fn from_contiguous_values(
         values: Vec<f64>,
         shape: Vec<usize>,
@@ -1333,6 +1353,24 @@ impl DenseTensor {
     ) -> Result<Self, DenseTensorError> {
         let meta = TensorMeta::from_shape(shape, DType::BF16, device);
         Self::from_storage_bf16(meta, values)
+    }
+
+    pub fn from_contiguous_values_complex64(
+        values: Vec<Complex64>,
+        shape: Vec<usize>,
+        device: Device,
+    ) -> Result<Self, DenseTensorError> {
+        let meta = TensorMeta::from_shape(shape, DType::Complex64, device);
+        Self::from_storage_complex64(meta, values)
+    }
+
+    pub fn from_contiguous_values_complex128(
+        values: Vec<Complex128>,
+        shape: Vec<usize>,
+        device: Device,
+    ) -> Result<Self, DenseTensorError> {
+        let meta = TensorMeta::from_shape(shape, DType::Complex128, device);
+        Self::from_storage_complex128(meta, values)
     }
 
     pub fn from_contiguous_values_qint8(
@@ -1469,6 +1507,54 @@ impl DenseTensor {
         let end = Self::storage_span_required_len(&self.meta)?;
         match &self.storage {
             TensorStorage::F32(v) => Ok(&v[start..end]),
+            _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
+        }
+    }
+
+    pub fn contiguous_values_f16(&self) -> Result<&[Float16], DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::storage_span_required_len(&self.meta)?;
+        match &self.storage {
+            TensorStorage::F16(v) => Ok(&v[start..end]),
+            _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
+        }
+    }
+
+    pub fn contiguous_values_bf16(&self) -> Result<&[BFloat16], DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::storage_span_required_len(&self.meta)?;
+        match &self.storage {
+            TensorStorage::BF16(v) => Ok(&v[start..end]),
+            _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
+        }
+    }
+
+    pub fn contiguous_values_complex64(&self) -> Result<&[Complex64], DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::storage_span_required_len(&self.meta)?;
+        match &self.storage {
+            TensorStorage::Complex64(v) => Ok(&v[start..end]),
+            _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
+        }
+    }
+
+    pub fn contiguous_values_complex128(&self) -> Result<&[Complex128], DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::storage_span_required_len(&self.meta)?;
+        match &self.storage {
+            TensorStorage::Complex128(v) => Ok(&v[start..end]),
             _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
         }
     }

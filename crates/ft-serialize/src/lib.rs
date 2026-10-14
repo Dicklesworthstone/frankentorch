@@ -587,7 +587,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use ft_core::{
-    BFloat16, DType, DenseTensor, DenseTensorError, Device, Float16, TensorMeta, TensorStorage,
+    BFloat16, Complex64, Complex128, DType, DenseBoolTensor, DenseI32Tensor, DenseI64Tensor,
+    DenseTensor, DenseTensorError, Device, Float16, TensorMeta, TensorStorage,
 };
 
 /// Magic bytes identifying a FrankenTorch state dict file.
@@ -598,10 +599,103 @@ const FT_DTYPE_TAG_F64: u8 = 0;
 const FT_DTYPE_TAG_F32: u8 = 1;
 const FT_DTYPE_TAG_F16: u8 = 2;
 const FT_DTYPE_TAG_BF16: u8 = 3;
+const FT_DTYPE_TAG_COMPLEX64: u8 = 4;
+const FT_DTYPE_TAG_COMPLEX128: u8 = 5;
+const FT_DTYPE_TAG_QINT8: u8 = 6;
+const FT_DTYPE_TAG_QUINT8: u8 = 7;
+const FT_DTYPE_TAG_I64: u8 = 8;
+const FT_DTYPE_TAG_I32: u8 = 9;
+const FT_DTYPE_TAG_BOOL: u8 = 10;
+const FT_QSCHEME_PER_TENSOR: u8 = 0;
+const FT_QSCHEME_PER_CHANNEL: u8 = 1;
 const FT_MIN_NATIVE_TENSOR_HEADER_BYTES: usize = 8 + 8 + 1; // key_len + ndim + dtype tag
 const FT_NATIVE_SAVE_BUFFER_BYTES: usize = 1024 * 1024;
 #[cfg(not(target_endian = "little"))]
 const FT_NATIVE_HALF_VALUE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A multi-dtype state dict entry capable of holding any FrankenTorch tensor
+/// type (`DenseTensor` for float/complex/quantized, plus `DenseI64Tensor`,
+/// `DenseI32Tensor`, and `DenseBoolTensor`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedStateEntry {
+    Dense(DenseTensor),
+    I64(DenseI64Tensor),
+    I32(DenseI32Tensor),
+    Bool(DenseBoolTensor),
+}
+
+impl TypedStateEntry {
+    #[must_use]
+    pub fn meta(&self) -> &TensorMeta {
+        match self {
+            Self::Dense(t) => t.meta(),
+            Self::I64(t) => t.meta(),
+            Self::I32(t) => t.meta(),
+            Self::Bool(t) => t.meta(),
+        }
+    }
+
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.meta().dtype()
+    }
+
+    #[must_use]
+    pub const fn as_dense(&self) -> Option<&DenseTensor> {
+        match self {
+            Self::Dense(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_i64(&self) -> Option<&DenseI64Tensor> {
+        match self {
+            Self::I64(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_i32(&self) -> Option<&DenseI32Tensor> {
+        match self {
+            Self::I32(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_bool(&self) -> Option<&DenseBoolTensor> {
+        match self {
+            Self::Bool(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+impl From<DenseTensor> for TypedStateEntry {
+    fn from(value: DenseTensor) -> Self {
+        Self::Dense(value)
+    }
+}
+
+impl From<DenseI64Tensor> for TypedStateEntry {
+    fn from(value: DenseI64Tensor) -> Self {
+        Self::I64(value)
+    }
+}
+
+impl From<DenseI32Tensor> for TypedStateEntry {
+    fn from(value: DenseI32Tensor) -> Self {
+        Self::I32(value)
+    }
+}
+
+impl From<DenseBoolTensor> for TypedStateEntry {
+    fn from(value: DenseBoolTensor) -> Self {
+        Self::Bool(value)
+    }
+}
 
 /// Errors from tensor state dict save/load operations.
 #[derive(Debug, Clone, PartialEq)]
@@ -656,7 +750,13 @@ fn dtype_to_tag(dtype: DType) -> Option<u8> {
         DType::F32 => Some(FT_DTYPE_TAG_F32),
         DType::F16 => Some(FT_DTYPE_TAG_F16),
         DType::BF16 => Some(FT_DTYPE_TAG_BF16),
-        _ => None,
+        DType::Complex64 => Some(FT_DTYPE_TAG_COMPLEX64),
+        DType::Complex128 => Some(FT_DTYPE_TAG_COMPLEX128),
+        DType::QInt8 => Some(FT_DTYPE_TAG_QINT8),
+        DType::QUInt8 => Some(FT_DTYPE_TAG_QUINT8),
+        DType::I64 => Some(FT_DTYPE_TAG_I64),
+        DType::I32 => Some(FT_DTYPE_TAG_I32),
+        DType::Bool => Some(FT_DTYPE_TAG_BOOL),
     }
 }
 
@@ -666,6 +766,13 @@ fn tag_to_dtype(tag: u8) -> Result<DType, TensorIOError> {
         FT_DTYPE_TAG_F32 => Ok(DType::F32),
         FT_DTYPE_TAG_F16 => Ok(DType::F16),
         FT_DTYPE_TAG_BF16 => Ok(DType::BF16),
+        FT_DTYPE_TAG_COMPLEX64 => Ok(DType::Complex64),
+        FT_DTYPE_TAG_COMPLEX128 => Ok(DType::Complex128),
+        FT_DTYPE_TAG_QINT8 => Ok(DType::QInt8),
+        FT_DTYPE_TAG_QUINT8 => Ok(DType::QUInt8),
+        FT_DTYPE_TAG_I64 => Ok(DType::I64),
+        FT_DTYPE_TAG_I32 => Ok(DType::I32),
+        FT_DTYPE_TAG_BOOL => Ok(DType::Bool),
         _ => Err(TensorIOError::Corrupt {
             reason: format!("unknown dtype tag: {tag}"),
         }),
@@ -725,6 +832,83 @@ pub fn save_state_dict<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Save a multi-dtype `TypedStateEntry` state dict (supporting `DenseTensor` plus
+/// `I64`, `I32`, and `Bool` tensors) to a file in FrankenTorch native `FTSV` format.
+pub fn save_typed_state_dict<P: AsRef<Path>>(
+    state_dict: &BTreeMap<String, TypedStateEntry>,
+    path: P,
+) -> Result<(), TensorIOError> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
+    let encoded = encode_typed_state_dict_to_bytes(state_dict)?;
+    std::fs::write(&path, encoded).map_err(|e| io_err(&path_str, e))?;
+    Ok(())
+}
+
+/// Encode a multi-dtype `TypedStateEntry` state dict to `FTSV` bytes in memory.
+pub fn encode_typed_state_dict_to_bytes(
+    state_dict: &BTreeMap<String, TypedStateEntry>,
+) -> Result<Vec<u8>, TensorIOError> {
+    let io_path = "typed native state dict buffer";
+    let mut writer = Vec::new();
+    write_native_bytes(&mut writer, FT_MAGIC, io_path)?;
+    write_native_bytes(&mut writer, &FT_STATE_FORMAT_VERSION.to_le_bytes(), io_path)?;
+    let num_tensors = state_dict.len() as u64;
+    write_native_bytes(&mut writer, &num_tensors.to_le_bytes(), io_path)?;
+
+    for (key, entry) in state_dict {
+        match entry {
+            TypedStateEntry::Dense(tensor) => {
+                validate_single_dense_native_save(key, tensor)?;
+                write_single_dense_tensor_to_writer(key, tensor, &mut writer, io_path)?;
+            }
+            TypedStateEntry::I64(tensor) => {
+                let values = tensor
+                    .contiguous_values()
+                    .map_err(TensorIOError::TensorError)?;
+                write_native_tensor_header(
+                    &mut writer,
+                    key,
+                    tensor.meta().shape(),
+                    FT_DTYPE_TAG_I64,
+                    io_path,
+                )?;
+                for &v in values {
+                    write_native_bytes(&mut writer, &v.to_le_bytes(), io_path)?;
+                }
+            }
+            TypedStateEntry::I32(tensor) => {
+                let values = tensor
+                    .contiguous_values()
+                    .map_err(TensorIOError::TensorError)?;
+                write_native_tensor_header(
+                    &mut writer,
+                    key,
+                    tensor.meta().shape(),
+                    FT_DTYPE_TAG_I32,
+                    io_path,
+                )?;
+                for &v in values {
+                    write_native_bytes(&mut writer, &v.to_le_bytes(), io_path)?;
+                }
+            }
+            TypedStateEntry::Bool(tensor) => {
+                let values = tensor
+                    .contiguous_values()
+                    .map_err(TensorIOError::TensorError)?;
+                write_native_tensor_header(
+                    &mut writer,
+                    key,
+                    tensor.meta().shape(),
+                    FT_DTYPE_TAG_BOOL,
+                    io_path,
+                )?;
+                write_native_bytes(&mut writer, values, io_path)?;
+            }
+        }
+    }
+    Ok(writer)
+}
+
 #[cfg(test)]
 fn encode_state_dict_to_bytes(
     state_dict: &BTreeMap<String, DenseTensor>,
@@ -735,49 +919,227 @@ fn encode_state_dict_to_bytes(
     Ok(encoded)
 }
 
+fn validate_single_dense_native_save(key: &str, tensor: &DenseTensor) -> Result<(), TensorIOError> {
+    let meta = tensor.meta();
+    let dtype = meta.dtype();
+    dtype_to_tag(dtype).ok_or_else(|| TensorIOError::Corrupt {
+        reason: format!("unsupported dtype for save: {dtype:?}"),
+    })?;
+    match dtype {
+        DType::F64 => {
+            tensor
+                .contiguous_values()
+                .map_err(TensorIOError::TensorError)?;
+        }
+        DType::F32 => {
+            tensor
+                .contiguous_values_f32()
+                .map_err(TensorIOError::TensorError)?;
+        }
+        DType::F16 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::F16(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            let _ = &values[start..end];
+        }
+        DType::BF16 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::BF16(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            let _ = &values[start..end];
+        }
+        DType::Complex64 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::Complex64(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            let _ = &values[start..end];
+        }
+        DType::Complex128 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::Complex128(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            let _ = &values[start..end];
+        }
+        DType::QInt8 => {
+            if meta.quantization().is_none() {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("quantized tensor '{key}' missing quantization metadata"),
+                });
+            }
+            tensor
+                .contiguous_values_qint8()
+                .map_err(TensorIOError::TensorError)?;
+        }
+        DType::QUInt8 => {
+            if meta.quantization().is_none() {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("quantized tensor '{key}' missing quantization metadata"),
+                });
+            }
+            tensor
+                .contiguous_values_quint8()
+                .map_err(TensorIOError::TensorError)?;
+        }
+        other => {
+            return Err(TensorIOError::Corrupt {
+                reason: format!("unsupported dtype for save: {other:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_state_dict_native_save(
     state_dict: &BTreeMap<String, DenseTensor>,
 ) -> Result<(), TensorIOError> {
     for (key, tensor) in state_dict {
-        let meta = tensor.meta();
-        let dtype = meta.dtype();
-        dtype_to_tag(dtype).ok_or_else(|| TensorIOError::Corrupt {
-            reason: format!("unsupported dtype for save: {dtype:?}"),
-        })?;
-        match dtype {
-            DType::F64 => {
-                tensor
-                    .contiguous_values()
-                    .map_err(TensorIOError::TensorError)?;
-            }
-            DType::F32 => {
-                tensor
-                    .contiguous_values_f32()
-                    .map_err(TensorIOError::TensorError)?;
-            }
-            DType::F16 => {
-                let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
-                let TensorStorage::F16(values) = tensor.typed_storage() else {
-                    return Err(TensorIOError::Corrupt {
-                        reason: format!("tensor storage does not match dtype for '{key}'"),
-                    });
-                };
-                let _ = &values[start..end];
-            }
-            DType::BF16 => {
-                let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
-                let TensorStorage::BF16(values) = tensor.typed_storage() else {
-                    return Err(TensorIOError::Corrupt {
-                        reason: format!("tensor storage does not match dtype for '{key}'"),
-                    });
-                };
-                let _ = &values[start..end];
-            }
-            other => {
+        validate_single_dense_native_save(key, tensor)?;
+    }
+    Ok(())
+}
+
+fn write_native_tensor_header<W: Write>(
+    writer: &mut W,
+    key: &str,
+    shape: &[usize],
+    dtype_tag: u8,
+    io_path: &str,
+) -> Result<(), TensorIOError> {
+    let key_bytes = key.as_bytes();
+    write_native_bytes(writer, &(key_bytes.len() as u64).to_le_bytes(), io_path)?;
+    write_native_bytes(writer, key_bytes, io_path)?;
+    write_native_bytes(writer, &(shape.len() as u64).to_le_bytes(), io_path)?;
+    for &dim in shape {
+        write_native_bytes(writer, &(dim as u64).to_le_bytes(), io_path)?;
+    }
+    write_native_bytes(writer, &[dtype_tag], io_path)
+}
+
+fn write_native_quantization_header<W: Write>(
+    writer: &mut W,
+    meta: &TensorMeta,
+    key: &str,
+    io_path: &str,
+) -> Result<(), TensorIOError> {
+    let qparams = meta.quantization().ok_or_else(|| TensorIOError::Corrupt {
+        reason: format!("quantized tensor '{key}' missing quantization metadata"),
+    })?;
+    if let Some(axis) = qparams.axis() {
+        write_native_bytes(writer, &[FT_QSCHEME_PER_CHANNEL], io_path)?;
+        write_native_bytes(writer, &(axis as u64).to_le_bytes(), io_path)?;
+        let scales = qparams.scales();
+        let zero_points = qparams.zero_points();
+        write_native_bytes(writer, &(scales.len() as u64).to_le_bytes(), io_path)?;
+        write_native_f64_values(writer, &scales, io_path)?;
+        for &zp in zero_points {
+            write_native_bytes(writer, &zp.to_le_bytes(), io_path)?;
+        }
+    } else {
+        write_native_bytes(writer, &[FT_QSCHEME_PER_TENSOR], io_path)?;
+        write_native_bytes(writer, &qparams.scale().to_le_bytes(), io_path)?;
+        write_native_bytes(writer, &qparams.zero_point().to_le_bytes(), io_path)?;
+    }
+    Ok(())
+}
+
+fn write_single_dense_tensor_to_writer<W: Write>(
+    key: &str,
+    tensor: &DenseTensor,
+    writer: &mut W,
+    io_path: &str,
+) -> Result<(), TensorIOError> {
+    let meta = tensor.meta();
+    let dtype_tag = dtype_to_tag(meta.dtype()).ok_or_else(|| TensorIOError::Corrupt {
+        reason: format!("unsupported dtype for save: {:?}", meta.dtype()),
+    })?;
+
+    write_native_tensor_header(writer, key, meta.shape(), dtype_tag, io_path)?;
+
+    match meta.dtype() {
+        DType::F64 => {
+            let values = tensor
+                .contiguous_values()
+                .map_err(TensorIOError::TensorError)?;
+            write_native_f64_values(writer, values, io_path)?;
+        }
+        DType::F32 => {
+            let values = tensor
+                .contiguous_values_f32()
+                .map_err(TensorIOError::TensorError)?;
+            write_native_f32_values(writer, values, io_path)?;
+        }
+        DType::F16 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::F16(values) = tensor.typed_storage() else {
                 return Err(TensorIOError::Corrupt {
-                    reason: format!("unsupported dtype for save: {other:?}"),
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
                 });
+            };
+            write_native_f16_values(writer, &values[start..end], io_path)?;
+        }
+        DType::BF16 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::BF16(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            write_native_bf16_values(writer, &values[start..end], io_path)?;
+        }
+        DType::Complex64 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::Complex64(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            for z in &values[start..end] {
+                write_native_bytes(writer, &z.re.to_le_bytes(), io_path)?;
+                write_native_bytes(writer, &z.im.to_le_bytes(), io_path)?;
             }
+        }
+        DType::Complex128 => {
+            let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
+            let TensorStorage::Complex128(values) = tensor.typed_storage() else {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("tensor storage does not match dtype for '{key}'"),
+                });
+            };
+            for z in &values[start..end] {
+                write_native_bytes(writer, &z.re.to_le_bytes(), io_path)?;
+                write_native_bytes(writer, &z.im.to_le_bytes(), io_path)?;
+            }
+        }
+        DType::QInt8 => {
+            write_native_quantization_header(writer, meta, key, io_path)?;
+            let values = tensor
+                .contiguous_values_qint8()
+                .map_err(TensorIOError::TensorError)?;
+            write_native_bytes(writer, bytemuck::cast_slice(values), io_path)?;
+        }
+        DType::QUInt8 => {
+            write_native_quantization_header(writer, meta, key, io_path)?;
+            let values = tensor
+                .contiguous_values_quint8()
+                .map_err(TensorIOError::TensorError)?;
+            write_native_bytes(writer, values, io_path)?;
+        }
+        other => {
+            return Err(TensorIOError::Corrupt {
+                reason: format!("unsupported dtype for save: {other:?}"),
+            });
         }
     }
     Ok(())
@@ -797,64 +1159,7 @@ fn write_state_dict_to_writer<W: Write>(
     write_native_bytes(writer, &num_tensors.to_le_bytes(), io_path)?;
 
     for (key, tensor) in state_dict {
-        let meta = tensor.meta();
-        let dtype_tag = dtype_to_tag(meta.dtype()).ok_or_else(|| TensorIOError::Corrupt {
-            reason: format!("unsupported dtype for save: {:?}", meta.dtype()),
-        })?;
-
-        // Key
-        let key_bytes = key.as_bytes();
-        write_native_bytes(writer, &(key_bytes.len() as u64).to_le_bytes(), io_path)?;
-        write_native_bytes(writer, key_bytes, io_path)?;
-
-        // Shape
-        let shape = meta.shape();
-        write_native_bytes(writer, &(shape.len() as u64).to_le_bytes(), io_path)?;
-        for &dim in shape {
-            write_native_bytes(writer, &(dim as u64).to_le_bytes(), io_path)?;
-        }
-
-        // DType
-        write_native_bytes(writer, &[dtype_tag], io_path)?;
-
-        // Values
-        match meta.dtype() {
-            DType::F64 => {
-                let values = tensor
-                    .contiguous_values()
-                    .map_err(TensorIOError::TensorError)?;
-                write_native_f64_values(writer, values, io_path)?;
-            }
-            DType::F32 => {
-                let values = tensor
-                    .contiguous_values_f32()
-                    .map_err(TensorIOError::TensorError)?;
-                write_native_f32_values(writer, values, io_path)?;
-            }
-            DType::F16 => {
-                let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
-                let TensorStorage::F16(values) = tensor.typed_storage() else {
-                    return Err(TensorIOError::Corrupt {
-                        reason: format!("tensor storage does not match dtype for '{key}'"),
-                    });
-                };
-                write_native_f16_values(writer, &values[start..end], io_path)?;
-            }
-            DType::BF16 => {
-                let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
-                let TensorStorage::BF16(values) = tensor.typed_storage() else {
-                    return Err(TensorIOError::Corrupt {
-                        reason: format!("tensor storage does not match dtype for '{key}'"),
-                    });
-                };
-                write_native_bf16_values(writer, &values[start..end], io_path)?;
-            }
-            other => {
-                return Err(TensorIOError::Corrupt {
-                    reason: format!("unsupported dtype for save: {other:?}"),
-                });
-            }
-        }
+        write_single_dense_tensor_to_writer(key, tensor, writer, io_path)?;
     }
 
     Ok(())
@@ -1001,6 +1306,15 @@ pub fn load_state_dict<P: AsRef<Path>>(
     load_state_dict_from_bytes(&data)
 }
 
+/// Load a multi-dtype `TypedStateEntry` state dict from a FrankenTorch native `FTSV` file.
+pub fn load_typed_state_dict<P: AsRef<Path>>(
+    path: P,
+) -> Result<BTreeMap<String, TypedStateEntry>, TensorIOError> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
+    let data = std::fs::read(&path).map_err(|e| io_err(&path_str, e))?;
+    load_typed_state_dict_from_bytes(&data)
+}
+
 /// Load a state dict from raw bytes.
 pub fn load_state_dict_from_bytes(
     data: &[u8],
@@ -1023,9 +1337,6 @@ pub fn load_state_dict_from_bytes(
     }
 
     // Number of tensors — bound by the smallest possible per-tensor header.
-    // Value bytes and shape dimensions are validated after parsing each tensor;
-    // this early guard must stay conservative so valid compact tensors (for
-    // example F16 scalar tensors under an empty key) are not rejected.
     let num_tensors = read_usize(data, &mut pos, "tensor count")?;
     let remaining = data.len().saturating_sub(pos);
     let min_tensor_bytes = FT_MIN_NATIVE_TENSOR_HEADER_BYTES;
@@ -1042,6 +1353,62 @@ pub fn load_state_dict_from_bytes(
         return Ok(result);
     }
 
+    let typed = load_typed_state_dict_entries(data, pos, num_tensors, false)?;
+    let mut result = BTreeMap::new();
+    for (key, entry) in typed {
+        let TypedStateEntry::Dense(tensor) = entry else {
+            return Err(TensorIOError::Corrupt {
+                reason: format!(
+                    "unsupported dtype in DenseTensor state dict for '{key}': {:?}",
+                    entry.dtype()
+                ),
+            });
+        };
+        result.insert(key, tensor);
+    }
+    Ok(result)
+}
+
+/// Load a multi-dtype `TypedStateEntry` state dict from raw `FTSV` bytes.
+pub fn load_typed_state_dict_from_bytes(
+    data: &[u8],
+) -> Result<BTreeMap<String, TypedStateEntry>, TensorIOError> {
+    let mut pos = 0;
+
+    if data.len() < 4 || &data[0..4] != FT_MAGIC {
+        return Err(TensorIOError::InvalidMagic);
+    }
+    pos += 4;
+
+    let version = read_u32(data, &mut pos)?;
+    if version > FT_STATE_FORMAT_VERSION {
+        return Err(TensorIOError::UnsupportedVersion {
+            found: version,
+            max: FT_STATE_FORMAT_VERSION,
+        });
+    }
+
+    let num_tensors = read_usize(data, &mut pos, "tensor count")?;
+    let remaining = data.len().saturating_sub(pos);
+    let min_tensor_bytes = FT_MIN_NATIVE_TENSOR_HEADER_BYTES;
+    let max_possible = remaining / min_tensor_bytes;
+    if num_tensors > max_possible {
+        return Err(TensorIOError::Corrupt {
+            reason: format!(
+                "claimed {num_tensors} tensors but only {remaining} bytes remain (min {min_tensor_bytes} per tensor)"
+            ),
+        });
+    }
+
+    load_typed_state_dict_entries(data, pos, num_tensors, true)
+}
+
+fn load_typed_state_dict_entries(
+    data: &[u8],
+    mut pos: usize,
+    num_tensors: usize,
+    allow_non_dense: bool,
+) -> Result<BTreeMap<String, TypedStateEntry>, TensorIOError> {
     let mut result = BTreeMap::new();
     for _ in 0..num_tensors {
         // Key
@@ -1110,35 +1477,102 @@ pub fn load_state_dict_from_bytes(
         let dtype = tag_to_dtype(data[pos])?;
         pos += 1;
 
-        // Values — use checked arithmetic to reject adversarial shapes
         if shape_overflow {
             return Err(TensorIOError::Corrupt {
                 reason: format!("shape overflow in native state dict tensor '{key}'"),
             });
         }
-        let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
 
-        let tensor = match dtype {
+        let state_entry = match dtype {
             DType::F64 => {
-                if numel == 4 {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+                let tensor = if numel == 4 {
                     let values = read_f64_payload4(data, &mut pos, key)?;
                     DenseTensor::from_storage_f64_inline4(meta, values)?
                 } else {
                     let values = read_f64_payload(data, &mut pos, numel, key)?;
                     DenseTensor::from_storage(meta, values)?
-                }
+                };
+                TypedStateEntry::Dense(tensor)
             }
             DType::F32 => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
                 let values = read_f32_payload(data, &mut pos, numel, key)?;
-                DenseTensor::from_storage_f32(meta, values)?
+                TypedStateEntry::Dense(DenseTensor::from_storage_f32(meta, values)?)
             }
             DType::F16 => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
                 let values = read_f16_payload(data, &mut pos, numel, key)?;
-                DenseTensor::from_storage_f16(meta, values)?
+                TypedStateEntry::Dense(DenseTensor::from_storage_f16(meta, values)?)
             }
             DType::BF16 => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
                 let values = read_bf16_payload(data, &mut pos, numel, key)?;
-                DenseTensor::from_storage_bf16(meta, values)?
+                TypedStateEntry::Dense(DenseTensor::from_storage_bf16(meta, values)?)
+            }
+            DType::Complex64 => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+                let values = read_complex64_payload(data, &mut pos, numel, key)?;
+                TypedStateEntry::Dense(DenseTensor::from_storage_complex64(meta, values)?)
+            }
+            DType::Complex128 => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+                let values = read_complex128_payload(data, &mut pos, numel, key)?;
+                TypedStateEntry::Dense(DenseTensor::from_storage_complex128(meta, values)?)
+            }
+            DType::QInt8 => {
+                let meta = read_quantized_meta(data, &mut pos, shape, DType::QInt8, key)?;
+                let payload = native_payload(
+                    data,
+                    &mut pos,
+                    numel,
+                    1,
+                    "qint8",
+                    key,
+                    "truncated qint8 data",
+                )?;
+                let values: Vec<i8> = payload.iter().map(|&b| b as i8).collect();
+                TypedStateEntry::Dense(DenseTensor::from_storage_qint8(meta, values)?)
+            }
+            DType::QUInt8 => {
+                let meta = read_quantized_meta(data, &mut pos, shape, DType::QUInt8, key)?;
+                let payload = native_payload(
+                    data,
+                    &mut pos,
+                    numel,
+                    1,
+                    "quint8",
+                    key,
+                    "truncated quint8 data",
+                )?;
+                TypedStateEntry::Dense(DenseTensor::from_storage_quint8(meta, payload.to_vec())?)
+            }
+            DType::I64 if allow_non_dense => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+                let payload =
+                    native_payload(data, &mut pos, numel, 8, "i64", key, "truncated i64 data")?;
+                let mut values = Vec::with_capacity(numel);
+                for chunk in payload.as_chunks::<8>().0 {
+                    values.push(i64::from_le_bytes(*chunk));
+                }
+                TypedStateEntry::I64(DenseI64Tensor::from_storage(meta, values)?)
+            }
+            DType::I32 if allow_non_dense => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+                let payload =
+                    native_payload(data, &mut pos, numel, 4, "i32", key, "truncated i32 data")?;
+                let mut values = Vec::with_capacity(numel);
+                for chunk in payload.as_chunks::<4>().0 {
+                    values.push(i32::from_le_bytes(*chunk));
+                }
+                TypedStateEntry::I32(DenseI32Tensor::from_storage(meta, values)?)
+            }
+            DType::Bool if allow_non_dense => {
+                let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+                let payload =
+                    native_payload(data, &mut pos, numel, 1, "bool", key, "truncated bool data")?;
+                let values: Vec<u8> = payload.iter().map(|&b| u8::from(b != 0)).collect();
+                TypedStateEntry::Bool(DenseBoolTensor::from_storage(meta, values)?)
             }
             _ => {
                 return Err(TensorIOError::Corrupt {
@@ -1147,7 +1581,7 @@ pub fn load_state_dict_from_bytes(
             }
         };
 
-        entry.insert(tensor);
+        entry.insert(state_entry);
     }
 
     if pos != data.len() {
@@ -1160,6 +1594,62 @@ pub fn load_state_dict_from_bytes(
     }
 
     Ok(result)
+}
+
+fn read_quantized_meta(
+    data: &[u8],
+    pos: &mut usize,
+    shape: Vec<usize>,
+    dtype: DType,
+    key: &str,
+) -> Result<TensorMeta, TensorIOError> {
+    if *pos >= data.len() {
+        return Err(TensorIOError::Corrupt {
+            reason: format!("truncated quantization scheme for tensor '{key}'"),
+        });
+    }
+    let scheme = data[*pos];
+    *pos += 1;
+    match scheme {
+        FT_QSCHEME_PER_TENSOR => {
+            let scale_bytes = read_fixed_bytes::<8>(data, pos, "truncated quantization scale")?;
+            let zp_bytes = read_fixed_bytes::<8>(data, pos, "truncated quantization zero_point")?;
+            let scale = f64::from_le_bytes(scale_bytes);
+            let zero_point = i64::from_le_bytes(zp_bytes);
+            TensorMeta::quantized_from_shape(shape, dtype, Device::Cpu, scale, zero_point)
+                .map_err(|e| TensorIOError::TensorError(DenseTensorError::Meta(e)))
+        }
+        FT_QSCHEME_PER_CHANNEL => {
+            let axis = read_usize(data, pos, "quantization axis")?;
+            let channels = read_usize(data, pos, "quantization channel count")?;
+            let scales = read_f64_payload(data, pos, channels, key)?;
+            let zp_payload = native_payload(
+                data,
+                pos,
+                channels,
+                8,
+                "quantization zero_points",
+                key,
+                "truncated quantization zero_points",
+            )?;
+            let mut zero_points = Vec::with_capacity(channels);
+            for chunk in zp_payload.as_chunks::<8>().0 {
+                zero_points.push(i64::from_le_bytes(*chunk));
+            }
+            TensorMeta::quantized_per_channel_from_shape(
+                shape,
+                dtype,
+                Device::Cpu,
+                scales,
+                zero_points,
+                axis,
+            )
+            .map_err(|e| TensorIOError::TensorError(DenseTensorError::Meta(e)))
+        }
+        other => Err(TensorIOError::Corrupt {
+            reason: format!("unknown quantization scheme tag {other} for tensor '{key}'"),
+        }),
+    }
 }
 
 fn try_load_rank1_width4_f64_native(
@@ -1452,6 +1942,58 @@ fn read_bf16_payload(
     Ok(values)
 }
 
+fn read_complex64_payload(
+    data: &[u8],
+    pos: &mut usize,
+    numel: usize,
+    key: &str,
+) -> Result<Vec<Complex64>, TensorIOError> {
+    let payload = native_payload(
+        data,
+        pos,
+        numel,
+        8,
+        "complex64",
+        key,
+        "truncated complex64 data",
+    )?;
+    let mut values = Vec::with_capacity(numel);
+    for chunk in payload.as_chunks::<8>().0 {
+        let re = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let im = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        values.push(Complex64::new(re, im));
+    }
+    Ok(values)
+}
+
+fn read_complex128_payload(
+    data: &[u8],
+    pos: &mut usize,
+    numel: usize,
+    key: &str,
+) -> Result<Vec<Complex128>, TensorIOError> {
+    let payload = native_payload(
+        data,
+        pos,
+        numel,
+        16,
+        "complex128",
+        key,
+        "truncated complex128 data",
+    )?;
+    let mut values = Vec::with_capacity(numel);
+    for chunk in payload.as_chunks::<16>().0 {
+        let re = f64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        let im = f64::from_le_bytes([
+            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+        ]);
+        values.push(Complex128::new(re, im));
+    }
+    Ok(values)
+}
+
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, TensorIOError> {
     let bytes = read_fixed_bytes::<4>(data, pos, "truncated u32")?;
     Ok(u32::from_le_bytes(bytes))
@@ -1632,6 +2174,350 @@ pub fn export_linear_onnx_to_bytes(
     push_message_field(&mut graph, 5, &weight_initializer);
     if let Some(initializer) = &bias_initializer {
         push_message_field(&mut graph, 5, initializer);
+    }
+
+    let input_shape = onnx_linear_io_shape(config.batch_size, in_features)?;
+    let output_shape = onnx_linear_io_shape(config.batch_size, out_features)?;
+    let input_value = encode_onnx_value_info(&config.input_name, elem_type, &input_shape);
+    let output_value = encode_onnx_value_info(&config.output_name, elem_type, &output_shape);
+    push_message_field(&mut graph, 11, &input_value);
+    push_message_field(&mut graph, 12, &output_value);
+
+    let opset = encode_onnx_opset_import(config.opset_version);
+    let mut model = Vec::new();
+    push_i64_field(&mut model, 1, ONNX_IR_VERSION)?;
+    push_string_field(&mut model, 2, "frankentorch");
+    push_message_field(&mut model, 7, &graph);
+    push_message_field(&mut model, 8, &opset);
+    Ok(model)
+}
+
+/// Activation op types supported by multi-layer ONNX sequential export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnnxActivation {
+    Relu,
+    Sigmoid,
+    Tanh,
+    Gelu,
+    Silu,
+    Identity,
+}
+
+impl OnnxActivation {
+    #[must_use]
+    pub const fn onnx_op_type(self) -> &'static str {
+        match self {
+            Self::Relu => "Relu",
+            Self::Sigmoid => "Sigmoid",
+            Self::Tanh => "Tanh",
+            Self::Gelu => "Gelu",
+            Self::Silu => "Silu",
+            Self::Identity => "Identity",
+        }
+    }
+}
+
+/// Layer specification for multi-layer sequential ONNX graph export.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnnxLayerSpec {
+    Linear {
+        name: String,
+        weight: DenseTensor,
+        bias: Option<DenseTensor>,
+    },
+    Activation {
+        name: String,
+        kind: OnnxActivation,
+    },
+    LayerNorm {
+        name: String,
+        weight: DenseTensor,
+        bias: Option<DenseTensor>,
+        eps: f32,
+    },
+}
+
+/// Configuration for exporting a multi-layer sequential model to ONNX format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnnxSequentialExportConfig {
+    pub graph_name: String,
+    pub input_name: String,
+    pub output_name: String,
+    pub batch_size: Option<usize>,
+    pub opset_version: i64,
+}
+
+impl OnnxSequentialExportConfig {
+    pub fn new(
+        graph_name: impl Into<String>,
+        input_name: impl Into<String>,
+        output_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            graph_name: graph_name.into(),
+            input_name: input_name.into(),
+            output_name: output_name.into(),
+            batch_size: None,
+            opset_version: ONNX_DEFAULT_OPSET_VERSION,
+        }
+    }
+}
+
+pub fn save_sequential_onnx<P: AsRef<Path>>(
+    config: &OnnxSequentialExportConfig,
+    layers: &[OnnxLayerSpec],
+    path: P,
+) -> Result<(), TensorIOError> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
+    let encoded = export_sequential_onnx_to_bytes(config, layers)?;
+    std::fs::write(&path, encoded).map_err(|e| io_err(&path_str, e))?;
+    Ok(())
+}
+
+pub fn export_sequential_onnx_to_bytes(
+    config: &OnnxSequentialExportConfig,
+    layers: &[OnnxLayerSpec],
+) -> Result<Vec<u8>, TensorIOError> {
+    validate_onnx_name("graph_name", &config.graph_name)?;
+    validate_onnx_name("input_name", &config.input_name)?;
+    validate_onnx_name("output_name", &config.output_name)?;
+    if config.opset_version <= 0 {
+        return Err(TensorIOError::Corrupt {
+            reason: "ONNX opset_version must be positive".to_string(),
+        });
+    }
+    if layers.is_empty() {
+        return Err(TensorIOError::Corrupt {
+            reason: "ONNX sequential export requires at least one layer".to_string(),
+        });
+    }
+
+    let mut graph_dtype: Option<DType> = None;
+    let mut first_in_features: Option<usize> = None;
+    let mut current_features: Option<usize> = None;
+    let mut nodes: Vec<Vec<u8>> = Vec::new();
+    let mut initializers: Vec<Vec<u8>> = Vec::new();
+    let mut current_tensor_name = config.input_name.clone();
+
+    for (idx, layer) in layers.iter().enumerate() {
+        let is_last = idx + 1 == layers.len();
+        let layer_output = if is_last {
+            config.output_name.clone()
+        } else {
+            format!("{}_layer_{idx}_out", config.graph_name)
+        };
+
+        match layer {
+            OnnxLayerSpec::Linear { name, weight, bias } => {
+                validate_onnx_name("layer_name", name)?;
+                let [out_features, in_features] = validate_onnx_linear_weight(weight)?;
+                let dtype = weight.meta().dtype();
+                if let Some(expected_dtype) = graph_dtype {
+                    if dtype != expected_dtype {
+                        return Err(TensorIOError::Corrupt {
+                            reason: format!(
+                                "ONNX sequential layer '{name}' dtype {dtype:?} does not match graph dtype {expected_dtype:?}"
+                            ),
+                        });
+                    }
+                } else {
+                    graph_dtype = Some(dtype);
+                }
+
+                if let Some(prev_out) = current_features {
+                    if prev_out != in_features {
+                        return Err(TensorIOError::Corrupt {
+                            reason: format!(
+                                "ONNX sequential layer '{name}' in_features={in_features} does not match previous out_features={prev_out}"
+                            ),
+                        });
+                    }
+                } else {
+                    first_in_features = Some(in_features);
+                }
+                current_features = Some(out_features);
+
+                let transposed_weight =
+                    transposed_linear_weight_values(weight, in_features, out_features)?;
+                let weight_name = format!("{name}.weight");
+                initializers.push(encode_onnx_tensor(
+                    &weight_name,
+                    &[in_features, out_features],
+                    dtype,
+                    &transposed_weight,
+                )?);
+
+                if let Some(bias_tensor) = bias {
+                    let bias_values = validate_onnx_linear_bias(bias_tensor, dtype, out_features)?;
+                    let bias_name = format!("{name}.bias");
+                    initializers.push(encode_onnx_tensor(
+                        &bias_name,
+                        &[out_features],
+                        dtype,
+                        &bias_values,
+                    )?);
+                    let matmul_out = format!("{name}_matmul");
+                    nodes.push(encode_onnx_node(
+                        &format!("{name}_matmul_node"),
+                        "MatMul",
+                        &[current_tensor_name.as_str(), weight_name.as_str()],
+                        &[matmul_out.as_str()],
+                    ));
+                    nodes.push(encode_onnx_node(
+                        &format!("{name}_add_node"),
+                        "Add",
+                        &[matmul_out.as_str(), bias_name.as_str()],
+                        &[layer_output.as_str()],
+                    ));
+                } else {
+                    nodes.push(encode_onnx_node(
+                        &format!("{name}_matmul_node"),
+                        "MatMul",
+                        &[current_tensor_name.as_str(), weight_name.as_str()],
+                        &[layer_output.as_str()],
+                    ));
+                }
+            }
+            OnnxLayerSpec::Activation { name, kind } => {
+                validate_onnx_name("layer_name", name)?;
+                match kind {
+                    OnnxActivation::Silu => {
+                        let sig_out = format!("{name}_sigmoid");
+                        nodes.push(encode_onnx_node(
+                            &format!("{name}_sigmoid_node"),
+                            "Sigmoid",
+                            &[current_tensor_name.as_str()],
+                            &[sig_out.as_str()],
+                        ));
+                        nodes.push(encode_onnx_node(
+                            &format!("{name}_mul_node"),
+                            "Mul",
+                            &[current_tensor_name.as_str(), sig_out.as_str()],
+                            &[layer_output.as_str()],
+                        ));
+                    }
+                    other => {
+                        nodes.push(encode_onnx_node(
+                            name,
+                            other.onnx_op_type(),
+                            &[current_tensor_name.as_str()],
+                            &[layer_output.as_str()],
+                        ));
+                    }
+                }
+            }
+            OnnxLayerSpec::LayerNorm {
+                name,
+                weight,
+                bias,
+                eps,
+            } => {
+                validate_onnx_name("layer_name", name)?;
+                if !eps.is_finite() || *eps <= 0.0 {
+                    return Err(TensorIOError::Corrupt {
+                        reason: format!("ONNX LayerNorm '{name}' eps must be finite and > 0"),
+                    });
+                }
+                let dtype = weight.meta().dtype();
+                if !matches!(dtype, DType::F64 | DType::F32) {
+                    return Err(TensorIOError::Corrupt {
+                        reason: format!(
+                            "ONNX LayerNorm '{name}' supports F64/F32 weight, got {dtype:?}"
+                        ),
+                    });
+                }
+                if let Some(expected_dtype) = graph_dtype {
+                    if dtype != expected_dtype {
+                        return Err(TensorIOError::Corrupt {
+                            reason: format!(
+                                "ONNX LayerNorm '{name}' dtype {dtype:?} does not match graph dtype {expected_dtype:?}"
+                            ),
+                        });
+                    }
+                } else {
+                    graph_dtype = Some(dtype);
+                }
+
+                let shape = weight.meta().shape();
+                if shape.len() != 1 || shape[0] == 0 {
+                    return Err(TensorIOError::Corrupt {
+                        reason: format!(
+                            "ONNX LayerNorm '{name}' weight must be rank 1 non-empty, got {shape:?}"
+                        ),
+                    });
+                }
+                let norm_features = shape[0];
+                if let Some(prev_out) = current_features {
+                    if prev_out != norm_features {
+                        return Err(TensorIOError::Corrupt {
+                            reason: format!(
+                                "ONNX LayerNorm '{name}' features={norm_features} does not match previous features={prev_out}"
+                            ),
+                        });
+                    }
+                } else {
+                    first_in_features = Some(norm_features);
+                }
+                current_features = Some(norm_features);
+
+                let scale_name = format!("{name}.weight");
+                let scale_values = contiguous_tensor_values_as_f64(weight)?;
+                initializers.push(encode_onnx_tensor(
+                    &scale_name,
+                    &[norm_features],
+                    dtype,
+                    &scale_values,
+                )?);
+
+                let mut ln_inputs = vec![current_tensor_name.clone(), scale_name];
+                if let Some(bias_tensor) = bias {
+                    let bias_values = validate_onnx_linear_bias(bias_tensor, dtype, norm_features)?;
+                    let bias_name = format!("{name}.bias");
+                    initializers.push(encode_onnx_tensor(
+                        &bias_name,
+                        &[norm_features],
+                        dtype,
+                        &bias_values,
+                    )?);
+                    ln_inputs.push(bias_name);
+                }
+
+                let input_refs: Vec<&str> = ln_inputs.iter().map(String::as_str).collect();
+                let mut node = encode_onnx_node(
+                    name,
+                    "LayerNormalization",
+                    &input_refs,
+                    &[layer_output.as_str()],
+                );
+                let mut attr = Vec::new();
+                push_string_field(&mut attr, 1, "epsilon");
+                push_f32_field(&mut attr, 2, *eps);
+                push_i32_field(&mut attr, 20, 1)?; // AttributeProto::FLOAT = 1
+                push_message_field(&mut node, 5, &attr);
+                nodes.push(node);
+            }
+        }
+        current_tensor_name = layer_output;
+    }
+
+    let dtype = graph_dtype.ok_or_else(|| TensorIOError::Corrupt {
+        reason: "ONNX sequential export requires at least one parameterized layer (Linear or LayerNorm) to infer dtype and shapes".to_string(),
+    })?;
+    let in_features = first_in_features.ok_or_else(|| TensorIOError::Corrupt {
+        reason: "ONNX sequential export could not infer input feature dimension".to_string(),
+    })?;
+    let out_features = current_features.ok_or_else(|| TensorIOError::Corrupt {
+        reason: "ONNX sequential export could not infer output feature dimension".to_string(),
+    })?;
+    let elem_type = onnx_tensor_elem_type(dtype)?;
+
+    let mut graph = Vec::new();
+    for node in &nodes {
+        push_message_field(&mut graph, 1, node);
+    }
+    push_string_field(&mut graph, 2, &config.graph_name);
+    for init in &initializers {
+        push_message_field(&mut graph, 5, init);
     }
 
     let input_shape = onnx_linear_io_shape(config.batch_size, in_features)?;
@@ -4664,18 +5550,18 @@ mod tests {
         let original = b"sentinel-state";
         std::fs::write(&path, original).unwrap();
 
-        let tensor = DenseTensor::from_contiguous_values_f32(vec![1.0, 2.0], vec![2], Device::Cpu)
-            .unwrap()
-            .to_dtype(DType::Complex64)
-            .unwrap();
+        let meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![3, 1], 0, DType::F64, Device::Cpu)
+                .unwrap();
+        let tensor = DenseTensor::from_storage(meta, vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         let mut sd = BTreeMap::new();
-        sd.insert("complex".to_string(), tensor);
+        sd.insert("noncontiguous".to_string(), tensor);
 
-        let err = save_state_dict(&sd, &path).expect_err("unsupported dtype must fail");
+        let err = save_state_dict(&sd, &path).expect_err("noncontiguous layout must fail");
         let persisted = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert!(matches!(err, TensorIOError::Corrupt { .. }));
+        assert!(matches!(err, TensorIOError::TensorError(_)));
         assert_eq!(persisted, original);
     }
 
@@ -5341,5 +6227,324 @@ mod tests {
             "expected at least 21 corpus seeds, walked {seeds_seen} in {}",
             corpus_dir.display()
         );
+    }
+
+    #[test]
+    fn native_format_round_trips_all_dense_dtypes_and_quantization() {
+        use ft_core::{Complex64, Complex128};
+
+        let mut sd = BTreeMap::new();
+        sd.insert(
+            "f64".to_string(),
+            make_f64_tensor(vec![1.5, -2.25, 3.0], vec![3]),
+        );
+        sd.insert(
+            "f32".to_string(),
+            DenseTensor::from_contiguous_values_f32(vec![0.5_f32, -1.25], vec![2], Device::Cpu)
+                .unwrap(),
+        );
+        sd.insert(
+            "f16".to_string(),
+            DenseTensor::from_contiguous_values_f16(
+                vec![Float16::from_f32(1.0), Float16::from_f32(-0.5)],
+                vec![2],
+                Device::Cpu,
+            )
+            .unwrap(),
+        );
+        sd.insert(
+            "bf16".to_string(),
+            DenseTensor::from_contiguous_values_bf16(
+                vec![BFloat16::from_f32(2.0), BFloat16::from_f32(-3.5)],
+                vec![2],
+                Device::Cpu,
+            )
+            .unwrap(),
+        );
+        let c64_vals = vec![Complex64::new(1.25, -0.5), Complex64::new(-3.0, 4.5)];
+        sd.insert(
+            "c64".to_string(),
+            DenseTensor::from_contiguous_values_complex64(c64_vals.clone(), vec![2], Device::Cpu)
+                .unwrap(),
+        );
+        let c128_vals = vec![
+            Complex128::new(1.125, -2.5),
+            Complex128::new(0.0, 9.75),
+            Complex128::new(-4.25, 1.0),
+        ];
+        sd.insert(
+            "c128".to_string(),
+            DenseTensor::from_contiguous_values_complex128(c128_vals.clone(), vec![3], Device::Cpu)
+                .unwrap(),
+        );
+        sd.insert(
+            "qint8_tensor".to_string(),
+            DenseTensor::from_contiguous_values_qint8(
+                vec![-12_i8, 0, 7, 42],
+                vec![2, 2],
+                Device::Cpu,
+                0.125,
+                -3,
+            )
+            .unwrap(),
+        );
+        sd.insert(
+            "qint8_channel".to_string(),
+            DenseTensor::from_contiguous_values_qint8_per_channel(
+                vec![-5_i8, 10, -20, 30],
+                vec![2, 2],
+                Device::Cpu,
+                vec![0.25, 0.5],
+                vec![-1, 2],
+                0,
+            )
+            .unwrap(),
+        );
+        sd.insert(
+            "quint8_tensor".to_string(),
+            DenseTensor::from_contiguous_values_quint8(
+                vec![10_u8, 128, 250],
+                vec![3],
+                Device::Cpu,
+                0.5,
+                128,
+            )
+            .unwrap(),
+        );
+        sd.insert(
+            "quint8_channel".to_string(),
+            DenseTensor::from_contiguous_values_quint8_per_channel(
+                vec![1_u8, 2, 3, 4],
+                vec![2, 2],
+                Device::Cpu,
+                vec![0.1, 0.2],
+                vec![10, 20],
+                1,
+            )
+            .unwrap(),
+        );
+
+        let encoded = super::encode_state_dict_to_bytes(&sd).unwrap();
+        let path = test_temp_path("ft_test_all_dense_dtypes_native.ftsv");
+        let _ = std::fs::remove_file(&path);
+        save_state_dict(&sd, &path).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+        let loaded = load_state_dict(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(persisted, encoded);
+        assert_eq!(loaded.len(), sd.len());
+        assert_eq!(
+            loaded["c64"].contiguous_values_complex64().unwrap(),
+            c64_vals
+        );
+        assert_eq!(
+            loaded["c128"].contiguous_values_complex128().unwrap(),
+            c128_vals
+        );
+        assert_eq!(
+            loaded["qint8_tensor"].typed_storage().as_qint8().unwrap(),
+            &[-12_i8, 0, 7, 42]
+        );
+        assert_eq!(
+            loaded["qint8_tensor"].meta().quantization(),
+            sd["qint8_tensor"].meta().quantization()
+        );
+        assert_eq!(
+            loaded["qint8_channel"].typed_storage().as_qint8().unwrap(),
+            &[-5_i8, 10, -20, 30]
+        );
+        assert_eq!(
+            loaded["qint8_channel"].meta().quantization(),
+            sd["qint8_channel"].meta().quantization()
+        );
+        assert_eq!(
+            loaded["quint8_tensor"].typed_storage().as_quint8().unwrap(),
+            &[10_u8, 128, 250]
+        );
+        assert_eq!(
+            loaded["quint8_tensor"].meta().quantization(),
+            sd["quint8_tensor"].meta().quantization()
+        );
+        assert_eq!(
+            loaded["quint8_channel"]
+                .typed_storage()
+                .as_quint8()
+                .unwrap(),
+            &[1_u8, 2, 3, 4]
+        );
+        assert_eq!(
+            loaded["quint8_channel"].meta().quantization(),
+            sd["quint8_channel"].meta().quantization()
+        );
+    }
+
+    #[test]
+    fn native_format_round_trips_typed_state_dict_i64_i32_bool() {
+        use super::{
+            TypedStateEntry, encode_typed_state_dict_to_bytes, load_typed_state_dict,
+            save_typed_state_dict,
+        };
+        use ft_core::{DenseBoolTensor, DenseI32Tensor, DenseI64Tensor};
+
+        let mut sd = BTreeMap::new();
+        sd.insert(
+            "dense_f32".to_string(),
+            TypedStateEntry::Dense(
+                DenseTensor::from_contiguous_values_f32(vec![1.0_f32, 2.0], vec![2], Device::Cpu)
+                    .unwrap(),
+            ),
+        );
+        sd.insert(
+            "indices_i64".to_string(),
+            TypedStateEntry::I64(
+                DenseI64Tensor::from_contiguous_values(
+                    vec![-100_i64, 0, 42, 9_000_000_000],
+                    vec![2, 2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+            ),
+        );
+        sd.insert(
+            "counts_i32".to_string(),
+            TypedStateEntry::I32(
+                DenseI32Tensor::from_contiguous_values(vec![-7_i32, 14, 28], vec![3], Device::Cpu)
+                    .unwrap(),
+            ),
+        );
+        sd.insert(
+            "mask_bool".to_string(),
+            TypedStateEntry::Bool(
+                DenseBoolTensor::from_bools(&[true, false, true, true], vec![2, 2], Device::Cpu)
+                    .unwrap(),
+            ),
+        );
+
+        let bytes = encode_typed_state_dict_to_bytes(&sd).unwrap();
+        let path = test_temp_path("ft_test_typed_state_dict.ftsv");
+        let _ = std::fs::remove_file(&path);
+        save_typed_state_dict(&sd, &path).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+        let loaded = load_typed_state_dict(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(persisted, bytes);
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(
+            loaded["dense_f32"]
+                .as_dense()
+                .unwrap()
+                .contiguous_values_f32()
+                .unwrap(),
+            &[1.0_f32, 2.0]
+        );
+        assert_eq!(
+            loaded["indices_i64"]
+                .as_i64()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            vec![-100_i64, 0, 42, 9_000_000_000]
+        );
+        assert_eq!(
+            loaded["counts_i32"]
+                .as_i32()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            vec![-7_i32, 14, 28]
+        );
+        assert_eq!(
+            loaded["mask_bool"]
+                .as_bool()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            &[1_u8, 0, 1, 1]
+        );
+    }
+
+    #[test]
+    fn onnx_sequential_export_multi_layer_linear_activation_layernorm() {
+        use super::{
+            OnnxActivation, OnnxLayerSpec, OnnxSequentialExportConfig,
+            export_sequential_onnx_to_bytes, save_sequential_onnx,
+        };
+
+        let mut config = OnnxSequentialExportConfig::new("ft_sequential_mlp", "input", "logits");
+        config.batch_size = Some(4);
+
+        let layers = vec![
+            OnnxLayerSpec::Linear {
+                name: "fc1".to_string(),
+                weight: DenseTensor::from_contiguous_values_f32(
+                    vec![0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6],
+                    vec![3, 2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                bias: Some(
+                    DenseTensor::from_contiguous_values_f32(
+                        vec![0.01_f32, 0.02, 0.03],
+                        vec![3],
+                        Device::Cpu,
+                    )
+                    .unwrap(),
+                ),
+            },
+            OnnxLayerSpec::Activation {
+                name: "act1".to_string(),
+                kind: OnnxActivation::Relu,
+            },
+            OnnxLayerSpec::LayerNorm {
+                name: "ln1".to_string(),
+                weight: DenseTensor::from_contiguous_values_f32(
+                    vec![1.0_f32, 1.0, 1.0],
+                    vec![3],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                bias: Some(
+                    DenseTensor::from_contiguous_values_f32(
+                        vec![0.0_f32, 0.0, 0.0],
+                        vec![3],
+                        Device::Cpu,
+                    )
+                    .unwrap(),
+                ),
+                eps: 1e-5,
+            },
+            OnnxLayerSpec::Activation {
+                name: "act2".to_string(),
+                kind: OnnxActivation::Silu,
+            },
+            OnnxLayerSpec::Linear {
+                name: "fc2".to_string(),
+                weight: DenseTensor::from_contiguous_values_f32(
+                    vec![0.7_f32, -0.4, 0.9],
+                    vec![1, 3],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                bias: None,
+            },
+        ];
+
+        let bytes = export_sequential_onnx_to_bytes(&config, &layers).unwrap();
+        let path = test_temp_path("ft_test_sequential_mlp.onnx");
+        let _ = std::fs::remove_file(&path);
+        save_sequential_onnx(&config, &layers, &path).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(persisted, bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("ft_sequential_mlp"));
+        assert!(text.contains("MatMul"));
+        assert!(text.contains("Relu"));
+        assert!(text.contains("LayerNormalization"));
+        assert!(text.contains("Sigmoid"));
+        assert!(text.contains("Mul"));
     }
 }
