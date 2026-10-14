@@ -11,6 +11,11 @@ on:
       - 'crates/ft-core/**'
       - 'crates/ft-kernel-cpu/**'
       - 'crates/ft-kernel-metal/**'
+      - 'artifacts/optimization/golden_outputs/ft_core_numel_pass22.txt'
+      - 'artifacts/optimization/golden_outputs/sum_reduction_frankentorch-uxhh.txt'
+      - 'artifacts/optimization/golden_outputs/ft_kernel_cpu_pow_parallel_frankentorch-3gzv.txt'
+      - 'artifacts/optimization/golden_outputs/ft_kernel_cpu_softmax_parallel_frankentorch-wcoo.txt'
+      - 'artifacts/optimization/golden_outputs/ft_kernel_cpu_lu_parallel_frankentorch-872a.txt'
   workflow_dispatch:
 
 # Build source packages, never publish them or provide registry credentials.
@@ -42,13 +47,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Dicklesworthstone/franken_whisper
-          ref: a06e241565ac9fab83e5715ec52e6685504a18b3
+          ref: 54d090b420ca44ec147e22bd13931cb3f2806d9a
           path: tools
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /scripts/package_registry_dependencies.py
             /scripts/test_registry_dependencies.py
+            /scripts/test_registry_dependencies_inputs.py
             /scripts/verify_registry_archives.py
             /scripts/registry-source-contract.json
             /rust-toolchain.toml
@@ -56,7 +62,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Test the packaging driver independently of registry publication
-        run: python3 -m unittest discover -s tools/scripts -p 'test_registry_dependencies.py' -v
+        run: python3 -m unittest discover -s tools/scripts -p 'test_registry_dependencies*.py' -v
       - name: Install the consumer's committed Rust toolchain
         run: |
           if [[ "$RUNNER_OS" == macOS ]]; then test "$(uname -m)" = arm64; fi
