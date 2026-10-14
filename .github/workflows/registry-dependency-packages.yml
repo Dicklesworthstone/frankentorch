@@ -47,12 +47,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Dicklesworthstone/franken_whisper
-          ref: 54d090b420ca44ec147e22bd13931cb3f2806d9a
+          ref: cc39057a7487a3c5f015472d8fe70d4188379bee
           path: tools
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /scripts/package_registry_dependencies.py
+            /scripts/registry_test_outputs.py
+            /scripts/test_registry_dependencies_outputs.py
             /scripts/test_registry_dependencies.py
             /scripts/test_registry_dependencies_inputs.py
             /scripts/verify_registry_archives.py
@@ -89,7 +91,7 @@ jobs:
                   or report.get('published') is not False
                   or report.get('source_revision') != os.environ['GITHUB_SHA']
                   or report.get('repository') != 'https://github.com/' + os.environ['GITHUB_REPOSITORY']
-                  or any(report.get(p) != 'pass' for p in ('resolution', 'unit_tests', 'package_verification'))
+                  or any(report.get(p) != 'pass' for p in ('resolution', 'unit_tests', 'test_input_integrity', 'package_verification'))
                   or set(report.get('artifacts', {})) != expected):
               raise SystemExit('Incomplete or wrong-source dependency package evidence')
           if hashlib.sha256((root / 'source/Cargo.lock').read_bytes()).hexdigest() != report.get('lock_sha256'):
