@@ -781,7 +781,6 @@ mod tests {
         );
     }
 
-
     /// THE ENVELOPE IS NOT THE GATED QUANTITY — `frankentorch-strict-aa-gate-band-v8rpa`.
     ///
     /// The bead reported this exact row as a gate-integrity defect:
@@ -804,7 +803,12 @@ mod tests {
         let rounds: Vec<[f64; 4]> = (0..24)
             .map(|i| {
                 let f = f64::from(i);
-                [10.0 + f * 0.1, 5.0 + f * 0.02, 5.1 - f * 0.01, 4.9 + f * 0.03]
+                [
+                    10.0 + f * 0.1,
+                    5.0 + f * 0.02,
+                    5.1 - f * 0.01,
+                    4.9 + f * 0.03,
+                ]
             })
             .collect();
         let a = permutation_null_band(&rounds, 1, NULL_PERMUTATION_DRAWS);
@@ -828,9 +832,15 @@ mod tests {
             })
             .collect();
         let (lo, hi) = permutation_null_band(&rounds, 1, NULL_PERMUTATION_DRAWS);
-        assert!(lo <= 1.0 && hi >= 1.0, "band [{lo},{hi}] must contain unity");
+        assert!(
+            lo <= 1.0 && hi >= 1.0,
+            "band [{lo},{hi}] must contain unity"
+        );
         // Slot 0 is 20x the warm slots here and must not reach the band at all.
-        assert!(hi < 2.0, "slot 0 leaked into the permutation band: [{lo},{hi}]");
+        assert!(
+            hi < 2.0,
+            "slot 0 leaked into the permutation band: [{lo},{hi}]"
+        );
     }
 
     /// MORE ROUNDS MUST NARROW IT. That is the property a fixed constant cannot have, and it is
@@ -876,17 +886,32 @@ mod tests {
 
     #[test]
     fn the_reported_envelopes_are_calm_because_the_band_is_not_an_envelope_test() {
-        assert_eq!(adjudicate_null(0.966, 1.018, MAX_NULL_CI_WIDTH), NullVerdict::Calm);
-        assert_eq!(adjudicate_null(0.948, 1.036, MAX_NULL_CI_WIDTH), NullVerdict::Calm);
+        assert_eq!(
+            adjudicate_null(0.966, 1.018, MAX_NULL_CI_WIDTH),
+            NullVerdict::Calm
+        );
+        assert_eq!(
+            adjudicate_null(0.948, 1.036, MAX_NULL_CI_WIDTH),
+            NullVerdict::Calm
+        );
     }
 
     /// What DOES make an envelope fail: not bracketing unity, at any width.
     #[test]
     fn an_envelope_that_misses_unity_is_off_centre_however_tight() {
-        assert_eq!(adjudicate_null(1.004, 1.006, MAX_NULL_CI_WIDTH), NullVerdict::OffCentre);
-        assert_eq!(adjudicate_null(0.994, 0.996, MAX_NULL_CI_WIDTH), NullVerdict::OffCentre);
+        assert_eq!(
+            adjudicate_null(1.004, 1.006, MAX_NULL_CI_WIDTH),
+            NullVerdict::OffCentre
+        );
+        assert_eq!(
+            adjudicate_null(0.994, 0.996, MAX_NULL_CI_WIDTH),
+            NullVerdict::OffCentre
+        );
         // ...and an envelope that brackets unity but is too wide supports no verdict at all.
-        assert_eq!(adjudicate_null(0.60, 1.30, MAX_NULL_CI_WIDTH), NullVerdict::TooWide);
+        assert_eq!(
+            adjudicate_null(0.60, 1.30, MAX_NULL_CI_WIDTH),
+            NullVerdict::TooWide
+        );
     }
 
     /// **THE DEFECT ITSELF, as a property.** Under the old rule a null centred on

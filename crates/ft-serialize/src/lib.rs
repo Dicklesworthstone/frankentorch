@@ -825,10 +825,23 @@ pub fn save_state_dict<P: AsRef<Path>>(
 ) -> Result<(), TensorIOError> {
     let path_str = path.as_ref().to_string_lossy().to_string();
     validate_state_dict_native_save(state_dict)?;
-    let file = std::fs::File::create(&path).map_err(|e| io_err(&path_str, e))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| io_err(&path_str, e))?;
     let mut writer = BufWriter::with_capacity(FT_NATIVE_SAVE_BUFFER_BYTES, file);
     write_state_dict_to_writer(state_dict, &mut writer, &path_str)?;
     writer.flush().map_err(|e| io_err(&path_str, e))?;
+    let mut file = writer
+        .into_inner()
+        .map_err(|e| io_err(&path_str, e.into_error()))?;
+    let pos = std::io::Seek::stream_position(&mut file).map_err(|e| io_err(&path_str, e))?;
+    if let Ok(meta) = file.metadata()
+        && meta.len() > pos
+    {
+        file.set_len(pos).map_err(|e| io_err(&path_str, e))?;
+    }
     Ok(())
 }
 
@@ -1853,11 +1866,20 @@ fn read_f64_payload(
             ]),
         ]);
     }
-    let mut values = Vec::with_capacity(numel);
-    for chunk in payload.as_chunks::<8>().0 {
-        values.push(f64::from_le_bytes(*chunk));
+    #[cfg(target_endian = "little")]
+    {
+        let mut values = vec![0.0_f64; numel];
+        bytemuck::cast_slice_mut::<f64, u8>(&mut values).copy_from_slice(payload);
+        Ok(values)
     }
-    Ok(values)
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut values = Vec::with_capacity(numel);
+        for chunk in payload.as_chunks::<8>().0 {
+            values.push(f64::from_le_bytes(*chunk));
+        }
+        Ok(values)
+    }
 }
 
 fn read_f64_payload4(data: &[u8], pos: &mut usize, key: &str) -> Result<[f64; 4], TensorIOError> {
@@ -1907,11 +1929,20 @@ fn read_f32_payload(
     key: &str,
 ) -> Result<Vec<f32>, TensorIOError> {
     let payload = native_payload(data, pos, numel, 4, "f32", key, "truncated f32 data")?;
-    let mut values = Vec::with_capacity(numel);
-    for chunk in payload.as_chunks::<4>().0 {
-        values.push(f32::from_le_bytes(*chunk));
+    #[cfg(target_endian = "little")]
+    {
+        let mut values = vec![0.0_f32; numel];
+        bytemuck::cast_slice_mut::<f32, u8>(&mut values).copy_from_slice(payload);
+        Ok(values)
     }
-    Ok(values)
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut values = Vec::with_capacity(numel);
+        for chunk in payload.as_chunks::<4>().0 {
+            values.push(f32::from_le_bytes(*chunk));
+        }
+        Ok(values)
+    }
 }
 
 fn read_f16_payload(

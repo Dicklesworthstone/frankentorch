@@ -11976,7 +11976,12 @@ impl TensorTape {
             // gradient lookups see the hook-adjusted incoming. (Replaces two
             // per-node ~numel f64 clones that capped through-tape throughput.)
             let mut incoming = std::mem::take(&mut grads[node_id.0].values);
-            if incoming.is_empty() && grads[node_id.0].expected_len > 0 {
+            if incoming.is_empty()
+                && grads[node_id.0].expected_len > 0
+                && (self.nodes[node_id.0].requires_grad
+                    || !matches!(self.nodes[node_id.0].op, TensorNodeOp::Leaf)
+                    || self.tensor_hooks.contains_key(&node_id.0))
+            {
                 incoming = ft_core::buffer_pool::take_zeroed(grads[node_id.0].expected_len);
             }
             let hook_started = std::time::Instant::now();
@@ -12005,21 +12010,13 @@ impl TensorTape {
                     }
                 }
                 TensorNodeOp::Add { lhs, rhs } => {
-                    // d(a+b)/da = d(a+b)/db = 1: add `incoming` to both operand grad slots.
-                    // Parallel per-index accumulate (bit-identical to the serial borrowed
-                    // accumulate; universal binary-op hot path). frankentorch-binop-bwd-par.
-                    Self::accumulate_tensor_gradient_par_with(
-                        lhs,
-                        &mut grads[lhs.0],
-                        incoming.len(),
-                        |index| incoming[index],
-                    )?;
-                    Self::accumulate_tensor_gradient_par_with(
-                        rhs,
-                        &mut grads[rhs.0],
-                        incoming.len(),
-                        |index| incoming[index],
-                    )?;
+                    // d(a+b)/da = d(a+b)/db = 1: add `incoming` to operand grad slots.
+                    if self.nodes[lhs.0].requires_grad {
+                        Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
+                    }
+                    if self.nodes[rhs.0].requires_grad {
+                        Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &incoming)?;
+                    }
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
                     Self::complete_dependency(&mut pending, rhs, &mut queue)?;
@@ -12031,20 +12028,18 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sub { lhs, rhs } => {
-                    // d(a-b)/da = 1 ; d(a-b)/db = -1. Parallel per-index accumulate
-                    // (bit-identical to the serial form). frankentorch-binop-bwd-par.
-                    Self::accumulate_tensor_gradient_par_with(
-                        lhs,
-                        &mut grads[lhs.0],
-                        incoming.len(),
-                        |index| incoming[index],
-                    )?;
-                    Self::accumulate_tensor_gradient_par_with(
-                        rhs,
-                        &mut grads[rhs.0],
-                        incoming.len(),
-                        |index| -incoming[index],
-                    )?;
+                    // d(a-b)/da = 1 ; d(a-b)/db = -1.
+                    if self.nodes[lhs.0].requires_grad {
+                        Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
+                    }
+                    if self.nodes[rhs.0].requires_grad {
+                        Self::accumulate_tensor_gradient_par_with(
+                            rhs,
+                            &mut grads[rhs.0],
+                            incoming.len(),
+                            |index| -incoming[index],
+                        )?;
+                    }
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
                     Self::complete_dependency(&mut pending, rhs, &mut queue)?;
@@ -12098,27 +12093,43 @@ impl TensorTape {
                     // receive a gradient, so do not materialize its counterpart merely
                     // to compute and discard that absent gradient. This matters for f32:
                     // each operand otherwise widens into the tape's f64 grad-space.
-                    if lhs_requires_grad {
-                        let rhs_values = Self::operand_values_cow(&self.nodes[rhs.0].tensor)?;
-                        Self::ensure_tensor_len(lhs, incoming.len(), incoming.len())?;
-                        Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
-                        Self::accumulate_tensor_gradient_par_with(
-                            lhs,
-                            &mut grads[lhs.0],
-                            incoming.len(),
-                            |index| incoming[index] * rhs_values[index],
-                        )?;
-                    }
-                    if rhs_requires_grad {
-                        let lhs_values = Self::operand_values_cow(&self.nodes[lhs.0].tensor)?;
-                        Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
-                        Self::ensure_tensor_len(rhs, incoming.len(), incoming.len())?;
-                        Self::accumulate_tensor_gradient_par_with(
-                            rhs,
-                            &mut grads[rhs.0],
-                            incoming.len(),
-                            |index| incoming[index] * lhs_values[index],
-                        )?;
+                    if lhs == rhs && grads[lhs.0].values.is_empty() {
+                        if lhs_requires_grad {
+                            let lhs_values = Self::operand_values_cow(&self.nodes[lhs.0].tensor)?;
+                            Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
+                            Self::accumulate_tensor_gradient_par_with(
+                                lhs,
+                                &mut grads[lhs.0],
+                                incoming.len(),
+                                |index| {
+                                    let term = incoming[index] * lhs_values[index];
+                                    term + term
+                                },
+                            )?;
+                        }
+                    } else {
+                        if lhs_requires_grad {
+                            let rhs_values = Self::operand_values_cow(&self.nodes[rhs.0].tensor)?;
+                            Self::ensure_tensor_len(lhs, incoming.len(), incoming.len())?;
+                            Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
+                            Self::accumulate_tensor_gradient_par_with(
+                                lhs,
+                                &mut grads[lhs.0],
+                                incoming.len(),
+                                |index| incoming[index] * rhs_values[index],
+                            )?;
+                        }
+                        if rhs_requires_grad {
+                            let lhs_values = Self::operand_values_cow(&self.nodes[lhs.0].tensor)?;
+                            Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
+                            Self::ensure_tensor_len(rhs, incoming.len(), incoming.len())?;
+                            Self::accumulate_tensor_gradient_par_with(
+                                rhs,
+                                &mut grads[rhs.0],
+                                incoming.len(),
+                                |index| incoming[index] * lhs_values[index],
+                            )?;
+                        }
                     }
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -12149,8 +12160,10 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::MatMul { lhs, rhs } => {
-                    let lhs_values = self.nodes[lhs.0].tensor.contiguous_values_as_f64()?;
-                    let rhs_values = self.nodes[rhs.0].tensor.contiguous_values_as_f64()?;
+                    let lhs_requires_grad = self.nodes[lhs.0].requires_grad;
+                    let rhs_requires_grad = self.nodes[rhs.0].requires_grad;
+                    let lhs_values = Self::operand_values_cow(&self.nodes[lhs.0].tensor)?;
+                    let rhs_values = Self::operand_values_cow(&self.nodes[rhs.0].tensor)?;
                     let lhs_shape = self.nodes[lhs.0].tensor.meta().shape();
                     let rhs_shape = self.nodes[rhs.0].tensor.meta().shape();
                     let (m, k, n) = Self::matmul_dims(lhs_shape, rhs_shape)?;
@@ -12174,37 +12187,50 @@ impl TensorTape {
                     Self::ensure_tensor_len(rhs, rhs_values.len(), rhs_numel)?;
                     Self::ensure_tensor_len(node_id, incoming.len(), out_numel)?;
 
-                    let mut lhs_contrib = vec![0.0; lhs_numel];
-                    let mut rhs_contrib = vec![0.0; rhs_numel];
-
                     let one_bits = 1.0_f64.to_bits();
                     let incoming_all_ones = incoming
                         .iter()
                         .all(|value| value.to_bits().cmp(&one_bits).is_eq());
 
                     if incoming_all_ones {
-                        for inner in 0..k {
-                            let mut acc = 0.0;
-                            for col in 0..n {
-                                let grad_out = 1.0;
-                                let rhs_value = rhs_values[inner * n + col];
-                                acc += grad_out * rhs_value;
+                        if lhs_requires_grad {
+                            let mut lhs_contrib = vec![0.0; lhs_numel];
+                            for inner in 0..k {
+                                let mut acc = 0.0;
+                                for col in 0..n {
+                                    let grad_out = 1.0;
+                                    let rhs_value = rhs_values[inner * n + col];
+                                    acc += grad_out * rhs_value;
+                                }
+                                for row in 0..m {
+                                    lhs_contrib[row * k + inner] = acc;
+                                }
                             }
-                            for row in 0..m {
-                                lhs_contrib[row * k + inner] = acc;
-                            }
+                            Self::accumulate_tensor_gradient_owned(
+                                lhs,
+                                &mut grads[lhs.0],
+                                lhs_contrib,
+                            )?;
                         }
 
-                        for inner in 0..k {
-                            let mut acc = 0.0;
-                            for row in 0..m {
-                                let lhs_value = lhs_values[row * k + inner];
-                                let grad_out = 1.0;
-                                acc += lhs_value * grad_out;
+                        if rhs_requires_grad {
+                            let mut rhs_contrib = vec![0.0; rhs_numel];
+                            for inner in 0..k {
+                                let mut acc = 0.0;
+                                for row in 0..m {
+                                    let lhs_value = lhs_values[row * k + inner];
+                                    let grad_out = 1.0;
+                                    acc += lhs_value * grad_out;
+                                }
+                                for col in 0..n {
+                                    rhs_contrib[inner * n + col] = acc;
+                                }
                             }
-                            for col in 0..n {
-                                rhs_contrib[inner * n + col] = acc;
-                            }
+                            Self::accumulate_tensor_gradient_owned(
+                                rhs,
+                                &mut grads[rhs.0],
+                                rhs_contrib,
+                            )?;
                         }
                     } else {
                         // Route the general (non-all-ones) 2-D matmul backward through the FAST,
@@ -12214,48 +12240,116 @@ impl TensorTape {
                         // grad_lhs[M,K] = incoming[M,N] @ rhs[K,N]^T  (dgemm_bt; rhs already in [K,N]=[n,k]).
                         // grad_rhs[K,N] = lhs[M,K]^T @ incoming[M,N]  (transpose lhs O(MK), then dgemm).
                         // frankentorch matmul2d-bwd-fast.
-                        lhs_contrib = ft_kernel_cpu::matmul_rhs_transposed_contiguous_f64(
-                            m,
-                            n,
-                            k,
-                            &incoming,
-                            &rhs_values,
-                        )
-                        .map_err(|e| {
-                            AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
-                        })?;
-                        let mut lhs_t = vec![0.0_f64; k * m];
-                        for row in 0..m {
-                            for inner in 0..k {
-                                lhs_t[inner * m + row] = lhs_values[row * k + inner];
+                        if lhs_requires_grad {
+                            let lhs_contrib = if let TensorNodeOp::Transpose {
+                                input: orig_rhs,
+                                dim0,
+                                dim1,
+                            } = self.nodes[rhs.0].op
+                                && dim0 != dim1
+                                && self.nodes[orig_rhs.0].tensor.meta().shape().len() == 2
+                                && self.nodes[orig_rhs.0].tensor.meta().is_contiguous()
+                            {
+                                let orig_rhs_values =
+                                    Self::operand_values_cow(&self.nodes[orig_rhs.0].tensor)?;
+                                ft_kernel_cpu::matmul_contiguous_f64_slices(
+                                    m,
+                                    n,
+                                    k,
+                                    &incoming,
+                                    &orig_rhs_values,
+                                )
+                            } else {
+                                ft_kernel_cpu::matmul_rhs_transposed_contiguous_f64(
+                                    m,
+                                    n,
+                                    k,
+                                    &incoming,
+                                    &rhs_values,
+                                )
+                            }
+                            .map_err(|e| {
+                                AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                            })?;
+                            Self::accumulate_tensor_gradient_owned(
+                                lhs,
+                                &mut grads[lhs.0],
+                                lhs_contrib,
+                            )?;
+                        }
+                        let mut fused_rhs_transpose: Option<TensorNodeId> = None;
+                        if rhs_requires_grad {
+                            if let TensorNodeOp::Transpose {
+                                input: orig_rhs,
+                                dim0,
+                                dim1,
+                            } = self.nodes[rhs.0].op
+                                && dim0 != dim1
+                                && self.nodes[rhs.0].tensor.meta().shape().len() == 2
+                                && pending[rhs.0] == 1
+                                && grads[rhs.0].values.is_empty()
+                                && !self.retains_grad.contains(&rhs.0)
+                                && !self.tensor_hooks.contains_key(&rhs.0)
+                            {
+                                if self.nodes[orig_rhs.0].requires_grad {
+                                    let incoming_t =
+                                        ft_kernel_cpu::transpose_2d_f64(&incoming, m, n);
+                                    let orig_rhs_contrib =
+                                        ft_kernel_cpu::matmul_contiguous_f64_slices(
+                                            n,
+                                            m,
+                                            k,
+                                            &incoming_t,
+                                            &lhs_values,
+                                        )
+                                        .map_err(|e| {
+                                            AutogradError::Dispatch(
+                                                ft_dispatch::DispatchError::Kernel(e),
+                                            )
+                                        })?;
+                                    ft_core::buffer_pool::recycle(incoming_t);
+                                    Self::accumulate_tensor_gradient_owned(
+                                        orig_rhs,
+                                        &mut grads[orig_rhs.0],
+                                        orig_rhs_contrib,
+                                    )?;
+                                }
+                                fused_rhs_transpose = Some(orig_rhs);
+                            } else {
+                                let rhs_contrib =
+                                    ft_kernel_cpu::matmul_lhs_transposed_contiguous_f64(
+                                        k,
+                                        m,
+                                        n,
+                                        &lhs_values,
+                                        &incoming,
+                                    )
+                                    .map_err(|e| {
+                                        AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                                            e,
+                                        ))
+                                    })?;
+                                Self::accumulate_tensor_gradient_owned(
+                                    rhs,
+                                    &mut grads[rhs.0],
+                                    rhs_contrib,
+                                )?;
                             }
                         }
-                        let lhs_t_meta = ft_core::TensorMeta::from_shape(
-                            vec![k, m],
-                            DType::F64,
-                            ft_core::Device::Cpu,
-                        );
-                        let inc_meta = ft_core::TensorMeta::from_shape(
-                            vec![m, n],
-                            DType::F64,
-                            ft_core::Device::Cpu,
-                        );
-                        rhs_contrib = ft_kernel_cpu::matmul_tensor_contiguous_f64(
-                            &lhs_t,
-                            &incoming,
-                            &lhs_t_meta,
-                            &inc_meta,
-                        )
-                        .map_err(|e| {
-                            AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
-                        })?;
+
+                        Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                        if let Some(orig_rhs) = fused_rhs_transpose {
+                            pending[rhs.0] = 0;
+                            Self::complete_dependency(&mut pending, orig_rhs, &mut queue)?;
+                        } else {
+                            Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                        }
                     }
 
-                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
-                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
-
-                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
-                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                    if incoming_all_ones {
+                        Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                        Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                    }
 
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -13471,14 +13565,16 @@ impl TensorTape {
                                 let rhs_requires_grad = self.nodes[rhs.0].requires_grad;
                                 match (lhs_requires_grad, rhs_requires_grad) {
                                     (true, false)
-                                        if self.nodes[lhs.0].tensor.meta().numel() == input_numel
+                                        if self.nodes[lhs.0].tensor.meta().numel()
+                                            == input_numel
                                             && self.nodes[rhs.0].tensor.meta().numel()
                                                 == input_numel =>
                                     {
                                         Some((lhs, rhs))
                                     }
                                     (false, true)
-                                        if self.nodes[rhs.0].tensor.meta().numel() == input_numel
+                                        if self.nodes[rhs.0].tensor.meta().numel()
+                                            == input_numel
                                             && self.nodes[lhs.0].tensor.meta().numel()
                                                 == input_numel =>
                                     {
@@ -13493,8 +13589,7 @@ impl TensorTape {
                         None
                     };
                     if let Some((grad_input, scale_values)) = fused_mul_sum {
-                        let values =
-                            Self::operand_values_cow(&self.nodes[scale_values.0].tensor)?;
+                        let values = Self::operand_values_cow(&self.nodes[scale_values.0].tensor)?;
                         Self::ensure_tensor_len(scale_values, values.len(), input_numel)?;
                         Self::accumulate_tensor_gradient_par_with(
                             grad_input,
@@ -14541,12 +14636,26 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Transpose { input, dim0, dim1 } => {
-                    let output_shape = self.nodes[node_id.0].tensor.meta().shape();
-                    let ndim = output_shape.len();
-                    let mut inv_perm: Vec<usize> = (0..ndim).collect();
-                    inv_perm.swap(dim0, dim1);
-                    let permuted_grad = Self::permute_data(&incoming, output_shape, &inv_perm)?;
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &permuted_grad)?;
+                    if self.nodes[input.0].requires_grad {
+                        let output_shape = self.nodes[node_id.0].tensor.meta().shape();
+                        let ndim = output_shape.len();
+                        let permuted_grad = if ndim == 2 && dim0 != dim1 {
+                            ft_kernel_cpu::transpose_2d_f64(
+                                &incoming,
+                                output_shape[0],
+                                output_shape[1],
+                            )
+                        } else {
+                            let mut inv_perm: Vec<usize> = (0..ndim).collect();
+                            inv_perm.swap(dim0, dim1);
+                            Self::permute_data(&incoming, output_shape, &inv_perm)?
+                        };
+                        Self::accumulate_tensor_gradient_owned(
+                            input,
+                            &mut grads[input.0],
+                            permuted_grad,
+                        )?;
+                    }
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -14650,69 +14759,92 @@ impl TensorTape {
                         "expand backward output shape volume overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, out_numel, incoming.len())?;
-                    // Bit-exact PARALLEL broadcast-reduction. Instead of the serial
-                    // scatter-add `contrib[orig_idx] += incoming[k]` over all out_numel
-                    // outputs, compute each contrib[o] INDEPENDENTLY by gathering its
-                    // contributing incoming elements in ascending output-flat order — a
-                    // mixed-radix odometer over the broadcast dims with the leftmost
-                    // (most-significant / largest-stride) dim first. Ascending flat order
-                    // == the serial visit order for a fixed reduced index, so the f64 sum
-                    // is bit-for-bit identical; parallelizing over `o` has no write
-                    // contention. Gated on out_numel (the work), not orig_numel (lane
-                    // count, often small e.g. a bias vector). frankentorch-expand-bwd-par.
-                    let grad_strides = ft_core::contiguous_strides(&output_shape);
-                    let orig_strides = ft_core::contiguous_strides(original_shape);
-                    // Split the output dims into KEPT (coord taken from o) and BROADCAST
-                    // (summed over). A dim is broadcast if it is a leading prefix dim, or
-                    // the corresponding input dim has extent 1.
-                    let mut kept: Vec<(usize, usize)> = Vec::new(); // (input_dim, grad_stride)
-                    let mut bcast: Vec<(usize, usize)> = Vec::new(); // (extent, grad_stride), ascending d
-                    for d in 0..ndim {
-                        if d >= prefix {
-                            let input_dim = d - prefix;
-                            if original_shape[input_dim] != 1 {
-                                kept.push((input_dim, grad_strides[d]));
-                                continue;
+                    if self.nodes[input.0].requires_grad {
+                        let contrib: Vec<f64> = if ndim == 2
+                            && orig_numel == output_shape[1]
+                            && (original_shape.as_slice() == [1, orig_numel]
+                                || original_shape.as_slice() == [orig_numel])
+                        {
+                            let mut row_sum = vec![0.0_f64; orig_numel];
+                            if orig_numel > 0 {
+                                for row in incoming.chunks_exact(orig_numel) {
+                                    for (acc, &val) in row_sum.iter_mut().zip(row.iter()) {
+                                        *acc += val;
+                                    }
+                                }
                             }
-                        }
-                        bcast.push((output_shape[d], grad_strides[d]));
-                    }
-                    // Suffix products so the flat combo index j decodes with the first
-                    // (leftmost) broadcast dim most-significant -> incrementing j walks the
-                    // gathered offsets in ascending output-flat order.
-                    let mut bcast_suffix = vec![1usize; bcast.len()];
-                    for i in (0..bcast.len().saturating_sub(1)).rev() {
-                        bcast_suffix[i] = bcast_suffix[i + 1] * bcast[i + 1].0;
-                    }
-                    // 1 for no broadcast dims; 0 if any output dim has extent 0 (=> no
-                    // contributions, matching the serial loop's zero iterations).
-                    let bcast_count: usize = bcast.iter().map(|&(e, _)| e).product();
-                    let incoming_ref: &[f64] = &incoming;
-                    let compute = |o: usize| -> f64 {
-                        let mut base = 0usize;
-                        for &(input_dim, gstride) in &kept {
-                            let c = (o / orig_strides[input_dim]) % original_shape[input_dim];
-                            base += c * gstride;
-                        }
-                        let mut sum = 0.0;
-                        for j in 0..bcast_count {
-                            let mut off = base;
-                            for (bi, &(_, gstride)) in bcast.iter().enumerate() {
-                                let coord = (j / bcast_suffix[bi]) % bcast[bi].0;
-                                off += coord * gstride;
+                            row_sum
+                        } else {
+                            // Bit-exact PARALLEL broadcast-reduction. Instead of the serial
+                            // scatter-add `contrib[orig_idx] += incoming[k]` over all out_numel
+                            // outputs, compute each contrib[o] INDEPENDENTLY by gathering its
+                            // contributing incoming elements in ascending output-flat order — a
+                            // mixed-radix odometer over the broadcast dims with the leftmost
+                            // (most-significant / largest-stride) dim first. Ascending flat order
+                            // == the serial visit order for a fixed reduced index, so the f64 sum
+                            // is bit-for-bit identical; parallelizing over `o` has no write
+                            // contention. Gated on out_numel (the work), not orig_numel (lane
+                            // count, often small e.g. a bias vector). frankentorch-expand-bwd-par.
+                            let grad_strides = ft_core::contiguous_strides(&output_shape);
+                            let orig_strides = ft_core::contiguous_strides(original_shape);
+                            // Split the output dims into KEPT (coord taken from o) and BROADCAST
+                            // (summed over). A dim is broadcast if it is a leading prefix dim, or
+                            // the corresponding input dim has extent 1.
+                            let mut kept: Vec<(usize, usize)> = Vec::new(); // (input_dim, grad_stride)
+                            let mut bcast: Vec<(usize, usize)> = Vec::new(); // (extent, grad_stride), ascending d
+                            for d in 0..ndim {
+                                if d >= prefix {
+                                    let input_dim = d - prefix;
+                                    if original_shape[input_dim] != 1 {
+                                        kept.push((input_dim, grad_strides[d]));
+                                        continue;
+                                    }
+                                }
+                                bcast.push((output_shape[d], grad_strides[d]));
                             }
-                            sum += incoming_ref[off];
-                        }
-                        sum
-                    };
-                    let contrib: Vec<f64> = if out_numel >= (1 << 15) {
-                        use rayon::prelude::*;
-                        (0..orig_numel).into_par_iter().map(compute).collect()
-                    } else {
-                        (0..orig_numel).map(compute).collect()
-                    };
+                            // Suffix products so the flat combo index j decodes with the first
+                            // (leftmost) broadcast dim most-significant -> incrementing j walks the
+                            // gathered offsets in ascending output-flat order.
+                            let mut bcast_suffix = vec![1usize; bcast.len()];
+                            for i in (0..bcast.len().saturating_sub(1)).rev() {
+                                bcast_suffix[i] = bcast_suffix[i + 1] * bcast[i + 1].0;
+                            }
+                            // 1 for no broadcast dims; 0 if any output dim has extent 0 (=> no
+                            // contributions, matching the serial loop's zero iterations).
+                            let bcast_count: usize = bcast.iter().map(|&(e, _)| e).product();
+                            let incoming_ref: &[f64] = &incoming;
+                            let compute = |o: usize| -> f64 {
+                                let mut base = 0usize;
+                                for &(input_dim, gstride) in &kept {
+                                    let c =
+                                        (o / orig_strides[input_dim]) % original_shape[input_dim];
+                                    base += c * gstride;
+                                }
+                                let mut sum = 0.0;
+                                for j in 0..bcast_count {
+                                    let mut off = base;
+                                    for (bi, &(_, gstride)) in bcast.iter().enumerate() {
+                                        let coord = (j / bcast_suffix[bi]) % bcast[bi].0;
+                                        off += coord * gstride;
+                                    }
+                                    sum += incoming_ref[off];
+                                }
+                                sum
+                            };
+                            if out_numel >= (1 << 19) {
+                                use rayon::prelude::*;
+                                (0..orig_numel).into_par_iter().map(compute).collect()
+                            } else {
+                                (0..orig_numel).map(compute).collect()
+                            }
+                        };
 
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        Self::accumulate_tensor_gradient_owned(
+                            input,
+                            &mut grads[input.0],
+                            contrib,
+                        )?;
+                    }
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -21128,13 +21260,18 @@ impl TensorTape {
         // FrankenTorch gave `+0.0`. All four accumulators that can construct an empty
         // slot dropped it TOGETHER — removing it from only some would make two paths
         // computing one gradient disagree, which is worse than a uniform divergence.
-        const PAR_MIN: usize = 1 << 15;
+        const PAR_MIN: usize = 1 << 19;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
             // frankentorch-dtyiz: with the -0.0 canonicalization gone this is a plain
             // copy, so the parallel/serial split that used to straddle `0.0 + value`
             // has nothing left to straddle. One memcpy for both sizes.
-            target.values.extend_from_slice(contribution);
+            if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(contribution.len()) {
+                pooled.copy_from_slice(contribution);
+                target.values = pooled;
+            } else {
+                target.values.extend_from_slice(contribution);
+            }
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution.len())?;
@@ -21171,7 +21308,7 @@ impl TensorTape {
         target: &mut TensorGradientSlot,
         contribution: Vec<f64>,
     ) -> Result<(), AutogradError> {
-        const PAR_MIN: usize = 1 << 15;
+        const PAR_MIN: usize = 1 << 19;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
             // Move the buffer in with no fresh allocation. No sign-of-zero fixup:
@@ -21201,7 +21338,7 @@ impl TensorTape {
         target: &mut [f64],
         contribution: &[f64],
     ) -> Result<(), AutogradError> {
-        const PAR_MIN: usize = 1 << 15;
+        const PAR_MIN: usize = 1 << 19;
         Self::ensure_tensor_len(node, target.len(), contribution.len())?;
         if contribution.len() >= PAR_MIN {
             use rayon::prelude::*;
@@ -21221,7 +21358,7 @@ impl TensorTape {
     where
         F: Fn(f64, f64) -> f64 + Send + Sync,
     {
-        const PAR_MIN: usize = 1 << 15;
+        const PAR_MIN: usize = 1 << 19;
         if incoming.len() >= PAR_MIN {
             use rayon::prelude::*;
             incoming
@@ -21252,7 +21389,7 @@ impl TensorTape {
     {
         Self::ensure_tensor_len(node, target.expected_len, incoming.len())?;
         Self::ensure_tensor_len(node, values.len(), incoming.len())?;
-        const PAR_MIN: usize = 1 << 15;
+        const PAR_MIN: usize = 1 << 19;
         if target.values.is_empty() {
             if incoming.len() >= PAR_MIN {
                 use rayon::prelude::*;
@@ -21262,6 +21399,15 @@ impl TensorTape {
                     .zip(values.par_iter().copied())
                     .map(|(grad, value)| f(grad, value))
                     .collect();
+            } else if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(incoming.len()) {
+                for ((dst, grad), value) in pooled
+                    .iter_mut()
+                    .zip(incoming.iter().copied())
+                    .zip(values.iter().copied())
+                {
+                    *dst = f(grad, value);
+                }
+                target.values = pooled;
             } else {
                 target.values.reserve(incoming.len());
                 for (grad, value) in incoming.iter().copied().zip(values.iter().copied()) {
@@ -21309,7 +21455,7 @@ impl TensorTape {
         contribution_len: usize,
         contribution: F,
     ) -> Result<(), AutogradError> {
-        const PAR_MIN: usize = 1 << 15;
+        const PAR_MIN: usize = 1 << 19;
         Self::ensure_tensor_len(node, target.expected_len, contribution_len)?;
         if target.values.is_empty() {
             if contribution_len >= PAR_MIN {
@@ -21318,6 +21464,12 @@ impl TensorTape {
                     .into_par_iter()
                     .map(&contribution)
                     .collect();
+            } else if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(contribution_len)
+            {
+                for (index, dst) in pooled.iter_mut().enumerate() {
+                    *dst = contribution(index);
+                }
+                target.values = pooled;
             } else {
                 target.values.reserve(contribution_len);
                 for index in 0..contribution_len {
@@ -22997,10 +23149,12 @@ mod tests {
             report.gradient(values).expect("input gradient").to_vec(),
             vec![-0.5, 4.0, 0.0, 1.5]
         );
-        assert!(report
-            .steps
-            .iter()
-            .any(|step| step.rule == "d(sum(a*b))/da=b*grad (single-grad fused)"));
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.rule == "d(sum(a*b))/da=b*grad (single-grad fused)")
+        );
     }
 
     #[test]

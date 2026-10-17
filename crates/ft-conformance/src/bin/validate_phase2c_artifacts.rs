@@ -41,6 +41,8 @@ const RAPTORQ_REPAIR_MANIFEST_FILE: &str =
     "artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json";
 const RAPTORQ_SCRUB_REPORT_FILE: &str = "artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json";
 const RAPTORQ_DECODE_EVENTS_FILE: &str = "artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json";
+const PERF_SLO_MEASUREMENT_FILE: &str =
+    "artifacts/phase2c/performance/perf_slo_measurement_v1.json";
 const DISABLE_PACKET_PARALLELISM_ENV: &str = "FT_DISABLE_PACKET_PARALLELISM";
 const PACKET_VALIDATOR_WORKERS_ENV: &str = "FT_PACKET_VALIDATOR_WORKERS";
 const REQUIRED_ALLOWLIST_TOP_LEVEL_KEYS: [&str; 5] = [
@@ -269,6 +271,7 @@ fn validate_global(root: &Path, packet_ids: &[String]) -> GlobalValidation {
     }
 
     validate_global_raptorq_artifacts(root, &mut errors, &mut checks);
+    validate_global_perf_slo_artifacts(root, &mut errors, &mut checks);
 
     let status = if errors.is_empty() {
         "READY"
@@ -834,6 +837,73 @@ fn validate_global_raptorq_artifacts(
             "raptorq decode events summary must show corruption_probe_passed == total_events"
                 .to_string(),
         );
+    }
+}
+
+fn validate_global_perf_slo_artifacts(
+    root: &Path,
+    errors: &mut Vec<String>,
+    checks: &mut BTreeMap<String, bool>,
+) {
+    let perf_path = root.join(PERF_SLO_MEASUREMENT_FILE);
+    let perf_exists = perf_path.exists();
+    checks.insert("perf_slo:measurement_exists".to_string(), perf_exists);
+    if !perf_exists {
+        errors.push(format!(
+            "missing required performance SLO measurement artifact '{}'",
+            PERF_SLO_MEASUREMENT_FILE
+        ));
+        return;
+    }
+
+    let Some(perf_value) = read_json(perf_path.as_path()) else {
+        checks.insert("perf_slo:measurement_valid_json".to_string(), false);
+        errors.push(format!(
+            "{} is present but is not valid json",
+            PERF_SLO_MEASUREMENT_FILE
+        ));
+        return;
+    };
+    checks.insert("perf_slo:measurement_valid_json".to_string(), true);
+
+    let schema_ok = perf_value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema == "ft-perf-slo-report-v1");
+    checks.insert("perf_slo:schema_version".to_string(), schema_ok);
+    if !schema_ok {
+        errors.push(
+            "perf_slo_measurement_v1.json schema_version must be 'ft-perf-slo-report-v1'"
+                .to_string(),
+        );
+    }
+
+    let overall_pass = perf_value
+        .get("overall_status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "pass");
+    checks.insert("perf_slo:overall_status_pass".to_string(), overall_pass);
+    if !overall_pass {
+        errors.push(
+            "perf_slo_measurement_v1.json overall_status must be 'pass' for READY status"
+                .to_string(),
+        );
+    }
+
+    let all_checks_pass = perf_value
+        .get("budgets")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    item.get("status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status == "pass")
+                })
+        });
+    checks.insert("perf_slo:all_checks_pass".to_string(), all_checks_pass);
+    if !all_checks_pass {
+        errors.push("perf_slo_measurement_v1.json budgets must all have status 'pass'".to_string());
     }
 }
 

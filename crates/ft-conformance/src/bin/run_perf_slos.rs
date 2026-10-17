@@ -335,14 +335,22 @@ fn main() -> Result<(), String> {
         .transpose()?;
     let config = args.profile.config();
 
+    let training_step_memory = measure_training_step_memory(&args, &config)?;
+    let representative_backward = measure_representative_backward(&args, &config)?;
+    let backward_heavy_allocation = measure_backward_heavy_allocation(&args, &config)?;
+    let matmul_core = measure_matmul_core(&args, &config)?;
+    let elementwise_forward = measure_elementwise_forward(&args, &config)?;
+    let optimizer_step = measure_optimizer_step(&args, &config)?;
+    let checkpoint_roundtrip = measure_checkpoint_roundtrip(&args, &config)?;
+
     let mut measurements = Measurements {
-        elementwise_forward: measure_elementwise_forward(&args, &config)?,
-        representative_backward: measure_representative_backward(&args, &config)?,
-        matmul_core: measure_matmul_core(&args, &config)?,
-        optimizer_step: measure_optimizer_step(&args, &config)?,
-        checkpoint_roundtrip: measure_checkpoint_roundtrip(&args, &config)?,
-        training_step_memory: measure_training_step_memory(&args, &config)?,
-        backward_heavy_allocation: measure_backward_heavy_allocation(&args, &config)?,
+        elementwise_forward,
+        representative_backward,
+        matmul_core,
+        optimizer_step,
+        checkpoint_roundtrip,
+        training_step_memory,
+        backward_heavy_allocation,
         benchmark_family_tail: TailStabilityMeasurement {
             status: MeasurementStatus::Ok,
             workload_ids: Vec::new(),
@@ -683,16 +691,18 @@ fn run_representative_backward_iteration(
 
     let mut backward_ns = 0_u128;
     let mut outcome = Ok(());
+    let mut report_holder = None;
     let info = measure(|| {
         let started = Instant::now();
         outcome = session
             .tensor_backward(loss)
             .map(|report| {
-                black_box(report);
+                report_holder = Some(black_box(report));
             })
             .map_err(|error| format!("representative tensor_backward failed: {error}"));
         backward_ns = started.elapsed().as_nanos();
     });
+    drop(black_box(report_holder));
     outcome?;
 
     Ok((forward_ns, backward_ns, info))
@@ -771,26 +781,42 @@ fn measure_optimizer_step(
         .optimizer_total_params
         .checked_div(config.optimizer_param_chunks)
         .ok_or_else(|| "optimizer_param_chunks must be > 0".to_string())?;
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let params = (0..config.optimizer_param_chunks)
         .map(|_| {
-            DenseTensor::from_contiguous_values(
+            let tensor = DenseTensor::from_contiguous_values(
                 vec![0.25_f64; chunk_len],
                 vec![chunk_len],
                 Device::Cpu,
             )
-            .map_err(|error| format!("failed to build optimizer parameter tensor: {error}"))
+            .map_err(|error| format!("failed to build optimizer parameter tensor: {error}"))?;
+            Ok(session.tensor_variable_from_storage(tensor, true))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let gradient = vec![0.01_f64; chunk_len];
+        .collect::<Result<Vec<_>, String>>()?;
+    for &param in &params {
+        session
+            .tensor_set_accumulated_gradient(param, vec![0.01_f64; chunk_len])
+            .map_err(|error| format!("failed to seed optimizer gradient: {error}"))?;
+    }
+    let dummy = session
+        .tensor_variable(vec![1.0], vec![1], true)
+        .map_err(|error| format!("failed to create optimizer dummy tensor: {error}"))?;
+    let dummy_sum = session
+        .tensor_sum(dummy)
+        .map_err(|error| format!("failed to sum optimizer dummy tensor: {error}"))?;
+    let report = session
+        .tensor_backward(dummy_sum)
+        .map_err(|error| format!("failed to build optimizer dummy report: {error}"))?;
+    let mut optimizer = Adam::new(params, 1e-3);
     let mut samples = Vec::with_capacity(args.iterations);
     let mut allocation = AllocationMetrics::default();
     let mut memory = MemoryMetrics::default();
 
     for _ in 0..args.warmup_iterations {
-        let _ = run_optimizer_iteration(params.as_slice(), gradient.as_slice())?;
+        let _ = run_optimizer_iteration(&mut session, &mut optimizer, &report)?;
     }
     for _ in 0..args.iterations {
-        let (elapsed, info) = run_optimizer_iteration(params.as_slice(), gradient.as_slice())?;
+        let (elapsed, info) = run_optimizer_iteration(&mut session, &mut optimizer, &report)?;
         samples.push(elapsed);
         allocation.add_assign(info);
         update_memory_metrics(&mut memory, current_rss_kb()?);
@@ -809,36 +835,16 @@ fn measure_optimizer_step(
 }
 
 fn run_optimizer_iteration(
-    param_templates: &[DenseTensor],
-    gradient: &[f64],
+    session: &mut FrankenTorchSession,
+    optimizer: &mut Adam,
+    report: &ft_autograd::TensorBackwardReport,
 ) -> Result<(u128, AllocationInfo), String> {
-    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-    let params = param_templates
-        .iter()
-        .map(|tensor| session.tensor_variable_from_storage(tensor.clone(), true))
-        .collect::<Vec<_>>();
-    for &param in &params {
-        session
-            .tensor_set_accumulated_gradient(param, gradient.to_vec())
-            .map_err(|error| format!("failed to seed optimizer gradient: {error}"))?;
-    }
-    let dummy = session
-        .tensor_variable(vec![1.0], vec![1], true)
-        .map_err(|error| format!("failed to create optimizer dummy tensor: {error}"))?;
-    let dummy_sum = session
-        .tensor_sum(dummy)
-        .map_err(|error| format!("failed to sum optimizer dummy tensor: {error}"))?;
-    let report = session
-        .tensor_backward(dummy_sum)
-        .map_err(|error| format!("failed to build optimizer dummy report: {error}"))?;
-    let mut optimizer = Adam::new(params, 1e-3);
-
     let mut elapsed = 0_u128;
     let mut outcome = Ok(());
     let info = measure(|| {
         let started = Instant::now();
         outcome = optimizer
-            .step(&mut session, &report)
+            .step(session, report)
             .map_err(|error| format!("adam step failed: {error}"));
         elapsed = started.elapsed().as_nanos();
     });

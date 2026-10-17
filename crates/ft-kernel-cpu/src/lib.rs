@@ -88,8 +88,8 @@ pub struct DgemmBtSubCensusEntry {
 
 #[allow(unsafe_code, clippy::items_after_test_module)]
 mod gemm {
-    use rayon::prelude::*;
     use super::DgemmBtSubCensusEntry;
+    use rayon::prelude::*;
 
     // Above this many fused multiply-adds, split the GEMM across output row
     // blocks and run them on the rayon pool. `matrixmultiply` is single-threaded,
@@ -400,8 +400,7 @@ mod gemm {
     fn householder_skinny_parallel_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var("FT_HOUSEHOLDER_SKINNY_GEMM")
-                .map_or(true, |value| value != "0")
+            std::env::var("FT_HOUSEHOLDER_SKINNY_GEMM").map_or(true, |value| value != "0")
         })
     }
 
@@ -9126,7 +9125,8 @@ pub(crate) fn conv2d_dweight_streamed_f32_if_enabled(
 ///
 /// Both are summed across rayon workers, so they measure CPU time rather than wall time and their
 /// ratio is the meaningful quantity, not either absolute against the frame.
-static CONV2D_DWEIGHT_GATHER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONV2D_DWEIGHT_GATHER_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 static CONV2D_DWEIGHT_GEMM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Drain the streamed f32 dweight's `(gather_ns, gemm_ns)`, summed over workers.
@@ -9565,13 +9565,11 @@ fn conv2d_dweight_streamed_f64(
                     let batch_off = b * in_ch * ph * pw;
                     let prow = &mut ptile[r * jn..(r + 1) * jn];
                     for &(ch, kr, off, len, dst) in &runs {
-                        let irow =
-                            batch_off + ch * ph * pw + (base_h + kr) * pw + base_w + off;
+                        let irow = batch_off + ch * ph * pw + (base_h + kr) * pw + base_w + off;
                         prow[dst..dst + len].copy_from_slice(&padded[irow..irow + len]);
                     }
                     let src = row * out_ch + oc0;
-                    atile[r * ocn..(r + 1) * ocn]
-                        .copy_from_slice(&dout_flat[src..src + ocn]);
+                    atile[r * ocn..(r + 1) * ocn].copy_from_slice(&dout_flat[src..src + ocn]);
                 }
                 gemm::dgemm_tb_add_into(
                     ocn,
@@ -10096,7 +10094,8 @@ fn conv2d_backward_dinput_blocked_rows_f32(
                             // scatter it is near its memory floor FOR THIS ALGORITHM, and the distance to
                             // PyTorch is a vectorised direct-convolution microkernel (oneDNN-class), which is
                             // a different piece of work and not another pass over these frames.
-                            let (dst, src) = (&mut dpb[irow..irow + kw], &block[prow_off..prow_off + kw]);
+                            let (dst, src) =
+                                (&mut dpb[irow..irow + kw], &block[prow_off..prow_off + kw]);
                             for (d, s) in dst.iter_mut().zip(src) {
                                 *d += *s;
                             }
@@ -10769,7 +10768,19 @@ pub fn conv2d_backward_f32(
     // disagreeing — `conv2d_ones_dout_route`'s rationale applied to dinput.
     let dpadded = if conv2d_dinput_blocked_any(batch, in_ch) {
         conv2d_backward_dinput_direct_f32(
-            &dout_flat, weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+            &dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
         )
     } else {
         let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
@@ -19831,6 +19842,34 @@ pub fn matmul_tensor_contiguous_f64(
     Ok(out)
 }
 
+pub fn matmul_contiguous_f64_slices(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs: &[f64],
+    rhs: &[f64],
+) -> Result<Vec<f64>, KernelError> {
+    let lhs_len = checked_mul(m, k, "matmul_contiguous lhs overflow")?;
+    let rhs_len = checked_mul(k, n, "matmul_contiguous rhs overflow")?;
+    let out_len = checked_mul(m, n, "matmul_contiguous output overflow")?;
+    if lhs.len() < lhs_len {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![lhs_len],
+            rhs: vec![lhs.len()],
+        });
+    }
+    if rhs.len() < rhs_len {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![rhs_len],
+            rhs: vec![rhs.len()],
+        });
+    }
+    let mut out =
+        ft_core::buffer_pool::try_take_exact(out_len).unwrap_or_else(|| vec![0.0_f64; out_len]);
+    gemm::dgemm(m, k, n, &lhs[..lhs_len], &rhs[..rhs_len], &mut out);
+    Ok(out)
+}
+
 pub fn matmul_rhs_transposed_contiguous_f64(
     m: usize,
     k: usize,
@@ -19853,8 +19892,37 @@ pub fn matmul_rhs_transposed_contiguous_f64(
             rhs: vec![rhs_nk.len()],
         });
     }
-    let mut out = vec![0.0_f64; out_len];
+    let mut out =
+        ft_core::buffer_pool::try_take_exact(out_len).unwrap_or_else(|| vec![0.0_f64; out_len]);
     gemm::dgemm_bt(m, k, n, &lhs[..lhs_len], &rhs_nk[..rhs_len], &mut out);
+    Ok(out)
+}
+
+pub fn matmul_lhs_transposed_contiguous_f64(
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs_km: &[f64],
+    rhs_kn: &[f64],
+) -> Result<Vec<f64>, KernelError> {
+    let lhs_len = checked_mul(k, m, "matmul_lhs_transposed lhs overflow")?;
+    let rhs_len = checked_mul(k, n, "matmul_lhs_transposed rhs overflow")?;
+    let out_len = checked_mul(m, n, "matmul_lhs_transposed output overflow")?;
+    if lhs_km.len() < lhs_len {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![lhs_len],
+            rhs: vec![lhs_km.len()],
+        });
+    }
+    if rhs_kn.len() < rhs_len {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![rhs_len],
+            rhs: vec![rhs_kn.len()],
+        });
+    }
+    let mut out =
+        ft_core::buffer_pool::try_take_exact(out_len).unwrap_or_else(|| vec![0.0_f64; out_len]);
+    gemm::dgemm_tb(m, k, n, &lhs_km[..lhs_len], &rhs_kn[..rhs_len], &mut out);
     Ok(out)
 }
 
@@ -25672,8 +25740,7 @@ static LU_SWAP_NS: AtomicU64 = AtomicU64::new(0);
 ///
 /// The knob survives because it is how the row was taken and how it can be retaken; a lower-rep
 /// version of this same A/B printed 0.82x with a FAILING null, so the estimator is load-bearing.
-static LU_TRSM_ROW_ACCUM: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static LU_TRSM_ROW_ACCUM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Select the row-accumulating triangular solve, returning the previous setting.
 #[doc(hidden)]
@@ -25809,7 +25876,11 @@ fn lu_factor_panel_recursive_f64(
                     max_row = i;
                 }
             }
-            stage_family_add(&LU_PIVOT_NS, &LU_STAGE_OWNER, __t_piv.elapsed().as_nanos() as u64);
+            stage_family_add(
+                &LU_PIVOT_NS,
+                &LU_STAGE_OWNER,
+                __t_piv.elapsed().as_nanos() as u64,
+            );
             ipiv[k] = max_row;
             let __t_swap = std::time::Instant::now();
             if max_row != k {
@@ -25818,7 +25889,11 @@ fn lu_factor_panel_recursive_f64(
                     lu.swap(k * n + j, max_row * n + j);
                 }
             }
-            stage_family_add(&LU_SWAP_NS, &LU_STAGE_OWNER, __t_swap.elapsed().as_nanos() as u64);
+            stage_family_add(
+                &LU_SWAP_NS,
+                &LU_STAGE_OWNER,
+                __t_swap.elapsed().as_nanos() as u64,
+            );
             let diag = lu[k * n + k];
             if diag.abs() < singular_tol {
                 for i in (k + 1)..n {
@@ -25940,7 +26015,11 @@ pub fn lu_factor_contiguous_nb_f64(
         // Every panel, including the final one with no U12/A22 work, belongs to the
         // panel stage. Commit it before the terminal exit so `lu_stage_take_ns()`
         // accounts for the complete LU factorization.
-        stage_family_add(&LU_PANEL_NS, &LU_STAGE_OWNER, __t_panel.elapsed().as_nanos() as u64);
+        stage_family_add(
+            &LU_PANEL_NS,
+            &LU_STAGE_OWNER,
+            __t_panel.elapsed().as_nanos() as u64,
+        );
         if tcols == 0 {
             break;
         }
@@ -25953,7 +26032,11 @@ pub fn lu_factor_contiguous_nb_f64(
         // frankentorch-kgs4.62.
         gemm::ltrsm_unit_lower_panel_f64(&mut lu, n, k0, pe);
 
-        stage_family_add(&LU_SOLVE_NS, &LU_STAGE_OWNER, __t_solve.elapsed().as_nanos() as u64);
+        stage_family_add(
+            &LU_SOLVE_NS,
+            &LU_STAGE_OWNER,
+            __t_solve.elapsed().as_nanos() as u64,
+        );
         let __t_trail = std::time::Instant::now();
         // --- 3. Trailing update A22 -= L21 * U12, FUSED directly into lu ---
         // Pack L21 (rows pe..n, cols k0..pe) -> contiguous [trows x kb] and U12
@@ -25975,7 +26058,11 @@ pub fn lu_factor_contiguous_nb_f64(
             u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
         }
         gemm::dgemm_sub_into(trows, kb, tcols, &l21, &u12, &mut lu, pe * n + pe, n);
-        stage_family_add(&LU_TRAIL_NS, &LU_STAGE_OWNER, __t_trail.elapsed().as_nanos() as u64);
+        stage_family_add(
+            &LU_TRAIL_NS,
+            &LU_STAGE_OWNER,
+            __t_trail.elapsed().as_nanos() as u64,
+        );
 
         k0 = pe;
     }
@@ -26347,7 +26434,11 @@ pub fn lu_solve_contiguous_f64(
         }
         out
     };
-    stage_family_add(&LU_SOLVE_PERM_NS, &LU_SOLVE_OWNER, perm_start.elapsed().as_nanos() as u64);
+    stage_family_add(
+        &LU_SOLVE_PERM_NS,
+        &LU_SOLVE_OWNER,
+        perm_start.elapsed().as_nanos() as u64,
+    );
 
     // BLAS-3 BLOCKED path for the large multi-RHS regime (the n-RHS inverse and
     // big batched solves). The column-parallel path below re-streams the WHOLE LU
@@ -26399,7 +26490,11 @@ pub fn lu_solve_contiguous_f64(
             k0 = pe;
         }
 
-        stage_family_add(&LU_SOLVE_FWD_NS, &LU_SOLVE_OWNER, fwd_start.elapsed().as_nanos() as u64);
+        stage_family_add(
+            &LU_SOLVE_FWD_NS,
+            &LU_SOLVE_OWNER,
+            fwd_start.elapsed().as_nanos() as u64,
+        );
 
         // BACK: U · x = y, blocked over row panels from the bottom.
         let back_start = std::time::Instant::now();
@@ -26442,7 +26537,11 @@ pub fn lu_solve_contiguous_f64(
             }
             peb = k0;
         }
-        stage_family_add(&LU_SOLVE_BACK_NS, &LU_SOLVE_OWNER, back_start.elapsed().as_nanos() as u64);
+        stage_family_add(
+            &LU_SOLVE_BACK_NS,
+            &LU_SOLVE_OWNER,
+            back_start.elapsed().as_nanos() as u64,
+        );
         return Ok(x);
     }
 
@@ -27157,7 +27256,11 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let mut panel = vec![0.0f64; n * nb_width];
     let mut ypanel = vec![0.0f64; nb_width * n];
 
-    stage_family_add(&LU_INV_SETUP_NS, &LU_INV_OWNER, __t_setup.elapsed().as_nanos() as u64);
+    stage_family_add(
+        &LU_INV_SETUP_NS,
+        &LU_INV_OWNER,
+        __t_setup.elapsed().as_nanos() as u64,
+    );
     let __t_fwd = std::time::Instant::now();
     // FORWARD: L y = I, restricted to the columns that can be nonzero.
     let mut k0 = 0;
@@ -27199,7 +27302,11 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         k0 = pe;
     }
 
-    stage_family_add(&LU_INV_FWD_NS, &LU_INV_OWNER, __t_fwd.elapsed().as_nanos() as u64);
+    stage_family_add(
+        &LU_INV_FWD_NS,
+        &LU_INV_OWNER,
+        __t_fwd.elapsed().as_nanos() as u64,
+    );
     let __t_back = std::time::Instant::now();
     // BACK: U z = y, over all n columns — `y` is triangular but `z` is dense.
     let mut peb = n;
@@ -27252,7 +27359,11 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         peb = k0;
     }
 
-    stage_family_add(&LU_INV_BACK_NS, &LU_INV_OWNER, __t_back.elapsed().as_nanos() as u64);
+    stage_family_add(
+        &LU_INV_BACK_NS,
+        &LU_INV_OWNER,
+        __t_back.elapsed().as_nanos() as u64,
+    );
     let __t_perm = std::time::Instant::now();
     // A^-1[:, pivots[c]] = Z[:, c]. A COLUMN permutation, but done row by row: each row is 8n
     // bytes and both the source and destination row stay resident while it is scattered, so this
@@ -27264,7 +27375,11 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
             out[row + factor.pivots[c]] = x[row + c];
         }
     }
-    stage_family_add(&LU_INV_PERM_NS, &LU_INV_OWNER, __t_perm.elapsed().as_nanos() as u64);
+    stage_family_add(
+        &LU_INV_PERM_NS,
+        &LU_INV_OWNER,
+        __t_perm.elapsed().as_nanos() as u64,
+    );
     out
 }
 
@@ -28198,12 +28313,10 @@ fn cholesky_panel_factor_f64(
             match mode {
                 1 => {
                     use rayon::prelude::*;
-                    tail[..rows * n]
-                        .par_chunks_mut(n)
-                        .for_each(|row| {
-                            let t = cholesky_panel_dot_sub_f64(row[jj], &row[jb..jj], drow);
-                            row[jj] = t / d;
-                        });
+                    tail[..rows * n].par_chunks_mut(n).for_each(|row| {
+                        let t = cholesky_panel_dot_sub_f64(row[jj], &row[jb..jj], drow);
+                        row[jj] = t / d;
+                    });
                 }
                 2 => {
                     // FOUR ROWS PER PASS over `drow`. Each row keeps its OWN four FMA chains in
@@ -28268,7 +28381,11 @@ fn cholesky_panel_factor_f64(
             );
             stage_family_add(&CHOLESKY_PANEL_COLS, &CHOLESKY_PANEL_CENSUS_OWNER, 1);
             let macs = (jj - jb) as u64;
-            stage_family_add(&CHOLESKY_PANEL_MACS, &CHOLESKY_PANEL_CENSUS_OWNER, macs * (rows as u64 + 1));
+            stage_family_add(
+                &CHOLESKY_PANEL_MACS,
+                &CHOLESKY_PANEL_CENSUS_OWNER,
+                macs * (rows as u64 + 1),
+            );
         }
     }
     Ok(())
@@ -30707,7 +30824,10 @@ fn tred2_dot(a: &[f64], b: &[f64]) -> f64 {
         }
         idx += 16;
     }
-    let mut total: f64 = ((acc[0] + acc[1]) + (acc[2] + acc[3])).to_array().iter().sum();
+    let mut total: f64 = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
+        .to_array()
+        .iter()
+        .sum();
     while idx < len {
         total += a[idx] * b[idx];
         idx += 1;
@@ -30860,7 +30980,8 @@ fn eigh_tred2_reduce_packed_blocked(
                     } else {
                         (0..=l).into_par_iter().map(ggs_at).collect()
                     };
-                    TRED2_GGS_NS.fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                    TRED2_GGS_NS
+                        .fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                     f = 0.0;
                     for j in 0..=l {
                         scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
@@ -31079,8 +31200,7 @@ pub fn set_eigh_bt_par_min(v: usize) -> usize {
 /// SO THIS REASSOCIATES, where the column split did not. It is admitted under the ratified qgce4
 /// tolerance contract for eigensolver outputs, the same standard the blocked backtransform and the
 /// blocked dsytrd ship under — not as a bit-exact claim.
-static EIGH_BT_ROW_SPLIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static EIGH_BT_ROW_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Select the row-split projection, returning the previous setting.
 #[doc(hidden)]
@@ -31144,20 +31264,20 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
                         );
                     projections[..i].copy_from_slice(&partial);
                 } else {
-                let chunk = i.div_ceil(threads).max(64);
-                projections[..i]
-                    .par_chunks_mut(chunk)
-                    .enumerate()
-                    .for_each(|(ci, out)| {
-                        let j0 = ci * chunk;
-                        for k in 0..i {
-                            let row_factor = row_i[k];
-                            let row = &prev[k * n + j0..k * n + j0 + out.len()];
-                            for (slot, &value) in out.iter_mut().zip(row) {
-                                *slot += row_factor * value;
+                    let chunk = i.div_ceil(threads).max(64);
+                    projections[..i]
+                        .par_chunks_mut(chunk)
+                        .enumerate()
+                        .for_each(|(ci, out)| {
+                            let j0 = ci * chunk;
+                            for k in 0..i {
+                                let row_factor = row_i[k];
+                                let row = &prev[k * n + j0..k * n + j0 + out.len()];
+                                for (slot, &value) in out.iter_mut().zip(row) {
+                                    *slot += row_factor * value;
+                                }
                             }
-                        }
-                    });
+                        });
                 }
                 let proj: &[f64] = &projections;
                 previous_rows.par_chunks_mut(n).for_each(|row_full| {
@@ -36342,11 +36462,7 @@ mod bidiag {
     }
 
     #[inline]
-    fn takes_parallel(
-        plan: Option<BidiagParallelPlan>,
-        nrows: usize,
-        ncols: usize,
-    ) -> bool {
+    fn takes_parallel(plan: Option<BidiagParallelPlan>, nrows: usize, ncols: usize) -> bool {
         plan.map_or_else(
             || {
                 rayon::current_num_threads() > 1
@@ -41155,7 +41271,6 @@ fn qr_factor_panel_recursive_f64(
     );
 }
 
-
 /// Whether the QR panel factorisation runs against a COLUMN-MAJOR panel buffer.
 /// `false` = the shipped in-place row-major form. `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
 ///
@@ -41443,7 +41558,17 @@ fn qr_factor_panel_recursive_cm_f64(
         return;
     }
     let mid = range_start + (range_end - range_start) / 2;
-    qr_factor_panel_recursive_cm_f64(pbuf, vbuf, m, panel_start, range_start, mid, tau, tiny, leaf);
+    qr_factor_panel_recursive_cm_f64(
+        pbuf,
+        vbuf,
+        m,
+        panel_start,
+        range_start,
+        mid,
+        tau,
+        tiny,
+        leaf,
+    );
     qr_apply_panel_block_reflector_cm_f64(
         pbuf,
         vbuf,
@@ -41457,7 +41582,6 @@ fn qr_factor_panel_recursive_cm_f64(
     );
     qr_factor_panel_recursive_cm_f64(pbuf, vbuf, m, panel_start, mid, range_end, tau, tiny, leaf);
 }
-
 
 /// Whether the blocked QR forward pass holds R in COLUMN-MAJOR order for the whole reduction.
 /// `false` = the shipped row-major form. `frankentorch-geqrf-misses-blocked-kernel-1zp6r`.
@@ -42227,10 +42351,7 @@ pub fn ormqr_blocked_f64(
     let panel_started = profile.then(std::time::Instant::now);
     let panels = householder_panels_from_packed_f64(packed, tau, m, n, k, 32);
     if let Some(started) = panel_started {
-        ORMQR_PANEL_BUILD_NS.fetch_add(
-            started.elapsed().as_nanos() as u64,
-            LuOrdering::Relaxed,
-        );
+        ORMQR_PANEL_BUILD_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
     }
 
     // REVERSE iff left != transpose; see the table above.
@@ -42253,10 +42374,8 @@ pub fn ormqr_blocked_f64(
                 }
             }
             if let Some(started) = transpose_started {
-                ORMQR_T_TRANSPOSE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_T_TRANSPOSE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             Some(tt)
         } else {
@@ -42269,10 +42388,8 @@ pub fn ormqr_blocked_f64(
             let workspace_started = profile.then(std::time::Instant::now);
             let mut w1 = vec![0.0f64; nb * cc];
             if let Some(started) = workspace_started {
-                ORMQR_WORKSPACE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_WORKSPACE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let vt_c_started = profile.then(std::time::Instant::now);
             gemm::dgemm_tb(nb, m, cc, vmat, c, &mut w1); // Vᵀ C
@@ -42282,10 +42399,8 @@ pub fn ormqr_blocked_f64(
             let workspace_started = profile.then(std::time::Instant::now);
             let mut w2 = vec![0.0f64; nb * cc];
             if let Some(started) = workspace_started {
-                ORMQR_WORKSPACE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_WORKSPACE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let t_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm(nb, nb, cc, tx, &w1, &mut w2); // T (Vᵀ C)
@@ -42305,37 +42420,32 @@ pub fn ormqr_blocked_f64(
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                 }
             } else {
-            let workspace_started = profile.then(std::time::Instant::now);
-            let mut upd = vec![0.0f64; m * cc];
-            if let Some(started) = workspace_started {
-                ORMQR_WORKSPACE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
-            }
-            let v_w_started = profile.then(std::time::Instant::now);
-            gemm::dgemm(m, nb, cc, vmat, &w2, &mut upd); // V (...)
-            if let Some(started) = v_w_started {
-                ORMQR_V_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
-            }
-            let subtract_started = profile.then(std::time::Instant::now);
-            ormqr_subtract_update(c, &upd, m, cc);
-            if let Some(started) = subtract_started {
-                ORMQR_SUBTRACT_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
-            }
+                let workspace_started = profile.then(std::time::Instant::now);
+                let mut upd = vec![0.0f64; m * cc];
+                if let Some(started) = workspace_started {
+                    ORMQR_WORKSPACE_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                }
+                let v_w_started = profile.then(std::time::Instant::now);
+                gemm::dgemm(m, nb, cc, vmat, &w2, &mut upd); // V (...)
+                if let Some(started) = v_w_started {
+                    ORMQR_V_W_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                }
+                let subtract_started = profile.then(std::time::Instant::now);
+                ormqr_subtract_update(c, &upd, m, cc);
+                if let Some(started) = subtract_started {
+                    ORMQR_SUBTRACT_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                }
             }
         } else {
             // C <- C - ((C V) T) Vᵀ,  C is cr x m.
             let workspace_started = profile.then(std::time::Instant::now);
             let mut w1 = vec![0.0f64; cr * nb];
             if let Some(started) = workspace_started {
-                ORMQR_WORKSPACE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_WORKSPACE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let vt_c_started = profile.then(std::time::Instant::now);
             gemm::dgemm(cr, m, nb, c, vmat, &mut w1); // C V
@@ -42345,10 +42455,8 @@ pub fn ormqr_blocked_f64(
             let workspace_started = profile.then(std::time::Instant::now);
             let mut w2 = vec![0.0f64; cr * nb];
             if let Some(started) = workspace_started {
-                ORMQR_WORKSPACE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_WORKSPACE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let t_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm(cr, nb, nb, &w1, tx, &mut w2); // (C V) T
@@ -42369,10 +42477,8 @@ pub fn ormqr_blocked_f64(
             let workspace_started = profile.then(std::time::Instant::now);
             let mut upd = vec![0.0f64; cr * m];
             if let Some(started) = workspace_started {
-                ORMQR_WORKSPACE_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_WORKSPACE_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let v_w_started = profile.then(std::time::Instant::now);
             gemm::dgemm_bt(cr, nb, m, &w2, vmat, &mut upd); // (...) Vᵀ
@@ -42382,10 +42488,8 @@ pub fn ormqr_blocked_f64(
             let subtract_started = profile.then(std::time::Instant::now);
             ormqr_subtract_update(c, &upd, cr, m);
             if let Some(started) = subtract_started {
-                ORMQR_SUBTRACT_NS.fetch_add(
-                    started.elapsed().as_nanos() as u64,
-                    LuOrdering::Relaxed,
-                );
+                ORMQR_SUBTRACT_NS
+                    .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
         }
     }
@@ -43158,38 +43262,41 @@ where
     F: Fn(f32) -> f32 + Sync,
     S: Fn(f32x8) -> f32x8 + Sync,
 {
-    // 16384 elems (64 KiB) per chunk: large enough to amortise rayon dispatch on a
-    // bandwidth-bound map, small enough to load-balance 16M elems across the pool.
-    const CHUNK: usize = 1 << 14;
     let numel = window.len();
-    let mut output = vec![0.0f32; numel];
-    output
-        .par_chunks_mut(CHUNK)
-        .zip(window.par_chunks(CHUNK))
-        .for_each(|(out_chunk, in_chunk)| {
-            let n = in_chunk.len();
-            let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
-            let mut i = 0;
-            while i < simd_len {
-                let a = f32x8::new([
-                    in_chunk[i],
-                    in_chunk[i + 1],
-                    in_chunk[i + 2],
-                    in_chunk[i + 3],
-                    in_chunk[i + 4],
-                    in_chunk[i + 5],
-                    in_chunk[i + 6],
-                    in_chunk[i + 7],
-                ]);
-                let result = simd_op(a);
-                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array());
-                i += SIMD_WIDTH_F32;
-            }
-            for j in simd_len..n {
-                out_chunk[j] = scalar_op(in_chunk[j]);
-            }
-        });
-    output
+    let threads = rayon::current_num_threads().max(1);
+    let grain = numel
+        .div_ceil(4 * threads)
+        .max(1 << 14)
+        .div_ceil(SIMD_WIDTH_F32)
+        * SIMD_WIDTH_F32;
+    build_uninit(numel, |output| {
+        output
+            .par_chunks_mut(grain)
+            .zip(window.par_chunks(grain))
+            .for_each(|(out_chunk, in_chunk)| {
+                let n = in_chunk.len();
+                let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+                let mut i = 0;
+                while i < simd_len {
+                    let a = f32x8::new([
+                        in_chunk[i],
+                        in_chunk[i + 1],
+                        in_chunk[i + 2],
+                        in_chunk[i + 3],
+                        in_chunk[i + 4],
+                        in_chunk[i + 5],
+                        in_chunk[i + 6],
+                        in_chunk[i + 7],
+                    ]);
+                    let result = simd_op(a);
+                    out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array());
+                    i += SIMD_WIDTH_F32;
+                }
+                for j in simd_len..n {
+                    out_chunk[j] = scalar_op(in_chunk[j]);
+                }
+            });
+    })
 }
 
 fn simd_binary_f32<F, S>(
@@ -43260,47 +43367,52 @@ where
     F: Fn(f32, f32) -> f32 + Sync,
     S: Fn(f32x8, f32x8) -> f32x8 + Sync,
 {
-    const CHUNK: usize = 1 << 14;
     let numel = lhs_window.len();
-    let mut output = vec![0.0f32; numel];
-    output
-        .par_chunks_mut(CHUNK)
-        .zip(lhs_window.par_chunks(CHUNK))
-        .zip(rhs_window.par_chunks(CHUNK))
-        .for_each(|((out_chunk, lhs_chunk), rhs_chunk)| {
-            let n = out_chunk.len();
-            let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
-            let mut i = 0;
-            while i < simd_len {
-                let a = f32x8::new([
-                    lhs_chunk[i],
-                    lhs_chunk[i + 1],
-                    lhs_chunk[i + 2],
-                    lhs_chunk[i + 3],
-                    lhs_chunk[i + 4],
-                    lhs_chunk[i + 5],
-                    lhs_chunk[i + 6],
-                    lhs_chunk[i + 7],
-                ]);
-                let b = f32x8::new([
-                    rhs_chunk[i],
-                    rhs_chunk[i + 1],
-                    rhs_chunk[i + 2],
-                    rhs_chunk[i + 3],
-                    rhs_chunk[i + 4],
-                    rhs_chunk[i + 5],
-                    rhs_chunk[i + 6],
-                    rhs_chunk[i + 7],
-                ]);
-                let result = simd_op(a, b);
-                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array());
-                i += SIMD_WIDTH_F32;
-            }
-            for j in simd_len..n {
-                out_chunk[j] = scalar_op(lhs_chunk[j], rhs_chunk[j]);
-            }
-        });
-    output
+    let threads = rayon::current_num_threads().max(1);
+    let grain = numel
+        .div_ceil(4 * threads)
+        .max(1 << 14)
+        .div_ceil(SIMD_WIDTH_F32)
+        * SIMD_WIDTH_F32;
+    build_uninit(numel, |output| {
+        output
+            .par_chunks_mut(grain)
+            .zip(lhs_window.par_chunks(grain))
+            .zip(rhs_window.par_chunks(grain))
+            .for_each(|((out_chunk, lhs_chunk), rhs_chunk)| {
+                let n = out_chunk.len();
+                let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+                let mut i = 0;
+                while i < simd_len {
+                    let a = f32x8::new([
+                        lhs_chunk[i],
+                        lhs_chunk[i + 1],
+                        lhs_chunk[i + 2],
+                        lhs_chunk[i + 3],
+                        lhs_chunk[i + 4],
+                        lhs_chunk[i + 5],
+                        lhs_chunk[i + 6],
+                        lhs_chunk[i + 7],
+                    ]);
+                    let b = f32x8::new([
+                        rhs_chunk[i],
+                        rhs_chunk[i + 1],
+                        rhs_chunk[i + 2],
+                        rhs_chunk[i + 3],
+                        rhs_chunk[i + 4],
+                        rhs_chunk[i + 5],
+                        rhs_chunk[i + 6],
+                        rhs_chunk[i + 7],
+                    ]);
+                    let result = simd_op(a, b);
+                    out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array());
+                    i += SIMD_WIDTH_F32;
+                }
+                for j in simd_len..n {
+                    out_chunk[j] = scalar_op(lhs_chunk[j], rhs_chunk[j]);
+                }
+            });
+    })
 }
 
 fn unary_contiguous_f32<F>(
@@ -44837,9 +44949,7 @@ pub fn linear_int8_dynamic_f32(
     let (x_i8, a_scales) = quantize_rows_i8(x, m, k);
 
     #[cfg(target_arch = "x86_64")]
-    if let Some(out) = dynamic_int8_x86::try_linear(
-        &x_i8, &a_scales, k, w_i8, w_scales, n, bias,
-    ) {
+    if let Some(out) = dynamic_int8_x86::try_linear(&x_i8, &a_scales, k, w_i8, w_scales, n, bias) {
         return out;
     }
 
@@ -49144,9 +49254,12 @@ pub fn sparse_coo_add(
 /// once) ⇒ bit-identical to the scalar transpose; parallel over disjoint 4-output-row blocks.
 #[must_use]
 pub fn transpose_2d_f64(src: &[f64], rows: usize, cols: usize) -> Vec<f64> {
-    let mut dst = vec![0.0f64; rows * cols];
-    transpose_2d_into_f64(src, &mut dst, rows, cols);
-    dst
+    let len = rows * cols;
+    if let Some(mut dst) = ft_core::buffer_pool::try_take_exact(len) {
+        transpose_2d_into_f64(src, &mut dst, rows, cols);
+        return dst;
+    }
+    build_uninit(len, |dst| transpose_2d_into_f64(src, dst, rows, cols))
 }
 
 /// In-place variant of [`transpose_2d_f64`]: writes the `[cols, rows]` transpose into `dst`.
@@ -49157,7 +49270,7 @@ pub fn transpose_2d_into_f64(src: &[f64], dst: &mut [f64], rows: usize, cols: us
     if rows == 0 || cols == 0 {
         return;
     }
-    const PAR_MIN: usize = 1 << 16;
+    const PAR_MIN: usize = 1 << 19;
     if rows * cols >= PAR_MIN {
         use rayon::prelude::*;
         dst.par_chunks_mut(TRANSPOSE_BLK_F64 * rows)
@@ -49663,7 +49776,9 @@ mod tests {
                 }
             }
         });
-        foreign.join().expect("the foreign factorisation thread must not panic");
+        foreign
+            .join()
+            .expect("the foreign factorisation thread must not panic");
 
         assert_eq!(
             super::lu_inverse_half_take_ns(),
@@ -49684,9 +49799,15 @@ mod tests {
         // AND EACH INSTRUMENT IS STILL LIVE FOR ITS OWNER.
         let _ = super::inv_tensor_contiguous_f64(&diag, &meta).expect("own inv");
         let (fwd, back) = super::lu_inverse_half_take_ns();
-        assert!(fwd > 0 && back > 0, "own getri halves were not recorded: ({fwd}, {back})");
+        assert!(
+            fwd > 0 && back > 0,
+            "own getri halves were not recorded: ({fwd}, {back})"
+        );
         let (setup, perm) = super::lu_inverse_extra_take_ns();
-        assert!(setup > 0 || perm > 0, "own getri setup/permute was not recorded");
+        assert!(
+            setup > 0 || perm > 0,
+            "own getri setup/permute was not recorded"
+        );
 
         // The panel census is opt-in, so it has to be turned on to be observed at all; that is a
         // property of the census, not of the ownership being tested.
@@ -49695,7 +49816,10 @@ mod tests {
         let _ = super::cholesky_contiguous_f64(&spd, &meta, false).expect("own cholesky");
         let (_diag_ns, _rows_ns, cols, macs) = super::cholesky_panel_census_take();
         super::set_cholesky_panel_census_enabled(previous_census);
-        assert!(cols > 0 && macs > 0, "own cholesky panel census was not recorded");
+        assert!(
+            cols > 0 && macs > 0,
+            "own cholesky panel census was not recorded"
+        );
     }
 
     /// Once a thread has DRAINED a stage-counter family, another thread's calls must not land in
@@ -49762,7 +49886,9 @@ mod tests {
                 }
             }
         });
-        foreign.join().expect("the foreign factorisation thread must not panic");
+        foreign
+            .join()
+            .expect("the foreign factorisation thread must not panic");
 
         assert_eq!(
             super::lu_stage_take_ns(),
@@ -50281,12 +50407,30 @@ mod tests {
                     .collect();
                 let mut serial = initial.clone();
                 super::ormqr_blocked_f64(
-                    &packed, &tau, M, N, N, &mut serial, cr, cc, left, transpose,
+                    &packed,
+                    &tau,
+                    M,
+                    N,
+                    N,
+                    &mut serial,
+                    cr,
+                    cc,
+                    left,
+                    transpose,
                 );
                 super::set_ormqr_subtract_parallel(true);
                 let mut parallel = initial;
                 super::ormqr_blocked_f64(
-                    &packed, &tau, M, N, N, &mut parallel, cr, cc, left, transpose,
+                    &packed,
+                    &tau,
+                    M,
+                    N,
+                    N,
+                    &mut parallel,
+                    cr,
+                    cc,
+                    left,
+                    transpose,
                 );
                 super::set_ormqr_subtract_parallel(false);
                 for (idx, (serial, parallel)) in serial.iter().zip(&parallel).enumerate() {
@@ -50351,7 +50495,16 @@ mod tests {
             super::set_ormqr_fused_subtract(false);
             let mut materialised = initial.clone();
             super::ormqr_blocked_f64(
-                &packed, &tau, M, N, N, &mut materialised, cr, cc, left, transpose,
+                &packed,
+                &tau,
+                M,
+                N,
+                N,
+                &mut materialised,
+                cr,
+                cc,
+                left,
+                transpose,
             );
 
             super::set_ormqr_fused_subtract(true);
@@ -50443,13 +50596,16 @@ mod tests {
             let tau = tau.clone();
             move || {
                 for round in 0..8 {
-                    let mut d: Vec<f64> =
-                        (0..M * W).map(|i| ((i as f64 + round as f64) * 0.017).sin()).collect();
+                    let mut d: Vec<f64> = (0..M * W)
+                        .map(|i| ((i as f64 + round as f64) * 0.017).sin())
+                        .collect();
                     super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut d, M, W, true, true);
                 }
             }
         });
-        foreign.join().expect("the foreign ORMQR thread must not panic");
+        foreign
+            .join()
+            .expect("the foreign ORMQR thread must not panic");
 
         let mut c: Vec<f64> = (0..M * W).map(|i| ((i as f64) * 0.019).cos()).collect();
         super::ormqr_blocked_f64(&packed, &tau, M, N, N, &mut c, M, W, true, false);
@@ -50496,7 +50652,10 @@ mod tests {
         assert!(panel > 0, "panel construction was not profiled");
         assert_eq!(transpose, 0, "left non-transpose must not materialize T^T");
         assert!(workspace > 0, "workspace allocation was not profiled");
-        assert!(vt_c > 0 && t_w > 0 && v_w > 0, "one of ORMQR's three GEMMs was not profiled");
+        assert!(
+            vt_c > 0 && t_w > 0 && v_w > 0,
+            "one of ORMQR's three GEMMs was not profiled"
+        );
         assert!(subtract > 0, "C -= update was not profiled");
         assert!(
             total >= panel + workspace + vt_c + t_w + v_w + subtract,
@@ -51897,12 +52056,18 @@ mod tests {
             // Non-vacuity: the update must actually have changed C, or the comparison above is
             // two copies of the untouched fixture agreeing with each other.
             assert!(
-                off.iter().zip(&base).any(|(x, y)| x.to_bits() != y.to_bits()),
+                off.iter()
+                    .zip(&base)
+                    .any(|(x, y)| x.to_bits() != y.to_bits()),
                 "({m},{k},{n}) left C untouched, so the bitwise check proves nothing"
             );
             // And everything OUTSIDE the [c_off, ..] window must be untouched in both arms.
             for i in 0..c_off {
-                assert_eq!(on[i].to_bits(), base[i].to_bits(), "wrote before the window");
+                assert_eq!(
+                    on[i].to_bits(),
+                    base[i].to_bits(),
+                    "wrote before the window"
+                );
             }
         }
     }
@@ -51948,11 +52113,17 @@ mod tests {
                 );
             }
             assert!(
-                off.iter().zip(&base).any(|(x, y)| x.to_bits() != y.to_bits()),
+                off.iter()
+                    .zip(&base)
+                    .any(|(x, y)| x.to_bits() != y.to_bits()),
                 "({m},{k},{n}) left C untouched, so the bitwise check proves nothing"
             );
             for i in 0..c_off {
-                assert_eq!(on[i].to_bits(), base[i].to_bits(), "wrote before the window");
+                assert_eq!(
+                    on[i].to_bits(),
+                    base[i].to_bits(),
+                    "wrote before the window"
+                );
             }
         }
     }
@@ -52513,12 +52684,38 @@ mod tests {
 
         let previous = super::set_conv2d_dinput_panel_legacy(true);
         let (panel_dpadded, _, _) = super::conv2d_backward_f32(
-            &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+            &dout,
+            &padded,
+            &weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
             false,
         );
         super::set_conv2d_dinput_panel_legacy(false);
         let (direct_dpadded, _, _) = super::conv2d_backward_f32(
-            &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+            &dout,
+            &padded,
+            &weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            kh,
+            kw,
+            oh,
+            ow,
+            sh,
+            sw,
+            out_ch,
             false,
         );
         super::set_conv2d_dinput_panel_legacy(previous);
@@ -52570,7 +52767,8 @@ mod tests {
             let previous = super::set_lu_inv_identity_struct(false);
             let dense = super::inv_tensor_contiguous_f64(&data, &meta).expect("dense-identity inv");
             super::set_lu_inv_identity_struct(true);
-            let structured = super::inv_tensor_contiguous_f64(&data, &meta).expect("structured inv");
+            let structured =
+                super::inv_tensor_contiguous_f64(&data, &meta).expect("structured inv");
             super::set_lu_inv_identity_struct(previous);
 
             assert_eq!(dense.len(), structured.len(), "length differs at n={n}");
@@ -52626,7 +52824,13 @@ mod tests {
         // Sizes cross the blocked gate (`num_rhs >= 64 && n >= 256`) in both directions so the
         // blocked path and the column-parallel path below it are both covered, and m=1 pins the
         // 1-D single-RHS shape, where `num_rhs == 1` makes the two forms look deceptively alike.
-        for (n, m) in [(64usize, 1usize), (64, 8), (256, 64), (256, 100), (300, 128)] {
+        for (n, m) in [
+            (64usize, 1usize),
+            (64, 8),
+            (256, 64),
+            (256, 100),
+            (300, 128),
+        ] {
             let data: Vec<f64> = (0..n * n)
                 .map(|idx| {
                     let i = idx / n;
@@ -52656,7 +52860,11 @@ mod tests {
             let rowwise = super::lu_solve_contiguous_f64(&factor, &b, &b_meta).expect("rowwise");
             super::set_lu_solve_perm_rowwise(previous);
 
-            assert_eq!(shipped.len(), rowwise.len(), "length differs at n={n} m={m}");
+            assert_eq!(
+                shipped.len(),
+                rowwise.len(),
+                "length differs at n={n} m={m}"
+            );
             for (index, (a, c)) in shipped.iter().zip(&rowwise).enumerate() {
                 assert_eq!(
                     a.to_bits(),
@@ -52688,7 +52896,11 @@ mod tests {
                     if i == j { v + (n as f64) } else { v }
                 })
                 .collect();
-            let meta = ft_core::TensorMeta::from_shape(vec![n, n], ft_core::DType::F64, ft_core::Device::Cpu);
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![n, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
 
             let previous = super::set_lu_trsm_row_accum(false);
             let shipped = super::lu_factor_contiguous_f64(&data, &meta).expect("shipped lu");
@@ -52708,7 +52920,10 @@ mod tests {
                     "LU[{index}] differs at n={n}: shipped {a:e} vs row-accum {b:e}"
                 );
             }
-            assert_eq!(shipped.pivots, accum.pivots, "pivot sequence differs at n={n}");
+            assert_eq!(
+                shipped.pivots, accum.pivots,
+                "pivot sequence differs at n={n}"
+            );
         }
     }
 
@@ -52729,7 +52944,17 @@ mod tests {
         // straddles what the tiler must get right: a `patch_width` that does not divide by the
         // column-block width, `in_ch == 1`, `out_ch` below and above the 8-row block, stride 2,
         // and a non-square kernel.
-        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 5] = [
+        let shapes: [(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ); 5] = [
             (8, 32, 32, 34, 34, 3, 3, 1, 1),
             (6, 1, 3, 20, 18, 3, 3, 1, 1),
             (5, 7, 13, 17, 19, 3, 2, 1, 1),
@@ -52763,14 +52988,40 @@ mod tests {
             let previous_floor = super::set_conv2d_dweight_stream_min_panel(0);
             let previous = super::set_conv2d_dweight_streamed(false);
             let (panel_dpadded, panel_dweight, _) = super::conv2d_backward_f32(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             super::set_conv2d_dweight_streamed(true);
             let _ = super::take_conv2d_dweight_streamed_calls();
             let (stream_dpadded, stream_dweight, _) = super::conv2d_backward_f32(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             assert_eq!(
                 super::take_conv2d_dweight_streamed_calls(),
@@ -52799,8 +53050,22 @@ mod tests {
             super::set_conv2d_dweight_streamed(false);
             let _ = super::take_conv2d_dweight_streamed_calls();
             let (_, fused_panel_dw, _) = super::conv2d_backward_mask_fused_f32(
-                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
-                sw, out_ch, [true, true, false],
+                &dout,
+                &mask,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                [true, true, false],
             );
             assert_eq!(
                 super::take_conv2d_dweight_streamed_calls(),
@@ -52809,8 +53074,22 @@ mod tests {
             );
             super::set_conv2d_dweight_streamed(true);
             let (_, fused_stream_dw, _) = super::conv2d_backward_mask_fused_f32(
-                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
-                sw, out_ch, [true, true, false],
+                &dout,
+                &mask,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                [true, true, false],
             );
             assert_eq!(
                 super::take_conv2d_dweight_streamed_calls(),
@@ -52861,7 +53140,17 @@ mod tests {
 
         // out_ch=13 / patch_width=42 is the cell that actually failed; the others straddle
         // out_ch below and at the 8-row block, and a strided, non-square kernel.
-        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 3] = [
+        let shapes: [(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ); 3] = [
             (5, 7, 13, 17, 19, 3, 2, 1, 1),
             (9, 3, 8, 12, 14, 2, 3, 1, 2),
             (6, 1, 3, 20, 18, 3, 3, 1, 1),
@@ -52886,8 +53175,21 @@ mod tests {
             let floor = super::set_conv2d_dweight_stream_min_panel(0);
             let previous = super::set_conv2d_dweight_streamed(false);
             let (_, panel_dweight, _) = super::conv2d_backward_f64(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             let (_, panel_dweight32, _) = super::conv2d_backward_f32(
                 &dout32, &padded32, &weight32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
@@ -52902,8 +53204,21 @@ mod tests {
                     .expect("build a pool of the requested width");
                 let (dw64, dw32) = pool.install(|| {
                     let (_, a, _) = super::conv2d_backward_f64(
-                        &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
-                        sw, out_ch, false,
+                        &dout,
+                        &padded,
+                        &weight_flat,
+                        batch,
+                        in_ch,
+                        ph,
+                        pw,
+                        kh,
+                        kw,
+                        oh,
+                        ow,
+                        sh,
+                        sw,
+                        out_ch,
+                        false,
                     );
                     let (_, b, _) = super::conv2d_backward_f32(
                         &dout32, &padded32, &weight32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
@@ -52948,7 +53263,17 @@ mod tests {
         // The set straddles the cases the tiler has to get right: `patch_width` that does not
         // divide by the column-block width, `in_ch == 1`, `out_ch` below and above the row
         // block of 8, stride > 1, and a non-square kernel.
-        let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 5] = [
+        let shapes: [(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ); 5] = [
             // batch, in_ch, out_ch, ph, pw, kh, kw, sh, sw
             (8, 32, 32, 34, 34, 3, 3, 1, 1), // the scored conv2d shape
             (6, 1, 3, 20, 18, 3, 3, 1, 1),   // in_ch == 1, out_ch < the 8-row block
@@ -52995,14 +53320,40 @@ mod tests {
             let previous_floor = super::set_conv2d_dweight_stream_min_panel(0);
             let previous = super::set_conv2d_dweight_streamed(false);
             let (panel_dpadded, panel_dweight, _) = super::conv2d_backward_f64(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             super::set_conv2d_dweight_streamed(true);
             let _ = super::take_conv2d_dweight_streamed_calls();
             let (stream_dpadded, stream_dweight, _) = super::conv2d_backward_f64(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             assert_eq!(
                 super::take_conv2d_dweight_streamed_calls(),
@@ -53042,8 +53393,22 @@ mod tests {
             let previous = super::set_conv2d_dweight_streamed(false);
             let _ = super::take_conv2d_dweight_streamed_calls();
             let (_, fused_panel_dw, _) = super::conv2d_backward_mask_fused_f64(
-                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
-                sw, out_ch, [true, true, false],
+                &dout,
+                &mask,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                [true, true, false],
             );
             assert_eq!(
                 super::take_conv2d_dweight_streamed_calls(),
@@ -53052,8 +53417,22 @@ mod tests {
             );
             super::set_conv2d_dweight_streamed(true);
             let (_, fused_stream_dw, _) = super::conv2d_backward_mask_fused_f64(
-                &dout, &mask, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh,
-                sw, out_ch, [true, true, false],
+                &dout,
+                &mask,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                [true, true, false],
             );
             assert_eq!(
                 super::take_conv2d_dweight_streamed_calls(),
@@ -70356,8 +70735,7 @@ mod tests {
         for i in 0..n {
             let row_start = i * n;
             let lower_start = super::lower_packed_index(i, 0);
-            z[row_start..=row_start + i]
-                .copy_from_slice(&lower[lower_start..=lower_start + i]);
+            z[row_start..=row_start + i].copy_from_slice(&lower[lower_start..=lower_start + i]);
             for j in 0..i {
                 z[j * n + i] = scaled[super::lower_packed_index(i, j)];
             }
@@ -70497,13 +70875,25 @@ mod tests {
             super::set_qr_panel_t_fast(previous);
 
             assert_eq!(
-                fast_packed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                full_packed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                fast_packed
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                full_packed
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
                 "packed output differs for special={special:?}"
             );
             assert_eq!(
-                fast_tau.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-                full_tau.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                fast_tau
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                full_tau
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
                 "tau differs for special={special:?}"
             );
         }
@@ -70548,7 +70938,10 @@ mod tests {
         super::set_eigh_bt_par_min(prev_min);
         super::set_eigh_bt_row_split(prev_split);
 
-        let scale = serial.eigenvalues.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        let scale = serial
+            .eigenvalues
+            .iter()
+            .fold(1.0f64, |m, v| m.max(v.abs()));
         let worst = (0..n).fold(0.0f64, |m, i| {
             m.max((serial.eigenvalues[i] - forked.eigenvalues[i]).abs())
         });

@@ -115,7 +115,11 @@ impl Level {
     /// split, and this is how a third would make itself visible rather than hide inside one.
     #[must_use]
     pub fn spread(&self) -> f64 {
-        if self.min > 0.0 { self.max / self.min } else { 1.0 }
+        if self.min > 0.0 {
+            self.max / self.min
+        } else {
+            1.0
+        }
     }
 }
 
@@ -261,7 +265,11 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
                 level.max,
                 level.spread(),
                 level.n.saturating_sub(1),
-                format!("{}{}", span_caveat(records, false), concurrent_writer_note(records))
+                format!(
+                    "{}{}",
+                    span_caveat(records, false),
+                    concurrent_writer_note(records)
+                )
             );
         }
         ModeReport::Split {
@@ -303,7 +311,11 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
                  a disagreement with the majority is a NO-VERDICT, not a correction. A standing \
                  whose SIGN differs between the levels must not be banked from one invocation.{}",
                 if *drawn == 0 { "A" } else { "B" },
-                format!("{}{}", span_caveat(records, true), concurrent_writer_note(records))
+                format!(
+                    "{}{}",
+                    span_caveat(records, true),
+                    concurrent_writer_note(records)
+                )
             );
         }
     }
@@ -313,8 +325,10 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
 /// Where the bank lives. `FT_H2H_INCUMBENT_BANK` overrides.
 #[must_use]
 pub fn bank_path() -> PathBuf {
-    std::env::var("FT_H2H_INCUMBENT_BANK")
-        .map_or_else(|_| PathBuf::from("artifacts/perf/incumbent_bank.jsonl"), PathBuf::from)
+    std::env::var("FT_H2H_INCUMBENT_BANK").map_or_else(
+        |_| PathBuf::from("artifacts/perf/incumbent_bank.jsonl"),
+        PathBuf::from,
+    )
 }
 
 /// Prior observations for a key as `(incumbent_ms, recorded_unix)`, oldest first. A missing or
@@ -325,13 +339,18 @@ pub fn load_records(path: &Path, key: &IncumbentKey) -> Vec<(f64, u64)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    text.lines().filter_map(|line| match_line(line, key)).collect()
+    text.lines()
+        .filter_map(|line| match_line(line, key))
+        .collect()
 }
 
 /// Just the times, for the classifier.
 #[must_use]
 pub fn load(path: &Path, key: &IncumbentKey) -> Vec<f64> {
-    load_records(path, key).into_iter().map(|(ms, _)| ms).collect()
+    load_records(path, key)
+        .into_iter()
+        .map(|(ms, _)| ms)
+        .collect()
 }
 
 /// How long the banked observations span, in seconds, and how many there are.
@@ -432,7 +451,9 @@ fn match_line(line: &str, key: &IncumbentKey) -> Option<(f64, u64)> {
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0)?;
     // A record written before the timestamp field existed still carries a usable time.
-    let stamp = number("recorded_unix").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let stamp = number("recorded_unix")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     Some((ms, stamp))
 }
 
@@ -511,7 +532,11 @@ mod tests {
     /// its standing has the opposite sign to the twenty that drew the low one.
     #[test]
     fn an_invocation_that_draws_the_high_level_is_labelled_as_such() {
-        let priors: Vec<f64> = TODAY_CONV2D_BIG.iter().copied().filter(|v| *v < 7.0).collect();
+        let priors: Vec<f64> = TODAY_CONV2D_BIG
+            .iter()
+            .copied()
+            .filter(|v| *v < 7.0)
+            .collect();
         let report = classify(&priors, 10.500, DEFAULT_SPLIT_RATIO);
         let ModeReport::Split { drawn, levels, .. } = report else {
             panic!("expected a split, got {report:?}");
@@ -519,7 +544,10 @@ mod tests {
         assert_eq!(drawn, 1, "10.5 ms is the high level");
         assert_eq!(levels[1].n, 1);
         assert!(report.row_tag().contains("LEVEL-B"));
-        assert!(render("conv2d_big", &report, &[]).contains("comparable ONLY to rows that drew level B"));
+        assert!(
+            render("conv2d_big", &report, &[])
+                .contains("comparable ONLY to rows that drew level B")
+        );
     }
 
     /// THE THRESHOLD IS NOT LOAD-BEARING. Today's low level is 1.26x wide internally and the gap
@@ -536,7 +564,11 @@ mod tests {
             let ModeReport::Split { levels, .. } = report else {
                 panic!("threshold {threshold:.2} failed to split the measured population");
             };
-            assert_eq!((levels[0].n, levels[1].n), (20, 2), "at threshold {threshold:.2}");
+            assert_eq!(
+                (levels[0].n, levels[1].n),
+                (20, 2),
+                "at threshold {threshold:.2}"
+            );
             checked += 1;
             threshold += 0.01;
         }
@@ -571,7 +603,10 @@ mod tests {
         let ModeReport::Split { levels, drawn, .. } = report else {
             panic!("expected a split, got {report:?}");
         };
-        assert_eq!(drawn, 0, "6.075 is the LOW level even though it is the minority here");
+        assert_eq!(
+            drawn, 0,
+            "6.075 is the LOW level even though it is the minority here"
+        );
         assert_eq!(levels[0].n, 1);
         assert_eq!(levels[1].n, 6);
     }
@@ -598,8 +633,10 @@ mod tests {
             classify(&[], 5.0, DEFAULT_SPLIT_RATIO),
             ModeReport::NoHistory { .. }
         ));
-        assert!(render("x", &classify(&[], 5.0, DEFAULT_SPLIT_RATIO), &[])
-            .contains("ONE INVOCATION SHORT OF READABLE"));
+        assert!(
+            render("x", &classify(&[], 5.0, DEFAULT_SPLIT_RATIO), &[])
+                .contains("ONE INVOCATION SHORT OF READABLE")
+        );
     }
 
     /// A round-trip through the on-disk format, and — the part that matters — a record with a
@@ -642,7 +679,11 @@ mod tests {
         .expect("bank is writable in the temp dir");
 
         let loaded = load(&path, &key);
-        assert_eq!(loaded, vec![5.688, 10.500], "only this shape's observations");
+        assert_eq!(
+            loaded,
+            vec![5.688, 10.500],
+            "only this shape's observations"
+        );
         assert_eq!(load(&path, &other_shape), vec![99.0]);
         let _ = std::fs::remove_file(&path);
     }
@@ -666,7 +707,10 @@ mod tests {
         assert!(matches!(report, ModeReport::Single { .. }));
         let text = render("conv2d_big", &report, &records);
         assert!(text.contains("ONE session's draws"), "{text}");
-        assert!(text.contains("single-level verdict from them is WEAK"), "{text}");
+        assert!(
+            text.contains("single-level verdict from them is WEAK"),
+            "{text}"
+        );
     }
 
     /// A bank that spans real time reports the span instead of the warning.
@@ -735,8 +779,14 @@ mod tests {
         let note = concurrent_writer_note(&contended);
         assert!(note.contains("CONCURRENT WRITER: 1"), "{note}");
         assert!(note.contains("TWO harnesses measured at once"), "{note}");
-        assert!(render("conv2d_big", &classify(&[5.5, 7.611, 7.674], 5.6, DEFAULT_SPLIT_RATIO), &contended)
-            .contains("CONCURRENT WRITER"));
+        assert!(
+            render(
+                "conv2d_big",
+                &classify(&[5.5, 7.611, 7.674], 5.6, DEFAULT_SPLIT_RATIO),
+                &contended
+            )
+            .contains("CONCURRENT WRITER")
+        );
     }
 
     /// A record written with no timestamp (an older bank line) must not be read as a collision
