@@ -823,6 +823,7 @@ dependencies = [
  "frankentorch-dispatch",
  "frankentorch-kernel-cpu",
  "frankentorch-runtime",
+ "ft-device",
  "libm",
  "mimalloc",
  "rayon",
@@ -860,6 +861,7 @@ dependencies = [
  "criterion",
  "frankentorch-core",
  "frankentorch-kernel-cpu",
+ "ft-device",
  "insta",
  "proptest",
 ]
