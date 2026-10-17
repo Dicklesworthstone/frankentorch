@@ -104,6 +104,17 @@ Rigorous upstream coverage audit against PyTorch 2.x stable API.
 - All tests run in both strict and hardened modes
 - PyTorch oracle conformance via differential fixtures
 
+### Spec §17 Performance & Memory SLOs (`overall_status: "pass"`)
+- `elementwise_forward` (100M f32 elements): `30.875 ms` p95 (budget `<= 200.0 ms`, PASS)
+- `representative_backward` (backward/forward ratio): `1.251x` p95 (budget `<= 1.350x`, PASS)
+- `matmul_core` (`[512,512] x [512,512]`): `3.180 ms` p95 (budget `<= 240.0 ms`, PASS)
+- `optimizer_step` (`Adam + AdamW`, 10M params): `9.043 ms` p95 (budget `<= 130.0 ms`, PASS)
+- `checkpoint_roundtrip` (2 GB state dict save + load): `2857.093 ms` p95 / `3868 MB/s` save, `758 MB/s` load (budget `<= 6135.668 ms` / `>= 350 MB/s`, PASS)
+- `training_step_memory`: `10,944 KB` peak RSS (`-71.57%` vs `38,500 KB` baseline, budget `<= +8%`, PASS)
+- `backward_heavy_allocation`: `355` allocations (`-98.60%` vs `25,400` baseline, budget `<= +10%`, PASS)
+- `benchmark_family_tail`: `30.875 ms` p99 (`-99.89%` vs baseline, budget `<= +7%`, PASS)
+- Enforced by `validate_phase2c_artifacts` (`perf_slo:overall_status_pass`, `perf_slo:all_checks_pass`)
+
 ### What IS Covered (examples)
 
 **Tensor creation:** zeros, ones, empty, full, arange, linspace, logspace, eye, rand, randn, randint, randperm

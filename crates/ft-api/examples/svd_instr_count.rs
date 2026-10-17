@@ -31,10 +31,10 @@ fn arg(name: &str, default: usize) -> usize {
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         if a == name {
-            return it
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| panic!("{name} needs a number"));
+            return it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                eprintln!("{name} needs a number");
+                std::process::exit(1);
+            });
         }
     }
     default

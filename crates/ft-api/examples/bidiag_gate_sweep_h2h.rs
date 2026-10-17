@@ -279,10 +279,18 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
     };
     format!(
         "{gate}/{}/{}/{}/{}/{}{}",
-        if arm.gate_hoisted { "gate-hoisted" } else { "gate-per-reflector" },
+        if arm.gate_hoisted {
+            "gate-hoisted"
+        } else {
+            "gate-per-reflector"
+        },
         if arm.blocked { "4row" } else { "1row" },
         if arm.fused { "fused" } else { "2pass" },
-        if arm.form_p_blocked { "formP-blocked" } else { "formP-unblocked" },
+        if arm.form_p_blocked {
+            "formP-blocked"
+        } else {
+            "formP-unblocked"
+        },
         if arm.panel_output_blocked {
             "4output"
         } else {
@@ -294,14 +302,34 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
     } else {
         "/replay-rowmajor"
     } + if arm.grouped_ggs { "/ggs4" } else { "/ggs1" }
-        + if arm.eigvalsh_ggs_reuse_e { "/ggs-e" } else { "/ggs-vec" }
+        + if arm.eigvalsh_ggs_reuse_e {
+            "/ggs-e"
+        } else {
+            "/ggs-vec"
+        }
         + if arm.sub_serial { "/subSER" } else { "/subPAR" }
         + if arm.sub_tile_2d { "/sub2D" } else { "/subCOL" }
-        + if arm.ormqr_subtract_parallel { "/ormqrSUBPAR" } else { "/ormqrSUBSER" }
+        + if arm.ormqr_subtract_parallel {
+            "/ormqrSUBPAR"
+        } else {
+            "/ormqrSUBSER"
+        }
         + &format!("/panelmode{}", arm.panel_mode)
-        + &(if arm.cholesky_nb == 0 { "/nbSHIPPED".to_string() } else { format!("/nb{}", arm.cholesky_nb) })
-        + &(if arm.lu_nb == 0 { "/luSHIPPED".to_string() } else { format!("/lunb{}", arm.lu_nb) })
-        + &(if arm.geqrf_nb == 0 { "/qrSHIPPED".to_string() } else { format!("/qrnb{}", arm.geqrf_nb) })
+        + &(if arm.cholesky_nb == 0 {
+            "/nbSHIPPED".to_string()
+        } else {
+            format!("/nb{}", arm.cholesky_nb)
+        })
+        + &(if arm.lu_nb == 0 {
+            "/luSHIPPED".to_string()
+        } else {
+            format!("/lunb{}", arm.lu_nb)
+        })
+        + &(if arm.geqrf_nb == 0 {
+            "/qrSHIPPED".to_string()
+        } else {
+            format!("/qrnb{}", arm.geqrf_nb)
+        })
         + &(if op == LinalgOp::CholeskyF32 {
             if arm.cholesky_nb_f32 == 0 {
                 "/f32nbSHIPPED".to_string()
@@ -311,7 +339,11 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
         } else {
             String::new()
         })
-        + &(if arm.sub_cols > 0 { format!("/cols{}", arm.sub_cols) } else { "/colsAUTO".to_string() })
+        + &(if arm.sub_cols > 0 {
+            format!("/cols{}", arm.sub_cols)
+        } else {
+            "/colsAUTO".to_string()
+        })
         + &(match arm.panel_par_min {
             Some(v) => format!("/ppm{v}"),
             None => "/ppmSHIPPED".to_string(),
@@ -492,11 +524,19 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_tsb = arm
         .eigvalsh_two_stage_band
         .map(ft_kernel_cpu::set_eigvalsh_two_stage_band);
-    let previous_qcm = arm.qr_panel_cm.map(ft_kernel_cpu::set_qr_panel_column_major);
-    let previous_qrc = arm.qr_trailing_cm.map(ft_kernel_cpu::set_qr_trailing_column_major);
-    let previous_qtb = arm.qr_cm_blocked_transpose.map(ft_kernel_cpu::set_qr_cm_blocked_transpose);
+    let previous_qcm = arm
+        .qr_panel_cm
+        .map(ft_kernel_cpu::set_qr_panel_column_major);
+    let previous_qrc = arm
+        .qr_trailing_cm
+        .map(ft_kernel_cpu::set_qr_trailing_column_major);
+    let previous_qtb = arm
+        .qr_cm_blocked_transpose
+        .map(ft_kernel_cpu::set_qr_cm_blocked_transpose);
     let previous_qtf = arm.qr_panel_t_fast.map(ft_kernel_cpu::set_qr_panel_t_fast);
-    let previous_btr = arm.eigh_bt_row_split.map(ft_kernel_cpu::set_eigh_bt_row_split);
+    let previous_btr = arm
+        .eigh_bt_row_split
+        .map(ft_kernel_cpu::set_eigh_bt_row_split);
     let previous_btp = ft_kernel_cpu::set_eigh_bt_par_min(if arm.eigh_bt_par_min == 0 {
         usize::MAX
     } else {
@@ -552,16 +592,32 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_lu_nb(previous_lunb);
         ft_kernel_cpu::set_geqrf_nb(previous_qrnb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
-        if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
+        if let Some(v) = previous_ppm {
+            ft_kernel_cpu::set_lu_panel_par_min(v);
+        }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
-        if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
-        if let Some(v) = previous_tsb { ft_kernel_cpu::set_eigvalsh_two_stage_band(v); }
+        if let Some(v) = previous_tnb {
+            ft_kernel_cpu::set_tred2_block_nb(v);
+        }
+        if let Some(v) = previous_tsb {
+            ft_kernel_cpu::set_eigvalsh_two_stage_band(v);
+        }
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
-        if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
-        if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
-        if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
-        if let Some(v) = previous_qtf { ft_kernel_cpu::set_qr_panel_t_fast(v); }
-        if let Some(v) = previous_btr { ft_kernel_cpu::set_eigh_bt_row_split(v); }
+        if let Some(v) = previous_qcm {
+            ft_kernel_cpu::set_qr_panel_column_major(v);
+        }
+        if let Some(v) = previous_qrc {
+            ft_kernel_cpu::restore_qr_trailing_column_major(v);
+        }
+        if let Some(v) = previous_qtb {
+            ft_kernel_cpu::set_qr_cm_blocked_transpose(v);
+        }
+        if let Some(v) = previous_qtf {
+            ft_kernel_cpu::set_qr_panel_t_fast(v);
+        }
+        if let Some(v) = previous_btr {
+            ft_kernel_cpu::set_eigh_bt_row_split(v);
+        }
         return (ms, sum);
     }
     if op == LinalgOp::Orgqr {
@@ -596,16 +652,32 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::set_lu_nb(previous_lunb);
         ft_kernel_cpu::set_geqrf_nb(previous_qrnb);
         ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
-        if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
+        if let Some(v) = previous_ppm {
+            ft_kernel_cpu::set_lu_panel_par_min(v);
+        }
         ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
-        if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
-        if let Some(v) = previous_tsb { ft_kernel_cpu::set_eigvalsh_two_stage_band(v); }
+        if let Some(v) = previous_tnb {
+            ft_kernel_cpu::set_tred2_block_nb(v);
+        }
+        if let Some(v) = previous_tsb {
+            ft_kernel_cpu::set_eigvalsh_two_stage_band(v);
+        }
         ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
-        if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
-        if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
-        if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
-        if let Some(v) = previous_qtf { ft_kernel_cpu::set_qr_panel_t_fast(v); }
-        if let Some(v) = previous_btr { ft_kernel_cpu::set_eigh_bt_row_split(v); }
+        if let Some(v) = previous_qcm {
+            ft_kernel_cpu::set_qr_panel_column_major(v);
+        }
+        if let Some(v) = previous_qrc {
+            ft_kernel_cpu::restore_qr_trailing_column_major(v);
+        }
+        if let Some(v) = previous_qtb {
+            ft_kernel_cpu::set_qr_cm_blocked_transpose(v);
+        }
+        if let Some(v) = previous_qtf {
+            ft_kernel_cpu::set_qr_panel_t_fast(v);
+        }
+        if let Some(v) = previous_btr {
+            ft_kernel_cpu::set_eigh_bt_row_split(v);
+        }
         return (ms, sum);
     }
     let started = Instant::now();
@@ -658,7 +730,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
                 session.tensor_abs(d).expect("abs")
             }
             LinalgOp::CholeskyF32 => {
-                let l = session.tensor_linalg_cholesky(x, false).expect("cholesky f32");
+                let l = session
+                    .tensor_linalg_cholesky(x, false)
+                    .expect("cholesky f32");
                 let d = session.tensor_diagonal(l, 0).expect("diag f32");
                 session.tensor_abs(d).expect("abs f32")
             }
@@ -711,16 +785,32 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::set_lu_nb(previous_lunb);
     ft_kernel_cpu::set_geqrf_nb(previous_qrnb);
     ft_kernel_cpu::set_dgemm_sub_block_cols(previous_subcols);
-    if let Some(v) = previous_ppm { ft_kernel_cpu::set_lu_panel_par_min(v); }
+    if let Some(v) = previous_ppm {
+        ft_kernel_cpu::set_lu_panel_par_min(v);
+    }
     ft_kernel_cpu::set_tred2_par_min_l(previous_tpm);
-    if let Some(v) = previous_tnb { ft_kernel_cpu::set_tred2_block_nb(v); }
-    if let Some(v) = previous_tsb { ft_kernel_cpu::set_eigvalsh_two_stage_band(v); }
+    if let Some(v) = previous_tnb {
+        ft_kernel_cpu::set_tred2_block_nb(v);
+    }
+    if let Some(v) = previous_tsb {
+        ft_kernel_cpu::set_eigvalsh_two_stage_band(v);
+    }
     ft_kernel_cpu::set_eigh_bt_par_min(previous_btp);
-    if let Some(v) = previous_qcm { ft_kernel_cpu::set_qr_panel_column_major(v); }
-    if let Some(v) = previous_qrc { ft_kernel_cpu::restore_qr_trailing_column_major(v); }
-    if let Some(v) = previous_qtb { ft_kernel_cpu::set_qr_cm_blocked_transpose(v); }
-    if let Some(v) = previous_qtf { ft_kernel_cpu::set_qr_panel_t_fast(v); }
-    if let Some(v) = previous_btr { ft_kernel_cpu::set_eigh_bt_row_split(v); }
+    if let Some(v) = previous_qcm {
+        ft_kernel_cpu::set_qr_panel_column_major(v);
+    }
+    if let Some(v) = previous_qrc {
+        ft_kernel_cpu::restore_qr_trailing_column_major(v);
+    }
+    if let Some(v) = previous_qtb {
+        ft_kernel_cpu::set_qr_cm_blocked_transpose(v);
+    }
+    if let Some(v) = previous_qtf {
+        ft_kernel_cpu::set_qr_panel_t_fast(v);
+    }
+    if let Some(v) = previous_btr {
+        ft_kernel_cpu::set_eigh_bt_row_split(v);
+    }
     (ms, sum)
 }
 
@@ -798,9 +888,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "matrix_exp" => LinalgOp::MatrixExp,
         "inv" => LinalgOp::Inv,
         "lu_factor" => LinalgOp::LuFactor,
-        other => panic!(
-            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|cholesky_f32|slogdet|matrix_exp|inv|lu_factor"
-        ),
+        other => {
+            eprintln!(
+                "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|cholesky_f32|slogdet|matrix_exp|inv|lu_factor"
+            );
+            std::process::exit(1);
+        }
     };
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let sizes: Vec<usize> = std::env::var("FT_GATE_SIZES")
@@ -1106,22 +1199,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for &replay_transposed in &replays {
                         for &grouped_ggs in &ggs_arms {
                             for &sub_serial in &subsers {
-                            for &sub_tile_2d in &subtiles {
-                            for &ormqr_subtract_parallel in &ormqr_subtracts {
-                            for &panel_mode in &panelmodes {
-                            for &cholesky_nb in &cholnbs {
-                            for &cholesky_nb_f32 in &cholnbs_f32 {
-                            for &lu_nb in &lunbs {
-                            for &geqrf_nb in &qrnbs {
-                                for &sub_cols in &subcols {
-                                  for &panel_par_min in &ppms {
-                                   for &tred2_par_min in &tpms {
-                                    for &tred2_block_nb in &tnbs {
-                                    for &eigvalsh_two_stage_band in &tsbs {
-                                    for &eigh_bt_par_min in &btps {
-                                    for &qr_panel_cm in &qcms {
-                                    for &qr_trailing_cm in &qrcs {
-                                    for &qr_cm_blocked_transpose in &qtbs {
+                                for &sub_tile_2d in &subtiles {
+                                    for &ormqr_subtract_parallel in &ormqr_subtracts {
+                                        for &panel_mode in &panelmodes {
+                                            for &cholesky_nb in &cholnbs {
+                                                for &cholesky_nb_f32 in &cholnbs_f32 {
+                                                    for &lu_nb in &lunbs {
+                                                        for &geqrf_nb in &qrnbs {
+                                                            for &sub_cols in &subcols {
+                                                                for &panel_par_min in &ppms {
+                                                                    for &tred2_par_min in &tpms {
+                                                                        for &tred2_block_nb in &tnbs
+                                                                        {
+                                                                            for &eigvalsh_two_stage_band in
+                                                                                &tsbs
+                                                                            {
+                                                                                for &eigh_bt_par_min in
+                                                                                    &btps
+                                                                                {
+                                                                                    for &qr_panel_cm in
+                                                                                        &qcms
+                                                                                    {
+                                                                                        for &qr_trailing_cm in
+                                                                                            &qrcs
+                                                                                        {
+                                                                                            for &qr_cm_blocked_transpose in &qtbs {
                                     for &qr_panel_t_fast in &qtfs {
                                     for &eigh_bt_row_split in &btrs {
                                     arms.push(Arm {
@@ -1158,21 +1260,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     }
                                     }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    }
-                                    }
-                                    }
-                                    }
-                                   }
-                                  }
                                 }
-                            }
-                            }
-                            }
-                            }
-                            }
-                            }
-                            }
                             }
                         }
                     }
@@ -1328,9 +1430,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // matrix_exp: GEMM-dominated (scaling-squaring + Pade), unique result. See the
         // Rust arm for why the fixture is scaled by 1/n.
         "matrix_exp" => ("torch.linalg.matrix_exp(A).abs().sum().reshape(1)", false),
-        other => panic!(
-            "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|cholesky_f32|slogdet|matrix_exp|inv|lu_factor"
-        ),
+        other => {
+            eprintln!(
+                "FT_OP={other:?} is not one of svd|svdvals|eigh|eigvalsh|qr|geqrf|orgqr|ormqr|cholesky|cholesky_f32|slogdet|matrix_exp|inv|lu_factor"
+            );
+            std::process::exit(1);
+        }
     };
     let lanes: Vec<(usize, String)> = sizes.iter().map(|&n| (n, format!("{op}_{n}"))).collect();
     let lane_entries: Vec<String> = lanes
@@ -1451,7 +1556,9 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
     );
     println!(
         "arms (gate/step-12/trailing/panel-output; u64::MAX = always serial): {:?}",
-        arms.iter().map(|a| arm_label(*a, ft_op)).collect::<Vec<_>>()
+        arms.iter()
+            .map(|a| arm_label(*a, ft_op))
+            .collect::<Vec<_>>()
     );
     println!(
         "null: repeat an arm in FT_GATE_VALUES — two identical arms differ only by this window's \
@@ -1683,7 +1790,10 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // have, taken beside its own incumbent rather than in a separate window.
         //
         // Printed to STDERR so it survives when only the tail of stdout is captured.
-        if matches!(ft_op, LinalgOp::LuFactor | LinalgOp::Slogdet | LinalgOp::Inv) {
+        if matches!(
+            ft_op,
+            LinalgOp::LuFactor | LinalgOp::Slogdet | LinalgOp::Inv
+        ) {
             let _ = ft_kernel_cpu::lu_stage_take_ns();
             let _ = ft_kernel_cpu::lu_pivot_swap_take_ns();
             let probe = ft_one(n, &data, arms[0], ft_op);
@@ -1696,8 +1806,16 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             eprintln!(
                 "LU phases (arm0, one instrumented call): panel {:.3} ms {:.0}%  solve {:.3} ms \
                  {:.0}%  trailing {:.3} ms {:.0}%  pivot {:.3} ms {:.0}%  swap {:.3} ms {:.0}%",
-                ms(panel), pct(panel), ms(solve), pct(solve), ms(trail), pct(trail),
-                ms(pivot), pct(pivot), ms(swap), pct(swap)
+                ms(panel),
+                pct(panel),
+                ms(solve),
+                pct(solve),
+                ms(trail),
+                pct(trail),
+                ms(pivot),
+                pct(pivot),
+                ms(swap),
+                pct(swap)
             );
         }
 
@@ -1822,7 +1940,11 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 branches[idx],
                 sub_arms[idx],
                 ormqr_subtract_hits[idx],
-                if rel < parity_tolerance(ft_op) { "MATCH" } else { "MISMATCH" }
+                if rel < parity_tolerance(ft_op) {
+                    "MATCH"
+                } else {
+                    "MISMATCH"
+                }
             );
             let (reduction, form_pq, sweep) = phases[idx];
             let total = (reduction + form_pq + sweep).max(1) as f64;
@@ -1838,7 +1960,11 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             );
         }
         if ft_op == LinalgOp::CholeskyF32 {
-            assert_eq!(arms.len(), 4, "f32 Cholesky certification requires exactly A/B/A/B arms");
+            assert_eq!(
+                arms.len(),
+                4,
+                "f32 Cholesky certification requires exactly A/B/A/B arms"
+            );
             assert_eq!(arms[0].cholesky_nb_f32, arms[2].cholesky_nb_f32);
             assert_eq!(arms[1].cholesky_nb_f32, arms[3].cholesky_nb_f32);
             let mut shipped_null: Vec<f64> = ft_ms[2]

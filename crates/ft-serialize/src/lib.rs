@@ -828,6 +828,7 @@ pub fn save_state_dict<P: AsRef<Path>>(
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .map_err(|e| io_err(&path_str, e))?;
     let mut writer = BufWriter::with_capacity(FT_NATIVE_SAVE_BUFFER_BYTES, file);
