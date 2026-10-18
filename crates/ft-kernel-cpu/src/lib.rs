@@ -407,7 +407,12 @@ mod gemm {
 
     fn should_parallelize_householder_skinny(m: usize, k: usize, n: usize) -> bool {
         let width = householder_panel_width();
-        let is_panel_shape = n >= HOUSEHOLDER_SKINNY_MIN_DIM
+        let min_dim = if super::qr_active_submatrix() {
+            2 * MIN_BLOCK_COLS + 1
+        } else {
+            HOUSEHOLDER_SKINNY_MIN_DIM
+        };
+        let is_panel_shape = n >= min_dim
             && ((m == width && k >= HOUSEHOLDER_SKINNY_MIN_ACTIVE)
                 || (k == width && m >= HOUSEHOLDER_SKINNY_MIN_ACTIVE));
         let admitted = householder_skinny_parallel_enabled()
@@ -816,26 +821,13 @@ mod gemm {
         }
     }
 
-    /// Fused trailing-update: `C_sub -= A · B` (B NOT transposed, contiguous
-    /// [k×n]), accumulating straight into a STRIDED submatrix of `c` (start
-    /// `c_off`, row stride `ldc`) via matrixmultiply with alpha=-1, beta=1 — no temp
-    /// product buffer and no scalar subtract pass. Parallelised over disjoint N
-    /// column-blocks. Used by the blocked LU trailing update (A22 -= L21·U12).
-    /// frankentorch-kgs4.62.
-    #[allow(clippy::too_many_arguments)]
     /// `C[m,n] = A^T @ B` where `A` is row-major `[k, m]` and `B` is a SUBMATRIX with row
     /// stride `ldb` starting at `b_off`. `C` is contiguous `[m, n]`.
     ///
     /// The strided-B counterpart to [`dgemm_sub_into`]'s strided C — `frankentorch-wjrqt`.
     /// Between them a blocked update can read and write submatrices of a larger array with NO
     /// staging copy at all.
-    ///
-    /// WHY IT EXISTS. `gemm::dgemm` has no `ld` parameter, so every blocked update stages a
-    /// packed copy of its operands. That staging is measured at 29.9% of the geqrf lane at
-    /// n=1024, and it is what made the blocked eigh backtransform a REJECT (`bfe29436`:
-    /// instructions flat, because the gather and scatter cost what the BLAS-3 conversion
-    /// saved). `matrixmultiply::dgemm` accepts arbitrary row/column strides and our `dgemm_mm`
-    /// already passes them through; only the safe wrapper layer could not express it.
+    #[allow(clippy::too_many_arguments)]
     pub fn dgemm_tb_b_strided(
         m: usize,
         k: usize,
@@ -858,11 +850,66 @@ mod gemm {
             "dgemm_tb_b_strided: B window {span} exceeds {} (ldb={ldb}, n={n})",
             b.len()
         );
-        // SAFETY: same operand model as `dgemm_tb_scaled` — A is [k,m] read as A^T via
-        // rsa=1, csa=m — except B is read with rsb=ldb rather than rsb=n, which is exactly
-        // what makes it a submatrix view. The assert above proves every (row, col) the kernel
-        // touches lies inside `b`, and `ldb >= n` proves the row windows do not overlap. C is
-        // contiguous [m,n] and disjoint from both.
+        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
+            let nb = block_cols(n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        1.0,
+                        a.as_ptr(),
+                        1,
+                        m as isize,
+                        b.as_ptr().add(b_off + n0),
+                        ldb as isize,
+                        1,
+                        0.0,
+                        cp.0.add(n0),
+                        n as isize,
+                        1,
+                    );
+                }
+            });
+            return;
+        }
+        if should_parallelize(m, k, n) {
+            let (mb, nb) = tile_shape(m, n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
+                let cp = &cp;
+                let j0 = j_blk * nb;
+                let bj = (j0 + nb).min(n) - j0;
+                (0..m.div_ceil(mb)).into_par_iter().for_each(|i_blk| {
+                    let i0 = i_blk * mb;
+                    let bi = (i0 + mb).min(m) - i0;
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            bj,
+                            1.0,
+                            a.as_ptr().add(i0),
+                            1,
+                            m as isize,
+                            b.as_ptr().add(b_off + j0),
+                            ldb as isize,
+                            1,
+                            0.0,
+                            cp.0.add(i0 * n + j0),
+                            n as isize,
+                            1,
+                        );
+                    }
+                });
+            });
+            return;
+        }
         unsafe {
             dgemm_mm(
                 m,
@@ -880,6 +927,279 @@ mod gemm {
                 n as isize,
                 1,
             );
+        }
+    }
+
+    /// `C[m,n] = A_sub[m,k] @ B[k,n]` where `A_sub` is a submatrix starting at `a_off` with
+    /// row stride `lda` (and contiguous rows `csa = 1`), and `B`, `C` are contiguous row-major.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dgemm_a_strided(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f64],
+        a_off: usize,
+        lda: usize,
+        b: &[f64],
+        c: &mut [f64],
+    ) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        let span = a_off + (m - 1) * lda + k;
+        assert!(
+            a.len() >= span && lda >= k,
+            "dgemm_a_strided: A window {span} exceeds {} (lda={lda}, k={k})",
+            a.len()
+        );
+        let b = &b[..k * n];
+        let c = &mut c[..m * n];
+        let width = householder_panel_width();
+        let min_dim = if super::qr_active_submatrix() {
+            2 * MIN_BLOCK_COLS + 1
+        } else {
+            HOUSEHOLDER_SKINNY_MIN_DIM
+        };
+        let is_tall_skinny_panel = super::qr_active_submatrix()
+            && householder_skinny_parallel_enabled()
+            && rayon::current_num_threads() > 1
+            && n == width
+            && m >= min_dim
+            && k >= HOUSEHOLDER_SKINNY_MIN_ACTIVE
+            && (m as u128) * (k as u128) * (n as u128) >= HOUSEHOLDER_SKINNY_MIN_FLOPS;
+        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
+            let nb = block_cols(n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        1.0,
+                        a.as_ptr().add(a_off),
+                        lda as isize,
+                        1,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        0.0,
+                        cp.0.add(n0),
+                        n as isize,
+                        1,
+                    );
+                }
+            });
+        } else if should_parallelize(m, k, n) || is_tall_skinny_panel {
+            if n >= 2 * MIN_BLOCK_COLS {
+                let (mb, nb) = tile_shape(m, n);
+                let cp = TilePtr(c.as_mut_ptr());
+                (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
+                    let cp = &cp;
+                    let j0 = j_blk * nb;
+                    let bj = (j0 + nb).min(n) - j0;
+                    (0..m.div_ceil(mb)).into_par_iter().for_each(|i_blk| {
+                        let i0 = i_blk * mb;
+                        let bi = (i0 + mb).min(m) - i0;
+                        unsafe {
+                            dgemm_mm(
+                                bi,
+                                k,
+                                bj,
+                                1.0,
+                                a.as_ptr().add(a_off + i0 * lda),
+                                lda as isize,
+                                1,
+                                b.as_ptr().add(j0),
+                                n as isize,
+                                1,
+                                0.0,
+                                cp.0.add(i0 * n + j0),
+                                n as isize,
+                                1,
+                            );
+                        }
+                    });
+                });
+            } else {
+                let br = block_rows(m);
+                let cp = TilePtr(c.as_mut_ptr());
+                (0..m.div_ceil(br)).into_par_iter().for_each(|i_blk| {
+                    let cp = &cp;
+                    let i0 = i_blk * br;
+                    let bi = (i0 + br).min(m) - i0;
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            n,
+                            1.0,
+                            a.as_ptr().add(a_off + i0 * lda),
+                            lda as isize,
+                            1,
+                            b.as_ptr(),
+                            n as isize,
+                            1,
+                            0.0,
+                            cp.0.add(i0 * n),
+                            n as isize,
+                            1,
+                        );
+                    }
+                });
+            }
+        } else {
+            unsafe {
+                dgemm_mm(
+                    m,
+                    k,
+                    n,
+                    1.0,
+                    a.as_ptr().add(a_off),
+                    lda as isize,
+                    1,
+                    b.as_ptr(),
+                    n as isize,
+                    1,
+                    0.0,
+                    c.as_mut_ptr(),
+                    n as isize,
+                    1,
+                );
+            }
+        }
+    }
+
+    /// `C_sub[m,n] -= A[m,k] @ B[k,n]` writing directly into a strided submatrix of `c`
+    /// (`c_off`, `ldc`) while gating parallelism on the same shape/flop predicates as [`dgemm`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dgemm_sub_strided_gated(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+        c_off: usize,
+        ldc: usize,
+    ) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..k * n];
+        let span = c_off + (m - 1) * ldc + n;
+        assert!(
+            c.len() >= span && ldc >= n,
+            "dgemm_sub_strided_gated: C window {span} exceeds {} (ldc={ldc}, n={n})",
+            c.len()
+        );
+        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
+            let nb = block_cols(n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            });
+        } else if should_parallelize(m, k, n) {
+            if n >= 2 * MIN_BLOCK_COLS {
+                let (mb, nb) = tile_shape(m, n);
+                let cp = TilePtr(c.as_mut_ptr());
+                (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
+                    let cp = &cp;
+                    let j0 = j_blk * nb;
+                    let bj = (j0 + nb).min(n) - j0;
+                    (0..m.div_ceil(mb)).into_par_iter().for_each(|i_blk| {
+                        let i0 = i_blk * mb;
+                        let bi = (i0 + mb).min(m) - i0;
+                        unsafe {
+                            dgemm_mm(
+                                bi,
+                                k,
+                                bj,
+                                -1.0,
+                                a.as_ptr().add(i0 * k),
+                                k as isize,
+                                1,
+                                b.as_ptr().add(j0),
+                                n as isize,
+                                1,
+                                1.0,
+                                cp.0.add(c_off + i0 * ldc + j0),
+                                ldc as isize,
+                                1,
+                            );
+                        }
+                    });
+                });
+            } else {
+                let br = block_rows(m);
+                let cp = TilePtr(c.as_mut_ptr());
+                (0..m.div_ceil(br)).into_par_iter().for_each(|i_blk| {
+                    let cp = &cp;
+                    let i0 = i_blk * br;
+                    let bi = (i0 + br).min(m) - i0;
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            n,
+                            -1.0,
+                            a.as_ptr().add(i0 * k),
+                            k as isize,
+                            1,
+                            b.as_ptr(),
+                            n as isize,
+                            1,
+                            1.0,
+                            cp.0.add(c_off + i0 * ldc),
+                            ldc as isize,
+                            1,
+                        );
+                    }
+                });
+            }
+        } else {
+            unsafe {
+                dgemm_mm(
+                    m,
+                    k,
+                    n,
+                    -1.0,
+                    a.as_ptr(),
+                    k as isize,
+                    1,
+                    b.as_ptr(),
+                    n as isize,
+                    1,
+                    1.0,
+                    c.as_mut_ptr().add(c_off),
+                    ldc as isize,
+                    1,
+                );
+            }
         }
     }
 
@@ -41714,10 +42034,79 @@ fn qr_trailing_column_major_for(n: usize) -> bool {
     }
 }
 
+/// Whether blocked compact-WY Householder kernels (`qr`, `geqrf`, `orgqr`, `ormqr`) restrict
+/// panel reflector matrices `V` and target submatrices to the active rows `p..m` (and active
+/// columns `p..qcols` in reverse `dorgqr`), where rows `0..p` of `V` are identically zero.
+///
+/// In LAPACK `dgeqrf`/`dorgqr`/`dormqr`, panel `p` passes height `M - p` (and width `N - p` in
+/// `dorgqr`) to `dlarft`/`dlarfb`. Passing full `m` (and `qcols`) multiplies across `p` rows of
+/// exact zeros on every panel, doing 2x the asymptotic GEMM FLOPs in `geqrf`/`ormqr` (`m^2*n` vs
+/// `m^2*n/2`) and 3x the asymptotic GEMM FLOPs in `orgqr` and `qr`'s reverse-Q phase (`2*m^3` vs
+/// `2/3*m^3`), plus allocating and zeroing a full `m * qcols` temporary `upd` buffer per panel in
+/// `orgqr` and `qr`.
+static QR_ACTIVE_SUBMATRIX: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Select active-submatrix trimming across blocked Householder kernels, returning the previous
+/// setting.
+#[doc(hidden)]
+pub fn set_qr_active_submatrix(on: bool) -> bool {
+    QR_ACTIVE_SUBMATRIX.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn qr_active_submatrix() -> bool {
+    QR_ACTIVE_SUBMATRIX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn ormqr_subtract_update_cols(
+    c: &mut [f64],
+    col_off: usize,
+    ldc: usize,
+    upd: &[f64],
+    rows: usize,
+    cols: usize,
+) {
+    if col_off == 0 && ldc == cols {
+        ormqr_subtract_update(c, upd, rows, cols);
+        return;
+    }
+    debug_assert!(c.len() >= rows * ldc && col_off + cols <= ldc);
+    debug_assert_eq!(upd.len(), rows * cols);
+    let parallel = ORMQR_SUBTRACT_PARALLEL.load(LuOrdering::Relaxed)
+        && rayon::current_num_threads() > 1
+        && rows.saturating_mul(cols) >= ORMQR_SUBTRACT_PARALLEL_MIN_AREA;
+    if parallel {
+        let row_block = rows.div_ceil(rayon::current_num_threads().max(1)).max(1);
+        ORMQR_SUBTRACT_PARALLEL_HITS.fetch_add(1, LuOrdering::Relaxed);
+        c[..rows * ldc]
+            .par_chunks_mut(row_block * ldc)
+            .zip(upd.par_chunks(row_block * cols))
+            .for_each(|(dst_rows, delta_rows)| {
+                let blk_rows = delta_rows.len() / cols;
+                for r in 0..blk_rows {
+                    let dst = &mut dst_rows[r * ldc + col_off..r * ldc + col_off + cols];
+                    let delta = &delta_rows[r * cols..(r + 1) * cols];
+                    for (d, s) in dst.iter_mut().zip(delta) {
+                        *d -= *s;
+                    }
+                }
+            });
+    } else {
+        for r in 0..rows {
+            let dst = &mut c[r * ldc + col_off..r * ldc + col_off + cols];
+            let delta = &upd[r * cols..(r + 1) * cols];
+            for (d, s) in dst.iter_mut().zip(delta) {
+                *d -= *s;
+            }
+        }
+    }
+}
+
 /// `qr_blocked_forward_f64` with R held COLUMN-MAJOR for the whole reduction.
 ///
-/// Returns the identical `(panel_start, nb, V, T, tau)` panels — `V` stays `m x nb` row-major, so
-/// every consumer (the reverse dorgqr, geqrf's reflector extraction, ormqr) is untouched.
+/// Returns the `(panel_start, nb, V, T, tau)` panels. When [`qr_active_submatrix`] is enabled,
+/// `V` has shape `(m - p) x nb` row-major (only the active rows `p..m`); when disabled, `V` is
+/// `m x nb` row-major with zeros in rows `0..p`.
 fn qr_blocked_forward_cm_f64(
     r_mat: &mut [f64],
     m: usize,
@@ -41730,6 +42119,7 @@ fn qr_blocked_forward_cm_f64(
     let nb_block = nb_block.max(1);
     let tiny = f64::EPSILON * 1e6;
     let profile_enabled = timings.is_some();
+    let active_sub = qr_active_submatrix();
     let mut panels: Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::new();
 
     // R -> column-major, ONCE. This is the whole cost the per-panel gather is traded against, and
@@ -41757,6 +42147,8 @@ fn qr_blocked_forward_cm_f64(
     while p < k {
         let pe = (p + nb_block).min(k);
         let nb = pe - p;
+        let v_row0 = if active_sub { p } else { 0 };
+        let v_rows = m - v_row0;
 
         let panel_start_t = qr_profile_stage_start(profile_enabled);
         // IN PLACE: the panel's nb columns are the contiguous slice rc[p*m .. pe*m], and column
@@ -41779,11 +42171,11 @@ fn qr_blocked_forward_cm_f64(
         if let Some(timings) = timings.as_mut() {
             qr_profile_record_ns(&mut timings.panel_factor_ns, panel_start_t);
         }
-        // V back to m x nb row-major for the trailing GEMMs and for every downstream consumer.
-        let mut vmat = vec![0.0f64; m * nb];
+        // V back to v_rows x nb row-major for the trailing GEMMs and for every downstream consumer.
+        let mut vmat = vec![0.0f64; v_rows * nb];
         for c in 0..nb {
-            let src = c * m;
-            for row in 0..m {
+            let src = c * m + v_row0;
+            for row in 0..v_rows {
                 vmat[row * nb + c] = vbuf[src + row];
             }
         }
@@ -41791,7 +42183,7 @@ fn qr_blocked_forward_cm_f64(
         if let Some(timings) = timings.as_mut() {
             qr_profile_record_ns(&mut timings.panel_v_transpose_ns, v_transpose_start);
         }
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb, p);
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, v_rows, nb, 0, nb, p - v_row0);
         if let Some(timings) = timings.as_mut() {
             qr_profile_record_ns(&mut timings.panel_t_build_ns, t_build_start);
             qr_profile_record_ns(&mut timings.panel_and_t_ns, panel_start_t);
@@ -41800,13 +42192,18 @@ fn qr_blocked_forward_cm_f64(
         let nt = n - pe;
         if nt > 0 {
             let trailing_start = qr_profile_stage_start(profile_enabled);
-            // NO PACKING. rc[pe*m..n*m] is the trailing block transposed, contiguous, nt x m.
+            // NO PACKING. rc[pe*m..n*m] is the trailing block transposed, nt x m with stride m,
+            // and only columns v_row0..m (rows p..m of R) are active.
             let mut wt = vec![0.0f64; nt * nb];
-            gemm::dgemm(nt, m, nb, &rc[pe * m..n * m], &vmat, &mut wt); // R_trailᵀ · V
+            if active_sub {
+                gemm::dgemm_a_strided(nt, v_rows, nb, &rc, pe * m + v_row0, m, &vmat, &mut wt);
+            } else {
+                gemm::dgemm(nt, m, nb, &rc[pe * m..n * m], &vmat, &mut wt); // R_trailᵀ · V
+            }
             let mut w2t = vec![0.0f64; nt * nb];
             gemm::dgemm(nt, nb, nb, &wt, &tmat, &mut w2t); // (Wt) · T  — no Tᵀ buffer
             let gemm_start = qr_profile_stage_start(profile_enabled);
-            gemm::dgemm_bt_sub_into(nt, nb, m, &w2t, &vmat, &mut rc, pe * m, m);
+            gemm::dgemm_bt_sub_into(nt, nb, v_rows, &w2t, &vmat, &mut rc, pe * m + v_row0, m);
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.trailing_gemm_ns, gemm_start);
                 qr_profile_record_ns(&mut timings.trailing_r_ns, trailing_start);
@@ -41857,18 +42254,20 @@ fn qr_blocked_forward_f64(
     let nb_block = nb_block.max(1);
     let tiny = f64::EPSILON * 1e6;
     let profile_enabled = timings.is_some();
+    let active_sub = qr_active_submatrix();
     let mut panels: Vec<(usize, usize, Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::new();
     let mut p = 0;
     while p < k {
         let pe = (p + nb_block).min(k);
         let nb = pe - p;
+        let v_row0 = if active_sub { p } else { 0 };
+        let v_rows = m - v_row0;
 
-        // --- Panel factorization: build V (m×nb) and tau, applying each reflector
+        // --- Panel factorization: build V and tau, applying each reflector
         //     only to the remaining PANEL columns (the trailing [pe,n) is deferred).
         let panel_start = qr_profile_stage_start(profile_enabled);
-        let mut vmat = vec![0.0f64; m * nb];
         let mut tau = vec![0.0f64; nb];
-        if qr_panel_column_major() && m >= QR_PANEL_CM_MIN_M {
+        let vmat = if qr_panel_column_major() && m >= QR_PANEL_CM_MIN_M {
             // PACK, FACTOR, UNPACK. Only rows `p..m` are ever touched by the panel — reflector
             // `c` starts at row `p + c` — so the buffer is `nb x (m - p)` and shrinks with the
             // panel index, and `panel_start` becomes 0 in the packed coordinates.
@@ -41892,23 +42291,28 @@ fn qr_blocked_forward_f64(
                     r_mat[(p + r) * n + col] = pbuf[src + r];
                 }
             }
-            // `vmat` stays m x nb row-major: the compact-WY T and the trailing update below are
-            // UNCHANGED, which is what keeps this bit-exact rather than a rewrite of the op.
+            let mut vmat = vec![0.0f64; v_rows * nb];
             for c in 0..nb {
                 let src = c * mp;
                 for r in 0..mp {
-                    vmat[(p + r) * nb + c] = vbuf[src + r];
+                    vmat[(p - v_row0 + r) * nb + c] = vbuf[src + r];
                 }
             }
+            vmat
         } else {
+            let mut vmat_full = vec![0.0f64; m * nb];
             qr_factor_panel_recursive_f64(
-                r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny, leaf,
+                r_mat, m, n, p, 0, nb, nb, &mut vmat_full, &mut tau, tiny, leaf,
             );
-        }
+            if v_row0 > 0 {
+                vmat_full.drain(..v_row0 * nb);
+            }
+            vmat_full
+        };
 
         // --- Compact-WY T (nb×nb upper triangular, LAPACK dlarft forward) so that
         //     H_p H_{p+1} ... H_{pe-1} = I - V T Vᵀ.
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb, p);
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, v_rows, nb, 0, nb, p - v_row0);
         if let Some(timings) = timings.as_mut() {
             qr_profile_record_ns(&mut timings.panel_and_t_ns, panel_start);
         }
@@ -41917,48 +42321,17 @@ fn qr_blocked_forward_f64(
         let nt = n - pe;
         if nt > 0 {
             let trailing_start = qr_profile_stage_start(profile_enabled);
-            // STAGING. `gemm::dgemm` has no leading-dimension parameter, so the strided
-            // trailing submatrix must be GATHERED into `rt` and the reflectors TRANSPOSED
-            // into `vt` before any GEMM can run, then SCATTERED back. This measures that
-            // cost so the missing `ld` argument is a number, not a hypothesis.
-            // The GATHER STAYS, and that is a measured result, not an oversight.
-            //
-            // `matrixmultiply::dgemm` does accept arbitrary strides (verified — `dgemm_bt`
-            // uses them for transposes), so this gather CAN be removed. It was, and it was
-            // 1.144x SLOWER at nb=32/leaf=2 (176.639 -> 202.073 ms at n=1024), 1.046x
-            // slower at nb=64, neutral at 96/128 where the trailing matrix is small.
-            //
-            // Mechanism: `copy_from_slice` per row is a sequential memcpy, after which
-            // matrixmultiply packs from CONTIGUOUS memory. Two sequential passes beat one
-            // strided pass. This is the same reason BLIS/Goto pack deliberately.
-            //
-            // So the ~29.9%-of-lane "staging" measured here is NOT a recoverable lever —
-            // it is the cheapest way to feed the GEMM.
             let stage_start = qr_profile_stage_start(profile_enabled);
-            let mut rt = vec![0.0f64; m * nt];
-            for i in 0..m {
-                let base = i * n + pe;
+            let mut rt = vec![0.0f64; v_rows * nt];
+            for i in 0..v_rows {
+                let base = (v_row0 + i) * n + pe;
                 let dst = i * nt;
                 rt[dst..dst + nt].copy_from_slice(&r_mat[base..base + nt]);
             }
-            // BOTH STAGING BUFFERS STAY, and both are measured, not assumed.
-            //
-            //   `rt` gather     — removing it (r_mat strided as B) was 1.144x SLOWER
-            //   `vt` transpose  — removing it (dgemm_tb, A strided) was 1.079x SLOWER
-            //                     (163.296 -> 176.243 ms at n=1024/nb=32/leaf=2)
-            //
-            // Both are bit-exact alternatives; both lose. A sequential memcpy feeding a
-            // PACKED gemm beats stride-walking an INPUT inside the gemm, which is exactly
-            // why BLIS/Goto pack deliberately.
-            //
-            // Contrast the OUTPUT side, where `dgemm_sub_into` (alpha=-1/beta=1 into
-            // strided C) WON 1.082x by removing the `upd` buffer and its scatter pass. The
-            // asymmetry is the point: strided OUTPUT avoids a materialised buffer for free;
-            // strided INPUT defeats the packing the microkernel depends on.
-            let mut vt = vec![0.0f64; nb * m];
-            for row in 0..m {
+            let mut vt = vec![0.0f64; nb * v_rows];
+            for row in 0..v_rows {
                 for c in 0..nb {
-                    vt[c * m + row] = vmat[row * nb + c];
+                    vt[c * v_rows + row] = vmat[row * nb + c];
                 }
             }
             if let Some(timings) = timings.as_mut() {
@@ -41966,7 +42339,7 @@ fn qr_blocked_forward_f64(
                 qr_profile_record_ns(&mut timings.trailing_pack_ns, stage_start);
             }
             let mut w = vec![0.0f64; nb * nt];
-            gemm::dgemm(nb, m, nt, &vt, &rt, &mut w); // Vᵀ R
+            gemm::dgemm(nb, v_rows, nt, &vt, &rt, &mut w); // Vᵀ R
             let mut tt = vec![0.0f64; nb * nb];
             for i in 0..nb {
                 for jj in 0..nb {
@@ -41975,27 +42348,8 @@ fn qr_blocked_forward_f64(
             }
             let mut w2 = vec![0.0f64; nb * nt];
             gemm::dgemm(nb, nb, nt, &tt, &w, &mut w2); // Tᵀ (Vᵀ R)
-            // REVERTED from a fused subtract-into-strided-rows. Measured at n=1024,
-            // min-of-7 interleaved: the fused form was SLOWER in every cell
-            // (nb=32/leaf=2 201.604 -> 206.911ms, nb=16/leaf=2 227.244 -> 247.008ms,
-            // nb=64/leaf=2 210.340 -> 213.319ms). It traded ONE m x nt allocation for a
-            // per-row-block zeroed temporary inside each parallel closure, and the
-            // allocation churn cost more than the saved pass.
-            //
-            // This also bounds the attribution: the SCATTER is not the expensive half of
-            // staging. If it were, removing it would have paid even with that overhead.
-            // The gather + transpose dominate, so a real fix needs `dgemm` to read a
-            // strided B, not just write a strided C.
-            // R[:, pe:] -= V (...) accumulated straight into the strided destination via
-            // `dgemm_sub_into`, which parallelises over DISJOINT COLUMN WINDOWS and uses
-            // matrixmultiply's alpha=-1/beta=1. No m x nt temp, no second scatter pass.
-            //
-            // This helper already existed and is shipped in getrf's trailing update. I
-            // previously hand-wrote an equivalent (`dgemm_sub_into_rows`), measured it
-            // 1.026x SLOWER and reverted - it allocated a per-row-block temp and did the
-            // subtract in Rust. That rejected my implementation, not the technique.
             let scatter_start = qr_profile_stage_start(profile_enabled);
-            gemm::dgemm_sub_into(m, nb, nt, &vmat, &w2, r_mat, pe, n);
+            gemm::dgemm_sub_into(v_rows, nb, nt, &vmat, &w2, r_mat, v_row0 * n + pe, n);
             if let Some(timings) = timings.as_mut() {
                 qr_profile_record_ns(&mut timings.copy_zeroing_ns, scatter_start);
                 qr_profile_record_ns(&mut timings.trailing_gemm_ns, scatter_start);
@@ -42021,10 +42375,12 @@ fn qr_householder_panel_blocked_profiled(
     mut timings: Option<&mut QrStageTimings>,
 ) -> Vec<f64> {
     let profile_enabled = timings.is_some();
+    let active_sub = qr_active_submatrix();
+    let leaf = if active_sub { 2 } else { 8 };
     // Forward pass reduces R and stores each panel's (V, T); Q is then built
     // (m×qcols) by a reverse dorgqr — so REDUCED tall matrices (qcols=k<m) cost
     // O(m·k²) instead of building the full m×m Q (O(m²·k)). frankentorch-ct2yy.
-    let panels = qr_blocked_forward_f64(r_mat, m, n, k, nb_block, 8, timings.as_deref_mut());
+    let panels = qr_blocked_forward_f64(r_mat, m, n, k, nb_block, leaf, timings.as_deref_mut());
 
     // --- Reverse dorgqr: Q (m×qcols) = H_0 H_1 ... H_{k-1} · I[:, :qcols].
     // Start X = I[:, :qcols]; apply blocks innermost-first (reverse panel order),
@@ -42034,22 +42390,33 @@ fn qr_householder_panel_blocked_profiled(
     for i in 0..m.min(qcols) {
         x[i * qcols + i] = 1.0;
     }
-    for (_p, nb, vmat, tmat, _tau) in panels.iter().rev() {
+    for (p, nb, vmat, tmat, _tau) in panels.iter().rev() {
+        let p = *p;
         let nb = *nb;
-        let mut vt = vec![0.0f64; nb * m];
-        for row in 0..m {
-            for c in 0..nb {
-                vt[c * m + row] = vmat[row * nb + c];
+        if active_sub {
+            let v_rows = m - p;
+            let nq = qcols - p;
+            let mut w1 = vec![0.0f64; nb * nq];
+            gemm::dgemm_tb_b_strided(nb, v_rows, nq, vmat, &x, p * qcols + p, qcols, &mut w1); // Vᵀ X
+            let mut w2 = vec![0.0f64; nb * nq];
+            gemm::dgemm(nb, nb, nq, tmat, &w1, &mut w2); // T (Vᵀ X)
+            gemm::dgemm_sub_strided_gated(v_rows, nb, nq, vmat, &w2, &mut x, p * qcols + p, qcols); // X -= V (...)
+        } else {
+            let mut vt = vec![0.0f64; nb * m];
+            for row in 0..m {
+                for c in 0..nb {
+                    vt[c * m + row] = vmat[row * nb + c];
+                }
             }
-        }
-        let mut w1 = vec![0.0f64; nb * qcols];
-        gemm::dgemm(nb, m, qcols, &vt, &x, &mut w1); // Vᵀ X
-        let mut w2 = vec![0.0f64; nb * qcols];
-        gemm::dgemm(nb, nb, qcols, tmat, &w1, &mut w2); // T (Vᵀ X)
-        let mut upd = vec![0.0f64; m * qcols];
-        gemm::dgemm(m, nb, qcols, vmat, &w2, &mut upd); // V (...)
-        for t in 0..m * qcols {
-            x[t] -= upd[t];
+            let mut w1 = vec![0.0f64; nb * qcols];
+            gemm::dgemm(nb, m, qcols, &vt, &x, &mut w1); // Vᵀ X
+            let mut w2 = vec![0.0f64; nb * qcols];
+            gemm::dgemm(nb, nb, qcols, tmat, &w1, &mut w2); // T (Vᵀ X)
+            let mut upd = vec![0.0f64; m * qcols];
+            gemm::dgemm(m, nb, qcols, vmat, &w2, &mut upd); // V (...)
+            for t in 0..m * qcols {
+                x[t] -= upd[t];
+            }
         }
     }
     if let Some(timings) = timings.as_mut() {
@@ -42179,9 +42546,10 @@ pub fn geqrf_blocked_nb_f64(
     // the reflectors into the lower triangle overwrites nothing R needs.
     let mut tau_out = vec![0.0f64; k];
     for (p, nb, vmat, _tmat, tau) in &panels {
+        let v_row0 = if vmat.len() == (m - p) * nb { *p } else { 0 };
         for c in 0..*nb {
             let j = p + c;
-            let vj = vmat[j * nb + c];
+            let vj = vmat[(j - v_row0) * nb + c];
             if vj == 0.0 {
                 // Zero reflector (the panel leaf skipped this column): LAPACK's tau = 0,
                 // and the column below the diagonal is already zero.
@@ -42189,7 +42557,7 @@ pub fn geqrf_blocked_nb_f64(
             }
             tau_out[j] = tau[c] * vj * vj;
             for i in (j + 1)..m {
-                packed[i * n + j] = vmat[i * nb + c] / vj;
+                packed[i * n + j] = vmat[(i - v_row0) * nb + c] / vj;
             }
         }
     }
@@ -42232,45 +42600,38 @@ pub fn orgqr_blocked_f64(packed: &[f64], tau: &[f64], m: usize, n: usize, k: usi
         return x;
     }
 
-    let nb_block = 32;
-    let mut panels: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
-    let mut p = 0;
-    while p < k {
-        let pe = (p + nb_block).min(k);
-        let nb = pe - p;
-        // V (m x nb) in LAPACK convention: v_j = 1 at row j, zeros above, the stored
-        // reflector entries below.
-        let mut vmat = vec![0.0f64; m * nb];
-        for c in 0..nb {
-            let j = p + c;
-            vmat[j * nb + c] = 1.0;
-            for i in (j + 1)..m {
-                vmat[i * nb + c] = packed[i * n + j];
-            }
-        }
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb, p);
-        panels.push((nb, vmat, tmat));
-        p = pe;
-    }
+    let active_sub = qr_active_submatrix();
+    let panels = householder_panels_from_packed_f64(packed, tau, m, n, k, 32);
 
     // Q_block . X = X - V (T (Vᵀ X)), innermost panel first.
-    for (nb, vmat, tmat) in panels.iter().rev() {
+    for (p, nb, vmat, tmat) in panels.iter().rev() {
+        let p = *p;
         let nb = *nb;
-        let mut w1 = vec![0.0f64; nb * n];
-        gemm::dgemm_tb(nb, m, n, vmat, &x, &mut w1); // Vᵀ X
-        let mut w2 = vec![0.0f64; nb * n];
-        gemm::dgemm(nb, nb, n, tmat, &w1, &mut w2); // T (Vᵀ X)
-        let mut upd = vec![0.0f64; m * n];
-        gemm::dgemm(m, nb, n, vmat, &w2, &mut upd); // V (...)
-        for t in 0..m * n {
-            x[t] -= upd[t];
+        if active_sub {
+            let v_rows = m - p;
+            let nq = n - p;
+            let mut w1 = vec![0.0f64; nb * nq];
+            gemm::dgemm_tb_b_strided(nb, v_rows, nq, vmat, &x, p * n + p, n, &mut w1); // Vᵀ X
+            let mut w2 = vec![0.0f64; nb * nq];
+            gemm::dgemm(nb, nb, nq, tmat, &w1, &mut w2); // T (Vᵀ X)
+            gemm::dgemm_sub_strided_gated(v_rows, nb, nq, vmat, &w2, &mut x, p * n + p, n); // X -= V (...)
+        } else {
+            let mut w1 = vec![0.0f64; nb * n];
+            gemm::dgemm_tb(nb, m, n, vmat, &x, &mut w1); // Vᵀ X
+            let mut w2 = vec![0.0f64; nb * n];
+            gemm::dgemm(nb, nb, n, tmat, &w1, &mut w2); // T (Vᵀ X)
+            let mut upd = vec![0.0f64; m * n];
+            gemm::dgemm(m, nb, n, vmat, &w2, &mut upd); // V (...)
+            for t in 0..m * n {
+                x[t] -= upd[t];
+            }
         }
     }
     x
 }
 
-/// Build the `(V, T)` panels a blocked reflector application needs, from LAPACK-convention
-/// packed reflectors. Shared by [`orgqr_blocked_f64`] and [`ormqr_blocked_f64`].
+/// Build the `(panel_start, nb, V, T)` panels a blocked reflector application needs, from
+/// LAPACK-convention packed reflectors. Shared by [`orgqr_blocked_f64`] and [`ormqr_blocked_f64`].
 fn householder_panels_from_packed_f64(
     packed: &[f64],
     tau: &[f64],
@@ -42278,22 +42639,25 @@ fn householder_panels_from_packed_f64(
     n: usize,
     k: usize,
     nb_block: usize,
-) -> Vec<(usize, Vec<f64>, Vec<f64>)> {
+) -> Vec<(usize, usize, Vec<f64>, Vec<f64>)> {
+    let active_sub = qr_active_submatrix();
     let mut panels = Vec::new();
     let mut p = 0;
     while p < k {
         let pe = (p + nb_block).min(k);
         let nb = pe - p;
-        let mut vmat = vec![0.0f64; m * nb];
+        let v_row0 = if active_sub { p } else { 0 };
+        let v_rows = m - v_row0;
+        let mut vmat = vec![0.0f64; v_rows * nb];
         for c in 0..nb {
             let j = p + c;
-            vmat[j * nb + c] = 1.0;
+            vmat[(j - v_row0) * nb + c] = 1.0;
             for i in (j + 1)..m {
-                vmat[i * nb + c] = packed[i * n + j];
+                vmat[(i - v_row0) * nb + c] = packed[i * n + j];
             }
         }
-        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], m, nb, 0, nb, p);
-        panels.push((nb, vmat, tmat));
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau[p..pe], v_rows, nb, 0, nb, p - v_row0);
+        panels.push((p, nb, vmat, tmat));
         p = pe;
     }
     panels
@@ -42350,6 +42714,7 @@ pub fn ormqr_blocked_f64(
     let profile = ORMQR_STAGE_PROFILE_OWNER.load(LuOrdering::Relaxed) == thread_measurement_key();
     let total_started = profile.then(std::time::Instant::now);
     let panel_started = profile.then(std::time::Instant::now);
+    let active_sub = qr_active_submatrix();
     let panels = householder_panels_from_packed_f64(packed, tau, m, n, k, 32);
     if let Some(started) = panel_started {
         ORMQR_PANEL_BUILD_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
@@ -42357,14 +42722,17 @@ pub fn ormqr_blocked_f64(
 
     // REVERSE iff left != transpose; see the table above.
     let reverse = left != transpose;
-    let ordered: Vec<&(usize, Vec<f64>, Vec<f64>)> = if reverse {
+    let ordered: Vec<&(usize, usize, Vec<f64>, Vec<f64>)> = if reverse {
         panels.iter().rev().collect()
     } else {
         panels.iter().collect()
     };
 
-    for (nb, vmat, tmat) in ordered {
+    for (p, nb, vmat, tmat) in ordered {
+        let p = *p;
         let nb = *nb;
+        let v_row0 = if active_sub { p } else { 0 };
+        let v_rows = m - v_row0;
         // Tᵀ when applying the reverse product.
         let tx_owned = if transpose {
             let transpose_started = profile.then(std::time::Instant::now);
@@ -42385,7 +42753,8 @@ pub fn ormqr_blocked_f64(
         let tx: &[f64] = tx_owned.as_deref().unwrap_or(tmat.as_slice());
 
         if left {
-            // C <- C - V (T (Vᵀ C)),  C is m x cc.
+            // C[p..m, :] <- C[p..m, :] - V (T (Vᵀ C[p..m, :])),  C is m x cc.
+            let c_active = &mut c[v_row0 * cc..(v_row0 + v_rows) * cc];
             let workspace_started = profile.then(std::time::Instant::now);
             let mut w1 = vec![0.0f64; nb * cc];
             if let Some(started) = workspace_started {
@@ -42393,7 +42762,7 @@ pub fn ormqr_blocked_f64(
                     .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let vt_c_started = profile.then(std::time::Instant::now);
-            gemm::dgemm_tb(nb, m, cc, vmat, c, &mut w1); // Vᵀ C
+            gemm::dgemm_tb(nb, v_rows, cc, vmat, c_active, &mut w1); // Vᵀ C
             if let Some(started) = vt_c_started {
                 ORMQR_VT_C_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
@@ -42415,33 +42784,33 @@ pub fn ormqr_blocked_f64(
                 // fast. `frankentorch-g0wpj`.
                 ORMQR_FUSED_SUBTRACT_HITS.fetch_add(1, LuOrdering::Relaxed);
                 let v_w_started = profile.then(std::time::Instant::now);
-                gemm::dgemm_sub_into(m, nb, cc, vmat, &w2, c, 0, cc);
+                gemm::dgemm_sub_into(v_rows, nb, cc, vmat, &w2, c_active, 0, cc);
                 if let Some(started) = v_w_started {
                     ORMQR_V_W_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                 }
             } else {
                 let workspace_started = profile.then(std::time::Instant::now);
-                let mut upd = vec![0.0f64; m * cc];
+                let mut upd = vec![0.0f64; v_rows * cc];
                 if let Some(started) = workspace_started {
                     ORMQR_WORKSPACE_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                 }
                 let v_w_started = profile.then(std::time::Instant::now);
-                gemm::dgemm(m, nb, cc, vmat, &w2, &mut upd); // V (...)
+                gemm::dgemm(v_rows, nb, cc, vmat, &w2, &mut upd); // V (...)
                 if let Some(started) = v_w_started {
                     ORMQR_V_W_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                 }
                 let subtract_started = profile.then(std::time::Instant::now);
-                ormqr_subtract_update(c, &upd, m, cc);
+                ormqr_subtract_update(c_active, &upd, v_rows, cc);
                 if let Some(started) = subtract_started {
                     ORMQR_SUBTRACT_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
                 }
             }
         } else {
-            // C <- C - ((C V) T) Vᵀ,  C is cr x m.
+            // C[:, p..m] <- C[:, p..m] - ((C[:, p..m] V) T) Vᵀ,  C is cr x m.
             let workspace_started = profile.then(std::time::Instant::now);
             let mut w1 = vec![0.0f64; cr * nb];
             if let Some(started) = workspace_started {
@@ -42449,7 +42818,11 @@ pub fn ormqr_blocked_f64(
                     .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let vt_c_started = profile.then(std::time::Instant::now);
-            gemm::dgemm(cr, m, nb, c, vmat, &mut w1); // C V
+            if v_row0 == 0 {
+                gemm::dgemm(cr, m, nb, c, vmat, &mut w1); // C V
+            } else {
+                gemm::dgemm_a_strided(cr, v_rows, nb, c, v_row0, m, vmat, &mut w1);
+            }
             if let Some(started) = vt_c_started {
                 ORMQR_VT_C_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
@@ -42468,7 +42841,7 @@ pub fn ormqr_blocked_f64(
                 // FUSED right route: C -= W * V^T, same argument as the left. g0wpj.
                 ORMQR_FUSED_SUBTRACT_HITS.fetch_add(1, LuOrdering::Relaxed);
                 let v_w_started = profile.then(std::time::Instant::now);
-                gemm::dgemm_bt_sub_into(cr, nb, m, &w2, vmat, c, 0, m);
+                gemm::dgemm_bt_sub_into(cr, nb, v_rows, &w2, vmat, c, v_row0, m);
                 if let Some(started) = v_w_started {
                     ORMQR_V_W_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
@@ -42476,18 +42849,18 @@ pub fn ormqr_blocked_f64(
                 continue;
             }
             let workspace_started = profile.then(std::time::Instant::now);
-            let mut upd = vec![0.0f64; cr * m];
+            let mut upd = vec![0.0f64; cr * v_rows];
             if let Some(started) = workspace_started {
                 ORMQR_WORKSPACE_NS
                     .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let v_w_started = profile.then(std::time::Instant::now);
-            gemm::dgemm_bt(cr, nb, m, &w2, vmat, &mut upd); // (...) Vᵀ
+            gemm::dgemm_bt(cr, nb, v_rows, &w2, vmat, &mut upd); // (...) Vᵀ
             if let Some(started) = v_w_started {
                 ORMQR_V_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
             let subtract_started = profile.then(std::time::Instant::now);
-            ormqr_subtract_update(c, &upd, cr, m);
+            ormqr_subtract_update_cols(c, v_row0, m, &upd, cr, v_rows);
             if let Some(started) = subtract_started {
                 ORMQR_SUBTRACT_NS
                     .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
@@ -42527,13 +42900,14 @@ fn qr_householder_panel_blocked_f32(
 ) -> Vec<f32> {
     const NB: usize = 32;
     let tiny = f32::EPSILON * 1e6;
-    let mut panels: Vec<(usize, Vec<f32>, Vec<f32>)> = Vec::new();
+    let mut panels: Vec<(usize, usize, Vec<f32>, Vec<f32>)> = Vec::new();
     let mut p = 0;
     while p < k {
         let pe = (p + NB).min(k);
         let nb = pe - p;
+        let mp = m - p;
 
-        let mut vmat = vec![0.0f32; m * nb];
+        let mut vmat = vec![0.0f32; mp * nb];
         let mut tau = vec![0.0f32; nb];
         for c in 0..nb {
             let j = p + c;
@@ -42549,18 +42923,18 @@ fn qr_householder_panel_blocked_f32(
             }
             let v0 = r_mat[j * n + j];
             let sign = if v0 >= 0.0 { 1.0 } else { -1.0 };
-            vmat[j * nb + c] = v0 + sign * norm_v;
+            vmat[c * nb + c] = v0 + sign * norm_v;
             for t in 1..col_len {
-                vmat[(j + t) * nb + c] = r_mat[(j + t) * n + j];
+                vmat[(c + t) * nb + c] = r_mat[(j + t) * n + j];
             }
             let mut nv2 = 0.0f32;
             for t in 0..col_len {
-                let x = vmat[(j + t) * nb + c];
+                let x = vmat[(c + t) * nb + c];
                 nv2 += x * x;
             }
             if nv2 < tiny {
                 for t in 0..col_len {
-                    vmat[(j + t) * nb + c] = 0.0;
+                    vmat[(c + t) * nb + c] = 0.0;
                 }
                 continue;
             }
@@ -42573,11 +42947,11 @@ fn qr_householder_panel_blocked_f32(
             for col in (j + 1)..pe {
                 let mut dot = 0.0f32;
                 for t in 0..col_len {
-                    dot += vmat[(j + t) * nb + c] * r_mat[(j + t) * n + col];
+                    dot += vmat[(c + t) * nb + c] * r_mat[(j + t) * n + col];
                 }
                 let factor = tau_c * dot;
                 for t in 0..col_len {
-                    r_mat[(j + t) * n + col] -= factor * vmat[(j + t) * nb + c];
+                    r_mat[(j + t) * n + col] -= factor * vmat[(c + t) * nb + c];
                 }
             }
         }
@@ -42590,7 +42964,7 @@ fn qr_householder_panel_blocked_f32(
             tmat[c * nb + c] = tau[c];
             for i in 0..c {
                 let mut dot = 0.0f32;
-                for row in 0..m {
+                for row in c..mp {
                     dot += vmat[row * nb + i] * vmat[row * nb + c];
                 }
                 tmat[i * nb + c] = -tau[c] * dot;
@@ -42610,20 +42984,20 @@ fn qr_householder_panel_blocked_f32(
 
         let nt = n - pe;
         if nt > 0 {
-            let mut rt = vec![0.0f32; m * nt];
-            for i in 0..m {
-                let base = i * n + pe;
+            let mut rt = vec![0.0f32; mp * nt];
+            for i in 0..mp {
+                let base = (p + i) * n + pe;
                 let dst = i * nt;
                 rt[dst..dst + nt].copy_from_slice(&r_mat[base..base + nt]);
             }
-            let mut vt = vec![0.0f32; nb * m];
-            for row in 0..m {
+            let mut vt = vec![0.0f32; nb * mp];
+            for row in 0..mp {
                 for c in 0..nb {
-                    vt[c * m + row] = vmat[row * nb + c];
+                    vt[c * mp + row] = vmat[row * nb + c];
                 }
             }
             let mut w = vec![0.0f32; nb * nt];
-            gemm::sgemm(nb, m, nt, &vt, &rt, &mut w); // Vᵀ R
+            gemm::sgemm(nb, mp, nt, &vt, &rt, &mut w); // Vᵀ R
             let mut tt = vec![0.0f32; nb * nb];
             for i in 0..nb {
                 for jj in 0..nb {
@@ -42632,18 +43006,10 @@ fn qr_householder_panel_blocked_f32(
             }
             let mut w2 = vec![0.0f32; nb * nt];
             gemm::sgemm(nb, nb, nt, &tt, &w, &mut w2); // Tᵀ (Vᵀ R)
-            let mut upd = vec![0.0f32; m * nt];
-            gemm::sgemm(m, nb, nt, &vmat, &w2, &mut upd); // V (...)
-            for i in 0..m {
-                let base = i * n + pe;
-                let src = i * nt;
-                for t in 0..nt {
-                    r_mat[base + t] -= upd[src + t];
-                }
-            }
+            gemm::sgemm_sub_into(mp, nb, nt, &vmat, &w2, r_mat, p * n + pe, n);
         }
 
-        panels.push((nb, vmat, tmat));
+        panels.push((p, nb, vmat, tmat));
         p = pe;
     }
 
@@ -42651,23 +43017,28 @@ fn qr_householder_panel_blocked_f32(
     for i in 0..m.min(qcols) {
         x[i * qcols + i] = 1.0;
     }
-    for (nb, vmat, tmat) in panels.iter().rev() {
+    for (p, nb, vmat, tmat) in panels.iter().rev() {
+        let p = *p;
         let nb = *nb;
-        let mut vt = vec![0.0f32; nb * m];
-        for row in 0..m {
+        let mp = m - p;
+        let nq = qcols - p;
+        let mut vt = vec![0.0f32; nb * mp];
+        for row in 0..mp {
             for c in 0..nb {
-                vt[c * m + row] = vmat[row * nb + c];
+                vt[c * mp + row] = vmat[row * nb + c];
             }
         }
-        let mut w1 = vec![0.0f32; nb * qcols];
-        gemm::sgemm(nb, m, qcols, &vt, &x, &mut w1); // Vᵀ X
-        let mut w2 = vec![0.0f32; nb * qcols];
-        gemm::sgemm(nb, nb, qcols, tmat, &w1, &mut w2); // T (Vᵀ X)
-        let mut upd = vec![0.0f32; m * qcols];
-        gemm::sgemm(m, nb, qcols, vmat, &w2, &mut upd); // V (...)
-        for t in 0..m * qcols {
-            x[t] -= upd[t];
+        let mut x_sub = vec![0.0f32; mp * nq];
+        for row in 0..mp {
+            let src = (p + row) * qcols + p;
+            let dst = row * nq;
+            x_sub[dst..dst + nq].copy_from_slice(&x[src..src + nq]);
         }
+        let mut w1 = vec![0.0f32; nb * nq];
+        gemm::sgemm(nb, mp, nq, &vt, &x_sub, &mut w1); // Vᵀ X
+        let mut w2 = vec![0.0f32; nb * nq];
+        gemm::sgemm(nb, nb, nq, tmat, &w1, &mut w2); // T (Vᵀ X)
+        gemm::sgemm_sub_into(mp, nb, nq, vmat, &w2, &mut x, p * qcols + p, qcols);
     }
     x
 }
@@ -78718,4 +79089,104 @@ mod tests {
             );
         }
     }
+
+    rusty_fork_test! {
+    #[test]
+    fn qr_active_submatrix_toggle_matches_full_matrix_path_across_all_four_ops() {
+        for &(m, n) in &[(96usize, 80usize), (80, 96), (96, 96)] {
+            let a = bidiag_test_matrix(m, n, 0x51A1_0001 ^ (m * 131 + n) as u64);
+
+            for &cm in &[false, true] {
+                let prev_cm = super::set_qr_trailing_column_major(cm);
+                let prev_qas = super::set_qr_active_submatrix(false);
+                let (full_packed, full_tau) = super::geqrf_blocked_f64(&a, m, n);
+                super::set_qr_active_submatrix(true);
+                let (act_packed, act_tau) = super::geqrf_blocked_f64(&a, m, n);
+                super::set_qr_active_submatrix(prev_qas);
+                super::restore_qr_trailing_column_major(prev_cm);
+
+                for (i, (f, g)) in full_tau.iter().zip(&act_tau).enumerate() {
+                    assert!(
+                        (f - g).abs() <= 1e-12,
+                        "geqrf tau[{i}] differs at {m}x{n} cm={cm}: full {f:e} vs active {g:e}"
+                    );
+                }
+                for (i, (f, g)) in full_packed.iter().zip(&act_packed).enumerate() {
+                    assert!(
+                        (f - g).abs() <= 1e-11,
+                        "geqrf packed[{i}] differs at {m}x{n} cm={cm}: full {f:e} vs active {g:e}"
+                    );
+                }
+            }
+
+            for &reduced in &[true, false] {
+                let prev_qas = super::set_qr_active_submatrix(false);
+                let (full_q, full_r) = super::qr_householder_panel_blocked(&a, m, n, reduced);
+                super::set_qr_active_submatrix(true);
+                let (act_q, act_r) = super::qr_householder_panel_blocked(&a, m, n, reduced);
+                super::set_qr_active_submatrix(prev_qas);
+
+                for (i, (f, g)) in full_q.iter().zip(&act_q).enumerate() {
+                    assert!(
+                        (f - g).abs() <= 1e-11,
+                        "qr Q[{i}] differs at {m}x{n} reduced={reduced}: full {f:e} vs active {g:e}"
+                    );
+                }
+                for (i, (f, g)) in full_r.iter().zip(&act_r).enumerate() {
+                    assert!(
+                        (f - g).abs() <= 1e-11,
+                        "qr R[{i}] differs at {m}x{n} reduced={reduced}: full {f:e} vs active {g:e}"
+                    );
+                }
+            }
+        }
+
+        for &(m, n, k) in &[(96usize, 80usize, 80usize), (96, 96, 68)] {
+            let a = bidiag_test_matrix(m, n, 0x51A1_0002 ^ (m * 73 + n * 19 + k) as u64);
+            let (packed, tau) = super::geqrf_blocked_f64(&a, m, n);
+
+            let prev_qas = super::set_qr_active_submatrix(false);
+            let full_q = super::orgqr_blocked_f64(&packed, &tau[..k], m, n, k);
+            super::set_qr_active_submatrix(true);
+            let act_q = super::orgqr_blocked_f64(&packed, &tau[..k], m, n, k);
+            super::set_qr_active_submatrix(prev_qas);
+
+            for (i, (f, g)) in full_q.iter().zip(&act_q).enumerate() {
+                assert!(
+                    (f - g).abs() <= 1e-11,
+                    "orgqr Q[{i}] differs at {m}x{n} k={k}: full {f:e} vs active {g:e}"
+                );
+            }
+
+            let c_left = bidiag_test_matrix(m, 40, 0x51A1_0003 ^ k as u64);
+            let c_right = bidiag_test_matrix(40, m, 0x51A1_0004 ^ k as u64);
+            for &fused in &[false, true] {
+                let prev_fused = super::set_ormqr_fused_subtract(fused);
+                for &(left, transpose) in &[(true, false), (true, true), (false, false), (false, true)] {
+                    let (c_slice, cr, cc) = if left {
+                        (&c_left[..], m, 40usize)
+                    } else {
+                        (&c_right[..], 40usize, m)
+                    };
+                    let mut c_full = c_slice.to_vec();
+                    let mut c_act = c_slice.to_vec();
+                    let prev_qas = super::set_qr_active_submatrix(false);
+                    super::ormqr_blocked_f64(&packed, m, n, &tau[..k], k, &mut c_full, cr, cc, left, transpose);
+                    super::set_qr_active_submatrix(true);
+                    super::ormqr_blocked_f64(&packed, m, n, &tau[..k], k, &mut c_act, cr, cc, left, transpose);
+                    super::set_qr_active_submatrix(prev_qas);
+
+                    for (i, (f, g)) in c_full.iter().zip(&c_act).enumerate() {
+                        assert!(
+                            (f - g).abs() <= 1e-11,
+                            "ormqr C[{i}] differs at {m}x{n} k={k} left={left} transpose={transpose} fused={fused}: full {f:e} vs active {g:e}"
+                        );
+                    }
+                }
+                super::set_ormqr_fused_subtract(prev_fused);
+            }
+        }
+    }
+    }
 }
+
