@@ -22931,41 +22931,96 @@ impl FrankenTorchSession {
         input_shape: &[usize],
         weight_vals: &[f64],
     ) -> Vec<f64> {
-        // Per-element select+multiply are independent, so parallelize large inputs (par_iter +
-        // enumerate preserves index order => bit-identical to the serial map). Mirrors the already-
-        // parallel prelu_forward_values_f32; the f64 version had been left serial. Used by the no-grad
-        // fast path AND the grad-path forward, so both benefit.
-        let prelu_at = |i: usize, x: f64| -> f64 {
-            if weight_vals.len() == 1 {
-                if x > 0.0 { x } else { weight_vals[0] * x }
+        let len = input_vals.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let num_channels = weight_vals.len();
+        let channel_size: usize = if input_shape.len() >= 2 {
+            input_shape[2..].iter().product()
+        } else {
+            1
+        };
+        let fill = |out: &mut [f64]| {
+            if num_channels == 1 {
+                let w0 = weight_vals[0];
+                if len >= PARALLEL_ELEMENTWISE_MIN {
+                    use rayon::prelude::*;
+                    out.par_chunks_mut(16_384)
+                        .zip(input_vals.par_chunks(16_384))
+                        .for_each(|(dst, src)| {
+                            for (d, &x) in dst.iter_mut().zip(src.iter()) {
+                                *d = if x > 0.0 { x } else { w0 * x };
+                            }
+                        });
+                } else {
+                    for (d, &x) in out.iter_mut().zip(input_vals.iter()) {
+                        *d = if x > 0.0 { x } else { w0 * x };
+                    }
+                }
+            } else if input_shape.len() >= 2
+                && channel_size > 1
+                && len.is_multiple_of(channel_size)
+            {
+                if len >= PARALLEL_ELEMENTWISE_MIN {
+                    use rayon::prelude::*;
+                    let chunks_per_task = (4_096 / channel_size).max(1);
+                    let task_elems = chunks_per_task * channel_size;
+                    out.par_chunks_mut(task_elems)
+                        .zip(input_vals.par_chunks(task_elems))
+                        .enumerate()
+                        .for_each(|(task_idx, (dst_task, src_task))| {
+                            let base_chunk = task_idx * chunks_per_task;
+                            for (local_chunk, (dst_ch, src_ch)) in dst_task
+                                .chunks_mut(channel_size)
+                                .zip(src_task.chunks(channel_size))
+                                .enumerate()
+                            {
+                                let w_c = weight_vals[(base_chunk + local_chunk) % num_channels];
+                                for (d, &x) in dst_ch.iter_mut().zip(src_ch.iter()) {
+                                    *d = if x > 0.0 { x } else { w_c * x };
+                                }
+                            }
+                        });
+                } else {
+                    for (chunk_idx, (dst_ch, src_ch)) in out
+                        .chunks_mut(channel_size)
+                        .zip(input_vals.chunks(channel_size))
+                        .enumerate()
+                    {
+                        let w_c = weight_vals[chunk_idx % num_channels];
+                        for (d, &x) in dst_ch.iter_mut().zip(src_ch.iter()) {
+                            *d = if x > 0.0 { x } else { w_c * x };
+                        }
+                    }
+                }
             } else {
-                let num_channels = weight_vals.len();
-                let channel_size: usize = if input_shape.len() >= 2 {
-                    input_shape[2..].iter().product()
-                } else {
-                    1
+                let prelu_at = |i: usize, x: f64| -> f64 {
+                    let c = if input_shape.len() >= 2 {
+                        (i / channel_size) % num_channels
+                    } else {
+                        i % num_channels
+                    };
+                    if x > 0.0 { x } else { weight_vals[c] * x }
                 };
-                let c = if input_shape.len() >= 2 {
-                    (i / channel_size) % num_channels
+                if len >= PARALLEL_ELEMENTWISE_MIN {
+                    use rayon::prelude::*;
+                    out.par_iter_mut()
+                        .zip(input_vals.par_iter())
+                        .enumerate()
+                        .for_each(|(i, (d, &x))| *d = prelu_at(i, x));
                 } else {
-                    i % num_channels
-                };
-                if x > 0.0 { x } else { weight_vals[c] * x }
+                    for (i, (d, &x)) in out.iter_mut().zip(input_vals.iter()).enumerate() {
+                        *d = prelu_at(i, x);
+                    }
+                }
             }
         };
-        if input_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-            use rayon::prelude::*;
-            input_vals
-                .par_iter()
-                .enumerate()
-                .map(|(i, &x)| prelu_at(i, x))
-                .collect()
+        if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(len) {
+            fill(&mut pooled);
+            pooled
         } else {
-            input_vals
-                .iter()
-                .enumerate()
-                .map(|(i, &x)| prelu_at(i, x))
-                .collect()
+            ft_kernel_cpu::build_uninit(len, fill)
         }
     }
 
@@ -22978,38 +23033,91 @@ impl FrankenTorchSession {
         input_shape: &[usize],
         weight_vals: &[f32],
     ) -> Vec<f32> {
-        let prelu_at = |i: usize, x: f32| -> f32 {
-            if weight_vals.len() == 1 {
-                if x > 0.0 { x } else { weight_vals[0] * x }
-            } else {
-                let num_channels = weight_vals.len();
-                let channel_size: usize = if input_shape.len() >= 2 {
-                    input_shape[2..].iter().product()
-                } else {
-                    1
-                };
-                let c = if input_shape.len() >= 2 {
-                    (i / channel_size) % num_channels
-                } else {
-                    i % num_channels
-                };
-                if x > 0.0 { x } else { weight_vals[c] * x }
-            }
-        };
-        if input_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-            use rayon::prelude::*;
-            input_vals
-                .par_iter()
-                .enumerate()
-                .map(|(i, &x)| prelu_at(i, x))
-                .collect()
-        } else {
-            input_vals
-                .iter()
-                .enumerate()
-                .map(|(i, &x)| prelu_at(i, x))
-                .collect()
+        let len = input_vals.len();
+        if len == 0 {
+            return Vec::new();
         }
+        let num_channels = weight_vals.len();
+        let channel_size: usize = if input_shape.len() >= 2 {
+            input_shape[2..].iter().product()
+        } else {
+            1
+        };
+        ft_kernel_cpu::build_uninit(len, |out: &mut [f32]| {
+            if num_channels == 1 {
+                let w0 = weight_vals[0];
+                if len >= PARALLEL_ELEMENTWISE_MIN {
+                    use rayon::prelude::*;
+                    out.par_chunks_mut(16_384)
+                        .zip(input_vals.par_chunks(16_384))
+                        .for_each(|(dst, src)| {
+                            for (d, &x) in dst.iter_mut().zip(src.iter()) {
+                                *d = if x > 0.0 { x } else { w0 * x };
+                            }
+                        });
+                } else {
+                    for (d, &x) in out.iter_mut().zip(input_vals.iter()) {
+                        *d = if x > 0.0 { x } else { w0 * x };
+                    }
+                }
+            } else if input_shape.len() >= 2
+                && channel_size > 1
+                && len.is_multiple_of(channel_size)
+            {
+                if len >= PARALLEL_ELEMENTWISE_MIN {
+                    use rayon::prelude::*;
+                    let chunks_per_task = (4_096 / channel_size).max(1);
+                    let task_elems = chunks_per_task * channel_size;
+                    out.par_chunks_mut(task_elems)
+                        .zip(input_vals.par_chunks(task_elems))
+                        .enumerate()
+                        .for_each(|(task_idx, (dst_task, src_task))| {
+                            let base_chunk = task_idx * chunks_per_task;
+                            for (local_chunk, (dst_ch, src_ch)) in dst_task
+                                .chunks_mut(channel_size)
+                                .zip(src_task.chunks(channel_size))
+                                .enumerate()
+                            {
+                                let w_c = weight_vals[(base_chunk + local_chunk) % num_channels];
+                                for (d, &x) in dst_ch.iter_mut().zip(src_ch.iter()) {
+                                    *d = if x > 0.0 { x } else { w_c * x };
+                                }
+                            }
+                        });
+                } else {
+                    for (chunk_idx, (dst_ch, src_ch)) in out
+                        .chunks_mut(channel_size)
+                        .zip(input_vals.chunks(channel_size))
+                        .enumerate()
+                    {
+                        let w_c = weight_vals[chunk_idx % num_channels];
+                        for (d, &x) in dst_ch.iter_mut().zip(src_ch.iter()) {
+                            *d = if x > 0.0 { x } else { w_c * x };
+                        }
+                    }
+                }
+            } else {
+                let prelu_at = |i: usize, x: f32| -> f32 {
+                    let c = if input_shape.len() >= 2 {
+                        (i / channel_size) % num_channels
+                    } else {
+                        i % num_channels
+                    };
+                    if x > 0.0 { x } else { weight_vals[c] * x }
+                };
+                if len >= PARALLEL_ELEMENTWISE_MIN {
+                    use rayon::prelude::*;
+                    out.par_iter_mut()
+                        .zip(input_vals.par_iter())
+                        .enumerate()
+                        .for_each(|(i, (d, &x))| *d = prelu_at(i, x));
+                } else {
+                    for (i, (d, &x)) in out.iter_mut().zip(input_vals.iter()).enumerate() {
+                        *d = prelu_at(i, x);
+                    }
+                }
+            }
+        })
     }
 
     /// Parametric ReLU activation.
@@ -23057,6 +23165,7 @@ impl FrankenTorchSession {
                     let g = grad_outputs[0];
                     let xv = borrowed[0].0;
                     let wv = borrowed[1].0;
+                    let len = xv.len();
                     let nch = wv.len();
                     let channel_size: usize = if ndim >= 2 {
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -23065,24 +23174,71 @@ impl FrankenTorchSession {
                     } else {
                         1
                     };
-                    let parallel_backward = xv.len() >= 65_536;
+                    let parallel_backward = len >= 65_536;
                     let (grad_x, grad_w) = if parallel_backward {
                         use rayon::prelude::*;
 
-                        let grad_x: Vec<f64> = (0..xv.len())
-                            .into_par_iter()
-                            .map(|i| {
-                                let x = xv[i];
-                                let c = if nch == 1 {
-                                    0
-                                } else if ndim >= 2 {
-                                    (i / channel_size) % nch
-                                } else {
-                                    i % nch
-                                };
-                                if x > 0.0 { g[i] } else { g[i] * wv[c] }
-                            })
-                            .collect();
+                        let fill_grad_x = |dst: &mut [f64]| {
+                            if nch == 1 {
+                                let w0 = wv[0];
+                                dst.par_chunks_mut(16_384)
+                                    .zip(xv.par_chunks(16_384).zip(g.par_chunks(16_384)))
+                                    .for_each(|(d_chunk, (x_chunk, g_chunk))| {
+                                        for (d, (&x, &gi)) in
+                                            d_chunk.iter_mut().zip(x_chunk.iter().zip(g_chunk.iter()))
+                                        {
+                                            *d = if x > 0.0 { gi } else { gi * w0 };
+                                        }
+                                    });
+                            } else if ndim >= 2
+                                && channel_size > 1
+                                && len.is_multiple_of(channel_size)
+                            {
+                                let chunks_per_task = (4_096 / channel_size).max(1);
+                                let task_elems = chunks_per_task * channel_size;
+                                dst.par_chunks_mut(task_elems)
+                                    .zip(xv.par_chunks(task_elems).zip(g.par_chunks(task_elems)))
+                                    .enumerate()
+                                    .for_each(|(task_idx, (d_task, (x_task, g_task)))| {
+                                        let base_chunk = task_idx * chunks_per_task;
+                                        for (local_chunk, (d_ch, (x_ch, g_ch))) in d_task
+                                            .chunks_mut(channel_size)
+                                            .zip(
+                                                x_task
+                                                    .chunks(channel_size)
+                                                    .zip(g_task.chunks(channel_size)),
+                                            )
+                                            .enumerate()
+                                        {
+                                            let w_c = wv[(base_chunk + local_chunk) % nch];
+                                            for (d, (&x, &gi)) in
+                                                d_ch.iter_mut().zip(x_ch.iter().zip(g_ch.iter()))
+                                            {
+                                                *d = if x > 0.0 { gi } else { gi * w_c };
+                                            }
+                                        }
+                                    });
+                            } else {
+                                dst.par_iter_mut()
+                                    .zip(xv.par_iter().zip(g.par_iter()))
+                                    .enumerate()
+                                    .for_each(|(i, (d, (&x, &gi)))| {
+                                        let c = if ndim >= 2 {
+                                            (i / channel_size) % nch
+                                        } else {
+                                            i % nch
+                                        };
+                                        *d = if x > 0.0 { gi } else { gi * wv[c] };
+                                    });
+                            }
+                        };
+                        let grad_x: Vec<f64> =
+                            if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(len) {
+                                fill_grad_x(&mut pooled);
+                                pooled
+                            } else {
+                                ft_kernel_cpu::build_uninit(len, fill_grad_x)
+                            };
                         let mut grad_w = vec![0.0_f64; nch];
                         if nch == 1 {
                             for (i, &x) in xv.iter().enumerate() {
@@ -26657,6 +26813,7 @@ impl FrankenTorchSession {
                 let upstream = grad_outputs[0][0];
                 let xv = borrowed[0].0;
                 let wv = borrowed[1].0;
+                let len = xv.len();
                 let nch = wv.len();
                 let channel_for = |i: usize| {
                     if nch == 1 {
@@ -26667,30 +26824,86 @@ impl FrankenTorchSession {
                         i % nch
                     }
                 };
-                let grad_x: Vec<f64> = if xv.len() >= 65_536 {
-                    use rayon::prelude::*;
-                    (0..xv.len())
-                        .into_par_iter()
-                        .map(|i| {
-                            if xv[i] > 0.0 {
+                let fill_grad_x = |dst: &mut [f64]| {
+                    if nch == 1 {
+                        let scaled = upstream * wv[0];
+                        if len >= 65_536 {
+                            use rayon::prelude::*;
+                            dst.par_chunks_mut(16_384)
+                                .zip(xv.par_chunks(16_384))
+                                .for_each(|(d_chunk, x_chunk)| {
+                                    for (d, &x) in d_chunk.iter_mut().zip(x_chunk.iter()) {
+                                        *d = if x > 0.0 { upstream } else { scaled };
+                                    }
+                                });
+                        } else {
+                            for (d, &x) in dst.iter_mut().zip(xv.iter()) {
+                                *d = if x > 0.0 { upstream } else { scaled };
+                            }
+                        }
+                    } else if ndim >= 2 && channel_size > 1 && len.is_multiple_of(channel_size) {
+                        if len >= 65_536 {
+                            use rayon::prelude::*;
+                            let chunks_per_task = (4_096 / channel_size).max(1);
+                            let task_elems = chunks_per_task * channel_size;
+                            dst.par_chunks_mut(task_elems)
+                                .zip(xv.par_chunks(task_elems))
+                                .enumerate()
+                                .for_each(|(task_idx, (d_task, x_task))| {
+                                    let base_chunk = task_idx * chunks_per_task;
+                                    for (local_chunk, (d_ch, x_ch)) in d_task
+                                        .chunks_mut(channel_size)
+                                        .zip(x_task.chunks(channel_size))
+                                        .enumerate()
+                                    {
+                                        let scaled =
+                                            upstream * wv[(base_chunk + local_chunk) % nch];
+                                        for (d, &x) in d_ch.iter_mut().zip(x_ch.iter()) {
+                                            *d = if x > 0.0 { upstream } else { scaled };
+                                        }
+                                    }
+                                });
+                        } else {
+                            for (chunk_idx, (d_ch, x_ch)) in dst
+                                .chunks_mut(channel_size)
+                                .zip(xv.chunks(channel_size))
+                                .enumerate()
+                            {
+                                let scaled = upstream * wv[chunk_idx % nch];
+                                for (d, &x) in d_ch.iter_mut().zip(x_ch.iter()) {
+                                    *d = if x > 0.0 { upstream } else { scaled };
+                                }
+                            }
+                        }
+                    } else if len >= 65_536 {
+                        use rayon::prelude::*;
+                        dst.par_iter_mut()
+                            .zip(xv.par_iter())
+                            .enumerate()
+                            .for_each(|(i, (d, &x))| {
+                                *d = if x > 0.0 {
+                                    upstream
+                                } else {
+                                    upstream * wv[channel_for(i)]
+                                };
+                            });
+                    } else {
+                        for (i, (d, &x)) in dst.iter_mut().zip(xv.iter()).enumerate() {
+                            *d = if x > 0.0 {
                                 upstream
                             } else {
                                 upstream * wv[channel_for(i)]
-                            }
-                        })
-                        .collect()
-                } else {
-                    xv.iter()
-                        .enumerate()
-                        .map(|(i, &x)| {
-                            if x > 0.0 {
-                                upstream
-                            } else {
-                                upstream * wv[channel_for(i)]
-                            }
-                        })
-                        .collect()
+                            };
+                        }
+                    }
                 };
+                let grad_x: Vec<f64> =
+                    if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(len) {
+                        fill_grad_x(&mut pooled);
+                        pooled
+                    } else {
+                        ft_kernel_cpu::build_uninit(len, fill_grad_x)
+                    };
                 let mut grad_w = vec![0.0_f64; nch];
                 if nch == 1 {
                     for &x in xv {
@@ -75397,6 +75610,18 @@ impl FrankenTorchSession {
         let (m, n) = (shape[r - 2], shape[r - 1]);
         let k = m.min(n);
         let batch: usize = shape[..r - 2].iter().product();
+        let mut tau_shape = shape[..r - 2].to_vec();
+        tau_shape.push(k);
+        if batch == 1 {
+            let (a_one, tau_one) = if m >= 128 && k >= 16 {
+                ft_kernel_cpu::geqrf_blocked_f64(&values, m, n)
+            } else {
+                Self::geqrf_packed_f64(&values, m, n)
+            };
+            let a_node = self.tensor_variable(a_one, shape.to_vec(), false)?;
+            let tau_node = self.tensor_variable(tau_one, tau_shape, false)?;
+            return Ok((a_node, tau_node));
+        }
         let mut a_all = vec![0.0_f64; batch * m * n];
         let mut tau_all = vec![0.0_f64; batch * k];
         for b in 0..batch {
@@ -75421,8 +75646,6 @@ impl FrankenTorchSession {
             tau_all[b * k..(b + 1) * k].copy_from_slice(&tau);
         }
         let a_node = self.tensor_variable(a_all, shape.to_vec(), false)?;
-        let mut tau_shape = shape[..r - 2].to_vec();
-        tau_shape.push(k);
         let tau_node = self.tensor_variable(tau_all, tau_shape, false)?;
         Ok((a_node, tau_node))
     }
@@ -75595,6 +75818,10 @@ impl FrankenTorchSession {
             return Err(Self::incompatible_tensor_args(
                 "householder_product: tau batch dims must match a batch dims",
             ));
+        }
+        if batch == 1 && m >= 128 && k >= 16 {
+            let blocked = ft_kernel_cpu::orgqr_blocked_f64(&a_vals, &tau_vals[..k], m, n, k);
+            return self.tensor_variable(blocked, a_shape.to_vec(), false);
         }
         let mut q_all = vec![0.0_f64; batch * m * n];
         for b in 0..batch {

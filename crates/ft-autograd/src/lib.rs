@@ -21391,7 +21391,26 @@ impl TensorTape {
         Self::ensure_tensor_len(node, values.len(), incoming.len())?;
         const PAR_MIN: usize = 1 << 19;
         if target.values.is_empty() {
-            if incoming.len() >= PAR_MIN {
+            if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(incoming.len()) {
+                if incoming.len() >= PAR_MIN {
+                    use rayon::prelude::*;
+                    pooled
+                        .par_iter_mut()
+                        .zip(incoming.par_iter().copied().zip(values.par_iter().copied()))
+                        .for_each(|(dst, (grad, value))| {
+                            *dst = f(grad, value);
+                        });
+                } else {
+                    for ((dst, grad), value) in pooled
+                        .iter_mut()
+                        .zip(incoming.iter().copied())
+                        .zip(values.iter().copied())
+                    {
+                        *dst = f(grad, value);
+                    }
+                }
+                target.values = pooled;
+            } else if incoming.len() >= PAR_MIN {
                 use rayon::prelude::*;
                 target.values = incoming
                     .par_iter()
@@ -21399,15 +21418,6 @@ impl TensorTape {
                     .zip(values.par_iter().copied())
                     .map(|(grad, value)| f(grad, value))
                     .collect();
-            } else if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(incoming.len()) {
-                for ((dst, grad), value) in pooled
-                    .iter_mut()
-                    .zip(incoming.iter().copied())
-                    .zip(values.iter().copied())
-                {
-                    *dst = f(grad, value);
-                }
-                target.values = pooled;
             } else {
                 target.values.reserve(incoming.len());
                 for (grad, value) in incoming.iter().copied().zip(values.iter().copied()) {
@@ -21458,18 +21468,27 @@ impl TensorTape {
         const PAR_MIN: usize = 1 << 19;
         Self::ensure_tensor_len(node, target.expected_len, contribution_len)?;
         if target.values.is_empty() {
-            if contribution_len >= PAR_MIN {
+            if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(contribution_len) {
+                if contribution_len >= PAR_MIN {
+                    use rayon::prelude::*;
+                    pooled
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(index, dst)| {
+                            *dst = contribution(index);
+                        });
+                } else {
+                    for (index, dst) in pooled.iter_mut().enumerate() {
+                        *dst = contribution(index);
+                    }
+                }
+                target.values = pooled;
+            } else if contribution_len >= PAR_MIN {
                 use rayon::prelude::*;
                 target.values = (0..contribution_len)
                     .into_par_iter()
                     .map(&contribution)
                     .collect();
-            } else if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(contribution_len)
-            {
-                for (index, dst) in pooled.iter_mut().enumerate() {
-                    *dst = contribution(index);
-                }
-                target.values = pooled;
             } else {
                 target.values.reserve(contribution_len);
                 for index in 0..contribution_len {

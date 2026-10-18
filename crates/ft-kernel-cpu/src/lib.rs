@@ -395,7 +395,8 @@ mod gemm {
     pub(crate) static HOUSEHOLDER_SKINNY_REJECTED: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     const HOUSEHOLDER_SKINNY_MIN_DIM: usize = 512;
-    const HOUSEHOLDER_SKINNY_MIN_FLOPS: u128 = 1 << 23;
+    const HOUSEHOLDER_SKINNY_MIN_ACTIVE: usize = 64;
+    const HOUSEHOLDER_SKINNY_MIN_FLOPS: u128 = 1 << 20;
 
     fn householder_skinny_parallel_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -407,8 +408,8 @@ mod gemm {
     fn should_parallelize_householder_skinny(m: usize, k: usize, n: usize) -> bool {
         let width = householder_panel_width();
         let is_panel_shape = n >= HOUSEHOLDER_SKINNY_MIN_DIM
-            && ((m == width && k >= HOUSEHOLDER_SKINNY_MIN_DIM)
-                || (k == width && m >= HOUSEHOLDER_SKINNY_MIN_DIM));
+            && ((m == width && k >= HOUSEHOLDER_SKINNY_MIN_ACTIVE)
+                || (k == width && m >= HOUSEHOLDER_SKINNY_MIN_ACTIVE));
         let admitted = householder_skinny_parallel_enabled()
             && rayon::current_num_threads() > 1
             && is_panel_shape
@@ -8900,11 +8901,6 @@ fn group_norm_backward_scalar_f32_general(
     (dx, dweight, dbias)
 }
 
-/// im2col gather for conv2d over a PADDED `[batch, in_ch, ph, pw]` input. Writes
-/// the panel `[batch·oh·ow, in_ch·kh·kw]` in patch-major, `(in_ch,kh,kw)`-minor
-/// order (matching the no-grad fast path bit-for-bit). Parallel over panel rows.
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 /// Whether `conv2d_backward_f64` computes `dweight` by STREAMING the im2col panel in
 /// `DGEMM_KC`-aligned k-tiles instead of materialising all of it.
 /// `frankentorch-hi9r6`.
@@ -9410,12 +9406,6 @@ pub fn take_conv2d_dweight_streamed_calls() -> u64 {
     CONV2D_DWEIGHT_STREAMED_CALLS.with(|c| c.replace(0))
 }
 
-/// `dweight[out_ch, patch_width] = dout_flat^T · im2col(padded)`, with the panel never
-/// materialised. See [`conv2d_dweight_streamed`] for why this is bit-exact.
-///
-/// Returns `None` when the shape cannot be tiled bit-exactly or is too small to be worth
-/// the tiling, so the caller keeps the panel route.
-#[allow(clippy::too_many_arguments)]
 /// Overrides for the streamed f64 dweight's tiling. `0` means the shipped heuristic.
 ///
 /// `frankentorch-06csx`. The f32 twin ships an n-split-first tiling worth 1.5468x paired on its
@@ -9448,6 +9438,12 @@ pub fn set_conv2d_dweight_min_nb_f64(min_nb: usize) -> usize {
     CONV2D_DWEIGHT_MIN_NB_F64.swap(min_nb, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `dweight[out_ch, patch_width] = dout_flat^T · im2col(padded)`, with the panel never
+/// materialised. See [`conv2d_dweight_streamed`] for why this is bit-exact.
+///
+/// Returns `None` when the shape cannot be tiled bit-exactly or is too small to be worth
+/// the tiling, so the caller keeps the panel route.
+#[allow(clippy::too_many_arguments)]
 fn conv2d_dweight_streamed_f64(
     dout_flat: &[f64],
     padded: &[f64],
@@ -9598,6 +9594,11 @@ fn conv2d_dweight_streamed_f64(
     Some(dweight)
 }
 
+/// im2col gather for conv2d over a PADDED `[batch, in_ch, ph, pw]` input. Writes
+/// the panel `[batch·oh·ow, in_ch·kh·kw]` in patch-major, `(in_ch,kh,kw)`-minor
+/// order (matching the no-grad fast path bit-for-bit). Parallel over panel rows.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn conv2d_im2col_f64(
     padded: &[f64],
     batch: usize,
@@ -9947,11 +9948,6 @@ pub fn conv2d_backward_dinput_direct_f32(
     )
 }
 
-/// Patch rows per `sgemm` call, from the same BYTE budget as the f64 path.
-///
-/// 576 KiB, so the block stays L2-resident; at f32's 4 bytes that is twice the rows the f64 path
-/// gets for the same footprint, which is the point of budgeting bytes rather than rows.
-#[must_use]
 /// Runtime override for the f32 dinput block budget; `0` means "use the shipped constant".
 ///
 /// The budget is a TUNING CONSTANT that has never been swept. `block_rows` is derived from it as
@@ -9992,6 +9988,11 @@ pub fn set_conv2d_dinput_budget_bytes_f32(bytes: usize) -> usize {
     CONV2D_DINPUT_BUDGET_BYTES_F32.swap(bytes, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Patch rows per `sgemm` call, from the same BYTE budget as the f64 path.
+///
+/// 576 KiB, so the block stays L2-resident; at f32's 4 bytes that is twice the rows the f64 path
+/// gets for the same footprint, which is the point of budgeting bytes rather than rows.
+#[must_use]
 fn conv2d_dinput_block_rows_f32(patch_width: usize) -> usize {
     const BUDGET_BYTES: usize = 576 * 1024;
     if patch_width == 0 {
@@ -31565,7 +31566,7 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
 /// two-stage path already owns a full row-major band from stage 1; staying in
 /// that layout avoids the packed conversion and replaces triangular-index
 /// column walks with fixed-stride row-major loads.
-#[allow(clippy::needless_range_loop)]
+#[allow(dead_code, clippy::needless_range_loop)]
 fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
     debug_assert!(lower.len() >= n * n);
     for i in (1..n).rev() {
