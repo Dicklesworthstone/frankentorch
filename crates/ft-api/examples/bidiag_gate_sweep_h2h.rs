@@ -269,6 +269,11 @@ struct Arm {
     /// Half-bandwidth for eigvalsh's opt-in full -> band -> tridiagonal path.
     /// `FT_TSB=0,32` compares the production packed sweep with the band-packed candidate.
     eigvalsh_two_stage_band: Option<usize>,
+    /// Whether the blocked Householder QR family (`geqrf`, `qr`, `orgqr`, `ormqr`) trims
+    /// panel `p`'s compact-WY GEMMs and workspaces to the active `(m - p)` rows (and `(n - p)`
+    /// columns in reverse Q accumulation). `FT_QAS=0,1,0` prices the active-submatrix path
+    /// against the full-m incumbent in one invocation against one live PyTorch.
+    qr_active_submatrix: Option<bool>,
 }
 
 fn arm_label(arm: Arm, op: LinalgOp) -> String {
@@ -388,6 +393,11 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
             Some(true) => "/Tskip",
             Some(false) => "/Tfull",
             None => "/TSHIPPED",
+        }
+        + match arm.qr_active_submatrix {
+            Some(true) => "/QASon",
+            Some(false) => "/QASoff",
+            None => "",
         }
 }
 
@@ -534,6 +544,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         .qr_cm_blocked_transpose
         .map(ft_kernel_cpu::set_qr_cm_blocked_transpose);
     let previous_qtf = arm.qr_panel_t_fast.map(ft_kernel_cpu::set_qr_panel_t_fast);
+    let previous_qas = arm
+        .qr_active_submatrix
+        .map(ft_kernel_cpu::set_qr_active_submatrix);
     let previous_btr = arm
         .eigh_bt_row_split
         .map(ft_kernel_cpu::set_eigh_bt_row_split);
@@ -615,6 +628,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_qtf {
             ft_kernel_cpu::set_qr_panel_t_fast(v);
         }
+        if let Some(v) = previous_qas {
+            ft_kernel_cpu::set_qr_active_submatrix(v);
+        }
         if let Some(v) = previous_btr {
             ft_kernel_cpu::set_eigh_bt_row_split(v);
         }
@@ -674,6 +690,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         }
         if let Some(v) = previous_qtf {
             ft_kernel_cpu::set_qr_panel_t_fast(v);
+        }
+        if let Some(v) = previous_qas {
+            ft_kernel_cpu::set_qr_active_submatrix(v);
         }
         if let Some(v) = previous_btr {
             ft_kernel_cpu::set_eigh_bt_row_split(v);
@@ -807,6 +826,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     }
     if let Some(v) = previous_qtf {
         ft_kernel_cpu::set_qr_panel_t_fast(v);
+    }
+    if let Some(v) = previous_qas {
+        ft_kernel_cpu::set_qr_active_submatrix(v);
     }
     if let Some(v) = previous_btr {
         ft_kernel_cpu::set_eigh_bt_row_split(v);
@@ -1010,6 +1032,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         Err(_) => vec![None],
     };
+    let qass: Vec<Option<bool>> = match std::env::var("FT_QAS") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
     let qrcs: Vec<Option<bool>> = match std::env::var("FT_QRC") {
         Ok(v) => v
             .split(',')
@@ -1187,7 +1220,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !form_p_blockeds.is_empty()
             && !panel_outputs.is_empty()
             && !gate_hoists.is_empty()
-            && !qtfs.is_empty(),
+            && !qtfs.is_empty()
+            && !qass.is_empty(),
         "empty grid"
     );
     let mut arms: Vec<Arm> =
@@ -1256,6 +1290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         qr_cm_blocked_transpose,
                                         qr_panel_t_fast,
                                         eigh_bt_row_split,
+                                        qr_active_submatrix: None,
                                     });
                                     }
                                     }
@@ -1316,6 +1351,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eigvalsh_ggs_reuse_e,
                     ..arm
                 })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            qass.iter().map(move |&qr_active_submatrix| Arm {
+                qr_active_submatrix,
+                ..arm
+            })
         })
         .collect();
     // FT_VALUES_ARM=1 appends ONE extra arm running the values-only entry, with the shipped

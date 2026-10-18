@@ -42302,7 +42302,17 @@ fn qr_blocked_forward_f64(
         } else {
             let mut vmat_full = vec![0.0f64; m * nb];
             qr_factor_panel_recursive_f64(
-                r_mat, m, n, p, 0, nb, nb, &mut vmat_full, &mut tau, tiny, leaf,
+                r_mat,
+                m,
+                n,
+                p,
+                0,
+                nb,
+                nb,
+                &mut vmat_full,
+                &mut tau,
+                tiny,
+                leaf,
             );
             if v_row0 > 0 {
                 vmat_full.drain(..v_row0 * nb);
@@ -53484,7 +53494,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The streamed dweight tiling must be correct at EVERY rayon width, not at this machine's.
     /// `frankentorch-vcxf7`.
     ///
@@ -53618,6 +53627,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn conv2d_dweight_streamed_matches_the_panel_gemm_bitwise() {
         let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
             .lock()
@@ -72969,7 +72979,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// `frankentorch-valnx`: the three PANEL formulations must agree BITWISE.
     ///
     /// Mode 1 fans the independent rows across the pool and mode 2 batches four rows over one
@@ -72982,7 +72991,6 @@ mod tests {
     /// n is chosen larger than NB=128 so more than one panel runs, and the shapes deliberately
     /// include a row count that is NOT a multiple of four, which is the remainder path mode 2
     /// would otherwise never execute.
-    #[test]
     /// `frankentorch-valnx`: the NB knob must be BEHAVIOUR-NEUTRAL at its default and CORRECT at
     /// every other width.
     ///
@@ -73130,6 +73138,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn cholesky_panel_modes_agree_bitwise() {
         for n in [130usize, 192, 259] {
             let mut a = vec![0.0f64; n * n];
@@ -73178,6 +73187,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn cholesky_blocked_phase_counters_cover_each_live_stage() {
         let _guard = STAGE_COUNTER_TEST_GUARD
             .lock()
@@ -76790,7 +76800,6 @@ mod tests {
     /// matrix put through the real reduction, NOT synthetic reflectors: random u, v are not
     /// valid tred2 output (u = v/h, h = ||v||^2/2 makes each operator orthogonal), and testing
     /// against synthetic ones manufactures divergence that is the fixture's, not the code's.
-    #[test]
     /// `frankentorch-wjrqt`: the four-outputs-in-flight `ggs` matvec must be BIT-IDENTICAL to
     /// the per-`j` loop it replaces.
     ///
@@ -79119,11 +79128,15 @@ mod tests {
                 }
             }
 
+            let k = m.min(n);
             for &reduced in &[true, false] {
+                let qcols = if reduced { k } else { m };
+                let mut full_r = a.clone();
+                let mut act_r = a.clone();
                 let prev_qas = super::set_qr_active_submatrix(false);
-                let (full_q, full_r) = super::qr_householder_panel_blocked(&a, m, n, reduced);
+                let full_q = super::qr_householder_panel_blocked(&mut full_r, m, n, k, qcols);
                 super::set_qr_active_submatrix(true);
-                let (act_q, act_r) = super::qr_householder_panel_blocked(&a, m, n, reduced);
+                let act_q = super::qr_householder_panel_blocked(&mut act_r, m, n, k, qcols);
                 super::set_qr_active_submatrix(prev_qas);
 
                 for (i, (f, g)) in full_q.iter().zip(&act_q).enumerate() {
@@ -79171,9 +79184,9 @@ mod tests {
                     let mut c_full = c_slice.to_vec();
                     let mut c_act = c_slice.to_vec();
                     let prev_qas = super::set_qr_active_submatrix(false);
-                    super::ormqr_blocked_f64(&packed, m, n, &tau[..k], k, &mut c_full, cr, cc, left, transpose);
+                    super::ormqr_blocked_f64(&packed, &tau[..k], m, n, k, &mut c_full, cr, cc, left, transpose);
                     super::set_qr_active_submatrix(true);
-                    super::ormqr_blocked_f64(&packed, m, n, &tau[..k], k, &mut c_act, cr, cc, left, transpose);
+                    super::ormqr_blocked_f64(&packed, &tau[..k], m, n, k, &mut c_act, cr, cc, left, transpose);
                     super::set_qr_active_submatrix(prev_qas);
 
                     for (i, (f, g)) in c_full.iter().zip(&c_act).enumerate() {
@@ -79189,4 +79202,3 @@ mod tests {
     }
     }
 }
-
