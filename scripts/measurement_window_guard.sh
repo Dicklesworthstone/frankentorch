@@ -40,6 +40,8 @@
 #
 #         scripts/measurement_window_guard.sh && <your timed run>
 #         scripts/measurement_window_guard.sh --max-load 30 && ...
+#         scripts/measurement_window_guard.sh --why
+#         scripts/guarded_run.sh <your timed run>
 #
 # NEVER PUT THIS IN A PIPELINE. `if guard 2>&1 | head -3; then <measure>; fi` tests the PIPELINE's
 # status, which is `head`'s, which is always 0 — so the guard prints REFUSING TO MEASURE and the
@@ -48,7 +50,8 @@
 # consume that, never the stdout:
 #
 #     guard >/dev/null 2>&1 || exit 1       # correct
-#     if guard >/dev/null 2>&1; then ...    # correct
+#     if guard --why; then ...              # correct (one-line refusal reason on stderr)
+#     scripts/guarded_run.sh <cmd...>       # correct (acquires window + runs guard)
 #     if guard 2>&1 | head -3; then ...     # SILENTLY DEFEATED
 #
 # Every scripted harness in this repo gets it right by calling the guard as a bare command; every
@@ -60,6 +63,7 @@ set -uo pipefail
 MAX_LOAD="${FT_GUARD_MAX_LOAD:-35}"
 MAX_IOWAIT="${FT_GUARD_MAX_IOWAIT:-10}"
 MAX_LOAD_RATIO="${FT_GUARD_MAX_LOAD_RATIO:-4}"
+WHY_ONLY=0
 
 # The stability limb lives in a library so the corpus replay exercises the shipping code path.
 # shellcheck source=lib/loadavg_spread_verdict.sh
@@ -67,6 +71,7 @@ MAX_LOAD_RATIO="${FT_GUARD_MAX_LOAD_RATIO:-4}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --max-load) MAX_LOAD="$2"; shift 2 ;;
+        --why) WHY_ONLY=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -140,12 +145,16 @@ mapfile -t HITS < <(
 )
 
 STATUS=0
+REASONS=()
 
 if [ "${#HITS[@]}" -gt 0 ]; then
-    echo "REFUSING TO MEASURE: ${#HITS[@]} peer measurement process(es) are live." >&2
-    for h in "${HITS[@]}"; do
-        echo "    $h" >&2
-    done
+    REASONS+=("peer-measurement(${#HITS[@]})")
+    if [ "$WHY_ONLY" -eq 0 ]; then
+        echo "REFUSING TO MEASURE: ${#HITS[@]} peer measurement process(es) are live." >&2
+        for h in "${HITS[@]}"; do
+            echo "    $h" >&2
+        done
+    fi
     STATUS=1
 fi
 
@@ -171,18 +180,24 @@ fi
 WINDOW_LOCK="${FT_H2H_WINDOW_LOCK:-/data/tmp/ft-h2h-window.lock}"
 if [ -z "${FT_H2H_WINDOW_OWNED:-}" ] && [ -e "$WINDOW_LOCK" ] && command -v flock >/dev/null 2>&1; then
     if ! flock -n "$WINDOW_LOCK" -c true >/dev/null 2>&1; then
-        echo "REFUSING TO MEASURE: the H2H window is held for the duration of another measurement." >&2
-        if [ -s "${WINDOW_LOCK}.holder" ]; then
-            echo "    holder: $(cat "${WINDOW_LOCK}.holder" 2>/dev/null)" >&2
+        REASONS+=("window-lock")
+        if [ "$WHY_ONLY" -eq 0 ]; then
+            echo "REFUSING TO MEASURE: the H2H window is held for the duration of another measurement." >&2
+            if [ -s "${WINDOW_LOCK}.holder" ]; then
+                echo "    holder: $(cat "${WINDOW_LOCK}.holder" 2>/dev/null)" >&2
+            fi
+            echo "    Take the window with: scripts/h2h_window.sh <your measurement>" >&2
         fi
-        echo "    Take the window with: scripts/h2h_window.sh <your measurement>" >&2
         STATUS=1
     fi
 fi
 
 LOAD1="$(cut -d' ' -f1 /proc/loadavg)"
 if awk -v l="$LOAD1" -v m="$MAX_LOAD" 'BEGIN { exit !(l > m) }'; then
-    echo "REFUSING TO MEASURE: 1-minute loadavg $LOAD1 exceeds $MAX_LOAD." >&2
+    REASONS+=("load1=${LOAD1}>${MAX_LOAD}")
+    if [ "$WHY_ONLY" -eq 0 ]; then
+        echo "REFUSING TO MEASURE: 1-minute loadavg $LOAD1 exceeds $MAX_LOAD." >&2
+    fi
     STATUS=1
 fi
 
@@ -201,7 +216,10 @@ IOWAIT_PCT="$(
         | awk '{ dt = $3 - $1; dw = $4 - $2; if (dt <= 0) print "0.0"; else printf "%.1f", 100 * dw / dt }'
 )"
 if awk -v w="$IOWAIT_PCT" -v m="$MAX_IOWAIT" 'BEGIN { exit !(w > m) }'; then
-    echo "REFUSING TO MEASURE: iowait ${IOWAIT_PCT}% exceeds ${MAX_IOWAIT}% — host is disk-bound." >&2
+    REASONS+=("iowait=${IOWAIT_PCT}%>${MAX_IOWAIT}%")
+    if [ "$WHY_ONLY" -eq 0 ]; then
+        echo "REFUSING TO MEASURE: iowait ${IOWAIT_PCT}% exceeds ${MAX_IOWAIT}% — host is disk-bound." >&2
+    fi
     STATUS=1
 fi
 
@@ -224,13 +242,24 @@ SPREAD_READING="$(loadavg_spread_exceeds "$LOAD1" "$LOAD5" "$LOAD15" "$MAX_LOAD_
 SPREAD_EXCEEDS=$?
 SPREAD_RATIO="$(echo "$SPREAD_READING" | cut -d' ' -f3)"
 if [ "$SPREAD_EXCEEDS" -eq 0 ]; then
-    echo "REFUSING TO MEASURE: loadavg $LOAD1 / $LOAD5 / $LOAD15 spread ${SPREAD_RATIO}x exceeds ${MAX_LOAD_RATIO}x (floor ${SPREAD_FLOOR}) — the host is still settling, quiet is not stable." >&2
+    REASONS+=("spread=${SPREAD_RATIO}x>${MAX_LOAD_RATIO}x")
+    if [ "$WHY_ONLY" -eq 0 ]; then
+        echo "REFUSING TO MEASURE: loadavg $LOAD1 / $LOAD5 / $LOAD15 spread ${SPREAD_RATIO}x exceeds ${MAX_LOAD_RATIO}x (floor ${SPREAD_FLOOR}) — the host is still settling, quiet is not stable." >&2
+    fi
     STATUS=1
 fi
 
 if [ "$STATUS" -ne 0 ]; then
-    echo "Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)" >&2
+    if [ "$WHY_ONLY" -ne 0 ]; then
+        echo "waiting: $(IFS=', '; echo "${REASONS[*]}") (loadavg $LOAD1/$LOAD5/$LOAD15, iowait ${IOWAIT_PCT}%)" >&2
+    else
+        echo "Guard FAILED — do source work and retry. (overrides: FT_GUARD_MAX_LOAD, FT_GUARD_MAX_IOWAIT, FT_GUARD_SPREAD_FLOOR)" >&2
+    fi
     exit "$STATUS"
 fi
 
-echo "guard PASS: no peer measurement detected, loadavg $LOAD1/$LOAD5/$LOAD15 (spread ${SPREAD_RATIO}x <= ${MAX_LOAD_RATIO}x, floor ${SPREAD_FLOOR}), iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"
+if [ "$WHY_ONLY" -ne 0 ]; then
+    echo "guard PASS: no peer measurement, loadavg $LOAD1/$LOAD5/$LOAD15 (spread ${SPREAD_RATIO}x <= ${MAX_LOAD_RATIO}x, floor ${SPREAD_FLOOR}), iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%" >&2
+else
+    echo "guard PASS: no peer measurement detected, loadavg $LOAD1/$LOAD5/$LOAD15 (spread ${SPREAD_RATIO}x <= ${MAX_LOAD_RATIO}x, floor ${SPREAD_FLOOR}), iowait ${IOWAIT_PCT}% <= ${MAX_IOWAIT}%"
+fi
