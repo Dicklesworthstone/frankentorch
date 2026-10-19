@@ -364,3 +364,7 @@
 {"host":"thinkstation1","torch":"2.12.0+cpu","lane":"conv2d_f32_masked_train_dwpanel","fingerprint":"4.498600e5","incumbent_ms":36.637491,"rounds":16,"lane_count":2,"recorded_unix":1792385149}
 {"host":"thinkstation1","torch":"2.12.0+cpu","lane":"conv2d_f32_masked_train","fingerprint":"4.498600e5","incumbent_ms":35.841839,"rounds":24,"lane_count":2,"recorded_unix":1792385238}
 {"host":"thinkstation1","torch":"2.12.0+cpu","lane":"conv2d_f32_masked_train_dwpanel","fingerprint":"4.498600e5","incumbent_ms":35.701495,"rounds":24,"lane_count":2,"recorded_unix":1792385238}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"max_pool1d_dense","fingerprint":"2.637742e5","incumbent_ms":12.302778,"rounds":24,"lane_count":2,"recorded_unix":1792441511}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"max_pool1d_nopool_dense","fingerprint":"2.637742e5","incumbent_ms":12.219417,"rounds":24,"lane_count":2,"recorded_unix":1792441511}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32","fingerprint":"6.565040e6","incumbent_ms":15.480009,"rounds":16,"lane_count":2,"recorded_unix":1792441747}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_kernels","fingerprint":"6.565040e6","incumbent_ms":15.261763,"rounds":16,"lane_count":2,"recorded_unix":1792441747}
