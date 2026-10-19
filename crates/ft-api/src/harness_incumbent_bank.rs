@@ -258,18 +258,15 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
                 out,
                 "  incumbent_mode lane={lane} drawn={drawn_ms:.3} ms  SINGLE LEVEL (n={}, \
                  median {:.3}, range [{:.3}, {:.3}], spread {:.2}x) — no second level banked for \
-                 this lane, so this row is comparable to the other {}.{}",
+                 this lane, so this row is comparable to the other {}.{}{}",
                 level.n,
                 level.median,
                 level.min,
                 level.max,
                 level.spread(),
                 level.n.saturating_sub(1),
-                format!(
-                    "{}{}",
-                    span_caveat(records, false),
-                    concurrent_writer_note(records)
-                )
+                span_caveat(records, false),
+                concurrent_writer_note(records)
             );
         }
         ModeReport::Split {
@@ -309,13 +306,10 @@ pub fn render(lane: &str, report: &ModeReport, records: &[(f64, u64)]) -> String
                  KNOWN TO BE THE CORRECT ONE and the harness does not assert one: on conv2d_big \
                  the ~6 ms level was 1 of 8 observations in 2026-08 and 20 of 22 in 2026-09, so \
                  a disagreement with the majority is a NO-VERDICT, not a correction. A standing \
-                 whose SIGN differs between the levels must not be banked from one invocation.{}",
+                 whose SIGN differs between the levels must not be banked from one invocation.{}{}",
                 if *drawn == 0 { "A" } else { "B" },
-                format!(
-                    "{}{}",
-                    span_caveat(records, true),
-                    concurrent_writer_note(records)
-                )
+                span_caveat(records, true),
+                concurrent_writer_note(records)
             );
         }
     }
@@ -370,8 +364,6 @@ pub fn history_span_seconds(records: &[(f64, u64)]) -> u64 {
     }
 }
 
-/// The sentence that qualifies a SINGLE-level verdict by how much time the bank covers.
-#[must_use]
 /// The sentence that qualifies a verdict by how much time the bank covers.
 ///
 /// `found_split` matters: a bank narrower than an hour weakens a SINGLE-level verdict, because
@@ -799,8 +791,8 @@ mod tests {
 
     #[test]
     fn a_last_ulp_checksum_wobble_does_not_fork_the_key() {
-        let a = IncumbentKey::new("h", "2.12.1+cpu", "lane", 1234.567_890_123);
-        let b = IncumbentKey::new("h", "2.12.1+cpu", "lane", 1234.567_890_124);
+        let a = IncumbentKey::new("h", "2.12.1+cpu", "lane", 1_234.567_890_123);
+        let b = IncumbentKey::new("h", "2.12.1+cpu", "lane", 1_234.567_890_124);
         assert_eq!(a, b);
     }
 

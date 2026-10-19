@@ -48,9 +48,8 @@ unsafe fn quantize_scaled_row(dst: &mut [i8], row: &[f32], scale: f32) {
         unsafe {
             let values = _mm512_loadu_ps(row.as_ptr().add(index));
             let scaled = _mm512_div_ps(values, scale_vector);
-            let integral = _mm512_roundscale_ps::<
-                { _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC },
-            >(scaled);
+            let integral =
+                _mm512_roundscale_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(scaled);
             _mm512_storeu_ps(rounded.as_mut_ptr(), integral);
         }
         for (dst, value) in dst[index..index + 16].iter_mut().zip(rounded) {
@@ -122,10 +121,18 @@ pub(super) fn try_linear(
             // at compile time, including the final 1/2/3-row tail.
             unsafe {
                 match rows {
-                    1 => block_vnni::<1>(input, scales, k, weights, w_scales, &sums, n, bias, output),
-                    2 => block_vnni::<2>(input, scales, k, weights, w_scales, &sums, n, bias, output),
-                    3 => block_vnni::<3>(input, scales, k, weights, w_scales, &sums, n, bias, output),
-                    4 => block_vnni::<4>(input, scales, k, weights, w_scales, &sums, n, bias, output),
+                    1 => {
+                        block_vnni::<1>(input, scales, k, weights, w_scales, &sums, n, bias, output)
+                    }
+                    2 => {
+                        block_vnni::<2>(input, scales, k, weights, w_scales, &sums, n, bias, output)
+                    }
+                    3 => {
+                        block_vnni::<3>(input, scales, k, weights, w_scales, &sums, n, bias, output)
+                    }
+                    4 => {
+                        block_vnni::<4>(input, scales, k, weights, w_scales, &sums, n, bias, output)
+                    }
                     _ => unreachable!("invalid int8 row tile"),
                 }
             }
@@ -258,11 +265,15 @@ mod tests {
                     let a = vec![a_value; k];
                     let b = vec![b_value; k];
                     let sum = i32::from(b_value) * i32::try_from(k).unwrap();
-                    let expected = i64::from(a_value) * i64::from(b_value)
-                        * i64::try_from(k).unwrap();
+                    let expected =
+                        i64::from(a_value) * i64::from(b_value) * i64::try_from(k).unwrap();
                     // SAFETY: ISA checked, lengths equal, k is within bound.
                     let actual = unsafe { dot_with_sum(&a, &b, sum) };
-                    assert_eq!(i64::from(actual), expected, "k={k}, a={a_value}, b={b_value}");
+                    assert_eq!(
+                        i64::from(actual),
+                        expected,
+                        "k={k}, a={a_value}, b={b_value}"
+                    );
                 }
             }
         }
@@ -275,10 +286,18 @@ mod tests {
         }
         assert!(RowQuantizer::detect().is_some());
         for rows in 1..MIN_ROWS_FOR_PRECOMPUTE {
-            assert!(try_linear(
-                &vec![1; rows * 64], &vec![1.0; rows], 64,
-                &[1; 256], &[1.0; 4], 4, None,
-            ).is_none());
+            assert!(
+                try_linear(
+                    &vec![1; rows * 64],
+                    &vec![1.0; rows],
+                    64,
+                    &[1; 256],
+                    &[1.0; 4],
+                    4,
+                    None,
+                )
+                .is_none()
+            );
         }
         let result = try_linear(&[1; 512], &[1.0; 8], 64, &[1; 256], &[1.0; 4], 4, None);
         assert_eq!(result, Some(vec![64.0; 32]));
