@@ -51,10 +51,14 @@ fn main() {
     }
     eprintln!(
         "PROV host={} nproc={} rayon={} reps={reps} loadavg={}",
-        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .trim(),
     );
 
     let values: Vec<f32> = (0..BATCH * IN_CH * H * W)
@@ -121,7 +125,11 @@ fn main() {
             gw_on
         );
         assert_eq!(mismatches, 0, "reuse path changed the input gradient");
-        assert_eq!(gw_off.to_bits(), gw_on.to_bits(), "reuse path changed the weight gradient");
+        assert_eq!(
+            gw_off.to_bits(),
+            gw_on.to_bits(),
+            "reuse path changed the weight gradient"
+        );
     }
 
     let mut total = f64::INFINITY;
@@ -231,20 +239,34 @@ fn main() {
                 t_tape_custom_prepare.min(machinery.custom_function_prepare_ns as f64 / 1e6);
             t_tape_custom_callback =
                 t_tape_custom_callback.min(machinery.custom_function_callback_ns as f64 / 1e6);
-            t_tape_custom_accumulate = t_tape_custom_accumulate
-                .min(machinery.custom_function_accumulate_ns as f64 / 1e6);
-            t_tape_custom_dependency = t_tape_custom_dependency
-                .min(machinery.custom_function_dependency_ns as f64 / 1e6);
+            t_tape_custom_accumulate =
+                t_tape_custom_accumulate.min(machinery.custom_function_accumulate_ns as f64 / 1e6);
+            t_tape_custom_dependency =
+                t_tape_custom_dependency.min(machinery.custom_function_dependency_ns as f64 / 1e6);
         }
     }
 
     let accounted = t_fwd + t_mul + t_sum + t_bwd;
-    eprintln!("TRAIN b={BATCH} ci={IN_CH} co={OUT_CH} {H}x{W} k{K}x{K}  (min after discarding the first)");
+    eprintln!(
+        "TRAIN b={BATCH} ci={IN_CH} co={OUT_CH} {H}x{W} k{K}x{K}  (min after discarding the first)"
+    );
     eprintln!("TRAIN   lane total (fwd+mul+sum+bwd)   {total:8.3} ms");
-    eprintln!("TRAIN     functional_conv2d (pad+fwd)  {t_fwd:8.3} ms  ({:5.1}%)", 100.0 * t_fwd / total);
-    eprintln!("TRAIN     tensor_mul (mask)            {t_mul:8.3} ms  ({:5.1}%)", 100.0 * t_mul / total);
-    eprintln!("TRAIN     tensor_sum                   {t_sum:8.3} ms  ({:5.1}%)", 100.0 * t_sum / total);
-    eprintln!("TRAIN     tensor_backward (tape walk)  {t_bwd:8.3} ms  ({:5.1}%)", 100.0 * t_bwd / total);
+    eprintln!(
+        "TRAIN     functional_conv2d (pad+fwd)  {t_fwd:8.3} ms  ({:5.1}%)",
+        100.0 * t_fwd / total
+    );
+    eprintln!(
+        "TRAIN     tensor_mul (mask)            {t_mul:8.3} ms  ({:5.1}%)",
+        100.0 * t_mul / total
+    );
+    eprintln!(
+        "TRAIN     tensor_sum                   {t_sum:8.3} ms  ({:5.1}%)",
+        100.0 * t_sum / total
+    );
+    eprintln!(
+        "TRAIN     tensor_backward (tape walk)  {t_bwd:8.3} ms  ({:5.1}%)",
+        100.0 * t_bwd / total
+    );
     eprintln!(
         "TRAIN   accounted {:5.1}%   unattributed {:8.3} ms",
         100.0 * accounted / total,
@@ -279,7 +301,9 @@ fn main() {
     eprintln!(
         "TRAIN       CUSTOM detail: prepare {t_tape_custom_prepare:8.3} ms | callback {t_tape_custom_callback:8.3} ms | accumulate {t_tape_custom_accumulate:8.3} ms | dependency {t_tape_custom_dependency:8.3} ms"
     );
-    eprintln!("TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms");
+    eprintln!(
+        "TRAIN   [outside the lane clock] leaf build {t_build:8.3} ms | grad read+checksum {t_grad:8.3} ms"
+    );
 
     // THE ALLOCATOR-WARMTH TEST -- `frankentorch-t1gph`, ledger 283d.
     //
@@ -362,7 +386,11 @@ fn main() {
         }
         let med = |v: &mut Vec<f64>| -> f64 {
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let r = med(&mut recompute.clone());
         let pl = med(&mut plain.clone());
@@ -374,7 +402,11 @@ fn main() {
             "TRAIN_PRIME   priming recovered {:+.3} ms of the {:+.3} ms the reuse arm gives up vs recompute in the backward  ({:.0}%)",
             pl - pr,
             pl - r,
-            if (pl - r).abs() > 1e-9 { 100.0 * (pl - pr) / (pl - r) } else { 0.0 }
+            if (pl - r).abs() > 1e-9 {
+                100.0 * (pl - pr) / (pl - r)
+            } else {
+                0.0
+            }
         );
     }
 
@@ -442,7 +474,11 @@ fn main() {
         }
         let median = |v: &mut Vec<f64>| -> f64 {
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let mut ratios: Vec<f64> = ungated.iter().zip(&gated).map(|(a, b)| a / b).collect();
         let paired = median(&mut ratios);
@@ -456,7 +492,11 @@ fn main() {
         eprintln!(
             "WIDEN_GATE   paired {paired:.4}x (gated faster if >1)   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
             ungated.len(),
-            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+            if (0.97..=1.03).contains(&null) {
+                "PASS"
+            } else {
+                "FAIL -- discard this row"
+            }
         );
     }
 
@@ -509,7 +549,11 @@ fn main() {
             let (calls, elems) = probe(with_mask, wg);
             eprintln!(
                 "NARROW_ROUTE {name}  narrow calls {calls}  elements {elems}{}",
-                if calls == 0 { "   <- UNREACHED: gate is correctness only, no perf claim" } else { "" }
+                if calls == 0 {
+                    "   <- UNREACHED: gate is correctness only, no perf claim"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -576,7 +620,11 @@ fn main() {
         }
         let median = |v: &mut Vec<f64>| -> f64 {
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let mut ratios: Vec<f64> = off_l.iter().zip(&on_l).map(|(a, b)| a / b).collect();
         let paired = median(&mut ratios);
@@ -594,7 +642,11 @@ fn main() {
             "TRAIN_NARROW   marginal {:.4}x   paired {paired:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
             olm / onm,
             off_l.len(),
-            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+            if (0.97..=1.03).contains(&null) {
+                "PASS"
+            } else {
+                "FAIL -- discard this row"
+            }
         );
     }
 
@@ -670,7 +722,11 @@ fn main() {
         }
         let median = |v: &mut Vec<f64>| -> f64 {
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let mut ratios: Vec<f64> = off_l.iter().zip(&on_l).map(|(a, b)| a / b).collect();
         let paired = median(&mut ratios);
@@ -688,7 +744,11 @@ fn main() {
             "TRAIN_AB   marginal {:.4}x   paired {paired:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
             olm / onm,
             off_l.len(),
-            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+            if (0.97..=1.03).contains(&null) {
+                "PASS"
+            } else {
+                "FAIL -- discard this row"
+            }
         );
         // WHERE THE SHED TIME WENT. Each neighbouring frame is measured, not inferred.
         let ofm = median(&mut off_f.clone());

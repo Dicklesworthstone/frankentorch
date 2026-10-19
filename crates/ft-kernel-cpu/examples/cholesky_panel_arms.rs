@@ -97,7 +97,10 @@ fn main() {
         host.trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     println!(
         "PREDICTION REGISTERED: a panel column is ~2,730 MACs / ~6.7 us and a rayon fork is ~7 us \
@@ -106,7 +109,14 @@ fn main() {
     );
     println!(
         "\n{:>5} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8}",
-        "nb", "serial ms", "par ms", "lvl2 ms", "ser GF/s", "par GF/s", "lvl2 GF/s", "par x",
+        "nb",
+        "serial ms",
+        "par ms",
+        "lvl2 ms",
+        "ser GF/s",
+        "par GF/s",
+        "lvl2 GF/s",
+        "par x",
         "lvl2 x"
     );
 

@@ -136,7 +136,11 @@ fn main() {
                 continue;
             }
             let times = interleaved::run(3, reps, 2, |i| {
-                ft_kernel_cpu::set_householder_panel_width(if i == 1 { ROUTE_OFF_WIDTH } else { 0 });
+                ft_kernel_cpu::set_householder_panel_width(if i == 1 {
+                    ROUTE_OFF_WIDTH
+                } else {
+                    0
+                });
                 let started = std::time::Instant::now();
                 if op == "orgqr" {
                     let q = ft_kernel_cpu::orgqr_blocked_f64(&packed, &tau, n, n, n);
@@ -163,7 +167,12 @@ fn main() {
                 interleaved::iqr_ratio(&times[0]),
                 gate - 1.0
             );
-            println!("    {:>12} {:>10} {}", "arm", "median", interleaved::Verdict::header());
+            println!(
+                "    {:>12} {:>10} {}",
+                "arm",
+                "median",
+                interleaved::Verdict::header()
+            );
             for i in 0..3 {
                 let trust = if i == 0 {
                     format!("{:>9} {:>9} {:>8} {:>8}  incumbent", "-", "-", "-", "-")

@@ -87,10 +87,8 @@ const INCUMBENT_THREADS: usize = 8;
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
     BALANCED_SQUARE, MAX_NULL_CI_WIDTH, NULL_PERMUTATION_DRAWS, QUIT_REQUEST, READY_MARKER,
-    TIMED_STEPS,
-    TIMED_STEPS_MARKER, adjudicate_null, parse_sample_line, parse_timed_steps,
-    permutation_null_band, sample_request,
-    timed_region_disagreement,
+    TIMED_STEPS, TIMED_STEPS_MARKER, adjudicate_null, parse_sample_line, parse_timed_steps,
+    permutation_null_band, sample_request, timed_region_disagreement,
 };
 use ft_core::{DType, ExecutionMode, TensorMeta};
 
@@ -371,9 +369,7 @@ fn balanced_null_is_centered(point: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        balanced_null_is_centered, group_norm_dense_dy, median, timed_conv3d,
-    };
+    use super::{balanced_null_is_centered, group_norm_dense_dy, median, timed_conv3d};
 
     #[test]
     fn balanced_square_overall_median_matches_python_statistics_median() {
@@ -382,8 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn balanced_square_pair_median_matches_python_statistics_median() {
-    }
+    fn balanced_square_pair_median_matches_python_statistics_median() {}
 
     #[test]
     fn balanced_square_null_requires_a_centred_point_estimate() {
@@ -1133,6 +1128,12 @@ fn timed_conv2d(
     (elapsed, checksum)
 }
 
+thread_local! {
+    /// Milliseconds the kernels-only conv2d f32 lane spent on its hand-rolled pad, which is inside
+    /// its timed region but is NOT kernel work. See `timed_conv2d_f32_kernels`.
+    static CONV2D_F32_KERNELS_PAD_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
 /// conv2d f32 train step — `frankentorch-hi9r6`, item 191. The dtype twin of [`timed_conv2d`],
 /// and the only lane that can price items 179, 181, 185 and 187.
 ///
@@ -1187,12 +1188,6 @@ fn timed_conv2d(
 /// The all-ones `dout` mirrors the summed loss the paired lane uses. `conv2d_backward_f32` picks
 /// its route from `conv2d_ones_dout_route`, so passing ones takes the same route the session's
 /// backward takes rather than a different one.
-thread_local! {
-    /// Milliseconds the kernels-only conv2d f32 lane spent on its hand-rolled pad, which is inside
-    /// its timed region but is NOT kernel work. See `timed_conv2d_f32_kernels`.
-    static CONV2D_F32_KERNELS_PAD_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
-}
-
 fn timed_conv2d_f32_kernels(
     values: &[f32],
     weights: &[f32],
@@ -1451,8 +1446,22 @@ fn timed_conv2d_masked_train_kernels(
     let ones_dout = vec![1.0f64; batch * C2_CO * C2_H * C2_W];
     let bwd_started = Instant::now();
     let (dpadded, _dweight, _dbias) = ft_kernel_cpu::conv2d_backward_mask_fused_f64(
-        &ones_dout, mask, &padded, weights, batch, C2_CI, ph, pw, C2_K, C2_K, C2_H, C2_W, 1, 1,
-        C2_CO, [true, true, false],
+        &ones_dout,
+        mask,
+        &padded,
+        weights,
+        batch,
+        C2_CI,
+        ph,
+        pw,
+        C2_K,
+        C2_K,
+        C2_H,
+        C2_W,
+        1,
+        1,
+        C2_CO,
+        [true, true, false],
     );
     let dpadded = dpadded.expect("dinput requested");
     let bwd_ms = bwd_started.elapsed().as_secs_f64() * 1_000.0;
@@ -2698,15 +2707,11 @@ LANES = {
             // Same `gnx` fixture as the group_norm rows so the two families are directly
             // comparable on identical bytes.
             "inplace_neg_f32",
-            Box::new(|| {
-                timed_inplace_f32(&gnx, |s, x| s.tensor_neg_(x).expect("neg_ f32"))
-            }),
+            Box::new(|| timed_inplace_f32(&gnx, |s, x| s.tensor_neg_(x).expect("neg_ f32"))),
         ),
         (
             "inplace_exp_f32",
-            Box::new(|| {
-                timed_inplace_f32(&gnx, |s, x| s.tensor_exp_(x).expect("exp_ f32"))
-            }),
+            Box::new(|| timed_inplace_f32(&gnx, |s, x| s.tensor_exp_(x).expect("exp_ f32"))),
         ),
         (
             "inplace_mul_f32",
@@ -3177,14 +3182,32 @@ LANES = {
             // frankentorch-58zjz: in_features > 4*out_features, so dgemm_tb's column gate
             // ENGAGES here (m=128, n=1024: n > 4m, and m*k*n = 67M > 16.8M).
             "linear_wide",
-            Box::new(|| timed_linear(&linx_wide, &linw_wide, LIN_B_WIDE, LIN_IN, LIN_OUT_WIDE, false)),
+            Box::new(|| {
+                timed_linear(
+                    &linx_wide,
+                    &linw_wide,
+                    LIN_B_WIDE,
+                    LIN_IN,
+                    LIN_OUT_WIDE,
+                    false,
+                )
+            }),
         ),
         (
             // The same op on the OTHER side of that gate (m=512, n=1024: n > 4m is false), so
             // item 119's path does NOT engage. Carried so the pair says where the change acts
             // rather than implying it acts everywhere.
             "linear_narrow",
-            Box::new(|| timed_linear(&linx_narrow, &linw_narrow, LIN_B_NARROW, LIN_IN, LIN_OUT_NARROW, false)),
+            Box::new(|| {
+                timed_linear(
+                    &linx_narrow,
+                    &linw_narrow,
+                    LIN_B_NARROW,
+                    LIN_IN,
+                    LIN_OUT_NARROW,
+                    false,
+                )
+            }),
         ),
         (
             "attention",
@@ -3201,11 +3224,29 @@ LANES = {
         // the only figure from these lanes that survives a bimodal incumbent.
         (
             "linear_wide_dense",
-            Box::new(|| timed_linear(&linx_wide, &linw_wide, LIN_B_WIDE, LIN_IN, LIN_OUT_WIDE, true)),
+            Box::new(|| {
+                timed_linear(
+                    &linx_wide,
+                    &linw_wide,
+                    LIN_B_WIDE,
+                    LIN_IN,
+                    LIN_OUT_WIDE,
+                    true,
+                )
+            }),
         ),
         (
             "linear_narrow_dense",
-            Box::new(|| timed_linear(&linx_narrow, &linw_narrow, LIN_B_NARROW, LIN_IN, LIN_OUT_NARROW, true)),
+            Box::new(|| {
+                timed_linear(
+                    &linx_narrow,
+                    &linw_narrow,
+                    LIN_B_NARROW,
+                    LIN_IN,
+                    LIN_OUT_NARROW,
+                    true,
+                )
+            }),
         ),
         (
             "attention_dense",
@@ -3713,8 +3754,7 @@ LANES = {
             // recorded slot is warm and the comparison starts at slot 0. Same rule either way:
             // FIRST WARM against LAST.
             let first_warm = usize::from(round_warmup == 0);
-            ft_round_slots[index]
-                .push([ft_slots[0], ft_slots[1], ft_slots[2], ft_slots[3]]);
+            ft_round_slots[index].push([ft_slots[0], ft_slots[1], ft_slots[2], ft_slots[3]]);
             pt_round_slots[index].push([
                 incumbent_slots[0],
                 incumbent_slots[1],
@@ -3723,8 +3763,11 @@ LANES = {
             ]);
             pt_first_half[index].push(incumbent_slots[first_warm]);
             pt_second_half[index].push(incumbent_slots[3]);
-            let pt_tail_median =
-                median(vec![incumbent_slots[1], incumbent_slots[2], incumbent_slots[3]]);
+            let pt_tail_median = median(vec![
+                incumbent_slots[1],
+                incumbent_slots[2],
+                incumbent_slots[3],
+            ]);
             if pt_tail_median > 0.0 {
                 pt_slot0_ratio[index].push(incumbent_slots[0] / pt_tail_median);
             }
@@ -4092,8 +4135,7 @@ LANES = {
         );
         let incumbent_records =
             ft_api::harness_incumbent_bank::load_records(&incumbent_bank_path, &incumbent_key);
-        let incumbent_priors: Vec<f64> =
-            incumbent_records.iter().map(|(ms, _)| *ms).collect();
+        let incumbent_priors: Vec<f64> = incumbent_records.iter().map(|(ms, _)| *ms).collect();
         let incumbent_mode = ft_api::harness_incumbent_bank::classify(
             &incumbent_priors,
             pt_ms,
@@ -4101,7 +4143,9 @@ LANES = {
         );
         println!(
             "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} PT {} {pt_null_ratio:.3} perm[{pt_perm_lo:.3},{pt_perm_hi:.3}] [{pt_null_lo:.3},{pt_null_hi:.3}] FT {} {ft_null_ratio:.3} perm[{ft_perm_lo:.3},{ft_perm_hi:.3}] [{ft_null_lo:.3},{ft_null_hi:.3}] ratio {ratio:.3} [{ratio_lo:.3},{ratio_hi:.3}] {parity}{}",
-            pt_null_label, ft_null_label, incumbent_mode.row_tag(),
+            pt_null_label,
+            ft_null_label,
+            incumbent_mode.row_tag(),
         );
         // Legacy verdict, printed for continuity with every row banked before mdsmm.1: the fixed
         // +/-0.02 band. It is NO LONGER the gate — it rejects 41% of provably clean arms — but a

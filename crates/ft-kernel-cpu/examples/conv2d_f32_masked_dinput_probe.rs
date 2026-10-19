@@ -51,10 +51,14 @@ fn main() {
     }
     eprintln!(
         "PROV host={} nproc={} rayon={} loadavg={}",
-        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .trim(),
     );
 
     let padded: Vec<f32> = (0..BATCH * IN_CH * PH * PW)
@@ -179,7 +183,21 @@ fn main() {
         // non-uniform mask, so the all-ones route is not taken.
         let start = Instant::now();
         let b = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            &ones,
+            &mask,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            PH,
+            PW,
+            K,
+            K,
+            H,
+            W,
+            1,
+            1,
+            OUT_CH,
             [true, true, false],
         );
         let t_both = start.elapsed().as_secs_f64() * 1e3;
@@ -187,7 +205,21 @@ fn main() {
 
         let start = Instant::now();
         let c = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            &ones,
+            &mask,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            PH,
+            PW,
+            K,
+            K,
+            H,
+            W,
+            1,
+            1,
+            OUT_CH,
             [true, false, false],
         );
         let t_din = start.elapsed().as_secs_f64() * 1e3;
@@ -195,7 +227,21 @@ fn main() {
 
         let start = Instant::now();
         let d = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            &ones,
+            &mask,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            PH,
+            PW,
+            K,
+            K,
+            H,
+            W,
+            1,
+            1,
+            OUT_CH,
             [false, true, false],
         );
         let t_dw = start.elapsed().as_secs_f64() * 1e3;
@@ -204,7 +250,21 @@ fn main() {
         let previous_stream = ft_kernel_cpu::set_conv2d_dweight_streamed(false);
         let start = Instant::now();
         let dwl = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            &ones,
+            &mask,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            PH,
+            PW,
+            K,
+            K,
+            H,
+            W,
+            1,
+            1,
+            OUT_CH,
             [false, true, false],
         );
         let t_dw_legacy = start.elapsed().as_secs_f64() * 1e3;
@@ -212,16 +272,12 @@ fn main() {
         ft_kernel_cpu::set_conv2d_dweight_streamed(previous_stream);
 
         let start = Instant::now();
-        let ic = ft_kernel_cpu::conv2d_im2col_f32(
-            &padded, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1,
-        );
+        let ic = ft_kernel_cpu::conv2d_im2col_f32(&padded, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1);
         let t_im2col = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&ic);
 
         let start = Instant::now();
-        let sc = ft_kernel_cpu::conv2d_col2im_f32(
-            &dpanel, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1,
-        );
+        let sc = ft_kernel_cpu::conv2d_col2im_f32(&dpanel, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1);
         let t_col2im = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&sc);
 
@@ -235,7 +291,21 @@ fn main() {
         let previous_legacy = ft_kernel_cpu::set_conv2d_dinput_panel_legacy(true);
         let start = Instant::now();
         let f = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-            &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            &ones,
+            &mask,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            PH,
+            PW,
+            K,
+            K,
+            H,
+            W,
+            1,
+            1,
+            OUT_CH,
             [true, false, false],
         );
         let t_legacy = start.elapsed().as_secs_f64() * 1e3;
@@ -244,7 +314,21 @@ fn main() {
 
         let start = Instant::now();
         let e = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-            &ones, &ones_mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+            &ones,
+            &ones_mask,
+            &padded,
+            &weight,
+            BATCH,
+            IN_CH,
+            PH,
+            PW,
+            K,
+            K,
+            H,
+            W,
+            1,
+            1,
+            OUT_CH,
             [true, true, false],
         );
         let t_ones_mask = start.elapsed().as_secs_f64() * 1e3;
@@ -271,14 +355,34 @@ fn main() {
     // frame carrying the f32 deficit, and it has never been swept. Swept BELOW the shipped value
     // as well as above, per `feedback_tuning_grid_missing_the_winner`.
     let mut budget_rows: Vec<(usize, f64)> = Vec::new();
-    for &budget in &[128 * 1024usize, 256 * 1024, 576 * 1024, 1024 * 1024, 2048 * 1024, 4096 * 1024]
-    {
+    for &budget in &[
+        128 * 1024usize,
+        256 * 1024,
+        576 * 1024,
+        1024 * 1024,
+        2048 * 1024,
+        4096 * 1024,
+    ] {
         let previous = ft_kernel_cpu::set_conv2d_dinput_budget_bytes_f32(budget);
         let mut best = f64::INFINITY;
         for rep in 0..reps {
             let start = Instant::now();
             let r = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                &ones,
+                &mask,
+                &padded,
+                &weight,
+                BATCH,
+                IN_CH,
+                PH,
+                PW,
+                K,
+                K,
+                H,
+                W,
+                1,
+                1,
+                OUT_CH,
                 [true, false, false],
             );
             let t = start.elapsed().as_secs_f64() * 1e3;
@@ -291,7 +395,11 @@ fn main() {
         budget_rows.push((budget, best));
     }
     for (budget, ms) in &budget_rows {
-        let shipped = if *budget == 576 * 1024 { "  <- SHIPPED" } else { "" };
+        let shipped = if *budget == 576 * 1024 {
+            "  <- SHIPPED"
+        } else {
+            ""
+        };
         eprintln!(
             "F32_DINPUT BUDGET {:>5} KiB -> block_rows {:>5}  dinput {:8.3} ms{}",
             budget / 1024,
@@ -398,8 +506,7 @@ fn main() {
                     for oc in 0..OUT_CH {
                         let base = (n * OUT_CH + oc) * patch_count_t;
                         for patch in p0..p1 {
-                            plane[patch * OUT_CH + oc] =
-                                ones[base + patch] * mask[base + patch];
+                            plane[patch * OUT_CH + oc] = ones[base + patch] * mask[base + patch];
                         }
                     }
                     p0 = p1;
@@ -464,7 +571,21 @@ fn main() {
         for rep in 0..reps {
             let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                &ones,
+                &mask,
+                &padded,
+                &weight,
+                BATCH,
+                IN_CH,
+                PH,
+                PW,
+                K,
+                K,
+                H,
+                W,
+                1,
+                1,
+                OUT_CH,
                 [false, true, false],
             );
             std::hint::black_box(&out);
@@ -528,7 +649,20 @@ fn main() {
                 };
                 let start = Instant::now();
                 let out = ft_kernel_cpu::conv2d_backward_mask_fused_f64(
-                    &ones64, &mask64, &padded64, &weight64, B64, IN_CH, PH, PW, K, K, H, W, 1, 1,
+                    &ones64,
+                    &mask64,
+                    &padded64,
+                    &weight64,
+                    B64,
+                    IN_CH,
+                    PH,
+                    PW,
+                    K,
+                    K,
+                    H,
+                    W,
+                    1,
+                    1,
                     OUT_CH,
                     [true, true, false],
                 );
@@ -558,7 +692,11 @@ fn main() {
             }
             let median = |v: &mut Vec<f64>| -> f64 {
                 v.sort_by(f64::total_cmp);
-                if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+                if v.is_empty() {
+                    f64::NAN
+                } else {
+                    v[v.len() / 2]
+                }
             };
             let mut ratios: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
             let paired = median(&mut ratios);
@@ -573,7 +711,11 @@ fn main() {
                 "F64_NSPLIT   marginal {:.4}x   paired {paired:.4}x   SIGN TEST {wins}/{}   A/A null {null:.4} {}",
                 off_m / on_m,
                 off_v.len(),
-                if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+                if (0.97..=1.03).contains(&null) {
+                    "PASS"
+                } else {
+                    "FAIL -- discard this row"
+                }
             );
         }
 
@@ -584,7 +726,20 @@ fn main() {
             for rep in 0..reps {
                 let start = Instant::now();
                 let out = ft_kernel_cpu::conv2d_backward_mask_fused_f64(
-                    &ones64, &mask64, &padded64, &weight64, B64, IN_CH, PH, PW, K, K, H, W, 1, 1,
+                    &ones64,
+                    &mask64,
+                    &padded64,
+                    &weight64,
+                    B64,
+                    IN_CH,
+                    PH,
+                    PW,
+                    K,
+                    K,
+                    H,
+                    W,
+                    1,
+                    1,
                     OUT_CH,
                     [false, true, false],
                 );
@@ -612,7 +767,10 @@ fn main() {
     {
         let once = |on: bool| -> f64 {
             let (pm, pn) = if on {
-                (ft_kernel_cpu::set_conv2d_dweight_mb(0), ft_kernel_cpu::set_conv2d_dweight_min_nb(0))
+                (
+                    ft_kernel_cpu::set_conv2d_dweight_mb(0),
+                    ft_kernel_cpu::set_conv2d_dweight_min_nb(0),
+                )
             } else {
                 // min_nb=72, NOT 64. Under the new n-split code, min_nb=64 gives
                 // n_blocks = min(16, ceil(288/64)) = 5 and so 4 x 5 = 20 tiles on 16 threads --
@@ -620,11 +778,28 @@ fn main() {
                 // n_blocks = threads.div_ceil(m_blocks) = 4 and produced exactly 16 tiles.
                 // Measuring against that straw man read 2.2969x. 288/72 = 4 reproduces the
                 // incumbent tiling exactly: m_blocks 4, n_blocks 4, nb 72, 16 tiles.
-                (ft_kernel_cpu::set_conv2d_dweight_mb(8), ft_kernel_cpu::set_conv2d_dweight_min_nb(72))
+                (
+                    ft_kernel_cpu::set_conv2d_dweight_mb(8),
+                    ft_kernel_cpu::set_conv2d_dweight_min_nb(72),
+                )
             };
             let start = Instant::now();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                &ones,
+                &mask,
+                &padded,
+                &weight,
+                BATCH,
+                IN_CH,
+                PH,
+                PW,
+                K,
+                K,
+                H,
+                W,
+                1,
+                1,
+                OUT_CH,
                 [true, true, false],
             );
             let ms = start.elapsed().as_secs_f64() * 1e3;
@@ -653,7 +828,11 @@ fn main() {
         }
         let median = |v: &mut Vec<f64>| -> f64 {
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let mut ratios: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
         let paired = median(&mut ratios);
@@ -668,7 +847,11 @@ fn main() {
             "F32_NSPLIT   marginal {:.4}x   paired {paired:.4}x   SIGN TEST ON faster in {wins}/{} reps   A/A null {null:.4} {}",
             off_m / on_m,
             off_v.len(),
-            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL -- discard this row" }
+            if (0.97..=1.03).contains(&null) {
+                "PASS"
+            } else {
+                "FAIL -- discard this row"
+            }
         );
     }
 
@@ -683,7 +866,14 @@ fn main() {
     // occupancy. The risk is that nb=18 is a poor GEMM width -- the shape probe measured only
     // 1.12x between a good and a bad shape, so the gather term should dominate. If it does NOT
     // win, GEMM width matters more than the shape probe suggested and the frame is closed.
-    for (mb, min_nb) in [(8usize, 0usize), (32, 64), (32, 18), (32, 9), (16, 18), (32, 32)] {
+    for (mb, min_nb) in [
+        (8usize, 0usize),
+        (32, 64),
+        (32, 18),
+        (32, 9),
+        (16, 18),
+        (32, 32),
+    ] {
         let prev_nb = ft_kernel_cpu::set_conv2d_dweight_min_nb(min_nb);
         let previous = ft_kernel_cpu::set_conv2d_dweight_mb(mb);
         let mut best = f64::INFINITY;
@@ -693,7 +883,21 @@ fn main() {
             let _ = ft_kernel_cpu::masked_frame_take_ns();
             let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                &ones,
+                &mask,
+                &padded,
+                &weight,
+                BATCH,
+                IN_CH,
+                PH,
+                PW,
+                K,
+                K,
+                H,
+                W,
+                1,
+                1,
+                OUT_CH,
                 [false, true, false],
             );
             std::hint::black_box(&out);
@@ -710,7 +914,11 @@ fn main() {
         let m_blocks = OUT_CH.div_ceil(mb);
         eprintln!(
             "F32_DWNB mb={mb:2} min_nb={min_nb:2} -> m_blocks {m_blocks}   frame {best:7.3} ms   gather {best_g:8.3} + GEMM {best_m:7.3} ms CPU{}",
-            if mb == 8 && min_nb == 0 { "   <- SHIPPED" } else { "" }
+            if mb == 8 && min_nb == 0 {
+                "   <- SHIPPED"
+            } else {
+                ""
+            }
         );
     }
 
@@ -723,7 +931,21 @@ fn main() {
             let _ = ft_kernel_cpu::masked_frame_take_ns();
             let _ = ft_kernel_cpu::conv2d_dweight_split_take_ns();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                &ones,
+                &mask,
+                &padded,
+                &weight,
+                BATCH,
+                IN_CH,
+                PH,
+                PW,
+                K,
+                K,
+                H,
+                W,
+                1,
+                1,
+                OUT_CH,
                 [false, true, false],
             );
             std::hint::black_box(&out);
@@ -779,8 +1001,7 @@ fn main() {
             let _ = ft_kernel_cpu::masked_frame_take_ns();
             let start = Instant::now();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
-                om,
+                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH, om,
             );
             let ms = start.elapsed().as_secs_f64() * 1e3;
             std::hint::black_box(&out);
@@ -826,7 +1047,21 @@ fn main() {
             let previous = ft_kernel_cpu::set_masked_dout_tiled(tiled);
             let start = Instant::now();
             let out = ft_kernel_cpu::conv2d_backward_mask_fused_f32(
-                &ones, &mask, &padded, &weight, BATCH, IN_CH, PH, PW, K, K, H, W, 1, 1, OUT_CH,
+                &ones,
+                &mask,
+                &padded,
+                &weight,
+                BATCH,
+                IN_CH,
+                PH,
+                PW,
+                K,
+                K,
+                H,
+                W,
+                1,
+                1,
+                OUT_CH,
                 [true, true, false],
             );
             let ms = start.elapsed().as_secs_f64() * 1e3;
@@ -853,7 +1088,11 @@ fn main() {
     {
         let median = |v: &mut Vec<f64>| -> f64 {
             v.sort_by(f64::total_cmp);
-            if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[v.len() / 2]
+            }
         };
         let mut ratios: Vec<f64> = tile_off.iter().zip(&tile_on).map(|(a, b)| a / b).collect();
         let paired = median(&mut ratios);
@@ -861,12 +1100,18 @@ fn main() {
         let wins = tile_off.iter().zip(&tile_on).filter(|(o, n)| n < o).count();
         let off_m = median(&mut tile_off.clone());
         let on_m = median(&mut tile_on.clone());
-        eprintln!("F32_TILEAB fused backward (dinput+dweight), OFF row-gather {off_m:8.3} ms   ON tiled {on_m:8.3} ms");
+        eprintln!(
+            "F32_TILEAB fused backward (dinput+dweight), OFF row-gather {off_m:8.3} ms   ON tiled {on_m:8.3} ms"
+        );
         eprintln!(
             "F32_TILEAB   marginal {:.4}x   paired {paired:.4}x   SIGN TEST ON faster in {wins}/{} reps   A/A null {null:.4} {}",
             off_m / on_m,
             tile_off.len(),
-            if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
+            if (0.97..=1.03).contains(&null) {
+                "PASS"
+            } else {
+                "FAIL — discard this row"
+            }
         );
     }
 
@@ -902,8 +1147,7 @@ fn main() {
                     for c in 0..IN_CH {
                         for tap in 0..K * K {
                             for oc in 0..OUT_CH {
-                                w9[tap * OUT_CH + oc] =
-                                    weight[oc * patch_width + c * K * K + tap];
+                                w9[tap * OUT_CH + oc] = weight[oc * patch_width + c * K * K + tap];
                             }
                         }
                         for ih in 0..PH {
@@ -922,8 +1166,8 @@ fn main() {
                                             continue;
                                         }
                                         let pc = oh_i * W + ow_i;
-                                        let drow = &dout_flat
-                                            [(b * patch_count + pc) * OUT_CH..][..OUT_CH];
+                                        let drow =
+                                            &dout_flat[(b * patch_count + pc) * OUT_CH..][..OUT_CH];
                                         let wrow = &w9[(kr * K + kc) * OUT_CH..][..OUT_CH];
                                         for (d, w) in drow.iter().zip(wrow) {
                                             acc += *d * *w;
@@ -957,7 +1201,9 @@ fn main() {
         }
         std::hint::black_box(&direct);
     }
-    eprintln!("F32_DINPUT dinput ONLY, PANEL-FREE direct kernel   {panel_free:8.3} ms  (worst rel vs shipping route {panel_free_worst_rel:.3e})");
+    eprintln!(
+        "F32_DINPUT dinput ONLY, PANEL-FREE direct kernel   {panel_free:8.3} ms  (worst rel vs shipping route {panel_free_worst_rel:.3e})"
+    );
     let gflop = 2.0 * (BATCH * H * W * IN_CH * K * K * OUT_CH) as f64 / 1e9;
     eprintln!(
         "F32_DINPUT   {gflop:.3} GFLOP -> shipping {:.1} GFLOP/s, panel-free {:.1} GFLOP/s, ratio {:.4}x",

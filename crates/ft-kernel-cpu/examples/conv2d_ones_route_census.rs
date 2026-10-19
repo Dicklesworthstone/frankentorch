@@ -46,8 +46,8 @@ const H: usize = 32;
 fn main() {
     let ph = H + 2 * PAD;
     let pw = H + 2 * PAD;
-    let oh = (ph - K) / 1 + 1;
-    let ow = (pw - K) / 1 + 1;
+    let oh = ph - K + 1;
+    let ow = pw - K + 1;
     println!(
         "CONV2D BOARD LANE FIXTURE: batch={BATCH} in_ch={IN_CH} out_ch={OUT_CH} {H}x{H} k{K}x{K} \
          stride 1 pad {PAD}  ->  padded {ph}x{pw}, out {oh}x{ow}"
@@ -75,11 +75,16 @@ fn main() {
     // `.sum().backward()` produces exactly this.
     let ones: Vec<f64> = vec![1.0; n_dout];
     // What any real objective produces.
-    let varied: Vec<f64> = (0..n_dout).map(|i| ((i % 23) as f64) * 0.019 - 0.19).collect();
+    let varied: Vec<f64> = (0..n_dout)
+        .map(|i| ((i % 23) as f64) * 0.019 - 0.19)
+        .collect();
     let ones32: Vec<f32> = vec![1.0; n_dout];
     let varied32: Vec<f32> = varied.iter().map(|&v| v as f32).collect();
 
-    println!("  {:>10} {:>8} {:>22} {:>6} {:>19}", "dtype", "loss", "(dweight, dpanel) GEMMs", "ones", "route");
+    println!(
+        "  {:>10} {:>8} {:>22} {:>6} {:>19}",
+        "dtype", "loss", "(dweight, dpanel) GEMMs", "ones", "route"
+    );
     for (label, dout) in [("sum()", &ones), ("non-uniform", &varied)] {
         ft_kernel_cpu::reset_conv2d_backward_gemm_counts();
         let _ = ft_kernel_cpu::conv2d_ones_path_census_take();
@@ -89,8 +94,16 @@ fn main() {
         let counts = ft_kernel_cpu::conv2d_backward_gemm_counts();
         let ones_hits = ft_kernel_cpu::conv2d_ones_path_census_take();
         std::hint::black_box(&out);
-        let route = if ones_hits > 0 { "ALL-ONES FAST PATH" } else { "generic" };
-        println!("  {:>10} {label:>8} {:>22} {ones_hits:>6} {route:>19}", "f64", format!("{counts:?}"));
+        let route = if ones_hits > 0 {
+            "ALL-ONES FAST PATH"
+        } else {
+            "generic"
+        };
+        println!(
+            "  {:>10} {label:>8} {:>22} {ones_hits:>6} {route:>19}",
+            "f64",
+            format!("{counts:?}")
+        );
     }
     for (label, dout) in [("sum()", &ones32), ("non-uniform", &varied32)] {
         ft_kernel_cpu::reset_conv2d_backward_gemm_counts();
@@ -101,8 +114,16 @@ fn main() {
         let counts = ft_kernel_cpu::conv2d_backward_gemm_counts();
         let ones_hits = ft_kernel_cpu::conv2d_ones_path_census_take();
         std::hint::black_box(&out);
-        let route = if ones_hits > 0 { "ALL-ONES FAST PATH" } else { "generic" };
-        println!("  {:>10} {label:>8} {:>22} {ones_hits:>6} {route:>19}", "f32", format!("{counts:?}"));
+        let route = if ones_hits > 0 {
+            "ALL-ONES FAST PATH"
+        } else {
+            "generic"
+        };
+        println!(
+            "  {:>10} {label:>8} {:>22} {ones_hits:>6} {route:>19}",
+            "f32",
+            format!("{counts:?}")
+        );
     }
 
     println!(

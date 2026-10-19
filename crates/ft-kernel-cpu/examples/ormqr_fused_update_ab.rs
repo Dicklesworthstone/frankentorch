@@ -89,7 +89,12 @@ fn main() {
             interleaved::iqr_ratio(&times[0]),
             gate - 1.0
         );
-        println!("  {:>14} {:>10} {}", "arm", "median", interleaved::Verdict::header());
+        println!(
+            "  {:>14} {:>10} {}",
+            "arm",
+            "median",
+            interleaved::Verdict::header()
+        );
         for i in 0..3 {
             let arm = match i {
                 0 => "materialised",
@@ -101,7 +106,10 @@ fn main() {
             } else {
                 interleaved::verdict(&times[0], &times[i], gate).row()
             };
-            println!("  {arm:>14} {:>10.4} {trust}", interleaved::median(&times[i]));
+            println!(
+                "  {arm:>14} {:>10.4} {trust}",
+                interleaved::median(&times[i])
+            );
         }
     }
     ft_kernel_cpu::set_ormqr_fused_subtract(false);

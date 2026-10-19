@@ -32,13 +32,17 @@
 //!
 //!   cargo run --release -p frankentorch-kernel-cpu --example ormqr_phase_decomposition -- [reps]
 
-fn median(v: &mut Vec<f64>) -> f64 {
+fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
     let n = v.len();
     if n == 0 {
         return f64::NAN;
     }
-    if n % 2 == 1 { v[n / 2] } else { f64::midpoint(v[n / 2 - 1], v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        f64::midpoint(v[n / 2 - 1], v[n / 2])
+    }
 }
 
 fn main() {
@@ -52,7 +56,10 @@ fn main() {
         host.trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     println!(
         "PROFILER OWNERSHIP: the ORMQR stage counters are process-global and became thread-owned \
@@ -84,7 +91,7 @@ fn main() {
 
         let previous = ft_kernel_cpu::set_ormqr_stage_profile_enabled(true);
         let mut totals: Vec<f64> = Vec::with_capacity(reps);
-        let mut phase_totals: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); 7];
+        let mut phase_totals: Vec<Vec<f64>> = (0..7).map(|_| Vec::with_capacity(reps)).collect();
         for _ in 0..reps {
             let mut c = c0.clone();
             let _ = ft_kernel_cpu::ormqr_stage_take_ns();
@@ -111,7 +118,11 @@ fn main() {
         // call it a phase"), and it made the one line whose job is to prove the accounting CLOSES
         // the least trustworthy line in the table.
         let total_med = median(&mut totals);
-        let phase_sum: f64 = phase_totals.iter_mut().map(|v| median(v)).sum();
+        let phase_sum: f64 = phase_totals
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .map(median)
+            .sum();
         let names = [
             "panel build",
             "T transpose",
@@ -125,7 +136,10 @@ fn main() {
         println!("  {:>12} {:>10} {:>8}", "phase", "ms/call", "share");
         for (name, samples) in names.iter().zip(phase_totals.iter_mut()) {
             let per_call = median(samples);
-            println!("  {name:>12} {per_call:>10.4} {:>7.1}%", 100.0 * per_call / total_med);
+            println!(
+                "  {name:>12} {per_call:>10.4} {:>7.1}%",
+                100.0 * per_call / total_med
+            );
         }
         let unattributed = total_med - phase_sum;
         println!(

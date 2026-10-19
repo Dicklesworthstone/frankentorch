@@ -37,7 +37,10 @@ fn main() {
     let n: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(256);
 
     let host = std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "unknown\n".to_owned());
-    println!("PROV host={} n={n}  (census is a COUNT, not a timing — load-insensitive)", host.trim());
+    println!(
+        "PROV host={} n={n}  (census is a COUNT, not a timing — load-insensitive)",
+        host.trim()
+    );
     println!(
         "PREDICTION REGISTERED: if z = U^-1 y is mathematically dense, backward zero-touch is ~0 \
          and there is NO restriction to win — only an explanation for the 2x."
@@ -64,7 +67,10 @@ fn main() {
 
     println!("\nCOLUMN-UPDATES PERFORMED");
     println!("  forward   {fwd:>14}");
-    println!("  backward  {back:>14}   ({:.2}x the forward)", back as f64 / fwd as f64);
+    println!(
+        "  backward  {back:>14}   ({:.2}x the forward)",
+        back as f64 / fwd as f64
+    );
     println!(
         "  backward updates whose SOURCE element was still zero when read: {zero} \
          ({:.3}% of the backward's work)",

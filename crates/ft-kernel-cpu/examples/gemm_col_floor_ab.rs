@@ -179,7 +179,12 @@ fn main() {
             differing,
             shipped.len()
         );
-        println!("  {:>14} {:>10} {}", "arm", "median", interleaved::Verdict::header());
+        println!(
+            "  {:>14} {:>10} {}",
+            "arm",
+            "median",
+            interleaved::Verdict::header()
+        );
         for i in 0..3 {
             let arm = match i {
                 0 => "floor 128",
@@ -191,7 +196,10 @@ fn main() {
             } else {
                 interleaved::verdict(&times[0], &times[i], gate).row()
             };
-            println!("  {arm:>14} {:>10.4} {trust}", interleaved::median(&times[i]));
+            println!(
+                "  {arm:>14} {:>10.4} {trust}",
+                interleaved::median(&times[i])
+            );
         }
     }
     ft_kernel_cpu::set_gemm_tile_col_floor_adaptive(false);

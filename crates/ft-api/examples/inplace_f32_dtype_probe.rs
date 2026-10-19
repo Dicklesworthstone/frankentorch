@@ -113,7 +113,11 @@ fn main() {
         threads,
         numel,
         reps,
-        loadavg.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        loadavg
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     println!(
         "PREDICTION f32/f64 ~0.5 if the extra passes are free (half the bytes); \
@@ -163,7 +167,10 @@ fn main() {
         f64_mins.push(a);
         f32_mins.push(b);
         ratios.push(b / a);
-        println!("REP {rep:2} f64 {a:8.3} ms   f32 {b:8.3} ms   f32/f64 {:.4}", b / a);
+        println!(
+            "REP {rep:2} f64 {a:8.3} ms   f32 {b:8.3} ms   f32/f64 {:.4}",
+            b / a
+        );
     }
 
     let paired = median(ratios.clone());

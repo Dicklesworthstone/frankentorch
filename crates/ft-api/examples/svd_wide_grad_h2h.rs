@@ -39,9 +39,7 @@ fn run_ft(
             .tensor_variable(data, vec![batch, m, n], requires_grad)
             .map_err(boxed)?;
         let start = Instant::now();
-        let (_u, sg, _vh) = s
-            .tensor_linalg_svd(a, full_matrices)
-            .map_err(boxed)?;
+        let (_u, sg, _vh) = s.tensor_linalg_svd(a, full_matrices).map_err(boxed)?;
         let loss = s.tensor_sum(sg).map_err(boxed)?;
         if requires_grad {
             s.tensor_backward(loss).map_err(boxed)?;
@@ -71,6 +69,8 @@ fn run_pytorch(
     requires_grad: bool,
 ) -> Option<(f64, f64)> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let py_requires_grad = if requires_grad { "True" } else { "False" };
+    let py_full_matrices = if full_matrices { "True" } else { "False" };
     let script = format!(
         r#"
 import time, torch
@@ -82,10 +82,10 @@ cols=torch.arange(N,dtype=torch.int64).reshape(1,1,N)
 A=((((p+1)*(rows+2)*(cols+3))%17).to(torch.float64)-8.0)*0.05
 A=A+torch.eye(M,N,dtype=torch.float64).unsqueeze(0)*(3.0+rows.to(torch.float64))
 def step():
-    Ar=A.clone().requires_grad_({requires_grad})
-    U,S,Vh=torch.linalg.svd(Ar,full_matrices={full_matrices})
+    Ar=A.clone().requires_grad_({py_requires_grad})
+    U,S,Vh=torch.linalg.svd(Ar,full_matrices={py_full_matrices})
     loss=S.sum()
-    if {requires_grad}:
+    if {py_requires_grad}:
         loss.backward()
         return Ar.grad
     return loss
@@ -153,9 +153,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let Some((pt_aa_ms, pt_aa_sum)) =
                 run_pytorch(batch, m, n, full_matrices, requires_grad)
             else {
-                println!(
-                    "B={batch} m={m} n={n}: PyTorch second A/A arm unavailable"
-                );
+                println!("B={batch} m={m} n={n}: PyTorch second A/A arm unavailable");
                 continue;
             };
             let rel = (ft_sum - tsum).abs() / (tsum.abs() + 1e-12);

@@ -20,6 +20,7 @@
 //! kernel API without touching it.
 //!
 //! Run: `cargo run -q --release -p frankentorch-kernel-cpu --example svd_scale_probe`
+#![allow(clippy::print_literal)]
 
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{

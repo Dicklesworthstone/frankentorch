@@ -154,10 +154,10 @@ fn incumbent_sample(
         if reader.read_line(&mut line)? == 0 {
             return Err(format!("PyTorch arm closed before answering {lane}").into());
         }
-        if let Some(sample) = parse_sample_line(line.trim()) {
-            if sample.lane == lane {
-                return Ok((sample.milliseconds, sample.gradient_checksum));
-            }
+        if let Some(sample) = parse_sample_line(line.trim())
+            && sample.lane == lane
+        {
+            return Ok((sample.milliseconds, sample.gradient_checksum));
         }
     }
 }
@@ -168,8 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(12);
     let profile_inplace = std::env::var("FT_INPLACE_PROFILE").is_ok_and(|value| value == "1");
-    let python =
-        std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "/data/tmp/torchvenv-2121/bin/python".to_owned());
+    let python = std::env::var("PYTORCH_PYTHON")
+        .unwrap_or_else(|_| "/data/tmp/torchvenv-2121/bin/python".to_owned());
 
     let host = std::fs::read_to_string("/etc/hostname").unwrap_or_else(|_| "unknown\n".to_owned());
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| "unknown".to_owned());
@@ -178,7 +178,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host.trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".to_owned()),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
     println!("HOST CACHE  L2 16 MiB aggregate, L3 128 MiB (4 x 32 MiB) — Threadripper PRO 5975WX");
     println!(
@@ -228,7 +231,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Err(format!("PyTorch arm ({python}) exited before {READY_MARKER}: {preamble}").into());
+            return Err(
+                format!("PyTorch arm ({python}) exited before {READY_MARKER}: {preamble}").into(),
+            );
         }
         if line.trim() == READY_MARKER {
             break;
@@ -252,7 +257,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let (mut ft_times, mut pt_times) = (Vec::new(), Vec::new());
         let (mut rayon_spans_ns, mut ledger_spans_ns) = (Vec::new(), Vec::new());
-        let (mut ft_a, mut ft_b, mut pt_a, mut pt_b) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut ft_a, mut ft_b, mut pt_a, mut pt_b) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut ft_checksum, mut pt_checksum) = (0.0, 0.0);
         for _ in 0..reps {
             let (mut ft_slots, mut pt_slots) = (Vec::with_capacity(4), Vec::with_capacity(4));
@@ -303,8 +309,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "    INPLACE_PROFILE samples={} rayon_map_join median={:.3} ms ledger_format_append median={:.3} us",
                     expected_profile_samples,
-                    median(rayon_spans_ns.iter().map(|&nanos| nanos as f64 / 1_000_000.0).collect()),
-                    median(ledger_spans_ns.iter().map(|&nanos| nanos as f64 / 1_000.0).collect()),
+                    median(
+                        rayon_spans_ns
+                            .iter()
+                            .map(|&nanos| nanos as f64 / 1_000_000.0)
+                            .collect()
+                    ),
+                    median(
+                        ledger_spans_ns
+                            .iter()
+                            .map(|&nanos| nanos as f64 / 1_000.0)
+                            .collect()
+                    ),
                 );
             } else {
                 println!("    INPLACE_PROFILE MISSING: expected one span pair per FT sample");
@@ -330,9 +346,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("  absolute gap {gap_first:.3} ms -> {gap_last:.3} ms");
         if last.3 < 1.25 && gap_last > gap_first * 2.0 {
-            println!("  => (a) CACHE RESIDENCY: ratio collapsed past L3 while the absolute gap grew.");
+            println!(
+                "  => (a) CACHE RESIDENCY: ratio collapsed past L3 while the absolute gap grew."
+            );
         } else if last.3 < 1.25 && (gap_last - gap_first).abs() <= gap_first.abs().max(0.05) {
-            println!("  => (d) FIXED PER-CALL COST: ratio collapsed and the absolute gap held constant.");
+            println!(
+                "  => (d) FIXED PER-CALL COST: ratio collapsed and the absolute gap held constant."
+            );
         } else if ratio_collapse < 1.3 {
             println!(
                 "  => (c) PER-ELEMENT: the ratio did NOT collapse past L3, so this is not about \

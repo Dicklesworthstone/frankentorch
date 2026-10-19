@@ -218,6 +218,7 @@ fn timed_conv2d(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn timed_attention(
     query: &[f64],
     key: &[f64],

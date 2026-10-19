@@ -29,8 +29,7 @@ fn generic_symmetric(n: usize) -> Vec<f64> {
     let mut a = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {
-            let h = ((i as i64) * 73 + (j as i64) * 151 + ((i * j) as i64) % 257)
-                .rem_euclid(2048);
+            let h = ((i as i64) * 73 + (j as i64) * 151 + ((i * j) as i64) % 257).rem_euclid(2048);
             a[i * n + j] = h as f64 / 2048.0 - 1.0 + if i == j { 16.0 } else { 0.0 };
         }
     }

@@ -44,7 +44,10 @@ fn main() {
         host.trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
 
     // Diagonally dominant so the factorisation is well conditioned and every panel does real work.
@@ -104,13 +107,35 @@ fn main() {
 
     println!("\nBLOCKED CHOLESKY n={n}, min-wall rep of {reps}");
     println!("  {:<22} {:>9} {:>8}", "phase", "ms", "% lane");
-    println!("  {:<22} {:>9.4} {:>7.1}%", "panel factor", ms(panel), pct(panel));
-    println!("  {:<22} {:>9.4} {:>7.1}%", "TRSM (panel solve)", ms(trsm), pct(trsm));
-    println!("  {:<22} {:>9.4} {:>7.1}%", "trailing update", ms(trailing), pct(trailing));
-    println!("  {:<22} {:>9.4} {:>7.1}%", "strict-upper zero", ms(zero), pct(zero));
+    println!(
+        "  {:<22} {:>9.4} {:>7.1}%",
+        "panel factor",
+        ms(panel),
+        pct(panel)
+    );
+    println!(
+        "  {:<22} {:>9.4} {:>7.1}%",
+        "TRSM (panel solve)",
+        ms(trsm),
+        pct(trsm)
+    );
+    println!(
+        "  {:<22} {:>9.4} {:>7.1}%",
+        "trailing update",
+        ms(trailing),
+        pct(trailing)
+    );
+    println!(
+        "  {:<22} {:>9.4} {:>7.1}%",
+        "strict-upper zero",
+        ms(zero),
+        pct(zero)
+    );
     println!(
         "  {:<22} {:>9.4} {:>7.1}%   <- residual, NOT a measured phase",
-        "glue (residual)", glue, 100.0 * glue / wall
+        "glue (residual)",
+        glue,
+        100.0 * glue / wall
     );
     println!("  {:<22} {:>9.4} {:>7.1}%", "TOTAL (wall)", wall, 100.0);
     println!(

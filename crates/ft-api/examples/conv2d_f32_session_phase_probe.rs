@@ -134,6 +134,7 @@ fn main() {
     let min_of = |v: &[Phases], pick: fn(&Phases) -> f64| -> f64 {
         v.iter().map(pick).fold(f64::INFINITY, f64::min)
     };
+    #[allow(clippy::type_complexity)]
     let rows: [(&str, fn(&Phases) -> f64); 5] = [
         ("leaf build", |p| p.leaf),
         ("forward", |p| p.forward),

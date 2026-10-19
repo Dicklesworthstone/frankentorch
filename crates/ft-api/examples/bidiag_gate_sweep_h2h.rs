@@ -274,6 +274,14 @@ struct Arm {
     /// columns in reverse Q accumulation). `FT_QAS=0,1,0` prices the active-submatrix path
     /// against the full-m incumbent in one invocation against one live PyTorch.
     qr_active_submatrix: Option<bool>,
+    /// `frankentorch-g0wpj`: whether `ormqr_blocked_f64` uses the gated fused subtract
+    /// (`dgemm_sub_strided_gated` / `dgemm_bt_sub_strided_gated`, `Some(true)`) or forces the
+    /// materialised `upd + subtract` pass (`Some(false)`). `FT_ORMQR_FUSED=0,1,0`.
+    ormqr_fused_subtract: Option<bool>,
+    /// `frankentorch-bidiag-form-q-unblocked-gl0rj`: whether the SVD prologue's left-reflector
+    /// expansion (`form_q`) uses the compact-WY blocked path (`Some(true)`) or the unblocked
+    /// `dorg2r` path (`Some(false)`). `FT_FORM_Q_BLOCKED=0,1,0` (or `FT_FORM_Q=0,1,0`).
+    form_q_blocked: Option<bool>,
 }
 
 fn arm_label(arm: Arm, op: LinalgOp) -> String {
@@ -399,6 +407,16 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
             Some(false) => "/QASoff",
             None => "",
         }
+        + match arm.ormqr_fused_subtract {
+            Some(true) => "/ormqrFUSED",
+            Some(false) => "/ormqrMAT",
+            None => "",
+        }
+        + match arm.form_q_blocked {
+            Some(true) => "/formQ-blocked",
+            Some(false) => "/formQ-unblocked",
+            None => "",
+        }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -512,6 +530,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_rowdot = ft_kernel_cpu::bidiag_rowdot_blocked_set(arm.blocked);
     let previous_fused = ft_kernel_cpu::bidiag_fused_trailing_set(arm.fused);
     let previous_form_p = ft_kernel_cpu::bidiag_form_p_blocked_set(arm.form_p_blocked);
+    let previous_form_q = arm
+        .form_q_blocked
+        .map(ft_kernel_cpu::bidiag_form_q_blocked_set);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
@@ -547,6 +568,13 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_qas = arm
         .qr_active_submatrix
         .map(ft_kernel_cpu::set_qr_active_submatrix);
+    match arm.ormqr_fused_subtract {
+        Some(true) => ft_kernel_cpu::set_ormqr_fused_subtract_auto(),
+        Some(false) => {
+            let _ = ft_kernel_cpu::set_ormqr_fused_subtract(false);
+        }
+        None => {}
+    }
     let previous_btr = arm
         .eigh_bt_row_split
         .map(ft_kernel_cpu::set_eigh_bt_row_split);
@@ -591,6 +619,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
+        if let Some(v) = previous_form_q {
+            ft_kernel_cpu::bidiag_form_q_blocked_set(v);
+        }
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -630,6 +661,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         }
         if let Some(v) = previous_qas {
             ft_kernel_cpu::set_qr_active_submatrix(v);
+        }
+        if arm.ormqr_fused_subtract.is_some() {
+            ft_kernel_cpu::set_ormqr_fused_subtract_auto();
         }
         if let Some(v) = previous_btr {
             ft_kernel_cpu::set_eigh_bt_row_split(v);
@@ -654,6 +688,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
         ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
         ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
+        if let Some(v) = previous_form_q {
+            ft_kernel_cpu::bidiag_form_q_blocked_set(v);
+        }
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -693,6 +730,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         }
         if let Some(v) = previous_qas {
             ft_kernel_cpu::set_qr_active_submatrix(v);
+        }
+        if arm.ormqr_fused_subtract.is_some() {
+            ft_kernel_cpu::set_ormqr_fused_subtract_auto();
         }
         if let Some(v) = previous_btr {
             ft_kernel_cpu::set_eigh_bt_row_split(v);
@@ -790,6 +830,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_rowdot_blocked_set(previous_rowdot);
     ft_kernel_cpu::bidiag_fused_trailing_set(previous_fused);
     ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
+    if let Some(v) = previous_form_q {
+        ft_kernel_cpu::bidiag_form_q_blocked_set(v);
+    }
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
     ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -829,6 +872,9 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     }
     if let Some(v) = previous_qas {
         ft_kernel_cpu::set_qr_active_submatrix(v);
+    }
+    if arm.ormqr_fused_subtract.is_some() {
+        ft_kernel_cpu::set_ormqr_fused_subtract_auto();
     }
     if let Some(v) = previous_btr {
         ft_kernel_cpu::set_eigh_bt_row_split(v);
@@ -1043,6 +1089,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         Err(_) => vec![None],
     };
+    let ormqr_fuseds: Vec<Option<bool>> = match std::env::var("FT_ORMQR_FUSED") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let form_q_blockeds: Vec<Option<bool>> =
+        match std::env::var("FT_FORM_Q_BLOCKED").or_else(|_| std::env::var("FT_FORM_Q")) {
+            Ok(v) => v
+                .split(',')
+                .filter_map(|t| match t.trim() {
+                    "1" => Some(Some(true)),
+                    "0" => Some(Some(false)),
+                    _ => None,
+                })
+                .collect(),
+            Err(_) => vec![None],
+        };
     let qrcs: Vec<Option<bool>> = match std::env::var("FT_QRC") {
         Ok(v) => v
             .split(',')
@@ -1218,10 +1287,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !rowdots.is_empty()
             && !fuseds.is_empty()
             && !form_p_blockeds.is_empty()
+            && !form_q_blockeds.is_empty()
             && !panel_outputs.is_empty()
             && !gate_hoists.is_empty()
             && !qtfs.is_empty()
-            && !qass.is_empty(),
+            && !qass.is_empty()
+            && !ormqr_fuseds.is_empty(),
         "empty grid"
     );
     let mut arms: Vec<Arm> =
@@ -1291,6 +1362,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         qr_panel_t_fast,
                                         eigh_bt_row_split,
                                         qr_active_submatrix: None,
+                                        ormqr_fused_subtract: None,
+                                        form_q_blocked: None,
                                     });
                                     }
                                     }
@@ -1358,6 +1431,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|arm| {
             qass.iter().map(move |&qr_active_submatrix| Arm {
                 qr_active_submatrix,
+                ..arm
+            })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            ormqr_fuseds.iter().map(move |&ormqr_fused_subtract| Arm {
+                ormqr_fused_subtract,
+                ..arm
+            })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            form_q_blockeds.iter().map(move |&form_q_blocked| Arm {
+                form_q_blocked,
                 ..arm
             })
         })

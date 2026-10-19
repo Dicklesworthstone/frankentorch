@@ -27,7 +27,18 @@ fn main() {
         .unwrap_or(7);
 
     // batch, in_ch, out_ch, h, w, kh, kw, sh, sw
-    let shapes: [(usize, usize, usize, usize, usize, usize, usize, usize, usize); 15] = [
+    #[allow(clippy::type_complexity)]
+    let shapes: [(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ); 15] = [
         // THE SMALL END, sampled deliberately. `project_qr_panel_columnmajor` records the rule:
         // below the sizes anyone measured live the BATCHED-TINY planes, and an ungated inner
         // change has wrecked a shipped win there before. These are the shapes where the tile
@@ -81,16 +92,42 @@ fn main() {
             let previous = ft_kernel_cpu::set_conv2d_dweight_streamed(false);
             let start = Instant::now();
             let (_, panel_dw, _) = ft_kernel_cpu::conv2d_backward_f64(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             let a = start.elapsed().as_secs_f64() * 1e3;
 
             ft_kernel_cpu::set_conv2d_dweight_streamed(true);
             let start = Instant::now();
             let (_, stream_dw, _) = ft_kernel_cpu::conv2d_backward_f64(
-                &dout, &padded, &weight_flat, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
-                out_ch, false,
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                kh,
+                kw,
+                oh,
+                ow,
+                sh,
+                sw,
+                out_ch,
+                false,
             );
             let b = start.elapsed().as_secs_f64() * 1e3;
             ft_kernel_cpu::set_conv2d_dweight_streamed(previous);

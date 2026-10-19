@@ -166,7 +166,9 @@ fn reverse_apply_probe(reps: usize) {
 
     println!(
         "reverse_apply_raw_dgemm host={} reps={reps} serial_rayon={} eight_rayon={} par_min_fma={PAR_MIN_FMA}",
-        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim(),
         serial_pool.install(rayon::current_num_threads),
         eight_pool.install(rayon::current_num_threads),
     );
@@ -181,8 +183,16 @@ fn reverse_apply_probe(reps: usize) {
         let (raw_1t_ms, raw_1t_sum) = raw_best_ms(&serial_pool, m, k, n, &a, &b, reps);
         let (raw_8t_ms, raw_8t_sum) = raw_best_ms(&eight_pool, m, k, n, &a, &b, reps);
         let (wrapper_ms, wrapper_sum) = wrapper_best_ms(&eight_pool, m, k, n, &a, &b, reps);
-        assert_eq!(raw_1t_sum.to_bits(), raw_8t_sum.to_bits(), "raw checksums differ");
-        assert_eq!(raw_1t_sum.to_bits(), wrapper_sum.to_bits(), "wrapper checksum differs");
+        assert_eq!(
+            raw_1t_sum.to_bits(),
+            raw_8t_sum.to_bits(),
+            "raw checksums differ"
+        );
+        assert_eq!(
+            raw_1t_sum.to_bits(),
+            wrapper_sum.to_bits(),
+            "wrapper checksum differs"
+        );
         println!(
             "{m:>3}x{k:<3}x{n:<3} {fma:>8} {raw_1t_ms:>7.3}/{:>5.1} {raw_8t_ms:>7.3}/{:>5.1} {:>6.3} {wrapper_ms:>7.3}/{:>5.1} {:>7.3} {raw_1t_sum:.6}",
             gflops(m, k, n, raw_1t_ms),
@@ -211,10 +221,16 @@ fn ormqr_left_tb_probe(reps: usize) {
     let b = fill_f64(k * n, 59);
     let (serial_ms, serial_sum) = raw_tb_best_ms(&serial_pool, m, k, n, &a, &b, reps);
     let (eight_ms, eight_sum) = raw_tb_best_ms(&eight_pool, m, k, n, &a, &b, reps);
-    assert_eq!(serial_sum.to_bits(), eight_sum.to_bits(), "TB checksums differ");
+    assert_eq!(
+        serial_sum.to_bits(),
+        eight_sum.to_bits(),
+        "TB checksums differ"
+    );
     println!(
         "ormqr_left_tb_raw host={} reps={reps} shape={m}x{k}x{n} raw_1t={serial_ms:.4}ms/{:.1}GFLOP/s raw_8t={eight_ms:.4}ms/{:.1}GFLOP/s 8t/1t={:.3} checksum={eight_sum:.6}",
-        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim(),
         gflops(m, k, n, serial_ms),
         gflops(m, k, n, eight_ms),
         eight_ms / serial_ms,
@@ -223,14 +239,26 @@ fn ormqr_left_tb_probe(reps: usize) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).is_some_and(|argument| argument == "--reverse-apply") {
-        let reps = argv.get(2).and_then(|argument| argument.parse().ok()).unwrap_or(64);
+    if argv
+        .get(1)
+        .is_some_and(|argument| argument == "--reverse-apply")
+    {
+        let reps = argv
+            .get(2)
+            .and_then(|argument| argument.parse().ok())
+            .unwrap_or(64);
         assert!(reps > 0, "reverse-apply reps must be positive");
         reverse_apply_probe(reps);
         return;
     }
-    if argv.get(1).is_some_and(|argument| argument == "--ormqr-left-tb") {
-        let reps = argv.get(2).and_then(|argument| argument.parse().ok()).unwrap_or(64);
+    if argv
+        .get(1)
+        .is_some_and(|argument| argument == "--ormqr-left-tb")
+    {
+        let reps = argv
+            .get(2)
+            .and_then(|argument| argument.parse().ok())
+            .unwrap_or(64);
         assert!(reps > 0, "ormqr-left-tb reps must be positive");
         ormqr_left_tb_probe(reps);
         return;
@@ -310,11 +338,15 @@ mod tests {
             pool.install(|| probe_dgemm(m, k, n, &a, &b, &mut raw));
             let a_meta = TensorMeta::from_shape(vec![m, k], DType::F64, Device::Cpu);
             let b_meta = TensorMeta::from_shape(vec![k, n], DType::F64, Device::Cpu);
-            let wrapper = pool
-                .install(|| matmul_tensor_contiguous_f64(&a, &b, &a_meta, &b_meta).unwrap());
+            let wrapper =
+                pool.install(|| matmul_tensor_contiguous_f64(&a, &b, &a_meta, &b_meta).unwrap());
             assert_eq!(raw.len(), wrapper.len());
             for (index, (raw_value, wrapper_value)) in raw.iter().zip(wrapper).enumerate() {
-                assert_eq!(raw_value.to_bits(), wrapper_value.to_bits(), "shape {m}x{k}x{n}, index {index}");
+                assert_eq!(
+                    raw_value.to_bits(),
+                    wrapper_value.to_bits(),
+                    "shape {m}x{k}x{n}, index {index}"
+                );
             }
         }
     }

@@ -200,6 +200,7 @@ fn run_fwd_f64(
     elapsed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_f32(
     n: usize,
     dout: &[f32],
@@ -222,6 +223,7 @@ fn run_f32(
     elapsed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_f64(
     n: usize,
     dout: &[f64],

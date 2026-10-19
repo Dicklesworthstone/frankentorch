@@ -55,14 +55,20 @@ fn main() {
     }
     eprintln!(
         "PROV host={} nproc={} rayon={} reps={reps} loadavg={}",
-        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .trim(),
     );
 
     let fill = |n: usize, seed: usize| -> Vec<f32> {
-        (0..n).map(|i| ((i + seed) % 17) as f32 * 0.0625 - 0.5).collect()
+        (0..n)
+            .map(|i| ((i + seed) % 17) as f32 * 0.0625 - 0.5)
+            .collect()
     };
 
     // ---- ARM 1: the CEILING this box reaches on a shape the kernel likes. ------------------

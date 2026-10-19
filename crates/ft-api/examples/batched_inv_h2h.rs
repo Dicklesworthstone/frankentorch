@@ -13,7 +13,9 @@ fn spd_batch(b: usize, n: usize) -> Vec<f64> {
     let mut out = vec![0.0_f64; b * n * n];
     for bi in 0..b {
         let base = bi * n * n;
-        let m: Vec<f64> = (0..n * n).map(|i| (((i + bi) % 13) as f64 - 6.0) * 0.1).collect();
+        let m: Vec<f64> = (0..n * n)
+            .map(|i| (((i + bi) % 13) as f64 - 6.0) * 0.1)
+            .collect();
         for r in 0..n {
             for c in 0..n {
                 let mut acc = 0.0;
@@ -36,7 +38,9 @@ fn run_ft(b: usize, n: usize) -> Result<f64, Box<dyn Error>> {
         let start = Instant::now();
         let _inv = s.tensor_linalg_inv(av).map_err(boxed)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }

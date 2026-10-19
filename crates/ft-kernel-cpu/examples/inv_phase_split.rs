@@ -40,7 +40,10 @@ fn main() {
         host.trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(","),
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(","),
     );
 
     let a: Vec<f64> = (0..n * n)

@@ -72,15 +72,26 @@ fn main() {
     // are shared, and a lane timed next to somebody's build is not a lane.
     eprintln!(
         "PROV host={} nproc={} rayon={} mode={} reps={reps} loadavg={}",
-        std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim(),
+        std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim(),
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         rayon::current_num_threads(),
         if ab { "ab" } else { "decompose" },
-        std::fs::read_to_string("/proc/loadavg").unwrap_or_default().trim(),
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .trim(),
     );
 
-    let spec = if arg(1).is_empty() { "128,256,512,1024" } else { arg(1) };
-    let sizes: Vec<usize> = spec.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+    let spec = if arg(1).is_empty() {
+        "128,256,512,1024"
+    } else {
+        arg(1)
+    };
+    let sizes: Vec<usize> = spec
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
     for n in sizes {
         match arg(0) {
             "ab" => run_ab(n, reps),
@@ -134,8 +145,18 @@ fn run_phase_split(n: usize, reps: usize) {
 
     eprintln!("SLOGDET PHASE SPLIT n={n}, min-wall rep of {reps}");
     eprintln!("  {:<28} {:>9} {:>8}", "phase", "ms", "% lane");
-    eprintln!("  {:<28} {:>9.4} {:>7.1}%", "LU panel", ms(panel), pct(panel));
-    eprintln!("  {:<28} {:>9.4} {:>7.1}%", "LU solve", ms(solve), pct(solve));
+    eprintln!(
+        "  {:<28} {:>9.4} {:>7.1}%",
+        "LU panel",
+        ms(panel),
+        pct(panel)
+    );
+    eprintln!(
+        "  {:<28} {:>9.4} {:>7.1}%",
+        "LU solve",
+        ms(solve),
+        pct(solve)
+    );
     eprintln!(
         "  {:<28} {:>9.4} {:>7.1}%",
         "LU trailing update",
@@ -159,7 +180,6 @@ fn run_phase_split(n: usize, reps: usize) {
 }
 
 fn run_one(n: usize, reps: usize) {
-
     // Diagonally dominant so the factorisation is well conditioned and pivoting does not dominate
     // by accident — the point is to time the common path, not a pathological one.
     let data: Vec<f64> = (0..n * n)
@@ -212,7 +232,10 @@ fn run_one(n: usize, reps: usize) {
     let ms = |v: u64| v as f64 / 1e6 / counted.max(1) as f64;
     let residue = slog - lu;
     eprintln!("SLOGDET slogdet_contiguous_f64   {slog:8.3} ms");
-    eprintln!("SLOGDET lu_factor_contiguous_f64 {lu:8.3} ms   ({:.0}% of slogdet)", 100.0 * lu / slog);
+    eprintln!(
+        "SLOGDET lu_factor_contiguous_f64 {lu:8.3} ms   ({:.0}% of slogdet)",
+        100.0 * lu / slog
+    );
     eprintln!(
         "SLOGDET slogdet-SPECIFIC residue {residue:8.3} ms   ({:.0}% of slogdet)",
         100.0 * residue / slog
@@ -313,7 +336,11 @@ fn run_ab(n: usize, reps: usize) {
 
     let median = |v: &mut Vec<f64>| -> f64 {
         v.sort_by(f64::total_cmp);
-        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        if v.is_empty() {
+            f64::NAN
+        } else {
+            v[v.len() / 2]
+        }
     };
     let ratios = |a: &[f64], b: &[f64]| -> f64 {
         let mut r: Vec<f64> = a.iter().zip(b).map(|(x, y)| x / y).collect();
@@ -408,7 +435,8 @@ fn run_inv(n: usize, reps: usize) {
         let _ = ft_kernel_cpu::lu_solve_half_take_ns();
         let _ = ft_kernel_cpu::lu_solve_perm_take_ns();
         let start = Instant::now();
-        let x = ft_kernel_cpu::lu_solve_contiguous_f64(&factor, &identity, &meta).expect("lu_solve");
+        let x =
+            ft_kernel_cpu::lu_solve_contiguous_f64(&factor, &identity, &meta).expect("lu_solve");
         let t_sol = start.elapsed().as_secs_f64() * 1e3;
         let (fwd_ns, back_ns) = ft_kernel_cpu::lu_solve_half_take_ns();
         let perm_ns = ft_kernel_cpu::lu_solve_perm_take_ns();
@@ -427,23 +455,39 @@ fn run_inv(n: usize, reps: usize) {
 
     let median = |v: &mut Vec<f64>| -> f64 {
         v.sort_by(f64::total_cmp);
-        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        if v.is_empty() {
+            f64::NAN
+        } else {
+            v[v.len() / 2]
+        }
     };
     let inv = median(&mut inv_v);
     let fac = median(&mut fac_v);
     let sol = median(&mut sol_v);
 
-    eprintln!("INV n={n} reps={reps} threads={}", rayon::current_num_threads());
+    eprintln!(
+        "INV n={n} reps={reps} threads={}",
+        rayon::current_num_threads()
+    );
     eprintln!("INV   inv_tensor_contiguous_f64  {inv:8.3} ms");
-    eprintln!("INV   lu_factor_contiguous_f64   {fac:8.3} ms  ({:5.1}% of inv)  <- e1isq's panel lives here", 100.0 * fac / inv);
-    eprintln!("INV   lu_solve (identity RHS)    {sol:8.3} ms  ({:5.1}% of inv)  <- inv-specific residue", 100.0 * sol / inv);
+    eprintln!(
+        "INV   lu_factor_contiguous_f64   {fac:8.3} ms  ({:5.1}% of inv)  <- e1isq's panel lives here",
+        100.0 * fac / inv
+    );
+    eprintln!(
+        "INV   lu_solve (identity RHS)    {sol:8.3} ms  ({:5.1}% of inv)  <- inv-specific residue",
+        100.0 * sol / inv
+    );
     let fwd = median(&mut fwd_v);
     let back = median(&mut back_v);
     eprintln!(
         "INV     forward L y = Pb        {fwd:8.3} ms  ({:5.1}% of the solve)  <- the ONLY half the identity-structure lever touches",
         100.0 * fwd / sol
     );
-    eprintln!("INV     back    U x = y         {back:8.3} ms  ({:5.1}% of the solve)", 100.0 * back / sol);
+    eprintln!(
+        "INV     back    U x = y         {back:8.3} ms  ({:5.1}% of the solve)",
+        100.0 * back / sol
+    );
     let perm = median(&mut perm_v);
     eprintln!(
         "INV     pivot permutation      {perm:8.3} ms  ({:5.1}% of the solve)  <- MEASURED, not inferred by subtraction",
@@ -539,7 +583,11 @@ fn run_perm_ab(n: usize, reps: usize) {
 
     let median = |v: &mut Vec<f64>| -> f64 {
         v.sort_by(f64::total_cmp);
-        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        if v.is_empty() {
+            f64::NAN
+        } else {
+            v[v.len() / 2]
+        }
     };
     let ratios = |a: &[f64], b: &[f64]| -> f64 {
         let mut r: Vec<f64> = a.iter().zip(b).map(|(x, y)| x / y).collect();
@@ -549,7 +597,10 @@ fn run_perm_ab(n: usize, reps: usize) {
     let perm_ratio = ratios(&off_p, &on_p);
     let null = median(&mut nulls.clone());
 
-    eprintln!("PERM_AB n={n} reps={reps} threads={}", rayon::current_num_threads());
+    eprintln!(
+        "PERM_AB n={n} reps={reps} threads={}",
+        rayon::current_num_threads()
+    );
     eprintln!(
         "PERM_AB   inv OFF (column gather) {:8.3} ms   perm frame {:7.3} ms",
         median(&mut off_v.clone()),
@@ -580,8 +631,12 @@ fn run_perm_ab(n: usize, reps: usize) {
     );
     eprintln!(
         "PERM_AB   OFF p25/p50/p75 {:.3}/{:.3}/{:.3}   ON p25/p50/p75 {:.3}/{:.3}/{:.3}",
-        quart(&off_v, 0.25), quart(&off_v, 0.5), quart(&off_v, 0.75),
-        quart(&on_v, 0.25), quart(&on_v, 0.5), quart(&on_v, 0.75)
+        quart(&off_v, 0.25),
+        quart(&off_v, 0.5),
+        quart(&off_v, 0.75),
+        quart(&on_v, 0.25),
+        quart(&on_v, 0.5),
+        quart(&on_v, 0.75)
     );
     eprintln!(
         "PERM_AB   SIGN TEST: ON faster in {wins}/{} reps",
@@ -597,12 +652,14 @@ fn run_perm_ab(n: usize, reps: usize) {
         on_half - off_half,
         100.0 * (on_half - off_half) / (off_perm - on_perm).max(f64::MIN_POSITIVE)
     );
-    eprintln!(
-        "PERM_AB   fwd+back OFF {off_half:.3} ms   ON {on_half:.3} ms"
-    );
+    eprintln!("PERM_AB   fwd+back OFF {off_half:.3} ms   ON {on_half:.3} ms");
     eprintln!(
         "PERM_AB   INV LANE {lane:.4}x   PERM FRAME {perm_ratio:.4}x   A/A null {null:.4} {}",
-        if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
+        if (0.97..=1.03).contains(&null) {
+            "PASS"
+        } else {
+            "FAIL — discard this row"
+        }
     );
 }
 
@@ -653,14 +710,21 @@ fn run_struct_ab(n: usize, reps: usize) {
 
     let median = |v: &mut Vec<f64>| -> f64 {
         v.sort_by(f64::total_cmp);
-        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+        if v.is_empty() {
+            f64::NAN
+        } else {
+            v[v.len() / 2]
+        }
     };
     let mut r: Vec<f64> = off_v.iter().zip(&on_v).map(|(a, b)| a / b).collect();
     let lane = median(&mut r);
     let null = median(&mut nulls.clone());
     let wins = off_v.iter().zip(&on_v).filter(|(o, n)| n < o).count();
 
-    eprintln!("STRUCT_AB n={n} reps={reps} threads={}", rayon::current_num_threads());
+    eprintln!(
+        "STRUCT_AB n={n} reps={reps} threads={}",
+        rayon::current_num_threads()
+    );
     eprintln!(
         "STRUCT_AB   inv OFF (dense identity) {:8.3} ms   ON (structured) {:8.3} ms",
         median(&mut off_v.clone()),
@@ -673,6 +737,10 @@ fn run_struct_ab(n: usize, reps: usize) {
     );
     eprintln!(
         "STRUCT_AB   INV LANE {lane:.4}x   A/A null {null:.4} {}",
-        if (0.97..=1.03).contains(&null) { "PASS" } else { "FAIL — discard this row" }
+        if (0.97..=1.03).contains(&null) {
+            "PASS"
+        } else {
+            "FAIL — discard this row"
+        }
     );
 }

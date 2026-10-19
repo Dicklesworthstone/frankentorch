@@ -1126,6 +1126,7 @@ fn main() {
 }
 
 #[cfg(test)]
+#[allow(dead_code, unused_imports)]
 mod tests {
     use super::gauntlet_provenance;
 
