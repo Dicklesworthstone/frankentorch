@@ -821,6 +821,20 @@ mod gemm {
         }
     }
 
+    fn should_parallelize_strided_wy_cols(m: usize, k: usize, n: usize) -> bool {
+        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
+            return true;
+        }
+        let width = householder_panel_width();
+        let min_dim = 2 * MIN_BLOCK_COLS + 1;
+        householder_skinny_parallel_enabled()
+            && rayon::current_num_threads() > 1
+            && n >= min_dim
+            && ((m <= width && k >= HOUSEHOLDER_SKINNY_MIN_ACTIVE)
+                || (k <= width && m >= HOUSEHOLDER_SKINNY_MIN_ACTIVE))
+            && (m as u128) * (k as u128) * (n as u128) >= HOUSEHOLDER_SKINNY_MIN_FLOPS
+    }
+
     /// `C[m,n] = A^T @ B` where `A` is row-major `[k, m]` and `B` is a SUBMATRIX with row
     /// stride `ldb` starting at `b_off`. `C` is contiguous `[m, n]`.
     ///
@@ -850,7 +864,7 @@ mod gemm {
             "dgemm_tb_b_strided: B window {span} exceeds {} (ldb={ldb}, n={n})",
             b.len()
         );
-        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
+        if should_parallelize_strided_wy_cols(m, k, n) {
             let nb = block_cols(n);
             let cp = TilePtr(c.as_mut_ptr());
             (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
@@ -1097,7 +1111,7 @@ mod gemm {
             "dgemm_sub_strided_gated: C window {span} exceeds {} (ldc={ldc}, n={n})",
             c.len()
         );
-        if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
+        if should_parallelize_strided_wy_cols(m, k, n) {
             let nb = block_cols(n);
             let cp = TilePtr(c.as_mut_ptr());
             (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
@@ -1203,6 +1217,138 @@ mod gemm {
         }
     }
 
+    /// `C_sub[m,n] -= A[m,k] @ B^T` (with `B` row-major `[n, k]`) writing directly into a
+    /// strided submatrix of `c` (`c_off`, `ldc`) while gating parallelism on the same
+    /// shape/flop predicates as [`dgemm_bt`] and [`dgemm_sub_strided_gated`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dgemm_bt_sub_strided_gated(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+        c_off: usize,
+        ldc: usize,
+    ) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..n * k];
+        let span = c_off + (m - 1) * ldc + n;
+        assert!(
+            c.len() >= span && ldc >= n,
+            "dgemm_bt_sub_strided_gated: C window {span} exceeds {} (ldc={ldc}, n={n})",
+            c.len()
+        );
+        if should_parallelize_strided_wy_cols(m, k, n) {
+            let nb = block_cols(n);
+            let cp = TilePtr(c.as_mut_ptr());
+            (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0 * k),
+                        1,
+                        k as isize,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            });
+        } else if should_parallelize(m, k, n) {
+            if n >= 2 * MIN_BLOCK_COLS {
+                let (mb, nb) = tile_shape(m, n);
+                let cp = TilePtr(c.as_mut_ptr());
+                (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
+                    let cp = &cp;
+                    let j0 = j_blk * nb;
+                    let bj = (j0 + nb).min(n) - j0;
+                    (0..m.div_ceil(mb)).into_par_iter().for_each(|i_blk| {
+                        let i0 = i_blk * mb;
+                        let bi = (i0 + mb).min(m) - i0;
+                        unsafe {
+                            dgemm_mm(
+                                bi,
+                                k,
+                                bj,
+                                -1.0,
+                                a.as_ptr().add(i0 * k),
+                                k as isize,
+                                1,
+                                b.as_ptr().add(j0 * k),
+                                1,
+                                k as isize,
+                                1.0,
+                                cp.0.add(c_off + i0 * ldc + j0),
+                                ldc as isize,
+                                1,
+                            );
+                        }
+                    });
+                });
+            } else {
+                let br = block_rows(m);
+                let cp = TilePtr(c.as_mut_ptr());
+                (0..m.div_ceil(br)).into_par_iter().for_each(|i_blk| {
+                    let cp = &cp;
+                    let i0 = i_blk * br;
+                    let bi = (i0 + br).min(m) - i0;
+                    unsafe {
+                        dgemm_mm(
+                            bi,
+                            k,
+                            n,
+                            -1.0,
+                            a.as_ptr().add(i0 * k),
+                            k as isize,
+                            1,
+                            b.as_ptr(),
+                            1,
+                            k as isize,
+                            1.0,
+                            cp.0.add(c_off + i0 * ldc),
+                            ldc as isize,
+                            1,
+                        );
+                    }
+                });
+            }
+        } else {
+            unsafe {
+                dgemm_mm(
+                    m,
+                    k,
+                    n,
+                    -1.0,
+                    a.as_ptr(),
+                    k as isize,
+                    1,
+                    b.as_ptr(),
+                    1,
+                    k as isize,
+                    1.0,
+                    c.as_mut_ptr().add(c_off),
+                    ldc as isize,
+                    1,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn dgemm_sub_into(
         m: usize,
         k: usize,
@@ -9494,6 +9640,7 @@ pub fn set_conv2d_dweight_mb(mb: usize) -> usize {
     CONV2D_DWEIGHT_MB.swap(mb, std::sync::atomic::Ordering::Relaxed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv2d_dweight_streamed_f32(
     dout_flat: &[f32],
     padded: &[f32],
@@ -10608,6 +10755,7 @@ fn conv2d_backward_dinput_grouped_f64(
     dpadded
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv2d_backward_dinput_blocked_rows_f64(
     dout_flat: &[f64],
     weight_flat: &[f64],
@@ -10800,7 +10948,7 @@ fn conv2d_dout_flat_f32(dout: &[f32], batch: usize, out_ch: usize, patch_count: 
 ///
 /// BIT-EXACT BY CONSTRUCTION: every gradient still requested is computed by the same calls in the
 /// same order as before. Not computing a gradient nobody reads cannot change one that is read.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 pub fn conv2d_backward_masked_f32(
     dout: &[f32],
@@ -11179,7 +11327,7 @@ fn conv2d_transpose_bias_into_f64(
         return;
     }
     let plane = patch_count * out_ch;
-    if batch < threads && out_ch % TRANSPOSE_BLK_F64 == 0 {
+    if batch < threads && out_ch.is_multiple_of(TRANSPOSE_BLK_F64) {
         let per_batch = out_ch / TRANSPOSE_BLK_F64;
         o.par_chunks_mut(TRANSPOSE_BLK_F64 * patch_count)
             .enumerate()
@@ -11230,7 +11378,7 @@ fn conv2d_transpose_bias_into_f32(
         return;
     }
     let plane = patch_count * out_ch;
-    if batch < threads && out_ch % TRANSPOSE_BLK_F32 == 0 {
+    if batch < threads && out_ch.is_multiple_of(TRANSPOSE_BLK_F32) {
         let per_batch = out_ch / TRANSPOSE_BLK_F32;
         o.par_chunks_mut(TRANSPOSE_BLK_F32 * patch_count)
             .enumerate()
@@ -11468,7 +11616,7 @@ pub fn conv2d_forward_f64(
     // `build_uninit` is sound here for the usual reason plus an ordering one: the transpose pass
     // writes every element of `o` before the bias pass reads any of them, so nothing reads
     // uninitialized memory. It also subsumes the dead `vec![0.0; ..]` fill item 156 listed as owed.
-    let out = build_uninit(batch * out_ch * patch_count, |o: &mut [f64]| {
+    build_uninit(batch * out_ch * patch_count, |o: &mut [f64]| {
         conv2d_transpose_bias_into_f64(
             o,
             &out_flat,
@@ -11478,8 +11626,7 @@ pub fn conv2d_forward_f64(
             patch_count,
             rayon::current_num_threads(),
         );
-    });
-    out
+    })
 }
 
 /// f32 mirror of [`conv2d_im2col_f64`]: parallel im2col into a
@@ -11632,7 +11779,7 @@ pub fn conv2d_forward_f32(
     // per read on a 64-byte line, so the per-channel re-streaming is the same defect, not a
     // milder one. UNBUILT — item 160. Chunking now lives in `conv2d_transpose_bias_into_f32`,
     // which lifts item 171's `batch`-way ceiling without changing the coarse arm.
-    let out = build_uninit(batch * out_ch * patch_count, |o: &mut [f32]| {
+    build_uninit(batch * out_ch * patch_count, |o: &mut [f32]| {
         conv2d_transpose_bias_into_f32(
             o,
             &out_flat,
@@ -11642,8 +11789,7 @@ pub fn conv2d_forward_f32(
             patch_count,
             rayon::current_num_threads(),
         );
-    });
-    out
+    })
 }
 
 /// Direct depthwise conv2d forward (groups == channels, one filter per channel).
@@ -12248,7 +12394,7 @@ pub fn reset_conv2d_backward_gemm_counts() {
 /// makes `dout` all ones) and both freeze their weight, so both pay in full for a `dweight` they
 /// discard. Not taken here because this kernel's dispatch was being refactored by another agent in
 /// the same window and nothing can be compiled under the current throttle.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 pub fn conv2d_backward_masked_f64(
     dout: &[f64],
@@ -12395,6 +12541,8 @@ pub fn conv2d_backward_masked_f64(
     (dpadded, dweight, dbias)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn conv2d_backward_f64(
     dout: &[f64],
     padded: &[f64],
@@ -12995,7 +13143,7 @@ fn conv2d_ones_dout_route(
 /// route, which items 179, 181 and 183 assert is BIT-IDENTICAL to the adjoint on all-ones input —
 /// so the value returned is unchanged either way and only the route differs. Rejecting a case the
 /// old code accepted is the safe direction; accepting one it rejected would not be.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 pub fn conv2d_backward_f32_ones_dout_from_f64_grad(
     dout_f64: &[f64],
@@ -13374,6 +13522,7 @@ fn conv2d_backward_3x3_stride1_ones_dout_f32(
     (dpadded, dweight, dbias)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv2d_backward_3x3_stride1_ones_dout_f64(
     padded: &[f64],
     weight_flat: &[f64],
@@ -13410,7 +13559,7 @@ fn conv2d_backward_3x3_stride1_ones_dout_f64(
 /// The weight scan and input-gradient GEMM/scatter are independent, so a frozen weight must not
 /// make the summed route compute and discard `dweight`. Each selected half preserves the exact
 /// operation order of [`conv2d_backward_3x3_stride1_ones_dout_f64`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 fn conv2d_backward_3x3_stride1_ones_dout_masked_f64(
     padded: &[f64],
@@ -14003,8 +14152,7 @@ pub fn max_pool3d_forward_with_indices_f64(
                     let mut loc101 = loc100 + 1;
                     let mut loc110 = row11;
                     let mut loc111 = loc110 + 1;
-                    let mut oidx = (oz * oh + oy) * ow;
-                    for _ in 0..ow {
+                    for oidx in ((oz * oh + oy) * ow..).take(ow) {
                         let mut max_value = f64::NEG_INFINITY;
                         // The window's FIRST element, which is what torch reports
                         // when nothing displaces the seed (an all -inf window):
@@ -14064,7 +14212,6 @@ pub fn max_pool3d_forward_with_indices_f64(
                         loc101 += 2;
                         loc110 += 2;
                         loc111 += 2;
-                        oidx += 1;
                     }
                 }
             }
@@ -18322,7 +18469,7 @@ pub fn conv3d_backward_f32(
 /// first-order backwards and item 195 wired only one.
 ///
 /// **UNBUILT**: written under an absolute disk throttle; not compiled, not tested, not measured.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn conv3d_backward_masked_f32(
     dout: &[f32],
     padded: &[f32],
@@ -18726,7 +18873,7 @@ fn conv3d_backward_ones_dout_f64(
 /// Reaching the generic path just because a mask was passed would trade a fast path for a skip and
 /// could easily be a net LOSS on the summed route, so this delegates and masks afterwards there —
 /// saving nothing, and saying so rather than implying otherwise.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 pub fn conv3d_backward_masked_f64(
     dout: &[f64],
@@ -18857,7 +19004,7 @@ fn conv3d_backward_generic_f64(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn conv3d_backward_generic_masked_f64(
     dout: &[f64],
     padded: &[f64],
@@ -26222,7 +26369,7 @@ fn lu_factor_panel_recursive_f64(
                 }
                 continue;
             }
-            if n - k - 1 >= lu_panel_par_min() && rayon::current_num_threads() > 1 {
+            if n - k > lu_panel_par_min() && rayon::current_num_threads() > 1 {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n..(k + 1) * n];
                 tail.par_chunks_mut(n).for_each(|row| {
@@ -26737,8 +26884,8 @@ pub fn lu_solve_contiguous_f64(
     let perm_start = std::time::Instant::now();
     let mut x: Vec<f64> = if lu_solve_perm_rowwise() {
         let mut out: Vec<f64> = Vec::with_capacity(n * num_rhs);
-        for i in 0..n {
-            let src = offset + factor.pivots[i] * num_rhs;
+        for &pivot in factor.pivots.iter().take(n) {
+            let src = offset + pivot * num_rhs;
             out.extend_from_slice(&b_data[src..src + num_rhs]);
         }
         out
@@ -28645,9 +28792,9 @@ fn cholesky_panel_factor_f64(
                     // unchanged and the result is bit-exact; what changes is that one traversal of
                     // the diagonal row now serves four rows, and sixteen independent chains are in
                     // flight instead of four.
-                    let mut chunks = tail[..rows * n].chunks_mut(4 * n);
+                    let chunks = tail[..rows * n].chunks_mut(4 * n);
                     let mut base = jj + 1;
-                    while let Some(block) = chunks.next() {
+                    for block in chunks {
                         let nrows = block.len() / n;
                         if nrows == 4 {
                             let (r0, rest) = block.split_at_mut(n);
@@ -30958,7 +31105,7 @@ fn eigh_tred2_reduce_packed_full_gated(
                             acc += wide::f64x4::from(lane) * wide::f64x4::splat(row_i_ro[k]);
                         }
                         // k > j3: A[k, j0..=j3] is one contiguous run of four.
-                        for k in (j3 + 1)..=l {
+                        for (k, &row_i_k) in row_i_ro.iter().enumerate().take(l + 1).skip(j3 + 1) {
                             let base = lower_packed_index(k, 0) + j0;
                             let quad = [
                                 prev_ro[base],
@@ -30966,7 +31113,7 @@ fn eigh_tred2_reduce_packed_full_gated(
                                 prev_ro[base + 2],
                                 prev_ro[base + 3],
                             ];
-                            acc += wide::f64x4::from(quad) * wide::f64x4::splat(row_i_ro[k]);
+                            acc += wide::f64x4::from(quad) * wide::f64x4::splat(row_i_k);
                         }
                         let out = acc.to_array();
                         ggs[j0..j0 + 4].copy_from_slice(&out);
@@ -31195,6 +31342,7 @@ const TRED2_FLUSH_PANEL: usize = 64;
 ///   * row-`i` correction:  `A[i,j] -= pmat[j]·qmat[i]`  (and `A[i,i] -= pmat[i]·qmat[i]`)
 ///   * matvec correction:   `ggs[j] -= pmat[j]·swap(c)` where `c = Σ_j pmat[j]·v[j]`
 ///   * the flush:           `A[j,k] -= pmat[j]·qmat[k]`
+///
 /// Columns not yet written are zero, so a dot over the full `2*nb` width is the same sum as one
 /// truncated at the current step — no per-step bounds bookkeeping.
 #[allow(clippy::needless_range_loop)]
@@ -36990,6 +37138,7 @@ mod bidiag {
     // This changes floating-point association, so unlike the trailing-update switch above it is
     // not a bit-exact maintenance toggle: its live parity column is load-bearing.
     static BLOCKED_FORM_P: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static BLOCKED_FORM_Q: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
     pub(crate) fn fused_trailing_enabled() -> bool {
         FUSED_TRAILING.load(std::sync::atomic::Ordering::Relaxed)
@@ -37012,6 +37161,25 @@ mod bidiag {
     }
 
     #[inline]
+    pub(crate) fn blocked_form_q_enabled() -> bool {
+        BLOCKED_FORM_Q.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn set_blocked_form_q(blocked: bool) -> bool {
+        BLOCKED_FORM_Q.swap(blocked, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn svd_form_pq_block_size(n: usize) -> usize {
+        if n >= 256 {
+            32
+        } else {
+            super::svd_bidiag_block_size()
+        }
+    }
+
+    #[inline]
     pub(crate) fn form_p_for_svd(
         packed: &[f64],
         n: usize,
@@ -37019,13 +37187,29 @@ mod bidiag {
         blocked: bool,
     ) -> Vec<f64> {
         if blocked {
-            bidiag_form_p_blocked_f64(packed, n, taup, super::svd_bidiag_block_size())
+            bidiag_form_p_blocked_f64(packed, n, taup, svd_form_pq_block_size(n))
         } else {
             bidiag_form_p_f64(packed, n, taup)
         }
     }
 
     #[inline]
+    pub(crate) fn form_q_for_svd(
+        packed: &[f64],
+        m: usize,
+        n: usize,
+        tauq: &[f64],
+        blocked: bool,
+    ) -> Vec<f64> {
+        if blocked {
+            bidiag_form_q_blocked_f64(packed, m, n, tauq, svd_form_pq_block_size(n))
+        } else {
+            bidiag_form_q_f64(packed, m, n, tauq)
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
     // `pub(crate)` so `bidiag_rowdot_four_row_and_one_row_arms_are_bit_identical` can drive both
     // arms directly. Reaching it only through `bidiag_blocked_f64` would test the two arms
     // through the whole reduction, where a per-lane reassociation could be masked by the QR
@@ -37900,6 +38084,13 @@ mod bidiag {
 
         // The unblocked loop applies the greatest-index reflector first. Keep
         // that panel order so the product remains H_0 H_1 ... H_(n-1).
+        let max_w = nb.min(n);
+        let mut vmat_buf = vec![0.0f64; m * max_w];
+        let mut taus_buf = vec![0.0f64; max_w];
+        let mut tmat_buf = vec![0.0f64; max_w * max_w];
+        let mut tcol_buf = vec![0.0f64; max_w];
+        let mut w1_buf = vec![0.0f64; max_w * n];
+        let mut w2_buf = vec![0.0f64; max_w * n];
         let mut panel_end = n - 1;
         loop {
             let w = nb.min(panel_end + 1);
@@ -37910,8 +38101,10 @@ mod bidiag {
             // Staircase V and its taus. Column j represents reflector p0+j:
             // it is unit at row j in the panel and contains the packed tail
             // below it.
-            let mut vmat = vec![0.0f64; mrows * w];
-            let mut taus = vec![0.0f64; w];
+            let vmat = &mut vmat_buf[..mrows * w];
+            vmat.fill(0.0);
+            let taus = &mut taus_buf[..w];
+            taus.fill(0.0);
             for j in 0..w {
                 let i = p0 + j;
                 let tau = tauq[i];
@@ -37927,7 +38120,8 @@ mod bidiag {
 
             // dlarft's forward, columnwise recurrence: the panel represents
             // H_p0 H_(p0+1) ... H_panel_end.
-            let mut tmat = vec![0.0f64; w * w];
+            let tmat = &mut tmat_buf[..w * w];
+            tmat.fill(0.0);
             for j in 0..w {
                 let tau = taus[j];
                 tmat[j * w + j] = tau;
@@ -37941,7 +38135,7 @@ mod bidiag {
                     }
                     tmat[q_col * w + j] = dot;
                 }
-                let mut tcol = vec![0.0f64; j];
+                let tcol = &mut tcol_buf[..j];
                 for q_col in 0..j {
                     let mut sum = 0.0;
                     for s in q_col..j {
@@ -37954,40 +38148,14 @@ mod bidiag {
                 }
             }
 
-            // Apply the panel from the left to Q[p0..m, p0..n):
+            // Apply the panel from the left to Q[p0..m, p0..n) in place:
             // B <- B - V T (V^T B).
-            let mut block = vec![0.0f64; mrows * ncols];
-            for r in 0..mrows {
-                let src = (p0 + r) * n + p0;
-                block[r * ncols..(r + 1) * ncols].copy_from_slice(&q[src..src + ncols]);
-            }
-            let mut w1 = vec![0.0f64; w * ncols];
-            // V^T B, WITHOUT materialising V^T. `dgemm_tb(m, k, n, a, b, c)` computes
-            // `C[m,n] = A^T @ B` with `A` row-major `[k, m]`, reading A through strides
-            // (rsa=1, csa=m) — and `vmat` is already `[mrows, w]`, exactly that layout. So
-            // m=w, k=mrows, n=ncols.
-            //
-            // WHY: a cache-miss profile puts `dgemm` at 29.80% of the op's misses on 13.32%
-            // of its instructions, the largest single contributor, and the staged transpose
-            // is part of that traffic. `dgemm_tb` documents that its K traversal matches the
-            // materialise-transpose-then-dgemm path element for element, so this is bit-exact
-            // rather than merely equivalent.
-            //
-            // The `dgemm(m, k, n)` argument order is worth keeping in view here: it wants
-            // a: m x k, b: k x n, c: m x n. k and n were once transposed at this call site,
-            // which is INVISIBLE on square input (mrows == ncols) and panics inside dgemm's
-            // `c[..m*n]` slice on any TALL one.
-            super::gemm::dgemm_tb(w, mrows, ncols, &vmat, &block, &mut w1);
-            let mut w2 = vec![0.0f64; w * ncols];
-            super::gemm::dgemm(w, w, ncols, &tmat, &w1, &mut w2);
-            let mut upd = vec![0.0f64; mrows * ncols];
-            super::gemm::dgemm(mrows, w, ncols, &vmat, &w2, &mut upd);
-            for r in 0..mrows {
-                let dst = (p0 + r) * n + p0;
-                for c in 0..ncols {
-                    q[dst + c] = block[r * ncols + c] - upd[r * ncols + c];
-                }
-            }
+            let q_off = p0 * n + p0;
+            let w1 = &mut w1_buf[..w * ncols];
+            super::gemm::dgemm_tb_b_strided(w, mrows, ncols, vmat, &q, q_off, n, w1);
+            let w2 = &mut w2_buf[..w * ncols];
+            super::gemm::dgemm(w, w, ncols, tmat, w1, w2);
+            super::gemm::dgemm_sub_strided_gated(mrows, w, ncols, vmat, w2, &mut q, q_off, n);
 
             if p0 == 0 {
                 break;
@@ -38045,6 +38213,13 @@ mod bidiag {
         // Panels are applied in the same order the unblocked loop uses: the
         // highest-index reflectors first, so the product composes as
         // H_0 H_1 ... H_{n-1}.
+        let max_w = nb.min(n);
+        let mut vmat_buf = vec![0.0f64; n * max_w];
+        let mut taus_buf = vec![0.0f64; max_w];
+        let mut tmat_buf = vec![0.0f64; max_w * max_w];
+        let mut tcol_buf = vec![0.0f64; max_w];
+        let mut w1_buf = vec![0.0f64; max_w * n];
+        let mut w2_buf = vec![0.0f64; max_w * n];
         let mut panel_end = n - 1; // last reflector index with a non-empty block
         loop {
             let w = nb.min(panel_end + 1);
@@ -38053,8 +38228,10 @@ mod bidiag {
             let nrows = n - row0;
 
             // Staircase V (nrows x w) and its transpose, plus the panel's taus.
-            let mut vmat = vec![0.0f64; nrows * w];
-            let mut taus = vec![0.0f64; w];
+            let vmat = &mut vmat_buf[..nrows * w];
+            vmat.fill(0.0);
+            let taus = &mut taus_buf[..w];
+            taus.fill(0.0);
             for j in 0..w {
                 let i = p0 + j;
                 taus[j] = taup[i];
@@ -38069,7 +38246,8 @@ mod bidiag {
 
             // Compact-WY T, mirroring the dlarft recurrence used elsewhere in this
             // file: T[j][j] = tau_j, T[0:j, j] = -tau_j * T[0:j,0:j] @ (V^T v_j).
-            let mut tmat = vec![0.0f64; w * w];
+            let tmat = &mut tmat_buf[..w * w];
+            tmat.fill(0.0);
             for j in 0..w {
                 let tau = taus[j];
                 tmat[j * w + j] = tau;
@@ -38083,7 +38261,7 @@ mod bidiag {
                     }
                     tmat[q * w + j] = z;
                 }
-                let mut tcol = vec![0.0f64; j];
+                let tcol = &mut tcol_buf[..j];
                 for q in 0..j {
                     let mut sum = 0.0;
                     for s in q..j {
@@ -38096,29 +38274,13 @@ mod bidiag {
                 }
             }
 
-            // Gather the trailing block, apply (I - V T V^T) from the left with
-            // three GEMMs, scatter back.
-            let mut block = vec![0.0f64; nrows * nrows];
-            for r in 0..nrows {
-                let src = (row0 + r) * n + row0;
-                block[r * nrows..(r + 1) * nrows].copy_from_slice(&p[src..src + nrows]);
-            }
-            let mut w1 = vec![0.0f64; w * nrows];
-            // V^T B without materialising V^T — same substitution as the form_q sibling.
-            // `vmat` is row-major [nrows, w], which is exactly the [k, m] operand `dgemm_tb`
-            // reads through strides, so m=w, k=nrows, n=nrows. Bit-exact: dgemm_tb's K
-            // traversal matches the materialise-then-dgemm path element for element.
-            super::gemm::dgemm_tb(w, nrows, nrows, &vmat, &block, &mut w1); // V^T B
-            let mut w2 = vec![0.0f64; w * nrows];
-            super::gemm::dgemm(w, w, nrows, &tmat, &w1, &mut w2); // T (V^T B)
-            let mut upd = vec![0.0f64; nrows * nrows];
-            super::gemm::dgemm(nrows, w, nrows, &vmat, &w2, &mut upd); // V (T V^T B)
-            for r in 0..nrows {
-                let dst = (row0 + r) * n + row0;
-                for c in 0..nrows {
-                    p[dst + c] = block[r * nrows + c] - upd[r * nrows + c];
-                }
-            }
+            // Apply (I - V T V^T) from the left to P[row0..n, row0..n) in place.
+            let p_off = row0 * n + row0;
+            let w1 = &mut w1_buf[..w * nrows];
+            super::gemm::dgemm_tb_b_strided(w, nrows, nrows, vmat, &p, p_off, n, w1); // V^T B
+            let w2 = &mut w2_buf[..w * nrows];
+            super::gemm::dgemm(w, w, nrows, tmat, w1, w2); // T (V^T B)
+            super::gemm::dgemm_sub_strided_gated(nrows, w, nrows, vmat, w2, &mut p, p_off, n); // P -= V (T V^T B)
 
             if p0 == 0 {
                 break;
@@ -38481,11 +38643,8 @@ fn svd_blocked_bidiag_prologue(
     let t_formp = std::time::Instant::now();
     let v = bidiag::form_p_for_svd(a, n, &taup, n >= 130 && bidiag::blocked_form_p_enabled());
     if track_left {
-        let q = if n >= 130 {
-            bidiag::bidiag_form_q_blocked_f64(a, m, n, &tauq, svd_bidiag_block_size())
-        } else {
-            bidiag::bidiag_form_q_f64(a, m, n, &tauq)
-        };
+        let q =
+            bidiag::form_q_for_svd(a, m, n, &tauq, n >= 130 && bidiag::blocked_form_q_enabled());
         a[..m * n].copy_from_slice(&q);
     }
     SVD_FORM_PQ_NS.fetch_add(
@@ -39675,6 +39834,13 @@ pub fn bidiag_fused_trailing_set(fused: bool) -> bool {
 #[doc(hidden)]
 pub fn bidiag_form_p_blocked_set(blocked: bool) -> bool {
     bidiag::set_blocked_form_p(blocked)
+}
+
+/// Select the SVD prologue's left-reflector expansion: `true` is the shipped compact-WY
+/// form and `false` is the unblocked dorg2r form. Returns the previous setting.
+#[doc(hidden)]
+pub fn bidiag_form_q_blocked_set(blocked: bool) -> bool {
+    bidiag::set_blocked_form_q(blocked)
 }
 
 /// The currently live bidiagonal parallel gate.
@@ -40919,18 +41085,46 @@ pub fn ormqr_stage_take_ns() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
 /// hands each column block to ONE `dgemm_mm` call with `alpha = -1.0` accumulating into `C`, so
 /// every element's k-reduction happens whole in the same order and the final combine is `c - ab`
 /// — exactly the `c[t] -= upd[t]` it replaces.
-static ORMQR_FUSED_SUBTRACT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+const ORMQR_FUSED_SUBTRACT_OFF: u8 = 0;
+const ORMQR_FUSED_SUBTRACT_ON: u8 = 1;
+const ORMQR_FUSED_SUBTRACT_AUTO: u8 = 2;
+/// Minimum `C` matrix size (`cr * cc`) for the default size-gated fused ORMQR subtract
+/// (`dgemm_sub_strided_gated` / `dgemm_bt_sub_strided_gated`). Activated at `n >= 256`
+/// (`65_536` elements) when explicit subtract-parallel diagnostic mode is off, keeping small
+/// diagnostic/test shapes (`160x24`, `160x128`) on the stage-profiled materialised path by
+/// default. `frankentorch-g0wpj`.
+const ORMQR_FUSED_SUBTRACT_MIN_ELEMS: usize = 256 * 256;
+
+static ORMQR_FUSED_SUBTRACT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(ORMQR_FUSED_SUBTRACT_AUTO);
 static ORMQR_FUSED_SUBTRACT_HITS: AtomicU64 = AtomicU64::new(0);
 
-/// Enable or disable the fused ORMQR update; returns the previous setting.
+/// Enable or disable the fused ORMQR update explicitly; returns the previous explicit setting.
 #[doc(hidden)]
 pub fn set_ormqr_fused_subtract(on: bool) -> bool {
-    ORMQR_FUSED_SUBTRACT.swap(on, LuOrdering::Relaxed)
+    let mode = if on {
+        ORMQR_FUSED_SUBTRACT_ON
+    } else {
+        ORMQR_FUSED_SUBTRACT_OFF
+    };
+    ORMQR_FUSED_SUBTRACT.swap(mode, LuOrdering::Relaxed) == ORMQR_FUSED_SUBTRACT_ON
 }
 
-fn ormqr_fused_subtract() -> bool {
-    ORMQR_FUSED_SUBTRACT.load(LuOrdering::Relaxed)
+/// Restore the default size-gated (`cr * cc >= 256 * 256`) fused ORMQR update policy.
+#[doc(hidden)]
+pub fn set_ormqr_fused_subtract_auto() {
+    ORMQR_FUSED_SUBTRACT.store(ORMQR_FUSED_SUBTRACT_AUTO, LuOrdering::Relaxed);
+}
+
+fn ormqr_fused_subtract_for(c_elems: usize) -> bool {
+    match ORMQR_FUSED_SUBTRACT.load(LuOrdering::Relaxed) {
+        ORMQR_FUSED_SUBTRACT_OFF => false,
+        ORMQR_FUSED_SUBTRACT_ON => true,
+        _ => {
+            !ORMQR_SUBTRACT_PARALLEL.load(LuOrdering::Relaxed)
+                && c_elems >= ORMQR_FUSED_SUBTRACT_MIN_ELEMS
+        }
+    }
 }
 
 /// Drain the number of ORMQR panel applies that took the FUSED update. A candidate arm reporting
@@ -41782,7 +41976,7 @@ fn qr_apply_panel_block_reflector_cm_f64(
 }
 
 /// `qr_factor_panel_leaf_f64` over the column-major panel — every inner loop contiguous.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn qr_factor_panel_leaf_cm_f64(
     pbuf: &mut [f64],
     vbuf: &mut [f64],
@@ -41817,9 +42011,8 @@ fn qr_factor_panel_leaf_cm_f64(
         let v0 = pbuf[col_base];
         let sign = if v0 >= 0.0 { 1.0 } else { -1.0 };
         vbuf[col_base] = v0 + sign * norm_v;
-        for t in 1..col_len {
-            vbuf[col_base + t] = pbuf[col_base + t];
-        }
+        vbuf[(col_base + 1)..(col_base + col_len)]
+            .copy_from_slice(&pbuf[(col_base + 1)..(col_base + col_len)]);
         let mut nv2 = 0.0;
         for t in 0..col_len {
             let x = vbuf[col_base + t];
@@ -42107,6 +42300,7 @@ fn ormqr_subtract_update_cols(
 /// Returns the `(panel_start, nb, V, T, tau)` panels. When [`qr_active_submatrix`] is enabled,
 /// `V` has shape `(m - p) x nb` row-major (only the active rows `p..m`); when disabled, `V` is
 /// `m x nb` row-major with zeros in rows `0..p`.
+#[allow(clippy::type_complexity)]
 fn qr_blocked_forward_cm_f64(
     r_mat: &mut [f64],
     m: usize,
@@ -42239,6 +42433,7 @@ fn qr_blocked_forward_cm_f64(
 /// were previously thrown away: V survived only inside that function long enough to build
 /// Q, and tau was dropped entirely once the compact-WY T had been formed from it.
 /// frankentorch-geqrf-misses-blocked-kernel-1zp6r.
+#[allow(clippy::type_complexity)]
 fn qr_blocked_forward_f64(
     r_mat: &mut [f64],
     m: usize,
@@ -42787,14 +42982,14 @@ pub fn ormqr_blocked_f64(
             if let Some(started) = t_w_started {
                 ORMQR_T_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
-            if ormqr_fused_subtract() {
+            if ormqr_fused_subtract_for(cr * cc) {
                 // FUSED: C -= V * W in one pass. No `upd` allocation, no write, no read-back,
                 // no separate subtract. Timed as V_W because that is the GEMM it fuses into;
                 // SUBTRACT stays zero, which is the honest attribution — the phase is gone, not
                 // fast. `frankentorch-g0wpj`.
                 ORMQR_FUSED_SUBTRACT_HITS.fetch_add(1, LuOrdering::Relaxed);
                 let v_w_started = profile.then(std::time::Instant::now);
-                gemm::dgemm_sub_into(v_rows, nb, cc, vmat, &w2, c_active, 0, cc);
+                gemm::dgemm_sub_strided_gated(v_rows, nb, cc, vmat, &w2, c_active, 0, cc);
                 if let Some(started) = v_w_started {
                     ORMQR_V_W_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
@@ -42847,11 +43042,11 @@ pub fn ormqr_blocked_f64(
             if let Some(started) = t_w_started {
                 ORMQR_T_W_NS.fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
             }
-            if ormqr_fused_subtract() {
+            if ormqr_fused_subtract_for(cr * cc) {
                 // FUSED right route: C -= W * V^T, same argument as the left. g0wpj.
                 ORMQR_FUSED_SUBTRACT_HITS.fetch_add(1, LuOrdering::Relaxed);
                 let v_w_started = profile.then(std::time::Instant::now);
-                gemm::dgemm_bt_sub_into(cr, nb, v_rows, &w2, vmat, c, v_row0, m);
+                gemm::dgemm_bt_sub_strided_gated(cr, nb, v_rows, &w2, vmat, c, v_row0, m);
                 if let Some(started) = v_w_started {
                     ORMQR_V_W_NS
                         .fetch_add(started.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
@@ -50910,7 +51105,8 @@ mod tests {
                 );
             }
         }
-        super::set_ormqr_fused_subtract(previous);
+        let _ = previous;
+        super::set_ormqr_fused_subtract_auto();
     }
 
     /// Only one thread at a time may OWN the ORMQR stage profile — `frankentorch-ebbew`.
@@ -52515,6 +52711,7 @@ mod tests {
     /// `c` is oversized and the update targets a STRIDED window at `c_off` with row stride
     /// `ldc`, exactly as `bidiag_blocked_f64` uses it — a fused kernel that quietly assumed a
     /// contiguous `m x n` C would pass on a flat fixture and corrupt the real one.
+    #[allow(clippy::type_complexity)]
     fn fused_trailing_fixture(
         m: usize,
         k: usize,
@@ -53310,6 +53507,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn conv2d_dweight_streamed_f32_matches_the_panel_gemm_bitwise() {
         let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
             .lock()
@@ -53514,6 +53712,7 @@ mod tests {
     /// branch is exercised deterministically on any host. Widths include primes and values that
     /// divide neither `out_ch` nor `patch_width`, because those are the ones that break.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn conv2d_dweight_streamed_tiling_is_correct_at_every_rayon_width() {
         let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
             .lock()
@@ -53628,6 +53827,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn conv2d_dweight_streamed_matches_the_panel_gemm_bitwise() {
         let _guard = CONV2D_DWEIGHT_STREAM_TEST_GUARD
             .lock()
@@ -58419,7 +58619,7 @@ mod tests {
 
         let per_window_exact = |values: &[f64]| -> u64 {
             let mut acc = 0u64;
-            for w in values.chunks_exact(8) {
+            for w in values.as_chunks::<8>().0 {
                 let mut m = f64::NEG_INFINITY;
                 let mut arg = 0usize;
                 for (i, &v) in w.iter().enumerate() {
@@ -58434,7 +58634,7 @@ mod tests {
         };
         let per_window_fast = |values: &[f64]| -> u64 {
             let mut acc = 0u64;
-            for w in values.chunks_exact(8) {
+            for w in values.as_chunks::<8>().0 {
                 let mut any_nan = false;
                 for &v in w {
                     any_nan |= v != v;
@@ -58470,7 +58670,7 @@ mod tests {
                 return per_window_exact(values);
             }
             let mut acc = 0u64;
-            for w in values.chunks_exact(8) {
+            for w in values.as_chunks::<8>().0 {
                 let mut m = f64::NEG_INFINITY;
                 let mut arg = 0usize;
                 for (i, &v) in w.iter().enumerate() {
@@ -61625,11 +61825,11 @@ mod tests {
             }
 
             for b in 0..batch {
-                for oc in 0..out_ch {
+                for (oc, &bias_oc) in bias.iter().enumerate().take(out_ch) {
                     for z in 0..od {
                         for y in 0..oh {
                             for x in 0..ow {
-                                let mut want = bias[oc];
+                                let mut want = bias_oc;
                                 for c in 0..in_ch {
                                     for kdd in 0..kd {
                                         for kr in 0..kh {
@@ -61720,6 +61920,7 @@ mod tests {
     /// The ceiling must not evict the one shape where the direct kernel is measured to
     /// win: in_ch=8 still takes it.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn conv3d_direct_gate_still_admits_the_shape_it_wins_at() {
         assert!(
             8 <= super::CONV3D_DIRECT_MAX_IN_CH,
@@ -61912,6 +62113,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn conv3d_ones_dout_dweight_no_panel_matches_panel_gemm_bitwise() {
         let cases: &[(
             usize,
@@ -76524,7 +76726,7 @@ mod tests {
         let nb = super::svd_bidiag_block_size();
 
         for &n in &[136usize, 192] {
-            let input = bidiag_test_matrix(n, n, 0xB1D1_A6 ^ n as u64);
+            let input = bidiag_test_matrix(n, n, 0x00B1_D1A6 ^ n as u64);
 
             let mut hoisted_packed = input.clone();
             let (hoisted_d, hoisted_e, hoisted_tauq, hoisted_taup) =
@@ -77141,7 +77343,7 @@ mod tests {
     #[test]
     fn bidiag_blocked_reused_workspace_matches_negative_rank_deficient_oracle() {
         let (m, n, nb, rank, scale) = (48usize, 40usize, 4usize, 3usize, -1e-20f64);
-        let original = bidiag_test_matrix_rank_scaled(m, n, 0x75E3_8u64, rank, scale);
+        let original = bidiag_test_matrix_rank_scaled(m, n, 0x0007_5E38_u64, rank, scale);
         assert!(
             original.iter().any(|&value| value.is_sign_negative()),
             "seeded negative input unexpectedly has no negative entries"
@@ -79196,7 +79398,8 @@ mod tests {
                         );
                     }
                 }
-                super::set_ormqr_fused_subtract(prev_fused);
+                let _ = prev_fused;
+                super::set_ormqr_fused_subtract_auto();
             }
         }
     }

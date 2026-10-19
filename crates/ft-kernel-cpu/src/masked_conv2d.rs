@@ -55,7 +55,7 @@ fn masked_dout_tiled() -> bool {
 /// The product is written in the same `N, patch, C_out` gather order consumed by
 /// the incumbent dweight GEMM and dinput path. The GEMM reduction and col2im
 /// scatter are consequently unchanged.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 pub fn conv2d_backward_mask_fused_f64(
     incoming: &[f64],
@@ -243,7 +243,7 @@ pub fn conv2d_backward_mask_fused_f64(
 /// image-only gate is what left `conv2d_masked_train` on the old panel round trip at batch 8 while
 /// its batch-16 twin ran faster. At this lane's batch 160 the two agree, so the choice is
 /// invisible here and matters only for small batches.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[must_use]
 pub fn conv2d_backward_mask_fused_f32(
     incoming: &[f32],
@@ -474,7 +474,20 @@ mod tests {
         let run = |tiled: bool| {
             let previous = super::set_masked_dout_tiled(tiled);
             let out = conv2d_backward_mask_fused_f32(
-                &incoming, &mask, &padded, &weight, batch, in_ch, ph, pw, k, k, h, w, 1, 1,
+                &incoming,
+                &mask,
+                &padded,
+                &weight,
+                batch,
+                in_ch,
+                ph,
+                pw,
+                k,
+                k,
+                h,
+                w,
+                1,
+                1,
                 out_ch,
                 [true, true, true],
             );
