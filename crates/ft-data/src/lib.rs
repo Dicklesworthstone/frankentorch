@@ -1055,7 +1055,7 @@ fn stack_dense_tensors(
                         "DataLoader: sample values length does not match declared tensor shape",
                     ));
                 }
-                values.extend_from_slice(&sample_vals);
+                values.extend_from_slice(sample_vals);
             }
             let meta = TensorMeta::from_shape(batched_shape, DType::F64, device);
             DenseTensor::from_storage(meta, values).map_err(AutogradError::from)
@@ -1069,7 +1069,7 @@ fn stack_dense_tensors(
                         "DataLoader: sample values length does not match declared tensor shape",
                     ));
                 }
-                values.extend_from_slice(&sample_vals);
+                values.extend_from_slice(sample_vals);
             }
             let meta = TensorMeta::from_shape(batched_shape, DType::F32, device);
             DenseTensor::from_storage_f32(meta, values).map_err(AutogradError::from)
@@ -1083,7 +1083,7 @@ fn stack_dense_tensors(
                         "DataLoader: sample values length does not match declared tensor shape",
                     ));
                 }
-                values.extend_from_slice(&sample_vals);
+                values.extend_from_slice(sample_vals);
             }
             let meta = TensorMeta::from_shape(batched_shape, DType::F16, device);
             DenseTensor::from_storage_f16(meta, values).map_err(AutogradError::from)
@@ -1097,7 +1097,7 @@ fn stack_dense_tensors(
                         "DataLoader: sample values length does not match declared tensor shape",
                     ));
                 }
-                values.extend_from_slice(&sample_vals);
+                values.extend_from_slice(sample_vals);
             }
             let meta = TensorMeta::from_shape(batched_shape, DType::BF16, device);
             DenseTensor::from_storage_bf16(meta, values).map_err(AutogradError::from)
@@ -1113,7 +1113,7 @@ fn stack_dense_tensors(
                         "DataLoader: sample values length does not match declared tensor shape",
                     ));
                 }
-                values.extend_from_slice(&sample_vals);
+                values.extend_from_slice(sample_vals);
             }
             let meta = TensorMeta::from_shape(batched_shape, DType::Complex64, device);
             DenseTensor::from_storage_complex64(meta, values).map_err(AutogradError::from)
@@ -1129,7 +1129,7 @@ fn stack_dense_tensors(
                         "DataLoader: sample values length does not match declared tensor shape",
                     ));
                 }
-                values.extend_from_slice(&sample_vals);
+                values.extend_from_slice(sample_vals);
             }
             let meta = TensorMeta::from_shape(batched_shape, DType::Complex128, device);
             DenseTensor::from_storage_complex128(meta, values).map_err(AutogradError::from)

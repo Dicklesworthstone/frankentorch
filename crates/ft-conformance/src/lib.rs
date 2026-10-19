@@ -17158,6 +17158,7 @@ mod tests {
             // x ∈ (0, ~6.4].
             let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 10.0).collect();
             let n = input.len();
+            #[allow(clippy::approx_constant)]
             let euler_mascheroni: f64 = 0.577_215_664_901_532_9;
 
             // Contracts 1 + 2: anchors.

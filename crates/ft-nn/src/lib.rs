@@ -19335,8 +19335,7 @@ pub fn pad_packed_sequence(
             packed_offset += bs;
             continue;
         }
-        for s in 0..bs {
-            let orig_batch = packed.sorted_indices[s];
+        for (s, &orig_batch) in packed.sorted_indices.iter().enumerate().take(bs) {
             let d = if batch_first {
                 orig_batch * out_len + t
             } else {

@@ -15596,9 +15596,11 @@ impl TensorTape {
                     };
                     // Every branch below writes every contribution exactly once before it is
                     // read. Zeroing this buffer first is therefore a dead full-size write on
-                    // the conv2d route (about 40 MiB at the board shape); let the gather own
-                    // the first touch instead.
-                    let contrib = ft_kernel_cpu::build_uninit(in_numel, |contrib| {
+                    // the conv2d route (about 40 MiB at the board shape); reuse an exact-length
+                    // parked buffer from `ft_core::buffer_pool` when available so repeated
+                    // backward steps do not unmap/re-fault the crop allocation, and fall back
+                    // to `build_uninit` on a pool miss so misses never pay a zero-fill.
+                    let fill_crop = |contrib: &mut [f64]| {
                         if inner_len == 0 {
                             // ndim == 0 (scalar) or a zero-length innermost axis: no rows to
                             // copy. A 0-d pad has in_numel == 1 and its single element sits at
@@ -15621,11 +15623,15 @@ impl TensorTape {
                             // (it is the product of all trailing extents, which includes the
                             // innermost one), so the row-space stride below divides exactly.
                             let row_base = pad_before[ndim - 1];
+                            let row_strides: Vec<usize> = in_strides[..ndim - 1]
+                                .iter()
+                                .map(|&stride| stride / inner_len)
+                                .collect();
                             let copy_row = |row: usize, dst: &mut [f64]| {
                                 let mut rem = row;
                                 let mut flat_out = row_base;
                                 for d in 0..ndim - 1 {
-                                    let row_stride = in_strides[d] / inner_len;
+                                    let row_stride = row_strides[d];
                                     let coord = rem / row_stride;
                                     rem %= row_stride;
                                     flat_out += (coord + pad_before[d]) * out_strides[d];
@@ -15634,8 +15640,10 @@ impl TensorTape {
                             };
                             if in_numel >= PAD_BWD_PAR_MIN {
                                 use rayon::prelude::*;
+                                let min_rows = 4096usize.checked_div(inner_len).unwrap_or(1).max(1);
                                 contrib
                                     .par_chunks_mut(inner_len)
+                                    .with_min_len(min_rows)
                                     .enumerate()
                                     .for_each(|(row, dst)| copy_row(row, dst));
                             } else {
@@ -15644,7 +15652,14 @@ impl TensorTape {
                                 }
                             }
                         }
-                    });
+                    };
+                    let contrib = match ft_core::buffer_pool::try_take_exact(in_numel) {
+                        Some(mut pooled) => {
+                            fill_crop(&mut pooled);
+                            pooled
+                        }
+                        None => ft_kernel_cpu::build_uninit(in_numel, fill_crop),
+                    };
 
                     // `contrib` is this Pad node's sole contribution to its input on
                     // the ordinary first-order route. Move the freshly gathered crop
@@ -21471,12 +21486,9 @@ impl TensorTape {
             if let Some(mut pooled) = ft_core::buffer_pool::try_take_exact(contribution_len) {
                 if contribution_len >= PAR_MIN {
                     use rayon::prelude::*;
-                    pooled
-                        .par_iter_mut()
-                        .enumerate()
-                        .for_each(|(index, dst)| {
-                            *dst = contribution(index);
-                        });
+                    pooled.par_iter_mut().enumerate().for_each(|(index, dst)| {
+                        *dst = contribution(index);
+                    });
                 } else {
                     for (index, dst) in pooled.iter_mut().enumerate() {
                         *dst = contribution(index);
@@ -30577,6 +30589,58 @@ mod tests {
         let report = tape.backward(root).expect("backward");
 
         assert_eq!(report.gradient(x).expect("gradient").to_vec(), vec![-3.5]);
+    }
+
+    #[test]
+    fn pad_backward_reuses_exact_pooled_buffer_and_overwrites_poisoned_contents() {
+        const SHAPE: [usize; 4] = [3, 5, 37, 61];
+        const PADDING: [usize; 6] = [2, 1, 3, 2, 1, 4];
+        const PAD_BEFORE: [usize; 4] = [0, 1, 3, 2];
+        const PADDED_SHAPE: [usize; 4] = [3, 5 + 1 + 4, 37 + 3 + 2, 61 + 2 + 1];
+
+        let numel: usize = SHAPE.iter().product();
+        assert!(numel >= ft_core::buffer_pool::MIN_POOLED_LEN);
+        let padded_numel: usize = PADDED_SHAPE.iter().product();
+
+        let values: Vec<f64> = (0..numel).map(|i| (i % 97) as f64 * 0.5 - 13.0).collect();
+        let mask: Vec<f64> = (0..padded_numel).map(|i| i as f64 + 0.25).collect();
+
+        let guard = BUFFER_POOL_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ft_core::buffer_pool::clear();
+        ft_core::buffer_pool::set_enabled(true);
+        ft_core::buffer_pool::recycle(vec![f64::NAN; numel]);
+        let hits_before = ft_core::buffer_pool::stats().hits;
+
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(values, SHAPE.to_vec(), true).expect("leaf");
+        let padded = tape.pad(x, &PADDING, 0.0).expect("pad");
+        let m = tape
+            .leaf(mask.clone(), PADDED_SHAPE.to_vec(), false)
+            .expect("mask");
+        let (scaled, _) = tape.mul(padded, m, ExecutionMode::Strict).expect("mul");
+        let (root, _) = tape.sum(scaled, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(root).expect("backward");
+        let grad = report.gradient(x).expect("grad").to_vec();
+        let hits_after = ft_core::buffer_pool::stats().hits;
+        drop(report);
+        ft_core::buffer_pool::clear();
+        drop(guard);
+
+        let expected = unpad_gather_reference_4d(&mask, SHAPE, PAD_BEFORE, PADDED_SHAPE);
+        assert!(
+            hits_after > hits_before,
+            "pad backward must consume the exact-length pooled buffer"
+        );
+        assert_eq!(grad.len(), expected.len());
+        for (i, (g, e)) in grad.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "pad backward pooled crop differed at index {i}: {g} vs {e}"
+            );
+        }
     }
 
     #[test]

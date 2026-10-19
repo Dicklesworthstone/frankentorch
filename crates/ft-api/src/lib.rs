@@ -22958,9 +22958,7 @@ impl FrankenTorchSession {
                         *d = if x > 0.0 { x } else { w0 * x };
                     }
                 }
-            } else if input_shape.len() >= 2
-                && channel_size > 1
-                && len.is_multiple_of(channel_size)
+            } else if input_shape.len() >= 2 && channel_size > 1 && len.is_multiple_of(channel_size)
             {
                 if len >= PARALLEL_ELEMENTWISE_MIN {
                     use rayon::prelude::*;
@@ -23060,9 +23058,7 @@ impl FrankenTorchSession {
                         *d = if x > 0.0 { x } else { w0 * x };
                     }
                 }
-            } else if input_shape.len() >= 2
-                && channel_size > 1
-                && len.is_multiple_of(channel_size)
+            } else if input_shape.len() >= 2 && channel_size > 1 && len.is_multiple_of(channel_size)
             {
                 if len >= PARALLEL_ELEMENTWISE_MIN {
                     use rayon::prelude::*;
@@ -23184,8 +23180,9 @@ impl FrankenTorchSession {
                                 dst.par_chunks_mut(16_384)
                                     .zip(xv.par_chunks(16_384).zip(g.par_chunks(16_384)))
                                     .for_each(|(d_chunk, (x_chunk, g_chunk))| {
-                                        for (d, (&x, &gi)) in
-                                            d_chunk.iter_mut().zip(x_chunk.iter().zip(g_chunk.iter()))
+                                        for (d, (&x, &gi)) in d_chunk
+                                            .iter_mut()
+                                            .zip(x_chunk.iter().zip(g_chunk.iter()))
                                         {
                                             *d = if x > 0.0 { gi } else { gi * w0 };
                                         }
@@ -26877,16 +26874,15 @@ impl FrankenTorchSession {
                         }
                     } else if len >= 65_536 {
                         use rayon::prelude::*;
-                        dst.par_iter_mut()
-                            .zip(xv.par_iter())
-                            .enumerate()
-                            .for_each(|(i, (d, &x))| {
+                        dst.par_iter_mut().zip(xv.par_iter()).enumerate().for_each(
+                            |(i, (d, &x))| {
                                 *d = if x > 0.0 {
                                     upstream
                                 } else {
                                     upstream * wv[channel_for(i)]
                                 };
-                            });
+                            },
+                        );
                     } else {
                         for (i, (d, &x)) in dst.iter_mut().zip(xv.iter()).enumerate() {
                             *d = if x > 0.0 {
@@ -57830,7 +57826,7 @@ impl FrankenTorchSession {
                 format!(
                     "inplace_profile op={op} target={} rayon_map_join_ns={} ledger_format_append_ns={}",
                     target.0,
-                    rayon_map_join_ns.map_or(0, |nanos| nanos),
+                    rayon_map_join_ns.unwrap_or(0),
                     ledger_format_append_ns.unwrap_or(0),
                 ),
             );
