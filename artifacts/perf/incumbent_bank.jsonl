@@ -368,3 +368,16 @@
 {"host":"thinkstation1","torch":"2.8.0+cu128","lane":"max_pool1d_nopool_dense","fingerprint":"2.637742e5","incumbent_ms":12.219417,"rounds":24,"lane_count":2,"recorded_unix":1792441511}
 {"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32","fingerprint":"6.565040e6","incumbent_ms":15.480009,"rounds":16,"lane_count":2,"recorded_unix":1792441747}
 {"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_kernels","fingerprint":"6.565040e6","incumbent_ms":15.261763,"rounds":16,"lane_count":2,"recorded_unix":1792441747}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"max_pool3d","fingerprint":"1.310720e5","incumbent_ms":1.076008,"rounds":12,"lane_count":5,"recorded_unix":1792507006}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"max_pool3d_dense","fingerprint":"1.805099e4","incumbent_ms":1.261151,"rounds":12,"lane_count":5,"recorded_unix":1792507006}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"prelu","fingerprint":"2.273931e6","incumbent_ms":24.831024,"rounds":12,"lane_count":5,"recorded_unix":1792507006}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"prelu_dense","fingerprint":"2.851975e5","incumbent_ms":60.493052,"rounds":12,"lane_count":5,"recorded_unix":1792507006}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"prelu_noshortcut","fingerprint":"2.273931e6","incumbent_ms":24.166405,"rounds":12,"lane_count":5,"recorded_unix":1792507006}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"group_norm_f32","fingerprint":"4.425998e5","incumbent_ms":11.702011,"rounds":12,"lane_count":5,"recorded_unix":1792507091}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"group_norm_f32_dense","fingerprint":"3.662932e5","incumbent_ms":38.036396,"rounds":12,"lane_count":5,"recorded_unix":1792507091}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"batch_norm2d_f32_dense","fingerprint":"1.379402e4","incumbent_ms":34.851949,"rounds":12,"lane_count":5,"recorded_unix":1792507091}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_masked_train","fingerprint":"2.249929e4","incumbent_ms":10.022319,"rounds":12,"lane_count":5,"recorded_unix":1792507091}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_masked","fingerprint":"4.498600e5","incumbent_ms":44.762215,"rounds":12,"lane_count":5,"recorded_unix":1792507091}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"batch_norm2d_f64_dense","fingerprint":"1.379436e4","incumbent_ms":89.641621,"rounds":16,"lane_count":2,"recorded_unix":1792507183}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_masked","fingerprint":"4.498600e5","incumbent_ms":37.159933,"rounds":16,"lane_count":2,"recorded_unix":1792507183}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_masked","fingerprint":"4.498600e5","incumbent_ms":37.086267,"rounds":24,"lane_count":1,"recorded_unix":1792507224}
