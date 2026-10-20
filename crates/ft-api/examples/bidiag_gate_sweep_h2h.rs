@@ -282,6 +282,12 @@ struct Arm {
     /// expansion (`form_q`) uses the compact-WY blocked path (`Some(true)`) or the unblocked
     /// `dorg2r` path (`Some(false)`). `FT_FORM_Q_BLOCKED=0,1,0` (or `FT_FORM_Q=0,1,0`).
     form_q_blocked: Option<bool>,
+    /// `frankentorch-e1isq` / `frankentorch-x6wc3` / `frankentorch-37sxo`: whether the LU
+    /// family (`lu_factor`, `slogdet`, `inv`) uses the bit-exact fast kernel path. `FT_LU_FAST=0,1,0`.
+    lu_fast: Option<bool>,
+    /// `frankentorch-valnx`: whether `cholesky` uses the bit-exact 4-row TRSM + `dsyrk_lower_sub_into`
+    /// fast kernel path. `FT_CHOL_FAST=0,1,0`.
+    chol_fast: Option<bool>,
 }
 
 fn arm_label(arm: Arm, op: LinalgOp) -> String {
@@ -417,6 +423,16 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
             Some(false) => "/formQ-unblocked",
             None => "",
         }
+        + match arm.lu_fast {
+            Some(true) => "/luFAST",
+            Some(false) => "/luLEGACY",
+            None => "",
+        }
+        + match arm.chol_fast {
+            Some(true) => "/cholFAST",
+            Some(false) => "/cholLEGACY",
+            None => "",
+        }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -533,6 +549,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     let previous_form_q = arm
         .form_q_blocked
         .map(ft_kernel_cpu::bidiag_form_q_blocked_set);
+    let previous_lu_fast = arm.lu_fast.map(ft_kernel_cpu::set_lu_fast_kernel);
+    let previous_chol_fast = arm.chol_fast.map(ft_kernel_cpu::set_cholesky_fast_kernel);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
@@ -622,6 +640,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_form_q {
             ft_kernel_cpu::bidiag_form_q_blocked_set(v);
         }
+        if let Some(v) = previous_lu_fast {
+            ft_kernel_cpu::set_lu_fast_kernel(v);
+        }
+        if let Some(v) = previous_chol_fast {
+            ft_kernel_cpu::set_cholesky_fast_kernel(v);
+        }
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -690,6 +714,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
         if let Some(v) = previous_form_q {
             ft_kernel_cpu::bidiag_form_q_blocked_set(v);
+        }
+        if let Some(v) = previous_lu_fast {
+            ft_kernel_cpu::set_lu_fast_kernel(v);
+        }
+        if let Some(v) = previous_chol_fast {
+            ft_kernel_cpu::set_cholesky_fast_kernel(v);
         }
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
@@ -832,6 +862,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     ft_kernel_cpu::bidiag_form_p_blocked_set(previous_form_p);
     if let Some(v) = previous_form_q {
         ft_kernel_cpu::bidiag_form_q_blocked_set(v);
+    }
+    if let Some(v) = previous_lu_fast {
+        ft_kernel_cpu::set_lu_fast_kernel(v);
+    }
+    if let Some(v) = previous_chol_fast {
+        ft_kernel_cpu::set_cholesky_fast_kernel(v);
     }
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
@@ -1112,6 +1148,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
             Err(_) => vec![None],
         };
+    let lu_fasts: Vec<Option<bool>> = match std::env::var("FT_LU_FAST") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let chol_fasts: Vec<Option<bool>> = match std::env::var("FT_CHOL_FAST") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
     let qrcs: Vec<Option<bool>> = match std::env::var("FT_QRC") {
         Ok(v) => v
             .split(',')
@@ -1288,6 +1346,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !fuseds.is_empty()
             && !form_p_blockeds.is_empty()
             && !form_q_blockeds.is_empty()
+            && !lu_fasts.is_empty()
+            && !chol_fasts.is_empty()
             && !panel_outputs.is_empty()
             && !gate_hoists.is_empty()
             && !qtfs.is_empty()
@@ -1364,6 +1424,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         qr_active_submatrix: None,
                                         ormqr_fused_subtract: None,
                                         form_q_blocked: None,
+                                        lu_fast: None,
+                                        chol_fast: None,
                                     });
                                     }
                                     }
@@ -1449,6 +1511,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|arm| {
             form_q_blockeds.iter().map(move |&form_q_blocked| Arm {
                 form_q_blocked,
+                ..arm
+            })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            lu_fasts
+                .iter()
+                .map(move |&lu_fast| Arm { lu_fast, ..arm })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            chol_fasts.iter().map(move |&chol_fast| Arm {
+                chol_fast,
                 ..arm
             })
         })
@@ -1929,29 +2008,37 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
             ft_op,
             LinalgOp::LuFactor | LinalgOp::Slogdet | LinalgOp::Inv
         ) {
-            let _ = ft_kernel_cpu::lu_stage_take_ns();
-            let _ = ft_kernel_cpu::lu_pivot_swap_take_ns();
-            let probe = ft_one(n, &data, arms[0], ft_op);
-            std::hint::black_box(&probe);
-            let (panel, solve, trail) = ft_kernel_cpu::lu_stage_take_ns();
-            let (pivot, swap) = ft_kernel_cpu::lu_pivot_swap_take_ns();
-            let ms = |v: u64| v as f64 / 1e6;
-            let total = (panel + solve + trail + pivot + swap).max(1) as f64;
-            let pct = |v: u64| 100.0 * v as f64 / total;
-            eprintln!(
-                "LU phases (arm0, one instrumented call): panel {:.3} ms {:.0}%  solve {:.3} ms \
-                 {:.0}%  trailing {:.3} ms {:.0}%  pivot {:.3} ms {:.0}%  swap {:.3} ms {:.0}%",
-                ms(panel),
-                pct(panel),
-                ms(solve),
-                pct(solve),
-                ms(trail),
-                pct(trail),
-                ms(pivot),
-                pct(pivot),
-                ms(swap),
-                pct(swap)
-            );
+            let probe_arms = if arms.len() > 1 {
+                &arms[..2]
+            } else {
+                &arms[..1]
+            };
+            for (idx, &arm) in probe_arms.iter().enumerate() {
+                let _ = ft_kernel_cpu::lu_stage_take_ns();
+                let _ = ft_kernel_cpu::lu_pivot_swap_take_ns();
+                let probe = ft_one(n, &data, arm, ft_op);
+                std::hint::black_box(&probe);
+                let (panel, solve, trail) = ft_kernel_cpu::lu_stage_take_ns();
+                let (pivot, swap) = ft_kernel_cpu::lu_pivot_swap_take_ns();
+                let ms = |v: u64| v as f64 / 1e6;
+                let total = (panel + solve + trail + pivot + swap).max(1) as f64;
+                let pct = |v: u64| 100.0 * v as f64 / total;
+                eprintln!(
+                    "LU phases (arm{idx} [{}], one instrumented call): panel {:.3} ms {:.0}%  solve {:.3} ms \
+                     {:.0}%  trailing {:.3} ms {:.0}%  pivot {:.3} ms {:.0}%  swap {:.3} ms {:.0}%",
+                    arm_label(arm, ft_op),
+                    ms(panel),
+                    pct(panel),
+                    ms(solve),
+                    pct(solve),
+                    ms(trail),
+                    pct(trail),
+                    ms(pivot),
+                    pct(pivot),
+                    ms(swap),
+                    pct(swap)
+                );
+            }
         }
 
         // ORMQR PHASES — `frankentorch-g0wpj`.
@@ -2004,36 +2091,62 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
         // calls and their measured GEMM time before proposing the analogous transposed-right arm.
         // This is one extra, explicitly instrumented FT call outside the timed estimator.
         if ft_op == LinalgOp::Cholesky {
-            let previous = ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(true);
-            let _ = ft_kernel_cpu::dgemm_bt_sub_census_take();
-            let probe = ft_one(n, &data, arms[0], ft_op);
-            std::hint::black_box(&probe);
-            let census = ft_kernel_cpu::dgemm_bt_sub_census_take();
-            ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(previous);
-            let total_ns: u64 = census.iter().map(|entry| entry.elapsed_ns).sum();
-            let eligible_ns: u64 = census
-                .iter()
-                .filter(|entry| entry.eligible_2d)
-                .map(|entry| entry.elapsed_ns)
-                .sum();
-            eprintln!(
-                "cholesky dgemm_bt_sub census (one instrumented call): calls={} eligible_2d={} \
-                 gemm={:.3} ms eligible_gemm={:.3} ms ({:.1}%)",
-                census.len(),
-                census.iter().filter(|entry| entry.eligible_2d).count(),
-                total_ns as f64 / 1e6,
-                eligible_ns as f64 / 1e6,
-                100.0 * eligible_ns as f64 / total_ns.max(1) as f64,
-            );
-            for entry in census {
+            let probe_arms = if arms.len() > 1 {
+                &arms[..2]
+            } else {
+                &arms[..1]
+            };
+            for (idx, &arm) in probe_arms.iter().enumerate() {
+                let previous = ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(true);
+                let _ = ft_kernel_cpu::dgemm_bt_sub_census_take();
+                let _ = ft_kernel_cpu::cholesky_stage_take_ns();
+                let probe = ft_one(n, &data, arm, ft_op);
+                std::hint::black_box(&probe);
+                let (panel, trsm, pack, syrk) = ft_kernel_cpu::cholesky_stage_take_ns();
+                let census = ft_kernel_cpu::dgemm_bt_sub_census_take();
+                ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(previous);
+                let ms = |v: u64| v as f64 / 1e6;
+                let stage_total = (panel + trsm + pack + syrk).max(1) as f64;
+                let pct = |v: u64| 100.0 * v as f64 / stage_total;
                 eprintln!(
-                    "  dgemm_bt_sub shape {}x{}x{} eligible_2d={} gemm={:.3} ms",
-                    entry.m,
-                    entry.k,
-                    entry.n,
-                    entry.eligible_2d,
-                    entry.elapsed_ns as f64 / 1e6,
+                    "Cholesky phases (arm{idx} [{}], one instrumented call): panel {:.3} ms {:.0}%  \
+                     trsm {:.3} ms {:.0}%  pack {:.3} ms {:.0}%  syrk {:.3} ms {:.0}%",
+                    arm_label(arm, ft_op),
+                    ms(panel),
+                    pct(panel),
+                    ms(trsm),
+                    pct(trsm),
+                    ms(pack),
+                    pct(pack),
+                    ms(syrk),
+                    pct(syrk),
                 );
+                let total_ns: u64 = census.iter().map(|entry| entry.elapsed_ns).sum();
+                let eligible_ns: u64 = census
+                    .iter()
+                    .filter(|entry| entry.eligible_2d)
+                    .map(|entry| entry.elapsed_ns)
+                    .sum();
+                eprintln!(
+                    "cholesky dgemm_bt_sub census (arm{idx} [{}], one instrumented call): calls={} eligible_2d={} \
+                     gemm={:.3} ms eligible_gemm={:.3} ms ({:.1}%)",
+                    arm_label(arm, ft_op),
+                    census.len(),
+                    census.iter().filter(|entry| entry.eligible_2d).count(),
+                    total_ns as f64 / 1e6,
+                    eligible_ns as f64 / 1e6,
+                    100.0 * eligible_ns as f64 / total_ns.max(1) as f64,
+                );
+                for entry in census {
+                    eprintln!(
+                        "  dgemm_bt_sub shape {}x{}x{} eligible_2d={} gemm={:.3} ms",
+                        entry.m,
+                        entry.k,
+                        entry.n,
+                        entry.eligible_2d,
+                        entry.elapsed_ns as f64 / 1e6,
+                    );
+                }
             }
         }
 

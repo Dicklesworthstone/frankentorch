@@ -1478,7 +1478,28 @@ mod gemm {
             return;
         }
         DGEMM_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+        if crate::lu_fast_kernel() && col_blocks <= 1 {
+            unsafe {
+                dgemm_mm(
+                    m,
+                    k,
+                    n,
+                    -1.0,
+                    a.as_ptr(),
+                    k as isize,
+                    1,
+                    b.as_ptr(),
+                    n as isize,
+                    1,
+                    1.0,
+                    cp.0.add(c_off),
+                    ldc as isize,
+                    1,
+                );
+            }
+            return;
+        }
+        (0..col_blocks).into_par_iter().for_each(|blk| {
             let cp = &cp;
             let n0 = blk * nb;
             let bw = (n0 + nb).min(n) - n0;
@@ -1505,6 +1526,97 @@ mod gemm {
                 );
             }
         });
+    }
+
+    /// Lower-triangle-only symmetric rank-k update `C_sub[m,m] -= A[m,k] · A[m,k]^T`
+    /// for blocked Cholesky (`frankentorch-valnx`).
+    ///
+    /// Columns are partitioned into blocks `[n0, n0 + bw)` of width `SYRK_NB = 32`
+    /// (a multiple of `matrixmultiply`'s `MR = 8` and `NR = 4`), and each block
+    /// computes only rows `n0..m` (`rows = m - n0`), skipping all strict-upper
+    /// blocks `rows 0..n0` while keeping all Rayon workers saturated as `m` shrinks.
+    pub fn dsyrk_lower_sub_into(
+        m: usize,
+        k: usize,
+        a: &[f64],
+        c: &mut [f64],
+        c_off: usize,
+        ldc: usize,
+    ) {
+        if m == 0 || k == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        const SYRK_NB: usize = 32;
+        let col_blocks = m.div_ceil(SYRK_NB);
+        let census_started = dgemm_bt_sub_census_enabled().then(std::time::Instant::now);
+        let cp = TilePtr(c.as_mut_ptr());
+        DGEMM_BT_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if col_blocks <= 1 || rayon::current_num_threads() <= 1 || m < 64 {
+            for blk in 0..col_blocks {
+                let n0 = blk * SYRK_NB;
+                let bw = (n0 + SYRK_NB).min(m) - n0;
+                let rows = m - n0;
+                // SAFETY: `a` is `[m, k]` row-major; rows `n0..m` start at `a.add(n0 * k)`
+                // (`rsa = k, csa = 1`), and columns `n0..n0 + bw` of `A^T` also start at
+                // `a.add(n0 * k)` (`rsb = 1, csb = k`). Output tile starts at
+                // `c_off + n0 * ldc + n0` with `rows` rows and `bw` cols.
+                unsafe {
+                    dgemm_mm(
+                        rows,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr().add(n0 * k),
+                        k as isize,
+                        1,
+                        a.as_ptr().add(n0 * k),
+                        1,
+                        k as isize,
+                        1.0,
+                        cp.0.add(c_off + n0 * ldc + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            }
+        } else {
+            (0..col_blocks).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * SYRK_NB;
+                let bw = (n0 + SYRK_NB).min(m) - n0;
+                let rows = m - n0;
+                // SAFETY: column blocks `[n0, n0 + bw)` are disjoint across `blk`,
+                // so writes into `c` never race.
+                unsafe {
+                    dgemm_mm(
+                        rows,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr().add(n0 * k),
+                        k as isize,
+                        1,
+                        a.as_ptr().add(n0 * k),
+                        1,
+                        k as isize,
+                        1.0,
+                        cp.0.add(c_off + n0 * ldc + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            });
+        }
+        if let Some(started) = census_started {
+            record_dgemm_bt_sub_census(DgemmBtSubCensusEntry {
+                m,
+                k,
+                n: m,
+                eligible_2d: false,
+                elapsed_ns: started.elapsed().as_nanos() as u64,
+            });
+        }
     }
 
     /// BOTH trailing updates of a blocked bidiagonal reduction in ONE pass over `C_sub`:
@@ -1720,6 +1832,22 @@ mod gemm {
             return;
         }
         if tcols < 64 || rayon::current_num_threads() <= 1 {
+            if crate::lu_fast_kernel() {
+                for i in k0..pe {
+                    let (before_i, from_i) = lu.split_at_mut(i * n);
+                    let row_i = &mut from_i[..n];
+                    for t in k0..i {
+                        let lit = row_i[t];
+                        if lit != 0.0 {
+                            let row_t = &before_i[t * n + pe..t * n + n];
+                            for (dst, &src) in row_i[pe..n].iter_mut().zip(row_t) {
+                                *dst -= lit * src;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             for i in k0..pe {
                 for t in k0..i {
                     let lit = lu[i * n + t];
@@ -1730,6 +1858,37 @@ mod gemm {
                     }
                 }
             }
+            return;
+        }
+        if crate::lu_fast_kernel() && crate::lu_trsm_row_accum() {
+            // Disjoint non-aliasing slice windows (`row_i: &mut [f64]`, `row_t: &[f64]`)
+            // with 1 block per worker thread: gives LLVM `noalias` directly on `lu`
+            // without allocating `acc: Vec<f64>` per block and without copy-in/copy-out.
+            let base = TilePtr(lu.as_mut_ptr());
+            let threads = rayon::current_num_threads().max(1);
+            let cb = tcols.div_ceil(threads).max(32);
+            (0..tcols.div_ceil(cb)).into_par_iter().for_each(|blk| {
+                let base = &base;
+                let j0 = pe + blk * cb;
+                let j1 = (j0 + cb).min(n);
+                let bw = j1 - j0;
+                for i in k0..pe {
+                    // SAFETY: column window `[j0, j1)` is exclusive to `blk`, and row `t < i`
+                    // is strictly above row `i`, so `row_i` and `row_t` never overlap.
+                    let row_i =
+                        unsafe { std::slice::from_raw_parts_mut(base.0.add(i * n + j0), bw) };
+                    for t in k0..i {
+                        let lit = unsafe { *base.0.add(i * n + t) };
+                        if lit != 0.0 {
+                            let row_t =
+                                unsafe { std::slice::from_raw_parts(base.0.add(t * n + j0), bw) };
+                            for (dst, &src) in row_i.iter_mut().zip(row_t) {
+                                *dst -= lit * src;
+                            }
+                        }
+                    }
+                }
+            });
             return;
         }
         if crate::lu_trsm_row_accum() {
@@ -1799,6 +1958,71 @@ mod gemm {
                                 *base.0.add(i * n + j) -= lit * src;
                             }
                         }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Blocked-getri backward panel triangular solve `U11^{-1}` in place over all `n`
+    /// columns of `x` (rows `[k0, peb)`), parallelised across disjoint column blocks
+    /// when `n >= 128`. Bit-exact with the serial loop (`frankentorch-37sxo`).
+    pub fn utrsm_back_panel_f64(lu: &[f64], x: &mut [f64], n: usize, k0: usize, peb: usize) {
+        if n == 0 || k0 >= peb {
+            return;
+        }
+        let threads = rayon::current_num_threads().max(1);
+        if n < 128 || threads <= 1 {
+            for i in (k0..peb).rev() {
+                let (through_i, after_i) = x.split_at_mut((i + 1) * n);
+                let row_i = &mut through_i[i * n..(i + 1) * n];
+                for kk in (i + 1)..peb {
+                    let u_ik = lu[i * n + kk];
+                    if u_ik != 0.0 {
+                        let row_k = &after_i[(kk - i - 1) * n..(kk - i) * n];
+                        for (dst, &src) in row_i.iter_mut().zip(row_k) {
+                            *dst -= u_ik * src;
+                        }
+                    }
+                }
+                let diag = lu[i * n + i];
+                if diag.abs() < f64::EPSILON * 1e3 {
+                    row_i.fill(0.0);
+                } else {
+                    for dst in row_i.iter_mut() {
+                        *dst /= diag;
+                    }
+                }
+            }
+            return;
+        }
+        let base = TilePtr(x.as_mut_ptr());
+        let cb = n.div_ceil(threads).max(32);
+        (0..n.div_ceil(cb)).into_par_iter().for_each(|blk| {
+            let base = &base;
+            let j0 = blk * cb;
+            let j1 = (j0 + cb).min(n);
+            let bw = j1 - j0;
+            for i in (k0..peb).rev() {
+                // SAFETY: column window `[j0, j1)` is exclusive to `blk`, and row `kk > i`
+                // is strictly below row `i`, so `row_i` and `row_k` never alias.
+                let row_i = unsafe { std::slice::from_raw_parts_mut(base.0.add(i * n + j0), bw) };
+                for kk in (i + 1)..peb {
+                    let u_ik = lu[i * n + kk];
+                    if u_ik != 0.0 {
+                        let row_k =
+                            unsafe { std::slice::from_raw_parts(base.0.add(kk * n + j0), bw) };
+                        for (dst, &src) in row_i.iter_mut().zip(row_k) {
+                            *dst -= u_ik * src;
+                        }
+                    }
+                }
+                let diag = lu[i * n + i];
+                if diag.abs() < f64::EPSILON * 1e3 {
+                    row_i.fill(0.0);
+                } else {
+                    for dst in row_i.iter_mut() {
+                        *dst /= diag;
                     }
                 }
             }
@@ -26220,6 +26444,29 @@ fn lu_trsm_row_accum() -> bool {
     LU_TRSM_ROW_ACCUM.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Bit-exact fast kernel path for `lu_factor`, `slogdet`, and `inv`
+/// (`frankentorch-e1isq`, `frankentorch-x6wc3`, `frankentorch-37sxo`):
+/// - Preallocates panel packing workspaces once per factorization instead of
+///   allocating two `Vec<f64>`s per recursive split and outer panel.
+/// - Uses 4-row pipelined non-aliasing slice updates in the leaf panel rank-1
+///   update and contiguous row-wise inner loops in the recursive `U12` solve.
+/// - Uses zero-allocation non-aliasing slice windows in `ltrsm_unit_lower_panel_f64`
+///   with 1 column block per Rayon thread, and skips Rayon dispatch in
+///   `dgemm_sub_into` when `col_blocks == 1`.
+/// - Parallelizes the backward panel solve `utrsm_back_panel_f64` and eliminates
+///   the redundant `ypanel` copy in `lu_inverse_from_factor_f64`.
+static LU_FAST_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_lu_fast_kernel(on: bool) -> bool {
+    LU_FAST_KERNEL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn lu_fast_kernel() -> bool {
+    LU_FAST_KERNEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static LU_SOLVE_NS: AtomicU64 = AtomicU64::new(0);
 static LU_TRAIL_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -26317,6 +26564,7 @@ pub fn lu_stage_take_ns() -> (u64, u64, u64) {
 
 /// Recursive GETRF panel factorization: pivots swap full rows, while each split
 /// turns its internal Schur-complement update into GEMM before recursing right.
+#[allow(clippy::too_many_arguments)]
 fn lu_factor_panel_recursive_f64(
     lu: &mut [f64],
     n: usize,
@@ -26325,6 +26573,9 @@ fn lu_factor_panel_recursive_f64(
     pivots: &mut [usize],
     ipiv: &mut [usize],
     singular_tol: f64,
+    l21_scratch: &mut [f64],
+    u12_scratch: &mut [f64],
+    fast: bool,
 ) {
     const LEAF: usize = 16;
     if end - start <= LEAF {
@@ -26379,6 +26630,42 @@ fn lu_factor_panel_recursive_f64(
                         row[j] -= multiplier * pivot_row[j];
                     }
                 });
+            } else if fast {
+                let (head, tail) = lu.split_at_mut((k + 1) * n);
+                let pivot_row = &head[k * n + (k + 1)..k * n + end];
+                let mut chunks = tail.chunks_exact_mut(4 * n);
+                for block in &mut chunks {
+                    let (r0, rest) = block.split_at_mut(n);
+                    let (r1, rest) = rest.split_at_mut(n);
+                    let (r2, r3) = rest.split_at_mut(n);
+                    let m0 = r0[k] / diag;
+                    let m1 = r1[k] / diag;
+                    let m2 = r2[k] / diag;
+                    let m3 = r3[k] / diag;
+                    r0[k] = m0;
+                    r1[k] = m1;
+                    r2[k] = m2;
+                    r3[k] = m3;
+                    for ((((d0, d1), d2), d3), &piv) in r0[(k + 1)..end]
+                        .iter_mut()
+                        .zip(&mut r1[(k + 1)..end])
+                        .zip(&mut r2[(k + 1)..end])
+                        .zip(&mut r3[(k + 1)..end])
+                        .zip(pivot_row)
+                    {
+                        *d0 -= m0 * piv;
+                        *d1 -= m1 * piv;
+                        *d2 -= m2 * piv;
+                        *d3 -= m3 * piv;
+                    }
+                }
+                for row in chunks.into_remainder().chunks_mut(n) {
+                    let multiplier = row[k] / diag;
+                    row[k] = multiplier;
+                    for (dst, &piv) in row[(k + 1)..end].iter_mut().zip(pivot_row) {
+                        *dst -= multiplier * piv;
+                    }
+                }
             } else {
                 for i in (k + 1)..n {
                     let multiplier = lu[i * n + k] / diag;
@@ -26393,32 +26680,82 @@ fn lu_factor_panel_recursive_f64(
     }
 
     let mid = start + (end - start) / 2;
-    lu_factor_panel_recursive_f64(lu, n, start, mid, pivots, ipiv, singular_tol);
+    lu_factor_panel_recursive_f64(
+        lu,
+        n,
+        start,
+        mid,
+        pivots,
+        ipiv,
+        singular_tol,
+        l21_scratch,
+        u12_scratch,
+        fast,
+    );
     // U12 = L11^-1 A12, restricted to this panel; the outer GETRF solves its tail.
-    for i in start..mid {
-        for j in mid..end {
-            let mut value = lu[i * n + j];
+    if fast {
+        for i in start..mid {
+            let (before_i, from_i) = lu.split_at_mut(i * n);
+            let row_i = &mut from_i[..n];
             for h in start..i {
-                value -= lu[i * n + h] * lu[h * n + j];
+                let l_ih = row_i[h];
+                let row_h = &before_i[h * n + mid..h * n + end];
+                for (dst, &src) in row_i[mid..end].iter_mut().zip(row_h) {
+                    *dst -= l_ih * src;
+                }
             }
-            lu[i * n + j] = value;
         }
+        let rank = mid - start;
+        let rows = n - mid;
+        let cols = end - mid;
+        let l21 = &mut l21_scratch[..rows * rank];
+        for row in 0..rows {
+            let src = (mid + row) * n + start;
+            l21[row * rank..row * rank + rank].copy_from_slice(&lu[src..src + rank]);
+        }
+        let u12 = &mut u12_scratch[..rank * cols];
+        for row in 0..rank {
+            let src = (start + row) * n + mid;
+            u12[row * cols..row * cols + cols].copy_from_slice(&lu[src..src + cols]);
+        }
+        gemm::dgemm_sub_into(rows, rank, cols, l21, u12, lu, mid * n + mid, n);
+    } else {
+        for i in start..mid {
+            for j in mid..end {
+                let mut value = lu[i * n + j];
+                for h in start..i {
+                    value -= lu[i * n + h] * lu[h * n + j];
+                }
+                lu[i * n + j] = value;
+            }
+        }
+        let rank = mid - start;
+        let rows = n - mid;
+        let cols = end - mid;
+        let mut l21 = vec![0.0; rows * rank];
+        for row in 0..rows {
+            let src = (mid + row) * n + start;
+            l21[row * rank..row * rank + rank].copy_from_slice(&lu[src..src + rank]);
+        }
+        let mut u12 = vec![0.0; rank * cols];
+        for row in 0..rank {
+            let src = (start + row) * n + mid;
+            u12[row * cols..row * cols + cols].copy_from_slice(&lu[src..src + cols]);
+        }
+        gemm::dgemm_sub_into(rows, rank, cols, &l21, &u12, lu, mid * n + mid, n);
     }
-    let rank = mid - start;
-    let rows = n - mid;
-    let cols = end - mid;
-    let mut l21 = vec![0.0; rows * rank];
-    for row in 0..rows {
-        let src = (mid + row) * n + start;
-        l21[row * rank..row * rank + rank].copy_from_slice(&lu[src..src + rank]);
-    }
-    let mut u12 = vec![0.0; rank * cols];
-    for row in 0..rank {
-        let src = (start + row) * n + mid;
-        u12[row * cols..row * cols + cols].copy_from_slice(&lu[src..src + cols]);
-    }
-    gemm::dgemm_sub_into(rows, rank, cols, &l21, &u12, lu, mid * n + mid, n);
-    lu_factor_panel_recursive_f64(lu, n, mid, end, pivots, ipiv, singular_tol);
+    lu_factor_panel_recursive_f64(
+        lu,
+        n,
+        mid,
+        end,
+        pivots,
+        ipiv,
+        singular_tol,
+        l21_scratch,
+        u12_scratch,
+        fast,
+    );
 }
 
 pub fn lu_factor_contiguous_nb_f64(
@@ -26470,6 +26807,17 @@ pub fn lu_factor_contiguous_nb_f64(
     #[allow(non_snake_case)]
     let NB: usize = nb_runtime;
     let singular_tol = f64::EPSILON * 1e3;
+    let fast = lu_fast_kernel();
+    let mut l21_scratch = if fast {
+        vec![0.0f64; n * NB.min(n)]
+    } else {
+        Vec::new()
+    };
+    let mut u12_scratch = if fast {
+        vec![0.0f64; NB.min(n) * n]
+    } else {
+        Vec::new()
+    };
 
     let mut k0 = 0;
     while k0 < n {
@@ -26477,7 +26825,18 @@ pub fn lu_factor_contiguous_nb_f64(
 
         let __t_panel = std::time::Instant::now();
         // --- 1. Factor the column panel [k0, pe) recursively ---
-        lu_factor_panel_recursive_f64(&mut lu, n, k0, pe, &mut pivots, &mut ipiv, singular_tol);
+        lu_factor_panel_recursive_f64(
+            &mut lu,
+            n,
+            k0,
+            pe,
+            &mut pivots,
+            &mut ipiv,
+            singular_tol,
+            &mut l21_scratch,
+            &mut u12_scratch,
+            fast,
+        );
         let kb = pe - k0; // panel width
         let tcols = n - pe; // trailing columns
         // Every panel, including the final one with no U12/A22 work, belongs to the
@@ -26515,17 +26874,31 @@ pub fn lu_factor_contiguous_nb_f64(
         // cheap). The packed L21/U12 are separate buffers, so the GEMM output (lu)
         // never aliases its inputs. frankentorch-kgs4.62.
         let trows = n - pe;
-        let mut l21 = vec![0.0f64; trows * kb];
-        for ii in 0..trows {
-            let src = (pe + ii) * n + k0;
-            l21[ii * kb..ii * kb + kb].copy_from_slice(&lu[src..src + kb]);
+        if fast {
+            let l21 = &mut l21_scratch[..trows * kb];
+            for ii in 0..trows {
+                let src = (pe + ii) * n + k0;
+                l21[ii * kb..ii * kb + kb].copy_from_slice(&lu[src..src + kb]);
+            }
+            let u12 = &mut u12_scratch[..kb * tcols];
+            for ii in 0..kb {
+                let src = (k0 + ii) * n + pe;
+                u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
+            }
+            gemm::dgemm_sub_into(trows, kb, tcols, l21, u12, &mut lu, pe * n + pe, n);
+        } else {
+            let mut l21 = vec![0.0f64; trows * kb];
+            for ii in 0..trows {
+                let src = (pe + ii) * n + k0;
+                l21[ii * kb..ii * kb + kb].copy_from_slice(&lu[src..src + kb]);
+            }
+            let mut u12 = vec![0.0f64; kb * tcols];
+            for ii in 0..kb {
+                let src = (k0 + ii) * n + pe;
+                u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
+            }
+            gemm::dgemm_sub_into(trows, kb, tcols, &l21, &u12, &mut lu, pe * n + pe, n);
         }
-        let mut u12 = vec![0.0f64; kb * tcols];
-        for ii in 0..kb {
-            let src = (k0 + ii) * n + pe;
-            u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
-        }
-        gemm::dgemm_sub_into(trows, kb, tcols, &l21, &u12, &mut lu, pe * n + pe, n);
         stage_family_add(
             &LU_TRAIL_NS,
             &LU_STAGE_OWNER,
@@ -27712,6 +28085,7 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     let lu = &factor.lu;
     let nb_width = lu_inv_nb();
     let census = LU_INV_CENSUS_ENABLED.load(LuOrdering::Relaxed);
+    let fast = lu_fast_kernel();
 
     let __t_setup = std::time::Instant::now();
     // Z starts as the PLAIN identity: no row permutation, because the permutation is deferred to
@@ -27737,17 +28111,33 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
         let nb = pe - k0;
         // Rows [k0, pe) are zero in every column c >= pe, so only columns [0, pe) carry anything.
         let cols = pe;
-        for i in k0..pe {
-            let xi = i * n;
-            for kk in k0..i {
-                let l_ik = lu[i * n + kk];
-                if l_ik != 0.0 {
-                    let xk = kk * n;
-                    if census {
-                        stage_family_add(&LU_INV_FWD_COLUPD, &LU_INV_OWNER, cols as u64);
+        if fast && !census {
+            for i in k0..pe {
+                let (before_i, from_i) = x.split_at_mut(i * n);
+                let row_i = &mut from_i[..cols];
+                for kk in k0..i {
+                    let l_ik = lu[i * n + kk];
+                    if l_ik != 0.0 {
+                        let row_k = &before_i[kk * n..kk * n + cols];
+                        for (dst, &src) in row_i.iter_mut().zip(row_k) {
+                            *dst -= l_ik * src;
+                        }
                     }
-                    for c in 0..cols {
-                        x[xi + c] -= l_ik * x[xk + c];
+                }
+            }
+        } else {
+            for i in k0..pe {
+                let xi = i * n;
+                for kk in k0..i {
+                    let l_ik = lu[i * n + kk];
+                    if l_ik != 0.0 {
+                        let xk = kk * n;
+                        if census {
+                            stage_family_add(&LU_INV_FWD_COLUPD, &LU_INV_OWNER, cols as u64);
+                        }
+                        for c in 0..cols {
+                            x[xi + c] -= l_ik * x[xk + c];
+                        }
                     }
                 }
             }
@@ -27781,35 +28171,34 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
     while peb > 0 {
         let k0 = peb.saturating_sub(nb_width);
         let nb = peb - k0;
-        for i in (k0..peb).rev() {
-            let xi = i * n;
-            for kk in (i + 1)..peb {
-                let u_ik = lu[i * n + kk];
-                if u_ik != 0.0 {
-                    let xk = kk * n;
-                    if census {
-                        stage_family_add(&LU_INV_BACK_COLUPD, &LU_INV_OWNER, n as u64);
-                        // A column-update is WASTED only if the source element is still zero. `y`
-                        // is unit-lower-triangular, so row kk starts nonzero only in [0, kk] — but
-                        // rows below have already been overwritten by a DENSE z, so this counts
-                        // what is actually zero at the moment it is read, not what the structure
-                        // predicted.
-                        let zeros = (0..n).filter(|&c| x[xk + c] == 0.0).count() as u64;
-                        stage_family_add(&LU_INV_BACK_ZERO_TOUCH, &LU_INV_OWNER, zeros);
+        if fast && !census {
+            gemm::utrsm_back_panel_f64(lu, &mut x, n, k0, peb);
+        } else {
+            for i in (k0..peb).rev() {
+                let xi = i * n;
+                for kk in (i + 1)..peb {
+                    let u_ik = lu[i * n + kk];
+                    if u_ik != 0.0 {
+                        let xk = kk * n;
+                        if census {
+                            stage_family_add(&LU_INV_BACK_COLUPD, &LU_INV_OWNER, n as u64);
+                            let zeros = (0..n).filter(|&c| x[xk + c] == 0.0).count() as u64;
+                            stage_family_add(&LU_INV_BACK_ZERO_TOUCH, &LU_INV_OWNER, zeros);
+                        }
+                        for c in 0..n {
+                            x[xi + c] -= u_ik * x[xk + c];
+                        }
                     }
+                }
+                let diag = lu[i * n + i];
+                if diag.abs() < f64::EPSILON * 1e3 {
                     for c in 0..n {
-                        x[xi + c] -= u_ik * x[xk + c];
+                        x[xi + c] = 0.0;
                     }
-                }
-            }
-            let diag = lu[i * n + i];
-            if diag.abs() < f64::EPSILON * 1e3 {
-                for c in 0..n {
-                    x[xi + c] = 0.0;
-                }
-            } else {
-                for c in 0..n {
-                    x[xi + c] /= diag;
+                } else {
+                    for c in 0..n {
+                        x[xi + c] /= diag;
+                    }
                 }
             }
         }
@@ -27820,9 +28209,14 @@ fn lu_inverse_from_factor_f64(factor: &LuFactorResult) -> Vec<f64> {
                 let src = ii * n + k0;
                 u12[ii * nb..ii * nb + nb].copy_from_slice(&lu[src..src + nb]);
             }
-            let yp = &mut ypanel[..nb * n];
-            yp.copy_from_slice(&x[k0 * n..peb * n]);
-            gemm::dgemm_sub_into(m, nb, n, u12, yp, &mut x, 0, n);
+            if fast {
+                let (x_top, x_bot) = x.split_at_mut(k0 * n);
+                gemm::dgemm_sub_into(m, nb, n, u12, &x_bot[..nb * n], x_top, 0, n);
+            } else {
+                let yp = &mut ypanel[..nb * n];
+                yp.copy_from_slice(&x[k0 * n..peb * n]);
+                gemm::dgemm_sub_into(m, nb, n, u12, yp, &mut x, 0, n);
+            }
         }
         peb = k0;
     }
@@ -28727,6 +29121,26 @@ pub fn set_cholesky_panel_mode(mode: u8) -> u8 {
     CHOLESKY_PANEL_MODE.swap(mode, LuOrdering::Relaxed)
 }
 
+/// Bit-exact fast kernel path for blocked `cholesky_contiguous_f64` (`frankentorch-valnx`):
+/// - Batches 4 trailing rows per task in the panel TRSM (`L21 = A21 · L11^{-T}`) so 4
+///   independent FMA accumulators (`t0..t3`) run in lockstep while preserving each row's
+///   exact `p = 0..c` summation order, with `.with_min_len(...)` to avoid 1-row Rayon
+///   task thrash and fused L1-hot `l21` panel packing inside the TRSM pass.
+/// - Uses `gemm::dsyrk_lower_sub_into` (`SYRK_NB = 32`) in the trailing rank-`nb` update
+///   to compute only the lower-triangular column blocks (`rows = m - n0`) and keep all
+///   Rayon workers active as `m` shrinks.
+static CHOLESKY_FAST_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_cholesky_fast_kernel(on: bool) -> bool {
+    CHOLESKY_FAST_KERNEL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn cholesky_fast_kernel() -> bool {
+    CHOLESKY_FAST_KERNEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Probe shim: factor ONE panel in place at the current mode, so the arms can be compared at real
 /// panel shapes without a whole factorisation around them. `frankentorch-valnx`.
 #[doc(hidden)]
@@ -28923,11 +29337,12 @@ pub fn cholesky_contiguous_f64(
     // result matches the serial kernel only to tolerance — validated by
     // reconstruction (L·L^T ≈ A) and the numpy oracle, not bit-for-bit.
     let nb_width = cholesky_nb();
+    let fast = cholesky_fast_kernel();
     let mut l = vec![0.0f64; n * n];
     for i in 0..n {
-        for j in 0..=i {
-            l[i * n + j] = data[offset + i * n + j];
-        }
+        let dst_row = i * n;
+        let src_row = offset + i * n;
+        l[dst_row..=dst_row + i].copy_from_slice(&data[src_row..=src_row + i]);
     }
 
     // Scratch reused across panels: `l21` holds the sub-diagonal panel (m×nb),
@@ -28959,19 +29374,79 @@ pub fn cholesky_contiguous_f64(
         //    trailing row solves the lower-triangular L11 independently.
         let trsm_started = std::time::Instant::now();
         let (head, tail) = l.split_at_mut(je * n);
-        let trsm_body = |row: &mut [f64]| {
-            for c in 0..nb {
-                let mut t = row[jb + c];
-                for p in 0..c {
-                    t -= row[jb + p] * head[(jb + c) * n + (jb + p)];
+        let l21_panel = &mut l21[..m * nb];
+        if fast {
+            let trsm_chunk = |(block, l21_chunk): (&mut [f64], &mut [f64])| {
+                let nrows = block.len() / n;
+                if nrows == 4 {
+                    let (r0, rest) = block.split_at_mut(n);
+                    let (r1, rest) = rest.split_at_mut(n);
+                    let (r2, r3) = rest.split_at_mut(n);
+                    for c in 0..nb {
+                        let hrow = &head[(jb + c) * n + jb..(jb + c) * n + jb + c];
+                        let diag = head[(jb + c) * n + (jb + c)];
+                        let mut t0 = r0[jb + c];
+                        let mut t1 = r1[jb + c];
+                        let mut t2 = r2[jb + c];
+                        let mut t3 = r3[jb + c];
+                        for p in 0..c {
+                            let hp = hrow[p];
+                            t0 -= r0[jb + p] * hp;
+                            t1 -= r1[jb + p] * hp;
+                            t2 -= r2[jb + p] * hp;
+                            t3 -= r3[jb + p] * hp;
+                        }
+                        r0[jb + c] = t0 / diag;
+                        r1[jb + c] = t1 / diag;
+                        r2[jb + c] = t2 / diag;
+                        r3[jb + c] = t3 / diag;
+                    }
+                    l21_chunk[0..nb].copy_from_slice(&r0[jb..jb + nb]);
+                    l21_chunk[nb..2 * nb].copy_from_slice(&r1[jb..jb + nb]);
+                    l21_chunk[2 * nb..3 * nb].copy_from_slice(&r2[jb..jb + nb]);
+                    l21_chunk[3 * nb..4 * nb].copy_from_slice(&r3[jb..jb + nb]);
+                } else {
+                    for (row, l21_row) in block.chunks_mut(n).zip(l21_chunk.chunks_mut(nb)) {
+                        for c in 0..nb {
+                            let hrow = &head[(jb + c) * n + jb..(jb + c) * n + jb + c];
+                            let mut t = row[jb + c];
+                            for p in 0..c {
+                                t -= row[jb + p] * hrow[p];
+                            }
+                            row[jb + c] = t / head[(jb + c) * n + (jb + c)];
+                        }
+                        l21_row.copy_from_slice(&row[jb..jb + nb]);
+                    }
                 }
-                row[jb + c] = t / head[(jb + c) * n + (jb + c)];
+            };
+            let threads = rayon::current_num_threads().max(1);
+            if m >= 64 && threads > 1 {
+                let total_chunks = m.div_ceil(4);
+                let min_chunks = total_chunks.div_ceil(threads * 2).max(1);
+                tail.par_chunks_mut(4 * n)
+                    .with_min_len(min_chunks)
+                    .zip(l21_panel.par_chunks_mut(4 * nb).with_min_len(min_chunks))
+                    .for_each(trsm_chunk);
+            } else {
+                tail.chunks_mut(4 * n)
+                    .zip(l21_panel.chunks_mut(4 * nb))
+                    .for_each(trsm_chunk);
             }
-        };
-        if m >= 64 {
-            tail.par_chunks_mut(n).for_each(trsm_body);
         } else {
-            tail.chunks_mut(n).for_each(trsm_body);
+            let trsm_body = |row: &mut [f64]| {
+                for c in 0..nb {
+                    let mut t = row[jb + c];
+                    for p in 0..c {
+                        t -= row[jb + p] * head[(jb + c) * n + (jb + p)];
+                    }
+                    row[jb + c] = t / head[(jb + c) * n + (jb + c)];
+                }
+            };
+            if m >= 64 {
+                tail.par_chunks_mut(n).for_each(trsm_body);
+            } else {
+                tail.chunks_mut(n).for_each(trsm_body);
+            }
         }
 
         stage_family_add(
@@ -28981,21 +29456,19 @@ pub fn cholesky_contiguous_f64(
         );
 
         // 3. Trailing rank-nb update A22 -= L21 · L21^T, FUSED directly into l.
-        //    Pack L21 (m×nb) once, then one accumulate-GEMM (alpha=-1, beta=1)
-        //    writes -L21·L21^T straight into l's strided trailing block — no temp
-        //    product buffer and no scalar O(n³) subtract pass (which dominated the
-        //    wall time; the GEMM FLOPs were already cheap). dgemm_bt reads L21^T via
-        //    strides. The full m×m rectangle is written; the unused strict-upper
-        //    triangle is zeroed after the factorisation. frankentorch-kgs4.61.
         let trailing_started = std::time::Instant::now();
-        let l21 = &mut l21[..m * nb];
-        for i in 0..m {
-            for c in 0..nb {
-                l21[i * nb + c] = l[(je + i) * n + (jb + c)];
+        if fast {
+            let l21_ref: &[f64] = l21_panel;
+            gemm::dsyrk_lower_sub_into(m, nb, l21_ref, &mut l, je * n + je, n);
+        } else {
+            for i in 0..m {
+                for c in 0..nb {
+                    l21_panel[i * nb + c] = l[(je + i) * n + (jb + c)];
+                }
             }
+            let l21_ref: &[f64] = l21_panel;
+            gemm::dgemm_bt_sub_into(m, nb, m, l21_ref, l21_ref, &mut l, je * n + je, n);
         }
-        let l21: &[f64] = l21;
-        gemm::dgemm_bt_sub_into(m, nb, m, l21, l21, &mut l, je * n + je, n);
         stage_family_add(
             &CHOLESKY_TRAILING_NS,
             &CHOLESKY_STAGE_OWNER,
@@ -29005,15 +29478,13 @@ pub fn cholesky_contiguous_f64(
         jb = je;
     }
 
-    // The fused trailing GEMM wrote full m×m rectangles, polluting the strict-upper
-    // triangle of each trailing block. Clear it so the returned lower factor has
+    // The fused trailing GEMM wrote full m×m rectangles (or 32×32 diagonal blocks),
+    // polluting the strict-upper triangle. Clear it so the returned lower factor has
     // exact zeros above the diagonal. frankentorch-kgs4.61.
     let zero_started = std::time::Instant::now();
     for i in 0..n {
         let row = i * n;
-        for j in (i + 1)..n {
-            l[row + j] = 0.0;
-        }
+        l[row + i + 1..row + n].fill(0.0);
     }
 
     stage_family_add(
@@ -53309,8 +53780,13 @@ mod tests {
         }
     }
 
+    static LU_CHOL_FAST_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn lu_inv_identity_struct_matches_the_dense_identity_route() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // `frankentorch-37sxo`. Two assertions, and the second is the one that matters.
         //
         // AGREEMENT with the shipping route is necessary but NOT sufficient: both routes share
@@ -53394,6 +53870,9 @@ mod tests {
 
     #[test]
     fn lu_solve_perm_rowwise_matches_the_column_gather_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // `frankentorch-37sxo`. The row-wise RHS permutation is pure data movement — no arithmetic
         // — so "bit-exact" here is a claim about INDEXING, and indexing is exactly what a
         // row/column mixup gets wrong while still producing a plausible-looking matrix. Hence a
@@ -53456,6 +53935,9 @@ mod tests {
 
     #[test]
     fn lu_trsm_row_accum_matches_the_shipped_solve_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // `frankentorch-x6wc3`. The row-accumulating triangular solve keeps the running total in
         // a local buffer instead of read-modify-writing `lu[i*n + j]` once per `t`. The claim is
         // that this is BIT-EXACT — identical subtractions, identical order, identical values,
@@ -53503,6 +53985,90 @@ mod tests {
                 shipped.pivots, accum.pivots,
                 "pivot sequence differs at n={n}"
             );
+        }
+    }
+
+    #[test]
+    fn lu_fast_kernel_matches_shipped_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for n in [67usize, 128, 200, 256] {
+            let data: Vec<f64> = (0..n * n)
+                .map(|idx| {
+                    let i = idx / n;
+                    let j = idx % n;
+                    let v = ((i * 31 + j * 17) % 23) as f64 * 0.05 - 0.5;
+                    if i == j { v + (n as f64) } else { v }
+                })
+                .collect();
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![n, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+
+            let previous = super::set_lu_fast_kernel(false);
+            let shipped_lu = super::lu_factor_contiguous_f64(&data, &meta).expect("shipped lu");
+            let shipped_inv = super::inv_tensor_contiguous_f64(&data, &meta).expect("shipped inv");
+            super::set_lu_fast_kernel(true);
+            let fast_lu = super::lu_factor_contiguous_f64(&data, &meta).expect("fast lu");
+            let fast_inv = super::inv_tensor_contiguous_f64(&data, &meta).expect("fast inv");
+            super::set_lu_fast_kernel(previous);
+
+            assert_eq!(shipped_lu.pivots, fast_lu.pivots, "pivots differ at n={n}");
+            for (idx, (a, b)) in shipped_lu.lu.iter().zip(&fast_lu.lu).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "LU[{idx}] differs at n={n}: shipped {a:e} vs fast {b:e}"
+                );
+            }
+            for (idx, (a, b)) in shipped_inv.iter().zip(&fast_inv).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "inv[{idx}] differs at n={n}: shipped {a:e} vs fast {b:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cholesky_fast_kernel_matches_shipped_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for n in [67usize, 130, 192, 256] {
+            let mut a = vec![0.0f64; n * n];
+            for i in 0..n {
+                for j in 0..i {
+                    let v = ((i * 17 + j * 31) % 23) as f64 * 0.01 - 0.1;
+                    a[i * n + j] = v;
+                    a[j * n + i] = v;
+                }
+                a[i * n + i] = n as f64;
+            }
+            let meta = ft_core::TensorMeta::from_shape(
+                vec![n, n],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+
+            let previous = super::set_cholesky_fast_kernel(false);
+            let shipped = super::cholesky_contiguous_f64(&a, &meta, false).expect("shipped chol");
+            super::set_cholesky_fast_kernel(true);
+            let fast = super::cholesky_contiguous_f64(&a, &meta, false).expect("fast chol");
+            super::set_cholesky_fast_kernel(previous);
+
+            assert_eq!(shipped.factor.len(), fast.factor.len());
+            for (idx, (x, y)) in shipped.factor.iter().zip(&fast.factor).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "cholesky[{idx}] differs at n={n}: shipped {x:?} vs fast {y:?}"
+                );
+            }
         }
     }
 
@@ -73205,6 +73771,9 @@ mod tests {
     /// numerical promise.
     #[test]
     fn cholesky_nb_knob_is_neutral_at_default_and_correct_elsewhere() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for n in [96usize, 192, 300] {
             let mut a = vec![0.0f64; n * n];
             for i in 0..n {
@@ -73280,6 +73849,9 @@ mod tests {
     /// produced a test that fails on correct output, which is worse than no test.
     #[test]
     fn cholesky_nb_f32_knob_is_neutral_at_default_and_correct_elsewhere() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for n in [96usize, 192, 300] {
             let mut a = vec![0.0f32; n * n];
             for i in 0..n {
@@ -73342,6 +73914,9 @@ mod tests {
 
     #[test]
     fn cholesky_panel_modes_agree_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for n in [130usize, 192, 259] {
             let mut a = vec![0.0f64; n * n];
             for i in 0..n {
