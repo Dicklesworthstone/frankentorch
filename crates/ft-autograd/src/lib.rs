@@ -14543,7 +14543,24 @@ impl TensorTape {
                             }
                             for r in 0..reduce_size {
                                 let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                softmax_contrib[idx] = output_values[idx] * (incoming[idx] - dot);
+                                let s_r = output_values[idx];
+                                softmax_contrib[idx] = if s_r > 0.5 {
+                                    // grad_r - dot = grad_r*(1 - s_r) - sum_{j!=r} grad_j*s_j,
+                                    // and 1 - s_r rounds to 0 once s_r rounds to 1
+                                    // ("softmax collapse"); take 1 - s_r as the sum of the
+                                    // other (small) outputs instead.
+                                    let (mut rest_s, mut rest_gs) = (0.0, 0.0);
+                                    for j in (0..reduce_size).filter(|&j| j != r) {
+                                        let jdx = outer * reduce_size * inner_size
+                                            + j * inner_size
+                                            + inner;
+                                        rest_s += output_values[jdx];
+                                        rest_gs += incoming[jdx] * output_values[jdx];
+                                    }
+                                    s_r * (incoming[idx] * rest_s - rest_gs)
+                                } else {
+                                    s_r * (incoming[idx] - dot)
+                                };
                             }
                         }
                     }
@@ -14587,8 +14604,20 @@ impl TensorTape {
                             }
                             for r in 0..reduce_size {
                                 let local = r * inner_size + inner;
-                                let softmax_i = output_values[base + local].exp();
-                                block[local] = incoming[base + local] - softmax_i * grad_sum;
+                                let out = output_values[base + local];
+                                block[local] = if out > -std::f64::consts::LN_2 {
+                                    // softmax_r > 1/2 (at most one such entry per lane):
+                                    // grad_r - softmax_r*sum(grad) cancels once softmax_r
+                                    // rounds to 1 ("softmax collapse"), so use the exact
+                                    // rewrite -sum_{j!=r}(grad_j) - expm1(out_r)*sum(grad).
+                                    let mut rest = 0.0;
+                                    for j in (0..reduce_size).filter(|&j| j != r) {
+                                        rest += incoming[base + j * inner_size + inner];
+                                    }
+                                    -rest - out.exp_m1() * grad_sum
+                                } else {
+                                    incoming[base + local] - out.exp() * grad_sum
+                                };
                             }
                         }
                     };
@@ -26406,6 +26435,67 @@ mod tests {
 
         for i in 0..3 {
             assert!((ls_vals[i] - sm_vals[i].ln()).abs() < 1e-12);
+        }
+    }
+
+    /// Gradient of `sum(op(x) * onehot(0))` along dim 1 of a `[1, 3]` leaf.
+    fn softmax_family_target_grad(x: Vec<f64>, f32_leaf: bool, log: bool) -> Vec<f64> {
+        let mut tape = TensorTape::new();
+        let (x, onehot) = if f32_leaf {
+            let x = x.iter().map(|&v| v as f32).collect();
+            (
+                tape.leaf_f32(x, vec![1, 3], true).expect("x"),
+                tape.leaf_f32(vec![1.0, 0.0, 0.0], vec![1, 3], false)
+                    .expect("onehot"),
+            )
+        } else {
+            (
+                tape.leaf(x, vec![1, 3], true).expect("x"),
+                tape.leaf(vec![1.0, 0.0, 0.0], vec![1, 3], false)
+                    .expect("onehot"),
+            )
+        };
+        let (y, _) = if log {
+            tape.log_softmax(x, 1, ExecutionMode::Strict)
+                .expect("log_softmax")
+        } else {
+            tape.softmax(x, 1, ExecutionMode::Strict).expect("softmax")
+        };
+        let (picked, _) = tape.mul(y, onehot, ExecutionMode::Strict).expect("mul");
+        let (loss, _) = tape.sum(picked, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(loss).expect("backward");
+        report.gradient(x).expect("grad").to_vec()
+    }
+
+    #[test]
+    fn tensor_softmax_family_backward_avoids_softmax_collapse() {
+        // Regression for frankentorch#8 ("softmax collapse"). With a logit
+        // margin past ~36.7 (f64) / ~16.6 (f32), softmax[argmax] rounds to 1,
+        // so `grad - softmax*sum(grad)` (log_softmax) and `s*(grad - dot)`
+        // (softmax) returned exactly 0 for the argmax while the other entries
+        // stayed nonzero. Expected values: exact gradients of
+        // log_softmax(x)[0] = onehot - softmax and softmax(x)[0] =
+        // s0*(onehot - softmax) from mpmath (the two agree to ~1e-17 here).
+        let check = |what: &str, got: &[f64], want: [f64; 3], rel: f64| {
+            for (i, (&g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= rel * w.abs(),
+                    "{what}[{i}] = {g:e}, expected {w:e}"
+                );
+            }
+        };
+        let want64 = [
+            8.496708510583178e-18,
+            -4.248354255291589e-18,
+            -4.248354255291589e-18,
+        ];
+        let want32 = [3.0459958e-08, -1.5229979e-08, -1.5229979e-08];
+        for log in [true, false] {
+            let what = if log { "log_softmax" } else { "softmax" };
+            let g64 = softmax_family_target_grad(vec![20.0, -20.0, -20.0], false, log);
+            check(what, &g64, want64, 1e-12);
+            let g32 = softmax_family_target_grad(vec![9.0, -9.0, -9.0], true, log);
+            check(what, &g32, want32, 1e-5);
         }
     }
 

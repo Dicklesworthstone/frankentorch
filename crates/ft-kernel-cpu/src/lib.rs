@@ -8177,6 +8177,118 @@ fn rms_norm_backward_f32_generic(
     (dx, dweight)
 }
 
+/// Max, first argmax index and log-normaliser of one cross-entropy row, with
+/// `lse(row) = max + log_norm` and `log_norm = ln_1p(Σ_{j≠argmax} exp(row_j −
+/// max))`: the argmax's `exp(0) = 1` never absorbs the tail (see
+/// [`log_softmax_row_norm_f64`]). `None` when the max is not finite (an all
+/// -inf, all-NaN or +inf row), where the loss and gradient are NaN.
+fn cross_entropy_row_norm_f64(row: &[f64]) -> Option<(f64, usize, f64)> {
+    let mut m = f64::NEG_INFINITY;
+    let mut imax = 0usize;
+    for (j, &v) in row.iter().enumerate() {
+        if v > m {
+            m = v;
+            imax = j;
+        }
+    }
+    if !m.is_finite() {
+        return None;
+    }
+    let mut tail = 0.0f64;
+    for (j, &v) in row.iter().enumerate() {
+        if j != imax {
+            tail += (v - m).exp();
+        }
+    }
+    Some((m, imax, tail.ln_1p()))
+}
+
+/// `-log_softmax(row)[t] = (max − row[t]) + log_norm`. When the target is the
+/// argmax this is an exact `0 + ln_1p(tail)`, so a large logit margin no longer
+/// rounds the loss to 0.
+fn cross_entropy_row_loss_f64(row: &[f64], t: usize) -> f64 {
+    match cross_entropy_row_norm_f64(row) {
+        Some((m, _, log_norm)) => (m - row[t]) + log_norm,
+        None => f64::NAN,
+    }
+}
+
+/// `drow[c] = g·(softmax(row)[c] − [c == t])`. When the target is the argmax,
+/// `softmax[t] − 1` cancels (softmax[t] rounds to 1 past the collapse margin),
+/// so the target entry is formed as `−g·Σ_{c≠t} softmax[c]` instead, which also
+/// keeps the row gradient summing to zero. Otherwise `softmax[t] ≤ 1/2` and
+/// `softmax[t] − 1` loses nothing.
+fn cross_entropy_row_grad_f64(row: &[f64], drow: &mut [f64], t: usize, g: f64) {
+    let Some((m, imax, log_norm)) = cross_entropy_row_norm_f64(row) else {
+        drow.fill(f64::NAN);
+        return;
+    };
+    let mut rest = 0.0f64;
+    for (c, (d, &v)) in drow.iter_mut().zip(row).enumerate() {
+        let sm = ((v - m) - log_norm).exp();
+        if c == t {
+            *d = g * (sm - 1.0);
+        } else {
+            *d = g * sm;
+            rest += sm;
+        }
+    }
+    if t == imax {
+        drow[t] = -(g * rest);
+    }
+}
+
+/// f32 mirror of [`cross_entropy_row_norm_f64`] (collapse margin ~16.6 in f32).
+fn cross_entropy_row_norm_f32(row: &[f32]) -> Option<(f32, usize, f32)> {
+    let mut m = f32::NEG_INFINITY;
+    let mut imax = 0usize;
+    for (j, &v) in row.iter().enumerate() {
+        if v > m {
+            m = v;
+            imax = j;
+        }
+    }
+    if !m.is_finite() {
+        return None;
+    }
+    let mut tail = 0.0f32;
+    for (j, &v) in row.iter().enumerate() {
+        if j != imax {
+            tail += (v - m).exp();
+        }
+    }
+    Some((m, imax, tail.ln_1p()))
+}
+
+/// f32 mirror of [`cross_entropy_row_loss_f64`].
+fn cross_entropy_row_loss_f32(row: &[f32], t: usize) -> f32 {
+    match cross_entropy_row_norm_f32(row) {
+        Some((m, _, log_norm)) => (m - row[t]) + log_norm,
+        None => f32::NAN,
+    }
+}
+
+/// f32 mirror of [`cross_entropy_row_grad_f64`].
+fn cross_entropy_row_grad_f32(row: &[f32], drow: &mut [f32], t: usize, g: f32) {
+    let Some((m, imax, log_norm)) = cross_entropy_row_norm_f32(row) else {
+        drow.fill(f32::NAN);
+        return;
+    };
+    let mut rest = 0.0f32;
+    for (c, (d, &v)) in drow.iter_mut().zip(row).enumerate() {
+        let sm = ((v - m) - log_norm).exp();
+        if c == t {
+            *d = g * (sm - 1.0);
+        } else {
+            *d = g * sm;
+            rest += sm;
+        }
+    }
+    if t == imax {
+        drow[t] = -(g * rest);
+    }
+}
+
 /// Fused softmax-cross-entropy forward (f64): per row of `[batch, classes]`
 /// logits with a class-index `target`, returns the per-row loss
 /// `lse(logits) - logits[target]` (`= -log_softmax[target]`) in one streaming
@@ -8192,18 +8304,7 @@ pub fn cross_entropy_forward_f64(
     let mut loss = vec![0.0f64; batch];
     loss.par_iter_mut().enumerate().for_each(|(i, li)| {
         let row = &logits[i * classes..i * classes + classes];
-        let mut m = f64::NEG_INFINITY;
-        for &v in row {
-            if v > m {
-                m = v;
-            }
-        }
-        let mut s = 0.0f64;
-        for &v in row {
-            s += (v - m).exp();
-        }
-        let lse = m + s.ln();
-        *li = lse - row[target[i]];
+        *li = cross_entropy_row_loss_f64(row, target[i]);
     });
     loss
 }
@@ -8226,23 +8327,7 @@ pub fn cross_entropy_backward_f64(
         .enumerate()
         .for_each(|(i, drow)| {
             let row = &logits[i * classes..i * classes + classes];
-            let mut m = f64::NEG_INFINITY;
-            for &v in row {
-                if v > m {
-                    m = v;
-                }
-            }
-            let mut s = 0.0f64;
-            for &v in row {
-                s += (v - m).exp();
-            }
-            let lse = m + s.ln();
-            let g = dloss[i];
-            let t = target[i];
-            for c in 0..classes {
-                let sm = (row[c] - lse).exp();
-                drow[c] = g * (sm - if c == t { 1.0 } else { 0.0 });
-            }
+            cross_entropy_row_grad_f64(row, drow, target[i], dloss[i]);
         });
     dlogits
 }
@@ -8260,18 +8345,7 @@ pub fn cross_entropy_forward_f32(
     let mut loss = vec![0.0f32; batch];
     loss.par_iter_mut().enumerate().for_each(|(i, li)| {
         let row = &logits[i * classes..i * classes + classes];
-        let mut m = f32::NEG_INFINITY;
-        for &v in row {
-            if v > m {
-                m = v;
-            }
-        }
-        let mut s = 0.0f32;
-        for &v in row {
-            s += (v - m).exp();
-        }
-        let lse = m + s.ln();
-        *li = lse - row[target[i]];
+        *li = cross_entropy_row_loss_f32(row, target[i]);
     });
     loss
 }
@@ -8292,23 +8366,7 @@ pub fn cross_entropy_backward_f32(
         .enumerate()
         .for_each(|(i, drow)| {
             let row = &logits[i * classes..i * classes + classes];
-            let mut m = f32::NEG_INFINITY;
-            for &v in row {
-                if v > m {
-                    m = v;
-                }
-            }
-            let mut s = 0.0f32;
-            for &v in row {
-                s += (v - m).exp();
-            }
-            let lse = m + s.ln();
-            let g = dloss[i];
-            let t = target[i];
-            for c in 0..classes {
-                let sm = (row[c] - lse).exp();
-                drow[c] = g * (sm - if c == t { 1.0 } else { 0.0 });
-            }
+            cross_entropy_row_grad_f32(row, drow, target[i], dloss[i]);
         });
     dlogits
 }
@@ -21714,6 +21772,41 @@ fn softmax_dim_block_transpose_trick_f64(
         });
 }
 
+/// Row max and log-normaliser `ln Σ_j exp(x_j − max)` of one log-softmax row,
+/// so that `log_softmax(x)_j = (x_j − max) − log_norm`.
+///
+/// The argmax's own term `exp(0) = 1` is left out of the pairwise sum and added
+/// back through `ln_1p`. Summing it in first rounds `1 + Σ_{j≠argmax} exp(x_j −
+/// max)` to exactly 1 once the logit margin passes ~36.7 (f64), which zeroes the
+/// argmax log-probability and, through `exp(log_softmax) − 1`, its gradient
+/// ("softmax collapse", Barron et al., arXiv:2610.31642); with `ln_1p` the tail
+/// survives down to exponent underflow. A non-finite max keeps the plain
+/// formula, so all -inf and +inf rows still produce NaN exactly as before.
+fn log_softmax_row_norm_f64(row: &[f64]) -> (f64, f64) {
+    let max_val = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let shifted_exp = |x: f64| (x - max_val).exp();
+    let log_norm = match row.iter().position(|&x| x == max_val) {
+        Some(i) if max_val.is_finite() => (pairwise_sum_map_f64(&row[..i], shifted_exp)
+            + pairwise_sum_map_f64(&row[i + 1..], shifted_exp))
+        .ln_1p(),
+        _ => pairwise_sum_map_f64(row, shifted_exp).ln(),
+    };
+    (max_val, log_norm)
+}
+
+/// f32 mirror of [`log_softmax_row_norm_f64`] (collapse margin ~16.6 in f32).
+fn log_softmax_row_norm_f32(row: &[f32]) -> (f32, f32) {
+    let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let shifted_exp = |x: f32| (x - max_val).exp();
+    let log_norm = match row.iter().position(|&x| x == max_val) {
+        Some(i) if max_val.is_finite() => (pairwise_sum_map_f32(&row[..i], shifted_exp)
+            + pairwise_sum_map_f32(&row[i + 1..], shifted_exp))
+        .ln_1p(),
+        _ => pairwise_sum_map_f32(row, shifted_exp).ln(),
+    };
+    (max_val, log_norm)
+}
+
 pub fn log_softmax_dim_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
@@ -21738,8 +21831,10 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
     // Same fast/general split as `softmax_dim_tensor_contiguous_f64`.
     // log-sum-exp = max + log(sum(exp(x - max))) — the max subtraction is the
     // standard numerical-stability trick; pairwise replaces the sum-of-exps
-    // accumulator. The strided general path also parallelizes over independent
-    // outer blocks while keeping every lane's serial FP order unchanged.
+    // accumulator, and the argmax's own exp(0) = 1 is added back through ln_1p
+    // (`log_softmax_row_norm_f64`) so a dominant logit keeps its tail. The
+    // strided general path also parallelizes over independent outer blocks
+    // while keeping every lane's serial FP order unchanged.
     // The output formulation is (x - max) - log(sum_exp), NOT
     // x - (max + log(sum_exp)). Algebraically identical, but the
     // first preserves precision when x and max are large-magnitude
@@ -21755,9 +21850,7 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
     // exp is compute-bound and each slice is independent -> bit-identical.
     if inner_size == 1 {
         let process = |out_slice: &mut [f64], in_slice: &[f64]| {
-            let max_val = in_slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let sum_exp = pairwise_sum_map_f64(in_slice, |x| (x - max_val).exp());
-            let log_sum_exp = sum_exp.ln();
+            let (max_val, log_sum_exp) = log_softmax_row_norm_f64(in_slice);
             for (out, &x) in out_slice.iter_mut().zip(in_slice.iter()) {
                 *out = (x - max_val) - log_sum_exp;
             }
@@ -21782,9 +21875,7 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
             for r in 0..reduce_size {
                 scratch[r] = in_block[r * inner_size + inner];
             }
-            let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let sum_exp = pairwise_sum_map_f64(scratch, |x| (x - max_val).exp());
-            let log_sum_exp = sum_exp.ln();
+            let (max_val, log_sum_exp) = log_softmax_row_norm_f64(scratch);
             for (r, &x) in scratch.iter().enumerate() {
                 out_block[r * inner_size + inner] = (x - max_val) - log_sum_exp;
             }
@@ -21846,9 +21937,7 @@ fn log_softmax_dim_block_transpose_trick_f64(
             for (r, slot) in trow.iter_mut().enumerate() {
                 *slot = in_block[r * inner + col];
             }
-            let max_val = trow.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let sum_exp = pairwise_sum_map_f64(trow, |x| (x - max_val).exp());
-            let log_sum_exp = sum_exp.ln();
+            let (max_val, log_sum_exp) = log_softmax_row_norm_f64(trow);
             for v in trow.iter_mut() {
                 *v = (*v - max_val) - log_sum_exp;
             }
@@ -47344,9 +47433,7 @@ pub fn log_softmax_dim_tensor_contiguous_f32(
             .par_chunks_mut(reduce_size)
             .zip(data[..numel].par_chunks(reduce_size))
             .for_each(|(out_slice, in_slice)| {
-                let max_val = in_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let sum_exp = pairwise_sum_map_f32(in_slice, |x| (x - max_val).exp());
-                let log_sum_exp = sum_exp.ln();
+                let (max_val, log_sum_exp) = log_softmax_row_norm_f32(in_slice);
                 for (out, &x) in out_slice.iter_mut().zip(in_slice.iter()) {
                     *out = (x - max_val) - log_sum_exp;
                 }
@@ -47381,9 +47468,7 @@ pub fn log_softmax_dim_tensor_contiguous_f32(
             for r in 0..reduce_size {
                 scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
-            let max_val = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp = pairwise_sum_map_f32(&scratch, |x| (x - max_val).exp());
-            let log_sum_exp = sum_exp.ln();
+            let (max_val, log_sum_exp) = log_softmax_row_norm_f32(&scratch);
             for (r, &x) in scratch.iter().enumerate() {
                 output[outer * reduce_size * inner_size + r * inner_size + inner] =
                     (x - max_val) - log_sum_exp;
@@ -47442,9 +47527,7 @@ fn log_softmax_dim_block_transpose_trick_f32(
             for (r, slot) in trow.iter_mut().enumerate() {
                 *slot = in_block[r * inner + col];
             }
-            let max_val = trow.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp = pairwise_sum_map_f32(trow, |x| (x - max_val).exp());
-            let log_sum_exp = sum_exp.ln();
+            let (max_val, log_sum_exp) = log_softmax_row_norm_f32(trow);
             for v in trow.iter_mut() {
                 *v = (*v - max_val) - log_sum_exp;
             }
@@ -67882,7 +67965,8 @@ mod tests {
                 .collect();
             let meta = TensorMeta::from_shape(shape.clone(), DType::F64, Device::Cpu);
 
-            // Serial references replicating the pre-parallel algorithm exactly.
+            // Serial references replicating the per-lane algorithm exactly (the
+            // log-normaliser leaves the argmax term out and adds it via ln_1p).
             let mut sm_ref = vec![0.0_f64; numel];
             let mut lsm_ref = vec![0.0_f64; numel];
             let mut scratch = vec![0.0_f64; reduce];
@@ -67892,7 +67976,11 @@ mod tests {
                         scratch[r] = data[o * reduce * inner + r * inner + i];
                     }
                     let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                    let log_sum_exp = pairwise_sum_map_f64(&scratch, |x| (x - max_val).exp()).ln();
+                    let imax = scratch.iter().position(|&x| x == max_val).expect("row max");
+                    let log_sum_exp =
+                        (pairwise_sum_map_f64(&scratch[..imax], |x| (x - max_val).exp())
+                            + pairwise_sum_map_f64(&scratch[imax + 1..], |x| (x - max_val).exp()))
+                        .ln_1p();
                     let mut exps = scratch.clone();
                     for v in exps.iter_mut() {
                         *v = (*v - max_val).exp();
@@ -67936,8 +68024,16 @@ mod tests {
                         scratch32[r] = data32[o * reduce * inner + r * inner + i];
                     }
                     let max_val = scratch32.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let imax = scratch32
+                        .iter()
+                        .position(|&x| x == max_val)
+                        .expect("row max");
                     let log_sum_exp =
-                        super::pairwise_sum_map_f32(&scratch32, |x| (x - max_val).exp()).ln();
+                        (super::pairwise_sum_map_f32(&scratch32[..imax], |x| (x - max_val).exp())
+                            + super::pairwise_sum_map_f32(&scratch32[imax + 1..], |x| {
+                                (x - max_val).exp()
+                            }))
+                        .ln_1p();
                     let mut exps = scratch32.clone();
                     for v in exps.iter_mut() {
                         *v = (*v - max_val).exp();
@@ -68267,6 +68363,185 @@ mod tests {
                 expected[i].to_bits(),
             );
         }
+    }
+
+    fn assert_rel_close(what: &str, got: &[f64], want: &[f64], rel: f64) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= rel * w.abs(),
+                "{what}[{i}] = {g:e}, expected {w:e} (rel tol {rel:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn log_softmax_and_cross_entropy_avoid_softmax_collapse() {
+        // Regression for frankentorch#8 ("softmax collapse", Barron et al.,
+        // arXiv:2610.31642). Past a logit margin of ~36.7 (f64) / ~16.6 (f32),
+        // `1 + Σ_{j≠argmax} exp(x_j − max)` rounds to exactly 1, so the old
+        // kernels returned log_softmax[argmax] = 0, cross-entropy loss 0 and a
+        // target gradient of exactly 0 while the other gradients stayed
+        // positive (the row gradient no longer summed to zero). The tail now
+        // goes through ln_1p and the target gradient is formed as minus the
+        // sum of the others. References: mpmath at 60 digits on the same
+        // (exactly representable) inputs.
+        let meta64 = TensorMeta::from_shape(vec![1, 3], DType::F64, Device::Cpu);
+        let x64 = [20.0_f64, -20.0, -20.0];
+        let lsm64 = log_softmax_dim_tensor_contiguous_f64(&x64, &meta64, 1).expect("log_softmax");
+        assert_rel_close(
+            "f64 log_softmax",
+            &lsm64,
+            &[-8.496708510583178e-18, -40.0, -40.0],
+            1e-12,
+        );
+        let loss64 = super::cross_entropy_forward_f64(&x64, &[0], 1, 3);
+        assert_rel_close("f64 ce loss", &loss64, &[8.496708510583178e-18], 1e-12);
+        let grad64 = super::cross_entropy_backward_f64(&x64, &[0], &[1.0], 1, 3);
+        assert_rel_close(
+            "f64 ce grad",
+            &grad64,
+            &[
+                -8.496708510583178e-18,
+                4.248354255291589e-18,
+                4.248354255291589e-18,
+            ],
+            1e-12,
+        );
+        assert_eq!(
+            grad64.iter().sum::<f64>(),
+            0.0,
+            "f64 grad row must sum to 0"
+        );
+
+        // Same row along a strided (non-last) dim: the per-block scratch path.
+        let meta_col = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let col = [20.0_f64, 1.0, -20.0, 0.0, -20.0, -1.0];
+        let lsm_col = log_softmax_dim_tensor_contiguous_f64(&col, &meta_col, 0).expect("strided");
+        assert_rel_close(
+            "f64 strided log_softmax",
+            &[lsm_col[0], lsm_col[2], lsm_col[4]],
+            &[-8.496708510583178e-18, -40.0, -40.0],
+            1e-12,
+        );
+
+        let meta32 = TensorMeta::from_shape(vec![1, 3], DType::F32, Device::Cpu);
+        let x32 = [9.0_f32, -9.0, -9.0];
+        let lsm32 =
+            super::log_softmax_dim_tensor_contiguous_f32(&x32, &meta32, 1).expect("log_softmax");
+        let widen = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
+        assert_rel_close(
+            "f32 log_softmax",
+            &widen(&lsm32),
+            &[-3.0459958e-08, -18.0, -18.0],
+            1e-5,
+        );
+        let loss32 = super::cross_entropy_forward_f32(&x32, &[0], 1, 3);
+        assert_rel_close("f32 ce loss", &widen(&loss32), &[3.0459958e-08], 1e-5);
+        let grad32 = super::cross_entropy_backward_f32(&x32, &[0], &[1.0], 1, 3);
+        assert_rel_close(
+            "f32 ce grad",
+            &widen(&grad32),
+            &[-3.0459958e-08, 1.5229979e-08, 1.5229979e-08],
+            1e-5,
+        );
+        assert_eq!(
+            grad32.iter().sum::<f32>(),
+            0.0,
+            "f32 grad row must sum to 0"
+        );
+    }
+
+    #[test]
+    fn cross_entropy_kernels_match_reference_on_ties_magnitudes_and_non_finite_rows() {
+        // Target tied with another maximum (either index), and a large-magnitude
+        // row whose target is not the argmax: same answers as the exact
+        // softmax − onehot (mpmath references).
+        let tie = [5.0_f64, 5.0, 0.0, 5.0, 5.0, 0.0];
+        assert_rel_close(
+            "tie loss",
+            &super::cross_entropy_forward_f64(&tie, &[0, 1], 2, 3),
+            &[0.6965104917820788, 0.6965104917820788],
+            1e-14,
+        );
+        assert_rel_close(
+            "tie grad",
+            &super::cross_entropy_backward_f64(&tie, &[0, 1], &[1.0, 1.0], 2, 3),
+            &[
+                -0.5016788308132513,
+                0.4983211691867487,
+                0.0033576616265026146,
+                0.4983211691867487,
+                -0.5016788308132513,
+                0.0033576616265026146,
+            ],
+            1e-14,
+        );
+        let big = [10000.0_f64, 9999.0, 9990.0];
+        assert_rel_close(
+            "big-magnitude loss",
+            &super::cross_entropy_forward_f64(&big, &[1], 1, 3),
+            &[1.3132948769755688],
+            1e-14,
+        );
+        assert_rel_close(
+            "big-magnitude grad",
+            &super::cross_entropy_backward_f64(&big, &[1], &[1.0], 1, 3),
+            &[
+                0.7310343155951328,
+                -0.7310675045017148,
+                3.318890658198521e-05,
+            ],
+            1e-13,
+        );
+
+        // Non-finite rows keep PyTorch's answers: a -inf target logit gives an
+        // infinite loss with an ordinary gradient; a +inf, all -inf or NaN row
+        // gives NaN loss and gradient.
+        let masked = [0.0_f64, f64::NEG_INFINITY, 0.0];
+        assert_eq!(
+            super::cross_entropy_forward_f64(&masked, &[1], 1, 3),
+            [f64::INFINITY]
+        );
+        assert_rel_close(
+            "masked-target grad",
+            &super::cross_entropy_backward_f64(&masked, &[1], &[1.0], 1, 3),
+            &[0.5, -1.0, 0.5],
+            1e-15,
+        );
+        for row in [
+            [f64::INFINITY, 0.0, 0.0],
+            [f64::NEG_INFINITY; 3],
+            [0.0, f64::NAN, 1.0],
+        ] {
+            assert!(super::cross_entropy_forward_f64(&row, &[0], 1, 3)[0].is_nan());
+            assert!(
+                super::cross_entropy_backward_f64(&row, &[0], &[1.0], 1, 3)
+                    .iter()
+                    .all(|g| g.is_nan())
+            );
+            let row32 = row.map(|x| x as f32);
+            assert!(super::cross_entropy_forward_f32(&row32, &[0], 1, 3)[0].is_nan());
+            assert!(
+                super::cross_entropy_backward_f32(&row32, &[0], &[1.0], 1, 3)
+                    .iter()
+                    .all(|g| g.is_nan())
+            );
+        }
+
+        // log_softmax keeps -inf entries and NaN rows as before.
+        let meta = TensorMeta::from_shape(vec![1, 2], DType::F64, Device::Cpu);
+        assert_eq!(
+            log_softmax_dim_tensor_contiguous_f64(&[f64::NEG_INFINITY, 0.0], &meta, 1)
+                .expect("masked log_softmax"),
+            [f64::NEG_INFINITY, 0.0]
+        );
+        assert!(
+            log_softmax_dim_tensor_contiguous_f64(&[f64::NAN, 0.0], &meta, 1)
+                .expect("nan log_softmax")
+                .iter()
+                .all(|v| v.is_nan())
+        );
     }
 
     #[test]
@@ -69774,8 +70049,11 @@ mod tests {
         for c in 0..cols {
             let scratch: Vec<f64> = (0..rows).map(|r| input[r * cols + c]).collect();
             let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let sum_exp = super::pairwise_sum_map_f64(&scratch, |x| (x - max_val).exp());
-            let lse = sum_exp.ln();
+            // The argmax term stays out of the sum and is added back via ln_1p.
+            let imax = scratch.iter().position(|&x| x == max_val).expect("col max");
+            let lse = (super::pairwise_sum_map_f64(&scratch[..imax], |x| (x - max_val).exp())
+                + super::pairwise_sum_map_f64(&scratch[imax + 1..], |x| (x - max_val).exp()))
+            .ln_1p();
             for r in 0..rows {
                 wantl[r * cols + c] = (scratch[r] - max_val) - lse;
             }
@@ -69813,8 +70091,10 @@ mod tests {
         for c in 0..cols {
             let scratch: Vec<f32> = (0..rows).map(|r| input32[r * cols + c]).collect();
             let max_val = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp = super::pairwise_sum_map_f32(&scratch, |x| (x - max_val).exp());
-            let lse = sum_exp.ln();
+            let imax = scratch.iter().position(|&x| x == max_val).expect("col max");
+            let lse = (super::pairwise_sum_map_f32(&scratch[..imax], |x| (x - max_val).exp())
+                + super::pairwise_sum_map_f32(&scratch[imax + 1..], |x| (x - max_val).exp()))
+            .ln_1p();
             for r in 0..rows {
                 wantl32[r * cols + c] = (scratch[r] - max_val) - lse;
             }

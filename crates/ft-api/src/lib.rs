@@ -110143,6 +110143,73 @@ mod tests {
     }
 
     #[test]
+    fn cross_entropy_avoids_softmax_collapse_on_fused_and_composed_paths() {
+        // Regression for frankentorch#8 ("softmax collapse", arXiv:2610.31642):
+        // once the target logit leads by more than ~36.7 (f64) / ~16.6 (f32),
+        // the loss used to round to exactly 0 and the target gradient to 0
+        // while the other gradients stayed positive. Expected values are the
+        // exact loss and softmax − onehot gradient (mpmath), for the fused f64
+        // and f32 kernels and for the composed log_softmax + nll_loss graph.
+        fn check(what: &str, got: &[f64], want: &[f64], rel: f64) {
+            assert_eq!(got.len(), want.len(), "{what}: length");
+            for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= rel * w.abs(),
+                    "{what}[{i}] = {g:e}, expected {w:e}"
+                );
+            }
+        }
+        let loss64 = [8.496708510583178e-18];
+        let grad64 = [
+            -8.496708510583178e-18,
+            4.248354255291589e-18,
+            4.248354255291589e-18,
+        ];
+        for composed in [false, true] {
+            let what = if composed {
+                "composed f64"
+            } else {
+                "fused f64"
+            };
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable(vec![20.0, -20.0, -20.0], vec![1, 3], true)
+                .unwrap();
+            let t = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+            let out = if composed {
+                let lp = s.tensor_log_softmax(x, 1).unwrap();
+                s.tensor_nll_loss(lp, t, "sum").unwrap()
+            } else {
+                s.functional_cross_entropy(x, t, "sum").unwrap()
+            };
+            check(what, &s.tensor_values(out).unwrap(), &loss64, 1e-12);
+            s.tensor_backward(out).unwrap();
+            check(what, &s.tensor_grad(x).unwrap().unwrap(), &grad64, 1e-12);
+        }
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(vec![9.0, -9.0, -9.0], vec![1, 3], true)
+            .unwrap();
+        let t = s.tensor_variable_f32(vec![0.0], vec![1], false).unwrap();
+        let out = s.functional_cross_entropy(x, t, "sum").unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F32);
+        check(
+            "fused f32",
+            &s.tensor_values_lossy_f64(out).unwrap(),
+            &[3.0459958e-08],
+            1e-5,
+        );
+        s.tensor_backward(out).unwrap();
+        check(
+            "fused f32",
+            &s.tensor_grad(x).unwrap().unwrap(),
+            &[-3.0459958e-08, 1.5229979e-08, 1.5229979e-08],
+            1e-5,
+        );
+    }
+
+    #[test]
     fn session_cross_entropy_loss_wrong_class_is_higher() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         // logits: batch=1, classes=3: class 0 has highest logit
