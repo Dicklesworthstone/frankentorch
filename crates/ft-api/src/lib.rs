@@ -1274,10 +1274,10 @@ impl FrankenTorchSession {
 
     /// Number of nodes currently retained in the autograd tensor tape.
     ///
-    /// Every tensor operation, including under `no_grad`, can retain a node.
-    /// Save this count after creating persistent parameters, then use
-    /// [`Self::truncate_autograd_graph`] after each completed training step to
-    /// release temporary tensors and custom-function state.
+    /// Every op (including under `no_grad`) pushes a node that owns its output
+    /// tensor. Use this count to capture a persistent-state boundary, then call
+    /// [`Self::truncate_autograd_graph`] between training steps to reclaim each
+    /// step's intermediates and saved custom-operation state.
     #[must_use]
     pub fn autograd_graph_node_count(&self) -> usize {
         self.tensor_tape.node_count()
@@ -1570,8 +1570,11 @@ impl FrankenTorchSession {
     /// Subsequent ops marked autocast-eligible (matmul, linear, conv) will
     /// have their inputs cast to `dtype` before computation. This mirrors
     /// `torch.autocast(device_type, dtype)` from `torch.amp`.
+    /// F16 and BF16 are supported; other target dtypes disable autocast in
+    /// this region. F64 and non-floating inputs are never autocast.
     pub fn autocast_enter(&mut self, dtype: DType) {
-        self.autocast_stack.push(Some(dtype));
+        self.autocast_stack
+            .push(matches!(dtype, DType::F16 | DType::BF16).then_some(dtype));
     }
 
     /// Exit the current autocast context, restoring the previous state.
@@ -1597,25 +1600,42 @@ impl FrankenTorchSession {
         }
     }
 
-    /// Cast a tensor to the autocast target dtype if autocast is active and
-    /// the source is a higher-precision float. Returns the tensor unchanged
-    /// otherwise. Used internally by autocast-eligible ops.
+    /// Run a region in its inputs' explicit dtypes, restoring the enclosing
+    /// autocast state even if the closure unwinds. Cast half outputs to F32
+    /// explicitly in this region when full-precision computation is required.
+    pub fn with_autocast_disabled<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        self.autocast_stack.push(None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.autocast_exit();
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Cast an eligible floating input to the region's low-precision dtype.
+    /// F64, complex, integer, and quantized inputs retain their explicit dtype.
+    /// The cast is differentiable and never changes the original parameter.
     pub fn maybe_autocast(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         if let Some(target) = self.autocast_dtype() {
             let current = self.tensor_dtype(input)?;
-            // Only down-cast from higher-precision floats to lower-precision floats.
-            // Note: F16/BF16 paths are gated until tape-level conversion lands.
-            let should_cast = matches!(
-                (current, target),
-                (DType::F64, DType::F32 | DType::F16 | DType::BF16)
-                    | (DType::F32, DType::F16 | DType::BF16)
-            );
-            // Skip if the target dtype isn't supported by the conversion path yet
-            let target_supported = matches!(target, DType::F32 | DType::F64);
-            let should_cast = should_cast && target_supported;
-            if should_cast {
+            if current != target && matches!(current, DType::F32 | DType::F16 | DType::BF16) {
                 return self.tensor_to_dtype(input, target);
             }
+        }
+        Ok(input)
+    }
+
+    /// Numerically sensitive AMP operations accumulate in F32. Preserve
+    /// explicit F64 inputs and leave index/non-floating tensors untouched.
+    fn maybe_autocast_fp32(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.is_autocast_enabled()
+            && matches!(self.tensor_dtype(input)?, DType::F16 | DType::BF16)
+        {
+            return self.tensor_to_f32(input);
         }
         Ok(input)
     }
@@ -1642,8 +1662,13 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.utils.checkpoint.checkpoint(function, *inputs)`.
     ///
-    /// The function must be deterministic — re-execution must produce identical
-    /// activations for correct gradient computation.
+    /// The session's random state, execution mode, device context, and autocast
+    /// context are replayed during recomputation. Tensor inputs retain their
+    /// dtype and gradient requirements. All tensors used by `function` must be
+    /// passed in `inputs`, since recomputation runs in an isolated session.
+    /// Intermediate tensor handles created by the forward closure are reclaimed
+    /// when it succeeds; only the returned checkpoint tensor remains valid.
+    /// Other captured state must be deterministic across both executions.
     pub fn checkpoint<F>(
         &mut self,
         inputs: &[TensorNodeId],
@@ -1655,104 +1680,101 @@ impl FrankenTorchSession {
             + Sync
             + 'static,
     {
-        // Capture input values and shapes for save_for_backward
-        let mut input_snapshots: Vec<(Vec<f64>, Vec<usize>)> = Vec::with_capacity(inputs.len());
+        // Keep typed snapshots instead of converting everything to F64. Storage
+        // is shared until an in-place mutation triggers copy-on-write, so these
+        // snapshots retain the forward values without retaining its graph.
+        let mut input_snapshots = Vec::with_capacity(inputs.len());
         for &inp in inputs {
-            let vals = self.tensor_values(inp)?;
-            let shape = self.tensor_shape(inp)?;
-            input_snapshots.push((vals, shape));
+            input_snapshots.push(self.tensor_tape.tensor(inp)?.clone());
         }
-        let n_inputs = inputs.len();
+        let saved_rng = self.rng.clone();
+        let saved_mode = self.mode();
+        let saved_device = self.current_device();
+        let saved_autocast = self.autocast_stack.clone();
+        let saved_detect_anomaly = self.is_detect_anomaly();
+        let boundary = self.autograd_graph_node_count();
 
-        // Forward: run in no_grad to avoid saving intermediates
+        // no_grad alone still retains every output in the tape's arena. Clone
+        // the actual output before reclaiming the whole successful region. On
+        // errors or panics with_no_grad restores grad mode and leaves the tape
+        // intact, so pre-existing tensors and diagnostics remain available.
         let output = self.with_no_grad(|s| function(s, inputs))?;
+        let output_tensor = self.tensor_tape.tensor(output)?.clone();
+        let output_meta = output_tensor.meta().clone();
+        self.truncate_autograd_graph(boundary);
 
-        // Get the output values and shape
-        let output_values = self.tensor_values(output)?;
-        let output_shape = self.tensor_shape(output)?;
-
-        // Use tensor_apply_function to register a node on the autograd tape
-        // that will re-execute the function during backward
-        let function_arc = std::sync::Arc::new(function);
-
-        self.tensor_apply_function(
-            inputs,
-            // Forward function: just return the already-computed output
-            move |ctx, input_refs| {
-                // Save all input values for backward recomputation
-                for (vals, shape) in input_refs {
-                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
-                }
-                Ok((output_values, output_shape))
-            },
-            // Backward function: re-run the forward with grad enabled, then backward
-            move |ctx, grad_outputs| {
-                let upstream_grad = grad_outputs[0];
-
-                // Reconstruct inputs from saved tensors
-                let mut recomp_session = FrankenTorchSession::new(ft_core::ExecutionMode::Strict);
-
-                let mut recomp_inputs = Vec::with_capacity(n_inputs);
-                for i in 0..n_inputs {
-                    let saved_vals = &ctx.saved_tensors()[i];
-                    let saved_shape = &ctx.saved_shapes()[i];
-                    let inp = recomp_session
-                        .tensor_variable(saved_vals.to_vec(), saved_shape.to_vec(), true)
-                        .map_err(|_| {
-                            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                    reason: "checkpoint: failed to reconstruct input",
-                                },
-                            ))
-                        })?;
-                    recomp_inputs.push(inp);
+        // The typed bridge accepts the exact forward tensor, including casts,
+        // half precision, complex values, and device metadata. Generic
+        // apply_function would instead choose the last input's dtype.
+        self.tensor_tape
+            .apply_complex_bridge(inputs, output_tensor, move |ctx, grad_outputs| {
+                let mut recomp_session = FrankenTorchSession::new(saved_mode);
+                recomp_session.rng = saved_rng.clone();
+                recomp_session.autocast_stack = saved_autocast.clone();
+                recomp_session.set_detect_anomaly(saved_detect_anomaly);
+                let recomp_inputs: Vec<_> = input_snapshots
+                    .iter()
+                    .zip(ctx.needs_input_grad())
+                    .map(|(tensor, &requires_grad)| {
+                        recomp_session.tensor_variable_from_storage(tensor.clone(), requires_grad)
+                    })
+                    .collect();
+                let recomp_output = recomp_session
+                    .with_device_guard(saved_device, |s, _| function(s, &recomp_inputs))?;
+                let recomputed_meta = recomp_session.tensor_tape.tensor(recomp_output)?.meta();
+                if recomputed_meta.shape() != output_meta.shape()
+                    || recomputed_meta.dtype() != output_meta.dtype()
+                    || recomputed_meta.device() != output_meta.device()
+                {
+                    return Err(Self::incompatible_tensor_args(
+                        "checkpoint: recomputation changed output shape, dtype, or device",
+                    ));
                 }
 
-                // Re-run the function with grad enabled
-                let recomp_output =
-                    function_arc(&mut recomp_session, &recomp_inputs).map_err(|_| {
-                        AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "checkpoint: recomputation failed during backward",
-                            },
-                        ))
-                    })?;
-
-                // Apply upstream gradient and run backward
-                let recomp_report =
-                    recomp_session.tensor_backward(recomp_output).map_err(|_| {
-                        AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "checkpoint: backward during recomputation failed",
-                            },
-                        ))
-                    })?;
-
-                // Extract gradients for each input, scaled by upstream gradient
-                let mut input_grads = Vec::with_capacity(n_inputs);
-                for inp_id in &recomp_inputs {
-                    if let Some(grad) = recomp_report.gradient(*inp_id) {
-                        // Scale by upstream gradient (chain rule)
-                        let scaled: Vec<f64> = grad
-                            .iter()
-                            .enumerate()
-                            .map(|(j, &g)| {
-                                g * if j < upstream_grad.len() {
-                                    upstream_grad[j]
-                                } else {
-                                    1.0
-                                }
-                            })
-                            .collect();
-                        input_grads.push(Some(scaled));
-                    } else {
-                        input_grads.push(None);
-                    }
+                // Seed the OUTPUT gradient, before the Jacobian is applied.
+                // Scaling input gradients afterwards is wrong for reductions,
+                // broadcasting, and any non-diagonal Jacobian (e.g. matmul).
+                // A typed scalar bridge avoids rounding the f64 gradient seed
+                // to the activation dtype or manufacturing a CPU-only tensor.
+                let vjp_output = if output_meta.dtype().is_complex() {
+                    recomp_session.tensor_view_as_real(recomp_output)?
+                } else {
+                    recomp_output
+                };
+                let values = recomp_session.tensor_values_lossy_f64(vjp_output)?;
+                let upstream = grad_outputs[0].to_vec();
+                if upstream.len() != values.len() {
+                    return Err(Self::incompatible_tensor_args(
+                        "checkpoint: upstream gradient must match the output element count",
+                    ));
                 }
-
-                Ok(input_grads)
-            },
-        )
+                let dot = values.iter().zip(&upstream).map(|(x, g)| x * g).sum();
+                let scalar = DenseTensor::from_storage(
+                    TensorMeta::scalar(DType::F64, output_meta.device()),
+                    vec![dot],
+                )?;
+                let seeded = recomp_session.tensor_tape.apply_complex_bridge(
+                    &[vjp_output],
+                    scalar,
+                    move |_ctx, scalar_grad| {
+                        Ok(vec![Some(
+                            upstream.iter().map(|g| g * scalar_grad[0][0]).collect(),
+                        )])
+                    },
+                )?;
+                let report = recomp_session.tensor_backward(seeded)?;
+                Ok(recomp_inputs
+                    .iter()
+                    .zip(ctx.needs_input_grad())
+                    .map(|(&input, &needs_grad)| {
+                        if needs_grad {
+                            report.gradient(input).map(<[f64]>::to_vec)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect())
+            })
     }
 
     fn sync_grad_enabled(&mut self) {
@@ -7368,18 +7390,22 @@ impl FrankenTorchSession {
             // torch shape-polymorphism) + real/imag/complex bridge, so the gradient
             // flows correctly (the real-elementwise tape matmul backward reads only
             // the real part and is silently wrong for complex). frankentorch-0pbll.
-            let ar = self.tensor_real(lhs)?;
-            let ai = self.tensor_imag(lhs)?;
-            let br = self.tensor_real(rhs)?;
-            let bi = self.tensor_imag(rhs)?;
-            let arbr = self.tensor_matmul(ar, br)?;
-            let aibi = self.tensor_matmul(ai, bi)?;
-            let cr = self.tensor_sub(arbr, aibi)?;
-            let arbi = self.tensor_matmul(ar, bi)?;
-            let aibr = self.tensor_matmul(ai, br)?;
-            let ci = self.tensor_add(arbi, aibr)?;
-            return self.tensor_complex(cr, ci);
+            return self.with_autocast_disabled(|session| {
+                let ar = session.tensor_real(lhs)?;
+                let ai = session.tensor_imag(lhs)?;
+                let br = session.tensor_real(rhs)?;
+                let bi = session.tensor_imag(rhs)?;
+                let arbr = session.tensor_matmul(ar, br)?;
+                let aibi = session.tensor_matmul(ai, bi)?;
+                let cr = session.tensor_sub(arbr, aibi)?;
+                let arbi = session.tensor_matmul(ar, bi)?;
+                let aibr = session.tensor_matmul(ai, br)?;
+                let ci = session.tensor_add(arbi, aibr)?;
+                session.tensor_complex(cr, ci)
+            });
         }
+        let lhs = self.maybe_autocast(lhs)?;
+        let rhs = self.maybe_autocast(rhs)?;
         let sa = self.tensor_shape(lhs)?;
         let sb = self.tensor_shape(rhs)?;
         let (na, nb) = (sa.len(), sb.len());
@@ -7615,6 +7641,8 @@ impl FrankenTorchSession {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        let lhs = self.maybe_autocast(lhs)?;
+        let rhs = self.maybe_autocast(rhs)?;
         let (out, event) = self.tensor_tape.bmm(lhs, rhs, self.mode())?;
         self.record_tensor_operation(&event);
         Ok(out)
@@ -7632,17 +7660,15 @@ impl FrankenTorchSession {
         beta: f64,
         alpha: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
         let bmm_result = self.tensor_bmm(batch1, batch2)?;
         let out_shape = self.tensor_shape(bmm_result)?;
 
-        // Scale bmm result by alpha
-        let alpha_tensor = self.full(out_shape.clone(), alpha, false)?;
-        let scaled_bmm = self.tensor_mul(bmm_result, alpha_tensor)?;
+        let scaled_bmm = self.scale_by_constant(bmm_result, alpha)?;
 
         // Scale input by beta and add
-        let input_expanded = self.tensor_expand(input, out_shape.clone())?;
-        let beta_tensor = self.full(out_shape, beta, false)?;
-        let scaled_input = self.tensor_mul(input_expanded, beta_tensor)?;
+        let input_expanded = self.tensor_expand(input, out_shape)?;
+        let scaled_input = self.scale_by_constant(input_expanded, beta)?;
 
         self.tensor_add(scaled_input, scaled_bmm)
     }
@@ -7659,17 +7685,16 @@ impl FrankenTorchSession {
         beta: f64,
         alpha: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
         let bmm_result = self.tensor_bmm(batch1, batch2)?;
         // Sum over batch dimension (dim 0)
         let summed = self.tensor_sum_dim(bmm_result, 0)?;
         let out_shape = self.tensor_shape(summed)?;
 
-        let alpha_tensor = self.full(out_shape.clone(), alpha, false)?;
-        let scaled = self.tensor_mul(summed, alpha_tensor)?;
+        let scaled = self.scale_by_constant(summed, alpha)?;
 
-        let input_expanded = self.tensor_expand(input, out_shape.clone())?;
-        let beta_tensor = self.full(out_shape, beta, false)?;
-        let scaled_input = self.tensor_mul(input_expanded, beta_tensor)?;
+        let input_expanded = self.tensor_expand(input, out_shape)?;
+        let scaled_input = self.scale_by_constant(input_expanded, beta)?;
 
         self.tensor_add(scaled_input, scaled)
     }
@@ -7691,6 +7716,33 @@ impl FrankenTorchSession {
         dropout_p: f64,
         is_causal: bool,
     ) -> Result<TensorNodeId, AutogradError> {
+        let query = self.maybe_autocast(query)?;
+        let key = self.maybe_autocast(key)?;
+        let value = self.maybe_autocast(value)?;
+        let dtype = self.tensor_dtype(query)?;
+        if matches!(dtype, DType::F16 | DType::BF16)
+            && self.tensor_dtype(key)? == dtype
+            && self.tensor_dtype(value)? == dtype
+        {
+            // Accumulate attention scores and softmax in F32, then round once
+            // to the activation dtype. Use the same route in inference and
+            // training so checkpoint recomputation has an identical contract.
+            return self.with_autocast_disabled(|s| {
+                let query = s.tensor_to_f32(query)?;
+                let key = s.tensor_to_f32(key)?;
+                let value = s.tensor_to_f32(value)?;
+                let attn_mask = attn_mask
+                    .map(|mask| match s.tensor_dtype(mask)? {
+                        DType::F16 | DType::BF16 => s.tensor_to_f32(mask),
+                        _ => Ok(mask),
+                    })
+                    .transpose()?;
+                let output = s.scaled_dot_product_attention(
+                    query, key, value, attn_mask, dropout_p, is_causal,
+                )?;
+                s.tensor_to_dtype(output, dtype)
+            });
+        }
         if is_causal && attn_mask.is_some() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -8163,7 +8215,7 @@ impl FrankenTorchSession {
         // Scale
         let aw_shape = self.tensor_shape(attn_weights)?;
         let softmax_dim = aw_shape.len() - 1;
-        let scale_tensor = self.full(aw_shape.clone(), scale, false)?;
+        let scale_tensor = self.const_tensor_like(attn_weights, aw_shape.clone(), scale)?;
         let scaled = self.tensor_mul(attn_weights, scale_tensor)?;
 
         // Apply causal mask if requested
@@ -8202,6 +8254,7 @@ impl FrankenTorchSession {
                 }
             }
             let causal_mask = self.tensor_variable(mask_data, aw_shape, false)?;
+            let causal_mask = self.tensor_to_dtype(causal_mask, self.tensor_dtype(scaled)?)?;
             self.tensor_add(scaled, causal_mask)?
         } else if let Some(mask) = attn_mask {
             self.tensor_add(scaled, mask)?
@@ -15610,6 +15663,8 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         // Fused no-grad mean/sum fast path (f64, same-shape): compute the
         // per-element (input-target)^2 once into a borrowed-input buffer and
         // reduce with the SAME reduction kernel as the composed path, so the
@@ -15737,6 +15792,8 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         // Fused no-grad mean/sum fast path (f64, same-shape): compute the
         // per-element |input-target| once into a borrowed-input buffer and reduce
         // with the SAME reduction kernel as the composed path, so the scalar is
@@ -15857,6 +15914,8 @@ impl FrankenTorchSession {
         reduction: &str,
         beta: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         if beta <= 0.0 || !beta.is_finite() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -16135,6 +16194,8 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         // BCE = -[target * log(input) + (1-target) * log(1-input)]
         // Fused no-grad mean/sum fast path (f64, same-shape): compute the
         // per-element term once into a borrowed-input buffer (all std-f64 ops in
@@ -16218,7 +16279,7 @@ impl FrankenTorchSession {
         let log_input = self.tensor_log(input)?;
         let term1 = self.tensor_mul(target, log_input)?;
         let shape = self.tensor_shape(input)?;
-        let ones = self.full(shape, 1.0, false)?;
+        let ones = self.const_tensor_like(input, shape, 1.0)?;
         let one_minus_target = self.tensor_sub(ones, target)?;
         let one_minus_input = self.tensor_sub(ones, input)?;
         let log_one_minus_input = self.tensor_log(one_minus_input)?;
@@ -16259,6 +16320,8 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         // BCE_logits = max(input, 0) - input * target + log(1 + exp(-|input|))
         let shape = self.tensor_shape(input)?;
         // No-grad fused fast path: the compose below is 11 elementwise tape ops + 2 full() allocs
@@ -16338,14 +16401,14 @@ impl FrankenTorchSession {
                 };
             }
         }
-        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let zeros = self.const_tensor_like(input, shape.clone(), 0.0)?;
         let relu_input = self.tensor_maximum(input, zeros)?;
         let input_target = self.tensor_mul(input, target)?;
         let term1 = self.tensor_sub(relu_input, input_target)?;
         let abs_input = self.tensor_abs(input)?;
         let neg_abs_input = self.tensor_neg(abs_input)?;
         let exp_term = self.tensor_exp(neg_abs_input)?;
-        let ones = self.full(shape, 1.0, false)?;
+        let ones = self.const_tensor_like(input, shape, 1.0)?;
         let one_plus_exp = self.tensor_add(ones, exp_term)?;
         let log_term = self.tensor_log(one_plus_exp)?;
         let loss = self.tensor_add(term1, log_term)?;
@@ -16390,6 +16453,8 @@ impl FrankenTorchSession {
         pos_weight: f64,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         if (pos_weight - 1.0).abs() < f64::EPSILON {
             return self.tensor_bce_with_logits_loss(input, target, reduction);
         }
@@ -16475,8 +16540,8 @@ impl FrankenTorchSession {
                 };
             }
         }
-        let ones = self.full(shape.clone(), 1.0, false)?;
-        let zeros = self.full(shape, 0.0, false)?;
+        let ones = self.const_tensor_like(input, shape.clone(), 1.0)?;
+        let zeros = self.const_tensor_like(input, shape, 0.0)?;
 
         // log_weight = 1 + (pos_weight - 1) * target
         let lw_scaled = self.tensor_mul_scalar(target, pos_weight - 1.0)?;
@@ -16521,6 +16586,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
         let input_shape = self.tensor_shape(input)?;
         let target_shape = self.tensor_shape(target)?;
         if input_shape.len() != 2 || target_shape.len() != 1 {
@@ -16588,6 +16654,8 @@ impl FrankenTorchSession {
         ignore_index: Option<i64>,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let weight = weight.map(|w| self.maybe_autocast_fp32(w)).transpose()?;
         if !matches!(reduction, "none" | "mean" | "sum") {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -16655,13 +16723,15 @@ impl FrankenTorchSession {
             let w_idx = self.tensor_variable(safe_idx.clone(), vec![n], false)?;
             let w_gathered = self.tensor_index_select(w, 0, w_idx)?;
             let mask_t = self.tensor_variable(mask.clone(), vec![n], false)?;
+            let mask_t = self.tensor_to_dtype(mask_t, self.tensor_dtype(w)?)?;
             let scale = self.tensor_mul(w_gathered, mask_t)?;
-            let w_vals = self.tensor_values(w)?;
+            let w_vals = self.tensor_values_lossy_f64(w)?;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let denom: f64 = (0..n).map(|i| mask[i] * w_vals[safe_idx[i] as usize]).sum();
             (scale, denom)
         } else {
             let mask_t = self.tensor_variable(mask.clone(), vec![n], false)?;
+            let mask_t = self.tensor_to_dtype(mask_t, self.tensor_dtype(input)?)?;
             let denom: f64 = mask.iter().sum();
             (mask_t, denom)
         };
@@ -16672,7 +16742,7 @@ impl FrankenTorchSession {
             _ => {
                 // "mean": sum / denom (0/0 -> NaN for an all-ignored batch).
                 let sum = self.tensor_sum(weighted)?;
-                let denom_t = self.full(vec![], denom, false)?;
+                let denom_t = self.const_tensor_like(sum, vec![], denom)?;
                 self.tensor_div(sum, denom_t)
             }
         }
@@ -16688,6 +16758,7 @@ impl FrankenTorchSession {
         ignore_index: Option<i64>,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
         let log_probs = self.tensor_log_softmax(input, 1)?;
         self.tensor_nll_loss_full(log_probs, target, weight, ignore_index, reduction)
     }
@@ -16708,6 +16779,8 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         if !matches!(reduction, "none" | "mean" | "sum") {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -16742,6 +16815,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
         // Soft-label form: a probability target matching the input's [N, C] shape
         // (torch auto-detects this vs a [N] class-index target). Distillation /
         // mixup / label-smoothing all pass soft labels here.
@@ -16905,6 +16979,7 @@ impl FrankenTorchSession {
         label_smoothing: f64,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
         if !(0.0..=1.0).contains(&label_smoothing) {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -17074,6 +17149,8 @@ impl FrankenTorchSession {
         reduction: &str,
         delta: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast_fp32(input)?;
+        let target = self.maybe_autocast_fp32(target)?;
         if delta <= 0.0 || !delta.is_finite() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -19773,6 +19850,9 @@ impl FrankenTorchSession {
         beta: f64,
         alpha: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
+        let mat1 = self.maybe_autocast(mat1)?;
+        let mat2 = self.maybe_autocast(mat2)?;
         let (out, event) = self
             .tensor_tape
             .addmm(input, mat1, mat2, beta, alpha, self.mode())?;
@@ -29143,6 +29223,10 @@ impl FrankenTorchSession {
             .map(|_| if self.rng.next_f64() < p { 0.0 } else { scale })
             .collect();
         let mask = self.tensor_variable(mask_vals, shape, false)?;
+        let mask = match self.tensor_dtype(input)? {
+            dtype @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_to_dtype(mask, dtype)?,
+            _ => mask,
+        };
         self.tensor_mul(input, mask)
     }
 
@@ -29724,6 +29808,22 @@ impl FrankenTorchSession {
         weight: TensorNodeId,
         bias: Option<TensorNodeId>,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
+        let weight = self.maybe_autocast(weight)?;
+        let bias = bias.map(|b| self.maybe_autocast(b)).transpose()?;
+        let dtype = self.tensor_dtype(input)?;
+        if matches!(dtype, DType::F16 | DType::BF16)
+            && self.tensor_dtype(weight)? == dtype
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == dtype))?
+        {
+            return self.with_autocast_disabled(|s| {
+                let input = s.tensor_to_f32(input)?;
+                let weight = s.tensor_to_f32(weight)?;
+                let bias = bias.map(|b| s.tensor_to_f32(b)).transpose()?;
+                let output = s.functional_linear(input, weight, bias)?;
+                s.tensor_to_dtype(output, dtype)
+            });
+        }
         // Fused no-grad fast path: y = x @ weight^T (+ bias) via dgemm_bt/sgemm_bt,
         // which read `weight` [out, in] directly and NEVER materialise its (cache-
         // unfriendly) transpose — the dominant cost of the addmm/matmul path. f64
@@ -29923,11 +30023,58 @@ impl FrankenTorchSession {
             }
         }
 
-        let weight_t = self.tensor_transpose(weight, 0, 1)?;
-        match bias {
-            Some(b) => self.tensor_addmm(b, input, weight_t, 1.0, 1.0),
-            None => self.tensor_matmul(input, weight_t),
+        let input_shape = self.tensor_shape(input)?;
+        let weight_shape = self.tensor_shape(weight)?;
+        if input_shape.is_empty() || weight_shape.len() != 2 {
+            return Err(Self::incompatible_tensor_args(
+                "linear: input must have at least one dimension and weight must be 2D",
+            ));
         }
+        let in_features = input_shape[input_shape.len() - 1];
+        let out_features = weight_shape[0];
+        if in_features != weight_shape[1] {
+            return Err(Self::incompatible_tensor_args(
+                "linear: input's last dimension must match weight's input features",
+            ));
+        }
+        if let Some(b) = bias
+            && self.tensor_shape(b)? != vec![out_features]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "linear: bias must have shape [out_features]",
+            ));
+        }
+        // Flatten all batch axes, including the implicit batch of a 1D input.
+        // Compute the product directly rather than numel / in_features so
+        // zero input features and empty batches retain their defined shapes.
+        let leading = &input_shape[..input_shape.len() - 1];
+        let batch = if leading.contains(&0) {
+            0
+        } else {
+            leading
+                .iter()
+                .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+                .ok_or_else(|| {
+                    Self::incompatible_tensor_args("linear: batch shape volume overflow")
+                })?
+        };
+        let input_2d = if input_shape.len() == 2 {
+            input
+        } else {
+            self.tensor_reshape(input, vec![batch, in_features])?
+        };
+        let weight_t = self.tensor_transpose(weight, 0, 1)?;
+        let product = self.tensor_matmul(input_2d, weight_t)?;
+        let output = match bias {
+            Some(b) => self.tensor_add(product, b)?,
+            None => product,
+        };
+        if input_shape.len() == 2 {
+            return Ok(output);
+        }
+        let mut output_shape = input_shape;
+        *output_shape.last_mut().unwrap() = out_features;
+        self.tensor_reshape(output, output_shape)
     }
 
     /// Scaled dot-product attention mechanism.
@@ -29951,6 +30098,30 @@ impl FrankenTorchSession {
         is_causal: bool,
         scale: Option<f64>,
     ) -> Result<TensorNodeId, AutogradError> {
+        let query = self.maybe_autocast(query)?;
+        let key = self.maybe_autocast(key)?;
+        let value = self.maybe_autocast(value)?;
+        let dtype = self.tensor_dtype(query)?;
+        if matches!(dtype, DType::F16 | DType::BF16)
+            && self.tensor_dtype(key)? == dtype
+            && self.tensor_dtype(value)? == dtype
+        {
+            return self.with_autocast_disabled(|s| {
+                let query = s.tensor_to_f32(query)?;
+                let key = s.tensor_to_f32(key)?;
+                let value = s.tensor_to_f32(value)?;
+                let attn_mask = attn_mask
+                    .map(|mask| match s.tensor_dtype(mask)? {
+                        DType::F16 | DType::BF16 => s.tensor_to_f32(mask),
+                        _ => Ok(mask),
+                    })
+                    .transpose()?;
+                let output = s.tensor_scaled_dot_product_attention(
+                    query, key, value, attn_mask, is_causal, scale,
+                )?;
+                s.tensor_to_dtype(output, dtype)
+            });
+        }
         let query_shape = self.tensor_shape(query)?;
         let key_shape = self.tensor_shape(key)?;
         if query_shape.len() < 2 || key_shape.len() < 2 {
@@ -30389,7 +30560,7 @@ impl FrankenTorchSession {
             self.tensor_matmul(query, key_t)?
         };
         let scores_shape = self.tensor_shape(scores)?;
-        let scale_t = self.full(scores_shape.clone(), scale_factor, false)?;
+        let scale_t = self.const_tensor_like(scores, scores_shape.clone(), scale_factor)?;
         let scaled_scores = self.tensor_mul(scores, scale_t)?;
         let masked_scores = if is_causal {
             let seq_len = scores_shape[scores_shape.len() - 2];
@@ -30403,6 +30574,7 @@ impl FrankenTorchSession {
                 }
             }
             let mask_node = self.tensor_variable(mask_vals, vec![seq_len, seq_len_kv], false)?;
+            let mask_node = self.tensor_to_dtype(mask_node, self.tensor_dtype(scaled_scores)?)?;
             let expanded_mask = self.tensor_expand(mask_node, scores_shape.clone())?;
             self.tensor_add(scaled_scores, expanded_mask)?
         } else if let Some(mask) = attn_mask {
@@ -30697,6 +30869,9 @@ impl FrankenTorchSession {
         padding: (usize, usize),
         groups: usize,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
+        let weight = self.maybe_autocast(weight)?;
+        let bias = bias.map(|b| self.maybe_autocast(b)).transpose()?;
         if groups == 0 {
             return Err(Self::incompatible_tensor_args(
                 "conv2d: groups must be greater than zero",
@@ -31661,6 +31836,25 @@ impl FrankenTorchSession {
         stride: (usize, usize),
         padding: (usize, usize),
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
+        let weight = self.maybe_autocast(weight)?;
+        let bias = bias.map(|b| self.maybe_autocast(b)).transpose()?;
+        let dtype = self.tensor_dtype(input)?;
+        if matches!(dtype, DType::F16 | DType::BF16)
+            && self.tensor_dtype(weight)? == dtype
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == dtype))?
+        {
+            // CPU half convolution accumulates in F32. These differentiable
+            // casts share the fused kernels across grad/no-grad paths and keep
+            // the bias addition inside the accumulation before final rounding.
+            return self.with_autocast_disabled(|s| {
+                let input = s.tensor_to_f32(input)?;
+                let weight = s.tensor_to_f32(weight)?;
+                let bias = bias.map(|b| s.tensor_to_f32(b)).transpose()?;
+                let output = s.functional_conv2d(input, weight, bias, stride, padding)?;
+                s.tensor_to_dtype(output, dtype)
+            });
+        }
         let (stride_h, stride_w) = stride;
         let (padding_h, padding_w) = padding;
         if stride_h == 0 || stride_w == 0 {
@@ -32637,6 +32831,9 @@ impl FrankenTorchSession {
         dilation: (usize, usize, usize),
         groups: usize,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
+        let weight = self.maybe_autocast(weight)?;
+        let bias = bias.map(|b| self.maybe_autocast(b)).transpose()?;
         let (dilation_d, dilation_h, dilation_w) = dilation;
         if dilation_d == 0 || dilation_h == 0 || dilation_w == 0 {
             return Err(Self::incompatible_tensor_args(
@@ -32896,6 +33093,22 @@ impl FrankenTorchSession {
         stride: (usize, usize, usize),
         padding: (usize, usize, usize),
     ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.maybe_autocast(input)?;
+        let weight = self.maybe_autocast(weight)?;
+        let bias = bias.map(|b| self.maybe_autocast(b)).transpose()?;
+        let dtype = self.tensor_dtype(input)?;
+        if matches!(dtype, DType::F16 | DType::BF16)
+            && self.tensor_dtype(weight)? == dtype
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == dtype))?
+        {
+            return self.with_autocast_disabled(|s| {
+                let input = s.tensor_to_f32(input)?;
+                let weight = s.tensor_to_f32(weight)?;
+                let bias = bias.map(|b| s.tensor_to_f32(b)).transpose()?;
+                let output = s.functional_conv3d(input, weight, bias, stride, padding)?;
+                s.tensor_to_dtype(output, dtype)
+            });
+        }
         let (stride_d, stride_h, stride_w) = stride;
         let (padding_d, padding_h, padding_w) = padding;
         if stride_d == 0 || stride_h == 0 || stride_w == 0 {
@@ -52953,6 +53166,30 @@ impl FrankenTorchSession {
         )
     }
 
+    /// Snapshot a tensor's typed storage and complete metadata without adding a
+    /// graph node. Copy-on-write storage keeps the snapshot independent of later
+    /// writes to the live tensor, including writes performed by checkpoint load.
+    pub fn tensor_snapshot(&self, node: TensorNodeId) -> Result<DenseTensor, AutogradError> {
+        Ok(self.tensor_tape.tensor(node)?.clone())
+    }
+
+    /// Atomically restore typed parameter or buffer values at a checkpoint
+    /// boundary. The operation preserves IDs, destination metadata and gradient
+    /// mode, adds no graph nodes, and increments the affected tensor versions.
+    /// Like loading a model state dict under `no_grad`, it does not create a
+    /// differentiable copy operation; saved forward graphs still detect the
+    /// in-place change through their version guards.
+    pub fn tensor_load_state(
+        &mut self,
+        updates: &[(TensorNodeId, DenseTensor)],
+    ) -> Result<(), AutogradError> {
+        self.tensor_tape.copy_tensors_from_storage(updates)?;
+        for (target, _) in updates {
+            self.record_tensor_in_place_operation("load_state_dict", *target, None);
+        }
+        Ok(())
+    }
+
     pub fn tensor_copy_(
         &mut self,
         target: TensorNodeId,
@@ -52969,8 +53206,14 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let source_vals = self.tensor_values(source)?;
-        self.update_tensor_values_for_float(target, source_vals, INPLACE_FLOAT_REASON)?;
+        if self.tensor_dtype(target)? == self.tensor_dtype(source)? {
+            let snapshot = self.tensor_snapshot(source)?;
+            self.tensor_tape
+                .copy_tensors_from_storage(&[(target, snapshot)])?;
+        } else {
+            let source_vals = self.tensor_values(source)?;
+            self.update_tensor_values_for_float(target, source_vals, INPLACE_FLOAT_REASON)?;
+        }
         self.record_tensor_in_place_operation("copy_", target, None);
         Ok(())
     }
@@ -54282,8 +54525,9 @@ impl FrankenTorchSession {
         alpha: f64,
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
-        let result = self.tensor_addmm(target, mat1, mat2, beta, alpha)?;
-        let result_vals = self.tensor_values(result)?;
+        let result =
+            self.with_autocast_disabled(|s| s.tensor_addmm(target, mat1, mat2, beta, alpha))?;
+        let result_vals = self.tensor_values_lossy_f64(result)?;
         self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
         self.record_tensor_in_place_operation(
             "addmm_",
@@ -54324,8 +54568,9 @@ impl FrankenTorchSession {
         alpha: f64,
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
-        let result = self.tensor_baddbmm(target, batch1, batch2, beta, alpha)?;
-        let result_vals = self.tensor_values(result)?;
+        let result =
+            self.with_autocast_disabled(|s| s.tensor_baddbmm(target, batch1, batch2, beta, alpha))?;
+        let result_vals = self.tensor_values_lossy_f64(result)?;
         self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
         self.record_tensor_in_place_operation(
             "baddbmm_",
@@ -54345,8 +54590,9 @@ impl FrankenTorchSession {
         alpha: f64,
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
-        let result = self.tensor_addbmm(target, batch1, batch2, beta, alpha)?;
-        let result_vals = self.tensor_values(result)?;
+        let result =
+            self.with_autocast_disabled(|s| s.tensor_addbmm(target, batch1, batch2, beta, alpha))?;
+        let result_vals = self.tensor_values_lossy_f64(result)?;
         self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
         self.record_tensor_in_place_operation(
             "addbmm_",
@@ -55132,7 +55378,9 @@ impl FrankenTorchSession {
         self.update_tensor_values_for_float(param, new_values, PARAM_UPDATE_FLOAT_REASON)
     }
 
-    /// Mutate a parameter's f64 values directly, bypassing the leaf-grad in-place guard.
+    /// Mutate a parameter's values in f64 arithmetic, bypassing the leaf-grad
+    /// in-place guard. F64 storage is updated directly; F32 master parameters
+    /// use a temporary f64 buffer and round once when written back to F32.
     ///
     /// The closure cannot fail, so callers must perform all validation before
     /// mutating the parameter slice.
@@ -55144,12 +55392,32 @@ impl FrankenTorchSession {
     where
         F: FnOnce(&mut [f64]),
     {
-        self.tensor_tape.update_tensor_values_with(param, update)
+        match self.tensor_tape.dtype(param)? {
+            DType::F64 => self.tensor_tape.update_tensor_values_with(param, update),
+            DType::F32 => {
+                let mut values: Vec<f64> = self
+                    .tensor_tape
+                    .values_f32_borrowed(param)?
+                    .iter()
+                    .map(|&value| f64::from(value))
+                    .collect();
+                update(&mut values);
+                self.tensor_tape
+                    .update_tensor_values_f32_with(param, |target| {
+                        for (target, value) in target.iter_mut().zip(values) {
+                            *target = value as f32;
+                        }
+                    })
+            }
+            _ => Err(Self::incompatible_tensor_args(PARAM_UPDATE_FLOAT_REASON)),
+        }
     }
 
     /// Mutate a parameter while borrowing its persistent gradient from the tape.
     ///
-    /// Returns `Ok(false)` when the parameter has no accumulated gradient.
+    /// Returns `Ok(false)` when the parameter has no accumulated gradient. F32
+    /// master storage is widened for the update and rounded back once; optimizer
+    /// moments and the persistent gradient retain their f64 representation.
     pub fn tensor_update_param_values_f64_with_accumulated_gradient<F>(
         &mut self,
         param: TensorNodeId,
@@ -55158,8 +55426,38 @@ impl FrankenTorchSession {
     where
         F: FnOnce(&[f64], &mut [f64]),
     {
-        self.tensor_tape
-            .update_tensor_values_with_accumulated_gradient(param, update)
+        match self.tensor_tape.dtype(param)? {
+            DType::F64 => self
+                .tensor_tape
+                .update_tensor_values_with_accumulated_gradient(param, update),
+            DType::F32 => {
+                let Some(gradient) = self.tensor_tape.tensor_accumulated_gradient(param)? else {
+                    return Ok(false);
+                };
+                let mut values: Vec<f64> = self
+                    .tensor_tape
+                    .values_f32_borrowed(param)?
+                    .iter()
+                    .map(|&value| f64::from(value))
+                    .collect();
+                if gradient.len() != values.len() {
+                    return Err(AutogradError::TensorGradientShapeMismatch {
+                        node: param,
+                        expected: values.len(),
+                        actual: gradient.len(),
+                    });
+                }
+                update(gradient, &mut values);
+                self.tensor_tape
+                    .update_tensor_values_f32_with(param, |target| {
+                        for (target, value) in target.iter_mut().zip(values) {
+                            *target = value as f32;
+                        }
+                    })?;
+                Ok(true)
+            }
+            _ => Err(Self::incompatible_tensor_args(PARAM_UPDATE_FLOAT_REASON)),
+        }
     }
 
     // ── Gradient Clipping Utilities ────────────────────────────────────
@@ -167252,46 +167550,6 @@ mod tests {
     // ── frankentorch-plj: Gradient checkpointing tests ────────────────
 
     #[test]
-    fn graph_truncation_discards_conv_mask_plans_before_node_reuse() {
-        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let input = s
-            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
-            .expect("input");
-        let weight = s
-            .tensor_variable(vec![2.0], vec![1, 1, 1, 1], true)
-            .expect("weight");
-        let conv = s
-            .functional_conv2d(input, weight, None, (1, 1), (0, 0))
-            .expect("convolution");
-        assert!(s.conv2d_mask_plans.contains_key(&conv.0));
-        s.truncate_autograd_graph(conv.0);
-        assert!(s.conv2d_mask_plans.is_empty());
-        let replacement = s
-            .tensor_variable(vec![10.0, 20.0, 30.0, 40.0], vec![1, 1, 2, 2], true)
-            .expect("replacement");
-        assert_eq!(replacement, conv);
-        let mask = s
-            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
-            .expect("mask");
-        let scored = s.tensor_mul(replacement, mask).expect("masked loss");
-        assert_eq!(
-            s.tensor_values(scored).expect("values"),
-            [10.0, 40.0, 90.0, 160.0]
-        );
-        let loss = s.tensor_sum(scored).expect("sum");
-        let report = s.tensor_backward(loss).expect("backward");
-        assert_eq!(
-            s.tensor_gradient(&report, replacement).expect("gradient"),
-            [1.0, 2.0, 3.0, 4.0]
-        );
-        assert!(s.tensor_gradient(&report, input).is_none());
-        assert!(s.tensor_gradient(&report, weight).is_none());
-        s.clear_autograd_graph();
-        assert_eq!(s.autograd_graph_node_count(), 0);
-        assert!(s.conv2d_mask_plans.is_empty());
-    }
-
-    #[test]
     fn checkpoint_produces_correct_forward_output() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s
@@ -167383,6 +167641,302 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_matmul_uses_output_vector_jacobian_product() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true)
+            .unwrap();
+        let w = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2], true)
+            .unwrap();
+        let out = s
+            .checkpoint(&[x, w], |s, inputs| s.tensor_matmul(inputs[0], inputs[1]))
+            .unwrap();
+        let gradients = s
+            .tensor_autograd_grad(
+                &[out],
+                &[x, w],
+                Some(&[vec![1.0, -2.0, 3.0, 4.0]]),
+                false,
+                false,
+            )
+            .unwrap();
+        // dX = V W^T and dW = X^T V, with a nonuniform V and different
+        // input/output shapes. Post-hoc scaling of input gradients fails both.
+        assert_eq!(
+            gradients[0].as_deref(),
+            Some(&[-3.0, -5.0, -7.0, 11.0, 25.0, 39.0][..])
+        );
+        assert_eq!(
+            gradients[1].as_deref(),
+            Some(&[13.0, 14.0, 17.0, 16.0, 21.0, 18.0][..])
+        );
+    }
+
+    #[test]
+    fn checkpoint_scalar_upstream_scales_every_reduced_input() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        let out = s
+            .checkpoint(&[x], |s, inputs| {
+                let squared = s.tensor_mul(inputs[0], inputs[0])?;
+                s.tensor_sum(squared)
+            })
+            .unwrap();
+        let scaled = s.tensor_mul_scalar(out, 3.0).unwrap();
+        let report = s.tensor_backward(scaled).unwrap();
+        assert_eq!(report.gradient(x), Some(&[6.0, 12.0, 18.0][..]));
+    }
+
+    #[test]
+    fn checkpoint_broadcast_preserves_frozen_inputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, 3.0], vec![2, 1], true).unwrap();
+        let w = s
+            .tensor_variable(vec![5.0, 7.0, 11.0], vec![1, 3], true)
+            .unwrap();
+        let bias = s.tensor_variable(vec![1.0; 6], vec![2, 3], false).unwrap();
+        let out = s
+            .checkpoint(&[x, w, bias], |s, inputs| {
+                assert!(!s.tensor_requires_grad(inputs[2])?);
+                let product = s.tensor_mul(inputs[0], inputs[1])?;
+                s.tensor_add(product, inputs[2])
+            })
+            .unwrap();
+        let gradients = s
+            .tensor_autograd_grad(
+                &[out],
+                &[x, w, bias],
+                Some(&[vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(gradients[0].as_deref(), Some(&[52.0, 121.0][..]));
+        assert_eq!(gradients[1].as_deref(), Some(&[14.0, 19.0, 24.0][..]));
+        assert!(gradients[2].is_none());
+    }
+
+    #[test]
+    fn checkpoint_preserves_f32_and_execution_context() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Hardened);
+        s.set_detect_anomaly(true);
+        let x = s
+            .tensor_variable_f32(vec![1.0, 2.0], vec![2], true)
+            .unwrap();
+        let out = s
+            .with_autocast(DType::BF16, |s| {
+                s.checkpoint(&[x], |s, inputs| {
+                    assert_eq!(s.mode(), ExecutionMode::Hardened);
+                    assert_eq!(s.autocast_dtype(), Some(DType::BF16));
+                    assert!(s.is_detect_anomaly());
+                    assert_eq!(s.tensor_dtype(inputs[0])?, DType::F32);
+                    s.tensor_mul_scalar(inputs[0], 2.0)
+                })
+            })
+            .unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F32);
+        assert_eq!(s.tensor_values_f32(out).unwrap(), vec![2.0, 4.0]);
+        assert_eq!(s.autocast_dtype(), None);
+        let report = s.tensor_backward(out).unwrap();
+        assert_eq!(report.gradient(x), Some(&[2.0, 2.0][..]));
+    }
+
+    #[test]
+    fn checkpoint_preserves_output_cast_and_device() {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(vec![1.25, 2.5], vec![2], true).unwrap();
+            let out = s
+                .checkpoint(&[x], move |s, inputs| s.tensor_to_dtype(inputs[0], dtype))
+                .unwrap();
+            assert_eq!(s.tensor_dtype(out).unwrap(), dtype);
+            assert_eq!(s.tensor_values_lossy_f64(out).unwrap(), vec![1.25, 2.5]);
+            let report = s.tensor_backward(out).unwrap();
+            assert_eq!(report.gradient(x), Some(&[1.0, 1.0][..]));
+        }
+
+        // Identity checkpointing needs no device kernel, but must retain both
+        // the tensor's metadata and the thread-local device on recomputation.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = DenseTensor::from_storage_f32(
+            TensorMeta::from_shape(vec![2], DType::F32, Device::Metal),
+            vec![3.0, 4.0],
+        )
+        .unwrap();
+        let x = s.tensor_variable_from_storage(tensor, true);
+        let out = s
+            .with_device_guard(Device::Metal, |s, _| {
+                s.checkpoint(&[x], |s, inputs| {
+                    assert_eq!(s.current_device(), Device::Metal);
+                    Ok(inputs[0])
+                })
+            })
+            .unwrap();
+        assert_eq!(s.tensor_device(out).unwrap(), Device::Metal);
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F32);
+        let report = s.tensor_backward(out).unwrap();
+        assert_eq!(report.gradient(x), Some(&[1.0, 1.0][..]));
+    }
+
+    #[test]
+    fn checkpoint_autocast_matmul_matches_weighted_f32_loss_gradients() {
+        for dtype in [DType::F16, DType::BF16] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+                .unwrap();
+            let w = s
+                .tensor_variable_f32(vec![2.0, -1.0, 1.0, 3.0], vec![2, 2], true)
+                .unwrap();
+            let out = s
+                .with_autocast(dtype, |s| {
+                    s.checkpoint(&[x, w], |s, inputs| s.tensor_matmul(inputs[0], inputs[1]))
+                })
+                .unwrap();
+            assert_eq!(s.tensor_dtype(out).unwrap(), dtype);
+            assert_eq!(
+                s.tensor_values_lossy_f64(out).unwrap(),
+                vec![4.0, 5.0, 10.0, 9.0]
+            );
+            let weights = s
+                .tensor_variable_f32(vec![0.5, -1.0, 2.0, 0.25], vec![2, 2], false)
+                .unwrap();
+            let weighted = s.tensor_mul(out, weights).unwrap();
+            assert_eq!(s.tensor_dtype(weighted).unwrap(), DType::F32);
+            let loss = s.tensor_sum(weighted).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            assert_eq!(report.gradient(x), Some(&[2.0, -2.5, 3.75, 2.75][..]));
+            assert_eq!(report.gradient(w), Some(&[6.5, -0.25, 9.0, -1.0][..]));
+            assert_eq!(s.tensor_dtype(x).unwrap(), DType::F32);
+            assert_eq!(s.tensor_dtype(w).unwrap(), DType::F32);
+        }
+    }
+
+    #[test]
+    fn checkpoint_preserves_complex_input_output_and_vjp() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let real = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let imag = s.tensor_variable(vec![3.0, 4.0], vec![2], true).unwrap();
+        let z = s.tensor_complex(real, imag).unwrap();
+        let out = s
+            .checkpoint(&[z], |s, inputs| s.tensor_conj(inputs[0]))
+            .unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::Complex128);
+        let components = s.tensor_view_as_real(out).unwrap();
+        assert_eq!(
+            s.tensor_values(components).unwrap(),
+            vec![1.0, -3.0, 2.0, -4.0]
+        );
+        let weights = s
+            .tensor_variable(vec![2.0, -3.0, 5.0, 7.0], vec![2, 2], false)
+            .unwrap();
+        let weighted = s.tensor_mul(components, weights).unwrap();
+        let loss = s.tensor_sum(weighted).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert_eq!(report.gradient(real), Some(&[2.0, 5.0][..]));
+        assert_eq!(report.gradient(imag), Some(&[3.0, -7.0][..]));
+    }
+
+    #[test]
+    fn checkpoint_replays_dropout_rng_without_advancing_parent_again() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        s.rng = super::Xoshiro256PlusPlus::new(1729);
+        s.rand(vec![7], false).unwrap();
+        let x = s.tensor_variable(vec![1.0; 16], vec![16], true).unwrap();
+        let mut reference = s.clone();
+        let direct = reference.functional_dropout(x, 0.5, true).unwrap();
+        let checkpointed = s
+            .checkpoint(&[x], |s, inputs| s.functional_dropout(inputs[0], 0.5, true))
+            .unwrap();
+        assert_eq!(
+            s.tensor_values(checkpointed).unwrap(),
+            reference.tensor_values(direct).unwrap()
+        );
+        let weights = vec![(1..=16).map(f64::from).collect()];
+        let expected = reference
+            .tensor_autograd_grad(&[direct], &[x], Some(&weights), false, false)
+            .unwrap();
+        let actual = s
+            .tensor_autograd_grad(&[checkpointed], &[x], Some(&weights), false, false)
+            .unwrap();
+        assert_eq!(actual, expected);
+        let next = s.rand(vec![8], false).unwrap();
+        let reference_next = reference.rand(vec![8], false).unwrap();
+        assert_eq!(
+            s.tensor_values(next).unwrap(),
+            reference.tensor_values(reference_next).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_nested_regions_release_forward_intermediates() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let existing = s.tensor_mul(x, x).unwrap();
+        let boundary = s.autograd_graph_node_count();
+        let out = s
+            .checkpoint(&[x], |s, inputs| {
+                let mut doubled = inputs[0];
+                for _ in 0..8 {
+                    doubled = s.tensor_add(doubled, doubled)?;
+                }
+                s.checkpoint(&[doubled], |s, inputs| {
+                    let squared = s.tensor_mul(inputs[0], inputs[0])?;
+                    s.tensor_sum(squared)
+                })
+            })
+            .unwrap();
+        assert_eq!(s.autograd_graph_node_count(), boundary + 1);
+        assert_eq!(s.tensor_values(existing).unwrap(), vec![1.0, 4.0]);
+        let report = s.tensor_backward(out).unwrap();
+        assert_eq!(report.gradient(x), Some(&[131_072.0, 262_144.0][..]));
+    }
+
+    #[test]
+    fn checkpoint_no_grad_output_is_detached_and_forward_errors_survive() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let out = s
+            .with_no_grad(|s| s.checkpoint(&[x], |_s, inputs| Ok(inputs[0])))
+            .unwrap();
+        assert!(!s.tensor_requires_grad(out).unwrap());
+        assert!(s.tensor_requires_grad(x).unwrap());
+        let boundary = s.autograd_graph_node_count();
+        let error = s
+            .checkpoint(&[x], |s, inputs| {
+                s.tensor_add(inputs[0], inputs[0])?;
+                Err(FrankenTorchSession::incompatible_tensor_args(
+                    "checkpoint regression sentinel",
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("checkpoint regression sentinel"));
+        assert!(s.is_grad_enabled());
+        assert_eq!(s.autograd_graph_node_count(), boundary + 1);
+        assert_eq!(s.tensor_values(x).unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn checkpoint_rejects_changed_recomputation_metadata() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let out = s
+            .checkpoint(&[x], |s, inputs| {
+                if s.is_grad_enabled() {
+                    s.tensor_to_f32(inputs[0])
+                } else {
+                    Ok(inputs[0])
+                }
+            })
+            .unwrap();
+        let error = s.tensor_backward(out).unwrap_err();
+        assert!(error.to_string().contains("recomputation changed output"));
+    }
+
+    #[test]
     fn checkpoint_marker_preserves_values_and_identity_gradient() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s
@@ -167470,15 +168024,14 @@ mod tests {
     }
 
     #[test]
-    fn maybe_autocast_downcasts_f64_to_f32_when_active() {
+    fn maybe_autocast_preserves_f64_when_active() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s
             .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
             .unwrap();
-        let cast = s.with_autocast(DType::F32, |sess| sess.maybe_autocast(x).unwrap());
-        // Should be a different node now (the F32-cast version)
-        assert_ne!(cast, x);
-        assert_eq!(s.tensor_dtype(cast).unwrap(), DType::F32);
+        let cast = s.with_autocast(DType::BF16, |sess| sess.maybe_autocast(x).unwrap());
+        assert_eq!(cast, x);
+        assert_eq!(s.tensor_dtype(cast).unwrap(), DType::F64);
     }
 
     #[test]
@@ -173986,6 +174539,55 @@ mod tests {
     /// f32 conv2d fast path (it was not, before this bead — the fusion bailed at its first
     /// condition, before the dtype gate it appeared to be blocked by), and it must be REMOVED
     /// by the fuse path, which only happens if the fused node was actually built.
+    #[test]
+    fn graph_truncation_discards_conv_mask_plans_before_node_reuse() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable_f32(vec![1.0; 9], vec![1, 1, 3, 3], true)
+            .unwrap();
+        let weight = session
+            .tensor_variable_f32(vec![2.0; 4], vec![1, 1, 2, 2], true)
+            .unwrap();
+        let boundary = session.autograd_graph_node_count();
+        let conv = session
+            .functional_conv2d(input, weight, None, (1, 1), (0, 0))
+            .unwrap();
+        assert!(session.conv2d_mask_plans.contains_key(&conv.0));
+        session.truncate_autograd_graph(boundary);
+
+        let replacement = session
+            .tensor_variable_f32(vec![10.0, 20.0, 30.0, 40.0], vec![1, 1, 2, 2], true)
+            .unwrap();
+        assert_eq!(
+            replacement, conv,
+            "the regression must exercise node-id reuse"
+        );
+        let mask = session
+            .tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let product = session.tensor_mul(replacement, mask).unwrap();
+        assert_eq!(
+            session.tensor_values_f32(product).unwrap(),
+            vec![10.0, 40.0, 90.0, 160.0]
+        );
+        let loss = session.tensor_sum(product).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        assert_eq!(
+            report.gradient(replacement),
+            Some([1.0, 2.0, 3.0, 4.0].as_slice())
+        );
+        assert!(report.gradient(input).is_none());
+        assert!(report.gradient(weight).is_none());
+
+        session
+            .functional_conv2d(input, weight, None, (1, 1), (0, 0))
+            .unwrap();
+        assert!(!session.conv2d_mask_plans.is_empty());
+        session.clear_autograd_graph();
+        assert!(session.conv2d_mask_plans.is_empty());
+        assert_eq!(session.autograd_graph_node_count(), 0);
+    }
+
     #[test]
     fn f32_masked_conv2d_fusion_fires_and_matches_masked_kernel_bitwise() {
         let (n, cin, cout, h, w, k) = (2usize, 1usize, 2usize, 5usize, 5usize, 3usize);

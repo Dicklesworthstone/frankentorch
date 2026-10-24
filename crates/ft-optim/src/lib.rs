@@ -7042,6 +7042,145 @@ mod tests {
     }
 
     #[test]
+    fn f32_amp_grad_scaler_updates_master_parameter_through_real_training_graph() {
+        use ft_core::DType;
+        for dtype in [DType::F16, DType::BF16] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let parameter = session
+                .tensor_variable_f32(vec![2.0], vec![1, 1], true)
+                .unwrap();
+            let weight = session
+                .tensor_variable_f32(vec![3.0], vec![1, 1], false)
+                .unwrap();
+            let target = session
+                .tensor_variable_f32(vec![0.0], vec![1, 1], false)
+                .unwrap();
+            let mut optimizer = SGD::new(vec![parameter], 0.01);
+            let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 100);
+            let loss = session
+                .with_autocast(dtype, |session| {
+                    let prediction = session.tensor_matmul(parameter, weight)?;
+                    assert_eq!(session.tensor_dtype(prediction)?, dtype);
+                    session.tensor_mse_loss(prediction, target, "mean")
+                })
+                .unwrap();
+            assert_eq!(session.tensor_dtype(loss).unwrap(), DType::F32);
+            assert_eq!(session.tensor_values_lossy_f64(loss).unwrap(), vec![36.0]);
+            let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+            let report = session.tensor_backward(scaled).unwrap();
+            assert_eq!(
+                session.tensor_grad(parameter).unwrap().unwrap(),
+                vec![288.0]
+            );
+            let before = session.tensor_snapshot(parameter).unwrap();
+            assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+            scaler.update();
+            assert_eq!(session.tensor_grad(parameter).unwrap().unwrap(), vec![36.0]);
+            assert_eq!(
+                session.tensor_values_f32(parameter).unwrap(),
+                vec![1.64_f32]
+            );
+            assert_eq!(session.tensor_dtype(parameter).unwrap(), DType::F32);
+            let after = session.tensor_snapshot(parameter).unwrap();
+            assert_eq!(after.id(), before.id());
+            assert_eq!(after.version(), before.version() + 1);
+            assert!(!session.is_autocast_enabled());
+            assert!(!scaler.last_step_was_skipped());
+        }
+    }
+
+    fn f32_training_optimizer(
+        algorithm: usize,
+        parameter: TensorNodeId,
+        lr: f64,
+    ) -> Box<dyn Optimizer> {
+        match algorithm {
+            0 => Box::new(
+                SGD::new(vec![parameter], lr)
+                    .momentum(0.8)
+                    .weight_decay(0.07),
+            ),
+            1 => Box::new(
+                Adam::new(vec![parameter], lr)
+                    .betas(0.7, 0.8)
+                    .amsgrad(true)
+                    .weight_decay(0.07),
+            ),
+            2 => Box::new(
+                AdamW::new(vec![parameter], lr)
+                    .betas(0.7, 0.8)
+                    .amsgrad(true)
+                    .weight_decay(0.07),
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    fn f32_training_step(
+        session: &mut FrankenTorchSession,
+        optimizer: &mut dyn Optimizer,
+        parameter: TensorNodeId,
+    ) {
+        optimizer.zero_grad(session).unwrap();
+        let square = session.tensor_mul(parameter, parameter).unwrap();
+        let loss = session.tensor_sum(square).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let version = session.tensor_snapshot(parameter).unwrap().version();
+        optimizer.step(session, &report).unwrap();
+        assert_eq!(
+            session.tensor_dtype(parameter).unwrap(),
+            ft_core::DType::F32
+        );
+        assert_eq!(
+            session.tensor_snapshot(parameter).unwrap().version(),
+            version + 1
+        );
+    }
+
+    #[test]
+    fn f32_optimizer_resume_preserves_sgd_adam_and_adamw_trajectories() {
+        for algorithm in 0..3 {
+            let mut uninterrupted = FrankenTorchSession::new(ExecutionMode::Strict);
+            let parameter = uninterrupted
+                .tensor_variable_f32(vec![2.0, -3.0], vec![2], true)
+                .unwrap();
+            let mut optimizer = f32_training_optimizer(algorithm, parameter, 0.03);
+            for _ in 0..2 {
+                f32_training_step(&mut uninterrupted, optimizer.as_mut(), parameter);
+            }
+            let encoded =
+                serde_json::to_vec(&optimizer.state_dict(&uninterrupted).unwrap()).unwrap();
+            let state: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+            let mut resumed = FrankenTorchSession::new(ExecutionMode::Strict);
+            resumed
+                .tensor_variable_f32(vec![0.0], vec![1], false)
+                .unwrap();
+            let restored_parameter = resumed
+                .tensor_variable_f32(
+                    uninterrupted.tensor_values_f32(parameter).unwrap(),
+                    vec![2],
+                    true,
+                )
+                .unwrap();
+            assert_ne!(parameter, restored_parameter);
+            let mut restored = f32_training_optimizer(algorithm, restored_parameter, 0.9);
+            restored.load_state_dict(&resumed, &state).unwrap();
+            for _ in 0..5 {
+                f32_training_step(&mut uninterrupted, optimizer.as_mut(), parameter);
+                f32_training_step(&mut resumed, restored.as_mut(), restored_parameter);
+                assert_eq!(
+                    resumed.tensor_values_f32(restored_parameter).unwrap(),
+                    uninterrupted.tensor_values_f32(parameter).unwrap(),
+                );
+                assert_eq!(
+                    restored.state_dict(&resumed).unwrap(),
+                    optimizer.state_dict(&uninterrupted).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exact_usize_state_field_rejects_saturating_cast_boundary() {
         let upper_exclusive = (usize::MAX as f64) + 1.0;
         assert_eq!(decode_exact_usize_field(42.0, 1), Some(42));

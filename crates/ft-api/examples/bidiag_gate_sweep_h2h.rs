@@ -1517,19 +1517,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     arms = arms
         .into_iter()
-        .flat_map(|arm| {
-            lu_fasts
-                .iter()
-                .map(move |&lu_fast| Arm { lu_fast, ..arm })
-        })
+        .flat_map(|arm| lu_fasts.iter().map(move |&lu_fast| Arm { lu_fast, ..arm }))
         .collect();
     arms = arms
         .into_iter()
         .flat_map(|arm| {
-            chol_fasts.iter().map(move |&chol_fast| Arm {
-                chol_fast,
-                ..arm
-            })
+            chol_fasts
+                .iter()
+                .map(move |&chol_fast| Arm { chol_fast, ..arm })
         })
         .collect();
     // FT_VALUES_ARM=1 appends ONE extra arm running the values-only entry, with the shipped

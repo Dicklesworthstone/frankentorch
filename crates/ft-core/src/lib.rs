@@ -1128,10 +1128,27 @@ pub enum DenseTensorError {
     Meta(TensorMetaError),
     UnsupportedDType(DType),
     UnsupportedLayout,
-    UnsupportedStorageAccess { dtype: DType },
-    StorageSpanOverflow { storage_offset: usize, numel: usize },
-    InsufficientStorage { needed: usize, actual: usize },
-    ShapeOverflow { shape: Vec<usize> },
+    UnsupportedStorageAccess {
+        dtype: DType,
+    },
+    StorageSpanOverflow {
+        storage_offset: usize,
+        numel: usize,
+    },
+    InsufficientStorage {
+        needed: usize,
+        actual: usize,
+    },
+    ShapeOverflow {
+        shape: Vec<usize>,
+    },
+    ShapeMismatch {
+        expected: Vec<usize>,
+        actual: Vec<usize>,
+    },
+    QuantizationMismatch,
+    OverlappingLayout,
+    VersionOverflow,
 }
 
 impl fmt::Display for DenseTensorError {
@@ -1163,6 +1180,19 @@ impl fmt::Display for DenseTensorError {
             Self::ShapeOverflow { shape } => {
                 write!(f, "dense tensor shape volume overflow for shape={shape:?}")
             }
+            Self::ShapeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "dense tensor shape mismatch: expected={expected:?}, actual={actual:?}"
+                )
+            }
+            Self::QuantizationMismatch => {
+                write!(f, "tensor copy requires matching quantization parameters")
+            }
+            Self::OverlappingLayout => {
+                write!(f, "tensor copy destination has overlapping elements")
+            }
+            Self::VersionOverflow => write!(f, "dense tensor version counter overflow"),
         }
     }
 }
@@ -1200,6 +1230,63 @@ fn checked_shape_numel(shape: &[usize]) -> Result<usize, DenseTensorError> {
             })?;
     }
     Ok(product)
+}
+
+enum TensorCopyPlan {
+    Contiguous {
+        target_start: usize,
+        source_start: usize,
+        len: usize,
+    },
+    Strided(Vec<(usize, usize)>),
+}
+
+impl TensorCopyPlan {
+    fn new(target: &TensorMeta, source: &TensorMeta) -> Result<Self, DenseTensorError> {
+        if target.is_contiguous() && source.is_contiguous() {
+            return Ok(Self::Contiguous {
+                target_start: target.storage_offset(),
+                source_start: source.storage_offset(),
+                len: target.numel(),
+            });
+        }
+        let mut positions = Vec::with_capacity(target.numel());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut index = vec![0; target.shape().len()];
+        for _ in 0..target.numel() {
+            let target_offset = target.storage_index_for(&index)?;
+            if !seen.insert(target_offset) {
+                return Err(DenseTensorError::OverlappingLayout);
+            }
+            positions.push((target_offset, source.storage_index_for(&index)?));
+            for dim in (0..index.len()).rev() {
+                index[dim] += 1;
+                if index[dim] < target.shape()[dim] {
+                    break;
+                }
+                index[dim] = 0;
+            }
+        }
+        Ok(Self::Strided(positions))
+    }
+
+    fn copy<T: Copy>(&self, target: &mut [T], source: &[T]) {
+        match self {
+            Self::Contiguous {
+                target_start,
+                source_start,
+                len,
+            } => {
+                target[*target_start..*target_start + *len]
+                    .copy_from_slice(&source[*source_start..*source_start + *len]);
+            }
+            Self::Strided(positions) => {
+                for &(target_offset, source_offset) in positions {
+                    target[target_offset] = source[source_offset];
+                }
+            }
+        }
+    }
 }
 
 impl DenseTensor {
@@ -1987,6 +2074,71 @@ impl DenseTensor {
             }
         }
         self.version += 1;
+        Ok(())
+    }
+
+    /// Copy logical elements without converting their dtype or changing this
+    /// tensor's identity, device, shape, strides, offset or quantization metadata.
+    ///
+    /// All storage types are copied exactly, including NaN payloads and signed
+    /// zero. Source views and non-overlapping destination views are supported;
+    /// storage outside the destination view is untouched. Validation precedes
+    /// every write, and a successful copy increments the destination version.
+    pub fn copy_values_from(&mut self, source: &Self) -> Result<(), DenseTensorError> {
+        if self.meta.shape() != source.meta.shape() {
+            return Err(DenseTensorError::ShapeMismatch {
+                expected: self.meta.shape().to_vec(),
+                actual: source.meta.shape().to_vec(),
+            });
+        }
+        if self.meta.dtype() != source.meta.dtype() {
+            return Err(DenseTensorError::UnsupportedDType(source.meta.dtype()));
+        }
+        if self.meta.quantization() != source.meta.quantization() {
+            return Err(DenseTensorError::QuantizationMismatch);
+        }
+        let version = self
+            .version
+            .checked_add(1)
+            .ok_or(DenseTensorError::VersionOverflow)?;
+        let plan = TensorCopyPlan::new(&self.meta, &source.meta)?;
+        match (&mut self.storage, &source.storage) {
+            (TensorStorage::F64(target), TensorStorage::F64(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::F64(target), TensorStorage::F64Inline4(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::F64Inline4(target), TensorStorage::F64(values)) => {
+                plan.copy(target, values)
+            }
+            (TensorStorage::F64Inline4(target), TensorStorage::F64Inline4(values)) => {
+                plan.copy(target, values)
+            }
+            (TensorStorage::F32(target), TensorStorage::F32(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::F16(target), TensorStorage::F16(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::BF16(target), TensorStorage::BF16(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::Complex64(target), TensorStorage::Complex64(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::Complex128(target), TensorStorage::Complex128(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::QInt8(target), TensorStorage::QInt8(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            (TensorStorage::QUInt8(target), TensorStorage::QUInt8(values)) => {
+                plan.copy(Arc::make_mut(target).as_mut_slice(), values)
+            }
+            _ => return Err(DenseTensorError::UnsupportedDType(source.meta.dtype())),
+        }
+        self.version = version;
         Ok(())
     }
 

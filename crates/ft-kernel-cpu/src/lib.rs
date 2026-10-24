@@ -29129,7 +29129,8 @@ pub fn set_cholesky_panel_mode(mode: u8) -> u8 {
 /// - Uses `gemm::dsyrk_lower_sub_into` (`SYRK_NB = 32`) in the trailing rank-`nb` update
 ///   to compute only the lower-triangular column blocks (`rows = m - n0`) and keep all
 ///   Rayon workers active as `m` shrinks.
-static CHOLESKY_FAST_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static CHOLESKY_FAST_KERNEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 #[doc(hidden)]
 pub fn set_cholesky_fast_kernel(on: bool) -> bool {

@@ -4447,8 +4447,8 @@ impl TensorTape {
     /// (bead frankentorch-v2os: the tape is otherwise append-only and leaks for
     /// the session's lifetime). Truncates `nodes` and every node-indexed side
     /// structure (persistent grads, hooks, retains_grad) so freed handles cannot
-    /// retain memory. `custom_functions` is keyed by its own counter, not node
-    /// ids, so it is left intact.
+    /// retain memory. Custom functions are kept only while a surviving node
+    /// references them, releasing saved activations and backward closures too.
     ///
     /// CONTRACT: all `TensorNodeId`s with `id >= boundary` are INVALIDATED — using
     /// one afterwards is a logic error (it errors as unknown, or aliases a node
@@ -4459,9 +4459,10 @@ impl TensorTape {
     /// already covers the whole tape.
     pub fn truncate_graph_to(&mut self, boundary: usize) {
         self.nodes.truncate(boundary);
-        // A custom function owns saved tensors and its backward closure. Drop
-        // records whose output nodes were discarded, including orphan records
-        // left by a failed forward at an otherwise unchanged boundary.
+        // Function ids use a separate counter and cannot be compared to node
+        // indices. Derive liveness from the retained graph instead. This also
+        // drops orphan records from a forward that failed while constructing
+        // its output, even when that failure did not grow the node arena.
         let live_functions: BTreeSet<usize> = self
             .nodes
             .iter()
@@ -4679,7 +4680,11 @@ impl TensorTape {
     }
 
     pub fn values_len(&self, node: TensorNodeId) -> Result<usize, AutogradError> {
-        Ok(self.node(node)?.tensor.contiguous_values()?.len())
+        let tensor = &self.node(node)?.tensor;
+        match tensor.meta().dtype() {
+            DType::F32 => Ok(tensor.contiguous_values_f32()?.len()),
+            _ => Ok(tensor.contiguous_values()?.len()),
+        }
     }
 
     pub fn tensor(&self, node: TensorNodeId) -> Result<&DenseTensor, AutogradError> {
@@ -4774,15 +4779,33 @@ impl TensorTape {
         if input_dtype == DType::F32 {
             return Ok(input);
         }
-        if input_dtype != DType::F64 {
+        if !matches!(input_dtype, DType::F64 | DType::F16 | DType::BF16) {
             return Err(AutogradError::DenseTensor(
                 ft_core::DenseTensorError::UnsupportedDType(input_dtype),
             ));
         }
         let requires_grad = input_node.requires_grad && self.grad_enabled;
         let meta = input_node.tensor.meta().clone();
-        let f64_values = input_node.tensor.contiguous_values()?;
-        let f32_values: Vec<f32> = f64_values.iter().map(|&v| v as f32).collect();
+        let f32_values: Vec<f32> = match input_dtype {
+            DType::F16 => input_node
+                .tensor
+                .contiguous_values_f16()?
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            DType::BF16 => input_node
+                .tensor
+                .contiguous_values_bf16()?
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+            _ => input_node
+                .tensor
+                .contiguous_values()?
+                .iter()
+                .map(|&v| v as f32)
+                .collect(),
+        };
 
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
@@ -4803,15 +4826,14 @@ impl TensorTape {
         if input_dtype == DType::F64 {
             return Ok(input);
         }
-        if input_dtype != DType::F32 {
+        if !matches!(input_dtype, DType::F32 | DType::F16 | DType::BF16) {
             return Err(AutogradError::DenseTensor(
                 ft_core::DenseTensorError::UnsupportedDType(input_dtype),
             ));
         }
         let requires_grad = input_node.requires_grad && self.grad_enabled;
         let meta = input_node.tensor.meta().clone();
-        let f32_values = input_node.tensor.contiguous_values_f32()?;
-        let f64_values: Vec<f64> = f32_values.iter().map(|&v| v as f64).collect();
+        let f64_values = input_node.tensor.contiguous_values_as_f64()?;
 
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
@@ -4828,9 +4850,8 @@ impl TensorTape {
 
     /// Cast a floating-point tensor to a half-precision dtype (F16 or BF16).
     ///
-    /// Accepts F32 or F64 inputs (the realistic mixed-precision cast
-    /// sources) and returns the input unchanged when it already matches
-    /// the target. The cast is differentiable: backward treats it as the
+    /// Accepts F32, F64, F16, or BF16 inputs and returns the input unchanged
+    /// when it already matches the target. The cast is differentiable: backward treats it as the
     /// identity (gradients flow in f64), matching PyTorch's `_to_copy`
     /// behavior. Non-floating inputs surface `UnsupportedDType`.
     fn cast_to_half(
@@ -4844,20 +4865,15 @@ impl TensorTape {
         if input_dtype == target {
             return Ok(input);
         }
-        let f64_values: Vec<f64> = match input_dtype {
-            DType::F64 => input_node.tensor.contiguous_values()?.to_vec(),
-            DType::F32 => input_node
-                .tensor
-                .contiguous_values_f32()?
-                .iter()
-                .map(|&v| f64::from(v))
-                .collect(),
-            other => {
-                return Err(AutogradError::DenseTensor(
-                    ft_core::DenseTensorError::UnsupportedDType(other),
-                ));
-            }
-        };
+        if !matches!(
+            input_dtype,
+            DType::F64 | DType::F32 | DType::F16 | DType::BF16
+        ) {
+            return Err(AutogradError::DenseTensor(
+                ft_core::DenseTensorError::UnsupportedDType(input_dtype),
+            ));
+        }
+        let f64_values = input_node.tensor.contiguous_values_as_f64()?;
         let requires_grad = input_node.requires_grad && self.grad_enabled;
         let meta = input_node.tensor.meta().clone();
         let out_meta = TensorMeta::from_shape(meta.shape().to_vec(), target, meta.device());
@@ -21773,6 +21789,34 @@ impl TensorTape {
     }
 
     /// Replace the storage values of a tensor node in-place (version is bumped).
+    ///
+    /// Prepare every typed copy before committing any of them, so a bad node,
+    /// dtype, shape, quantization parameter or destination layout cannot leave
+    /// a partially restored model. Node IDs and autograd relationships remain
+    /// intact, and the copied tensors retain their own version counters.
+    pub fn copy_tensors_from_storage(
+        &mut self,
+        updates: &[(TensorNodeId, DenseTensor)],
+    ) -> Result<(), AutogradError> {
+        let mut prepared: BTreeMap<usize, DenseTensor> = BTreeMap::new();
+        for (id, source) in updates {
+            let target = match prepared.entry(id.0) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(self.tensor(*id)?.clone())
+                }
+            };
+            target.copy_values_from(source)?;
+        }
+        for (index, tensor) in prepared {
+            // Bounds were checked above and no node topology changes while the
+            // prepared copies are being committed.
+            self.nodes[index].tensor = tensor;
+        }
+        Ok(())
+    }
+
+    /// Replace the storage values of a tensor node in-place (version is bumped).
     pub fn update_tensor_values(
         &mut self,
         id: TensorNodeId,
@@ -27339,60 +27383,78 @@ mod tests {
     fn truncate_graph_releases_discarded_custom_state_and_preserves_live_backward() {
         let mut tape = TensorTape::new();
         let x = tape.leaf(vec![2.0, 3.0], vec![2], true).expect("x");
-        let retained = tape
+        let live_state = Arc::new(vec![2.0]);
+        let live_weak = Arc::downgrade(&live_state);
+        let live = tape
             .apply_function(
                 &[x],
                 |_ctx, inputs| {
                     Ok((
                         inputs[0].0.iter().map(|value| value * 2.0).collect(),
-                        inputs[0].1.to_vec(),
+                        vec![2],
                     ))
                 },
-                |_ctx, grads| Ok(vec![Some(grads[0].iter().map(|g| g * 2.0).collect())]),
+                move |_ctx, grads| {
+                    Ok(vec![Some(
+                        grads[0].iter().map(|grad| grad * live_state[0]).collect(),
+                    )])
+                },
             )
             .expect("retained function");
         let boundary = tape.node_count();
-        let captured = Arc::new(vec![7.0; 1024]);
-        let weak = Arc::downgrade(&captured);
-        let discarded = tape
-            .apply_function(
-                &[x],
-                |ctx, inputs| {
-                    ctx.save_for_backward(inputs[0].0.to_vec(), inputs[0].1.to_vec());
-                    Ok((inputs[0].0.to_vec(), inputs[0].1.to_vec()))
-                },
-                move |_ctx, grads| {
-                    let scale = captured[0];
-                    Ok(vec![Some(grads[0].iter().map(|g| g * scale).collect())])
-                },
-            )
-            .expect("discarded function");
-        assert!(weak.upgrade().is_some());
+        let dead_state = Arc::new(vec![3.0; 4096]);
+        let dead_weak = Arc::downgrade(&dead_state);
+        tape.apply_function(
+            &[live],
+            |ctx, inputs| {
+                ctx.save_for_backward(vec![4.0; 4096], vec![4096]);
+                Ok((inputs[0].0.to_vec(), inputs[0].1.to_vec()))
+            },
+            move |_ctx, grads| {
+                Ok(vec![Some(
+                    grads[0].iter().map(|grad| grad * dead_state[0]).collect(),
+                )])
+            },
+        )
+        .expect("discarded function");
+
         tape.truncate_graph_to(boundary);
-        assert!(weak.upgrade().is_none());
-        assert!(tape.tensor(discarded).is_err());
-        assert_eq!(tape.custom_functions.len(), 1);
-        let report = tape.backward(retained).expect("retained backward");
-        assert_eq!(report.gradient(x).expect("gradient"), [2.0, 2.0]);
+        assert!(
+            dead_weak.upgrade().is_none(),
+            "discarded backward closure must release activations"
+        );
+        assert!(live_weak.upgrade().is_some());
+        let report = tape.backward(live).expect("surviving backward");
+        assert_eq!(report.gradient(x), Some([2.0, 2.0].as_slice()));
+        tape.clear_graph();
+        assert!(live_weak.upgrade().is_none());
     }
 
     #[test]
     fn truncate_graph_bounds_borrowed_custom_state_across_training_steps() {
         let mut tape = TensorTape::new();
-        let x = tape.leaf(vec![2.0, 3.0], vec![2], true).expect("x");
+        let x = tape
+            .leaf(vec![2.0, -3.0], vec![2], true)
+            .expect("parameter");
         let boundary = tape.node_count();
         for _ in 0..32 {
-            let y = tape
+            let output = tape
                 .apply_function_f64_borrowed_inputs(
                     &[x],
-                    |_ctx, inputs| Ok((inputs[0].0.to_vec(), inputs[0].1.to_vec())),
-                    |_ctx, grads, _inputs| Ok(vec![Some(grads[0].to_vec())]),
+                    |_ctx, inputs| Ok((inputs[0].0.iter().map(|v| v * v).collect(), vec![2])),
+                    |_ctx, grads, inputs| {
+                        Ok(vec![Some(
+                            grads[0]
+                                .iter()
+                                .zip(inputs[0].0)
+                                .map(|(g, x)| 2.0 * g * x)
+                                .collect(),
+                        )])
+                    },
                 )
-                .expect("borrowed function");
-            assert_eq!(tape.custom_functions.len(), 1);
-            assert_eq!(tape.custom_function_input_versions.len(), 1);
-            let report = tape.backward(y).expect("backward");
-            assert_eq!(report.gradient(x).expect("gradient"), [1.0, 1.0]);
+                .expect("step forward");
+            let report = tape.backward(output).expect("step backward");
+            assert_eq!(report.gradient(x), Some([4.0, -6.0].as_slice()));
             tape.truncate_graph_to(boundary);
             assert_eq!(tape.node_count(), boundary);
             assert!(tape.custom_functions.is_empty());
@@ -27405,24 +27467,25 @@ mod tests {
         let mut tape = TensorTape::new();
         let x = tape.leaf(vec![2.0], vec![1], true).expect("x");
         let boundary = tape.node_count();
-        let captured = Arc::new(vec![7.0]);
-        let weak = Arc::downgrade(&captured);
-        let error = tape.apply_function(
+        let saved = Arc::new(vec![7.0; 4096]);
+        let weak = Arc::downgrade(&saved);
+        let result = tape.apply_function(
             &[x],
             |_ctx, _inputs| Ok((vec![1.0], vec![2])),
             move |_ctx, grads| {
                 Ok(vec![Some(
-                    grads[0].iter().map(|g| g * captured[0]).collect(),
+                    grads[0].iter().map(|grad| grad * saved[0]).collect(),
                 )])
             },
         );
-        assert!(error.is_err());
+        assert!(result.is_err(), "invalid forward shape must fail");
         assert_eq!(tape.node_count(), boundary);
-        assert!(weak.upgrade().is_some());
         tape.truncate_graph_to(boundary);
-        assert!(weak.upgrade().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "failed forward must not retain an unreachable closure"
+        );
         assert!(tape.custom_functions.is_empty());
-        assert!(tape.custom_function_input_versions.is_empty());
     }
 
     #[test]
@@ -31756,24 +31819,25 @@ mod tests {
     #[test]
     fn to_half_rejects_non_float_input() {
         let mut tape = TensorTape::new();
-        let bf16_tensor = DenseTensor::from_contiguous_values_bf16(
-            vec![BFloat16::from_f32(1.0)],
-            vec![1],
-            Device::Cpu,
-        )
-        .unwrap();
-        let a = tape.leaf_tensor(bf16_tensor, false);
-        // BF16 → F16 is not a supported cast source (only F32/F64 inputs).
-        let err = tape.to_dtype(a, DType::F16).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AutogradError::DenseTensor(ft_core::DenseTensorError::UnsupportedDType(
-                    DType::BF16
-                ))
-            ),
-            "expected UnsupportedDType(BF16), got {err:?}"
-        );
+        let quantized =
+            DenseTensor::from_contiguous_values_qint8(vec![1], vec![1], Device::Cpu, 0.5, 0)
+                .unwrap();
+        let a = tape.leaf_tensor(quantized, false);
+        // Floating-point casts include BF16 <-> F16. Quantized storage is
+        // outside that contract and must still fail without adding a node.
+        for target in [DType::F16, DType::BF16] {
+            let err = tape.to_dtype(a, target).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    AutogradError::DenseTensor(ft_core::DenseTensorError::UnsupportedDType(
+                        DType::QInt8
+                    ))
+                ),
+                "expected UnsupportedDType(QInt8), got {err:?}"
+            );
+            assert_eq!(tape.node_count(), 1);
+        }
     }
 
     #[test]
