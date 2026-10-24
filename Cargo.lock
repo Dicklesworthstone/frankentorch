@@ -968,6 +968,8 @@ dependencies = [
  "frankentorch-dispatch",
  "ft-nn",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

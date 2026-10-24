@@ -10,10 +10,12 @@ ft-api = { workspace = true }
 ft-autograd = { workspace = true }
 ft-dispatch = { workspace = true }
 rayon = "1.12"
+serde = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 ft-nn = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 
 [[bench]]
 name = "optimizer_bench"
