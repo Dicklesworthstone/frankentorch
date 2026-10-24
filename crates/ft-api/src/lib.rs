@@ -1274,12 +1274,10 @@ impl FrankenTorchSession {
 
     /// Number of nodes currently retained in the autograd tensor tape.
     ///
-    /// The tape is an append-only arena: every op (including under `no_grad`)
-    /// pushes a node that owns its output tensor, and there is currently no
-    /// node-free/clear path (see bead frankentorch-v2os). This monotonically
-    /// increasing count is therefore a direct proxy for tape memory — expose it
-    /// so long-running training/inference loops can monitor growth and recreate
-    /// the session before it leaks unbounded, until a safe clear/truncate lands.
+    /// Every tensor operation, including under `no_grad`, can retain a node.
+    /// Save this count after creating persistent parameters, then use
+    /// [`Self::truncate_autograd_graph`] after each completed training step to
+    /// release temporary tensors and custom-function state.
     #[must_use]
     pub fn autograd_graph_node_count(&self) -> usize {
         self.tensor_tape.node_count()
@@ -1309,21 +1307,15 @@ impl FrankenTorchSession {
             .retain(|&node_id, _| node_id < boundary);
         self.max_pool3d_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
+        self.conv2d_mask_plans
+            .retain(|&node_id, _| node_id < boundary);
     }
 
     /// Free the entire autograd tape (`truncate_autograd_graph(0)`); invalidates
     /// all outstanding tensor handles. For use between independent graph
     /// generations (e.g. inference requests that re-create their inputs).
     pub fn clear_autograd_graph(&mut self) {
-        self.tensor_tape.clear_graph();
-        self.batch_norm1d_sum_shortcuts.clear();
-        self.batch_norm2d_f32_sum_shortcuts.clear();
-        self.group_norm_f32_sum_shortcuts.clear();
-        self.prelu_sum_shortcuts.clear();
-        self.avg_pool1d_sum_shortcuts.clear();
-        self.avg_pool2d_sum_shortcuts.clear();
-        self.max_pool1d_sum_shortcuts.clear();
-        self.max_pool3d_sum_shortcuts.clear();
+        self.truncate_autograd_graph(0);
     }
 
     fn compact_nograd_tensor_since(
@@ -167258,6 +167250,46 @@ mod tests {
     }
 
     // ── frankentorch-plj: Gradient checkpointing tests ────────────────
+
+    #[test]
+    fn graph_truncation_discards_conv_mask_plans_before_node_reuse() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
+            .expect("input");
+        let weight = s
+            .tensor_variable(vec![2.0], vec![1, 1, 1, 1], true)
+            .expect("weight");
+        let conv = s
+            .functional_conv2d(input, weight, None, (1, 1), (0, 0))
+            .expect("convolution");
+        assert!(s.conv2d_mask_plans.contains_key(&conv.0));
+        s.truncate_autograd_graph(conv.0);
+        assert!(s.conv2d_mask_plans.is_empty());
+        let replacement = s
+            .tensor_variable(vec![10.0, 20.0, 30.0, 40.0], vec![1, 1, 2, 2], true)
+            .expect("replacement");
+        assert_eq!(replacement, conv);
+        let mask = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .expect("mask");
+        let scored = s.tensor_mul(replacement, mask).expect("masked loss");
+        assert_eq!(
+            s.tensor_values(scored).expect("values"),
+            [10.0, 40.0, 90.0, 160.0]
+        );
+        let loss = s.tensor_sum(scored).expect("sum");
+        let report = s.tensor_backward(loss).expect("backward");
+        assert_eq!(
+            s.tensor_gradient(&report, replacement).expect("gradient"),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        assert!(s.tensor_gradient(&report, input).is_none());
+        assert!(s.tensor_gradient(&report, weight).is_none());
+        s.clear_autograd_graph();
+        assert_eq!(s.autograd_graph_node_count(), 0);
+        assert!(s.conv2d_mask_plans.is_empty());
+    }
 
     #[test]
     fn checkpoint_produces_correct_forward_output() {

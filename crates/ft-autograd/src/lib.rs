@@ -4458,10 +4458,22 @@ impl TensorTape {
     /// generation's graph while keeping the parameters. No-op if `boundary`
     /// already covers the whole tape.
     pub fn truncate_graph_to(&mut self, boundary: usize) {
-        if boundary >= self.nodes.len() {
-            return;
-        }
         self.nodes.truncate(boundary);
+        // A custom function owns saved tensors and its backward closure. Drop
+        // records whose output nodes were discarded, including orphan records
+        // left by a failed forward at an otherwise unchanged boundary.
+        let live_functions: BTreeSet<usize> = self
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                TensorNodeOp::CustomFunction { function_id, .. } => Some(*function_id),
+                _ => None,
+            })
+            .collect();
+        self.custom_functions
+            .retain(|id, _| live_functions.contains(id));
+        self.custom_function_input_versions
+            .retain(|id, _| live_functions.contains(id));
         self.persistent_grads.retain(|&id, _| id < boundary);
         self.tensor_hooks.retain(|&id, _| id < boundary);
         self.retains_grad.retain(|&id| id < boundary);
@@ -27322,6 +27334,96 @@ mod tests {
     }
 
     // ---- CustomFunction / apply_function tests ----
+
+    #[test]
+    fn truncate_graph_releases_discarded_custom_state_and_preserves_live_backward() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0, 3.0], vec![2], true).expect("x");
+        let retained = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    Ok((
+                        inputs[0].0.iter().map(|value| value * 2.0).collect(),
+                        inputs[0].1.to_vec(),
+                    ))
+                },
+                |_ctx, grads| Ok(vec![Some(grads[0].iter().map(|g| g * 2.0).collect())]),
+            )
+            .expect("retained function");
+        let boundary = tape.node_count();
+        let captured = Arc::new(vec![7.0; 1024]);
+        let weak = Arc::downgrade(&captured);
+        let discarded = tape
+            .apply_function(
+                &[x],
+                |ctx, inputs| {
+                    ctx.save_for_backward(inputs[0].0.to_vec(), inputs[0].1.to_vec());
+                    Ok((inputs[0].0.to_vec(), inputs[0].1.to_vec()))
+                },
+                move |_ctx, grads| {
+                    let scale = captured[0];
+                    Ok(vec![Some(grads[0].iter().map(|g| g * scale).collect())])
+                },
+            )
+            .expect("discarded function");
+        assert!(weak.upgrade().is_some());
+        tape.truncate_graph_to(boundary);
+        assert!(weak.upgrade().is_none());
+        assert!(tape.tensor(discarded).is_err());
+        assert_eq!(tape.custom_functions.len(), 1);
+        let report = tape.backward(retained).expect("retained backward");
+        assert_eq!(report.gradient(x).expect("gradient"), [2.0, 2.0]);
+    }
+
+    #[test]
+    fn truncate_graph_bounds_borrowed_custom_state_across_training_steps() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0, 3.0], vec![2], true).expect("x");
+        let boundary = tape.node_count();
+        for _ in 0..32 {
+            let y = tape
+                .apply_function_f64_borrowed_inputs(
+                    &[x],
+                    |_ctx, inputs| Ok((inputs[0].0.to_vec(), inputs[0].1.to_vec())),
+                    |_ctx, grads, _inputs| Ok(vec![Some(grads[0].to_vec())]),
+                )
+                .expect("borrowed function");
+            assert_eq!(tape.custom_functions.len(), 1);
+            assert_eq!(tape.custom_function_input_versions.len(), 1);
+            let report = tape.backward(y).expect("backward");
+            assert_eq!(report.gradient(x).expect("gradient"), [1.0, 1.0]);
+            tape.truncate_graph_to(boundary);
+            assert_eq!(tape.node_count(), boundary);
+            assert!(tape.custom_functions.is_empty());
+            assert!(tape.custom_function_input_versions.is_empty());
+        }
+    }
+
+    #[test]
+    fn truncate_graph_releases_failed_custom_forward_state_at_unchanged_boundary() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0], vec![1], true).expect("x");
+        let boundary = tape.node_count();
+        let captured = Arc::new(vec![7.0]);
+        let weak = Arc::downgrade(&captured);
+        let error = tape.apply_function(
+            &[x],
+            |_ctx, _inputs| Ok((vec![1.0], vec![2])),
+            move |_ctx, grads| {
+                Ok(vec![Some(
+                    grads[0].iter().map(|g| g * captured[0]).collect(),
+                )])
+            },
+        );
+        assert!(error.is_err());
+        assert_eq!(tape.node_count(), boundary);
+        assert!(weak.upgrade().is_some());
+        tape.truncate_graph_to(boundary);
+        assert!(weak.upgrade().is_none());
+        assert!(tape.custom_functions.is_empty());
+        assert!(tape.custom_function_input_versions.is_empty());
+    }
 
     #[test]
     fn custom_function_identity_forward() {
