@@ -1,6 +1,6 @@
-//! Exercise autocast through real operators, casts, and nonuniform losses.
-//! All fixture values and analytic gradients are exactly representable in
-//! F16 and BF16, so dtype routing and VJP failures cannot hide in tolerances.
+//! Exercise autocast, checkpoint replay, and typed training-state restoration.
+//! Analytic AMP and VJP fixtures use values exactly representable in F16 and
+//! BF16, while state fixtures check raw storage bits, identity, and atomicity.
 
 use ft_api::FrankenTorchSession;
 use ft_autograd::TensorNodeId;
@@ -588,4 +588,438 @@ fn autocast_losses_preserve_explicit_f64_inputs() {
     assert_eq!(s.tensor_values(loss).unwrap(), [value * value]);
     let report = s.tensor_backward(loss).unwrap();
     assert_eq!(s.tensor_gradient(&report, x).unwrap(), [2. * value]);
+}
+
+#[test]
+fn checkpoint_weighted_rectangular_matmul_has_exact_vjp() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = s
+        .tensor_variable(vec![1., 2., 3., 4., 5., 6.], vec![2, 3], true)
+        .unwrap();
+    let w = s
+        .tensor_variable(vec![1., 2., 3., 4., 5., 6.], vec![3, 2], true)
+        .unwrap();
+    let out = s
+        .checkpoint(&[x, w], |s, inputs| s.tensor_matmul(inputs[0], inputs[1]))
+        .unwrap();
+    let gradients = s
+        .tensor_autograd_grad(
+            &[out],
+            &[x, w],
+            Some(&[vec![1., -2., 3., 4.]]),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        gradients[0].as_deref(),
+        Some(&[-3., -5., -7., 11., 25., 39.][..])
+    );
+    assert_eq!(
+        gradients[1].as_deref(),
+        Some(&[13., 14., 17., 16., 21., 18.][..])
+    );
+}
+
+#[test]
+fn checkpoint_reduction_scales_every_input_gradient() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = s.tensor_variable(vec![1., 2., 3.], vec![3], true).unwrap();
+    let out = s
+        .checkpoint(&[x], |s, inputs| {
+            let square = s.tensor_mul(inputs[0], inputs[0])?;
+            s.tensor_sum(square)
+        })
+        .unwrap();
+    let loss = s.tensor_mul_scalar(out, 3.).unwrap();
+    let report = s.tensor_backward(loss).unwrap();
+    assert_eq!(report.gradient(x), Some(&[6., 12., 18.][..]));
+}
+
+#[test]
+fn checkpoint_broadcast_keeps_frozen_inputs_frozen() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = s.tensor_variable(vec![2., 3.], vec![2, 1], true).unwrap();
+    let w = s
+        .tensor_variable(vec![5., 7., 11.], vec![1, 3], true)
+        .unwrap();
+    let bias = s.tensor_variable(vec![1.; 6], vec![2, 3], false).unwrap();
+    let out = s
+        .checkpoint(&[x, w, bias], |s, inputs| {
+            assert!(!s.tensor_requires_grad(inputs[2])?);
+            let product = s.tensor_mul(inputs[0], inputs[1])?;
+            s.tensor_add(product, inputs[2])
+        })
+        .unwrap();
+    let gradients = s
+        .tensor_autograd_grad(
+            &[out],
+            &[x, w, bias],
+            Some(&[vec![1., 2., 3., 4., 5., 6.]]),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(gradients[0].as_deref(), Some(&[52., 121.][..]));
+    assert_eq!(gradients[1].as_deref(), Some(&[14., 19., 24.][..]));
+    assert!(gradients[2].is_none());
+}
+
+#[test]
+fn checkpoint_complex_vjp_preserves_real_and_imaginary_gradients() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let real = s.tensor_variable(vec![1., 2.], vec![2], true).unwrap();
+    let imag = s.tensor_variable(vec![3., 4.], vec![2], true).unwrap();
+    let z = s.tensor_complex(real, imag).unwrap();
+    let out = s
+        .checkpoint(&[z], |s, inputs| s.tensor_conj(inputs[0]))
+        .unwrap();
+    assert_eq!(s.tensor_dtype(out).unwrap(), DType::Complex128);
+    let components = s.tensor_view_as_real(out).unwrap();
+    assert_eq!(s.tensor_values(components).unwrap(), [1., -3., 2., -4.]);
+    let weights = s
+        .tensor_variable(vec![2., -3., 5., 7.], vec![2, 2], false)
+        .unwrap();
+    let weighted = s.tensor_mul(components, weights).unwrap();
+    let loss = s.tensor_sum(weighted).unwrap();
+    let report = s.tensor_backward(loss).unwrap();
+    assert_eq!(report.gradient(real), Some(&[2., 5.][..]));
+    assert_eq!(report.gradient(imag), Some(&[3., -7.][..]));
+}
+
+#[test]
+fn checkpoint_rng_replay_leaves_parent_stream_unchanged() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    s.rand(vec![7], false).unwrap();
+    let x = s.tensor_variable(vec![1.; 16], vec![16], true).unwrap();
+    let mut reference = s.clone();
+    let direct = reference.functional_dropout(x, 0.5, true).unwrap();
+    let replayed = s
+        .checkpoint(&[x], |s, inputs| s.functional_dropout(inputs[0], 0.5, true))
+        .unwrap();
+    assert_eq!(
+        s.tensor_values(replayed).unwrap(),
+        reference.tensor_values(direct).unwrap()
+    );
+    let weights = vec![(1..=16).map(f64::from).collect()];
+    let expected = reference
+        .tensor_autograd_grad(&[direct], &[x], Some(&weights), false, false)
+        .unwrap();
+    let actual = s
+        .tensor_autograd_grad(&[replayed], &[x], Some(&weights), false, false)
+        .unwrap();
+    assert_eq!(actual, expected);
+    let next = s.rand(vec![8], false).unwrap();
+    let reference_next = reference.rand(vec![8], false).unwrap();
+    assert_eq!(
+        s.tensor_values(next).unwrap(),
+        reference.tensor_values(reference_next).unwrap()
+    );
+}
+
+#[test]
+fn checkpoint_nested_replay_bounds_retained_nodes() {
+    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = s.tensor_variable(vec![1., 2.], vec![2], true).unwrap();
+    let existing = s.tensor_mul(x, x).unwrap();
+    let boundary = s.autograd_graph_node_count();
+    let out = s
+        .checkpoint(&[x], |s, inputs| {
+            let mut doubled = inputs[0];
+            for _ in 0..8 {
+                doubled = s.tensor_add(doubled, doubled)?;
+            }
+            s.checkpoint(&[doubled], |s, inputs| {
+                let square = s.tensor_mul(inputs[0], inputs[0])?;
+                s.tensor_sum(square)
+            })
+        })
+        .unwrap();
+    assert_eq!(s.autograd_graph_node_count(), boundary + 1);
+    assert_eq!(s.tensor_values(existing).unwrap(), [1., 4.]);
+    let report = s.tensor_backward(out).unwrap();
+    assert_eq!(report.gradient(x), Some(&[131_072., 262_144.][..]));
+}
+
+#[test]
+fn checkpoint_autocast_matmul_replays_nonuniform_f32_loss() {
+    for dtype in [DType::F16, DType::BF16] {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(vec![1., 2., 3., 4.], vec![2, 2], true)
+            .unwrap();
+        let w = s
+            .tensor_variable_f32(vec![2., -1., 1., 3.], vec![2, 2], true)
+            .unwrap();
+        let out = s
+            .with_autocast(dtype, |s| {
+                s.checkpoint(&[x, w], |s, inputs| s.tensor_matmul(inputs[0], inputs[1]))
+            })
+            .unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), dtype);
+        assert_eq!(s.tensor_values_lossy_f64(out).unwrap(), [4., 5., 10., 9.]);
+        let weights = s
+            .tensor_variable_f32(vec![0.5, -1., 2., 0.25], vec![2, 2], false)
+            .unwrap();
+        let weighted = s.tensor_mul(out, weights).unwrap();
+        assert_eq!(s.tensor_dtype(weighted).unwrap(), DType::F32);
+        let loss = s.tensor_sum(weighted).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert_eq!(report.gradient(x), Some(&[2., -2.5, 3.75, 2.75][..]));
+        assert_eq!(report.gradient(w), Some(&[6.5, -0.25, 9., -1.][..]));
+        assert_eq!(s.tensor_dtype(x).unwrap(), DType::F32);
+        assert_eq!(s.tensor_dtype(w).unwrap(), DType::F32);
+    }
+}
+
+fn state_restore_storage_bits(tensor: &ft_core::DenseTensor) -> Vec<u64> {
+    use ft_core::TensorStorage;
+    match tensor.typed_storage() {
+        TensorStorage::F64(values) => values.iter().map(|value| value.to_bits()).collect(),
+        TensorStorage::F64Inline4(values) => values.iter().map(|value| value.to_bits()).collect(),
+        TensorStorage::F32(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_bits()))
+            .collect(),
+        TensorStorage::F16(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_bits()))
+            .collect(),
+        TensorStorage::BF16(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_bits()))
+            .collect(),
+        TensorStorage::Complex64(values) => values
+            .iter()
+            .flat_map(|value| [u64::from(value.re.to_bits()), u64::from(value.im.to_bits())])
+            .collect(),
+        TensorStorage::Complex128(values) => values
+            .iter()
+            .flat_map(|value| [value.re.to_bits(), value.im.to_bits()])
+            .collect(),
+        TensorStorage::QInt8(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_ne_bytes()[0]))
+            .collect(),
+        TensorStorage::QUInt8(values) => values.iter().map(|&value| u64::from(value)).collect(),
+    }
+}
+
+#[test]
+fn state_restore_preserves_all_storage_variants_and_exact_bits() {
+    use ft_core::{
+        BFloat16, Complex64, Complex128, DenseTensor, Device, Float16, TensorMeta, TensorStorage,
+    };
+    use std::sync::Arc;
+    let samples = vec![
+        TensorStorage::F64(Arc::new(vec![
+            1.0,
+            -0.0,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+            f64::INFINITY,
+        ])),
+        TensorStorage::F64Inline4([
+            1.0,
+            -0.0,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+            f64::NEG_INFINITY,
+        ]),
+        TensorStorage::F32(Arc::new(vec![
+            1.0,
+            -0.0,
+            f32::from_bits(0x7fc0_0042),
+            f32::INFINITY,
+        ])),
+        TensorStorage::F16(Arc::new(vec![
+            Float16::from_bits(0x3c00),
+            Float16::from_bits(0x8000),
+            Float16::from_bits(0x7e42),
+            Float16::from_bits(0x7c00),
+        ])),
+        TensorStorage::BF16(Arc::new(vec![
+            BFloat16::from_bits(0x3f80),
+            BFloat16::from_bits(0x8000),
+            BFloat16::from_bits(0x7fc2),
+            BFloat16::from_bits(0x7f80),
+        ])),
+        TensorStorage::Complex64(Arc::new(vec![
+            Complex64::new(1.0, -0.0),
+            Complex64::new(f32::from_bits(0x7fc0_0042), 2.0),
+            Complex64::new(f32::INFINITY, f32::NEG_INFINITY),
+            Complex64::new(-3.0, 4.0),
+        ])),
+        TensorStorage::Complex128(Arc::new(vec![
+            Complex128::new(1.0, -0.0),
+            Complex128::new(f64::from_bits(0x7ff8_0000_0000_0042), 2.0),
+            Complex128::new(f64::INFINITY, f64::NEG_INFINITY),
+            Complex128::new(-3.0, 4.0),
+        ])),
+        TensorStorage::QInt8(Arc::new(vec![-128, -3, 4, 127])),
+        TensorStorage::QUInt8(Arc::new(vec![0, 3, 4, 255])),
+    ];
+    assert_eq!(samples.len(), 9);
+    for storage in samples {
+        let dtype = storage.dtype();
+        let zeros = match &storage {
+            TensorStorage::F64(_) => TensorStorage::F64(Arc::new(vec![0.0; 4])),
+            TensorStorage::F64Inline4(_) => TensorStorage::F64Inline4([0.0; 4]),
+            TensorStorage::F32(_) => TensorStorage::F32(Arc::new(vec![0.0; 4])),
+            TensorStorage::F16(_) => TensorStorage::F16(Arc::new(vec![Float16::ZERO; 4])),
+            TensorStorage::BF16(_) => TensorStorage::BF16(Arc::new(vec![BFloat16::ZERO; 4])),
+            TensorStorage::Complex64(_) => {
+                TensorStorage::Complex64(Arc::new(vec![Complex64::new(0.0, 0.0); 4]))
+            }
+            TensorStorage::Complex128(_) => {
+                TensorStorage::Complex128(Arc::new(vec![Complex128::new(0.0, 0.0); 4]))
+            }
+            TensorStorage::QInt8(_) => TensorStorage::QInt8(Arc::new(vec![0; 4])),
+            TensorStorage::QUInt8(_) => TensorStorage::QUInt8(Arc::new(vec![0; 4])),
+        };
+        let meta = if dtype.is_quantized() {
+            TensorMeta::quantized_from_shape(vec![4], dtype, Device::Cpu, 0.25, 0).unwrap()
+        } else {
+            TensorMeta::from_shape(vec![4], dtype, Device::Cpu)
+        };
+        let source = DenseTensor::from_typed_storage(meta.clone(), storage).unwrap();
+        let zero = DenseTensor::from_typed_storage(meta.clone(), zeros).unwrap();
+        let expected = state_restore_storage_bits(&source);
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let source_node = session.tensor_variable_from_storage(source, false);
+        let target_node = session.tensor_variable_from_storage(zero.clone(), false);
+        let snapshot = session.tensor_snapshot(source_node).unwrap();
+        let before = session.tensor_snapshot(target_node).unwrap();
+        let node_count = session.autograd_graph_node_count();
+        assert_eq!(snapshot.meta(), &meta);
+        assert_ne!(state_restore_storage_bits(&before), expected);
+        session
+            .tensor_load_state(&[(target_node, snapshot.clone())])
+            .unwrap();
+        let after = session.tensor_snapshot(target_node).unwrap();
+        assert_eq!(state_restore_storage_bits(&after), expected, "{dtype:?}");
+        assert_eq!(after.meta(), &meta);
+        assert_eq!(after.id(), before.id());
+        assert_eq!(after.storage_id(), before.storage_id());
+        assert_eq!(after.version(), before.version() + 1);
+        assert_eq!(session.autograd_graph_node_count(), node_count);
+        assert!(session.is_grad_enabled());
+        session.tensor_load_state(&[(source_node, zero)]).unwrap();
+        assert_eq!(state_restore_storage_bits(&snapshot), expected);
+        assert_eq!(
+            state_restore_storage_bits(&session.tensor_snapshot(target_node).unwrap()),
+            expected
+        );
+        assert_eq!(session.autograd_graph_node_count(), node_count);
+    }
+}
+
+#[test]
+fn state_restore_copies_noncontiguous_views_in_logical_order() {
+    use ft_core::{DenseTensor, Device, TensorMeta};
+    let source_meta =
+        TensorMeta::from_shape_and_strides(vec![2, 2], vec![1, 2], 1, DType::F32, Device::Cpu)
+            .unwrap();
+    let target_meta =
+        TensorMeta::from_shape_and_strides(vec![2, 2], vec![3, 1], 1, DType::F32, Device::Cpu)
+            .unwrap();
+    let source =
+        DenseTensor::from_storage_f32(source_meta.clone(), vec![99.0, 1.0, 2.0, 3.0, 4.0, 99.0])
+            .unwrap();
+    let target = DenseTensor::from_storage_f32(target_meta.clone(), vec![88.0; 8]).unwrap();
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let source_node = session.tensor_variable_from_storage(source, false);
+    let target_node = session.tensor_variable_from_storage(target, false);
+    let snapshot = session.tensor_snapshot(source_node).unwrap();
+    let before = session.tensor_snapshot(target_node).unwrap();
+    let node_count = session.autograd_graph_node_count();
+    assert_eq!(snapshot.meta(), &source_meta);
+    session.no_grad_enter();
+    session
+        .tensor_load_state(&[(target_node, snapshot)])
+        .unwrap();
+    assert!(!session.is_grad_enabled());
+    session.no_grad_exit();
+    assert!(session.is_grad_enabled());
+    let restored = session.tensor_snapshot(target_node).unwrap();
+    assert_eq!(restored.meta(), &target_meta);
+    assert_eq!(restored.id(), before.id());
+    assert_eq!(restored.storage_id(), before.storage_id());
+    assert_eq!(restored.version(), before.version() + 1);
+    assert_eq!(session.autograd_graph_node_count(), node_count);
+    assert_eq!(
+        restored.typed_storage().as_f32().unwrap(),
+        &[88.0, 1.0, 3.0, 88.0, 2.0, 4.0, 88.0, 88.0]
+    );
+}
+
+#[test]
+fn state_restore_late_overlap_error_is_atomic_and_preserves_grad_mode() {
+    use ft_autograd::AutogradError;
+    use ft_core::{DenseTensor, DenseTensorError, Device, TensorMeta};
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let first = session
+        .tensor_variable(vec![7.0, 8.0], vec![2], true)
+        .unwrap();
+    let overlapping_meta =
+        TensorMeta::from_shape_and_strides(vec![2], vec![0], 0, DType::F64, Device::Cpu).unwrap();
+    let second = session.tensor_variable_from_storage(
+        DenseTensor::from_storage(overlapping_meta, vec![9.0]).unwrap(),
+        false,
+    );
+    let before_first = session.tensor_snapshot(first).unwrap();
+    let before_second = session.tensor_snapshot(second).unwrap();
+    let updates = vec![
+        (
+            first,
+            DenseTensor::from_contiguous_values(vec![1.0, 2.0], vec![2], Device::Cpu).unwrap(),
+        ),
+        (
+            second,
+            DenseTensor::from_contiguous_values(vec![3.0, 4.0], vec![2], Device::Cpu).unwrap(),
+        ),
+    ];
+    let node_count = session.autograd_graph_node_count();
+    for grad_enabled in [true, false] {
+        if !grad_enabled {
+            session.no_grad_enter();
+        }
+        assert!(matches!(
+            session.tensor_load_state(&updates),
+            Err(AutogradError::DenseTensor(
+                DenseTensorError::OverlappingLayout
+            ))
+        ));
+        assert_eq!(session.tensor_snapshot(first).unwrap(), before_first);
+        assert_eq!(session.tensor_snapshot(second).unwrap(), before_second);
+        assert_eq!(session.is_grad_enabled(), grad_enabled);
+        assert_eq!(session.autograd_graph_node_count(), node_count);
+        if !grad_enabled {
+            session.no_grad_exit();
+        }
+    }
+    assert!(session.is_grad_enabled());
+}
+
+#[test]
+fn state_restore_rejects_backward_through_stale_borrowed_forward() {
+    use ft_autograd::AutogradError;
+    use ft_core::{DenseTensor, Device};
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let parameter = session
+        .tensor_variable(vec![2.0, 3.0], vec![2], true)
+        .unwrap();
+    let version = session.tensor_snapshot(parameter).unwrap().version();
+    let square = session.tensor_mul(parameter, parameter).unwrap();
+    let loss = session.tensor_sum(square).unwrap();
+    let replacement =
+        DenseTensor::from_contiguous_values(vec![4.0, 5.0], vec![2], Device::Cpu).unwrap();
+    session
+        .tensor_load_state(&[(parameter, replacement)])
+        .unwrap();
+    let result = session.tensor_backward(loss);
+    assert!(result.is_err(), "stale forward result: {result:?}");
+    assert!(matches!(
+        result,
+        Err(AutogradError::BorrowedInputVersionMismatch { node, recorded, observed, })
+            if node == parameter && recorded == version && observed == version + 1
+    ));
 }

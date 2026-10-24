@@ -4326,6 +4326,8 @@ pub struct TensorTape {
     /// backward time, which is what makes a mutation in between observable — and,
     /// before this guard, silent.
     custom_function_input_versions: BTreeMap<usize, Vec<(TensorNodeId, u64)>>,
+    /// Versions needed by native Mul/Div derivatives, keyed by output node.
+    native_binary_input_versions: BTreeMap<usize, Vec<(TensorNodeId, u64)>>,
     next_custom_function_id: usize,
     retains_grad: BTreeSet<usize>,
     /// Anomaly detection mode: when enabled, backward checks for NaN/Inf gradients.
@@ -4382,6 +4384,7 @@ impl Default for TensorTape {
             grad_enabled: true,
             custom_functions: BTreeMap::new(),
             custom_function_input_versions: BTreeMap::new(),
+            native_binary_input_versions: BTreeMap::new(),
             next_custom_function_id: 0,
             retains_grad: BTreeSet::new(),
             detect_anomaly: false,
@@ -4475,6 +4478,8 @@ impl TensorTape {
             .retain(|id, _| live_functions.contains(id));
         self.custom_function_input_versions
             .retain(|id, _| live_functions.contains(id));
+        self.native_binary_input_versions
+            .retain(|&id, _| id < boundary);
         self.persistent_grads.retain(|&id, _| id < boundary);
         self.tensor_hooks.retain(|&id, _| id < boundary);
         self.retains_grad.retain(|&id| id < boundary);
@@ -11790,6 +11795,44 @@ impl TensorTape {
         self.expand(node, target.to_vec())
     }
 
+    fn record_native_binary_versions(
+        &mut self,
+        output: TensorNodeId,
+        op: BinaryOp,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        if !matches!(op, BinaryOp::Mul | BinaryOp::Div) || !self.node(output)?.requires_grad {
+            return Ok(());
+        }
+        let lhs_needs_grad = self.node(lhs)?.requires_grad;
+        let rhs_needs_grad = self.node(rhs)?.requires_grad;
+        let mut inputs = Vec::with_capacity(2);
+        // Both rhs derivatives use lhs. A frozen lhs must still be saved
+        // when it determines the gradient of a trainable rhs.
+        if rhs_needs_grad {
+            inputs.push(lhs);
+        }
+        // Mul's lhs derivative uses rhs; both Div derivatives use rhs.
+        if (lhs_needs_grad || (op == BinaryOp::Div && rhs_needs_grad)) && !inputs.contains(&rhs) {
+            inputs.push(rhs);
+        }
+        if !inputs.is_empty() {
+            let versions = self.borrowed_input_versions(&inputs)?;
+            self.native_binary_input_versions.insert(output.0, versions);
+        }
+        Ok(())
+    }
+
+    fn assert_native_binary_versions(&self, reachable: &[bool]) -> Result<(), AutogradError> {
+        for (&output, versions) in &self.native_binary_input_versions {
+            if reachable.get(output).copied().unwrap_or(false) {
+                Self::assert_borrowed_versions(&self.nodes, Some(versions))?;
+            }
+        }
+        Ok(())
+    }
+
     fn binary(
         &mut self,
         op: BinaryOp,
@@ -11904,6 +11947,8 @@ impl TensorTape {
             },
         });
 
+        self.record_native_binary_versions(out, op, lhs, rhs)?;
+
         Ok((
             out,
             TensorOperationEvent {
@@ -11961,6 +12006,7 @@ impl TensorTape {
             .current_reentrant_depth
             .min(options.max_reentrant_depth);
         let reachable = self.compute_reachable(root)?;
+        self.assert_native_binary_versions(&reachable)?;
         let mut pending = self.compute_dependencies(&reachable)?;
         let dependency_snapshot = pending.clone();
 
@@ -16283,6 +16329,7 @@ impl TensorTape {
         let orig_node_count = self.nodes.len();
 
         let reachable = self.compute_reachable(root)?;
+        self.assert_native_binary_versions(&reachable)?;
         let mut pending = self.compute_dependencies(&reachable)?;
 
         // Gradient node IDs: each entry is a TensorNodeId representing the gradient
@@ -19207,6 +19254,7 @@ impl TensorTape {
             requires_grad,
             op: TensorNodeOp::Mul { lhs, rhs },
         });
+        self.record_native_binary_versions(out, BinaryOp::Mul, lhs, rhs)?;
         Ok(out)
     }
 
@@ -19626,6 +19674,7 @@ impl TensorTape {
             requires_grad,
             op: TensorNodeOp::Div { lhs, rhs },
         });
+        self.record_native_binary_versions(out, BinaryOp::Div, lhs, rhs)?;
         Ok(out)
     }
 
@@ -31711,6 +31760,135 @@ mod tests {
     }
 
     // ── to_dtype tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn native_mul_div_reject_modified_values_in_both_backward_modes() {
+        use ft_dispatch::BinaryOp;
+        for op in [BinaryOp::Mul, BinaryOp::Div] {
+            for change_rhs in [false, true] {
+                for create_graph in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let a = tape.leaf(vec![2.0, 3.0], vec![2], true).unwrap();
+                    let b = tape.leaf(vec![4.0, 5.0], vec![2], true).unwrap();
+                    let boundary = tape.node_count();
+                    let (out, _) = tape.binary(op, a, b, ExecutionMode::Strict).unwrap();
+                    let (loss, _) = tape.sum(out, ExecutionMode::Strict).unwrap();
+                    let changed = if change_rhs { b } else { a };
+                    tape.update_tensor_values(changed, vec![8.0, 9.0]).unwrap();
+                    let error = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions {
+                                create_graph,
+                                ..BackwardOptions::strict_default()
+                            },
+                        )
+                        .unwrap_err();
+                    assert!(
+                        matches!(error,
+                            AutogradError::BorrowedInputVersionMismatch {
+                                node, recorded: 0, observed: 1
+                            } if node == changed
+                        ),
+                        "{op:?}, create_graph={create_graph}: {error:?}"
+                    );
+                    tape.truncate_graph_to(boundary);
+                    let (fresh, _) = tape.add(a, b, ExecutionMode::Strict).unwrap();
+                    assert_eq!(fresh, out);
+                    let report = tape.backward(fresh).unwrap();
+                    assert_eq!(report.gradient(a), Some(&[1.0, 1.0][..]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_mul_div_guard_frozen_operands_used_by_gradients() {
+        use ft_dispatch::BinaryOp;
+        for op in [BinaryOp::Mul, BinaryOp::Div] {
+            for train_rhs in [false, true] {
+                let mut tape = TensorTape::new();
+                let a = tape.leaf(vec![2.0, 3.0], vec![2], !train_rhs).unwrap();
+                let b = tape.leaf(vec![4.0, 5.0], vec![2], train_rhs).unwrap();
+                let (out, _) = tape.binary(op, a, b, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(out, ExecutionMode::Strict).unwrap();
+                let frozen = if train_rhs { a } else { b };
+                tape.update_tensor_values(frozen, vec![7.0, 8.0]).unwrap();
+                let error = tape.backward(loss).unwrap_err();
+                assert!(
+                    matches!(error,
+                        AutogradError::BorrowedInputVersionMismatch { node, .. } if node == frozen
+                    ),
+                    "{op:?}, train_rhs={train_rhs}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_binary_allows_mutation_when_derivatives_do_not_use_values() {
+        use ft_dispatch::BinaryOp;
+        for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div] {
+            let mut tape = TensorTape::new();
+            let both_train = matches!(op, BinaryOp::Add | BinaryOp::Sub);
+            let a = tape.leaf(vec![2.0, 3.0], vec![2], true).unwrap();
+            let b = tape.leaf(vec![4.0, 5.0], vec![2], both_train).unwrap();
+            let (out, _) = tape.binary(op, a, b, ExecutionMode::Strict).unwrap();
+            let (loss, _) = tape.sum(out, ExecutionMode::Strict).unwrap();
+            tape.update_tensor_values(a, vec![9.0, 10.0]).unwrap();
+            if both_train {
+                tape.update_tensor_values(b, vec![11.0, 12.0]).unwrap();
+            }
+            let report = tape.backward(loss).unwrap();
+            let expected = match op {
+                BinaryOp::Mul => [4.0, 5.0],
+                BinaryOp::Div => [0.25, 0.2],
+                _ => [1.0, 1.0],
+            };
+            assert_eq!(report.gradient(a), Some(expected.as_slice()), "{op:?}");
+            if both_train {
+                let expected_b = if op == BinaryOp::Sub {
+                    [-1.0, -1.0]
+                } else {
+                    [1.0, 1.0]
+                };
+                assert_eq!(report.gradient(b), Some(expected_b.as_slice()));
+            } else {
+                assert!(report.gradient(b).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn native_binary_guards_nodes_created_by_differentiable_backward() {
+        for differentiate_lhs in [false, true] {
+            let mut tape = TensorTape::new();
+            let a = tape.leaf(vec![2.0, 3.0], vec![2], true).unwrap();
+            let b = tape.leaf(vec![4.0, 5.0], vec![2], true).unwrap();
+            let (quotient, _) = tape.div(a, b, ExecutionMode::Strict).unwrap();
+            let (loss, _) = tape.sum(quotient, ExecutionMode::Strict).unwrap();
+            let first = tape
+                .backward_with_options(
+                    loss,
+                    BackwardOptions {
+                        create_graph: true,
+                        retain_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .unwrap();
+            let parameter = if differentiate_lhs { a } else { b };
+            let derivative = first.gradient_node(parameter).unwrap();
+            tape.update_tensor_values(b, vec![8.0, 10.0]).unwrap();
+            let error = tape.backward(derivative).unwrap_err();
+            assert!(
+                matches!(error,
+                    AutogradError::BorrowedInputVersionMismatch { node, .. } if node == b
+                ),
+                "differentiate_lhs={differentiate_lhs}: {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn to_dtype_f64_to_f32() {
