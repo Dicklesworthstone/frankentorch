@@ -1660,7 +1660,8 @@ impl FrankenTorchSession {
     /// During backward, the function is re-executed with gradients enabled
     /// to recompute activations and then compute gradients normally.
     ///
-    /// Equivalent to `torch.utils.checkpoint.checkpoint(function, *inputs)`.
+    /// Supports first-order gradients. Higher-order differentiation with
+    /// `create_graph` is explicitly unsupported.
     ///
     /// The session's random state, execution mode, device context, and autocast
     /// context are replayed during recomputation. Tensor inputs retain their

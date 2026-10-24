@@ -631,21 +631,9 @@ fn collect_state_targets(
 
 fn snapshot_tensor_for_state_dict(
     session: &FrankenTorchSession,
-    key: &str,
     node: TensorNodeId,
 ) -> Result<DenseTensor, StateDictError> {
-    let (values_f64, meta) = session.tensor_values_meta(node)?;
-    match meta.dtype() {
-        DType::F64 => DenseTensor::from_storage(meta, values_f64).map_err(StateDictError::from),
-        DType::F32 => {
-            let values_f32 = session.tensor_values_f32(node)?;
-            DenseTensor::from_storage_f32(meta, values_f32).map_err(StateDictError::from)
-        }
-        other => Err(StateDictError::UnsupportedDType {
-            key: key.to_string(),
-            dtype: other,
-        }),
-    }
+    session.tensor_snapshot(node).map_err(StateDictError::from)
 }
 
 pub fn module_state_dict(
@@ -655,7 +643,7 @@ pub fn module_state_dict(
     let targets = collect_state_targets(module)?;
     let mut state = StateDict::new();
     for (name, node) in targets {
-        let snapshot = snapshot_tensor_for_state_dict(session, name.as_str(), node)?;
+        let snapshot = snapshot_tensor_for_state_dict(session, node)?;
         if state.insert(name.clone(), snapshot).is_some() {
             return Err(StateDictError::DuplicateStateKey { key: name });
         }
@@ -703,7 +691,8 @@ pub fn module_load_state_dict(
         let Some(source_tensor) = state.get(name) else {
             continue;
         };
-        let (_, target_meta) = session.tensor_values_meta(*target_node)?;
+        let target = session.tensor_snapshot(*target_node)?;
+        let target_meta = target.meta();
         let source_meta = source_tensor.meta();
         if target_meta.shape() != source_meta.shape() {
             return Err(StateDictError::ShapeMismatch {
@@ -722,13 +711,7 @@ pub fn module_load_state_dict(
         updates.push((*target_node, source_tensor.clone()));
     }
 
-    session.no_grad_enter();
-    for (target_node, source_tensor) in updates {
-        let source_node = session.tensor_variable_from_storage(source_tensor, false);
-        session.tensor_zero_(target_node)?;
-        session.tensor_add_(target_node, source_node)?;
-    }
-    session.no_grad_exit();
+    session.tensor_load_state(&updates)?;
 
     Ok(LoadStateDictReport {
         missing_keys,
@@ -962,6 +945,66 @@ impl Linear {
         })
     }
 
+    /// Create a Linear layer from existing F32 or F64 leaf parameters.
+    ///
+    /// The weight must have shape `[out_features, in_features]` with
+    /// `in_features > 0`. An optional bias must have shape `[out_features]`
+    /// and the same dtype and device as the weight. Frozen leaf parameters
+    /// are accepted. Parameter IDs, values and gradient requirements are
+    /// preserved; this constructor adds no graph nodes and consumes no RNG.
+    pub fn from_parameters(
+        session: &FrankenTorchSession,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+    ) -> Result<Self, AutogradError> {
+        let weight_shape = session.tensor_shape(weight)?;
+        let [out_features, in_features] = weight_shape.as_slice() else {
+            return Err(incompatible_error(
+                "linear weight must have shape [out_features, in_features]",
+            ));
+        };
+        let (out_features, in_features) = (*out_features, *in_features);
+        if in_features == 0 {
+            return Err(incompatible_error("linear layer requires in_features > 0"));
+        }
+        let dtype = session.tensor_dtype(weight)?;
+        if !matches!(dtype, DType::F32 | DType::F64) {
+            return Err(incompatible_error(
+                "linear parameters must use F32 or F64 storage",
+            ));
+        }
+        if !session.tensor_is_leaf(weight)? {
+            return Err(incompatible_error("linear weight must be a leaf tensor"));
+        }
+        let device = session.tensor_device(weight)?;
+        if let Some(bias) = bias {
+            if session.tensor_shape(bias)?.as_slice() != [out_features] {
+                return Err(incompatible_error(
+                    "linear bias must have shape [out_features]",
+                ));
+            }
+            if session.tensor_dtype(bias)? != dtype {
+                return Err(incompatible_error(
+                    "linear weight and bias must have the same dtype",
+                ));
+            }
+            if session.tensor_device(bias)? != device {
+                return Err(incompatible_error(
+                    "linear weight and bias must have the same device",
+                ));
+            }
+            if !session.tensor_is_leaf(bias)? {
+                return Err(incompatible_error("linear bias must be a leaf tensor"));
+            }
+        }
+        Ok(Self {
+            weight,
+            bias,
+            in_features,
+            out_features,
+        })
+    }
+
     /// Access the weight parameter node ID.
     #[must_use]
     pub fn weight(&self) -> TensorNodeId {
@@ -1069,6 +1112,9 @@ impl Module for Linear {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if session.is_autocast_enabled() {
+            return session.functional_linear(input, self.weight, self.bias);
+        }
         if let Some(output) = self.no_grad_f64_fast_path(session, input)? {
             return Ok(output);
         }
@@ -1080,10 +1126,7 @@ impl Module for Linear {
 
         match self.bias {
             Some(bias) => {
-                let out_shape = {
-                    let (_, meta) = session.tensor_values_meta(output)?;
-                    meta.shape().to_vec()
-                };
+                let out_shape = session.tensor_shape(output)?;
                 // bias is 1-D [out_features]; reshape to a rank-matched
                 // broadcast shape (1s in the leading dims) before
                 // expanding. `tensor_expand` only stretches size-1 dims;
@@ -31020,6 +31063,378 @@ mod tests {
             dense_values_f64(restored.get("bias").expect("bias")),
             dense_values_f64(original.get("bias").expect("bias"))
         );
+    }
+
+    fn model_state_storage_bits(tensor: &DenseTensor) -> Vec<u64> {
+        use ft_core::TensorStorage;
+        match tensor.typed_storage() {
+            TensorStorage::F64(values) => values.iter().map(|value| value.to_bits()).collect(),
+            TensorStorage::F64Inline4(values) => {
+                values.iter().map(|value| value.to_bits()).collect()
+            }
+            TensorStorage::F32(values) => values
+                .iter()
+                .map(|value| u64::from(value.to_bits()))
+                .collect(),
+            TensorStorage::F16(values) => values
+                .iter()
+                .map(|value| u64::from(value.to_bits()))
+                .collect(),
+            TensorStorage::BF16(values) => values
+                .iter()
+                .map(|value| u64::from(value.to_bits()))
+                .collect(),
+            TensorStorage::Complex64(values) => values
+                .iter()
+                .flat_map(|value| [u64::from(value.re.to_bits()), u64::from(value.im.to_bits())])
+                .collect(),
+            TensorStorage::Complex128(values) => values
+                .iter()
+                .flat_map(|value| [value.re.to_bits(), value.im.to_bits()])
+                .collect(),
+            TensorStorage::QInt8(values) => {
+                values.iter().map(|&value| u64::from(value as u8)).collect()
+            }
+            TensorStorage::QUInt8(values) => values.iter().map(|&value| u64::from(value)).collect(),
+        }
+    }
+
+    #[test]
+    fn model_state_roundtrip_preserves_all_storage_dtypes_and_exact_bits() {
+        use ft_core::{BFloat16, Complex64, Complex128, Float16, TensorStorage};
+        use std::sync::Arc;
+        let samples = vec![
+            TensorStorage::F64(Arc::new(vec![
+                1.0,
+                -0.0,
+                f64::from_bits(0x7ff8_0000_0000_0042),
+                f64::INFINITY,
+            ])),
+            TensorStorage::F64Inline4([
+                1.0,
+                -0.0,
+                f64::from_bits(0x7ff8_0000_0000_0042),
+                f64::NEG_INFINITY,
+            ]),
+            TensorStorage::F32(Arc::new(vec![
+                1.0,
+                -0.0,
+                f32::from_bits(0x7fc0_0042),
+                f32::INFINITY,
+            ])),
+            TensorStorage::F16(Arc::new(vec![
+                Float16::from_bits(0x3c00),
+                Float16::from_bits(0x8000),
+                Float16::from_bits(0x7e42),
+                Float16::from_bits(0x7c00),
+            ])),
+            TensorStorage::BF16(Arc::new(vec![
+                BFloat16::from_bits(0x3f80),
+                BFloat16::from_bits(0x8000),
+                BFloat16::from_bits(0x7fc2),
+                BFloat16::from_bits(0x7f80),
+            ])),
+            TensorStorage::Complex64(Arc::new(vec![
+                Complex64::new(1.0, -0.0),
+                Complex64::new(f32::from_bits(0x7fc0_0042), 2.0),
+                Complex64::new(f32::INFINITY, f32::NEG_INFINITY),
+                Complex64::new(-3.0, 4.0),
+            ])),
+            TensorStorage::Complex128(Arc::new(vec![
+                Complex128::new(1.0, -0.0),
+                Complex128::new(f64::from_bits(0x7ff8_0000_0000_0042), 2.0),
+                Complex128::new(f64::INFINITY, f64::NEG_INFINITY),
+                Complex128::new(-3.0, 4.0),
+            ])),
+            TensorStorage::QInt8(Arc::new(vec![-128, -3, 4, 127])),
+            TensorStorage::QUInt8(Arc::new(vec![0, 3, 4, 255])),
+        ];
+        for storage in samples {
+            let dtype = storage.dtype();
+            let zeros = match dtype {
+                DType::F64 => TensorStorage::F64(Arc::new(vec![0.0; 4])),
+                DType::F32 => TensorStorage::F32(Arc::new(vec![0.0; 4])),
+                DType::F16 => TensorStorage::F16(Arc::new(vec![Float16::ZERO; 4])),
+                DType::BF16 => TensorStorage::BF16(Arc::new(vec![BFloat16::ZERO; 4])),
+                DType::Complex64 => {
+                    TensorStorage::Complex64(Arc::new(vec![Complex64::new(0.0, 0.0); 4]))
+                }
+                DType::Complex128 => {
+                    TensorStorage::Complex128(Arc::new(vec![Complex128::new(0.0, 0.0); 4]))
+                }
+                DType::QInt8 => TensorStorage::QInt8(Arc::new(vec![0; 4])),
+                DType::QUInt8 => TensorStorage::QUInt8(Arc::new(vec![0; 4])),
+                _ => unreachable!(),
+            };
+            let meta = if dtype.is_quantized() {
+                TensorMeta::quantized_from_shape(vec![4], dtype, Device::Cpu, 0.25, 0).unwrap()
+            } else {
+                TensorMeta::from_shape(vec![4], dtype, Device::Cpu)
+            };
+            let source = DenseTensor::from_typed_storage(meta.clone(), storage).unwrap();
+            let zero = DenseTensor::from_typed_storage(meta.clone(), zeros).unwrap();
+            let expected = model_state_storage_bits(&source);
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let source_node = session.tensor_variable_from_storage(source, false);
+            let target_node = session.tensor_variable_from_storage(zero.clone(), false);
+            let source_module = ParameterList::new(vec![source_node]);
+            let target_module = ParameterList::new(vec![target_node]);
+            let snapshot = source_module.state_dict(&session).unwrap();
+            let typed: BTreeMap<_, _> = snapshot
+                .iter()
+                .map(|(name, tensor)| {
+                    (
+                        name.clone(),
+                        ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                    )
+                })
+                .collect();
+            let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+            let state = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+            let before = session.tensor_snapshot(target_node).unwrap();
+            let count = session.autograd_graph_node_count();
+            assert_ne!(model_state_storage_bits(&before), expected);
+            target_module
+                .load_state_dict(&mut session, &state, true)
+                .unwrap();
+            let after = session.tensor_snapshot(target_node).unwrap();
+            assert_eq!(model_state_storage_bits(&after), expected, "{dtype:?}");
+            assert_eq!(after.meta(), &meta);
+            assert_eq!(after.id(), before.id());
+            assert_eq!(after.storage_id(), before.storage_id());
+            assert_eq!(after.version(), before.version() + 1);
+            assert_eq!(session.autograd_graph_node_count(), count);
+            assert!(session.is_grad_enabled());
+            session.tensor_load_state(&[(source_node, zero)]).unwrap();
+            assert_eq!(model_state_storage_bits(&snapshot["0"]), expected);
+            assert_eq!(model_state_storage_bits(&state["0"]), expected);
+            assert_eq!(
+                model_state_storage_bits(&session.tensor_snapshot(target_node).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn model_state_copies_noncontiguous_views_in_logical_order() {
+        let source_meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![1, 2], 1, DType::F32, Device::Cpu)
+                .unwrap();
+        let target_meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![3, 1], 1, DType::F32, Device::Cpu)
+                .unwrap();
+        let source = DenseTensor::from_storage_f32(
+            source_meta.clone(),
+            vec![99.0, 1.0, 2.0, 3.0, 4.0, 99.0],
+        )
+        .unwrap();
+        let target = DenseTensor::from_storage_f32(target_meta.clone(), vec![88.0; 8]).unwrap();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let source_node = session.tensor_variable_from_storage(source, false);
+        let target_node = session.tensor_variable_from_storage(target, false);
+        let source_module = ParameterList::new(vec![source_node]);
+        let target_module = ParameterList::new(vec![target_node]);
+        let state = source_module.state_dict(&session).unwrap();
+        assert_eq!(state["0"].meta(), &source_meta);
+        session.no_grad_enter();
+        target_module
+            .load_state_dict(&mut session, &state, true)
+            .unwrap();
+        assert!(!session.is_grad_enabled());
+        session.no_grad_exit();
+        let restored = session.tensor_snapshot(target_node).unwrap();
+        assert_eq!(restored.meta(), &target_meta);
+        assert_eq!(
+            restored.typed_storage().as_f32().unwrap(),
+            &[88.0, 1.0, 3.0, 88.0, 2.0, 4.0, 88.0, 88.0]
+        );
+    }
+
+    #[test]
+    fn model_state_rejects_overlapping_destination_atomically_and_restores_grad_mode() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let first = session
+            .tensor_variable(vec![7.0, 8.0], vec![2], true)
+            .unwrap();
+        let meta = TensorMeta::from_shape_and_strides(vec![2], vec![0], 0, DType::F64, Device::Cpu)
+            .unwrap();
+        let second = session.tensor_variable_from_storage(
+            DenseTensor::from_storage(meta, vec![9.0]).unwrap(),
+            false,
+        );
+        let model = ParameterList::new(vec![first, second]);
+        let before = model.state_dict(&session).unwrap();
+        let state = BTreeMap::from([
+            (
+                "0".to_string(),
+                DenseTensor::from_contiguous_values(vec![1.0, 2.0], vec![2], Device::Cpu).unwrap(),
+            ),
+            (
+                "1".to_string(),
+                DenseTensor::from_contiguous_values(vec![3.0, 4.0], vec![2], Device::Cpu).unwrap(),
+            ),
+        ]);
+        let count = session.autograd_graph_node_count();
+        for grad_enabled in [true, false] {
+            if !grad_enabled {
+                session.no_grad_enter();
+            }
+            assert!(matches!(
+                model.load_state_dict(&mut session, &state, true),
+                Err(StateDictError::Autograd(AutogradError::DenseTensor(
+                    DenseTensorError::OverlappingLayout
+                )))
+            ));
+            assert_eq!(model.state_dict(&session).unwrap(), before);
+            assert_eq!(session.is_grad_enabled(), grad_enabled);
+            assert_eq!(session.autograd_graph_node_count(), count);
+            if !grad_enabled {
+                session.no_grad_exit();
+            }
+        }
+    }
+
+    #[test]
+    fn model_state_restore_invalidates_preexisting_forward_graphs() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session
+            .tensor_variable(vec![2.0, 3.0], vec![2], true)
+            .unwrap();
+        let square = session.tensor_mul(param, param).unwrap();
+        let loss = session.tensor_sum(square).unwrap();
+        let state = BTreeMap::from([(
+            "0".to_string(),
+            DenseTensor::from_contiguous_values(vec![4.0, 5.0], vec![2], Device::Cpu).unwrap(),
+        )]);
+        ParameterList::new(vec![param])
+            .load_state_dict(&mut session, &state, true)
+            .unwrap();
+        assert!(session.tensor_backward(loss).is_err());
+    }
+
+    #[test]
+    fn linear_autocast_preserves_bias_and_parameter_gradients() {
+        for dtype in [DType::F16, DType::BF16] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let weight = session
+                .tensor_variable_f32(vec![1.0, 2.0, -1.0, 0.5], vec![2, 2], true)
+                .unwrap();
+            let bias = session
+                .tensor_variable_f32(vec![0.25, -0.5], vec![2], true)
+                .unwrap();
+            let input = session
+                .tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2], true)
+                .unwrap();
+            let layer = Linear::from_parameters(&session, weight, Some(bias)).unwrap();
+            let output = session
+                .with_autocast(dtype, |session| layer.forward(session, input))
+                .unwrap();
+            assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+            assert_eq!(session.tensor_shape(output).unwrap(), vec![1, 2, 2]);
+            assert_eq!(
+                session.tensor_values_lossy_f64(output).unwrap(),
+                vec![5.25, -0.5, 11.25, -1.5]
+            );
+            let output = session.tensor_to_dtype(output, DType::F32).unwrap();
+            let loss = session.tensor_sum(output).unwrap();
+            session.tensor_backward(loss).unwrap();
+            assert_eq!(
+                session.tensor_grad(weight).unwrap().unwrap(),
+                vec![4.0, 6.0, 4.0, 6.0]
+            );
+            assert_eq!(session.tensor_grad(bias).unwrap().unwrap(), vec![2.0, 2.0]);
+            assert_eq!(
+                session.tensor_grad(input).unwrap().unwrap(),
+                vec![0.0, 2.5, 0.0, 2.5]
+            );
+        }
+    }
+
+    #[test]
+    fn linear_from_parameters_validates_without_mutating_session() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight = session
+            .tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let bias = session
+            .tensor_variable_f32(vec![0.25, -0.5], vec![2], true)
+            .unwrap();
+        let rank_one_weight = session
+            .tensor_variable_f32(vec![1.0, 2.0], vec![2], true)
+            .unwrap();
+        let empty_input_weight = session
+            .tensor_variable_f32(vec![], vec![2, 0], false)
+            .unwrap();
+        let wrong_bias_shape = session
+            .tensor_variable_f32(vec![0.0, 0.0], vec![1, 2], true)
+            .unwrap();
+        let wrong_bias_length = session
+            .tensor_variable_f32(vec![0.0], vec![1], true)
+            .unwrap();
+        let wrong_bias_dtype = session
+            .tensor_variable(vec![0.0, 0.0], vec![2], true)
+            .unwrap();
+        let nonleaf_weight = session.tensor_mul(weight, weight).unwrap();
+        let nonleaf_bias = session.tensor_add(bias, bias).unwrap();
+        let half_weight = session.tensor_to_dtype(weight, DType::F16).unwrap();
+        let other_device_bias = session.tensor_variable_from_storage(
+            DenseTensor::from_storage_f32(
+                TensorMeta::from_shape(vec![2], DType::F32, Device::Metal),
+                vec![0.0, 0.0],
+            )
+            .unwrap(),
+            false,
+        );
+        let frozen_weight = session
+            .tensor_variable(vec![2.0, -1.0], vec![1, 2], false)
+            .unwrap();
+        let zero_output_weight = session
+            .tensor_variable_f32(vec![], vec![0, 2], false)
+            .unwrap();
+        let zero_output_bias = session.tensor_variable_f32(vec![], vec![0], false).unwrap();
+        let before_weight = session.tensor_snapshot(weight).unwrap();
+        let before_bias = session.tensor_snapshot(bias).unwrap();
+        let node_count = session.autograd_graph_node_count();
+
+        let layer = Linear::from_parameters(&session, weight, Some(bias)).unwrap();
+        assert_eq!(layer.weight(), weight);
+        assert_eq!(layer.bias(), Some(bias));
+        assert_eq!(layer.in_features(), 2);
+        assert_eq!(layer.out_features(), 2);
+        assert_eq!(layer.parameters(), vec![weight, bias]);
+
+        let frozen = Linear::from_parameters(&session, frozen_weight, None).unwrap();
+        assert_eq!(frozen.weight(), frozen_weight);
+        assert_eq!(frozen.bias(), None);
+        assert!(!session.tensor_requires_grad(frozen.weight()).unwrap());
+        let zero_output =
+            Linear::from_parameters(&session, zero_output_weight, Some(zero_output_bias)).unwrap();
+        assert_eq!(zero_output.in_features(), 2);
+        assert_eq!(zero_output.out_features(), 0);
+
+        let unknown = TensorNodeId(usize::MAX);
+        for (candidate_weight, candidate_bias) in [
+            (rank_one_weight, None),
+            (empty_input_weight, None),
+            (weight, Some(wrong_bias_shape)),
+            (weight, Some(wrong_bias_length)),
+            (weight, Some(wrong_bias_dtype)),
+            (weight, Some(other_device_bias)),
+            (nonleaf_weight, Some(bias)),
+            (weight, Some(nonleaf_bias)),
+            (half_weight, None),
+            (unknown, None),
+            (weight, Some(unknown)),
+        ] {
+            assert!(Linear::from_parameters(&session, candidate_weight, candidate_bias).is_err());
+        }
+
+        assert_eq!(session.tensor_snapshot(weight).unwrap(), before_weight);
+        assert_eq!(session.tensor_snapshot(bias).unwrap(), before_bias);
+        assert_eq!(session.autograd_graph_node_count(), node_count);
+        assert!(session.tensor_requires_grad(weight).unwrap());
+        assert!(session.tensor_requires_grad(bias).unwrap());
+        assert!(session.is_grad_enabled());
     }
 
     #[test]
