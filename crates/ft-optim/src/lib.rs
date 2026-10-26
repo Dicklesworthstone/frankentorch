@@ -63,6 +63,9 @@ pub enum OptimizerState {
     Sgd(SgdState),
     Adam(AdamState),
     AdamW(AdamState),
+    Rmsprop(RmspropState),
+    Adagrad(AdagradState),
+    RAdam(RadamState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +101,67 @@ pub struct AdamParameterState {
     pub exp_avg: Vec<f64>,
     pub exp_avg_sq: Vec<f64>,
     pub max_exp_avg_sq: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RmspropState {
+    pub lr: f64,
+    pub alpha: f64,
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub momentum: f64,
+    pub centered: bool,
+    pub maximize: bool,
+    pub parameters: Vec<Option<RmspropParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RmspropParameterState {
+    pub step: u64,
+    pub square_avg: Vec<f64>,
+    pub grad_avg: Option<Vec<f64>>,
+    pub momentum_buffer: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdagradState {
+    pub lr: f64,
+    pub lr_decay: f64,
+    pub weight_decay: f64,
+    pub initial_accumulator_value: f64,
+    pub eps: f64,
+    pub maximize: bool,
+    pub parameters: Vec<Option<AdagradParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdagradParameterState {
+    pub step: u64,
+    pub sum: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadamState {
+    pub lr: f64,
+    pub betas: [f64; 2],
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub decoupled_weight_decay: bool,
+    pub maximize: bool,
+    pub parameters: Vec<Option<RadamParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadamParameterState {
+    pub step: u64,
+    pub exp_avg: Vec<f64>,
+    pub exp_avg_sq: Vec<f64>,
 }
 
 fn optimizer_parameter_metadata(
@@ -252,6 +316,104 @@ fn validate_adam_state_buffers(state: &AdamState, sizes: &[usize]) -> Result<(),
     Ok(())
 }
 
+fn validate_nonnegative_optimizer_buffer(
+    values: &[f64],
+    numel: usize,
+) -> Result<(), AutogradError> {
+    validate_optimizer_buffer(values, numel)?;
+    if values.iter().any(|&value| value < 0.0) {
+        return Err(optimizer_state_error(
+            "optimizer state has a negative squared-gradient accumulator",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rmsprop_state_buffers(
+    state: &RmspropState,
+    sizes: &[usize],
+) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "rmsprop state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized rmsprop state requires a positive step",
+            ));
+        }
+        validate_nonnegative_optimizer_buffer(&parameter.square_avg, numel)?;
+        match &parameter.grad_avg {
+            Some(values) => validate_optimizer_buffer(values, numel)?,
+            None if state.centered => {
+                return Err(optimizer_state_error(
+                    "centered rmsprop state is missing gradient averages",
+                ));
+            }
+            None => {}
+        }
+        match &parameter.momentum_buffer {
+            Some(values) => validate_optimizer_buffer(values, numel)?,
+            None if state.momentum > 0.0 => {
+                return Err(optimizer_state_error(
+                    "rmsprop state is missing momentum buffers",
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_adagrad_state_buffers(
+    state: &AdagradState,
+    sizes: &[usize],
+) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "adagrad state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized adagrad state requires a positive step",
+            ));
+        }
+        validate_nonnegative_optimizer_buffer(&parameter.sum, numel)?;
+    }
+    Ok(())
+}
+
+fn validate_radam_state_buffers(state: &RadamState, sizes: &[usize]) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "radam state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized radam state requires a positive step",
+            ));
+        }
+        validate_optimizer_buffer(&parameter.exp_avg, numel)?;
+        validate_nonnegative_optimizer_buffer(&parameter.exp_avg_sq, numel)?;
+    }
+    Ok(())
+}
+
 fn build_optimizer_state_dict(
     session: &FrankenTorchSession,
     params: &[TensorNodeId],
@@ -268,6 +430,9 @@ fn build_optimizer_state_dict(
         OptimizerState::Adam(state) | OptimizerState::AdamW(state) => {
             validate_adam_state_buffers(state, &sizes)?;
         }
+        OptimizerState::Rmsprop(state) => validate_rmsprop_state_buffers(state, &sizes)?,
+        OptimizerState::Adagrad(state) => validate_adagrad_state_buffers(state, &sizes)?,
+        OptimizerState::RAdam(state) => validate_radam_state_buffers(state, &sizes)?,
     }
     Ok(result)
 }
@@ -1548,7 +1713,7 @@ pub struct RMSprop {
     momentum: f64,
     centered: bool,
     maximize: bool,
-    step_count: u64,
+    step_counts: Vec<u64>,
     /// Running average of squared gradients per parameter.
     square_avg: Vec<Option<Vec<f64>>>,
     /// Running average of gradients (only used when centered=true).
@@ -1572,7 +1737,7 @@ impl RMSprop {
             momentum: 0.0,
             centered: false,
             maximize: false,
-            step_count: 0,
+            step_counts: vec![0; n],
             square_avg: vec![None; n],
             grad_avg: vec![None; n],
             momentum_buffer: vec![None; n],
@@ -1652,6 +1817,91 @@ impl RMSprop {
 }
 
 impl Optimizer for RMSprop {
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [
+            self.step_counts.len(),
+            self.square_avg.len(),
+            self.grad_avg.len(),
+            self.momentum_buffer.len(),
+        ] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "rmsprop state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_counts
+            .iter()
+            .enumerate()
+            .map(|(index, &step)| match &self.square_avg[index] {
+                None if step == 0
+                    && self.grad_avg[index].is_none()
+                    && self.momentum_buffer[index].is_none() =>
+                {
+                    Ok(None)
+                }
+                Some(square_avg) => Ok(Some(RmspropParameterState {
+                    step,
+                    square_avg: square_avg.clone(),
+                    grad_avg: self.grad_avg[index].clone(),
+                    momentum_buffer: self.momentum_buffer[index].clone(),
+                })),
+                None => Err(optimizer_state_error(
+                    "rmsprop state has inconsistent buffers",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Rmsprop(RmspropState {
+                lr: self.lr,
+                alpha: self.alpha,
+                eps: self.eps,
+                weight_decay: self.weight_decay,
+                momentum: self.momentum,
+                centered: self.centered,
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Rmsprop(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_rmsprop_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .alpha(saved.alpha)
+            .eps(saved.eps)
+            .weight_decay(saved.weight_decay)
+            .momentum(saved.momentum)
+            .centered(saved.centered)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_counts[index] = parameter.step;
+                restored.square_avg[index] = Some(parameter.square_avg.clone());
+                restored.grad_avg[index] = parameter.grad_avg.clone();
+                restored.momentum_buffer[index] = parameter.momentum_buffer.clone();
+            }
+        }
+        *self = restored;
+        Ok(())
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -1666,8 +1916,6 @@ impl Optimizer for RMSprop {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-        self.step_count =
-            checked_next_step_count(self.step_count, "rmsprop step counter overflow")?;
 
         // Fused parallel fast path for the DEFAULT config (centered=false,
         // momentum=0 — torch defaults, the dominant case): one in-place traversal
@@ -1687,6 +1935,8 @@ impl Optimizer for RMSprop {
                 };
                 let param_len = session.tensor_values_len(param)?;
                 ensure_grad_len_matches_param(param, param_len, grad_len)?;
+                let next_step =
+                    checked_next_step_count(self.step_counts[i], "rmsprop step counter overflow")?;
                 let sq = self.square_avg[i].get_or_insert_with(|| vec![0.0; grad_len]);
                 ensure_state_len(
                     grad_len,
@@ -1722,6 +1972,7 @@ impl Optimizer for RMSprop {
                         }
                     },
                 )?;
+                self.step_counts[i] = next_step;
             }
             return Ok(());
         }
@@ -1732,8 +1983,10 @@ impl Optimizer for RMSprop {
                 None => continue,
             };
 
-            let param_values = session.tensor_values(param)?;
+            let param_values = session.tensor_values_lossy_f64(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
+            let next_step =
+                checked_next_step_count(self.step_counts[i], "rmsprop step counter overflow")?;
             let mut effective_grad = grad;
 
             // maximize: negate the gradient first (before weight decay), torch parity.
@@ -1808,6 +2061,7 @@ impl Optimizer for RMSprop {
                     .collect();
                 apply_param_update(session, param, &update)?;
             }
+            self.step_counts[i] = next_step;
         }
         Ok(())
     }
@@ -1830,7 +2084,7 @@ pub struct Adagrad {
     initial_accumulator_value: f64,
     eps: f64,
     maximize: bool,
-    step_count: u64,
+    step_counts: Vec<u64>,
     /// Sum of squared gradients per parameter.
     sum_sq: Vec<Option<Vec<f64>>>,
 }
@@ -1849,7 +2103,7 @@ impl Adagrad {
             initial_accumulator_value: 0.0,
             eps: 1e-10,
             maximize: false,
-            step_count: 0,
+            step_counts: vec![0; n],
             sum_sq: vec![None; n],
         }
     }
@@ -1919,6 +2173,75 @@ impl Adagrad {
 }
 
 impl Optimizer for Adagrad {
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [self.step_counts.len(), self.sum_sq.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "adagrad state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_counts
+            .iter()
+            .zip(&self.sum_sq)
+            .map(|(&step, sum)| match sum {
+                None if step == 0 => Ok(None),
+                Some(sum) => Ok(Some(AdagradParameterState {
+                    step,
+                    sum: sum.clone(),
+                })),
+                None => Err(optimizer_state_error(
+                    "adagrad state has inconsistent accumulators",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Adagrad(AdagradState {
+                lr: self.lr,
+                lr_decay: self.lr_decay,
+                weight_decay: self.weight_decay,
+                initial_accumulator_value: self.initial_accumulator_value,
+                eps: self.eps,
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Adagrad(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_adagrad_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .lr_decay(saved.lr_decay)
+            .weight_decay(saved.weight_decay)
+            .initial_accumulator_value(saved.initial_accumulator_value)
+            .eps(saved.eps)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_counts[index] = parameter.step;
+                restored.sum_sq[index] = Some(parameter.sum.clone());
+            }
+        }
+        *self = restored;
+        Ok(())
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -1933,11 +2256,6 @@ impl Optimizer for Adagrad {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-        self.step_count =
-            checked_next_step_count(self.step_count, "adagrad step counter overflow")?;
-
-        // Compute decayed learning rate: lr / (1 + (step - 1) * lr_decay)
-        let clr = self.lr / (1.0 + (self.step_count.saturating_sub(1) as f64) * self.lr_decay);
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad_len = match session.tensor_accumulated_gradient_len(param)? {
@@ -1946,6 +2264,13 @@ impl Optimizer for Adagrad {
             };
             let param_len = session.tensor_values_len(param)?;
             ensure_grad_len_matches_param(param, param_len, grad_len)?;
+
+            // PyTorch decays each parameter's learning rate by its own applied
+            // steps. A parameter which has never received a gradient must still
+            // take its first update at the initial learning rate.
+            let next_step =
+                checked_next_step_count(self.step_counts[i], "adagrad step counter overflow")?;
+            let clr = self.lr / (1.0 + ((next_step - 1) as f64) * self.lr_decay);
 
             let init_val = self.initial_accumulator_value;
             let ss = self.sum_sq[i].get_or_insert_with(|| vec![init_val; grad_len]);
@@ -1996,6 +2321,7 @@ impl Optimizer for Adagrad {
                     }
                 },
             )?;
+            self.step_counts[i] = next_step;
         }
         Ok(())
     }
@@ -2116,6 +2442,78 @@ impl RAdam {
 }
 
 impl Optimizer for RAdam {
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [self.step_counts.len(), self.m.len(), self.v.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "radam state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_counts
+            .iter()
+            .zip(&self.m)
+            .zip(&self.v)
+            .map(|((&step, first), second)| match (first, second) {
+                (None, None) if step == 0 => Ok(None),
+                (Some(first), Some(second)) => Ok(Some(RadamParameterState {
+                    step,
+                    exp_avg: first.clone(),
+                    exp_avg_sq: second.clone(),
+                })),
+                _ => Err(optimizer_state_error(
+                    "radam state has inconsistent moments",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::RAdam(RadamState {
+                lr: self.lr,
+                betas: [self.beta1, self.beta2],
+                eps: self.eps,
+                weight_decay: self.weight_decay,
+                decoupled_weight_decay: self.decoupled_weight_decay,
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::RAdam(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_radam_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .betas(saved.betas[0], saved.betas[1])
+            .eps(saved.eps)
+            .weight_decay(saved.weight_decay)
+            .decoupled_weight_decay(saved.decoupled_weight_decay)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_counts[index] = parameter.step;
+                restored.m[index] = Some(parameter.exp_avg.clone());
+                restored.v[index] = Some(parameter.exp_avg_sq.clone());
+            }
+        }
+        *self = restored;
+        Ok(())
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6750,16 +7148,29 @@ mod tests {
     fn assert_optimizer_checkpoint_resume(
         make_optimizer: impl Fn(Vec<TensorNodeId>, bool) -> Box<dyn Optimizer>,
     ) {
-        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for (mode, dtype) in [
+            (ExecutionMode::Strict, ft_core::DType::F64),
+            (ExecutionMode::Hardened, ft_core::DType::F64),
+            (ExecutionMode::Strict, ft_core::DType::F32),
+            (ExecutionMode::Hardened, ft_core::DType::F32),
+        ] {
             let mut uninterrupted = FrankenTorchSession::new(mode);
-            let params = vec![
-                uninterrupted
-                    .tensor_variable(vec![2.0, -3.0], vec![2], true)
-                    .unwrap(),
-                uninterrupted
-                    .tensor_variable(vec![0.75, -1.25], vec![1, 2], true)
-                    .unwrap(),
-            ];
+            let params: Vec<_> = [(vec![2.0, -3.0], vec![2]), (vec![0.75, -1.25], vec![1, 2])]
+                .into_iter()
+                .map(|(values, shape)| {
+                    if dtype == ft_core::DType::F32 {
+                        uninterrupted
+                            .tensor_variable_f32(
+                                values.into_iter().map(|value| value as f32).collect(),
+                                shape,
+                                true,
+                            )
+                            .unwrap()
+                    } else {
+                        uninterrupted.tensor_variable(values, shape, true).unwrap()
+                    }
+                })
+                .collect();
             let mut optimizer = make_optimizer(params.clone(), true);
             for round in 0..2 {
                 checkpoint_training_step(&mut uninterrupted, optimizer.as_mut(), &params, round);
@@ -6770,6 +7181,9 @@ mod tests {
                 OptimizerState::Adam(state) | OptimizerState::AdamW(state) => {
                     assert!(state.parameters[1].is_none());
                 }
+                OptimizerState::Rmsprop(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::Adagrad(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::RAdam(state) => assert!(state.parameters[1].is_none()),
             }
             let encoded = serde_json::to_vec(&saved).unwrap();
             let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
@@ -6782,13 +7196,10 @@ mod tests {
             let restored_params: Vec<_> = params
                 .iter()
                 .map(|&param| {
-                    resumed
-                        .tensor_variable(
-                            uninterrupted.tensor_values(param).unwrap(),
-                            uninterrupted.tensor_shape(param).unwrap(),
-                            true,
-                        )
-                        .unwrap()
+                    resumed.tensor_variable_from_storage(
+                        uninterrupted.tensor_snapshot(param).unwrap(),
+                        true,
+                    )
                 })
                 .collect();
             assert_ne!(params[0], restored_params[0]);
@@ -6800,13 +7211,13 @@ mod tests {
                 checkpoint_training_step(&mut resumed, restored.as_mut(), &restored_params, round);
                 for (&original, &copy) in params.iter().zip(&restored_params) {
                     let expected: Vec<_> = uninterrupted
-                        .tensor_values(original)
+                        .tensor_values_lossy_f64(original)
                         .unwrap()
                         .iter()
                         .map(|value| value.to_bits())
                         .collect();
                     let actual: Vec<_> = resumed
-                        .tensor_values(copy)
+                        .tensor_values_lossy_f64(copy)
                         .unwrap()
                         .iter()
                         .map(|value| value.to_bits())
@@ -6882,6 +7293,232 @@ mod tests {
                 };
                 Box::new(optimizer)
             });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_rmsprop_resume_preserves_centered_momentum_and_lazy_state() {
+        for (centered, momentum) in [(false, 0.0), (false, 0.8), (true, 0.0), (true, 0.8)] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    RMSprop::new(params, 0.03)
+                        .alpha(0.85)
+                        .eps(1e-4)
+                        .weight_decay(0.07)
+                        .momentum(momentum)
+                        .centered(centered)
+                        .maximize(centered)
+                } else {
+                    RMSprop::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adagrad_resume_preserves_per_parameter_decay_and_accumulators() {
+        for maximize in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    Adagrad::new(params, 0.03)
+                        .lr_decay(0.2)
+                        .initial_accumulator_value(0.4)
+                        .eps(1e-4)
+                        .weight_decay(0.07)
+                        .maximize(maximize)
+                } else {
+                    Adagrad::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_radam_resume_preserves_rectification_and_decay_mode() {
+        for decoupled in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    RAdam::new(params, 0.03)
+                        .betas(0.7, 0.99)
+                        .eps(1e-4)
+                        .weight_decay(0.07)
+                        .decoupled_weight_decay(decoupled)
+                        .maximize(decoupled)
+                } else {
+                    RAdam::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn adagrad_late_first_gradient_uses_initial_learning_rate() {
+        // PyTorch v2.9.0 torch/optim/adagrad.py increments state_steps only for
+        // parameters in params_with_grad, then uses lr / (1 + (step - 1)*decay).
+        // Two earlier updates to another parameter must not decay this one's LR.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let first = session.tensor_variable(vec![4.0], vec![1], true).unwrap();
+        let late = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut optimizer = Adagrad::new(vec![first, late], 0.3)
+            .lr_decay(0.5)
+            .initial_accumulator_value(0.25)
+            .eps(0.01);
+        for _ in 0..2 {
+            optimizer.zero_grad(&mut session).unwrap();
+            let loss = session.tensor_sum(first).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            optimizer.step(&mut session, &report).unwrap();
+        }
+        assert_eq!(optimizer.step_counts, vec![2, 0]);
+        assert!(optimizer.sum_sq[1].is_none());
+
+        optimizer.zero_grad(&mut session).unwrap();
+        let loss = session.tensor_sum(late).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        optimizer.step(&mut session, &report).unwrap();
+        let expected = 2.0 - 0.3 / (1.25_f64.sqrt() + 0.01);
+        assert!((session.tensor_values(late).unwrap()[0] - expected).abs() < 1e-14);
+        assert_eq!(optimizer.step_counts[1], 1);
+    }
+
+    #[test]
+    fn optimizer_checkpoint_rejects_invalid_adaptive_state_without_mutation() {
+        for algorithm in 0..3 {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let param = session
+                .tensor_variable(vec![2.0, -3.0], vec![2], true)
+                .unwrap();
+            let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                0 => Box::new(RMSprop::new(vec![param], 0.03).centered(true).momentum(0.8)),
+                1 => Box::new(Adagrad::new(vec![param], 0.03).lr_decay(0.2)),
+                _ => Box::new(RAdam::new(vec![param], 0.03)),
+            };
+            checkpoint_training_step(&mut session, optimizer.as_mut(), &[param], 0);
+            let before = optimizer.state_dict(&session).unwrap();
+            for case in 0..11 {
+                let mut invalid = before.clone();
+                match case {
+                    0 => invalid.version += 1,
+                    1 => invalid.parameters[0].shape = vec![1, 2],
+                    2 => invalid.parameters[0].dtype = ft_core::DType::F32,
+                    _ => match &mut invalid.state {
+                        OptimizerState::Rmsprop(state) => match case {
+                            3 => state.parameters.clear(),
+                            4 => state.lr = -1.0,
+                            10 => state.alpha = 1.0,
+                            _ => {
+                                let parameter = state.parameters[0].as_mut().unwrap();
+                                match case {
+                                    5 => parameter.square_avg[0] = f64::NAN,
+                                    6 => parameter.square_avg[0] = -1.0,
+                                    7 => parameter.step = 0,
+                                    8 => parameter.grad_avg = None,
+                                    9 => parameter.momentum_buffer = None,
+                                    _ => unreachable!(),
+                                }
+                            }
+                        },
+                        OptimizerState::Adagrad(state) => match case {
+                            3 => state.parameters.clear(),
+                            4 => state.lr = -1.0,
+                            8 => state.eps = 0.0,
+                            9 => state.initial_accumulator_value = -1.0,
+                            10 => state.lr_decay = f64::NAN,
+                            _ => {
+                                let parameter = state.parameters[0].as_mut().unwrap();
+                                match case {
+                                    5 => parameter.sum.clear(),
+                                    6 => parameter.sum[0] = -1.0,
+                                    7 => parameter.step = 0,
+                                    _ => unreachable!(),
+                                }
+                            }
+                        },
+                        OptimizerState::RAdam(state) => match case {
+                            3 => state.parameters.clear(),
+                            4 => state.lr = -1.0,
+                            8 => state.betas[0] = 1.0,
+                            9 => state.betas[1] = f64::NAN,
+                            10 => state.weight_decay = -1.0,
+                            _ => {
+                                let parameter = state.parameters[0].as_mut().unwrap();
+                                match case {
+                                    5 => parameter.exp_avg[0] = f64::INFINITY,
+                                    6 => parameter.exp_avg_sq[0] = -1.0,
+                                    7 => parameter.step = 0,
+                                    _ => unreachable!(),
+                                }
+                            }
+                        },
+                        _ => unreachable!(),
+                    },
+                }
+                assert!(
+                    optimizer.load_state_dict(&session, &invalid).is_err(),
+                    "algorithm {algorithm}, case {case}"
+                );
+                assert_eq!(
+                    optimizer.state_dict(&session).unwrap(),
+                    before,
+                    "algorithm {algorithm}, case {case}"
+                );
+            }
+            let wrong_algorithm = SGD::new(vec![param], 0.1).state_dict(&session).unwrap();
+            assert!(
+                optimizer
+                    .load_state_dict(&session, &wrong_algorithm)
+                    .is_err()
+            );
+            assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adaptive_integer_steps_roundtrip_and_fail_on_overflow() {
+        for algorithm in 0..3 {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                0 => Box::new(RMSprop::new(vec![param], 0.03)),
+                1 => Box::new(Adagrad::new(vec![param], 0.03)),
+                _ => Box::new(RAdam::new(vec![param], 0.03)),
+            };
+            checkpoint_training_step(&mut session, optimizer.as_mut(), &[param], 0);
+            let variant = match algorithm {
+                0 => "Rmsprop",
+                1 => "Adagrad",
+                _ => "RAdam",
+            };
+            let mut json = serde_json::to_value(optimizer.state_dict(&session).unwrap()).unwrap();
+            json["state"][variant]["parameters"][0]["unexpected"] = true.into();
+            assert!(serde_json::from_value::<OptimizerStateDict>(json).is_err());
+            for step in [(1u64 << 53) + 3, u64::MAX] {
+                let mut state = optimizer.state_dict(&session).unwrap();
+                match &mut state.state {
+                    OptimizerState::Rmsprop(saved) => {
+                        saved.parameters[0].as_mut().unwrap().step = step
+                    }
+                    OptimizerState::Adagrad(saved) => {
+                        saved.parameters[0].as_mut().unwrap().step = step
+                    }
+                    OptimizerState::RAdam(saved) => {
+                        saved.parameters[0].as_mut().unwrap().step = step
+                    }
+                    _ => unreachable!(),
+                }
+                let encoded = serde_json::to_vec(&state).unwrap();
+                let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(decoded, state);
+                optimizer.load_state_dict(&session, &decoded).unwrap();
+                assert_eq!(optimizer.state_dict(&session).unwrap(), state);
+            }
+            let before = optimizer.state_dict(&session).unwrap();
+            let values = session.tensor_values(param).unwrap();
+            let loss = session.tensor_sum(param).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            assert!(optimizer.step(&mut session, &report).is_err());
+            assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+            assert_eq!(session.tensor_values(param).unwrap(), values);
         }
     }
 
@@ -7016,6 +7653,9 @@ mod tests {
             Box::new(SGD::new(vec![], 0.1)),
             Box::new(Adam::new(vec![], 0.1)),
             Box::new(AdamW::new(vec![], 0.1)),
+            Box::new(RMSprop::new(vec![], 0.1)),
+            Box::new(Adagrad::new(vec![], 0.1)),
+            Box::new(RAdam::new(vec![], 0.1)),
         ];
         for optimizer in &mut optimizers {
             let state = optimizer.state_dict(&session).unwrap();
@@ -7036,7 +7676,7 @@ mod tests {
         restored.load_state_dict(&session, &state).unwrap();
         assert_eq!(restored.state_dict(&session).unwrap(), state);
         assert_eq!(restored.params, vec![second]);
-        let mut unsupported = RMSprop::new(vec![param], 0.1);
+        let mut unsupported = Adadelta::new(vec![param], 0.1);
         assert!(unsupported.state_dict(&session).is_err());
         assert!(unsupported.load_state_dict(&session, &state).is_err());
     }
