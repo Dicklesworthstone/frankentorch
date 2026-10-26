@@ -1729,8 +1729,51 @@ mod gemm {
         let a_nt = &a_nt[..m * k];
         let b_nt = &b_nt[..k * n];
         let nb = block_cols(n);
+        let col_blocks = n.div_ceil(nb);
         let cp = TilePtr(c.as_mut_ptr());
-        (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
+        if dgemm_sub_serial() || col_blocks <= 1 || rayon::current_num_threads() <= 1 {
+            for blk in 0..col_blocks {
+                let n0 = blk * nb;
+                let bw = (n0 + nb).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a_bt.as_ptr(),
+                        k as isize,
+                        1,
+                        b_bt.as_ptr().add(n0 * k),
+                        1,
+                        k as isize,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a_nt.as_ptr(),
+                        k as isize,
+                        1,
+                        b_nt.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            }
+            return;
+        }
+        DGEMM_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (0..col_blocks).into_par_iter().for_each(|blk| {
             let cp = &cp;
             let n0 = blk * nb;
             let bw = (n0 + nb).min(n) - n0;
@@ -38352,21 +38395,96 @@ mod bidiag {
         PARALLEL_GATE_HOISTED.swap(hoisted, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Rows per task in [`reduce_scaled_rows_f64`]. Fixed (not derived from the
-    /// thread count) so the partial-sum tree — and therefore the result — is
-    /// identical on every machine and every run.
-    const REDUCE_CHUNK_ROWS: usize = 64;
+    /// Columns per Rayon strip in [`reduce_scaled_rows_f64`]. Multiple of 16 so
+    /// every strip shares the same 16-wide inner loop boundaries as the serial
+    /// sweep, and each column accumulates in ascending row order `0..nrows` with
+    /// zero heap allocation and bit-identical results across serial and parallel
+    /// arms.
+    const REDUCE_STRIP_COLS: usize = 32;
+
+    /// Rows per Rayon task in [`apply_scaled_rank1_f64`]. Grouping rows avoids
+    /// one-row-per-task scheduling overhead while keeping every row independent.
+    const APPLY_CHUNK_ROWS: usize = 32;
+
+    #[inline]
+    fn reduce_scaled_rows_strip_f64(
+        block: &[f64],
+        lda: usize,
+        col0: usize,
+        v: &[f64],
+        acc: &mut [f64],
+    ) {
+        let nrows = v.len();
+        let ncols = acc.len();
+        let mut r = 0usize;
+        while r + 4 <= nrows {
+            let v0 = wide::f64x4::splat(v[r]);
+            let v1 = wide::f64x4::splat(v[r + 1]);
+            let v2 = wide::f64x4::splat(v[r + 2]);
+            let v3 = wide::f64x4::splat(v[r + 3]);
+            let s0 = &block[r * lda + col0..r * lda + col0 + ncols];
+            let s1 = &block[(r + 1) * lda + col0..(r + 1) * lda + col0 + ncols];
+            let s2 = &block[(r + 2) * lda + col0..(r + 2) * lda + col0 + ncols];
+            let s3 = &block[(r + 3) * lda + col0..(r + 3) * lda + col0 + ncols];
+            let mut c = 0usize;
+            while c + 8 <= ncols {
+                let mut a0 = wide::f64x4::from([acc[c], acc[c + 1], acc[c + 2], acc[c + 3]]);
+                let mut a1 = wide::f64x4::from([acc[c + 4], acc[c + 5], acc[c + 6], acc[c + 7]]);
+                a0 += v0 * wide::f64x4::from([s0[c], s0[c + 1], s0[c + 2], s0[c + 3]]);
+                a1 += v0 * wide::f64x4::from([s0[c + 4], s0[c + 5], s0[c + 6], s0[c + 7]]);
+                a0 += v1 * wide::f64x4::from([s1[c], s1[c + 1], s1[c + 2], s1[c + 3]]);
+                a1 += v1 * wide::f64x4::from([s1[c + 4], s1[c + 5], s1[c + 6], s1[c + 7]]);
+                a0 += v2 * wide::f64x4::from([s2[c], s2[c + 1], s2[c + 2], s2[c + 3]]);
+                a1 += v2 * wide::f64x4::from([s2[c + 4], s2[c + 5], s2[c + 6], s2[c + 7]]);
+                a0 += v3 * wide::f64x4::from([s3[c], s3[c + 1], s3[c + 2], s3[c + 3]]);
+                a1 += v3 * wide::f64x4::from([s3[c + 4], s3[c + 5], s3[c + 6], s3[c + 7]]);
+                acc[c..c + 4].copy_from_slice(&a0.to_array());
+                acc[c + 4..c + 8].copy_from_slice(&a1.to_array());
+                c += 8;
+            }
+            while c < ncols {
+                let mut a = acc[c];
+                a += v[r] * s0[c];
+                a += v[r + 1] * s1[c];
+                a += v[r + 2] * s2[c];
+                a += v[r + 3] * s3[c];
+                acc[c] = a;
+                c += 1;
+            }
+            r += 4;
+        }
+        while r < nrows {
+            let vr = v[r];
+            let vr_vec = wide::f64x4::splat(vr);
+            let seg = &block[r * lda + col0..r * lda + col0 + ncols];
+            let mut c = 0usize;
+            while c + 8 <= ncols {
+                let mut a0 = wide::f64x4::from([acc[c], acc[c + 1], acc[c + 2], acc[c + 3]]);
+                let mut a1 = wide::f64x4::from([acc[c + 4], acc[c + 5], acc[c + 6], acc[c + 7]]);
+                a0 += vr_vec * wide::f64x4::from([seg[c], seg[c + 1], seg[c + 2], seg[c + 3]]);
+                a1 += vr_vec * wide::f64x4::from([seg[c + 4], seg[c + 5], seg[c + 6], seg[c + 7]]);
+                acc[c..c + 4].copy_from_slice(&a0.to_array());
+                acc[c + 4..c + 8].copy_from_slice(&a1.to_array());
+                c += 8;
+            }
+            while c < ncols {
+                acc[c] += vr * seg[c];
+                c += 1;
+            }
+            r += 1;
+        }
+    }
 
     /// `acc[c] += Σ_r v[r] · block[r][col0 + c]` over a row-major block whose
     /// row `r` starts at `block[r * lda]`.
     ///
     /// Row-outer/column-inner, so each row segment is read contiguously — the
     /// transposed form (column-outer) strides by `lda` and is what made the
-    /// staged `bidiag_form_*` helpers memory-bound. The parallel arm splits the
-    /// rows on a FIXED chunk boundary and combines the partial vectors in index
-    /// order, so it is deterministic; it is not bit-identical to the serial arm,
-    /// which the ratified SVD tolerance-parity policy (`frankentorch-qgce4`)
-    /// permits for singular-vector outputs.
+    /// staged `bidiag_form_*` helpers memory-bound. The parallel arm splits
+    /// `acc[..ncols]` into disjoint column strips (`REDUCE_STRIP_COLS`) so each
+    /// column `c` still accumulates over rows `r = 0..nrows` in ascending order
+    /// with zero heap allocation, making the parallel arm bit-identical to the
+    /// serial arm.
     fn reduce_scaled_rows_f64(
         block: &[f64],
         lda: usize,
@@ -38381,33 +38499,43 @@ mod bidiag {
             return;
         }
         let block = &block[..nrows * lda];
+        let acc = &mut acc[..ncols];
         if !takes_parallel(plan, nrows, ncols) {
-            for (row, &vr) in block.chunks_exact(lda).zip(v) {
-                let seg = &row[col0..col0 + ncols];
-                for c in 0..ncols {
-                    acc[c] += vr * seg[c];
-                }
-            }
+            reduce_scaled_rows_strip_f64(block, lda, col0, v, acc);
             return;
         }
         note_parallel_branch(0);
-        let partials: Vec<Vec<f64>> = block
-            .par_chunks(REDUCE_CHUNK_ROWS * lda)
-            .zip(v.par_chunks(REDUCE_CHUNK_ROWS))
-            .map(|(rows, vs)| {
-                let mut local = vec![0.0f64; ncols];
-                for (row, &vr) in rows.chunks_exact(lda).zip(vs) {
-                    let seg = &row[col0..col0 + ncols];
-                    for c in 0..ncols {
-                        local[c] += vr * seg[c];
-                    }
+        acc.par_chunks_mut(REDUCE_STRIP_COLS)
+            .enumerate()
+            .for_each(|(strip_idx, acc_strip)| {
+                let strip_col0 = col0 + strip_idx * REDUCE_STRIP_COLS;
+                reduce_scaled_rows_strip_f64(block, lda, strip_col0, v, acc_strip);
+            });
+    }
+
+    #[inline]
+    fn apply_scaled_rank1_rows_f64(
+        rows: &mut [f64],
+        lda: usize,
+        col0: usize,
+        v: &[f64],
+        acc: &[f64],
+    ) {
+        let ncols = acc.len();
+        for (row, &vr) in rows.chunks_exact_mut(lda).zip(v) {
+            let seg = &mut row[col0..col0 + ncols];
+            let mut c = 0usize;
+            while c + 16 <= ncols {
+                let dst = &mut seg[c..c + 16];
+                let src = &acc[c..c + 16];
+                for k in 0..16 {
+                    dst[k] -= vr * src[k];
                 }
-                local
-            })
-            .collect();
-        for local in &partials {
-            for c in 0..ncols {
-                acc[c] += local[c];
+                c += 16;
+            }
+            while c < ncols {
+                seg[c] -= vr * acc[c];
+                c += 1;
             }
         }
     }
@@ -38428,24 +38556,17 @@ mod bidiag {
             return;
         }
         let block = &mut block[..nrows * lda];
+        let acc = &acc[..ncols];
         if !takes_parallel(plan, nrows, ncols) {
-            for (row, &vr) in block.chunks_exact_mut(lda).zip(v) {
-                let seg = &mut row[col0..col0 + ncols];
-                for c in 0..ncols {
-                    seg[c] -= vr * acc[c];
-                }
-            }
+            apply_scaled_rank1_rows_f64(block, lda, col0, v, acc);
             return;
         }
         note_parallel_branch(1);
         block
-            .par_chunks_mut(lda)
-            .zip(v.par_iter())
-            .for_each(|(row, &vr)| {
-                let seg = &mut row[col0..col0 + ncols];
-                for c in 0..ncols {
-                    seg[c] -= vr * acc[c];
-                }
+            .par_chunks_mut(APPLY_CHUNK_ROWS * lda)
+            .zip(v.par_chunks(APPLY_CHUNK_ROWS))
+            .for_each(|(rows, vs)| {
+                apply_scaled_rank1_rows_f64(rows, lda, col0, vs, acc);
             });
     }
 
@@ -38648,6 +38769,38 @@ mod bidiag {
                 k += 1;
             }
             return;
+        }
+        while k + 8 <= nrows {
+            let b0 = first + k * row_stride;
+            let b4 = b0 + 4 * row_stride;
+            let r0 = &a[b0..b0 + vlen];
+            let r1 = &a[b0 + row_stride..b0 + row_stride + vlen];
+            let r2 = &a[b0 + 2 * row_stride..b0 + 2 * row_stride + vlen];
+            let r3 = &a[b0 + 3 * row_stride..b0 + 3 * row_stride + vlen];
+            let r4 = &a[b4..b4 + vlen];
+            let r5 = &a[b4 + row_stride..b4 + row_stride + vlen];
+            let r6 = &a[b4 + 2 * row_stride..b4 + 2 * row_stride + vlen];
+            let r7 = &a[b4 + 3 * row_stride..b4 + 3 * row_stride + vlen];
+            let mut acc0 = wide::f64x4::ZERO;
+            let mut acc1 = wide::f64x4::ZERO;
+            for (c, &vc_scalar) in v[..vlen].iter().enumerate() {
+                let vc = wide::f64x4::splat(vc_scalar);
+                let col0 = wide::f64x4::from([r0[c], r1[c], r2[c], r3[c]]);
+                let col1 = wide::f64x4::from([r4[c], r5[c], r6[c], r7[c]]);
+                acc0 += col0 * vc;
+                acc1 += col1 * vc;
+            }
+            let s0 = acc0.to_array();
+            let s1 = acc1.to_array();
+            dst[k * dst_stride] = s0[0];
+            dst[(k + 1) * dst_stride] = s0[1];
+            dst[(k + 2) * dst_stride] = s0[2];
+            dst[(k + 3) * dst_stride] = s0[3];
+            dst[(k + 4) * dst_stride] = s1[0];
+            dst[(k + 5) * dst_stride] = s1[1];
+            dst[(k + 6) * dst_stride] = s1[2];
+            dst[(k + 7) * dst_stride] = s1[3];
+            k += 8;
         }
         while k + 4 <= nrows {
             let b0 = first + k * row_stride;
@@ -40542,24 +40695,48 @@ fn svd_bidiag_qr_f64(
                     t[col * nrows + r] = block[base + col];
                 }
             }
-            for &op in ops {
-                match op {
-                    SvdVOp::Rot(j, c, s) => {
-                        // j and j+1 are adjacent columns, so their runs are adjacent in `t`
-                        // and one split yields both disjoint halves.
-                        let (head, tail) = t.split_at_mut((j + 1) * nrows);
-                        let xs = &mut head[j * nrows..];
-                        let zs = &mut tail[..nrows];
-                        for r in 0..nrows {
-                            let xv = xs[r];
-                            let zv = zs[r];
-                            xs[r] = xv * c + zv * s;
-                            zs[r] = zv * c - xv * s;
+            if nrows == 8 {
+                let cols = t.as_chunks_mut::<8>().0;
+                for &op in ops {
+                    match op {
+                        SvdVOp::Rot(j, c, s) => {
+                            let [xs, zs] = &mut cols[j..=j + 1] else {
+                                unreachable!();
+                            };
+                            for r in 0..8 {
+                                let xv = xs[r];
+                                let zv = zs[r];
+                                xs[r] = xv * c + zv * s;
+                                zs[r] = zv * c - xv * s;
+                            }
+                        }
+                        SvdVOp::Neg(k) => {
+                            for e in &mut cols[k] {
+                                *e = -*e;
+                            }
                         }
                     }
-                    SvdVOp::Neg(k) => {
-                        for e in &mut t[k * nrows..(k + 1) * nrows] {
-                            *e = -*e;
+                }
+            } else {
+                for &op in ops {
+                    match op {
+                        SvdVOp::Rot(j, c, s) => {
+                            // j and j+1 are adjacent columns, so their runs are adjacent in `t`
+                            // and one split yields both disjoint halves.
+                            let (head, tail) = t.split_at_mut((j + 1) * nrows);
+                            let xs = &mut head[j * nrows..];
+                            let zs = &mut tail[..nrows];
+                            for r in 0..nrows {
+                                let xv = xs[r];
+                                let zv = zs[r];
+                                xs[r] = xv * c + zv * s;
+                                zs[r] = zv * c - xv * s;
+                            }
+                        }
+                        SvdVOp::Neg(k) => {
+                            for e in &mut t[k * nrows..(k + 1) * nrows] {
+                                *e = -*e;
+                            }
                         }
                     }
                 }
@@ -40598,28 +40775,52 @@ fn svd_bidiag_qr_f64(
                     t[col * nrows + r] = block[base + col];
                 }
             }
-            for &(c0, c1, c, s) in ops {
-                // Unlike the V stream, c0 and c1 are NOT adjacent in general, so split at the
-                // larger and index the smaller in the head. c0 == c1 would alias; the stream
-                // never emits it (a rotation acts on two distinct columns) and the branch below
-                // keeps the slicing sound rather than trusting that.
-                if c0 == c1 {
-                    continue;
+            if nrows == 8 {
+                let cols = t.as_chunks_mut::<8>().0;
+                for &(c0, c1, c, s) in ops {
+                    if c0 == c1 {
+                        continue;
+                    }
+                    let (lo, hi) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
+                    let (head, tail) = cols.split_at_mut(hi);
+                    let lo_run = &mut head[lo];
+                    let hi_run = &mut tail[0];
+                    let (ys, zs) = if c0 < c1 {
+                        (lo_run, hi_run)
+                    } else {
+                        (hi_run, lo_run)
+                    };
+                    for r in 0..8 {
+                        let yu = ys[r];
+                        let zu = zs[r];
+                        ys[r] = yu * c + zu * s;
+                        zs[r] = zu * c - yu * s;
+                    }
                 }
-                let (lo, hi) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
-                let (head, tail) = t.split_at_mut(hi * nrows);
-                let lo_run = &mut head[lo * nrows..lo * nrows + nrows];
-                let hi_run = &mut tail[..nrows];
-                let (ys, zs) = if c0 < c1 {
-                    (lo_run, hi_run)
-                } else {
-                    (hi_run, lo_run)
-                };
-                for r in 0..nrows {
-                    let yu = ys[r];
-                    let zu = zs[r];
-                    ys[r] = yu * c + zu * s;
-                    zs[r] = zu * c - yu * s;
+            } else {
+                for &(c0, c1, c, s) in ops {
+                    // Unlike the V stream, c0 and c1 are NOT adjacent in general, so split at the
+                    // larger and index the smaller in the head. c0 == c1 would alias; the stream
+                    // never emits it (a rotation acts on two distinct columns) and the branch below
+                    // keeps the slicing sound rather than trusting that.
+                    if c0 == c1 {
+                        continue;
+                    }
+                    let (lo, hi) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
+                    let (head, tail) = t.split_at_mut(hi * nrows);
+                    let lo_run = &mut head[lo * nrows..lo * nrows + nrows];
+                    let hi_run = &mut tail[..nrows];
+                    let (ys, zs) = if c0 < c1 {
+                        (lo_run, hi_run)
+                    } else {
+                        (hi_run, lo_run)
+                    };
+                    for r in 0..nrows {
+                        let yu = ys[r];
+                        let zu = zs[r];
+                        ys[r] = yu * c + zu * s;
+                        zs[r] = zu * c - yu * s;
+                    }
                 }
             }
             for r in 0..nrows {
@@ -41328,17 +41529,31 @@ fn svd_full_rank_square_deferred_left_fast_path(
 
     let phase_t2 = std::time::Instant::now();
     let mut s = Vec::with_capacity(n);
+    let mut inv_s = Vec::with_capacity(n);
+    for &old_col in &order {
+        let sv = w_bidiag[old_col];
+        s.push(sv);
+        inv_s.push(1.0 / sv);
+    }
     let mut u = vec![0.0f64; m * n];
     let mut vh = vec![0.0f64; n * n];
 
-    for (new_col, &old_col) in order.iter().enumerate() {
-        s.push(w_bidiag[old_col]);
-        let inv_s = 1.0 / w_bidiag[old_col];
-        for row in 0..m {
-            u[row * n + new_col] = av[row * n + old_col] * inv_s;
+    for (u_row, av_row) in u.chunks_exact_mut(n).zip(av.chunks_exact(n)) {
+        for (new_col, (&old_col, &scale)) in order.iter().zip(&inv_s).enumerate() {
+            u_row[new_col] = av_row[old_col] * scale;
         }
-        for col in 0..n {
-            vh[new_col * n + col] = v[col * n + old_col];
+    }
+    const ASSEMBLE_TILE: usize = 32;
+    for nc0 in (0..n).step_by(ASSEMBLE_TILE) {
+        let nc_end = (nc0 + ASSEMBLE_TILE).min(n);
+        for c0 in (0..n).step_by(ASSEMBLE_TILE) {
+            let c_end = (c0 + ASSEMBLE_TILE).min(n);
+            for col in c0..c_end {
+                let v_row = &v[col * n..col * n + n];
+                for new_col in nc0..nc_end {
+                    vh[new_col * n + col] = v_row[order[new_col]];
+                }
+            }
         }
     }
 
@@ -78572,7 +78787,16 @@ mod tests {
                 .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()))
         };
 
-        for &n in &[136usize, 192] {
+        let same_bits = |a: &[f64], b: &[f64]| -> bool {
+            a.iter()
+                .map(|x| x.to_bits())
+                .eq(b.iter().map(|y| y.to_bits()))
+        };
+
+        // Include n=280 (280*280 = 78_400 > PARALLEL_GATE = 65_536) so the parallel
+        // branches of reduce_scaled_rows_f64, apply_scaled_rank1_f64, and dlabrd step (12)
+        // actually execute at the default gate.
+        for &n in &[136usize, 192, 280] {
             let nb = super::svd_bidiag_block_size();
 
             // (1) the REDUCTION, which reaches the gate through `dlabrd_panel_f64`.
@@ -78588,6 +78812,11 @@ mod tests {
                 .max(worst(&tauq_par, &tauq_ser))
                 .max(worst(&taup_par, &taup_ser))
                 .max(worst(&packed_par, &packed_ser));
+            let red_bits_eq = same_bits(&d_par, &d_ser)
+                && same_bits(&e_par, &e_ser)
+                && same_bits(&tauq_par, &tauq_ser)
+                && same_bits(&taup_par, &taup_ser)
+                && same_bits(&packed_par, &packed_ser);
 
             // (2) and (3) the two EXPANSIONS, both fed the parallel reduction's reflectors so
             // only the expansion's own branch differs between the arms.
@@ -78600,12 +78829,11 @@ mod tests {
 
             let q_worst = worst(&q_par, &q_ser);
             let p_worst = worst(&p_par, &p_ser);
+            let q_bits_eq = same_bits(&q_par, &q_ser);
+            let p_bits_eq = same_bits(&p_par, &p_ser);
 
             println!(
-                "gate-branch deviation n={n}: reduction {red_worst:.3e}  form_q {q_worst:.3e}                   form_p {p_worst:.3e}  (bit-identical: reduction {} form_q {} form_p {})",
-                red_worst == 0.0,
-                q_worst == 0.0,
-                p_worst == 0.0
+                "gate-branch deviation n={n}: reduction {red_worst:.3e}  form_q {q_worst:.3e}                   form_p {p_worst:.3e}  (bit-identical: reduction {red_bits_eq} form_q {q_bits_eq} form_p {p_bits_eq})"
             );
 
             // Orthonormality is the property the ratified policy actually protects, so it is
@@ -78625,15 +78853,13 @@ mod tests {
                 );
             }
 
-            // The bound. 1e-11 is the figure the blocked/unblocked oracle already uses for the
-            // same KIND of change (a reassociation of the same arithmetic), so the gate is held
-            // to the tolerance this codebase has already ratified rather than to a new one
-            // invented to fit the measurement.
+            // Column-strip parallelization in `reduce_scaled_rows_f64` accumulates each column
+            // in the exact same ascending row order `0..nrows` as the serial sweep, so both
+            // branches are bit-identical (`to_bits()` equal).
             assert!(
-                red_worst < 1e-11 && q_worst < 1e-11 && p_worst < 1e-11,
-                "n={n}: a gate branch moves a value by more than the ratified 1e-11 — \
-                 reduction {red_worst:.3e}, form_q {q_worst:.3e}, form_p {p_worst:.3e}. \
-                 Moving PARALLEL_GATE is then not a tolerance question but a correctness one."
+                red_bits_eq && q_bits_eq && p_bits_eq,
+                "n={n}: parallel and serial gate branches diverged bitwise — \
+                 reduction {red_worst:.3e} (bits={red_bits_eq}), form_q {q_worst:.3e} (bits={q_bits_eq}), form_p {p_worst:.3e} (bits={p_bits_eq})"
             );
         }
     }
