@@ -1478,25 +1478,57 @@ mod gemm {
             return;
         }
         DGEMM_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if crate::lu_fast_kernel() && col_blocks <= 1 {
-            unsafe {
-                dgemm_mm(
-                    m,
-                    k,
-                    n,
-                    -1.0,
-                    a.as_ptr(),
-                    k as isize,
-                    1,
-                    b.as_ptr(),
-                    n as isize,
-                    1,
-                    1.0,
-                    cp.0.add(c_off),
-                    ldc as isize,
-                    1,
-                );
+        if crate::lu_fast_kernel() {
+            let nb_fast = if n > 64 && m >= 128 && k >= 32 {
+                ((n.div_ceil(threads) + 15) & !15).max(32)
+            } else {
+                nb
+            };
+            let fast_col_blocks = n.div_ceil(nb_fast);
+            if fast_col_blocks <= 1 {
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        n,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr(),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off),
+                        ldc as isize,
+                        1,
+                    );
+                }
+                return;
             }
+            (0..fast_col_blocks).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb_fast;
+                let bw = (n0 + nb_fast).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            });
             return;
         }
         (0..col_blocks).into_par_iter().for_each(|blk| {
@@ -26693,8 +26725,13 @@ fn lu_factor_panel_recursive_f64(
             let __t_swap = std::time::Instant::now();
             if max_row != k {
                 pivots.swap(k, max_row);
-                for j in 0..n {
-                    lu.swap(k * n + j, max_row * n + j);
+                if fast {
+                    let (before, from_max) = lu.split_at_mut(max_row * n);
+                    before[k * n..(k + 1) * n].swap_with_slice(&mut from_max[..n]);
+                } else {
+                    for j in 0..n {
+                        lu.swap(k * n + j, max_row * n + j);
+                    }
                 }
             }
             stage_family_add(
@@ -26722,33 +26759,7 @@ fn lu_factor_panel_recursive_f64(
             } else if fast {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n + (k + 1)..k * n + end];
-                let mut chunks = tail.chunks_exact_mut(4 * n);
-                for block in &mut chunks {
-                    let (r0, rest) = block.split_at_mut(n);
-                    let (r1, rest) = rest.split_at_mut(n);
-                    let (r2, r3) = rest.split_at_mut(n);
-                    let m0 = r0[k] / diag;
-                    let m1 = r1[k] / diag;
-                    let m2 = r2[k] / diag;
-                    let m3 = r3[k] / diag;
-                    r0[k] = m0;
-                    r1[k] = m1;
-                    r2[k] = m2;
-                    r3[k] = m3;
-                    for ((((d0, d1), d2), d3), &piv) in r0[(k + 1)..end]
-                        .iter_mut()
-                        .zip(&mut r1[(k + 1)..end])
-                        .zip(&mut r2[(k + 1)..end])
-                        .zip(&mut r3[(k + 1)..end])
-                        .zip(pivot_row)
-                    {
-                        *d0 -= m0 * piv;
-                        *d1 -= m1 * piv;
-                        *d2 -= m2 * piv;
-                        *d3 -= m3 * piv;
-                    }
-                }
-                for row in chunks.into_remainder().chunks_mut(n) {
+                for row in tail.chunks_exact_mut(n) {
                     let multiplier = row[k] / diag;
                     row[k] = multiplier;
                     for (dst, &piv) in row[(k + 1)..end].iter_mut().zip(pivot_row) {
