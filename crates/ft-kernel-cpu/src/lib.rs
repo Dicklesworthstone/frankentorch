@@ -4503,6 +4503,43 @@ fn build_uninit_pair<T: Copy, U: Copy, F: FnOnce(&mut [T], &mut [U])>(
     )
 }
 
+/// Three fully-overwritten output buffers produced by one pass (e.g., SDPA backward
+/// `(dq, dk, dv)`), uninitialized unless [`pool_output_zeroed`] selects the legacy
+/// zero-initialized allocation path.
+fn build_pool_output_triple<
+    T: Copy + Default,
+    U: Copy + Default,
+    V: Copy + Default,
+    F: FnOnce(&mut [T], &mut [U], &mut [V]),
+>(
+    a_numel: usize,
+    b_numel: usize,
+    c_numel: usize,
+    fill: F,
+) -> (Vec<T>, Vec<U>, Vec<V>) {
+    if pool_output_zeroed() {
+        let mut a = vec![T::default(); a_numel];
+        let mut b = vec![U::default(); b_numel];
+        let mut c = vec![V::default(); c_numel];
+        fill(&mut a, &mut b, &mut c);
+        return (a, b, c);
+    }
+    let mut b_slot: Option<Vec<U>> = None;
+    let mut c_slot: Option<Vec<V>> = None;
+    let a = build_uninit(a_numel, |a| {
+        let b = build_uninit(b_numel, |b| {
+            let c = build_uninit(c_numel, |c| fill(a, b, c));
+            c_slot = Some(c);
+        });
+        b_slot = Some(b);
+    });
+    (
+        a,
+        b_slot.expect("build_uninit invokes its fill exactly once"),
+        c_slot.expect("build_uninit invokes its fill exactly once"),
+    )
+}
+
 /// Row-structured broadcast-expand materialization (`expand`/`broadcast_to`),
 /// building the output into an UNINITIALIZED buffer so the fill also does the
 /// page FIRST-TOUCH.
@@ -6192,21 +6229,24 @@ pub fn sdpa_forward_f64(
     causal: bool,
 ) -> Vec<f64> {
     const BR: usize = 64;
-    let mut out = vec![0.0f64; num_bh * seq_q * d_v];
+    let out_len = num_bh * seq_q * d_v;
+    if num_bh == 0 || seq_q == 0 || seq_k == 0 || d_v == 0 {
+        return vec![0.0f64; out_len];
+    }
     let q_stride = seq_q * d_k;
     let k_stride = seq_k * d_k;
     let v_stride = seq_k * d_v;
     let o_stride = seq_q * d_v;
     // One independent BR-row block: scores = scale*(q_block @ kh^T), causal-masked + stable
     // softmax per row, then o_block = softmax @ vh. Blocks within a head are independent.
-    let block = |bh: usize, q0: usize, o_block: &mut [f64]| {
+    let block_with_sc = |bh: usize, q0: usize, o_block: &mut [f64], sc: &mut [f64]| {
         let br = o_block.len() / d_v;
         let qh = &q[bh * q_stride..bh * q_stride + q_stride];
         let kh = &k[bh * k_stride..bh * k_stride + k_stride];
         let vh = &v[bh * v_stride..bh * v_stride + v_stride];
-        let mut sc = vec![0.0f64; br * seq_k];
+        let sc = &mut sc[..br * seq_k];
         let q_block = &qh[q0 * d_k..(q0 + br) * d_k];
-        gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, &mut sc);
+        gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, sc);
         for r in 0..br {
             let qi = q0 + r;
             let limit = if causal { (qi + 1).min(seq_k) } else { seq_k };
@@ -6231,33 +6271,44 @@ pub fn sdpa_forward_f64(
                 *s = 0.0;
             }
         }
-        gemm::dgemm(br, seq_k, d_v, &sc, vh, o_block);
+        gemm::dgemm(br, seq_k, d_v, sc, vh, o_block);
     };
-    // Few heads (B*H) but many cores: also split each head's independent BR-row blocks
-    // across the pool (the causal case especially, where late blocks carry more work).
-    // Head-heavy inputs already saturate the outer split, so keep the serial inner loop.
-    if num_bh < rayon::current_num_threads() && seq_q > BR {
-        out.par_chunks_mut(o_stride)
-            .enumerate()
-            .for_each(|(bh, o_chunk)| {
-                o_chunk
-                    .par_chunks_mut(BR * d_v)
-                    .enumerate()
-                    .for_each(|(blk, o_block)| block(bh, blk * BR, o_block));
-            });
-    } else {
-        out.par_chunks_mut(o_stride)
-            .enumerate()
-            .for_each(|(bh, o_chunk)| {
-                let mut q0 = 0;
-                while q0 < seq_q {
-                    let br = (q0 + BR).min(seq_q) - q0;
-                    block(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v]);
-                    q0 += br;
-                }
-            });
-    }
-    out
+    build_pool_output(out_len, |out| {
+        // Few heads (B*H) but many cores: also split each head's independent BR-row blocks
+        // across the pool (the causal case especially, where late blocks carry more work).
+        // Head-heavy inputs already saturate the outer split, so coarsen BR up to 256 (when
+        // the per-head score tile fits in L2) to eliminate redundant kh/vh B-repacking inside
+        // matrixmultiply and reuse one per-worker score scratch buffer across heads.
+        if num_bh < rayon::current_num_threads() && seq_q > BR {
+            out.par_chunks_mut(o_stride)
+                .enumerate()
+                .for_each(|(bh, o_chunk)| {
+                    o_chunk.par_chunks_mut(BR * d_v).enumerate().for_each_init(
+                        || vec![0.0f64; BR * seq_k],
+                        |sc, (blk, o_block)| block_with_sc(bh, blk * BR, o_block, sc),
+                    );
+                });
+        } else {
+            let br_tile = if pool_output_zeroed() {
+                BR
+            } else if seq_k <= 256 && d_k.max(d_v) <= 128 {
+                seq_q.clamp(1, 256)
+            } else {
+                seq_q.clamp(1, 128)
+            };
+            out.par_chunks_mut(o_stride).enumerate().for_each_init(
+                || vec![0.0f64; br_tile.min(seq_q) * seq_k],
+                |sc, (bh, o_chunk)| {
+                    let mut q0 = 0;
+                    while q0 < seq_q {
+                        let br = (q0 + br_tile).min(seq_q) - q0;
+                        block_with_sc(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v], sc);
+                        q0 += br;
+                    }
+                },
+            );
+        }
+    })
 }
 
 /// Flash SDPA forward with an ADDITIVE attention mask (the explicit-`attn_mask` case,
@@ -6282,7 +6333,10 @@ pub fn sdpa_forward_masked_f64(
     mask_bh_stride: usize,
 ) -> Vec<f64> {
     const BR: usize = 64;
-    let mut out = vec![0.0f64; num_bh * seq_q * d_v];
+    let out_len = num_bh * seq_q * d_v;
+    if num_bh == 0 || seq_q == 0 || seq_k == 0 || d_v == 0 {
+        return vec![0.0f64; out_len];
+    }
     let q_stride = seq_q * d_k;
     let k_stride = seq_k * d_k;
     let v_stride = seq_k * d_v;
@@ -6291,15 +6345,15 @@ pub fn sdpa_forward_masked_f64(
     // over all seq_k (masked positions carry -inf -> exp -> 0, exactly as torch), then
     // o_block = softmax @ vh. Each block is fully independent of the others in its head, so
     // it is the unit of both the serial loop and the intra-head parallel split.
-    let block = |bh: usize, q0: usize, o_block: &mut [f64]| {
+    let block_with_sc = |bh: usize, q0: usize, o_block: &mut [f64], sc: &mut [f64]| {
         let br = o_block.len() / d_v;
         let qh = &q[bh * q_stride..bh * q_stride + q_stride];
         let kh = &k[bh * k_stride..bh * k_stride + k_stride];
         let vh = &v[bh * v_stride..bh * v_stride + v_stride];
         let mask_base = bh * mask_bh_stride;
-        let mut sc = vec![0.0f64; br * seq_k];
+        let sc = &mut sc[..br * seq_k];
         let q_block = &qh[q0 * d_k..(q0 + br) * d_k];
-        gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, &mut sc);
+        gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, sc);
         for r in 0..br {
             let qi = q0 + r;
             let mrow = &mask[mask_base + qi * seq_k..mask_base + (qi + 1) * seq_k];
@@ -6326,34 +6380,43 @@ pub fn sdpa_forward_masked_f64(
                 *s /= sum;
             }
         }
-        gemm::dgemm(br, seq_k, d_v, &sc, vh, o_block);
+        gemm::dgemm(br, seq_k, d_v, sc, vh, o_block);
     };
-    // When there are fewer heads than worker threads (e.g. B*H=16 on a 64-core host), the
-    // per-head split alone leaves most cores idle; also split each head's independent BR-row
-    // blocks across the pool. For head-heavy inputs the outer split already saturates, so
-    // keep the cheaper serial inner loop (one reused scores buffer, no extra task overhead).
-    if num_bh < rayon::current_num_threads() && seq_q > BR {
-        out.par_chunks_mut(o_stride)
-            .enumerate()
-            .for_each(|(bh, o_chunk)| {
-                o_chunk
-                    .par_chunks_mut(BR * d_v)
-                    .enumerate()
-                    .for_each(|(blk, o_block)| block(bh, blk * BR, o_block));
-            });
-    } else {
-        out.par_chunks_mut(o_stride)
-            .enumerate()
-            .for_each(|(bh, o_chunk)| {
-                let mut q0 = 0;
-                while q0 < seq_q {
-                    let br = (q0 + BR).min(seq_q) - q0;
-                    block(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v]);
-                    q0 += br;
-                }
-            });
-    }
-    out
+    build_pool_output(out_len, |out| {
+        // When there are fewer heads than worker threads (e.g. B*H=16 on a 64-core host), the
+        // per-head split alone leaves most cores idle; also split each head's independent BR-row
+        // blocks across the pool. For head-heavy inputs the outer split already saturates, so
+        // keep the cheaper serial inner loop (one reused scores buffer, no extra task overhead).
+        if num_bh < rayon::current_num_threads() && seq_q > BR {
+            out.par_chunks_mut(o_stride)
+                .enumerate()
+                .for_each(|(bh, o_chunk)| {
+                    o_chunk.par_chunks_mut(BR * d_v).enumerate().for_each_init(
+                        || vec![0.0f64; BR * seq_k],
+                        |sc, (blk, o_block)| block_with_sc(bh, blk * BR, o_block, sc),
+                    );
+                });
+        } else {
+            let br_tile = if pool_output_zeroed() {
+                BR
+            } else if seq_k <= 256 && d_k.max(d_v) <= 128 {
+                seq_q.clamp(1, 256)
+            } else {
+                seq_q.clamp(1, 128)
+            };
+            out.par_chunks_mut(o_stride).enumerate().for_each_init(
+                || vec![0.0f64; br_tile.min(seq_q) * seq_k],
+                |sc, (bh, o_chunk)| {
+                    let mut q0 = 0;
+                    while q0 < seq_q {
+                        let br = (q0 + br_tile).min(seq_q) - q0;
+                        block_with_sc(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v], sc);
+                        q0 += br;
+                    }
+                },
+            );
+        }
+    })
 }
 
 /// Grouped-query (GQA / MQA) masked flash SDPA forward (f64), *without* materialising
@@ -6953,107 +7016,76 @@ pub fn sdpa_backward_f64(
     scale: f64,
     causal: bool,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut dq = vec![0.0f64; num_bh * seq_q * d_k];
-    let mut dk = vec![0.0f64; num_bh * seq_k * d_k];
-    let mut dv = vec![0.0f64; num_bh * seq_k * d_v];
     let qs = seq_q * d_k;
     let ks = seq_k * d_k;
     let vs = seq_k * d_v;
     let os = seq_q * d_v;
-    dq.par_chunks_mut(qs)
-        .zip(dk.par_chunks_mut(ks))
-        .zip(dv.par_chunks_mut(vs))
-        .enumerate()
-        .for_each(|(bh, ((dq_bh, dk_bh), dv_bh))| {
-            let qh = &q[bh * qs..bh * qs + qs];
-            let kh = &k[bh * ks..bh * ks + ks];
-            let vh = &v[bh * vs..bh * vs + vs];
-            let doh = &dout[bh * os..bh * os + os];
-            // P = softmax(scale·Q@Kᵀ) row-wise.  [seq_q, seq_k]
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
-            //
-            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
-            // "this write is dead" is a property of these two statements, not a prediction
-            // about scheduling (item 164 is why that distinction is now spelled out).
-            //
-            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
-            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
-            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
-            // so the softmax below sees exactly what it saw before.
-            //
-            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
-            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
-            let mut p = build_uninit(seq_q * seq_k, |p: &mut [f64]| {
-                if seq_q == 0 || seq_k == 0 {
-                    p.fill(0.0);
-                    return;
-                }
-                gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
-            });
-            for i in 0..seq_q {
-                let limit = if causal { (i + 1).min(seq_k) } else { seq_k };
-                let row = &mut p[i * seq_k..(i + 1) * seq_k];
-                let mut m = f64::NEG_INFINITY;
-                for s in row.iter_mut().take(limit) {
-                    *s *= scale;
-                    if *s > m {
-                        m = *s;
+    if num_bh == 0 || seq_q == 0 || seq_k == 0 || d_k == 0 || d_v == 0 {
+        return (
+            vec![0.0f64; num_bh * qs],
+            vec![0.0f64; num_bh * ks],
+            vec![0.0f64; num_bh * vs],
+        );
+    }
+    build_pool_output_triple(num_bh * qs, num_bh * ks, num_bh * vs, |dq, dk, dv| {
+        dq.par_chunks_mut(qs)
+            .zip(dk.par_chunks_mut(ks))
+            .zip(dv.par_chunks_mut(vs))
+            .enumerate()
+            .for_each_init(
+                || (vec![0.0f64; seq_q * seq_k], vec![0.0f64; seq_q * seq_k]),
+                |(p, du), (bh, ((dq_bh, dk_bh), dv_bh))| {
+                    let qh = &q[bh * qs..bh * qs + qs];
+                    let kh = &k[bh * ks..bh * ks + ks];
+                    let vh = &v[bh * vs..bh * vs + vs];
+                    let doh = &dout[bh * os..bh * os + os];
+                    // P = softmax(scale·Q@Kᵀ) row-wise.  [seq_q, seq_k]
+                    // Per-worker scratch `p` and `du` are allocated once per Rayon worker job
+                    // and reused across heads, keeping the 512 KiB tiles hot in L2/L3 cache.
+                    gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
+                    for (i, row) in p.chunks_exact_mut(seq_k).enumerate() {
+                        let limit = if causal { (i + 1).min(seq_k) } else { seq_k };
+                        let mut m = f64::NEG_INFINITY;
+                        for s in row.iter_mut().take(limit) {
+                            *s *= scale;
+                            if *s > m {
+                                m = *s;
+                            }
+                        }
+                        let mut sum = 0.0f64;
+                        for s in row.iter_mut().take(limit) {
+                            let e = (*s - m).exp();
+                            *s = e;
+                            sum += e;
+                        }
+                        for s in row.iter_mut().take(limit) {
+                            *s /= sum;
+                        }
+                        for s in row.iter_mut().skip(limit) {
+                            *s = 0.0;
+                        }
                     }
-                }
-                let mut sum = 0.0f64;
-                for s in row.iter_mut().take(limit) {
-                    let e = (*s - m).exp();
-                    *s = e;
-                    sum += e;
-                }
-                for s in row.iter_mut().take(limit) {
-                    *s /= sum;
-                }
-                for s in row.iter_mut().skip(limit) {
-                    *s = 0.0;
-                }
-            }
-            // dP = dOut @ Vᵀ  [seq_q, seq_k]
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
-            //
-            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
-            // "this write is dead" is a property of these two statements, not a prediction
-            // about scheduling (item 164 is why that distinction is now spelled out).
-            //
-            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
-            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
-            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
-            // so the softmax below sees exactly what it saw before.
-            //
-            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
-            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
-            let mut du = build_uninit(seq_q * seq_k, |du: &mut [f64]| {
-                if seq_q == 0 || seq_k == 0 {
-                    du.fill(0.0);
-                    return;
-                }
-                gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
-            });
-            // dU = P ⊙ (dP − rowsum(P⊙dP)); overwrite du in place.
-            for i in 0..seq_q {
-                let pr = &p[i * seq_k..(i + 1) * seq_k];
-                let dr = &mut du[i * seq_k..(i + 1) * seq_k];
-                let mut dot = 0.0f64;
-                for j in 0..seq_k {
-                    dot += pr[j] * dr[j];
-                }
-                for j in 0..seq_k {
-                    dr[j] = pr[j] * (dr[j] - dot);
-                }
-            }
-            // dV = Pᵀ @ dOut  [seq_k, d_v], without materialising Pᵀ.
-            gemm::dgemm_tb(seq_k, seq_q, d_v, &p, doh, dv_bh);
-            // dQ = scale · dU @ K  [seq_q, d_k]
-            gemm::dgemm_scaled(seq_q, seq_k, d_k, scale, &du, kh, dq_bh);
-            // dK = scale · dUᵀ @ Q  [seq_k, d_k], without materialising dUᵀ.
-            gemm::dgemm_tb_scaled(seq_k, seq_q, d_k, scale, &du, qh, dk_bh);
-        });
-    (dq, dk, dv)
+                    // dP = dOut @ Vᵀ  [seq_q, seq_k]
+                    gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
+                    // dU = P ⊙ (dP − rowsum(P⊙dP)); overwrite du in place.
+                    for (pr, dr) in p.chunks_exact(seq_k).zip(du.chunks_exact_mut(seq_k)) {
+                        let mut dot = 0.0f64;
+                        for (&p_val, &d_val) in pr.iter().zip(dr.iter()) {
+                            dot += p_val * d_val;
+                        }
+                        for (&p_val, d_val) in pr.iter().zip(dr.iter_mut()) {
+                            *d_val = p_val * (*d_val - dot);
+                        }
+                    }
+                    // dV = Pᵀ @ dOut  [seq_k, d_v], without materialising Pᵀ.
+                    gemm::dgemm_tb(seq_k, seq_q, d_v, p, doh, dv_bh);
+                    // dQ = scale · dU @ K  [seq_q, d_k]
+                    gemm::dgemm_scaled(seq_q, seq_k, d_k, scale, du, kh, dq_bh);
+                    // dK = scale · dUᵀ @ Q  [seq_k, d_k], without materialising dUᵀ.
+                    gemm::dgemm_tb_scaled(seq_k, seq_q, d_k, scale, du, qh, dk_bh);
+                },
+            );
+    })
 }
 
 /// Backward of [`sdpa_forward_masked_f64`]. Identical to [`sdpa_backward_f64`] except the
@@ -7077,106 +7109,73 @@ pub fn sdpa_backward_masked_f64(
     mask: &[f64],
     mask_bh_stride: usize,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut dq = vec![0.0f64; num_bh * seq_q * d_k];
-    let mut dk = vec![0.0f64; num_bh * seq_k * d_k];
-    let mut dv = vec![0.0f64; num_bh * seq_k * d_v];
     let qs = seq_q * d_k;
     let ks = seq_k * d_k;
     let vs = seq_k * d_v;
     let os = seq_q * d_v;
-    dq.par_chunks_mut(qs)
-        .zip(dk.par_chunks_mut(ks))
-        .zip(dv.par_chunks_mut(vs))
-        .enumerate()
-        .for_each(|(bh, ((dq_bh, dk_bh), dv_bh))| {
-            let qh = &q[bh * qs..bh * qs + qs];
-            let kh = &k[bh * ks..bh * ks + ks];
-            let vh = &v[bh * vs..bh * vs + vs];
-            let doh = &dout[bh * os..bh * os + os];
-            let mask_base = bh * mask_bh_stride;
-            // P = softmax(scale·Q@Kᵀ + mask) row-wise.  [seq_q, seq_k]
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
-            //
-            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
-            // "this write is dead" is a property of these two statements, not a prediction
-            // about scheduling (item 164 is why that distinction is now spelled out).
-            //
-            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
-            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
-            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
-            // so the softmax below sees exactly what it saw before.
-            //
-            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
-            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
-            let mut p = build_uninit(seq_q * seq_k, |p: &mut [f64]| {
-                if seq_q == 0 || seq_k == 0 {
-                    p.fill(0.0);
-                    return;
-                }
-                gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
-            });
-            for i in 0..seq_q {
-                let mrow = &mask[mask_base + i * seq_k..mask_base + (i + 1) * seq_k];
-                let row = &mut p[i * seq_k..(i + 1) * seq_k];
-                let mut m = f64::NEG_INFINITY;
-                for (s, &mv) in row.iter_mut().zip(mrow.iter()) {
-                    *s = *s * scale + mv;
-                    if *s > m {
-                        m = *s;
+    if num_bh == 0 || seq_q == 0 || seq_k == 0 || d_k == 0 || d_v == 0 {
+        return (
+            vec![0.0f64; num_bh * qs],
+            vec![0.0f64; num_bh * ks],
+            vec![0.0f64; num_bh * vs],
+        );
+    }
+    build_pool_output_triple(num_bh * qs, num_bh * ks, num_bh * vs, |dq, dk, dv| {
+        dq.par_chunks_mut(qs)
+            .zip(dk.par_chunks_mut(ks))
+            .zip(dv.par_chunks_mut(vs))
+            .enumerate()
+            .for_each_init(
+                || (vec![0.0f64; seq_q * seq_k], vec![0.0f64; seq_q * seq_k]),
+                |(p, du), (bh, ((dq_bh, dk_bh), dv_bh))| {
+                    let qh = &q[bh * qs..bh * qs + qs];
+                    let kh = &k[bh * ks..bh * ks + ks];
+                    let vh = &v[bh * vs..bh * vs + vs];
+                    let doh = &dout[bh * os..bh * os + os];
+                    let mask_base = bh * mask_bh_stride;
+                    // P = softmax(scale·Q@Kᵀ + mask) row-wise.  [seq_q, seq_k]
+                    gemm::dgemm_bt(seq_q, d_k, seq_k, qh, kh, p);
+                    for (i, row) in p.chunks_exact_mut(seq_k).enumerate() {
+                        let mrow = &mask[mask_base + i * seq_k..mask_base + (i + 1) * seq_k];
+                        let mut m = f64::NEG_INFINITY;
+                        for (s, &mv) in row.iter_mut().zip(mrow.iter()) {
+                            *s = *s * scale + mv;
+                            if *s > m {
+                                m = *s;
+                            }
+                        }
+                        // Fully masked rows contribute zero; genuine NaNs still propagate.
+                        if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                            row.fill(0.0);
+                            continue;
+                        }
+                        let mut sum = 0.0f64;
+                        for s in row.iter_mut() {
+                            let e = (*s - m).exp();
+                            *s = e;
+                            sum += e;
+                        }
+                        for s in row.iter_mut() {
+                            *s /= sum;
+                        }
                     }
-                }
-                // Fully masked rows contribute zero; genuine NaNs still propagate.
-                if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
-                    row.fill(0.0);
-                    continue;
-                }
-                let mut sum = 0.0f64;
-                for s in row.iter_mut() {
-                    let e = (*s - m).exp();
-                    *s = e;
-                    sum += e;
-                }
-                for s in row.iter_mut() {
-                    *s /= sum;
-                }
-            }
-            // dP = dOut @ Vᵀ; dU = P ⊙ (dP − rowsum(P⊙dP)); dV/dQ/dK — same as unmasked.
-            // DEAD ZERO-FILL: the GEMM below overwrites every element — item 168.
-            //
-            // UNBUILT (freeze, /data 27G): not compiled, tested or measured. STRUCTURAL claim —
-            // "this write is dead" is a property of these two statements, not a prediction
-            // about scheduling (item 164 is why that distinction is now spelled out).
-            //
-            // SOUNDNESS CITED: item 162 verified all eight `dgemm_bt`/`sgemm_bt` branches pass
-            // `beta = 0.0` with full coverage of C. The causal case is unaffected — the GEMM
-            // writes the whole `seq_q x seq_k` rectangle including the masked tail either way,
-            // so the softmax below sees exactly what it saw before.
-            //
-            // GUARD: the wrapper returns EARLY on `m == 0 || n == 0`, before matrixmultiply's
-            // own zero-fill, so a degenerate shape would hand back an uninitialized buffer.
-            let mut du = build_uninit(seq_q * seq_k, |du: &mut [f64]| {
-                if seq_q == 0 || seq_k == 0 {
-                    du.fill(0.0);
-                    return;
-                }
-                gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
-            });
-            for i in 0..seq_q {
-                let pr = &p[i * seq_k..(i + 1) * seq_k];
-                let dr = &mut du[i * seq_k..(i + 1) * seq_k];
-                let mut dot = 0.0f64;
-                for j in 0..seq_k {
-                    dot += pr[j] * dr[j];
-                }
-                for j in 0..seq_k {
-                    dr[j] = pr[j] * (dr[j] - dot);
-                }
-            }
-            gemm::dgemm_tb(seq_k, seq_q, d_v, &p, doh, dv_bh);
-            gemm::dgemm_scaled(seq_q, seq_k, d_k, scale, &du, kh, dq_bh);
-            gemm::dgemm_tb_scaled(seq_k, seq_q, d_k, scale, &du, qh, dk_bh);
-        });
-    (dq, dk, dv)
+                    // dP = dOut @ Vᵀ; dU = P ⊙ (dP − rowsum(P⊙dP)); dV/dQ/dK — same as unmasked.
+                    gemm::dgemm_bt(seq_q, d_v, seq_k, doh, vh, du);
+                    for (pr, dr) in p.chunks_exact(seq_k).zip(du.chunks_exact_mut(seq_k)) {
+                        let mut dot = 0.0f64;
+                        for (&p_val, &d_val) in pr.iter().zip(dr.iter()) {
+                            dot += p_val * d_val;
+                        }
+                        for (&p_val, d_val) in pr.iter().zip(dr.iter_mut()) {
+                            *d_val = p_val * (*d_val - dot);
+                        }
+                    }
+                    gemm::dgemm_tb(seq_k, seq_q, d_v, p, doh, dv_bh);
+                    gemm::dgemm_scaled(seq_q, seq_k, d_k, scale, du, kh, dq_bh);
+                    gemm::dgemm_tb_scaled(seq_k, seq_q, d_k, scale, du, qh, dk_bh);
+                },
+            );
+    })
 }
 
 /// f32 mirror of [`sdpa_backward_f64`] (sgemm). Used by the f32 SDPA grad fast
@@ -82809,6 +82808,62 @@ mod tests {
                 }
                 let _ = prev_fused;
                 super::set_ormqr_fused_subtract_auto();
+            }
+        }
+    }
+
+    #[test]
+    fn sdpa_f64_head_tile_and_uninit_outputs_match_legacy_bits() {
+        for &(num_bh, seq_q, seq_k, d_k, d_v) in &[(16usize, 256usize, 256usize, 64usize, 64usize), (2, 160, 160, 32, 48)] {
+            let q = bidiag_test_matrix(num_bh * seq_q, d_k, 0x7A01_0001 ^ (num_bh * 31 + seq_q) as u64);
+            let k = bidiag_test_matrix(num_bh * seq_k, d_k, 0x7A01_0002 ^ (num_bh * 37 + seq_k) as u64);
+            let v = bidiag_test_matrix(num_bh * seq_k, d_v, 0x7A01_0003 ^ (num_bh * 41 + d_v) as u64);
+            let dout = bidiag_test_matrix(num_bh * seq_q, d_v, 0x7A01_0004 ^ (num_bh * 43 + seq_q) as u64);
+            let mask = bidiag_test_matrix(seq_q, seq_k, 0x7A01_0005 ^ (seq_q * 17 + seq_k) as u64);
+            let scale = 1.0 / (d_k as f64).sqrt();
+
+            for &causal in &[false, true] {
+                let prev = super::set_pool_output_zeroed(true);
+                let out_legacy = super::sdpa_forward_f64(&q, &k, &v, num_bh, seq_q, seq_k, d_k, d_v, scale, causal);
+                let (dq_leg, dk_leg, dv_leg) = super::sdpa_backward_f64(&q, &k, &v, &dout, num_bh, seq_q, seq_k, d_k, d_v, scale, causal);
+                super::set_pool_output_zeroed(false);
+                let out_fast = super::sdpa_forward_f64(&q, &k, &v, num_bh, seq_q, seq_k, d_k, d_v, scale, causal);
+                let (dq_fast, dk_fast, dv_fast) = super::sdpa_backward_f64(&q, &k, &v, &dout, num_bh, seq_q, seq_k, d_k, d_v, scale, causal);
+                super::set_pool_output_zeroed(prev);
+
+                for (i, (a, b)) in out_legacy.iter().zip(&out_fast).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "sdpa_forward_f64 mismatch at {i} causal={causal}");
+                }
+                for (i, (a, b)) in dq_leg.iter().zip(&dq_fast).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "sdpa_backward_f64 dq mismatch at {i} causal={causal}");
+                }
+                for (i, (a, b)) in dk_leg.iter().zip(&dk_fast).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "sdpa_backward_f64 dk mismatch at {i} causal={causal}");
+                }
+                for (i, (a, b)) in dv_leg.iter().zip(&dv_fast).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "sdpa_backward_f64 dv mismatch at {i} causal={causal}");
+                }
+            }
+
+            let prev = super::set_pool_output_zeroed(true);
+            let out_m_leg = super::sdpa_forward_masked_f64(&q, &k, &v, num_bh, seq_q, seq_k, d_k, d_v, scale, &mask, 0);
+            let (dq_m_leg, dk_m_leg, dv_m_leg) = super::sdpa_backward_masked_f64(&q, &k, &v, &dout, num_bh, seq_q, seq_k, d_k, d_v, scale, &mask, 0);
+            super::set_pool_output_zeroed(false);
+            let out_m_fast = super::sdpa_forward_masked_f64(&q, &k, &v, num_bh, seq_q, seq_k, d_k, d_v, scale, &mask, 0);
+            let (dq_m_fast, dk_m_fast, dv_m_fast) = super::sdpa_backward_masked_f64(&q, &k, &v, &dout, num_bh, seq_q, seq_k, d_k, d_v, scale, &mask, 0);
+            super::set_pool_output_zeroed(prev);
+
+            for (i, (a, b)) in out_m_leg.iter().zip(&out_m_fast).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "sdpa_forward_masked_f64 mismatch at {i}");
+            }
+            for (i, (a, b)) in dq_m_leg.iter().zip(&dq_m_fast).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "sdpa_backward_masked_f64 dq mismatch at {i}");
+            }
+            for (i, (a, b)) in dk_m_leg.iter().zip(&dk_m_fast).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "sdpa_backward_masked_f64 dk mismatch at {i}");
+            }
+            for (i, (a, b)) in dv_m_leg.iter().zip(&dv_m_fast).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "sdpa_backward_masked_f64 dv mismatch at {i}");
             }
         }
     }

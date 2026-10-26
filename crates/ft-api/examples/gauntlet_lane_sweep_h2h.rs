@@ -2160,6 +2160,7 @@ LANES = {
     # frankentorch-58zjz: the query is the timed leaf; K and V require grad too, so the backward
     # reaches BOTH dV (the dgemm_tb entry this bead is about) and the softmax/dQ path.
     "attention": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)),
+    "attention_zeroed": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)),
     # frankentorch-mdsmm: incumbent twins for the three 58zjz lanes. SQUARED here for the same
     # reason every other _dense lane on this board is: the serve loop does fn(x).sum().backward(),
     # so returning the square makes this arm's loss sum(out*out) and matches the work the FT arm
@@ -2169,6 +2170,7 @@ LANES = {
     "linear_wide_dense":   (linx_wide, lambda x: Fn.linear(x, linw_wide)**2),
     "linear_narrow_dense": (linx_narrow, lambda x: Fn.linear(x, linw_narrow)**2),
     "attention_dense": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)**2),
+    "attention_dense_zeroed": (attnq, lambda x: Fn.scaled_dot_product_attention(x, attnk, attnv)**2),
     "conv3d":     (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
     # frankentorch-l2zki: NON-UNIFORM loss, the only lane here that reaches conv3d's GENERIC
     # backward. The `*c3m` sits inside the lane's own fn, so `run`'s `fn(x).sum()` becomes
@@ -3321,6 +3323,15 @@ LANES = {
             "attention",
             Box::new(|| timed_attention(&attnq, &attnk, &attnv, false)),
         ),
+        (
+            "attention_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let out = timed_attention(&attnq, &attnk, &attnv, false);
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                out
+            }),
+        ),
         // frankentorch-mdsmm: the NON-UNIFORM twins for the three lanes `frankentorch-58zjz`
         // added. Those lanes end in `tensor_sum(out)`, so their upstream gradient is exactly all
         // `+1.0` and they only ever price the all-ones route. On the conv family that route
@@ -3359,6 +3370,15 @@ LANES = {
         (
             "attention_dense",
             Box::new(|| timed_attention(&attnq, &attnk, &attnv, true)),
+        ),
+        (
+            "attention_dense_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let out = timed_attention(&attnq, &attnk, &attnv, true);
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                out
+            }),
         ),
         (
             "conv3d",
