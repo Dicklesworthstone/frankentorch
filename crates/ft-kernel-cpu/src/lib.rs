@@ -20631,12 +20631,70 @@ pub fn batch_norm_stats_f64(
     let mut mean = vec![0.0f64; channels];
     let mut var = vec![0.0f64; channels];
 
-    // BatchNorm1d's native [N, C, L] layout is cache-hostile for the old
-    // one-channel-per-task traversal: every task advances one whole NCL row
-    // between successive samples. Keep each channel's n-then-spatial addition
-    // order intact, but give a task a small adjacent-channel tile so each row
-    // visit is contiguous. The spatial==1 case keeps its established row path.
+    // BatchNorm1d's native [N, C, L] and [N, C] layouts are cache-hostile for the old
+    // one-channel-per-task traversal: every task advances one whole row between
+    // successive samples. Keep each channel's n-then-spatial addition order intact,
+    // but give a task a small adjacent-channel tile so each row visit is contiguous.
     const NCL_CHANNEL_BLOCK: usize = 8;
+    if spatial == 1 && channels >= NCL_CHANNEL_BLOCK {
+        mean.par_chunks_mut(NCL_CHANNEL_BLOCK)
+            .zip(var.par_chunks_mut(NCL_CHANNEL_BLOCK))
+            .enumerate()
+            .for_each(|(block, (mean_block, var_block))| {
+                let first_channel = block * NCL_CHANNEL_BLOCK;
+                let width = mean_block.len();
+                let mut sums = [0.0f64; NCL_CHANNEL_BLOCK];
+                if width == NCL_CHANNEL_BLOCK {
+                    for n in 0..batch {
+                        let base = n * channels + first_channel;
+                        let row = &x[base..base + NCL_CHANNEL_BLOCK];
+                        for lane in 0..NCL_CHANNEL_BLOCK {
+                            sums[lane] += row[lane];
+                        }
+                    }
+                } else {
+                    for n in 0..batch {
+                        let base = n * channels + first_channel;
+                        let row = &x[base..base + width];
+                        for (sum, &value) in sums[..width].iter_mut().zip(row) {
+                            *sum += value;
+                        }
+                    }
+                }
+                let mut means = [0.0f64; NCL_CHANNEL_BLOCK];
+                for (channel_offset, mean) in mean_block.iter_mut().enumerate() {
+                    let m = sums[channel_offset] * inv_n;
+                    *mean = m;
+                    means[channel_offset] = m;
+                }
+                let mut vsums = [0.0f64; NCL_CHANNEL_BLOCK];
+                if width == NCL_CHANNEL_BLOCK {
+                    for n in 0..batch {
+                        let base = n * channels + first_channel;
+                        let row = &x[base..base + NCL_CHANNEL_BLOCK];
+                        for lane in 0..NCL_CHANNEL_BLOCK {
+                            let delta = row[lane] - means[lane];
+                            vsums[lane] += delta * delta;
+                        }
+                    }
+                } else {
+                    for n in 0..batch {
+                        let base = n * channels + first_channel;
+                        let row = &x[base..base + width];
+                        for ((vsum, &m), &value) in
+                            vsums[..width].iter_mut().zip(&means[..width]).zip(row)
+                        {
+                            let delta = value - m;
+                            *vsum += delta * delta;
+                        }
+                    }
+                }
+                for (channel_offset, variance) in var_block.iter_mut().enumerate() {
+                    *variance = vsums[channel_offset] * inv_n;
+                }
+            });
+        return (mean, var);
+    }
     if spatial > 1 && channels >= NCL_CHANNEL_BLOCK {
         mean.par_chunks_mut(NCL_CHANNEL_BLOCK)
             .zip(var.par_chunks_mut(NCL_CHANNEL_BLOCK))
@@ -20730,49 +20788,50 @@ pub fn batch_norm_apply_f64(
         scale[c] = rstd * weight.map_or(1.0, |w| w[c]);
         shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
     }
-    let mut out = vec![0.0f64; x.len()];
     // Pure fma-copy (out = x*scale + shift, stats precomputed): BANDWIDTH-bound like
     // a scaled copy, so parallel only pays above the fault-parallelism crossover
     // (~4M); below it (the common CNN train shapes [b8..64, C, HW]) rayon overhead
     // regresses it 0.1-0.8x. Gate at the copy tier, not the compute default. Bit-exact.
     let parallel = x.len() >= COPY_MATERIALIZE_PARALLEL_MIN;
-    if spatial == 1 {
-        let row_fn = |n: usize, row: &mut [f64]| {
-            let base = n * channels;
-            for c in 0..channels {
-                row[c] = x[base + c] * scale[c] + shift[c];
+    build_pool_output(x.len(), |out| {
+        if spatial == 1 {
+            let row_fn = |n: usize, row: &mut [f64]| {
+                let base = n * channels;
+                for c in 0..channels {
+                    row[c] = x[base + c] * scale[c] + shift[c];
+                }
+            };
+            if parallel {
+                out.par_chunks_mut(channels)
+                    .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+                    .enumerate()
+                    .for_each(|(n, row)| row_fn(n, row));
+            } else {
+                out.chunks_mut(channels)
+                    .enumerate()
+                    .for_each(|(n, row)| row_fn(n, row));
             }
-        };
-        if parallel {
-            out.par_chunks_mut(channels)
-                .enumerate()
-                .for_each(|(n, row)| row_fn(n, row));
         } else {
-            out.chunks_mut(channels)
-                .enumerate()
-                .for_each(|(n, row)| row_fn(n, row));
-        }
-    } else {
-        let row_fn = |idx: usize, orow: &mut [f64]| {
-            let c = idx % channels;
-            let base = idx * spatial;
-            let (sc, sh) = (scale[c], shift[c]);
-            for s in 0..spatial {
-                orow[s] = x[base + s] * sc + sh;
+            let row_fn = |idx: usize, orow: &mut [f64]| {
+                let c = idx % channels;
+                let base = idx * spatial;
+                let (sc, sh) = (scale[c], shift[c]);
+                for s in 0..spatial {
+                    orow[s] = x[base + s] * sc + sh;
+                }
+            };
+            if parallel {
+                out.par_chunks_mut(spatial)
+                    .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+                    .enumerate()
+                    .for_each(|(idx, orow)| row_fn(idx, orow));
+            } else {
+                out.chunks_mut(spatial)
+                    .enumerate()
+                    .for_each(|(idx, orow)| row_fn(idx, orow));
             }
-        };
-        if parallel {
-            out.par_chunks_mut(spatial)
-                .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
-                .enumerate()
-                .for_each(|(idx, orow)| row_fn(idx, orow));
-        } else {
-            out.chunks_mut(spatial)
-                .enumerate()
-                .for_each(|(idx, orow)| row_fn(idx, orow));
         }
-    }
-    out
+    })
 }
 
 /// Scalar forward for `sum(BatchNorm(x, weight, bias))` in f64 training/eval
@@ -21016,56 +21075,104 @@ pub fn batch_norm_backward_f64(
     let mut dweight = vec![0.0f64; channels];
     let mut dbias = vec![0.0f64; channels];
     if spatial == 1 {
-        dweight
-            .par_iter_mut()
-            .zip(dbias.par_iter_mut())
-            .enumerate()
-            .for_each(|(c, (dwc, dbc))| {
-                let rstd = 1.0 / (var[c] + eps).sqrt();
-                let mut sw = 0.0f64;
-                let mut sb = 0.0f64;
-                for n in 0..batch {
-                    let idx = n * channels + c;
-                    let dyi = dy[idx];
-                    let xhat = (x[idx] - mean[c]) * rstd;
-                    sw += dyi * xhat;
-                    sb += dyi;
-                }
-                *dwc = sw;
-                *dbc = sb;
-            });
         let rstd: Vec<f64> = (0..channels).map(|c| 1.0 / (var[c] + eps).sqrt()).collect();
-        let mut dx = vec![0.0f64; x.len()];
-        dx.par_chunks_mut(channels)
-            .enumerate()
-            .for_each(|(n, dxrow)| {
-                let base = n * channels;
-                for c in 0..channels {
+        const NC_CHANNEL_BLOCK: usize = 8;
+        if channels >= NC_CHANNEL_BLOCK {
+            dweight
+                .par_chunks_mut(NC_CHANNEL_BLOCK)
+                .zip(dbias.par_chunks_mut(NC_CHANNEL_BLOCK))
+                .enumerate()
+                .for_each(|(block, (dw_block, db_block))| {
+                    let first_channel = block * NC_CHANNEL_BLOCK;
+                    let width = dw_block.len();
+                    let mut sw = [0.0f64; NC_CHANNEL_BLOCK];
+                    let mut sb = [0.0f64; NC_CHANNEL_BLOCK];
+                    let mut mean_blk = [0.0f64; NC_CHANNEL_BLOCK];
+                    let mut rstd_blk = [0.0f64; NC_CHANNEL_BLOCK];
+                    mean_blk[..width].copy_from_slice(&mean[first_channel..first_channel + width]);
+                    rstd_blk[..width].copy_from_slice(&rstd[first_channel..first_channel + width]);
+                    if width == NC_CHANNEL_BLOCK {
+                        for n in 0..batch {
+                            let base = n * channels + first_channel;
+                            let x_row = &x[base..base + NC_CHANNEL_BLOCK];
+                            let dy_row = &dy[base..base + NC_CHANNEL_BLOCK];
+                            for lane in 0..NC_CHANNEL_BLOCK {
+                                let dyi = dy_row[lane];
+                                let xhat = (x_row[lane] - mean_blk[lane]) * rstd_blk[lane];
+                                sw[lane] += dyi * xhat;
+                                sb[lane] += dyi;
+                            }
+                        }
+                    } else {
+                        for n in 0..batch {
+                            let base = n * channels + first_channel;
+                            let x_row = &x[base..base + width];
+                            let dy_row = &dy[base..base + width];
+                            for lane in 0..width {
+                                let dyi = dy_row[lane];
+                                let xhat = (x_row[lane] - mean_blk[lane]) * rstd_blk[lane];
+                                sw[lane] += dyi * xhat;
+                                sb[lane] += dyi;
+                            }
+                        }
+                    }
+                    dw_block.copy_from_slice(&sw[..width]);
+                    db_block.copy_from_slice(&sb[..width]);
+                });
+        } else {
+            dweight
+                .par_iter_mut()
+                .zip(dbias.par_iter_mut())
+                .enumerate()
+                .for_each(|(c, (dwc, dbc))| {
                     let rstd_c = rstd[c];
-                    let w = weight[c];
-                    let c1 = w * dbias[c];
-                    let c2 = w * dweight[c];
-                    let idx = base + c;
-                    let xhat = (x[idx] - mean[c]) * rstd_c;
-                    let dxhat = dy[idx] * w;
-                    dxrow[c] = rstd_c * inv_m * (m * dxhat - c1 - xhat * c2);
-                }
-            });
+                    let mut sw = 0.0f64;
+                    let mut sb = 0.0f64;
+                    for n in 0..batch {
+                        let idx = n * channels + c;
+                        let dyi = dy[idx];
+                        let xhat = (x[idx] - mean[c]) * rstd_c;
+                        sw += dyi * xhat;
+                        sb += dyi;
+                    }
+                    *dwc = sw;
+                    *dbc = sb;
+                });
+        }
+        let c1: Vec<f64> = (0..channels).map(|c| weight[c] * dbias[c]).collect();
+        let c2: Vec<f64> = (0..channels).map(|c| weight[c] * dweight[c]).collect();
+        let dx = build_pool_output(x.len(), |dx| {
+            dx.par_chunks_mut(channels)
+                .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+                .enumerate()
+                .for_each(|(n, dxrow)| {
+                    let base = n * channels;
+                    let x_row = &x[base..base + channels];
+                    let dy_row = &dy[base..base + channels];
+                    for c in 0..channels {
+                        let rstd_c = rstd[c];
+                        let xhat = (x_row[c] - mean[c]) * rstd_c;
+                        let dxhat = dy_row[c] * weight[c];
+                        dxrow[c] = rstd_c * inv_m * (m * dxhat - c1[c] - xhat * c2[c]);
+                    }
+                });
+        });
         return (dx, dweight, dbias);
     }
+    let rstd: Vec<f64> = (0..channels).map(|c| 1.0 / (var[c] + eps).sqrt()).collect();
     dweight
         .par_iter_mut()
         .zip(dbias.par_iter_mut())
         .enumerate()
         .for_each(|(c, (dwc, dbc))| {
-            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let rstd_c = rstd[c];
             let mut sw = 0.0f64;
             let mut sb = 0.0f64;
             for n in 0..batch {
                 let base = n * cs + c * spatial;
                 for s in 0..spatial {
                     let dyi = dy[base + s];
-                    let xhat = (x[base + s] - mean[c]) * rstd;
+                    let xhat = (x[base + s] - mean[c]) * rstd_c;
                     sw += dyi * xhat;
                     sb += dyi;
                 }
@@ -21073,40 +21180,24 @@ pub fn batch_norm_backward_f64(
             *dwc = sw;
             *dbc = sb;
         });
-    let mut dx = vec![0.0f64; x.len()];
-    if spatial == 1 {
-        dx.par_chunks_mut(channels)
-            .enumerate()
-            .for_each(|(n, dxrow)| {
-                let base = n * channels;
-                for c in 0..channels {
-                    let rstd = 1.0 / (var[c] + eps).sqrt();
-                    let w = weight[c];
-                    let c1 = w * dbias[c];
-                    let c2 = w * dweight[c];
-                    let xhat = (x[base + c] - mean[c]) * rstd;
-                    let dxhat = dy[base + c] * w;
-                    dxrow[c] = rstd * inv_m * (m * dxhat - c1 - xhat * c2);
-                }
-            });
-    } else {
+    let dx = build_pool_output(x.len(), |dx| {
         dx.par_chunks_mut(spatial)
             .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
             .enumerate()
             .for_each(|(idx, dxrow)| {
                 let c = idx % channels;
                 let base = idx * spatial;
-                let rstd = 1.0 / (var[c] + eps).sqrt();
+                let rstd_c = rstd[c];
                 let w = weight[c];
                 let c1 = w * dbias[c];
                 let c2 = w * dweight[c];
                 for s in 0..spatial {
-                    let xhat = (x[base + s] - mean[c]) * rstd;
+                    let xhat = (x[base + s] - mean[c]) * rstd_c;
                     let dxhat = dy[base + s] * w;
-                    dxrow[s] = rstd * inv_m * (m * dxhat - c1 - xhat * c2);
+                    dxrow[s] = rstd_c * inv_m * (m * dxhat - c1 - xhat * c2);
                 }
             });
-    }
+    });
     (dx, dweight, dbias)
 }
 
