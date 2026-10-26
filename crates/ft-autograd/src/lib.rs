@@ -18125,15 +18125,15 @@ impl TensorTape {
                     // At x == 0 (or -0.0) and NaN, use the slope branch.
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
+                    // The slope is locally constant, but the incoming gradient
+                    // may depend on x through a nonlinear downstream loss.
+                    let slopes: Vec<f64> = input_vals
                         .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| g * if *x > 0.0 { 1.0 } else { 0.01 })
+                        .map(|x| if *x > 0.0 { 1.0 } else { 0.01 })
                         .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    let slopes = self.leaf(slopes, input_shape, false)?;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.cg_mul(incoming, slopes)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18232,21 +18232,19 @@ impl TensorTape {
                     // d(hardsigmoid(x))/dx = 0 if x <= -3 or x >= 3, else 1/6
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
+                    let slopes: Vec<f64> = input_vals
                         .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| {
-                            g * if *x <= -3.0 || *x >= 3.0 {
+                        .map(|x| {
+                            if *x <= -3.0 || *x >= 3.0 {
                                 0.0
                             } else {
                                 1.0 / 6.0
                             }
                         })
                         .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    let slopes = self.leaf(slopes, input_shape, false)?;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.cg_mul(incoming, slopes)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18259,15 +18257,13 @@ impl TensorTape {
                     // d(hardtanh(x))/dx = 0 if x <= -1 or x >= 1, else 1
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
+                    let slopes: Vec<f64> = input_vals
                         .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| g * if *x <= -1.0 || *x >= 1.0 { 0.0 } else { 1.0 })
+                        .map(|x| if *x <= -1.0 || *x >= 1.0 { 0.0 } else { 1.0 })
                         .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    let slopes = self.leaf(slopes, input_shape, false)?;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.cg_mul(incoming, slopes)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -36451,5 +36447,327 @@ mod tests {
                 }
             }
         }
+    }
+    fn piecewise_activation(
+        tape: &mut TensorTape,
+        x: TensorNodeId,
+        kind: usize,
+        mode: ExecutionMode,
+    ) -> TensorNodeId {
+        match kind {
+            0 => tape.leaky_relu(x, mode).expect("leaky_relu").0,
+            1 => tape.hardsigmoid(x, mode).expect("hardsigmoid").0,
+            _ => tape.hardtanh(x, mode).expect("hardtanh").0,
+        }
+    }
+
+    fn assert_piecewise_relative(label: &str, actual: &[f64], expected: &[f64], relative: f64) {
+        assert_eq!(actual.len(), expected.len(), "{label}: gradient length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if expected == 0.0 {
+                assert_eq!(actual, 0.0, "{label}[{index}]");
+            } else {
+                assert!(
+                    (actual - expected).abs() <= relative * expected.abs(),
+                    "{label}[{index}]: actual={actual:.17e}, expected={expected:.17e}"
+                );
+            }
+        }
+    }
+
+    fn check_piecewise_cubic_higher_derivatives(kind: usize) {
+        // Each activation is affine on the chosen input regions. These are fixed
+        // mathematical outputs/slopes, independent of the implementation's predicates.
+        let (output, slope): ([f64; 6], [f64; 6]) = match kind {
+            0 => (
+                [-0.04, -0.02, -0.005, 0.5, 2.0, 4.0],
+                [0.01, 0.01, 0.01, 1.0, 1.0, 1.0],
+            ),
+            1 => (
+                [0.0, 1.0 / 6.0, 5.0 / 12.0, 7.0 / 12.0, 5.0 / 6.0, 1.0],
+                [0.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 0.0],
+            ),
+            _ => (
+                [-1.0, -1.0, -0.5, 0.5, 1.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+            ),
+        };
+        let weights = [0.5, -1.0, 2.0, -0.25, 1.5, -2.0];
+        let direction = [1.0, -0.5, 2.0, -1.0, 0.25, 1.5];
+        // L=sum(g*y^3), y=a*x+b locally:
+        // dL/dx=3*g*a*y^2; H*v=6*g*a^2*y*v; d/dg<dL/dx,v>=3*a*y^2*v.
+        // Differentiating sum(H*v) gives 6*g*a^3*v with respect to x and
+        // 6*a^2*y*v with respect to g. Nonzero small slopes use relative-only checks.
+        let expected_first: [f64; 6] =
+            std::array::from_fn(|i| 3.0 * weights[i] * slope[i] * output[i] * output[i]);
+        let expected_hvp: [f64; 6] = std::array::from_fn(|i| {
+            6.0 * weights[i] * slope[i] * slope[i] * output[i] * direction[i]
+        });
+        let expected_mixed: [f64; 6] =
+            std::array::from_fn(|i| 3.0 * slope[i] * output[i] * output[i] * direction[i]);
+        let expected_third: [f64; 6] = std::array::from_fn(|i| {
+            6.0 * weights[i] * slope[i] * slope[i] * slope[i] * direction[i]
+        });
+        let expected_third_upstream: [f64; 6] =
+            std::array::from_fn(|i| 6.0 * slope[i] * slope[i] * output[i] * direction[i]);
+        for f32_leaf in [false, true] {
+            let relative = if f32_leaf { 2.0e-6 } else { 3.0e-13 };
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for disable_forward_recording in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let x = routing_leaf(
+                        &mut tape,
+                        &[-4.0, -2.0, -0.5, 0.5, 2.0, 4.0],
+                        &[2, 3],
+                        f32_leaf,
+                    );
+                    let upstream = routing_leaf(&mut tape, &weights, &[2, 3], f32_leaf);
+                    let y = piecewise_activation(&mut tape, x, kind, mode);
+                    let (square, _) = tape.mul(y, y, mode).expect("activation square");
+                    let (cube, _) = tape.mul(square, y, mode).expect("activation cube");
+                    let (weighted, _) = tape
+                        .mul(cube, upstream, mode)
+                        .expect("weighted activation cube");
+                    let (loss, _) = tape.sum(weighted, mode).expect("activation loss");
+                    let ordinary = tape
+                        .backward_with_options(loss, routing_options(mode, false))
+                        .expect("ordinary activation gradient");
+                    tape.set_grad_enabled(!disable_forward_recording);
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, true))
+                        .expect("graph activation gradient");
+                    assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                    assert_piecewise_relative(
+                        "ordinary activation gradient",
+                        ordinary
+                            .gradient(x)
+                            .expect("ordinary activation gradient reaches x"),
+                        &expected_first,
+                        relative,
+                    );
+                    assert_piecewise_relative(
+                        "graph activation gradient",
+                        first
+                            .gradient(x)
+                            .expect("graph activation gradient reaches x"),
+                        &expected_first,
+                        relative,
+                    );
+                    tape.set_grad_enabled(true);
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).expect("activation gradient node"),
+                        &direction,
+                        mode,
+                    );
+                    for create_graph in [false, true] {
+                        tape.set_grad_enabled(!disable_forward_recording);
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, create_graph))
+                            .expect("activation Hessian-vector product");
+                        assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                        assert_piecewise_relative(
+                            "activation HVP",
+                            second.gradient(x).expect("activation Hessian reaches x"),
+                            &expected_hvp,
+                            relative,
+                        );
+                        assert_piecewise_relative(
+                            "activation upstream mixed derivative",
+                            second
+                                .gradient(upstream)
+                                .expect("activation mixed derivative reaches upstream"),
+                            &expected_mixed,
+                            relative,
+                        );
+                        if create_graph {
+                            tape.set_grad_enabled(true);
+                            let (third_loss, _) = tape
+                                .sum(
+                                    second.gradient_node(x).expect("activation Hessian node"),
+                                    mode,
+                                )
+                                .expect("activation Hessian sum");
+                            tape.set_grad_enabled(!disable_forward_recording);
+                            let third = tape
+                                .backward_with_options(third_loss, routing_options(mode, false))
+                                .expect("activation third derivative");
+                            assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                            assert_piecewise_relative(
+                                "activation third derivative",
+                                third
+                                    .gradient(x)
+                                    .expect("activation third derivative reaches x"),
+                                &expected_third,
+                                relative,
+                            );
+                            assert_piecewise_relative(
+                                "activation third upstream derivative",
+                                third
+                                    .gradient(upstream)
+                                    .expect("activation third derivative reaches upstream"),
+                                &expected_third_upstream,
+                                relative,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_piecewise_ieee(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "element {index} should remain NaN");
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "element {index}");
+            }
+        }
+    }
+
+    fn check_piecewise_boundary_nonfinite_upstreams(kind: usize) {
+        let inputs = [
+            f64::NEG_INFINITY,
+            -4.0,
+            -3.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            3.0,
+            4.0,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        // Preserve the existing native conventions: zero/NaN use the leaky slope;
+        // hardsigmoid and hardtanh exclude finite endpoints but pass NaN through
+        // their interior-slope branch. This change concerns graph dependencies.
+        let slopes: [f64; 11] = match kind {
+            0 => [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 1.0, 0.01],
+            1 => [
+                0.0,
+                0.0,
+                0.0,
+                1.0 / 6.0,
+                1.0 / 6.0,
+                1.0 / 6.0,
+                1.0 / 6.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0 / 6.0,
+            ],
+            _ => [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        let second_seed = [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            3.0,
+            -0.0,
+            0.0,
+            1.0,
+            -2.0,
+            f64::INFINITY,
+            f64::NAN,
+            f64::NEG_INFINITY,
+        ];
+        let expected_mixed: [f64; 11] = std::array::from_fn(|i| second_seed[i] * slopes[i]);
+        for f32_leaf in [false, true] {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for upstream_values in [
+                    [1.0, -2.0, 0.5, 3.0, -1.0, 2.0, -3.0, 0.25, -0.5, 4.0, -4.0],
+                    [
+                        f64::INFINITY,
+                        f64::NAN,
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                        -0.0,
+                        0.0,
+                        f64::NEG_INFINITY,
+                        f64::NAN,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                    ],
+                ] {
+                    let mut tape = TensorTape::new();
+                    let x = routing_leaf(&mut tape, &inputs, &[11], f32_leaf);
+                    let upstream = routing_leaf(&mut tape, &upstream_values, &[11], f32_leaf);
+                    let y = piecewise_activation(&mut tape, x, kind, mode);
+                    let (weighted, _) = tape
+                        .mul(y, upstream, mode)
+                        .expect("boundary weighted activation");
+                    let (loss, _) = tape.sum(weighted, mode).expect("boundary activation sum");
+                    let ordinary = tape
+                        .backward_with_options(loss, routing_options(mode, false))
+                        .expect("ordinary boundary backward");
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, true))
+                        .expect("graph boundary backward");
+                    let expected: [f64; 11] =
+                        std::array::from_fn(|i| upstream_values[i] * slopes[i]);
+                    // These activations multiply by a slope, unlike routing selection:
+                    // an infinite/NaN upstream times zero must continue to yield NaN.
+                    assert_piecewise_ieee(
+                        ordinary.gradient(x).expect("ordinary boundary gradient"),
+                        &expected,
+                    );
+                    assert_piecewise_ieee(
+                        first.gradient(x).expect("graph boundary gradient"),
+                        &expected,
+                    );
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).expect("boundary gradient node"),
+                        &second_seed,
+                        mode,
+                    );
+                    for create_graph in [false, true] {
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, create_graph))
+                            .expect("boundary mixed backward");
+                        assert_piecewise_ieee(
+                            second
+                                .gradient(upstream)
+                                .expect("boundary mixed derivative reaches upstream"),
+                            &expected_mixed,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_leaky_relu_cubic_hvps_and_third_derivatives() {
+        check_piecewise_cubic_higher_derivatives(0);
+    }
+
+    #[test]
+    fn create_graph_hardsigmoid_cubic_hvps_and_third_derivatives() {
+        check_piecewise_cubic_higher_derivatives(1);
+    }
+
+    #[test]
+    fn create_graph_hardtanh_cubic_hvps_and_third_derivatives() {
+        check_piecewise_cubic_higher_derivatives(2);
+    }
+
+    #[test]
+    fn create_graph_leaky_relu_boundary_nonfinite_upstreams() {
+        check_piecewise_boundary_nonfinite_upstreams(0);
+    }
+
+    #[test]
+    fn create_graph_hardsigmoid_boundary_nonfinite_upstreams() {
+        check_piecewise_boundary_nonfinite_upstreams(1);
+    }
+
+    #[test]
+    fn create_graph_hardtanh_boundary_nonfinite_upstreams() {
+        check_piecewise_boundary_nonfinite_upstreams(2);
     }
 }
