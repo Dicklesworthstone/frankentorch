@@ -33516,6 +33516,310 @@ mod tests {
         }
     }
 
+    fn check_softmax_conditioned_upstream(
+        f32_leaf: bool,
+        log: bool,
+        margin: f64,
+        upstream: [f64; 3],
+        gradient: [f64; 3],
+        hvp: [f64; 3],
+    ) {
+        let mut tape = TensorTape::new();
+        let x = if f32_leaf {
+            tape.leaf_f32(
+                vec![-margin as f32, -margin as f32, margin as f32],
+                vec![3],
+                true,
+            )
+        } else {
+            tape.leaf(vec![-margin, -margin, margin], vec![3], true)
+        }
+        .unwrap();
+        let (y, _) = if log {
+            tape.log_softmax(x, 0, ExecutionMode::Strict)
+        } else {
+            tape.softmax(x, 0, ExecutionMode::Strict)
+        }
+        .unwrap();
+        // Keep upstream contrasts in f64 even when the logits are f32.
+        let g = tape.leaf(upstream.to_vec(), vec![3], true).unwrap();
+        let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+        let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+        let ordinary = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions::strict_default().with_retain_graph(true),
+            )
+            .unwrap();
+        let first = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+        let relative = if f32_leaf { 5e-6 } else { 4e-13 };
+        let context = format!("conditioned f32={f32_leaf}, log={log}, g={upstream:?}");
+        assert_softmax_relative(
+            &format!("ordinary {context}"),
+            ordinary.gradient(x).unwrap(),
+            &gradient,
+            relative,
+        );
+        assert_softmax_relative(
+            &format!("graph {context}"),
+            first.gradient(x).unwrap(),
+            &gradient,
+            relative,
+        );
+        let dx = first.gradient_node(x).unwrap();
+        let v = tape.leaf(vec![0.75, -1.25, 2.0], vec![3], false).unwrap();
+        let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+        let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+        for second_create_graph in [false, true] {
+            let second = tape
+                .backward_with_options(
+                    dot,
+                    BackwardOptions {
+                        create_graph: second_create_graph,
+                        retain_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .unwrap();
+            assert_softmax_relative(
+                &format!("HVP cg={second_create_graph} {context}"),
+                second.gradient(x).unwrap(),
+                &hvp,
+                relative,
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_large_opposing_upstream_high_precision() {
+        // Decimal at precision 300, using the independent equations above.
+        // The weighted tails cancel before the dominant entry is added. The
+        // tiny dominant derivative must survive despite much larger tails.
+        let large = 18_014_398_509_481_984.0; // 2^54, exactly representable.
+        for f32_leaf in [false, true] {
+            let (margin, gradients, hvps) = if f32_leaf {
+                (
+                    9.0,
+                    [
+                        [-274358916.0556305, 274358916.0556305, 3.045995763380708e-8],
+                        [
+                            -18_014_398_509_481_984.0,
+                            18_014_398_509_481_984.0,
+                            3.045995856161615e-8,
+                        ],
+                    ],
+                    [
+                        [342948634.6233366, -891666450.0206752, 548717815.3973385],
+                        [
+                            1.9037473057224886e-8,
+                            4.949743161884104e-8,
+                            -6.853490467606592e-8,
+                        ],
+                    ],
+                )
+            } else {
+                (
+                    20.0,
+                    [
+                        [
+                            -0.07653154656427624,
+                            0.07653154656427624,
+                            8.496708510583178e-18,
+                        ],
+                        [
+                            -18_014_398_509_481_984.0,
+                            18_014_398_509_481_984.0,
+                            8.496708510583178e-18,
+                        ],
+                    ],
+                    [
+                        [
+                            0.0956644332053453,
+                            -0.24872752633389777,
+                            0.15306309312855246,
+                        ],
+                        [
+                            5.310442819114486e-18,
+                            1.3807151329697665e-17,
+                            -1.911759414881215e-17,
+                        ],
+                    ],
+                )
+            };
+            for log in [false, true] {
+                check_softmax_conditioned_upstream(
+                    f32_leaf,
+                    log,
+                    margin,
+                    [-large, large, 1.0],
+                    gradients[usize::from(log)],
+                    hvps[usize::from(log)],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_near_constant_upstream_preserves_factored_tails() {
+        // Subtracting p*g - p*dot loses the one-ulp contrast in g. The
+        // factored tails p*(g-dot) retain it. All weights are exact dyadics.
+        let delta = f64::EPSILON;
+        for f32_leaf in [false, true] {
+            let (margin, gradient, hvp) = if f32_leaf {
+                (
+                    40.0,
+                    [4.007575133625297e-51, -4.007575133625297e-51, 0.0],
+                    [
+                        -5.009468917031621e-51,
+                        1.3024619184282215e-50,
+                        -8.015150267250594e-51,
+                    ],
+                )
+            } else {
+                (
+                    20.0,
+                    [9.433241421977964e-34, -9.433241421977964e-34, 0.0],
+                    [
+                        -1.1791551777472456e-33,
+                        3.0658034621428386e-33,
+                        -1.886648284395593e-33,
+                    ],
+                )
+            };
+            check_softmax_conditioned_upstream(
+                f32_leaf,
+                false,
+                margin,
+                [1.0 + delta, 1.0 - delta, 1.0],
+                gradient,
+                hvp,
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_backward_ignores_forward_grad_recording_mode() {
+        for f32_leaf in [false, true] {
+            let reference = &softmax_cg_references(f32_leaf)[0];
+            let relative = if f32_leaf { 1e-5 } else { 3e-13 };
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(
+                        reference.logits.iter().map(|&v| v as f32).collect(),
+                        vec![3],
+                        true,
+                    )
+                } else {
+                    tape.leaf(reference.logits.to_vec(), vec![3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape
+                    .leaf(reference.upstream.to_vec(), vec![3], true)
+                    .unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                tape.set_grad_enabled(false);
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let dx = first
+                    .gradient_node(x)
+                    .expect("gradient graph survives no_grad");
+                assert!(tape.nodes[dx.0].requires_grad);
+                assert_softmax_relative(
+                    "no_grad first backward",
+                    first.gradient(x).unwrap(),
+                    &reference.gradient[usize::from(log)],
+                    relative,
+                );
+                tape.set_grad_enabled(true);
+                let v = tape
+                    .leaf(reference.direction.to_vec(), vec![3], false)
+                    .unwrap();
+                let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+                tape.set_grad_enabled(false);
+                let second = tape
+                    .backward_with_options(
+                        dot,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                assert_softmax_relative(
+                    "no_grad second backward",
+                    second.gradient(x).unwrap(),
+                    &reference.hessian_vector[usize::from(log)],
+                    relative,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_singleton_preserves_positive_zero() {
+        for f32_leaf in [false, true] {
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(vec![2.0, -3.0, 4.0, -5.0], vec![2, 1, 2], true)
+                } else {
+                    tape.leaf(vec![2.0, -3.0, 4.0, -5.0], vec![2, 1, 2], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 1, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 1, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape
+                    .leaf(vec![-2.0, 3.0, -4.0, 5.0], vec![2, 1, 2], false)
+                    .unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                for &value in first.gradient(x).unwrap() {
+                    assert_eq!(
+                        value.to_bits(),
+                        0.0_f64.to_bits(),
+                        "f32={f32_leaf}, log={log}: singleton graph gradient changed signed zero"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn create_graph_softmax_family_isolates_nonfinite_lanes_and_masked_logits() {
         for f32_leaf in [false, true] {
