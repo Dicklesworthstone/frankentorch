@@ -32845,6 +32845,149 @@ pub fn set_eigh_bt_row_split(on: bool) -> bool {
     EIGH_BT_ROW_SPLIT.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn eigh_backtransform_project_chunk_f64(
+    out: &mut [f64],
+    j_base: usize,
+    prev: &[f64],
+    row_i: &[f64],
+    n: usize,
+    i: usize,
+) {
+    let len = out.len();
+    let mut off = 0usize;
+    while off + 16 <= len {
+        let j0 = j_base + off;
+        let mut acc0 = wide::f64x4::ZERO;
+        let mut acc1 = wide::f64x4::ZERO;
+        let mut acc2 = wide::f64x4::ZERO;
+        let mut acc3 = wide::f64x4::ZERO;
+        let mut k = 0usize;
+        while k + 4 <= i {
+            let f0 = wide::f64x4::splat(row_i[k]);
+            let f1 = wide::f64x4::splat(row_i[k + 1]);
+            let f2 = wide::f64x4::splat(row_i[k + 2]);
+            let f3 = wide::f64x4::splat(row_i[k + 3]);
+            let r0 = &prev[k * n + j0..k * n + j0 + 16];
+            let r1 = &prev[(k + 1) * n + j0..(k + 1) * n + j0 + 16];
+            let r2 = &prev[(k + 2) * n + j0..(k + 2) * n + j0 + 16];
+            let r3 = &prev[(k + 3) * n + j0..(k + 3) * n + j0 + 16];
+            acc0 += wide::f64x4::from([r0[0], r0[1], r0[2], r0[3]]) * f0;
+            acc1 += wide::f64x4::from([r0[4], r0[5], r0[6], r0[7]]) * f0;
+            acc2 += wide::f64x4::from([r0[8], r0[9], r0[10], r0[11]]) * f0;
+            acc3 += wide::f64x4::from([r0[12], r0[13], r0[14], r0[15]]) * f0;
+            acc0 += wide::f64x4::from([r1[0], r1[1], r1[2], r1[3]]) * f1;
+            acc1 += wide::f64x4::from([r1[4], r1[5], r1[6], r1[7]]) * f1;
+            acc2 += wide::f64x4::from([r1[8], r1[9], r1[10], r1[11]]) * f1;
+            acc3 += wide::f64x4::from([r1[12], r1[13], r1[14], r1[15]]) * f1;
+            acc0 += wide::f64x4::from([r2[0], r2[1], r2[2], r2[3]]) * f2;
+            acc1 += wide::f64x4::from([r2[4], r2[5], r2[6], r2[7]]) * f2;
+            acc2 += wide::f64x4::from([r2[8], r2[9], r2[10], r2[11]]) * f2;
+            acc3 += wide::f64x4::from([r2[12], r2[13], r2[14], r2[15]]) * f2;
+            acc0 += wide::f64x4::from([r3[0], r3[1], r3[2], r3[3]]) * f3;
+            acc1 += wide::f64x4::from([r3[4], r3[5], r3[6], r3[7]]) * f3;
+            acc2 += wide::f64x4::from([r3[8], r3[9], r3[10], r3[11]]) * f3;
+            acc3 += wide::f64x4::from([r3[12], r3[13], r3[14], r3[15]]) * f3;
+            k += 4;
+        }
+        while k < i {
+            let fk = wide::f64x4::splat(row_i[k]);
+            let rk = &prev[k * n + j0..k * n + j0 + 16];
+            acc0 += wide::f64x4::from([rk[0], rk[1], rk[2], rk[3]]) * fk;
+            acc1 += wide::f64x4::from([rk[4], rk[5], rk[6], rk[7]]) * fk;
+            acc2 += wide::f64x4::from([rk[8], rk[9], rk[10], rk[11]]) * fk;
+            acc3 += wide::f64x4::from([rk[12], rk[13], rk[14], rk[15]]) * fk;
+            k += 1;
+        }
+        out[off..off + 4].copy_from_slice(&acc0.to_array());
+        out[off + 4..off + 8].copy_from_slice(&acc1.to_array());
+        out[off + 8..off + 12].copy_from_slice(&acc2.to_array());
+        out[off + 12..off + 16].copy_from_slice(&acc3.to_array());
+        off += 16;
+    }
+    while off + 4 <= len {
+        let j0 = j_base + off;
+        let mut acc = wide::f64x4::ZERO;
+        for (k, &row_factor) in row_i.iter().enumerate().take(i) {
+            let rk = &prev[k * n + j0..k * n + j0 + 4];
+            acc += wide::f64x4::from([rk[0], rk[1], rk[2], rk[3]]) * wide::f64x4::splat(row_factor);
+        }
+        out[off..off + 4].copy_from_slice(&acc.to_array());
+        off += 4;
+    }
+    while off < len {
+        let j = j_base + off;
+        let mut acc = 0.0;
+        for (k, &row_factor) in row_i.iter().enumerate().take(i) {
+            acc += row_factor * prev[k * n + j];
+        }
+        out[off] = acc;
+        off += 1;
+    }
+}
+
+fn eigh_backtransform_apply_rows_f64(rows_buf: &mut [f64], proj: &[f64], n: usize, i: usize) {
+    let num_rows = rows_buf.len() / n;
+    let mut r = 0usize;
+    let mut rest = rows_buf;
+    while r + 4 <= num_rows {
+        let (r0_full, tail1) = rest.split_at_mut(n);
+        let (r1_full, tail2) = tail1.split_at_mut(n);
+        let (r2_full, tail3) = tail2.split_at_mut(n);
+        let (r3_full, next_rest) = tail3.split_at_mut(n);
+        rest = next_rest;
+        let ref0 = r0_full[i];
+        let ref1 = r1_full[i];
+        let ref2 = r2_full[i];
+        let ref3 = r3_full[i];
+        let ref0_v = wide::f64x4::splat(ref0);
+        let ref1_v = wide::f64x4::splat(ref1);
+        let ref2_v = wide::f64x4::splat(ref2);
+        let ref3_v = wide::f64x4::splat(ref3);
+        let r0 = &mut r0_full[..i];
+        let r1 = &mut r1_full[..i];
+        let r2 = &mut r2_full[..i];
+        let r3 = &mut r3_full[..i];
+        let mut j = 0usize;
+        while j + 4 <= i {
+            let pv = wide::f64x4::from([proj[j], proj[j + 1], proj[j + 2], proj[j + 3]]);
+            let v0 = wide::f64x4::from([r0[j], r0[j + 1], r0[j + 2], r0[j + 3]]) - pv * ref0_v;
+            let v1 = wide::f64x4::from([r1[j], r1[j + 1], r1[j + 2], r1[j + 3]]) - pv * ref1_v;
+            let v2 = wide::f64x4::from([r2[j], r2[j + 1], r2[j + 2], r2[j + 3]]) - pv * ref2_v;
+            let v3 = wide::f64x4::from([r3[j], r3[j + 1], r3[j + 2], r3[j + 3]]) - pv * ref3_v;
+            r0[j..j + 4].copy_from_slice(&v0.to_array());
+            r1[j..j + 4].copy_from_slice(&v1.to_array());
+            r2[j..j + 4].copy_from_slice(&v2.to_array());
+            r3[j..j + 4].copy_from_slice(&v3.to_array());
+            j += 4;
+        }
+        while j < i {
+            let pj = proj[j];
+            r0[j] -= pj * ref0;
+            r1[j] -= pj * ref1;
+            r2[j] -= pj * ref2;
+            r3[j] -= pj * ref3;
+            j += 1;
+        }
+        r += 4;
+    }
+    for row_full in rest.chunks_exact_mut(n) {
+        let reflector = row_full[i];
+        let ref_v = wide::f64x4::splat(reflector);
+        let row = &mut row_full[..i];
+        let mut j = 0usize;
+        while j + 4 <= i {
+            let pv = wide::f64x4::from([proj[j], proj[j + 1], proj[j + 2], proj[j + 3]]);
+            let v = wide::f64x4::from([row[j], row[j + 1], row[j + 2], row[j + 3]]) - pv * ref_v;
+            row[j..j + 4].copy_from_slice(&v.to_array());
+            j += 4;
+        }
+        while j < i {
+            row[j] -= proj[j] * reflector;
+            j += 1;
+        }
+    }
+}
+
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
     let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
     if nb > 0 {
@@ -32852,6 +32995,7 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
         return;
     }
     let par_min = EIGH_BT_PAR_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    let fast = eigh_fast_kernel();
     let threads = rayon::current_num_threads();
     let mut projections = Vec::with_capacity(n);
     for i in 0..n {
@@ -32861,6 +33005,45 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
             let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
             let row_i = &current_and_after[..i];
             projections.resize(i, 0.0);
+            if fast && par_min == usize::MAX {
+                let prev: &[f64] = previous_rows;
+                if i >= 512 && threads > 1 {
+                    let chunk = ((i.div_ceil(threads) + 15) & !15).max(128);
+                    projections[..i]
+                        .par_chunks_mut(chunk)
+                        .enumerate()
+                        .for_each(|(ci, out)| {
+                            eigh_backtransform_project_chunk_f64(
+                                out,
+                                ci * chunk,
+                                prev,
+                                row_i,
+                                n,
+                                i,
+                            );
+                        });
+                } else {
+                    eigh_backtransform_project_chunk_f64(&mut projections[..i], 0, prev, row_i, n, i);
+                }
+                let proj: &[f64] = &projections[..i];
+                if i >= 384 && threads > 1 {
+                    let rows_per_task = ((i.div_ceil(threads * 2) + 3) & !3).max(32);
+                    previous_rows
+                        .par_chunks_mut(rows_per_task * n)
+                        .for_each(|rows_buf| {
+                            eigh_backtransform_apply_rows_f64(rows_buf, proj, n, i);
+                        });
+                } else {
+                    eigh_backtransform_apply_rows_f64(previous_rows, proj, n, i);
+                }
+                d[i] = z[i * n + i];
+                z[i * n + i] = 1.0;
+                for j in 0..i {
+                    z[j * n + i] = 0.0;
+                    z[i * n + j] = 0.0;
+                }
+                continue;
+            }
             // BIT-EXACT EITHER WAY, and that is the whole point of splitting these two loops
             // the way they are split rather than the obvious way.
             //
@@ -33560,6 +33743,7 @@ fn eigh_tql2_replay_blocked(z: &mut [f64], n: usize, ops: &[(usize, f64, f64)], 
     }
     let br = block_rows.max(1);
     let transposed = svd_replay_transposed();
+    let fast = eigh_fast_kernel();
     z.par_chunks_mut(br * n).for_each(|block| {
         let nrows = block.len() / n;
         if !transposed {
@@ -33594,16 +33778,37 @@ fn eigh_tql2_replay_blocked(z: &mut [f64], n: usize, ops: &[(usize, f64, f64)], 
                 t[col * nrows + r] = block[base + col];
             }
         }
-        for &(i, c, s) in ops {
-            // i and i+1 are adjacent columns, so their runs are adjacent in `t`.
-            let (head, tail) = t.split_at_mut((i + 1) * nrows);
-            let xs = &mut head[i * nrows..];
-            let zs = &mut tail[..nrows];
-            for r in 0..nrows {
-                let a = xs[r];
-                let bb = zs[r];
-                zs[r] = s * a + c * bb;
-                xs[r] = c * a - s * bb;
+        if fast && nrows == 8 {
+            for &(i, c, s) in ops {
+                let off = i * 8;
+                let pair = &mut t[off..off + 16];
+                let a0 = wide::f64x4::from([pair[0], pair[1], pair[2], pair[3]]);
+                let a1 = wide::f64x4::from([pair[4], pair[5], pair[6], pair[7]]);
+                let b0 = wide::f64x4::from([pair[8], pair[9], pair[10], pair[11]]);
+                let b1 = wide::f64x4::from([pair[12], pair[13], pair[14], pair[15]]);
+                let sv = wide::f64x4::splat(s);
+                let cv = wide::f64x4::splat(c);
+                let z0 = sv * a0 + cv * b0;
+                let z1 = sv * a1 + cv * b1;
+                let x0 = cv * a0 - sv * b0;
+                let x1 = cv * a1 - sv * b1;
+                pair[0..4].copy_from_slice(&x0.to_array());
+                pair[4..8].copy_from_slice(&x1.to_array());
+                pair[8..12].copy_from_slice(&z0.to_array());
+                pair[12..16].copy_from_slice(&z1.to_array());
+            }
+        } else {
+            for &(i, c, s) in ops {
+                // i and i+1 are adjacent columns, so their runs are adjacent in `t`.
+                let (head, tail) = t.split_at_mut((i + 1) * nrows);
+                let xs = &mut head[i * nrows..];
+                let zs = &mut tail[..nrows];
+                for r in 0..nrows {
+                    let a = xs[r];
+                    let bb = zs[r];
+                    zs[r] = s * a + c * bb;
+                    xs[r] = c * a - s * bb;
+                }
             }
         }
         for r in 0..nrows {
