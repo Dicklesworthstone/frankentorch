@@ -2097,24 +2097,24 @@ print('PT_THREADS %d' % torch.get_num_threads(), flush=True)
                 let _ = ft_kernel_cpu::cholesky_stage_take_ns();
                 let probe = ft_one(n, &data, arm, ft_op);
                 std::hint::black_box(&probe);
-                let (panel, trsm, pack, syrk) = ft_kernel_cpu::cholesky_stage_take_ns();
+                let (panel, trsm, syrk, zero) = ft_kernel_cpu::cholesky_stage_take_ns();
                 let census = ft_kernel_cpu::dgemm_bt_sub_census_take();
                 ft_kernel_cpu::set_dgemm_bt_sub_census_enabled(previous);
                 let ms = |v: u64| v as f64 / 1e6;
-                let stage_total = (panel + trsm + pack + syrk).max(1) as f64;
+                let stage_total = (panel + trsm + syrk + zero).max(1) as f64;
                 let pct = |v: u64| 100.0 * v as f64 / stage_total;
                 eprintln!(
                     "Cholesky phases (arm{idx} [{}], one instrumented call): panel {:.3} ms {:.0}%  \
-                     trsm {:.3} ms {:.0}%  pack {:.3} ms {:.0}%  syrk {:.3} ms {:.0}%",
+                     trsm {:.3} ms {:.0}%  syrk {:.3} ms {:.0}%  zero {:.3} ms {:.0}%",
                     arm_label(arm, ft_op),
                     ms(panel),
                     pct(panel),
                     ms(trsm),
                     pct(trsm),
-                    ms(pack),
-                    pct(pack),
                     ms(syrk),
                     pct(syrk),
+                    ms(zero),
+                    pct(zero),
                 );
                 let total_ns: u64 = census.iter().map(|entry| entry.elapsed_ns).sum();
                 let eligible_ns: u64 = census
