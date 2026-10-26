@@ -4742,6 +4742,59 @@ impl TensorTape {
             .map(|gradient| gradient.to_vec()))
     }
 
+    /// Refresh selected parameter gradients from the current accumulated tape.
+    ///
+    /// Optimizer reports must reflect unscaling, clipping, and earlier
+    /// microbatches rather than only the last backward invocation. Unselected
+    /// entries and the original execution trace are preserved. Refreshed values
+    /// are detached snapshots, so their old differentiable gradient nodes are
+    /// cleared even when the numeric values happen to be unchanged.
+    pub fn refresh_parameter_gradients(
+        &self,
+        report: &TensorBackwardReport,
+        parameters: &[TensorNodeId],
+    ) -> Result<TensorBackwardReport, AutogradError> {
+        // Validate before cloning or sizing from externally supplied node IDs.
+        for &parameter in parameters {
+            self.node(parameter)?;
+        }
+        let mut refreshed = report.clone();
+        if let Some(last) = parameters.iter().map(|parameter| parameter.0).max()
+            && refreshed.gradients.len() <= last
+        {
+            refreshed.gradients.resize(last + 1, None);
+        }
+        for &parameter in parameters {
+            let current = self.persistent_grads.get(&parameter.0);
+            let keep_sparse = match (current, report.sparse_gradient(parameter)) {
+                (Some(values), Some(sparse)) => {
+                    let tensor = &self.nodes[parameter.0].tensor;
+                    if sparse.dense_shape() != tensor.meta().shape()
+                        || sparse.device() != tensor.meta().device()
+                    {
+                        false
+                    } else {
+                        let dense = sparse.to_dense()?.contiguous_values_as_f64()?;
+                        dense.len() == values.len()
+                            && dense
+                                .iter()
+                                .zip(values.iter())
+                                .all(|(a, b)| a.to_bits() == b.to_bits())
+                    }
+                }
+                _ => false,
+            };
+            refreshed.gradients[parameter.0] = current.cloned();
+            if !keep_sparse && let Some(sparse) = refreshed.sparse_gradients.get_mut(parameter.0) {
+                *sparse = None;
+            }
+            if let Some(gradient_node) = refreshed.gradient_nodes.get_mut(parameter.0) {
+                *gradient_node = None;
+            }
+        }
+        Ok(refreshed)
+    }
+
     pub fn tensor_accumulated_gradient_len(
         &self,
         node: TensorNodeId,
@@ -27514,6 +27567,135 @@ mod tests {
             .expect("missing gradient skips update");
         assert!(!skipped);
         assert_eq!(tape.values(no_grad).unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn refresh_parameter_gradients_includes_accumulation_and_new_parameters() {
+        let mut tape = TensorTape::new();
+        let first = tape.leaf(vec![2.0, 3.0], vec![2], true).unwrap();
+        let (loss, _) = tape.sum(first, ExecutionMode::Strict).unwrap();
+        let old_report = tape.backward(loss).unwrap();
+        let second = tape.leaf(vec![4.0, 5.0], vec![2], true).unwrap();
+        let (loss, _) = tape.sum(second, ExecutionMode::Strict).unwrap();
+        let latest_report = tape.backward(loss).unwrap();
+        assert!(latest_report.gradient(first).is_none());
+        assert!(old_report.gradient(second).is_none());
+        tape.set_tensor_accumulated_gradient(first, vec![0.25, 0.5])
+            .unwrap();
+
+        let refreshed = tape
+            .refresh_parameter_gradients(&latest_report, &[first])
+            .unwrap();
+        assert_eq!(refreshed.gradient(first), Some([0.25, 0.5].as_slice()));
+        assert_eq!(refreshed.gradient(second), latest_report.gradient(second));
+        assert_eq!(refreshed.steps, latest_report.steps);
+        assert_eq!(refreshed.telemetry, latest_report.telemetry);
+        assert!(latest_report.gradient(first).is_none());
+
+        let extended = tape
+            .refresh_parameter_gradients(&old_report, &[first, second])
+            .unwrap();
+        assert_eq!(extended.gradient(first), Some([0.25, 0.5].as_slice()));
+        assert_eq!(extended.gradient(second), Some([1.0, 1.0].as_slice()));
+        tape.set_tensor_accumulated_gradient(first, vec![8.0, 9.0])
+            .unwrap();
+        assert_eq!(refreshed.gradient(first), Some([0.25, 0.5].as_slice()));
+
+        let error = tape
+            .refresh_parameter_gradients(&old_report, &[first, TensorNodeId(usize::MAX)])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AutogradError::UnknownTensorNode(TensorNodeId(usize::MAX))
+        ));
+        assert_eq!(old_report.gradient(first), Some([1.0, 1.0].as_slice()));
+        assert_eq!(
+            tape.tensor_accumulated_gradient(first).unwrap(),
+            Some([8.0, 9.0].as_slice())
+        );
+    }
+
+    #[test]
+    fn refresh_parameter_gradients_keeps_only_consistent_sparse_payloads() {
+        let mut tape = TensorTape::new();
+        let weight = tape.leaf(vec![1.0; 6], vec![3, 2], true).unwrap();
+        let selected = tape.index_select_sparse(weight, 0, &[1.0, 1.0]).unwrap();
+        let (loss, _) = tape.sum(selected, ExecutionMode::Strict).unwrap();
+        let report = tape.backward(loss).unwrap();
+        assert!(report.is_sparse_gradient(weight));
+        let unchanged = tape
+            .refresh_parameter_gradients(&report, &[weight])
+            .unwrap();
+        assert_eq!(
+            unchanged.sparse_gradient(weight),
+            report.sparse_gradient(weight)
+        );
+
+        // Dense equality alone cannot establish that an accompanying sparse
+        // payload is current; a report can carry independently scaled data.
+        let mut mismatched = report.clone();
+        mismatched.sparse_gradients[weight.0] = Some(
+            TensorTape::build_sparse_grad_dim0(
+                &[0.0, 0.0, 7.0, 7.0, 0.0, 0.0],
+                &[3, 2],
+                Device::Cpu,
+            )
+            .unwrap(),
+        );
+        let corrected = tape
+            .refresh_parameter_gradients(&mismatched, &[weight])
+            .unwrap();
+        assert!(!corrected.is_sparse_gradient(weight));
+        assert_eq!(corrected.gradient(weight), report.gradient(weight));
+
+        let clipped = vec![0.0, 0.0, 0.25, 0.75, 0.0, 0.0];
+        tape.set_tensor_accumulated_gradient(weight, clipped.clone())
+            .unwrap();
+        let refreshed = tape
+            .refresh_parameter_gradients(&report, &[weight])
+            .unwrap();
+        assert!(!refreshed.is_sparse_gradient(weight));
+        assert_eq!(refreshed.gradient(weight), Some(clipped.as_slice()));
+        assert!(
+            matches!(refreshed.gradient_value(weight), Some(super::GradientValue::Dense(values)) if values == clipped)
+        );
+        assert!(report.is_sparse_gradient(weight));
+
+        tape.persistent_grads.remove(&weight.0);
+        let cleared = tape
+            .refresh_parameter_gradients(&report, &[weight])
+            .unwrap();
+        assert!(cleared.gradient(weight).is_none());
+        assert!(cleared.gradient_value(weight).is_none());
+    }
+
+    #[test]
+    fn refresh_parameter_gradients_detaches_selected_gradient_nodes() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0], vec![1], true).unwrap();
+        let exponent = tape.leaf(vec![3.0], vec![1], false).unwrap();
+        let y = tape.pow_tensor(x, exponent, ExecutionMode::Strict).unwrap();
+        let report = tape
+            .backward_with_options(
+                y,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+        assert!(report.gradient_node(x).is_some());
+        let refreshed = tape.refresh_parameter_gradients(&report, &[x]).unwrap();
+        assert_eq!(refreshed.gradient(x), report.gradient(x));
+        assert!(refreshed.gradient_node(x).is_none());
+        assert!(report.gradient_node(x).is_some());
+
+        tape.set_tensor_accumulated_gradient(x, vec![3.0]).unwrap();
+        let scaled = report.scaled_clone(0.25).unwrap();
+        assert!(scaled.gradient_node(x).is_some());
+        let refreshed = tape.refresh_parameter_gradients(&scaled, &[x]).unwrap();
+        assert_eq!(refreshed.gradient(x), Some([3.0].as_slice()));
+        assert!(refreshed.gradient_node(x).is_none());
     }
 
     #[test]

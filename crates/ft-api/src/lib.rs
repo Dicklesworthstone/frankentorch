@@ -21233,21 +21233,12 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.logical_not(input)`. Composes through
     /// tensor_eq against a zeros constant. Returns 0/1 floats
     /// (matches the convention for tensor_eq, tensor_lt, etc.).
-    /// Non-differentiable: fail-loud on requires_grad.
-    /// Tracked under frankentorch-nezf.
+    /// The result is detached even when the input requires gradients.
     pub fn tensor_logical_not(
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "logical_not: autograd not supported (boolean negation is non-differentiable). Tracked under frankentorch-nezf.",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        let zeros = self.full(shape, 0.0, false)?;
+        let zeros = self.const_tensor_like(input, Vec::new(), 0.0)?;
         self.tensor_eq(input, zeros)
     }
 
@@ -21260,18 +21251,10 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "logical_and: autograd not supported (boolean ops are non-differentiable)",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        let zeros = self.full(shape, 0.0, false)?;
+        let (input, other) = self.prepare_float_predicate_inputs(input, other)?;
+        let zeros = self.const_tensor_like(input, Vec::new(), 0.0)?;
         let a_bool = self.tensor_ne(input, zeros)?;
-        let zeros2 = self.full(self.tensor_shape(other)?, 0.0, false)?;
-        let b_bool = self.tensor_ne(other, zeros2)?;
+        let b_bool = self.tensor_ne(other, zeros)?;
         self.tensor_mul(a_bool, b_bool)
     }
 
@@ -21284,21 +21267,12 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "logical_or: autograd not supported (boolean ops are non-differentiable)",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let (input, other) = self.prepare_float_predicate_inputs(input, other)?;
+        let zeros = self.const_tensor_like(input, Vec::new(), 0.0)?;
         let a_bool = self.tensor_ne(input, zeros)?;
-        let zeros2 = self.full(self.tensor_shape(other)?, 0.0, false)?;
-        let b_bool = self.tensor_ne(other, zeros2)?;
+        let b_bool = self.tensor_ne(other, zeros)?;
         let sum = self.tensor_add(a_bool, b_bool)?;
-        let ones = self.full(shape, 1.0, false)?;
-        self.tensor_minimum(sum, ones)
+        self.tensor_ne(sum, zeros)
     }
 
     /// Element-wise logical XOR.
@@ -21310,19 +21284,42 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "logical_xor: autograd not supported (boolean ops are non-differentiable)",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        let zeros = self.full(shape, 0.0, false)?;
+        let (input, other) = self.prepare_float_predicate_inputs(input, other)?;
+        let zeros = self.const_tensor_like(input, Vec::new(), 0.0)?;
         let a_bool = self.tensor_ne(input, zeros)?;
-        let zeros2 = self.full(self.tensor_shape(other)?, 0.0, false)?;
-        let b_bool = self.tensor_ne(other, zeros2)?;
+        let b_bool = self.tensor_ne(other, zeros)?;
         self.tensor_ne(a_bool, b_bool)
+    }
+
+    fn update_tensor_predicate_in_place(
+        &mut self,
+        target: TensorNodeId,
+        result: TensorNodeId,
+        other: Option<TensorNodeId>,
+        operation: &'static str,
+    ) -> Result<(), AutogradError> {
+        // Replacing a nonleaf's values would retain its old differentiable
+        // history. Keep in-place predicates fail-closed until that history can
+        // be replaced; out-of-place predicates safely return detached masks.
+        if self.tensor_requires_grad(target)?
+            || match other {
+                Some(other) => self.tensor_requires_grad(other)?,
+                None => false,
+            }
+        {
+            return Err(Self::incompatible_tensor_args(
+                "in-place predicates do not support autograd; use an out-of-place predicate",
+            ));
+        }
+        if self.tensor_shape(target)? != self.tensor_shape(result)? {
+            return Err(Self::incompatible_tensor_args(
+                "in-place predicates cannot expand the target shape",
+            ));
+        }
+        let values = self.tensor_values_lossy_f64(result)?;
+        self.update_tensor_values_for_float(target, values, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation(operation, target, None);
+        Ok(())
     }
 
     /// In-place logical AND: target = target && other (as 1.0/0.0).
@@ -21333,10 +21330,7 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
         let result = self.tensor_logical_and(target, other)?;
-        let result_vals = self.tensor_values(result)?;
-        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
-        self.record_tensor_in_place_operation("logical_and_", target, None);
-        Ok(())
+        self.update_tensor_predicate_in_place(target, result, Some(other), "logical_and_")
     }
 
     /// In-place logical OR: target = target || other (as 1.0/0.0).
@@ -21347,10 +21341,7 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
         let result = self.tensor_logical_or(target, other)?;
-        let result_vals = self.tensor_values(result)?;
-        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
-        self.record_tensor_in_place_operation("logical_or_", target, None);
-        Ok(())
+        self.update_tensor_predicate_in_place(target, result, Some(other), "logical_or_")
     }
 
     /// In-place logical XOR: target = target ^ other (as 1.0/0.0).
@@ -21361,20 +21352,14 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
         let result = self.tensor_logical_xor(target, other)?;
-        let result_vals = self.tensor_values(result)?;
-        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
-        self.record_tensor_in_place_operation("logical_xor_", target, None);
-        Ok(())
+        self.update_tensor_predicate_in_place(target, result, Some(other), "logical_xor_")
     }
 
     /// In-place logical NOT: target = !target (as 1.0/0.0).
     pub fn tensor_logical_not_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
         let result = self.tensor_logical_not(target)?;
-        let result_vals = self.tensor_values(result)?;
-        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
-        self.record_tensor_in_place_operation("logical_not_", target, None);
-        Ok(())
+        self.update_tensor_predicate_in_place(target, result, None, "logical_not_")
     }
 
     /// Element-wise bitwise AND.
@@ -27025,42 +27010,57 @@ impl FrankenTorchSession {
     /// sign bit is set: negative numbers, `-0.0`, `-inf`, and the
     /// negative-NaN bit pattern. Composing through `tensor_lt`
     /// against zero would silently drop `-0.0` (since `-0.0 < 0.0`
-    /// is false in IEEE 754), so this routes through Rust's
-    /// `f64::is_sign_negative` on the raw values to preserve
-    /// torch parity.
+    /// is false in IEEE 754), so this reads the sign in the input's
+    /// native dtype, including the sign of a NaN.
     ///
-    /// Non-differentiable (boolean mask); fail-loud on requires_grad
-    /// like the other classification ops. Tracked under
-    /// frankentorch-z50h.
+    /// The 0/1 result retains the floating input dtype and is detached
+    /// even when the input requires gradients.
     pub fn tensor_signbit(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "signbit: autograd not supported (boolean mask is non-differentiable). Tracked under frankentorch-z50h.",
-                },
-            )));
-        }
-        let dtype = self.tensor_dtype(input)?;
-        if !matches!(dtype, DType::F32 | DType::F64) {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "signbit requires f32 or f64 tensors",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        let vals = self.tensor_values(input)?;
-        let result: Vec<f64> = vals
-            .iter()
-            .map(|&v| if v.is_sign_negative() { 1.0 } else { 0.0 })
-            .collect();
-        match dtype {
-            DType::F32 => {
-                let f32_result: Vec<f32> = result.into_iter().map(|v| v as f32).collect();
-                self.tensor_variable_f32(f32_result, shape, false)
+        let input_tensor = self.tensor_tape.tensor(input)?;
+        let meta = input_tensor.meta();
+        let values: Vec<f64> = match meta.dtype() {
+            DType::F64 => input_tensor
+                .contiguous_values()?
+                .iter()
+                .map(|value| if value.is_sign_negative() { 1.0 } else { 0.0 })
+                .collect(),
+            DType::F32 => input_tensor
+                .contiguous_values_f32()?
+                .iter()
+                .map(|value| if value.is_sign_negative() { 1.0 } else { 0.0 })
+                .collect(),
+            DType::F16 => input_tensor
+                .contiguous_values_f16()?
+                .iter()
+                .map(|value| {
+                    if value.to_bits() & 0x8000 != 0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+            DType::BF16 => input_tensor
+                .contiguous_values_bf16()?
+                .iter()
+                .map(|value| {
+                    if value.to_bits() & 0x8000 != 0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+            _ => {
+                return Err(Self::incompatible_tensor_args(
+                    "signbit requires a floating-point tensor",
+                ));
             }
-            _ => self.tensor_variable(result, shape, false),
-        }
+        };
+        let result =
+            DenseTensor::from_contiguous_values(values, meta.shape().to_vec(), meta.device())?
+                .to_dtype(meta.dtype())?;
+        Ok(self.tensor_variable_from_storage(result, false))
     }
 
     pub fn tensor_eq(
@@ -54156,10 +54156,7 @@ impl FrankenTorchSession {
     pub fn tensor_signbit_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
         self.validate_tensor_in_place_target(target)?;
         let result = self.tensor_signbit(target)?;
-        let result_vals = self.tensor_values(result)?;
-        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
-        self.record_tensor_in_place_operation("signbit_", target, None);
-        Ok(())
+        self.update_tensor_predicate_in_place(target, result, None, "signbit_")
     }
 
     /// In-place reciprocal: 1/x for each element.
@@ -55613,6 +55610,18 @@ impl FrankenTorchSession {
         self.tensor_tape.tensor_accumulated_gradient_values(node)
     }
 
+    /// Copy a backward report with selected gradients refreshed from the tape.
+    /// This exposes current accumulated, unscaled, or clipped parameter values
+    /// to optimizers that consume reports instead of reading persistent gradients.
+    pub fn tensor_refresh_backward_report(
+        &self,
+        report: &TensorBackwardReport,
+        parameters: &[TensorNodeId],
+    ) -> Result<TensorBackwardReport, AutogradError> {
+        self.tensor_tape
+            .refresh_parameter_gradients(report, parameters)
+    }
+
     pub fn tensor_accumulated_gradient_len(
         &self,
         node: TensorNodeId,
@@ -57059,10 +57068,70 @@ impl FrankenTorchSession {
         self.tensor_relu(gates)
     }
 
+    fn validate_recurrent_cell_shapes(
+        &self,
+        input: TensorNodeId,
+        hidden: TensorNodeId,
+        w_ih: TensorNodeId,
+        w_hh: TensorNodeId,
+        biases: [Option<TensorNodeId>; 2],
+        gates: usize,
+    ) -> Result<(Vec<usize>, usize), AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let hidden_shape = self.tensor_shape(hidden)?;
+        if !matches!(input_shape.len(), 1 | 2)
+            || hidden_shape.len() != input_shape.len()
+            || (input_shape.len() == 2 && input_shape[0] != hidden_shape[0])
+        {
+            return Err(Self::incompatible_tensor_args(
+                "recurrent cell: input and hidden must have matching rank and batch size",
+            ));
+        }
+        let hidden_size = hidden_shape[hidden_shape.len() - 1];
+        let gate_width =
+            Self::checked_mul(hidden_size, gates, "recurrent cell gate size overflow")?;
+        if hidden_size == 0
+            || self.tensor_shape(w_ih)? != [input_shape[input_shape.len() - 1], gate_width]
+            || self.tensor_shape(w_hh)? != [hidden_size, gate_width]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "recurrent cell: weights must have shapes [input_size, gates*hidden_size] and [hidden_size, gates*hidden_size]",
+            ));
+        }
+        let dtype = self.tensor_dtype(input)?;
+        let device = self.tensor_device(input)?;
+        if !dtype.is_floating_point() {
+            return Err(Self::incompatible_tensor_args(
+                "recurrent cell: inputs must have a floating dtype",
+            ));
+        }
+        for node in [Some(hidden), Some(w_ih), Some(w_hh), biases[0], biases[1]]
+            .into_iter()
+            .flatten()
+        {
+            if self.tensor_dtype(node)? != dtype || self.tensor_device(node)? != device {
+                return Err(Self::incompatible_tensor_args(
+                    "recurrent cell: inputs, states, weights and biases must share dtype and device",
+                ));
+            }
+        }
+        for bias in biases.into_iter().flatten() {
+            if self.tensor_shape(bias)? != [gate_width] {
+                return Err(Self::incompatible_tensor_args(
+                    "recurrent cell: bias must have shape [gates*hidden_size]",
+                ));
+            }
+        }
+        Ok((hidden_shape, hidden_size))
+    }
+
     /// Single step of an LSTM cell.
     ///
     /// Equivalent to `torch.nn.LSTMCell`.
     /// Returns (h', c') tuple for the new hidden and cell states.
+    /// The session cell API right-multiplies weights: `w_ih` has shape
+    /// `[input_size, 4*hidden_size]` and `w_hh` is `[hidden_size, 4*hidden_size]`.
+    /// Batched and unbatched floating inputs retain their gradient graph.
     pub fn lstm_cell(
         &mut self,
         input: TensorNodeId,
@@ -57073,6 +57142,72 @@ impl FrankenTorchSession {
         b_hh: Option<TensorNodeId>,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
         let (h, c) = hx;
+        let (hidden_shape, hidden_size) =
+            self.validate_recurrent_cell_shapes(input, h, w_ih, w_hh, [b_ih, b_hh], 4)?;
+        if self.tensor_shape(c)? != hidden_shape
+            || self.tensor_dtype(c)? != self.tensor_dtype(input)?
+            || self.tensor_device(c)? != self.tensor_device(input)?
+        {
+            return Err(Self::incompatible_tensor_args(
+                "lstm_cell: cell state must match hidden state shape, dtype and device",
+            ));
+        }
+        let unbatched = hidden_shape.len() == 1;
+        let mut use_graph = unbatched || self.tensor_dtype(input)? != DType::F64;
+        if self.is_grad_enabled() {
+            for node in [
+                Some(input),
+                Some(h),
+                Some(c),
+                Some(w_ih),
+                Some(w_hh),
+                b_ih,
+                b_hh,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                use_graph |= self.tensor_requires_grad(node)?;
+            }
+        }
+        if use_graph {
+            let (input, h, c) = if unbatched {
+                (
+                    self.tensor_unsqueeze(input, 0)?,
+                    self.tensor_unsqueeze(h, 0)?,
+                    self.tensor_unsqueeze(c, 0)?,
+                )
+            } else {
+                (input, h, c)
+            };
+            let input_gates = self.tensor_mm(input, w_ih)?;
+            let hidden_gates = self.tensor_mm(h, w_hh)?;
+            let mut gates = self.tensor_add(input_gates, hidden_gates)?;
+            for bias in [b_ih, b_hh].into_iter().flatten() {
+                gates = self.tensor_add(gates, bias)?;
+            }
+            let i = self.tensor_narrow(gates, 1, 0, hidden_size)?;
+            let f = self.tensor_narrow(gates, 1, hidden_size, hidden_size)?;
+            let g = self.tensor_narrow(gates, 1, 2 * hidden_size, hidden_size)?;
+            let o = self.tensor_narrow(gates, 1, 3 * hidden_size, hidden_size)?;
+            let i = self.tensor_sigmoid(i)?;
+            let f = self.tensor_sigmoid(f)?;
+            let g = self.tensor_tanh(g)?;
+            let o = self.tensor_sigmoid(o)?;
+            let carried = self.tensor_mul(f, c)?;
+            let candidate = self.tensor_mul(i, g)?;
+            let cell = self.tensor_add(carried, candidate)?;
+            let activated = self.tensor_tanh(cell)?;
+            let hidden = self.tensor_mul(o, activated)?;
+            return if unbatched {
+                Ok((
+                    self.tensor_squeeze(hidden, 0)?,
+                    self.tensor_squeeze(cell, 0)?,
+                ))
+            } else {
+                Ok((hidden, cell))
+            };
+        }
 
         let mut gates = self.tensor_mm(input, w_ih)?;
         let hgates = self.tensor_mm(h, w_hh)?;
@@ -57126,6 +57261,9 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.nn.GRUCell`.
     /// Returns h' for the new hidden state.
+    /// The session cell API uses weights shaped `[input_size, 3*hidden_size]`
+    /// and `[hidden_size, 3*hidden_size]`, with reset/update/new gate order.
+    /// Batched and unbatched floating inputs retain their gradient graph.
     pub fn gru_cell(
         &mut self,
         input: TensorNodeId,
@@ -57135,6 +57273,66 @@ impl FrankenTorchSession {
         b_ih: Option<TensorNodeId>,
         b_hh: Option<TensorNodeId>,
     ) -> Result<TensorNodeId, AutogradError> {
+        let (hidden_shape, hidden_size) =
+            self.validate_recurrent_cell_shapes(input, hidden, w_ih, w_hh, [b_ih, b_hh], 3)?;
+        let unbatched = hidden_shape.len() == 1;
+        let mut use_graph = unbatched || self.tensor_dtype(input)? != DType::F64;
+        if self.is_grad_enabled() {
+            for node in [
+                Some(input),
+                Some(hidden),
+                Some(w_ih),
+                Some(w_hh),
+                b_ih,
+                b_hh,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                use_graph |= self.tensor_requires_grad(node)?;
+            }
+        }
+        if use_graph {
+            let (input, hidden) = if unbatched {
+                (
+                    self.tensor_unsqueeze(input, 0)?,
+                    self.tensor_unsqueeze(hidden, 0)?,
+                )
+            } else {
+                (input, hidden)
+            };
+            let mut gi = self.tensor_mm(input, w_ih)?;
+            let mut gh = self.tensor_mm(hidden, w_hh)?;
+            if let Some(bias) = b_ih {
+                gi = self.tensor_add(gi, bias)?;
+            }
+            if let Some(bias) = b_hh {
+                gh = self.tensor_add(gh, bias)?;
+            }
+            let ir = self.tensor_narrow(gi, 1, 0, hidden_size)?;
+            let iz = self.tensor_narrow(gi, 1, hidden_size, hidden_size)?;
+            let inn = self.tensor_narrow(gi, 1, 2 * hidden_size, hidden_size)?;
+            let hr = self.tensor_narrow(gh, 1, 0, hidden_size)?;
+            let hz = self.tensor_narrow(gh, 1, hidden_size, hidden_size)?;
+            let hn = self.tensor_narrow(gh, 1, 2 * hidden_size, hidden_size)?;
+            let reset = self.tensor_add(ir, hr)?;
+            let update = self.tensor_add(iz, hz)?;
+            let reset = self.tensor_sigmoid(reset)?;
+            let update = self.tensor_sigmoid(update)?;
+            let recurrent = self.tensor_mul(reset, hn)?;
+            let candidate = self.tensor_add(inn, recurrent)?;
+            let candidate = self.tensor_tanh(candidate)?;
+            let ones = self.ones_like(update, false)?;
+            let complement = self.tensor_sub(ones, update)?;
+            let new_part = self.tensor_mul(complement, candidate)?;
+            let old_part = self.tensor_mul(update, hidden)?;
+            let output = self.tensor_add(new_part, old_part)?;
+            return if unbatched {
+                self.tensor_squeeze(output, 0)
+            } else {
+                Ok(output)
+            };
+        }
         let mut gi = self.tensor_mm(input, w_ih)?;
         let mut gh = self.tensor_mm(hidden, w_hh)?;
 
@@ -59035,12 +59233,74 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Match floating predicate operands without making the result differentiable.
+    /// A zero-dimensional floating tensor follows the dimensioned operand's
+    /// dtype, while two scalars or two dimensioned tensors use normal promotion.
+    /// The existing mask representation retains that computation dtype as 0/1.
+    fn prepare_float_predicate_inputs(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (lhs_shape, rhs_shape, lhs_dtype, rhs_dtype) = {
+            let lhs_meta = self.tensor_tape.tensor_meta(lhs)?;
+            let rhs_meta = self.tensor_tape.tensor_meta(rhs)?;
+            if !lhs_meta.dtype().is_floating_point() || !rhs_meta.dtype().is_floating_point() {
+                return Err(Self::incompatible_tensor_args(
+                    "tensor predicates require floating-point operands",
+                ));
+            }
+            if lhs_meta.device() != rhs_meta.device() {
+                return Err(Self::incompatible_tensor_args(
+                    "tensor predicate operands must be on the same device",
+                ));
+            }
+            if lhs_meta.dtype() == rhs_meta.dtype() && lhs_meta.shape() == rhs_meta.shape() {
+                return Ok((lhs, rhs));
+            }
+            (
+                lhs_meta.shape().to_vec(),
+                rhs_meta.shape().to_vec(),
+                lhs_meta.dtype(),
+                rhs_meta.dtype(),
+            )
+        };
+        let shape = Self::broadcast_shape(&lhs_shape, &rhs_shape)?;
+        let dtype = match (lhs_shape.is_empty(), rhs_shape.is_empty()) {
+            (true, false) => rhs_dtype,
+            (false, true) => lhs_dtype,
+            _ => lhs_dtype.promote_types(rhs_dtype),
+        };
+        let lhs = if lhs_dtype == dtype {
+            lhs
+        } else {
+            self.tensor_to_dtype(lhs, dtype)?
+        };
+        let rhs = if rhs_dtype == dtype {
+            rhs
+        } else {
+            self.tensor_to_dtype(rhs, dtype)?
+        };
+        let lhs = if lhs_shape == shape {
+            lhs
+        } else {
+            self.tensor_broadcast_to(lhs, shape.clone())?
+        };
+        let rhs = if rhs_shape == shape {
+            rhs
+        } else {
+            self.tensor_broadcast_to(rhs, shape)?
+        };
+        Ok((lhs, rhs))
+    }
+
     fn tensor_comparison(
         &mut self,
         op: ComparisonOp,
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        let (lhs, rhs) = self.prepare_float_predicate_inputs(lhs, rhs)?;
         let (lhs_meta, rhs_meta) = {
             let lhs_tensor = self.tensor_tape.tensor(lhs)?;
             let rhs_tensor = self.tensor_tape.tensor(rhs)?;
@@ -129317,6 +129577,398 @@ mod tests {
         );
     }
 
+    fn predicate_test_tensor(
+        session: &mut FrankenTorchSession,
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        dtype: DType,
+        requires_grad: bool,
+    ) -> TensorNodeId {
+        let tensor = DenseTensor::from_contiguous_values(values, shape, Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        session.tensor_variable_from_storage(tensor, requires_grad)
+    }
+
+    #[test]
+    fn predicate_comparisons_broadcast_axes_and_preserve_ieee_values() {
+        type Predicate = fn(
+            &mut FrankenTorchSession,
+            TensorNodeId,
+            TensorNodeId,
+        ) -> Result<TensorNodeId, AutogradError>;
+        // [2,1,3] against [1,2,1] produces [2,2,3]. The NaN comparisons
+        // are false except !=, and both signs of zero compare equal.
+        let cases: [(&str, Predicate, [f64; 12]); 6] = [
+            (
+                "eq",
+                FrankenTorchSession::tensor_eq,
+                [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "ne",
+                FrankenTorchSession::tensor_ne,
+                [1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            ),
+            (
+                "lt",
+                FrankenTorchSession::tensor_lt,
+                [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ),
+            (
+                "le",
+                FrankenTorchSession::tensor_le,
+                [1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+            ),
+            (
+                "gt",
+                FrankenTorchSession::tensor_gt,
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                "ge",
+                FrankenTorchSession::tensor_ge,
+                [0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            ),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for requires_grad in [false, true] {
+                    let mut s = FrankenTorchSession::new(mode);
+                    let lhs = predicate_test_tensor(
+                        &mut s,
+                        vec![-1.0, 0.0, 1.0, f64::NAN, -0.0, 2.0],
+                        vec![2, 1, 3],
+                        dtype,
+                        requires_grad,
+                    );
+                    let rhs = predicate_test_tensor(
+                        &mut s,
+                        vec![0.0, 1.0],
+                        vec![1, 2, 1],
+                        dtype,
+                        requires_grad,
+                    );
+                    for (name, predicate, expected) in &cases {
+                        let mask = predicate(&mut s, lhs, rhs).unwrap();
+                        assert_eq!(s.tensor_shape(mask).unwrap(), vec![2, 2, 3]);
+                        assert_eq!(s.tensor_dtype(mask).unwrap(), dtype);
+                        assert_eq!(
+                            s.tensor_values_lossy_f64(mask).unwrap(),
+                            expected.to_vec(),
+                            "{name} {dtype:?} {mode:?}"
+                        );
+                        assert!(!s.tensor_requires_grad(mask).unwrap());
+                    }
+                    assert_eq!(s.tensor_requires_grad(lhs).unwrap(), requires_grad);
+                    assert_eq!(s.tensor_requires_grad(rhs).unwrap(), requires_grad);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_comparisons_promote_float_inputs_before_broadcast() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (lhs_dtype, rhs_dtype, output_dtype) in [
+                (DType::F32, DType::F64, DType::F64),
+                (DType::F16, DType::BF16, DType::F32),
+                (DType::F16, DType::F32, DType::F32),
+                (DType::BF16, DType::F64, DType::F64),
+            ] {
+                let mut s = FrankenTorchSession::new(mode);
+                let lhs =
+                    predicate_test_tensor(&mut s, vec![1.0, 2.0], vec![2, 1], lhs_dtype, true);
+                let rhs =
+                    predicate_test_tensor(&mut s, vec![0.0, 1.0, 3.0], vec![1, 3], rhs_dtype, true);
+                for (a, b) in [(lhs, rhs), (rhs, lhs)] {
+                    let mask = s.tensor_eq(a, b).unwrap();
+                    assert_eq!(s.tensor_shape(mask).unwrap(), vec![2, 3]);
+                    assert_eq!(s.tensor_dtype(mask).unwrap(), output_dtype);
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(mask).unwrap(),
+                        vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+                    );
+                    assert!(!s.tensor_requires_grad(mask).unwrap());
+                    let both = s.tensor_logical_and(a, b).unwrap();
+                    assert_eq!(s.tensor_shape(both).unwrap(), vec![2, 3]);
+                    assert_eq!(s.tensor_dtype(both).unwrap(), output_dtype);
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(both).unwrap(),
+                        vec![0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+                    );
+                    assert!(!s.tensor_requires_grad(both).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_scalar_comparisons_use_dimensioned_operand_dtype() {
+        // The F64 scalar rounds to 1.0 when compared with an F32 vector.
+        // The same value in a dimensioned F64 tensor instead widens that
+        // vector, so 1.0 is strictly smaller. Shape must precede promotion.
+        let halfway = 1.0 + f64::from(f32::EPSILON) / 2.0;
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut s = FrankenTorchSession::new(mode);
+            let vector = predicate_test_tensor(
+                &mut s,
+                vec![1.0, 1.0 + f64::from(f32::EPSILON)],
+                vec![2],
+                DType::F32,
+                true,
+            );
+            let scalar = predicate_test_tensor(&mut s, vec![halfway], Vec::new(), DType::F64, true);
+            for (lhs, rhs) in [(vector, scalar), (scalar, vector)] {
+                let equal = s.tensor_eq(lhs, rhs).unwrap();
+                assert_eq!(s.tensor_dtype(equal).unwrap(), DType::F32);
+                assert_eq!(s.tensor_shape(equal).unwrap(), vec![2]);
+                assert_eq!(s.tensor_values_f32(equal).unwrap(), vec![1.0, 0.0]);
+                assert!(!s.tensor_requires_grad(equal).unwrap());
+            }
+            let dimensioned = s.tensor_reshape(scalar, vec![1]).unwrap();
+            let less = s.tensor_lt(vector, dimensioned).unwrap();
+            assert_eq!(s.tensor_dtype(less).unwrap(), DType::F64);
+            assert_eq!(s.tensor_values(less).unwrap(), vec![1.0, 0.0]);
+            let scalar32 = predicate_test_tensor(&mut s, vec![1.0], Vec::new(), DType::F32, true);
+            let less = s.tensor_lt(scalar32, scalar).unwrap();
+            assert_eq!(s.tensor_dtype(less).unwrap(), DType::F64);
+            assert!(s.tensor_shape(less).unwrap().is_empty());
+            assert_eq!(s.tensor_values(less).unwrap(), vec![1.0]);
+
+            let half = predicate_test_tensor(&mut s, vec![1.0], vec![1], DType::F16, true);
+            let bfloat = predicate_test_tensor(&mut s, vec![1.0], Vec::new(), DType::BF16, true);
+            let equal = s.tensor_eq(half, bfloat).unwrap();
+            assert_eq!(s.tensor_dtype(equal).unwrap(), DType::F16);
+            assert_eq!(s.tensor_values_lossy_f64(equal).unwrap(), vec![1.0]);
+        }
+    }
+
+    #[test]
+    fn predicate_broadcast_rejects_incompatible_shapes_and_devices_and_accepts_empty() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut s = FrankenTorchSession::new(mode);
+            let lhs = predicate_test_tensor(&mut s, vec![1.0; 6], vec![2, 3], DType::F32, true);
+            let rhs = predicate_test_tensor(&mut s, vec![1.0; 6], vec![3, 2], DType::F32, true);
+            assert!(s.tensor_eq(lhs, rhs).is_err());
+            assert!(s.tensor_logical_and(lhs, rhs).is_err());
+            assert!(s.tensor_logical_or(lhs, rhs).is_err());
+            assert!(s.tensor_logical_xor(lhs, rhs).is_err());
+            let foreign = DenseTensor::from_typed_storage(
+                TensorMeta::from_shape(vec![2, 3], DType::F32, Device::Metal),
+                TensorStorage::F32(Arc::new(vec![1.0; 6])),
+            )
+            .unwrap();
+            let foreign = s.tensor_variable_from_storage(foreign, false);
+            assert!(s.tensor_eq(lhs, foreign).is_err());
+            assert!(s.tensor_logical_and(lhs, foreign).is_err());
+            assert_eq!(s.tensor_values_f32(lhs).unwrap(), vec![1.0; 6]);
+
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let empty = predicate_test_tensor(&mut s, Vec::new(), vec![0, 3], dtype, true);
+                let row =
+                    predicate_test_tensor(&mut s, vec![0.0, 1.0, 2.0], vec![1, 3], dtype, true);
+                let equal = s.tensor_eq(empty, row).unwrap();
+                let logical = s.tensor_logical_and(empty, row).unwrap();
+                let negated = s.tensor_logical_not(empty).unwrap();
+                for result in [equal, logical, negated] {
+                    assert_eq!(s.tensor_shape(result).unwrap(), vec![0, 3]);
+                    assert_eq!(s.tensor_dtype(result).unwrap(), dtype);
+                    assert!(s.tensor_values_lossy_f64(result).unwrap().is_empty());
+                    assert!(!s.tensor_requires_grad(result).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_logical_truth_tables_broadcast_and_detach_grad_inputs() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let mut s = FrankenTorchSession::new(mode);
+                let lhs =
+                    predicate_test_tensor(&mut s, vec![0.0, f64::NAN], vec![2, 1], dtype, true);
+                let rhs = predicate_test_tensor(
+                    &mut s,
+                    vec![-0.0, -2.0, f64::NAN],
+                    vec![1, 3],
+                    dtype,
+                    true,
+                );
+                let and = s.tensor_logical_and(lhs, rhs).unwrap();
+                let or = s.tensor_logical_or(lhs, rhs).unwrap();
+                let xor = s.tensor_logical_xor(lhs, rhs).unwrap();
+                for (result, expected) in [
+                    (and, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0]),
+                    (or, vec![0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+                    (xor, vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]),
+                ] {
+                    assert_eq!(s.tensor_shape(result).unwrap(), vec![2, 3]);
+                    assert_eq!(s.tensor_dtype(result).unwrap(), dtype);
+                    assert_eq!(s.tensor_values_lossy_f64(result).unwrap(), expected);
+                    assert!(!s.tensor_requires_grad(result).unwrap());
+                }
+                let not = s.tensor_logical_not(rhs).unwrap();
+                assert_eq!(s.tensor_shape(not).unwrap(), vec![1, 3]);
+                assert_eq!(s.tensor_dtype(not).unwrap(), dtype);
+                assert_eq!(s.tensor_values_lossy_f64(not).unwrap(), vec![1.0, 0.0, 0.0]);
+                assert!(!s.tensor_requires_grad(not).unwrap());
+                assert!(s.tensor_requires_grad(lhs).unwrap());
+                assert!(s.tensor_requires_grad(rhs).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_training_mask_routes_where_gradients_without_predicate_gradients() {
+        // The loss weights are deliberately nonuniform. Each branch broadcasts
+        // along a different axis; gradients sum only where that branch is selected.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let mut s = FrankenTorchSession::new(mode);
+                let x = predicate_test_tensor(&mut s, vec![-2.0, 3.0], vec![2, 1], dtype, true);
+                let y =
+                    predicate_test_tensor(&mut s, vec![10.0, 20.0, 30.0], vec![1, 3], dtype, true);
+                let threshold =
+                    predicate_test_tensor(&mut s, vec![0.0], Vec::new(), DType::F64, true);
+                let gate =
+                    predicate_test_tensor(&mut s, vec![1.0, 0.0, 1.0], vec![1, 3], dtype, true);
+                let positive = s.tensor_gt(x, threshold).unwrap();
+                let mask = s.tensor_logical_and(positive, gate).unwrap();
+                assert!(!s.tensor_requires_grad(mask).unwrap());
+                assert_eq!(s.tensor_dtype(mask).unwrap(), dtype);
+                assert_eq!(
+                    s.tensor_values_lossy_f64(mask).unwrap(),
+                    vec![0.0, 0.0, 0.0, 1.0, 0.0, 1.0]
+                );
+                let selected = s.tensor_where(mask, x, y).unwrap();
+                assert_eq!(
+                    s.tensor_values_lossy_f64(selected).unwrap(),
+                    vec![10.0, 20.0, 30.0, 3.0, 20.0, 3.0]
+                );
+                let upstream = predicate_test_tensor(
+                    &mut s,
+                    vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+                    vec![2, 3],
+                    dtype,
+                    false,
+                );
+                let weighted = s.tensor_mul(selected, upstream).unwrap();
+                let loss = s.tensor_sum(weighted).unwrap();
+                s.tensor_backward(loss).unwrap();
+                assert_eq!(s.tensor_grad(x).unwrap().unwrap(), vec![0.0, 40.0]);
+                assert_eq!(s.tensor_grad(y).unwrap().unwrap(), vec![1.0, 18.0, 4.0]);
+                assert!(s.tensor_grad(threshold).unwrap().is_none());
+                assert!(s.tensor_grad(gate).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_in_place_masks_preserve_dtype_and_reject_target_expansion() {
+        type BinaryInPlace =
+            fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId) -> Result<(), AutogradError>;
+        let cases: [(BinaryInPlace, [f64; 4]); 3] = [
+            (
+                FrankenTorchSession::tensor_logical_and_,
+                [0.0, 1.0, 0.0, 0.0],
+            ),
+            (
+                FrankenTorchSession::tensor_logical_or_,
+                [0.0, 1.0, 1.0, 1.0],
+            ),
+            (
+                FrankenTorchSession::tensor_logical_xor_,
+                [0.0, 0.0, 1.0, 1.0],
+            ),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                let mut s = FrankenTorchSession::new(mode);
+                for (operation, expected) in &cases {
+                    let target = predicate_test_tensor(
+                        &mut s,
+                        vec![0.0, -2.0, f64::NAN, 0.0],
+                        vec![2, 2],
+                        dtype,
+                        false,
+                    );
+                    let other = predicate_test_tensor(
+                        &mut s,
+                        vec![0.0, 1.0],
+                        vec![1, 2],
+                        DType::F64,
+                        false,
+                    );
+                    operation(&mut s, target, other).unwrap();
+                    assert_eq!(s.tensor_dtype(target).unwrap(), dtype);
+                    assert_eq!(s.tensor_shape(target).unwrap(), vec![2, 2]);
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(target).unwrap(),
+                        expected.to_vec()
+                    );
+
+                    // Equal numel does not authorize adding a leading axis in place.
+                    let target =
+                        predicate_test_tensor(&mut s, vec![0.0, 2.0, -3.0], vec![3], dtype, false);
+                    let expanded =
+                        predicate_test_tensor(&mut s, vec![1.0; 3], vec![1, 3], dtype, false);
+                    assert!(operation(&mut s, target, expanded).is_err());
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(target).unwrap(),
+                        vec![0.0, 2.0, -3.0]
+                    );
+                    let grad_other =
+                        predicate_test_tensor(&mut s, vec![1.0; 3], vec![3], dtype, true);
+                    assert!(operation(&mut s, target, grad_other).is_err());
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(target).unwrap(),
+                        vec![0.0, 2.0, -3.0]
+                    );
+                }
+                let target = predicate_test_tensor(
+                    &mut s,
+                    vec![0.0, -0.0, 2.0, f64::NAN],
+                    vec![4],
+                    dtype,
+                    false,
+                );
+                s.tensor_logical_not_(target).unwrap();
+                assert_eq!(s.tensor_dtype(target).unwrap(), dtype);
+                assert_eq!(
+                    s.tensor_values_lossy_f64(target).unwrap(),
+                    vec![1.0, 1.0, 0.0, 0.0]
+                );
+                let signs =
+                    predicate_test_tensor(&mut s, vec![-0.0, 1.0, -2.0], vec![3], dtype, false);
+                s.tensor_signbit_(signs).unwrap();
+                assert_eq!(s.tensor_dtype(signs).unwrap(), dtype);
+                assert_eq!(
+                    s.tensor_values_lossy_f64(signs).unwrap(),
+                    vec![1.0, 0.0, 1.0]
+                );
+                let parameter =
+                    predicate_test_tensor(&mut s, vec![1.0, -1.0], vec![2], dtype, true);
+                assert!(s.tensor_logical_not_(parameter).is_err());
+                assert!(s.tensor_signbit_(parameter).is_err());
+                assert_eq!(
+                    s.tensor_values_lossy_f64(parameter).unwrap(),
+                    vec![1.0, -1.0]
+                );
+                let nonleaf = s.tensor_neg(parameter).unwrap();
+                let other = predicate_test_tensor(&mut s, vec![1.0, 0.0], vec![2], dtype, false);
+                assert!(s.tensor_requires_grad(nonleaf).unwrap());
+                for (operation, _) in &cases {
+                    assert!(operation(&mut s, nonleaf, other).is_err());
+                }
+                assert!(s.tensor_logical_not_(nonleaf).is_err());
+                assert!(s.tensor_signbit_(nonleaf).is_err());
+                assert_eq!(s.tensor_values_lossy_f64(nonleaf).unwrap(), vec![-1.0, 1.0]);
+            }
+        }
+    }
+
     // ── tensor_logical_not + copysign tests (frankentorch-nezf) ───────
 
     #[test]
@@ -129330,10 +129982,13 @@ mod tests {
     }
 
     #[test]
-    fn logical_not_fails_loud_on_requires_grad() {
+    fn logical_not_returns_a_detached_mask_for_requires_grad_input() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s.tensor_variable(vec![0.0, 1.0], vec![2], true).unwrap();
-        assert!(s.tensor_logical_not(x).is_err());
+        let mask = s.tensor_logical_not(x).unwrap();
+        assert_eq!(s.tensor_values(mask).unwrap(), vec![1.0, 0.0]);
+        assert!(!s.tensor_requires_grad(mask).unwrap());
+        assert!(s.tensor_requires_grad(x).unwrap());
     }
 
     #[test]
@@ -165985,10 +166640,86 @@ mod tests {
     }
 
     #[test]
-    fn signbit_fails_loud_on_requires_grad() {
+    fn signbit_returns_a_detached_mask_for_requires_grad_input() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s.tensor_variable(vec![1.0, -1.0], vec![2], true).unwrap();
-        assert!(s.tensor_signbit(x).is_err());
+        let mask = s.tensor_signbit(x).unwrap();
+        assert_eq!(s.tensor_values(mask).unwrap(), vec![0.0, 1.0]);
+        assert!(!s.tensor_requires_grad(mask).unwrap());
+        assert!(s.tensor_requires_grad(x).unwrap());
+    }
+
+    #[test]
+    fn predicate_signbit_reads_native_signs_including_nan_payloads() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let storage = match dtype {
+                    DType::F64 => TensorStorage::F64(Arc::new(
+                        [
+                            0_u64,
+                            0x8000_0000_0000_0000,
+                            0x3ff0_0000_0000_0000,
+                            0xbff0_0000_0000_0000,
+                            0x7ff0_0000_0000_0000,
+                            0xfff0_0000_0000_0000,
+                            0x7ff8_0000_0000_0001,
+                            0xfff8_0000_0000_0001,
+                        ]
+                        .into_iter()
+                        .map(f64::from_bits)
+                        .collect(),
+                    )),
+                    DType::F32 => TensorStorage::F32(Arc::new(
+                        [
+                            0_u32,
+                            0x8000_0000,
+                            0x3f80_0000,
+                            0xbf80_0000,
+                            0x7f80_0000,
+                            0xff80_0000,
+                            0x7fc0_0001,
+                            0xffc0_0001,
+                        ]
+                        .into_iter()
+                        .map(f32::from_bits)
+                        .collect(),
+                    )),
+                    DType::F16 => TensorStorage::F16(Arc::new(
+                        [
+                            0_u16, 0x8000, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7e01, 0xfe01,
+                        ]
+                        .into_iter()
+                        .map(ft_core::Float16::from_bits)
+                        .collect(),
+                    )),
+                    DType::BF16 => TensorStorage::BF16(Arc::new(
+                        [
+                            0_u16, 0x8000, 0x3f80, 0xbf80, 0x7f80, 0xff80, 0x7fc1, 0xffc1,
+                        ]
+                        .into_iter()
+                        .map(ft_core::BFloat16::from_bits)
+                        .collect(),
+                    )),
+                    _ => unreachable!(),
+                };
+                let mut s = FrankenTorchSession::new(mode);
+                let input = DenseTensor::from_typed_storage(
+                    TensorMeta::from_shape(vec![8], dtype, Device::Cpu),
+                    storage,
+                )
+                .unwrap();
+                let input = s.tensor_variable_from_storage(input, true);
+                let mask = s.tensor_signbit(input).unwrap();
+                assert_eq!(s.tensor_dtype(mask).unwrap(), dtype);
+                assert_eq!(s.tensor_shape(mask).unwrap(), vec![8]);
+                assert_eq!(
+                    s.tensor_values_lossy_f64(mask).unwrap(),
+                    vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                );
+                assert!(!s.tensor_requires_grad(mask).unwrap());
+                assert!(s.tensor_requires_grad(input).unwrap());
+            }
+        }
     }
 
     // ── tensor_matrix_transpose tests (frankentorch-1mcj) ──────────────
@@ -175385,6 +176116,324 @@ mod tests {
         let (std, mean) = s.tensor_std_mean(a, 1, 1).unwrap();
         assert_eq!(s.tensor_shape(std).unwrap(), vec![2]);
         assert_eq!(s.tensor_shape(mean).unwrap(), vec![2]);
+    }
+
+    // Independent scalar equations for two timesteps, with no session ops.
+    fn recurrent_cell_sequence_oracle(
+        lstm: bool,
+        parameters: &[Vec<f64>],
+        batch: usize,
+    ) -> (Vec<f64>, Vec<f64>, f64) {
+        let gate_width = if lstm { 8 } else { 6 };
+        let mut hidden = parameters[1].clone();
+        let mut cell = parameters[2].clone();
+        for time in 0..2 {
+            let mut next_hidden = vec![0.0; batch * 2];
+            let mut next_cell = vec![0.0; batch * 2];
+            for b in 0..batch {
+                let mut input_gates = parameters[5].clone();
+                let mut hidden_gates = parameters[6].clone();
+                for gate in 0..gate_width {
+                    for feature in 0..2 {
+                        input_gates[gate] += parameters[0][(time * batch + b) * 2 + feature]
+                            * parameters[3][feature * gate_width + gate];
+                        hidden_gates[gate] +=
+                            hidden[b * 2 + feature] * parameters[4][feature * gate_width + gate];
+                    }
+                }
+                let sigmoid = |x: f64| 1.0 / (1.0 + (-x).exp());
+                for j in 0..2 {
+                    let index = b * 2 + j;
+                    if lstm {
+                        let i = sigmoid(input_gates[j] + hidden_gates[j]);
+                        let f = sigmoid(input_gates[2 + j] + hidden_gates[2 + j]);
+                        let g = (input_gates[4 + j] + hidden_gates[4 + j]).tanh();
+                        let o = sigmoid(input_gates[6 + j] + hidden_gates[6 + j]);
+                        next_cell[index] = f * cell[index] + i * g;
+                        next_hidden[index] = o * next_cell[index].tanh();
+                    } else {
+                        let r = sigmoid(input_gates[j] + hidden_gates[j]);
+                        let z = sigmoid(input_gates[2 + j] + hidden_gates[2 + j]);
+                        let n = (input_gates[4 + j] + r * hidden_gates[4 + j]).tanh();
+                        next_hidden[index] = (1.0 - z) * n + z * hidden[index];
+                    }
+                }
+            }
+            hidden = next_hidden;
+            if lstm {
+                cell = next_cell;
+            }
+        }
+        let mut loss = 0.0;
+        for (index, value) in hidden.iter().enumerate() {
+            loss += value * (index + 1) as f64 * 0.125;
+        }
+        if lstm {
+            for (index, value) in cell.iter().enumerate() {
+                loss -= value * (index + 1) as f64 * 0.0625;
+            }
+        }
+        (hidden, cell, loss)
+    }
+
+    #[test]
+    fn recurrent_cells_backpropagate_through_two_timesteps() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for lstm in [false, true] {
+                for f32_storage in [false, true] {
+                    for unbatched in [false, true] {
+                        let batch = if unbatched { 1 } else { 2 };
+                        let gate_width = if lstm { 8 } else { 6 };
+                        let sizes = [
+                            4 * batch,
+                            2 * batch,
+                            2 * batch,
+                            2 * gate_width,
+                            2 * gate_width,
+                            gate_width,
+                            gate_width,
+                        ];
+                        let parameters: Vec<Vec<f64>> = sizes
+                            .iter()
+                            .enumerate()
+                            .map(|(p, &n)| {
+                                (0..n)
+                                    .map(|i| (((i * 7 + p * 3) % 19) as f64 - 9.0) / 32.0)
+                                    .collect()
+                            })
+                            .collect();
+                        let state_shape = if unbatched { vec![2] } else { vec![batch, 2] };
+                        let input_shape = if unbatched {
+                            vec![2, 2]
+                        } else {
+                            vec![2, batch, 2]
+                        };
+                        let shapes = [
+                            input_shape,
+                            state_shape.clone(),
+                            state_shape.clone(),
+                            vec![2, gate_width],
+                            vec![2, gate_width],
+                            vec![gate_width],
+                            vec![gate_width],
+                        ];
+                        let mut session = FrankenTorchSession::new(mode);
+                        let make = |session: &mut FrankenTorchSession,
+                                    values: &[f64],
+                                    shape: Vec<usize>,
+                                    grad: bool| {
+                            if f32_storage {
+                                session
+                                    .tensor_variable_f32(
+                                        values.iter().map(|v| *v as f32).collect(),
+                                        shape,
+                                        grad,
+                                    )
+                                    .unwrap()
+                            } else {
+                                session
+                                    .tensor_variable(values.to_vec(), shape, grad)
+                                    .unwrap()
+                            }
+                        };
+                        let nodes: Vec<_> = parameters
+                            .iter()
+                            .zip(shapes)
+                            .map(|(values, shape)| make(&mut session, values, shape, true))
+                            .collect();
+                        let mut hidden = nodes[1];
+                        let mut cell = nodes[2];
+                        for time in 0..2 {
+                            let step = session.tensor_narrow(nodes[0], 0, time, 1).unwrap();
+                            let step = session.tensor_reshape(step, state_shape.clone()).unwrap();
+                            if lstm {
+                                (hidden, cell) = session
+                                    .lstm_cell(
+                                        step,
+                                        (hidden, cell),
+                                        nodes[3],
+                                        nodes[4],
+                                        Some(nodes[5]),
+                                        Some(nodes[6]),
+                                    )
+                                    .unwrap();
+                            } else {
+                                hidden = session
+                                    .gru_cell(
+                                        step,
+                                        hidden,
+                                        nodes[3],
+                                        nodes[4],
+                                        Some(nodes[5]),
+                                        Some(nodes[6]),
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        let expected = recurrent_cell_sequence_oracle(lstm, &parameters, batch);
+                        let tolerance = if f32_storage { 2.0e-5 } else { 2.0e-8 };
+                        assert_eq!(session.tensor_shape(hidden).unwrap(), state_shape);
+                        assert_eq!(
+                            session.tensor_dtype(hidden).unwrap(),
+                            if f32_storage { DType::F32 } else { DType::F64 }
+                        );
+                        assert!(session.tensor_requires_grad(hidden).unwrap());
+                        for (actual, expected) in session
+                            .tensor_values_lossy_f64(hidden)
+                            .unwrap()
+                            .iter()
+                            .zip(&expected.0)
+                        {
+                            assert!((actual - expected).abs() < tolerance);
+                        }
+                        if lstm {
+                            assert!(session.tensor_requires_grad(cell).unwrap());
+                            for (actual, expected) in session
+                                .tensor_values_lossy_f64(cell)
+                                .unwrap()
+                                .iter()
+                                .zip(&expected.1)
+                            {
+                                assert!((actual - expected).abs() < tolerance);
+                            }
+                        }
+                        let h_coefficients: Vec<_> =
+                            (0..2 * batch).map(|i| (i + 1) as f64 * 0.125).collect();
+                        let h_coefficients =
+                            make(&mut session, &h_coefficients, state_shape.clone(), false);
+                        let weighted_h = session.tensor_mul(hidden, h_coefficients).unwrap();
+                        let mut loss = session.tensor_sum(weighted_h).unwrap();
+                        if lstm {
+                            let c_coefficients: Vec<_> =
+                                (0..2 * batch).map(|i| -(i as f64 + 1.0) * 0.0625).collect();
+                            let c_coefficients =
+                                make(&mut session, &c_coefficients, state_shape, false);
+                            let weighted_c = session.tensor_mul(cell, c_coefficients).unwrap();
+                            let c_loss = session.tensor_sum(weighted_c).unwrap();
+                            loss = session.tensor_add(loss, c_loss).unwrap();
+                        }
+                        assert!(
+                            (session.tensor_values_lossy_f64(loss).unwrap()[0] - expected.2).abs()
+                                < tolerance
+                        );
+                        let report = session.tensor_backward(loss).unwrap();
+                        for (p, &node) in nodes.iter().enumerate() {
+                            if !lstm && p == 2 {
+                                assert!(report.gradient(node).is_none());
+                                continue;
+                            }
+                            let gradient = report
+                                .gradient(node)
+                                .expect("recurrent parameter lost its gradient graph");
+                            assert_eq!(gradient.len(), parameters[p].len());
+                            for (i, &actual) in gradient.iter().enumerate() {
+                                let mut perturbed = parameters.clone();
+                                let epsilon = 1.0e-5;
+                                perturbed[p][i] += epsilon;
+                                let plus =
+                                    recurrent_cell_sequence_oracle(lstm, &perturbed, batch).2;
+                                perturbed[p][i] -= 2.0 * epsilon;
+                                let minus =
+                                    recurrent_cell_sequence_oracle(lstm, &perturbed, batch).2;
+                                let numerical = (plus - minus) / (2.0 * epsilon);
+                                assert!(
+                                    (actual - numerical).abs()
+                                        <= tolerance * (1.0 + numerical.abs()),
+                                    "mode={mode:?} lstm={lstm} f32={f32_storage} unbatched={unbatched} parameter={p}[{i}]: analytical={actual}, numerical={numerical}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recurrent_cells_validate_shapes_and_train_with_frozen_inputs() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for lstm in [false, true] {
+                let mut session = FrankenTorchSession::new(mode);
+                let gate_width = if lstm { 8 } else { 6 };
+                let input = session
+                    .tensor_variable(vec![0.25, -0.5], vec![1, 2], false)
+                    .unwrap();
+                let hidden = session
+                    .tensor_variable(vec![0.125, -0.25], vec![1, 2], false)
+                    .unwrap();
+                let cell = session
+                    .tensor_variable(vec![0.25, 0.125], vec![1, 2], false)
+                    .unwrap();
+                let w_ih = session
+                    .tensor_variable(vec![0.125; 2 * gate_width], vec![2, gate_width], true)
+                    .unwrap();
+                let w_hh = session
+                    .tensor_variable(vec![0.25; 2 * gate_width], vec![2, gate_width], true)
+                    .unwrap();
+                let bad_bias = session
+                    .tensor_variable(vec![0.0; gate_width - 1], vec![gate_width - 1], false)
+                    .unwrap();
+                let wrong_batch = session
+                    .tensor_variable(vec![0.0; 4], vec![2, 2], false)
+                    .unwrap();
+                let wrong_dtype = session
+                    .tensor_variable_f32(vec![0.0; 2], vec![1, 2], false)
+                    .unwrap();
+                let output = if lstm {
+                    assert!(
+                        session
+                            .lstm_cell(input, (hidden, cell), w_ih, w_hh, Some(bad_bias), None)
+                            .is_err()
+                    );
+                    assert!(
+                        session
+                            .lstm_cell(input, (wrong_batch, cell), w_ih, w_hh, None, None)
+                            .is_err()
+                    );
+                    assert!(
+                        session
+                            .lstm_cell(input, (hidden, wrong_dtype), w_ih, w_hh, None, None)
+                            .is_err()
+                    );
+                    session
+                        .lstm_cell(input, (hidden, cell), w_ih, w_hh, None, None)
+                        .unwrap()
+                        .0
+                } else {
+                    assert!(
+                        session
+                            .gru_cell(input, hidden, w_ih, w_hh, Some(bad_bias), None)
+                            .is_err()
+                    );
+                    assert!(
+                        session
+                            .gru_cell(input, wrong_batch, w_ih, w_hh, None, None)
+                            .is_err()
+                    );
+                    assert!(
+                        session
+                            .gru_cell(input, wrong_dtype, w_ih, w_hh, None, None)
+                            .is_err()
+                    );
+                    session
+                        .gru_cell(input, hidden, w_ih, w_hh, None, None)
+                        .unwrap()
+                };
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert!(report.gradient(input).is_none());
+                assert!(report.gradient(hidden).is_none());
+                for parameter in [w_ih, w_hh] {
+                    assert!(
+                        report
+                            .gradient(parameter)
+                            .unwrap()
+                            .iter()
+                            .any(|gradient| gradient.abs() > 1.0e-8)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

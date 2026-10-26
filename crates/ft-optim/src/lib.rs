@@ -4,6 +4,7 @@ use ft_api::FrankenTorchSession;
 use ft_autograd::{AutogradError, TensorBackwardReport, TensorNodeId};
 use ft_dispatch::{DispatchError, DispatchKeyError};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Version of the portable optimizer state format.
 pub const OPTIMIZER_STATE_VERSION: u32 = 1;
@@ -655,8 +656,35 @@ fn apply_param_update(
     })
 }
 
+/// Stable identity of one optimizer, independent of its address or parameters.
+///
+/// Store one token in a custom optimizer and return it from
+/// [`Optimizer::identity`]. Moving the optimizer retains its identity; creating
+/// another optimizer, even for the same parameters, requires a new token.
+/// The token is deliberately not `Clone`: copying optimizer state must not copy
+/// its identity. It is runtime bookkeeping and is never serialized.
+#[derive(Debug)]
+pub struct OptimizerIdentity(Arc<()>);
+
+impl OptimizerIdentity {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl Default for OptimizerIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Trait for parameter optimizers.
 pub trait Optimizer {
+    /// Return the same identity token for the entire lifetime of this optimizer.
+    /// Loading a checkpoint must preserve this token.
+    fn identity(&self) -> &OptimizerIdentity;
+
     /// Parameter node IDs owned by this optimizer, in registration order.
     ///
     /// Gradient utilities use this set rather than the nodes reached by the
@@ -745,6 +773,7 @@ pub trait Optimizer {
 
 /// Stochastic Gradient Descent optimizer with optional momentum and weight decay.
 pub struct SGD {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     momentum: f64,
@@ -764,6 +793,7 @@ impl SGD {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             momentum: 0.0,
@@ -853,6 +883,10 @@ impl SGD {
 }
 
 impl Optimizer for SGD {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -895,6 +929,7 @@ impl Optimizer for SGD {
             .maximize(saved.maximize);
         restored.validate_hyperparams()?;
         restored.velocity = saved.momentum_buffers.clone();
+        std::mem::swap(&mut restored.identity, &mut self.identity);
         *self = restored;
         Ok(())
     }
@@ -1032,6 +1067,7 @@ impl Optimizer for SGD {
 
 /// Adam optimizer with bias correction.
 pub struct Adam {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     beta1: f64,
@@ -1055,6 +1091,7 @@ impl Adam {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             beta1: 0.9,
@@ -1135,6 +1172,10 @@ impl Adam {
 }
 
 impl Optimizer for Adam {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -1189,6 +1230,7 @@ impl Optimizer for Adam {
                 restored.v_max[index] = parameter.max_exp_avg_sq.clone();
             }
         }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
         *self = restored;
         Ok(())
     }
@@ -1372,6 +1414,7 @@ impl Optimizer for Adam {
 /// This decoupling improves regularization behavior and is the default optimizer
 /// for most modern transformer training.
 pub struct AdamW {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     beta1: f64,
@@ -1395,6 +1438,7 @@ impl AdamW {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             beta1: 0.9,
@@ -1475,6 +1519,10 @@ impl AdamW {
 }
 
 impl Optimizer for AdamW {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -1529,6 +1577,7 @@ impl Optimizer for AdamW {
                 restored.v_max[index] = parameter.max_exp_avg_sq.clone();
             }
         }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
         *self = restored;
         Ok(())
     }
@@ -1724,6 +1773,7 @@ impl Optimizer for AdamW {
 /// PyTorch-compatible implementation with `alpha`, `eps`, `weight_decay`,
 /// `momentum`, and `centered` options.
 pub struct RMSprop {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     alpha: f64,
@@ -1748,6 +1798,7 @@ impl RMSprop {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             alpha: 0.99,
@@ -1836,6 +1887,10 @@ impl RMSprop {
 }
 
 impl Optimizer for RMSprop {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -1921,6 +1976,7 @@ impl Optimizer for RMSprop {
                 restored.momentum_buffer[index] = parameter.momentum_buffer.clone();
             }
         }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
         *self = restored;
         Ok(())
     }
@@ -2100,6 +2156,7 @@ impl Optimizer for RMSprop {
 /// Parameters with large historical gradients get smaller learning rates,
 /// and parameters with small gradients get larger rates.
 pub struct Adagrad {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     lr_decay: f64,
@@ -2119,6 +2176,7 @@ impl Adagrad {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             lr_decay: 0.0,
@@ -2196,6 +2254,10 @@ impl Adagrad {
 }
 
 impl Optimizer for Adagrad {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -2265,6 +2327,7 @@ impl Optimizer for Adagrad {
                 restored.sum_sq[index] = Some(parameter.sum.clone());
             }
         }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
         *self = restored;
         Ok(())
     }
@@ -2369,6 +2432,7 @@ impl Optimizer for Adagrad {
 /// This eliminates the need for learning rate warmup while matching or exceeding
 /// Adam's performance.
 pub struct RAdam {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     beta1: f64,
@@ -2389,6 +2453,7 @@ impl RAdam {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             beta1: 0.9,
@@ -2469,6 +2534,10 @@ impl RAdam {
 }
 
 impl Optimizer for RAdam {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -2541,6 +2610,7 @@ impl Optimizer for RAdam {
                 restored.v[index] = Some(parameter.exp_avg_sq.clone());
             }
         }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
         *self = restored;
         Ok(())
     }
@@ -2704,6 +2774,7 @@ pub enum LBFGSLineSearch {
 /// (`backward` followed by `step`) and an explicit closure-based update via
 /// [`LBFGS::step_with_closure`].
 pub struct LBFGS {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     max_iter: usize,
@@ -2739,6 +2810,7 @@ impl LBFGS {
     /// - `line_search_fn=StrongWolfe`
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             max_iter: 20,
@@ -3120,6 +3192,10 @@ impl LBFGS {
 }
 
 impl Optimizer for LBFGS {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -4363,16 +4439,24 @@ impl LRScheduler for ReduceLROnPlateau {
 }
 
 struct ShadowOptimizer {
+    identity: OptimizerIdentity,
     lr: f64,
 }
 
 impl ShadowOptimizer {
     fn new(lr: f64) -> Self {
-        Self { lr }
+        Self {
+            identity: OptimizerIdentity::new(),
+            lr,
+        }
     }
 }
 
 impl Optimizer for ShadowOptimizer {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &[]
     }
@@ -5424,6 +5508,7 @@ impl LRScheduler for CyclicLR {
 /// This can be more stable than Adam for some problems and doesn't require
 /// bias correction on the second moment.
 pub struct Adamax {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     beta1: f64,
@@ -5443,6 +5528,7 @@ impl Adamax {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             beta1: 0.9,
@@ -5508,6 +5594,10 @@ impl Adamax {
 }
 
 impl Optimizer for Adamax {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -5609,6 +5699,7 @@ impl Optimizer for Adamax {
 /// gradient updates. Unlike most optimizers, it doesn't require an initial
 /// learning rate — though PyTorch exposes `lr` as a scaling factor (default 1.0).
 pub struct Adadelta {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     rho: f64,
@@ -5626,6 +5717,7 @@ impl Adadelta {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             rho: 0.9,
@@ -5685,6 +5777,10 @@ impl Adadelta {
 }
 
 impl Optimizer for Adadelta {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -5785,6 +5881,7 @@ impl Optimizer for Adadelta {
 /// moment estimate. The update uses both the current bias-corrected first moment
 /// and the raw gradient scaled by (1 - beta1), giving a Nesterov-like effect.
 pub struct NAdam {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     beta1: f64,
@@ -5812,6 +5909,7 @@ impl NAdam {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             beta1: 0.9,
@@ -5896,6 +5994,10 @@ impl NAdam {
 }
 
 impl Optimizer for NAdam {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -6012,6 +6114,7 @@ impl Optimizer for NAdam {
 /// Maintains a running average of parameters that converges to the minimum of
 /// the objective. After a warmup period (t0), the averaged parameters are used.
 pub struct ASGD {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     lambd: f64,
@@ -6032,6 +6135,7 @@ impl ASGD {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             lambd: 1e-4,
@@ -6099,6 +6203,10 @@ impl ASGD {
 }
 
 impl Optimizer for ASGD {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -6226,6 +6334,7 @@ impl ASGD {
 /// keeps the same sign, the step size increases. This makes it insensitive to
 /// gradient magnitude.
 pub struct Rprop {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     eta_minus: f64,
@@ -6244,6 +6353,7 @@ impl Rprop {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             eta_minus: 0.5,
@@ -6308,6 +6418,10 @@ impl Rprop {
 }
 
 impl Optimizer for Rprop {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -6422,6 +6536,7 @@ impl Optimizer for Rprop {
 /// updated at indices where the gradient is non-zero. Bias correction uses
 /// each parameter's applied-step count.
 pub struct SparseAdam {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     beta1: f64,
@@ -6439,6 +6554,7 @@ impl SparseAdam {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             beta1: 0.9,
@@ -6518,6 +6634,10 @@ impl SparseAdam {
 }
 
 impl Optimizer for SparseAdam {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -6753,6 +6873,7 @@ impl SparseAdam {
 ///
 /// Equivalent to experimental `torch.optim.Muon`.
 pub struct Muon {
+    identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     momentum: f64,
@@ -6768,6 +6889,7 @@ impl Muon {
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
+            identity: OptimizerIdentity::new(),
             params,
             lr,
             momentum: 0.95,
@@ -6820,6 +6942,10 @@ impl Muon {
 }
 
 impl Optimizer for Muon {
+    fn identity(&self) -> &OptimizerIdentity {
+        &self.identity
+    }
+
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
     }
@@ -6988,6 +7114,41 @@ fn factorize_approx_square(numel: usize) -> (usize, usize) {
 
 // ── frankentorch-iha: Mixed precision GradScaler ────────────────────────
 
+/// Version of the portable gradient-scaler state format.
+pub const GRAD_SCALER_STATE_VERSION: u32 = 1;
+
+/// Dynamic loss-scaling state at an iteration boundary, after `update()`.
+///
+/// Save alongside model and optimizer state. Runtime optimizer identities and
+/// in-progress unscale/step records are deliberately excluded. Integer counters
+/// remain integers in serialized checkpoints rather than being cast to floats.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GradScalerState {
+    pub version: u32,
+    pub enabled: bool,
+    pub scale: f64,
+    pub growth_factor: f64,
+    pub backoff_factor: f64,
+    pub growth_interval: u64,
+    pub growth_tracker: u64,
+    pub finite_steps: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalerOptimizerStage {
+    Unscaled,
+    Stepped,
+}
+
+struct ScalerOptimizerState {
+    // Retaining the allocation prevents identity reuse if an optimizer is
+    // dropped and another is constructed before this iteration finishes.
+    identity: Arc<()>,
+    stage: ScalerOptimizerStage,
+    found_overflow: bool,
+}
+
 /// Gradient scaler for mixed precision training.
 ///
 /// Scales the loss by a dynamic factor before backward to prevent F16 underflow,
@@ -7003,6 +7164,9 @@ fn factorize_approx_square(numel: usize) -> (usize, usize) {
 /// let loss = model.forward(x);
 /// let scaled_loss = scaler.scale_loss(&mut session, loss)?;
 /// let report = session.tensor_backward(scaled_loss)?;
+/// // Optional: inspect or clip the true, accumulated gradients.
+/// scaler.unscale_(&mut session, &optimizer)?;
+/// session.clip_grad_norm_(optimizer.parameters(), 1.0, 2.0)?;
 /// scaler.step(&mut session, &mut optimizer, &report)?;
 /// scaler.update();
 /// ```
@@ -7017,6 +7181,7 @@ pub struct GradScaler {
     stepped_since_update: bool,
     last_step_skipped: bool,
     enabled: bool,
+    optimizer_states: Vec<ScalerOptimizerState>,
 }
 
 impl Default for GradScaler {
@@ -7040,10 +7205,14 @@ impl GradScaler {
             stepped_since_update: false,
             last_step_skipped: false,
             enabled: true,
+            optimizer_states: Vec::new(),
         }
     }
 
     /// Construct with explicit parameters.
+    ///
+    /// Invalid configuration is rejected by `scale_loss`, `unscale_`, `step`,
+    /// and checkpoint operations before gradients or parameters are modified.
     #[must_use]
     pub fn with_config(
         init_scale: f64,
@@ -7062,17 +7231,119 @@ impl GradScaler {
             stepped_since_update: false,
             last_step_skipped: false,
             enabled: true,
+            optimizer_states: Vec::new(),
         }
     }
 
-    /// Disable the scaler (passthrough mode).
-    pub fn disable(&mut self) {
-        self.enabled = false;
+    fn validate_config(&self) -> Result<(), AutogradError> {
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(optimizer_hparam_error(
+                "GradScaler scale must be finite and positive",
+            ));
+        }
+        if !self.growth_factor.is_finite() || self.growth_factor <= 1.0 {
+            return Err(optimizer_hparam_error(
+                "GradScaler growth_factor must be finite and greater than one",
+            ));
+        }
+        if !self.backoff_factor.is_finite()
+            || self.backoff_factor <= 0.0
+            || self.backoff_factor >= 1.0
+        {
+            return Err(optimizer_hparam_error(
+                "GradScaler backoff_factor must be finite and in (0, 1)",
+            ));
+        }
+        if self.growth_interval == 0 {
+            return Err(optimizer_hparam_error(
+                "GradScaler growth_interval must be positive",
+            ));
+        }
+        Ok(())
     }
 
-    /// Re-enable the scaler.
-    pub fn enable(&mut self) {
+    fn ensure_iteration_boundary(&self) -> Result<(), AutogradError> {
+        if !self.optimizer_states.is_empty()
+            || self.stepped_since_update
+            || self.found_overflow_since_update
+        {
+            return Err(optimizer_state_error(
+                "GradScaler operation requires update after all optimizer steps",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Export loss scale, growth progress, configuration, and enabled state.
+    /// Call after `update()`, before accumulating the next iteration's gradients.
+    pub fn state_dict(&self) -> Result<GradScalerState, AutogradError> {
+        self.ensure_iteration_boundary()?;
+        self.validate_config()?;
+        Ok(GradScalerState {
+            version: GRAD_SCALER_STATE_VERSION,
+            enabled: self.enabled,
+            scale: self.scale,
+            growth_factor: self.growth_factor,
+            backoff_factor: self.backoff_factor,
+            growth_interval: u64::try_from(self.growth_interval)
+                .map_err(|_| optimizer_state_error("GradScaler interval exceeds u64"))?,
+            growth_tracker: u64::try_from(self.steps_since_growth)
+                .map_err(|_| optimizer_state_error("GradScaler growth tracker exceeds u64"))?,
+            finite_steps: u64::try_from(self.steps_since_inf)
+                .map_err(|_| optimizer_state_error("GradScaler finite-step count exceeds u64"))?,
+        })
+    }
+
+    /// Restore a checkpoint at an iteration boundary. All validation completes
+    /// before any state changes; malformed or unknown-version states fail closed.
+    pub fn load_state_dict(&mut self, state: &GradScalerState) -> Result<(), AutogradError> {
+        self.ensure_iteration_boundary()?;
+        if state.version != GRAD_SCALER_STATE_VERSION {
+            return Err(optimizer_state_error(
+                "unsupported GradScaler state version",
+            ));
+        }
+        let interval = usize::try_from(state.growth_interval)
+            .map_err(|_| optimizer_state_error("GradScaler interval exceeds platform capacity"))?;
+        let growth_tracker = usize::try_from(state.growth_tracker).map_err(|_| {
+            optimizer_state_error("GradScaler growth tracker exceeds platform capacity")
+        })?;
+        let finite_steps = usize::try_from(state.finite_steps).map_err(|_| {
+            optimizer_state_error("GradScaler finite-step count exceeds platform capacity")
+        })?;
+        let mut restored = Self::with_config(
+            state.scale,
+            state.growth_factor,
+            state.backoff_factor,
+            interval,
+        );
+        restored.validate_config()?;
+        if growth_tracker >= interval || finite_steps < growth_tracker {
+            return Err(optimizer_state_error(
+                "inconsistent GradScaler growth counters",
+            ));
+        }
+        restored.steps_since_growth = growth_tracker;
+        restored.steps_since_inf = finite_steps;
+        restored.enabled = state.enabled;
+        *self = restored;
+        Ok(())
+    }
+
+    /// Disable the scaler (passthrough mode) between training iterations.
+    /// Returns an error while an unscale or step is waiting for `update()`.
+    pub fn disable(&mut self) -> Result<(), AutogradError> {
+        self.ensure_iteration_boundary()?;
+        self.enabled = false;
+        Ok(())
+    }
+
+    /// Re-enable the scaler between training iterations.
+    pub fn enable(&mut self) -> Result<(), AutogradError> {
+        self.ensure_iteration_boundary()?;
+        self.validate_config()?;
         self.enabled = true;
+        Ok(())
     }
 
     /// Get the current scale factor.
@@ -7096,7 +7367,11 @@ impl GradScaler {
         session: &mut FrankenTorchSession,
         loss: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if !self.enabled || (self.scale - 1.0).abs() < f64::EPSILON {
+        if !self.enabled {
+            return Ok(loss);
+        }
+        self.validate_config()?;
+        if self.scale == 1.0 {
             return Ok(loss);
         }
         let loss_shape = session.tensor_shape(loss)?;
@@ -7106,12 +7381,94 @@ impl GradScaler {
         session.tensor_mul(loss, scale_tensor)
     }
 
+    fn optimizer_state_index(&self, optimizer: &dyn Optimizer) -> Option<usize> {
+        self.optimizer_states
+            .iter()
+            .position(|state| Arc::ptr_eq(&state.identity, &optimizer.identity().0))
+    }
+
+    /// Unscale this optimizer's accumulated gradients exactly once this iteration.
+    ///
+    /// Call after every microbatch has finished backward and before gradient
+    /// clipping or inspection. `step()` remembers this operation and will not
+    /// divide the gradients again. Calling twice, or after `step()` but before
+    /// `update()`, returns an error without modifying gradients.
+    ///
+    /// An overflow is recorded for this optimizer and its subsequent step is
+    /// skipped, even if clipping later hides the non-finite values. As in the
+    /// implicit-unscale path, an overflowing set is left unchanged. The scale
+    /// remains fixed until all optimizers have stepped and `update()` is called.
+    /// An optimizer without any accumulated gradients returns an error.
+    pub fn unscale_(
+        &mut self,
+        session: &mut FrankenTorchSession,
+        optimizer: &dyn Optimizer,
+    ) -> Result<(), AutogradError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.validate_config()?;
+        if let Some(index) = self.optimizer_state_index(optimizer) {
+            return Err(optimizer_state_error(
+                match self.optimizer_states[index].stage {
+                    ScalerOptimizerStage::Unscaled => {
+                        "GradScaler unscale_ already called for this optimizer before update"
+                    }
+                    ScalerOptimizerStage::Stepped => {
+                        "GradScaler unscale_ cannot follow step before update"
+                    }
+                },
+            ));
+        }
+
+        let mut gradients = Vec::new();
+        let mut found_overflow = false;
+        let mut seen = std::collections::BTreeSet::new();
+        for &node in optimizer.parameters() {
+            if !seen.insert(node.0) {
+                continue;
+            }
+            if let Some(mut gradient) = session.tensor_accumulated_gradient(node)? {
+                ensure_grad_len_matches_param(
+                    node,
+                    session.tensor_values_len(node)?,
+                    gradient.len(),
+                )?;
+                found_overflow |= gradient.iter().any(|value| !value.is_finite());
+                for value in &mut gradient {
+                    // Division also handles a valid subnormal scale whose
+                    // reciprocal would overflow before touching the gradient.
+                    *value /= self.scale;
+                }
+                found_overflow |= gradient.iter().any(|value| !value.is_finite());
+                gradients.push((node, gradient));
+            }
+        }
+        if gradients.is_empty() {
+            return Err(optimizer_state_error(
+                "GradScaler optimizer has no gradients to unscale",
+            ));
+        }
+        // All node IDs and lengths have been checked before the first mutation.
+        if !found_overflow {
+            for (node, gradient) in gradients {
+                session.tensor_set_accumulated_gradient(node, gradient)?;
+            }
+        }
+        self.found_overflow_since_update |= found_overflow;
+        self.optimizer_states.push(ScalerOptimizerState {
+            identity: Arc::clone(&optimizer.identity().0),
+            stage: ScalerOptimizerStage::Unscaled,
+            found_overflow,
+        });
+        Ok(())
+    }
+
     /// Step the optimizer with gradient unscaling and overflow detection.
     ///
-    /// 1. Reads all persistent gradients for the optimizer's parameter set
-    /// 2. Checks for any non-finite values (inf or nan)
-    /// 3. If found: skips the optimizer step entirely
-    /// 4. If not: unscales those gradients and runs the optimizer step
+    /// Unscales this optimizer's persistent gradients unless `unscale_()` has
+    /// already done so. Recorded or newly introduced non-finite gradients skip
+    /// the parameter update. A second step before `update()` returns an error.
     ///
     /// The scale stays fixed until [`Self::update`], which must be called once
     /// after all optimizers have stepped for this iteration. An overflow skips
@@ -7129,51 +7486,52 @@ impl GradScaler {
             self.last_step_skipped = false;
             return Ok(true);
         }
-
-        let inv_scale = 1.0 / self.scale;
-        let mut unscaled_persistent_gradients = Vec::new();
-        let mut found_overflow = false;
-        let mut seen = std::collections::BTreeSet::new();
-        for &node in optimizer.parameters() {
-            if !seen.insert(node.0) {
-                continue;
+        self.validate_config()?;
+        let index = match self.optimizer_state_index(optimizer) {
+            Some(index) => index,
+            None => {
+                self.unscale_(session, optimizer)?;
+                self.optimizer_states.len() - 1
             }
-            if let Some(mut gradient) = session.tensor_accumulated_gradient(node)? {
-                if gradient.iter().any(|&v| !v.is_finite()) {
-                    found_overflow = true;
-                    break;
-                }
-                for value in &mut gradient {
-                    *value *= inv_scale;
-                }
-                if gradient.iter().any(|value| !value.is_finite()) {
-                    found_overflow = true;
-                    break;
-                }
-                unscaled_persistent_gradients.push((node, gradient));
+        };
+        if self.optimizer_states[index].stage == ScalerOptimizerStage::Stepped {
+            return Err(optimizer_state_error(
+                "GradScaler step already called for this optimizer before update",
+            ));
+        }
+        let mut found_overflow = self.optimizer_states[index].found_overflow;
+        let mut has_gradient = false;
+        // A user-supplied transform after explicit unscale may itself overflow.
+        // Never let such a transform turn a finite check into a poisoned update.
+        for &node in optimizer.parameters() {
+            if let Some(gradient) = session.tensor_accumulated_gradient(node)? {
+                has_gradient = true;
+                found_overflow |= gradient.iter().any(|value| !value.is_finite());
             }
         }
-
         if found_overflow {
             // Defer backoff until every optimizer has used this iteration's
             // original scale, including those with finite gradients.
+            self.optimizer_states[index].stage = ScalerOptimizerStage::Stepped;
+            self.optimizer_states[index].found_overflow = true;
             self.found_overflow_since_update = true;
             self.stepped_since_update = true;
             self.last_step_skipped = true;
             return Ok(false);
         }
-
-        // Build the report before mutating persistent gradients so a failed
-        // sparse conversion cannot leave a partially unscaled optimizer.
-        let unscaled = report.scaled_clone(inv_scale)?;
-        for (node, gradient) in unscaled_persistent_gradients {
-            session.tensor_set_accumulated_gradient(node, gradient)?;
+        if !has_gradient {
+            return Err(optimizer_state_error(
+                "GradScaler optimizer has no gradients to step",
+            ));
         }
 
-        // Keep report consumers consistent with the persistent tape consumed by
-        // the optimizers in this crate.
+        // The supplied report describes only its original backward pass. Refresh
+        // this optimizer's entries from the tape so custom report consumers also
+        // see clipping and gradients accumulated by earlier microbatches.
+        let unscaled = session.tensor_refresh_backward_report(report, optimizer.parameters())?;
         optimizer.step(session, &unscaled)?;
 
+        self.optimizer_states[index].stage = ScalerOptimizerStage::Stepped;
         self.stepped_since_update = true;
         self.last_step_skipped = false;
         Ok(true)
@@ -7184,12 +7542,22 @@ impl GradScaler {
     /// Call this once after all optimizers have stepped for an iteration. Any
     /// overflow backs off the scale once. Otherwise `growth_interval` successful
     /// iterations grow the scale, regardless of how many optimizers were stepped.
+    /// It is inert while an explicitly unscaled optimizer is still waiting for
+    /// `step()`, preventing an iteration's scale from changing halfway through.
     pub fn update(&mut self) {
-        if !self.enabled || !self.stepped_since_update {
+        if !self.enabled
+            || !self.stepped_since_update
+            || self
+                .optimizer_states
+                .iter()
+                .any(|state| state.stage == ScalerOptimizerStage::Unscaled)
+        {
             return;
         }
         if self.found_overflow_since_update {
-            self.scale *= self.backoff_factor;
+            // Preserve the finite, positive checkpoint/configuration invariant
+            // even after enough overflows to exhaust the subnormal range.
+            self.scale = (self.scale * self.backoff_factor).max(f64::from_bits(1));
             self.steps_since_growth = 0;
             self.steps_since_inf = 0;
         } else {
@@ -7205,6 +7573,7 @@ impl GradScaler {
         }
         self.found_overflow_since_update = false;
         self.stepped_since_update = false;
+        self.optimizer_states.clear();
     }
 }
 
@@ -14740,6 +15109,726 @@ mod tests {
 
     // ── frankentorch-iha: GradScaler tests ───────────────────────────
 
+    fn scaler_test_parameter(
+        session: &mut FrankenTorchSession,
+        values: Vec<f64>,
+        dtype: ft_core::DType,
+    ) -> TensorNodeId {
+        let shape = vec![values.len()];
+        if dtype == ft_core::DType::F32 {
+            session
+                .tensor_variable_f32(
+                    values.into_iter().map(|value| value as f32).collect(),
+                    shape,
+                    true,
+                )
+                .unwrap()
+        } else {
+            session.tensor_variable(values, shape, true).unwrap()
+        }
+    }
+
+    #[test]
+    fn grad_scaler_explicit_unscale_clipping_matches_unscaled_accumulation() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for norm_clip in [false, true] {
+                    let run = |scaled: bool| {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let first = scaler_test_parameter(&mut session, vec![3.0, -4.0], dtype);
+                        let second = scaler_test_parameter(&mut session, vec![2.0], dtype);
+                        let mut optimizer = SGD::new(vec![first, second], 0.125);
+                        let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 2);
+                        let mut last_report = None;
+                        for microbatch in 0..2 {
+                            let square = session.tensor_mul(first, first).unwrap();
+                            let mut loss = session.tensor_sum(square).unwrap();
+                            if microbatch == 0 {
+                                let square = session.tensor_mul(second, second).unwrap();
+                                let term = session.tensor_sum(square).unwrap();
+                                loss = session.tensor_add(loss, term).unwrap();
+                            }
+                            if scaled {
+                                loss = scaler.scale_loss(&mut session, loss).unwrap();
+                            }
+                            last_report = Some(session.tensor_backward(loss).unwrap());
+                        }
+                        let report = last_report.unwrap();
+                        assert!(report.gradient(second).is_none());
+                        if scaled {
+                            scaler.unscale_(&mut session, &optimizer).unwrap();
+                        }
+                        assert_eq!(
+                            session.tensor_accumulated_gradient(first).unwrap(),
+                            Some(vec![12.0, -16.0])
+                        );
+                        assert_eq!(
+                            session.tensor_accumulated_gradient(second).unwrap(),
+                            Some(vec![4.0])
+                        );
+                        if norm_clip {
+                            let norm = session
+                                .clip_grad_norm_(optimizer.parameters(), 2.0, 2.0)
+                                .unwrap();
+                            assert!((norm - 416.0_f64.sqrt()).abs() < 1e-12);
+                        } else {
+                            session
+                                .clip_grad_value_(optimizer.parameters(), 1.25)
+                                .unwrap();
+                        }
+                        let clipped = session.tensor_accumulated_gradient(first).unwrap();
+                        if scaled {
+                            assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+                            assert_eq!(
+                                session.tensor_accumulated_gradient(first).unwrap(),
+                                clipped,
+                                "step must not unscale the clipped gradients again"
+                            );
+                            scaler.update();
+                        } else {
+                            optimizer.step(&mut session, &report).unwrap();
+                        }
+                        assert_eq!(session.tensor_dtype(first).unwrap(), dtype);
+                        let mut values = session.tensor_values_lossy_f64(first).unwrap();
+                        values.extend(session.tensor_values_lossy_f64(second).unwrap());
+                        values
+                    };
+                    let reference = run(false);
+                    let actual = run(true);
+                    assert_eq!(actual, reference, "{mode:?} {dtype:?} clipping workflow");
+                    let coefficient = 2.0 / (416.0_f64.sqrt() + 1e-6);
+                    let expected = if norm_clip {
+                        vec![
+                            3.0 - 0.125 * 12.0 * coefficient,
+                            -4.0 + 0.125 * 16.0 * coefficient,
+                            2.0 - 0.125 * 4.0 * coefficient,
+                        ]
+                    } else {
+                        vec![2.84375, -3.84375, 1.84375]
+                    };
+                    let tolerance = if dtype == ft_core::DType::F32 {
+                        2e-7
+                    } else {
+                        1e-12
+                    };
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        assert!((actual - expected).abs() < tolerance);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grad_scaler_stage_survives_optimizer_moves_and_checkpoint_loads() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let loss = session.tensor_sum(param).unwrap();
+        let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 2);
+        let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+        let report = session.tensor_backward(scaled).unwrap();
+        let optimizer = SGD::new(vec![param], 0.125);
+        let identity = Arc::clone(&optimizer.identity().0);
+        let saved = optimizer.state_dict(&session).unwrap();
+        scaler.unscale_(&mut session, &optimizer).unwrap();
+        let gradient = session.tensor_accumulated_gradient(param).unwrap();
+        assert!(scaler.unscale_(&mut session, &optimizer).is_err());
+        assert_eq!(
+            session.tensor_accumulated_gradient(param).unwrap(),
+            gradient
+        );
+
+        // Moving onto the heap and loading hyperparameters must not create a
+        // fresh AMP identity that permits another division by the loss scale.
+        let mut moved = Box::new(optimizer);
+        moved.load_state_dict(&session, &saved).unwrap();
+        assert!(Arc::ptr_eq(&identity, &moved.identity().0));
+        assert!(scaler.unscale_(&mut session, moved.as_ref()).is_err());
+        assert!(scaler.step(&mut session, moved.as_mut(), &report).unwrap());
+        assert_eq!(session.tensor_values(param).unwrap(), vec![1.875]);
+        assert!(scaler.step(&mut session, moved.as_mut(), &report).is_err());
+        assert!(scaler.unscale_(&mut session, moved.as_ref()).is_err());
+        assert_eq!(session.tensor_values(param).unwrap(), vec![1.875]);
+        scaler.update();
+        moved.zero_grad(&mut session).unwrap();
+        let loss = session.tensor_sum(param).unwrap();
+        let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+        let report = session.tensor_backward(scaled).unwrap();
+        scaler.unscale_(&mut session, moved.as_ref()).unwrap();
+        assert!(scaler.step(&mut session, moved.as_mut(), &report).unwrap());
+        scaler.update();
+        assert_eq!(scaler.get_scale(), 16.0);
+        assert_eq!(session.tensor_values(param).unwrap(), vec![1.75]);
+    }
+
+    #[test]
+    fn grad_scaler_distinguishes_optimizers_with_identical_parameter_sets() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut first = SGD::new(vec![param], 0.0);
+        let mut second = SGD::new(vec![param], 0.0);
+        assert!(!Arc::ptr_eq(&first.identity().0, &second.identity().0));
+        let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 1);
+        let loss = session.tensor_sum(param).unwrap();
+        let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+        let report = session.tensor_backward(scaled).unwrap();
+        scaler.unscale_(&mut session, &first).unwrap();
+        assert!(scaler.step(&mut session, &mut first, &report).unwrap());
+        // Supply a separate scaled gradient for the second optimizer. Its
+        // lifetime is distinct even though the parameter IDs are identical.
+        session
+            .tensor_set_accumulated_gradient(param, vec![16.0])
+            .unwrap();
+        scaler.unscale_(&mut session, &second).unwrap();
+        assert_eq!(
+            session.tensor_accumulated_gradient(param).unwrap(),
+            Some(vec![2.0])
+        );
+        scaler.update();
+        assert_eq!(
+            scaler.get_scale(),
+            8.0,
+            "an unscaled optimizer is still pending"
+        );
+        assert!(scaler.step(&mut session, &mut second, &report).unwrap());
+        assert_eq!(scaler.optimizer_states.len(), 2);
+        scaler.update();
+        assert_eq!(scaler.get_scale(), 16.0);
+        assert!(scaler.optimizer_states.is_empty());
+    }
+
+    #[test]
+    fn grad_scaler_explicit_unscale_remembers_overflow_after_clipping() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let bad = scaler_test_parameter(&mut session, vec![2.0, -3.0], dtype);
+                let good = scaler_test_parameter(&mut session, vec![4.0], dtype);
+                let mut bad_optimizer = SGD::new(vec![bad], 0.125);
+                let mut good_optimizer = SGD::new(vec![good], 0.125);
+                let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 1);
+                let bad_loss = session.tensor_sum(bad).unwrap();
+                let good_loss = session.tensor_sum(good).unwrap();
+                let loss = session.tensor_add(bad_loss, good_loss).unwrap();
+                let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+                let report = session.tensor_backward(scaled).unwrap();
+                session
+                    .tensor_set_accumulated_gradient(bad, vec![f64::INFINITY, 8.0])
+                    .unwrap();
+                scaler.unscale_(&mut session, &bad_optimizer).unwrap();
+                assert_eq!(
+                    session.tensor_accumulated_gradient(bad).unwrap(),
+                    Some(vec![f64::INFINITY, 8.0]),
+                    "overflow detection must not partially unscale the set"
+                );
+                session.clip_grad_value_(&[bad], 1.0).unwrap();
+                assert_eq!(
+                    session.tensor_accumulated_gradient(bad).unwrap(),
+                    Some(vec![1.0, 1.0])
+                );
+                assert!(
+                    !scaler
+                        .step(&mut session, &mut bad_optimizer, &report)
+                        .unwrap()
+                );
+                assert!(scaler.last_step_was_skipped());
+                scaler.unscale_(&mut session, &good_optimizer).unwrap();
+                assert!(
+                    scaler
+                        .step(&mut session, &mut good_optimizer, &report)
+                        .unwrap()
+                );
+                assert_eq!(
+                    session.tensor_values_lossy_f64(bad).unwrap(),
+                    vec![2.0, -3.0]
+                );
+                assert_eq!(session.tensor_values_lossy_f64(good).unwrap(), vec![3.875]);
+                assert_eq!(scaler.get_scale(), 8.0);
+                scaler.update();
+                assert_eq!(scaler.get_scale(), 4.0);
+
+                good_optimizer.zero_grad(&mut session).unwrap();
+                let loss = session.tensor_sum(good).unwrap();
+                let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+                let report = session.tensor_backward(scaled).unwrap();
+                scaler.unscale_(&mut session, &good_optimizer).unwrap();
+                session
+                    .tensor_set_accumulated_gradient(good, vec![f64::NAN])
+                    .unwrap();
+                assert!(
+                    !scaler
+                        .step(&mut session, &mut good_optimizer, &report)
+                        .unwrap()
+                );
+                assert_eq!(session.tensor_values_lossy_f64(good).unwrap(), vec![3.875]);
+                scaler.update();
+                assert_eq!(scaler.get_scale(), 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn grad_scaler_failed_unscale_does_not_mutate_valid_gradients_or_stage() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let loss = session.tensor_sum(param).unwrap();
+        let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 2);
+        let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+        session.tensor_backward(scaled).unwrap();
+        let invalid = SGD::new(vec![param, TensorNodeId(usize::MAX)], 0.1);
+        assert!(scaler.unscale_(&mut session, &invalid).is_err());
+        assert_eq!(
+            session.tensor_accumulated_gradient(param).unwrap(),
+            Some(vec![8.0])
+        );
+        assert!(scaler.optimizer_states.is_empty());
+        let valid = SGD::new(vec![param], 0.1);
+        scaler.unscale_(&mut session, &valid).unwrap();
+        assert_eq!(
+            session.tensor_accumulated_gradient(param).unwrap(),
+            Some(vec![1.0])
+        );
+    }
+
+    fn scaler_checkpoint_training_step(
+        session: &mut FrankenTorchSession,
+        param: TensorNodeId,
+        optimizer: &mut SGD,
+        scaler: &mut GradScaler,
+        round: usize,
+    ) {
+        optimizer.zero_grad(session).unwrap();
+        let square = session.tensor_mul(param, param).unwrap();
+        let loss = session.tensor_sum(square).unwrap();
+        let scaled = scaler.scale_loss(session, loss).unwrap();
+        let report = session.tensor_backward(scaled).unwrap();
+        if round == 4 {
+            session
+                .tensor_set_accumulated_gradient(param, vec![f64::INFINITY, 8.0])
+                .unwrap();
+        }
+        scaler.unscale_(session, optimizer).unwrap();
+        if round != 4 {
+            session.clip_grad_norm_(&[param], 0.75, 2.0).unwrap();
+        }
+        assert_eq!(
+            scaler.step(session, optimizer, &report).unwrap(),
+            round != 4
+        );
+        scaler.update();
+    }
+
+    #[test]
+    fn grad_scaler_checkpoint_resume_preserves_training_and_growth_progress() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                let mut uninterrupted = FrankenTorchSession::new(mode);
+                let param = scaler_test_parameter(&mut uninterrupted, vec![2.0, -3.0], dtype);
+                let mut optimizer = SGD::new(vec![param], 0.125).momentum(0.25);
+                let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 3);
+                for round in 0..2 {
+                    scaler_checkpoint_training_step(
+                        &mut uninterrupted,
+                        param,
+                        &mut optimizer,
+                        &mut scaler,
+                        round,
+                    );
+                }
+                let saved = scaler.state_dict().unwrap();
+                assert_eq!(saved.growth_tracker, 2);
+                let saved: GradScalerState =
+                    serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+                let saved_optimizer = optimizer.state_dict(&uninterrupted).unwrap();
+                let mut restored = FrankenTorchSession::new(mode);
+                restored
+                    .tensor_variable(vec![99.0], vec![1], false)
+                    .unwrap();
+                let restored_param = scaler_test_parameter(
+                    &mut restored,
+                    uninterrupted.tensor_values_lossy_f64(param).unwrap(),
+                    dtype,
+                );
+                assert_ne!(param, restored_param);
+                let mut restored_optimizer = SGD::new(vec![restored_param], 9.0);
+                restored_optimizer
+                    .load_state_dict(&restored, &saved_optimizer)
+                    .unwrap();
+                let mut restored_scaler = GradScaler::with_config(3.0, 3.0, 0.25, 20);
+                restored_scaler.load_state_dict(&saved).unwrap();
+                for round in 2..9 {
+                    scaler_checkpoint_training_step(
+                        &mut uninterrupted,
+                        param,
+                        &mut optimizer,
+                        &mut scaler,
+                        round,
+                    );
+                    scaler_checkpoint_training_step(
+                        &mut restored,
+                        restored_param,
+                        &mut restored_optimizer,
+                        &mut restored_scaler,
+                        round,
+                    );
+                    assert_eq!(
+                        uninterrupted.tensor_values_lossy_f64(param).unwrap(),
+                        restored.tensor_values_lossy_f64(restored_param).unwrap(),
+                        "{mode:?} {dtype:?} resumed training round {round}"
+                    );
+                    assert_eq!(
+                        scaler.state_dict().unwrap(),
+                        restored_scaler.state_dict().unwrap()
+                    );
+                    assert_eq!(
+                        optimizer.state_dict(&uninterrupted).unwrap(),
+                        restored_optimizer.state_dict(&restored).unwrap()
+                    );
+                    if round == 2 {
+                        assert_eq!(
+                            scaler.get_scale(),
+                            16.0,
+                            "restoration must retain partial growth progress"
+                        );
+                    }
+                    if round == 4 {
+                        assert_eq!(
+                            scaler.get_scale(),
+                            8.0,
+                            "overflow must back off once after restoration"
+                        );
+                    }
+                }
+                scaler.disable().unwrap();
+                let disabled = scaler.state_dict().unwrap();
+                restored_scaler.load_state_dict(&disabled).unwrap();
+                assert_eq!(restored_scaler.get_scale(), 1.0);
+                restored_scaler.enable().unwrap();
+                assert_eq!(restored_scaler.get_scale(), disabled.scale);
+            }
+        }
+    }
+
+    #[test]
+    fn grad_scaler_rejects_invalid_configuration_and_missing_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let unused = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
+        let loss = session.tensor_sum(param).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let mut optimizer = SGD::new(vec![param], 0.1);
+        for (scale, growth, backoff, interval) in [
+            (0.0, 2.0, 0.5, 1),
+            (-1.0, 2.0, 0.5, 1),
+            (f64::NAN, 2.0, 0.5, 1),
+            (f64::INFINITY, 2.0, 0.5, 1),
+            (8.0, 1.0, 0.5, 1),
+            (8.0, f64::NAN, 0.5, 1),
+            (8.0, f64::INFINITY, 0.5, 1),
+            (8.0, 2.0, 0.0, 1),
+            (8.0, 2.0, 1.0, 1),
+            (8.0, 2.0, f64::NAN, 1),
+            (8.0, 2.0, 0.5, 0),
+        ] {
+            let mut scaler = GradScaler::with_config(scale, growth, backoff, interval);
+            assert!(scaler.scale_loss(&mut session, loss).is_err());
+            assert!(scaler.unscale_(&mut session, &optimizer).is_err());
+            assert!(scaler.step(&mut session, &mut optimizer, &report).is_err());
+            assert!(scaler.state_dict().is_err());
+            assert_eq!(session.tensor_values(param).unwrap(), vec![2.0]);
+            assert_eq!(
+                session.tensor_accumulated_gradient(param).unwrap(),
+                Some(vec![1.0])
+            );
+            assert!(scaler.optimizer_states.is_empty());
+        }
+        let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 1);
+        let before = scaler.state_dict().unwrap();
+        for parameters in [vec![], vec![unused]] {
+            let mut idle = SGD::new(parameters, 0.1);
+            assert!(scaler.unscale_(&mut session, &idle).is_err());
+            assert!(scaler.step(&mut session, &mut idle, &report).is_err());
+            scaler.update();
+            assert_eq!(scaler.state_dict().unwrap(), before);
+        }
+        scaler.unscale_(&mut session, &optimizer).unwrap();
+        // Freezing a leaf removes its gradient; zero_grad only fills an
+        // existing buffer with zeros, which is still a valid gradient.
+        session.tensor_requires_grad_(param, false).unwrap();
+        session.tensor_requires_grad_(param, true).unwrap();
+        assert!(
+            session
+                .tensor_accumulated_gradient(param)
+                .unwrap()
+                .is_none()
+        );
+        assert!(scaler.step(&mut session, &mut optimizer, &report).is_err());
+        scaler.update();
+        assert_eq!(scaler.get_scale(), 8.0);
+        assert_eq!(scaler.steps_since_growth, 0);
+        assert_eq!(session.tensor_values(param).unwrap(), vec![2.0]);
+        // Correcting an empty-gradient error can retry the same step without
+        // unscaling the already-unscaled gradients a second time.
+        session
+            .tensor_set_accumulated_gradient(param, vec![1.0])
+            .unwrap();
+        assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+        scaler.update();
+        assert_eq!(scaler.get_scale(), 16.0);
+    }
+
+    #[test]
+    fn grad_scaler_handles_subnormal_scale_and_backoff_without_invalid_state() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let mut optimizer = SGD::new(vec![param], 0.125);
+            let minimum = f64::from_bits(1);
+            let mut scaler = GradScaler::with_config(minimum, 2.0, 0.5, 1);
+            let loss = session.tensor_sum(param).unwrap();
+            let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+            let report = session.tensor_backward(scaled).unwrap();
+            assert_eq!(
+                session.tensor_accumulated_gradient(param).unwrap(),
+                Some(vec![minimum])
+            );
+            scaler.unscale_(&mut session, &optimizer).unwrap();
+            assert_eq!(
+                session.tensor_accumulated_gradient(param).unwrap(),
+                Some(vec![1.0])
+            );
+            assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+            scaler.update();
+            assert_eq!(session.tensor_values(param).unwrap(), vec![1.875]);
+            assert_eq!(scaler.get_scale(), minimum * 2.0);
+            for _ in 0..2 {
+                session
+                    .tensor_set_accumulated_gradient(param, vec![f64::INFINITY])
+                    .unwrap();
+                assert!(!scaler.step(&mut session, &mut optimizer, &report).unwrap());
+                scaler.update();
+                assert_eq!(scaler.get_scale(), minimum);
+                let saved = scaler.state_dict().unwrap();
+                let mut restored = GradScaler::new();
+                restored.load_state_dict(&saved).unwrap();
+                assert_eq!(restored.state_dict().unwrap(), saved);
+            }
+        }
+    }
+
+    #[test]
+    fn grad_scaler_requires_iteration_boundaries_for_mode_and_checkpoint_changes() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut optimizer = SGD::new(vec![param], 0.125);
+        let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 2);
+        let saved = scaler.state_dict().unwrap();
+        let loss = session.tensor_sum(param).unwrap();
+        let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+        let report = session.tensor_backward(scaled).unwrap();
+        scaler.unscale_(&mut session, &optimizer).unwrap();
+        for stepped in [false, true] {
+            if stepped {
+                assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+            }
+            assert!(scaler.state_dict().is_err());
+            assert!(scaler.load_state_dict(&saved).is_err());
+            assert!(scaler.disable().is_err());
+            assert!(scaler.enable().is_err());
+            assert_eq!(scaler.get_scale(), 8.0);
+            assert_eq!(
+                session.tensor_accumulated_gradient(param).unwrap(),
+                Some(vec![1.0])
+            );
+        }
+        scaler.update();
+        scaler.disable().unwrap();
+        scaler.unscale_(&mut session, &optimizer).unwrap();
+        scaler.unscale_(&mut session, &optimizer).unwrap();
+        assert_eq!(scaler.scale_loss(&mut session, loss).unwrap(), loss);
+        assert_eq!(
+            session.tensor_accumulated_gradient(param).unwrap(),
+            Some(vec![1.0])
+        );
+        assert!(!scaler.state_dict().unwrap().enabled);
+        scaler.enable().unwrap();
+        assert_eq!(scaler.get_scale(), 8.0);
+    }
+
+    #[test]
+    fn grad_scaler_checkpoint_rejects_malformed_state_atomically() {
+        let mut target = GradScaler::with_config(32.0, 3.0, 0.25, 7);
+        let original = target.state_dict().unwrap();
+        let valid = GradScalerState {
+            version: GRAD_SCALER_STATE_VERSION,
+            enabled: true,
+            scale: 8.0,
+            growth_factor: 2.0,
+            backoff_factor: 0.5,
+            growth_interval: 3,
+            growth_tracker: 2,
+            finite_steps: 2,
+        };
+        for invalid in [
+            GradScalerState {
+                version: 99,
+                ..valid.clone()
+            },
+            GradScalerState {
+                scale: 0.0,
+                ..valid.clone()
+            },
+            GradScalerState {
+                scale: f64::NAN,
+                ..valid.clone()
+            },
+            GradScalerState {
+                scale: f64::INFINITY,
+                ..valid.clone()
+            },
+            GradScalerState {
+                growth_factor: 1.0,
+                ..valid.clone()
+            },
+            GradScalerState {
+                growth_factor: f64::INFINITY,
+                ..valid.clone()
+            },
+            GradScalerState {
+                backoff_factor: 0.0,
+                ..valid.clone()
+            },
+            GradScalerState {
+                backoff_factor: 1.0,
+                ..valid.clone()
+            },
+            GradScalerState {
+                growth_interval: 0,
+                ..valid.clone()
+            },
+            GradScalerState {
+                growth_tracker: 3,
+                finite_steps: 3,
+                ..valid.clone()
+            },
+            GradScalerState {
+                finite_steps: 1,
+                ..valid.clone()
+            },
+        ] {
+            assert!(target.load_state_dict(&invalid).is_err());
+            assert_eq!(target.state_dict().unwrap(), original);
+        }
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown["unknown_scaling_policy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<GradScalerState>(unknown).is_err());
+        let large = GradScalerState {
+            finite_steps: (1_u64 << 53) + 7,
+            ..valid.clone()
+        };
+        let restored: GradScalerState =
+            serde_json::from_str(&serde_json::to_string(&large).unwrap()).unwrap();
+        assert_eq!(restored.finite_steps, (1_u64 << 53) + 7);
+        if usize::try_from(restored.finite_steps).is_ok() {
+            target.load_state_dict(&restored).unwrap();
+            assert_eq!(target.state_dict().unwrap(), restored);
+        } else {
+            assert!(target.load_state_dict(&restored).is_err());
+            assert_eq!(target.state_dict().unwrap(), original);
+        }
+        target.load_state_dict(&valid).unwrap();
+        assert_eq!(target.state_dict().unwrap(), valid);
+    }
+
+    #[test]
+    fn grad_scaler_report_consumers_receive_clipped_accumulated_gradients() {
+        struct ReportOptimizer {
+            identity: OptimizerIdentity,
+            parameters: Vec<TensorNodeId>,
+            lr: f64,
+            observed: Vec<Vec<f64>>,
+        }
+        impl Optimizer for ReportOptimizer {
+            fn identity(&self) -> &OptimizerIdentity {
+                &self.identity
+            }
+            fn parameters(&self) -> &[TensorNodeId] {
+                &self.parameters
+            }
+            fn step(
+                &mut self,
+                session: &mut FrankenTorchSession,
+                report: &TensorBackwardReport,
+            ) -> Result<(), AutogradError> {
+                self.observed.clear();
+                for &parameter in &self.parameters {
+                    let gradient = report
+                        .gradient(parameter)
+                        .expect("refreshed parameter gradient");
+                    self.observed.push(gradient.to_vec());
+                    let update: Vec<_> = gradient.iter().map(|value| self.lr * value).collect();
+                    apply_param_update(session, parameter, &update)?;
+                }
+                Ok(())
+            }
+            fn zero_grad(
+                &mut self,
+                session: &mut FrankenTorchSession,
+            ) -> Result<(), AutogradError> {
+                zero_param_gradients(session, &self.parameters)
+            }
+            fn get_lr(&self) -> f64 {
+                self.lr
+            }
+            fn set_lr(&mut self, lr: f64) {
+                self.lr = lr;
+            }
+        }
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let first = scaler_test_parameter(&mut session, vec![3.0], dtype);
+                let second = scaler_test_parameter(&mut session, vec![-4.0], dtype);
+                let mut optimizer = ReportOptimizer {
+                    identity: OptimizerIdentity::new(),
+                    parameters: vec![first, second],
+                    lr: 0.125,
+                    observed: Vec::new(),
+                };
+                let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 2);
+                let mut last_report = None;
+                for parameter in [first, second] {
+                    let square = session.tensor_mul(parameter, parameter).unwrap();
+                    let loss = session.tensor_sum(square).unwrap();
+                    let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+                    last_report = Some(session.tensor_backward(scaled).unwrap());
+                }
+                let report = last_report.unwrap();
+                assert!(report.gradient(first).is_none());
+                assert_eq!(report.gradient(second), Some([-64.0].as_slice()));
+                scaler.unscale_(&mut session, &optimizer).unwrap();
+                session
+                    .clip_grad_value_(optimizer.parameters(), 0.75)
+                    .unwrap();
+                assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+                assert_eq!(optimizer.observed, vec![vec![0.75], vec![-0.75]]);
+                assert_eq!(
+                    session.tensor_values_lossy_f64(first).unwrap(),
+                    vec![2.90625]
+                );
+                assert_eq!(
+                    session.tensor_values_lossy_f64(second).unwrap(),
+                    vec![-3.90625]
+                );
+                assert!(
+                    report.gradient(first).is_none(),
+                    "the source report stays immutable"
+                );
+                assert_eq!(report.gradient(second), Some([-64.0].as_slice()));
+            }
+        }
+    }
+
     #[test]
     fn grad_scaler_default_scale_is_65536() {
         let scaler = GradScaler::new();
@@ -14749,7 +15838,7 @@ mod tests {
     #[test]
     fn grad_scaler_disabled_returns_unit_scale() {
         let mut scaler = GradScaler::new();
-        scaler.disable();
+        scaler.disable().unwrap();
         assert_eq!(scaler.get_scale(), 1.0);
     }
 
@@ -14772,7 +15861,7 @@ mod tests {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let loss = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
         let mut scaler = GradScaler::new();
-        scaler.disable();
+        scaler.disable().unwrap();
         let scaled = scaler.scale_loss(&mut session, loss).unwrap();
         // Should be the same node id (passthrough)
         assert_eq!(scaled, loss);
@@ -15095,7 +16184,7 @@ mod tests {
 
         for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
             for accumulate in [false, true] {
-                let run = |scaled_training: bool| {
+                let run = |scaled_training: bool, explicit_unscale: bool| {
                     let mut session = FrankenTorchSession::new(mode);
                     let embedding =
                         Embedding::with_options(&mut session, 5, 2, None, None, 2.0, true).unwrap();
@@ -15147,6 +16236,9 @@ mod tests {
                                     .unwrap(),
                                 unscaled.gradient(weight).unwrap()
                             );
+                            if explicit_unscale {
+                                scaler.unscale_(&mut session, &optimizer).unwrap();
+                            }
                             assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
                             scaler.update();
                         } else {
@@ -15160,7 +16252,9 @@ mod tests {
                     }
                     (values, optimizer.m, optimizer.v, optimizer.step_counts)
                 };
-                assert_eq!(run(true), run(false));
+                let reference = run(false, false);
+                assert_eq!(run(true, false), reference);
+                assert_eq!(run(true, true), reference);
             }
         }
     }
