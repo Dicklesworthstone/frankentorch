@@ -369,7 +369,10 @@ fn balanced_null_is_centered(point: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{balanced_null_is_centered, group_norm_dense_dy, median, timed_conv3d};
+    use super::{
+        balanced_null_is_centered, group_norm_dense_dy, median,
+        timed_batch_norm1d_f64_dense_shaped, timed_conv3d,
+    };
 
     #[test]
     fn balanced_square_overall_median_matches_python_statistics_median() {
@@ -407,6 +410,20 @@ mod tests {
         let dy = group_norm_dense_dy(&[-0.75, 0.0, 0.25, 1.5]);
         assert_eq!(dy, vec![-1.5, 0.0, 0.5, 3.0]);
         assert!(dy.iter().any(|value| value.to_bits() != 1.0_f32.to_bits()));
+    }
+
+    #[test]
+    fn batch_norm1d_dense_loss_produces_nonzero_input_gradient() {
+        // Under a bare `sum(out)` loss, BatchNorm's `dx` is analytically zero and
+        // `try_batch_norm1d_sum_shortcut` returns a zero buffer without reading `x` or `dy`.
+        // Squaring the output before summing exercises the real `spatial == 1` dense backward.
+        let values: Vec<f64> = (0..(4 * 64)).map(|i| (i as f64) * 0.01 - 1.0).collect();
+        let weight: Vec<f64> = (0..64).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let bias: Vec<f64> = (0..64).map(|i| (i as f64) * 0.02 - 0.3).collect();
+        let (milliseconds, checksum) =
+            timed_batch_norm1d_f64_dense_shaped(&values, 4, 64, &weight, &bias);
+        assert!(milliseconds.is_finite() && milliseconds >= 0.0);
+        assert!(checksum.is_finite() && checksum > 1e-3);
     }
 }
 
@@ -697,6 +714,52 @@ fn timed_batch_norm2d_f64_dense(values: &[f64], weight: &[f64], bias: &[f64]) ->
     let (out, _, _) = session
         .functional_batch_norm2d(x, None, None, Some(w), Some(b), true, 0.1, 1e-5)
         .expect("batch_norm2d");
+    let squared = session.tensor_mul(out, out).expect("square");
+    let loss = session.tensor_sum(squared).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+    let checksum = report
+        .gradient(x)
+        .expect("grad")
+        .iter()
+        .map(|g| g.abs())
+        .sum::<f64>();
+    (elapsed, checksum)
+}
+
+/// BatchNorm1d (`[N, C]`, `spatial == 1`) on the DENSE route in f64 — `frankentorch-mdsmm`.
+///
+/// `functional_batch_norm1d` owns the 8th sum-shortcut registration in `ft-api`
+/// (`try_batch_norm1d_sum_shortcut`), whose scalar backward returns a zero `dx` buffer without
+/// reading `x` or `dy`. Reshaping the `[GN_N, GN_C, GN_H, GN_W]` fixture to 2-D
+/// `[GN_N * GN_H * GN_W, GN_C]` (`[100_352, 64]`) keeps the element count and channel count
+/// identical to `batch_norm2d_f64_dense` while routing through `functional_batch_norm1d`'s
+/// `spatial == 1` branch under `sum(out * out)`.
+fn timed_batch_norm1d_f64_dense(values: &[f64], weight: &[f64], bias: &[f64]) -> (f64, f64) {
+    timed_batch_norm1d_f64_dense_shaped(values, GN_N * GN_H * GN_W, GN_C, weight, bias)
+}
+
+fn timed_batch_norm1d_f64_dense_shaped(
+    values: &[f64],
+    batch: usize,
+    channels: usize,
+    weight: &[f64],
+    bias: &[f64],
+) -> (f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), vec![batch, channels], true)
+        .expect("leaf");
+    let w = session
+        .tensor_variable(weight.to_vec(), vec![channels], true)
+        .expect("weight");
+    let b = session
+        .tensor_variable(bias.to_vec(), vec![channels], true)
+        .expect("bias");
+    let started = Instant::now();
+    let (out, _, _) = session
+        .functional_batch_norm1d(x, None, None, Some(w), Some(b), true, 0.1, 1e-5)
+        .expect("batch_norm1d");
     let squared = session.tensor_mul(out, out).expect("square");
     let loss = session.tensor_sum(squared).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
@@ -2160,6 +2223,7 @@ LANES = {
     "max_pool3d_nopool_dense": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))**2),
     "max_pool1d_dense": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
     "max_pool1d_nopool_dense": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
+    "max_pool1d_dense_zeroed": (mp1, lambda x: Fn.max_pool1d(x,2,2)**2),
     "group_norm_f32": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     # frankentorch-68pwz item 103c: the DENSE-route twin. The board's other group_norm
     # lanes all end in a plain sum, which fires the sum-shortcut whose backward never
@@ -2186,6 +2250,9 @@ LANES = {
     # The f64 twin, which is the one that can CERTIFY — see timed_batch_norm2d_f64_dense for
     # why an f32 BatchNorm lane cannot clear a 1e-6 parity gate at any shape.
     "batch_norm2d_f64_dense": (bnx, lambda x: Fn.batch_norm(x,None,None,bnw,bnb,True,0.1,1e-5)**2),
+    # frankentorch-mdsmm: 2-D [N, C] BatchNorm1d on the dense route, reshaping the same bnx
+    # fixture to [GN_N * GN_H * GN_W, GN_C] = [100352, 64] so the spatial==1 branch is measured.
+    "batch_norm1d_f64_dense": (bnx.reshape(32*56*56,64), lambda x: Fn.batch_norm(x,None,None,bnw,bnb,True,0.1,1e-5)**2),
     # frankentorch-jlcmi: incumbent twin for the group_norm uninit A/B.
     "group_norm_f32_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)),
     "group_norm_f32_dense_zeroed": (gnx, lambda x: Fn.group_norm(x,32,gnw,gnb)**2),
@@ -2685,6 +2752,19 @@ LANES = {
             }),
         ),
         (
+            // Pair the uninitialized-output control with the dense max_pool1d backward route
+            // (`max_pool1d_dense`) rather than only the scalar sum-shortcut (`max_pool1d_zeroed`).
+            "max_pool1d_dense_zeroed",
+            Box::new(|| {
+                let previous = ft_kernel_cpu::set_pool_output_zeroed(true);
+                let sample = timed_op_sq(&mp1, vec![MP1_N, MP1_C, MP1_L], |s, x| {
+                    s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+                });
+                ft_kernel_cpu::set_pool_output_zeroed(previous);
+                sample
+            }),
+        ),
+        (
             // frankentorch-9pafs: the SAME lane with `ft_core::buffer_pool` off.
             // Two things make this the readable form of the comparison. It is one
             // binary, so the two arms cannot differ by a compilation; and both are
@@ -2792,6 +2872,11 @@ LANES = {
             // f64: the lane that can certify, on the board's dominant convention.
             "batch_norm2d_f64_dense",
             Box::new(|| timed_batch_norm2d_f64_dense(&bnx, &bnw, &bnb)),
+        ),
+        (
+            // frankentorch-mdsmm: 2-D [N, C] BatchNorm1d on the dense route (`spatial == 1`).
+            "batch_norm1d_f64_dense",
+            Box::new(|| timed_batch_norm1d_f64_dense(&bnx, &bnw, &bnb)),
         ),
         (
             "group_norm_f32_kernels",
@@ -4405,8 +4490,16 @@ LANES = {
                     .map(|base| (base.to_owned(), "sum shortcut"))
             })
             .or_else(|| {
+                name.strip_suffix("_serialfwd_dense")
+                    .map(|base| (format!("{base}_dense"), "parallel forward gate"))
+            })
+            .or_else(|| {
                 name.strip_suffix("_serialfwd")
                     .map(|base| (base.to_owned(), "parallel forward gate"))
+            })
+            .or_else(|| {
+                name.strip_suffix("_recompute_dense")
+                    .map(|base| (format!("{base}_dense"), "forward-statistics reuse"))
             })
             .or_else(|| {
                 name.strip_suffix("_recompute")
