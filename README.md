@@ -6,30 +6,6 @@
 
 FrankenTorch is a clean-room Rust reimplementation targeting grand-scope excellence: semantic fidelity, mathematical rigor, operational safety, and profile-proven performance.
 
-## Registry release preparation for franken_whisper #17
-
-The next kernel publications use distinct versions: `frankentorch-core`
-**0.1.1**, `frankentorch-kernel-cpu` **0.1.2**, and `ft-kernel-metal`
-**0.1.1**. These manifests retain the implementation at `39b90cf7`, including
-the October 10 Metal command-buffer status checks, bounded retry, output
-preservation on failure, and test-only fault injection. Version preparation
-does not mean these packages have been published.
-
-Publish core first, then CPU; Metal is independent. Before publication run
-`cargo test -j2 -p frankentorch-core -p frankentorch-kernel-cpu --lib` and
-`cargo package -p frankentorch-core`. After core is available in the registry,
-run `cargo package -p frankentorch-kernel-cpu` without `--no-verify`.
-On an Apple Silicon host also run `cargo test -j2 -p ft-kernel-metal` and
-`cargo package -p ft-kernel-metal`. Linux tests exercise only the Metal stub
-and cannot establish GPU failure/recovery behavior.
-
-The workspace's `block` git patch is not shipped in dependent crates. Registry
-qualification must run in an extracted package outside this workspace to
-detect any reliance on that patch. franken_whisper's registry release gate
-checks the exact source fingerprints of the resolved kernels and runs its
-conformance fixtures, including the optional JAX oracle. Keep issue #17 open
-until actual publications and that gate pass on Linux and macOS.
-
 ## Absolute Parity Doctrine
 
 FrankenTorch is not a partial rewrite. The target is a true drop-in replacement with complete feature and functionality overlap with upstream PyTorch observable behavior.
@@ -167,6 +143,30 @@ For agent-heavy or shared-host workflows, prefer offloading these commands with 
 - [docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md](docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md)
 
 These docs (now under `docs/planning/`, not the repo root) are the canonical porting-to-rust workflow for this repo.
+
+## Registry release preparation for franken_whisper #17
+
+The next kernel publications use distinct versions: `frankentorch-core`
+**0.1.1**, `frankentorch-kernel-cpu` **0.1.2**, and `ft-kernel-metal`
+**0.1.1**. These manifests retain the implementation at `39b90cf7`, including
+the October 10 Metal command-buffer status checks, bounded retry, output
+preservation on failure, and test-only fault injection. Version preparation
+does not mean these packages have been published.
+
+Publish core first, then CPU; Metal is independent. Before publication run
+`cargo test -j2 -p frankentorch-core -p frankentorch-kernel-cpu --lib` and
+`cargo package -p frankentorch-core`. After core is available in the registry,
+run `cargo package -p frankentorch-kernel-cpu` without `--no-verify`.
+On an Apple Silicon host also run `cargo test -j2 -p ft-kernel-metal` and
+`cargo package -p ft-kernel-metal`. Linux tests exercise only the Metal stub
+and cannot establish GPU failure/recovery behavior.
+
+The workspace's `block` git patch is not shipped in dependent crates. Registry
+qualification must run in an extracted package outside this workspace to
+detect any reliance on that patch. franken_whisper's registry release gate
+checks the exact source fingerprints of the resolved kernels and runs its
+conformance fixtures, including the optional JAX oracle. Keep issue #17 open
+until actual publications and that gate pass on Linux and macOS.
 
 ## License
 
