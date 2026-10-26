@@ -16950,6 +16950,183 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Soft-target (distillation) cross-entropy from teacher *logits*: per sample
+    /// `loss_i = -Σ_c p[i, c] · log_softmax(student_logits)[i, c]` with
+    /// `p = softmax(teacher_logits)`, both `[N, C]`, then reduced like
+    /// [`Self::tensor_cross_entropy_soft`].
+    ///
+    /// The value equals `tensor_cross_entropy_soft(student_logits, softmax(teacher_logits))`.
+    /// The student gradient does not: through `log_softmax` it is `q - p` with
+    /// `q = softmax(student_logits)`, a difference of two separately rounded vectors,
+    /// which is not 0 when the logits are equal and loses most of its digits when they
+    /// are close ("softmax cancellation", Barron, Gnanapragasam and Tschannen, *A Fix
+    /// for Softmax and Cross-Entropy*). Following that paper, it is computed here in f64
+    /// from the logit difference `δ = student - teacher` and swapped in with `detach`:
+    /// `loss + Σ g · (student - detach(student))`. So it is exactly 0 for equal logits
+    /// and keeps its relative precision near them. A KL-divergence distillation loss
+    /// differs from this one only by the teacher's entropy, so it has the same student
+    /// gradient. The teacher gradient is the plain one, through `p`. Only the first
+    /// derivative is rewritten: a `create_graph` second derivative with respect to the
+    /// student logits comes out as 0, so use `tensor_cross_entropy_soft` for Hessians.
+    /// Logits must be `f32` or `f64`, both of the same dtype.
+    pub fn tensor_soft_target_cross_entropy(
+        &mut self,
+        student_logits: TensorNodeId,
+        teacher_logits: TensorNodeId,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let student = self.maybe_autocast_fp32(student_logits)?;
+        let teacher = self.maybe_autocast_fp32(teacher_logits)?;
+        if !matches!(reduction, "none" | "mean" | "sum") {
+            return Err(Self::incompatible_tensor_args(
+                "soft_target_cross_entropy: reduction must be 'none', 'mean', or 'sum'",
+            ));
+        }
+        let shape = self.tensor_shape(student)?;
+        if shape.len() != 2 || self.tensor_shape(teacher)? != shape {
+            return Err(Self::incompatible_tensor_args(
+                "soft_target_cross_entropy: student and teacher logits must both be [N, C]",
+            ));
+        }
+        let dtype = self.tensor_dtype(student)?;
+        if !matches!(dtype, DType::F64 | DType::F32) || self.tensor_dtype(teacher)? != dtype {
+            return Err(Self::incompatible_tensor_args(
+                "soft_target_cross_entropy: logits must both be f32 or both be f64",
+            ));
+        }
+        let (n, c) = (shape[0], shape[1]);
+
+        // Value: -Σ p · log q, with the student's gradient path cut.
+        let log_q = self.tensor_log_softmax(student, 1)?;
+        let log_q = self.tensor_detach(log_q)?;
+        let p = self.tensor_softmax(teacher, 1)?;
+        let prod = self.tensor_mul(p, log_q)?;
+        let summed = self.tensor_sum_dim(prod, 1)?;
+        let summed = self.tensor_reshape(summed, vec![n])?;
+        let loss = self.tensor_neg(summed)?;
+        let per_sample = if self.tensor_requires_grad(student)? {
+            self.soft_target_student_term(student, teacher, loss, n, c, dtype)?
+        } else {
+            loss
+        };
+        match reduction {
+            "none" => Ok(per_sample),
+            "sum" => self.tensor_sum(per_sample),
+            _ => self.tensor_mean(per_sample),
+        }
+    }
+
+    /// `loss + Σ_c g · (student - detach(student))`: the value of `loss`, with the student
+    /// gradient `g` of [`Self::tensor_soft_target_cross_entropy`].
+    fn soft_target_student_term(
+        &mut self,
+        student: TensorNodeId,
+        teacher: TensorNodeId,
+        loss: TensorNodeId,
+        n: usize,
+        c: usize,
+        dtype: DType,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = vec![n, c];
+        // Σ g · (student - detach(student)) is 0 with gradient g. A non-finite logit
+        // would make the difference NaN, so it is masked to 0.
+        let g = Self::soft_target_student_gradient(
+            &self.tensor_values_lossy_f64(student)?,
+            &self.tensor_values_lossy_f64(teacher)?,
+            c,
+        );
+        let device = self.tensor_device(student)?;
+        let g = if dtype == DType::F32 {
+            DenseTensor::from_contiguous_values_f32(
+                g.iter().map(|&v| v as f32).collect(),
+                shape,
+                device,
+            )?
+        } else {
+            DenseTensor::from_contiguous_values(g, shape, device)?
+        };
+        let g = self.tensor_tape.leaf_tensor(g, false);
+        let detached = self.tensor_detach(student)?;
+        let offset = self.tensor_sub(student, detached)?;
+        let finite = self.tensor_isfinite(student)?;
+        let zeros = self.zeros_like(student, false)?;
+        let offset = self.tensor_where(finite, offset, zeros)?;
+        let linear = self.tensor_mul(g, offset)?;
+        let linear = self.tensor_sum_dim(linear, 1)?;
+        let linear = self.tensor_reshape(linear, vec![n])?;
+        self.tensor_add(loss, linear)
+    }
+
+    /// `d/d student` of `-Σ_c softmax(teacher)_c · log_softmax(student)_c` per row of the
+    /// row-major `[N, cols]` logits, i.e. `q - p`, computed from the logit difference so
+    /// that it does not cancel (Barron, Gnanapragasam and Tschannen):
+    ///
+    /// ```text
+    /// δ = student - teacher,   d = δ - Σ_i p_i δ_i,   s = d - log1p(Σ_i p_i expm1(d_i))
+    /// u = p · expm1(s)   (= q - p, as s = log(q / p)),   g = u - q · Σ_i u_i
+    /// ```
+    ///
+    /// `δ` is first shifted by its value at the teacher's argmax, which is exact when the
+    /// logits differ by a common offset (softmax ignores it, but `Σ p δ` would round it
+    /// into `d`). An entry with `|s| > 1`, where `q` and `p` differ by more than a factor
+    /// `e` and `q - p` does not cancel, or with a non-finite `s` (an underflowed `p`, an
+    /// infinite logit) uses `q - p` directly.
+    fn soft_target_student_gradient(student: &[f64], teacher: &[f64], cols: usize) -> Vec<f64> {
+        fn softmax_row(z: &[f64]) -> Vec<f64> {
+            let max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = z.iter().map(|&v| (v - max).exp()).collect();
+            let sum: f64 = e.iter().sum();
+            e.iter().map(|&v| v / sum).collect()
+        }
+        let mut grad = vec![0.0; student.len()];
+        if cols == 0 {
+            return grad;
+        }
+        for ((zs, zt), out) in student
+            .chunks_exact(cols)
+            .zip(teacher.chunks_exact(cols))
+            .zip(grad.chunks_exact_mut(cols))
+        {
+            let q = softmax_row(zs);
+            let p = softmax_row(zt);
+            let mut teacher_max = 0;
+            for (k, &v) in zt.iter().enumerate() {
+                if v > zt[teacher_max] {
+                    teacher_max = k;
+                }
+            }
+            let delta_ref = zs[teacher_max] - zt[teacher_max];
+            let delta: Vec<f64> = zs
+                .iter()
+                .zip(zt)
+                .map(|(&a, &b)| (a - b) - delta_ref)
+                .collect();
+            let mean: f64 = p.iter().zip(&delta).map(|(&pi, &di)| pi * di).sum();
+            let d: Vec<f64> = delta.iter().map(|&di| di - mean).collect();
+            let log_norm = p
+                .iter()
+                .zip(&d)
+                .map(|(&pi, &di)| pi * di.exp_m1())
+                .sum::<f64>()
+                .ln_1p();
+            let u: Vec<f64> = (0..cols)
+                .map(|k| {
+                    let s = d[k] - log_norm;
+                    if s.abs() <= 1.0 {
+                        p[k] * s.exp_m1()
+                    } else {
+                        q[k] - p[k]
+                    }
+                })
+                .collect();
+            let u_sum: f64 = u.iter().sum();
+            for (k, slot) in out.iter_mut().enumerate() {
+                *slot = u[k] - q[k] * u_sum;
+            }
+        }
+        grad
+    }
+
     pub fn tensor_cross_entropy(
         &mut self,
         input: TensorNodeId,
@@ -63947,11 +64124,24 @@ impl FrankenTorchSession {
         let temp_tensor = self.full(vec![1], temperature, false)?;
         let student_scaled = self.tensor_div(student_logits, temp_tensor)?;
         let teacher_scaled = self.tensor_div(teacher_logits, temp_tensor)?;
-        let student_log_soft = self.tensor_log_softmax(student_scaled, 1)?;
-        let teacher_soft = self.tensor_softmax(teacher_scaled, 1)?;
-        let kl_elem = self.tensor_mul(teacher_soft, student_log_soft)?;
-        let neg_kl_elem = self.tensor_neg(kl_elem)?;
-        let soft_loss = self.tensor_mean(neg_kl_elem)?;
+        // Mean over all N*C elements of -softmax(teacher) * log_softmax(student). For
+        // f32/f64 logits the student gradient is computed without softmax cancellation.
+        let scaled_dtype = self.tensor_dtype(student_scaled)?;
+        let soft_loss = if matches!(scaled_dtype, DType::F32 | DType::F64)
+            && self.tensor_dtype(teacher_scaled)? == scaled_dtype
+        {
+            let soft_sum =
+                self.tensor_soft_target_cross_entropy(student_scaled, teacher_scaled, "sum")?;
+            let elements =
+                self.full(vec![1], (student_shape[0] * student_shape[1]) as f64, false)?;
+            self.tensor_div(soft_sum, elements)?
+        } else {
+            let student_log_soft = self.tensor_log_softmax(student_scaled, 1)?;
+            let teacher_soft = self.tensor_softmax(teacher_scaled, 1)?;
+            let kl_elem = self.tensor_mul(teacher_soft, student_log_soft)?;
+            let neg_kl_elem = self.tensor_neg(kl_elem)?;
+            self.tensor_mean(neg_kl_elem)?
+        };
         let t_sq = self.full(vec![1], temperature * temperature, false)?;
         let soft_loss_scaled = self.tensor_mul(soft_loss, t_sq)?;
         let hard_loss = self.tensor_cross_entropy(student_logits, labels, "mean")?;
@@ -107800,6 +107990,249 @@ mod tests {
                 grad[i]
             );
         }
+    }
+
+    /// Per-sample loss and the student and teacher gradients of soft-target cross-entropy,
+    /// either through `tensor_soft_target_cross_entropy` or through the plain composition
+    /// `tensor_cross_entropy_soft(student, softmax(teacher))`.
+    fn soft_target_loss_and_grads(
+        dtype: DType,
+        shape: [usize; 2],
+        student: &[f64],
+        teacher: &[f64],
+        plain: bool,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let leaf = |s: &mut FrankenTorchSession, values: &[f64]| {
+            if dtype == DType::F32 {
+                let values = values.iter().map(|&v| v as f32).collect();
+                s.tensor_variable_f32(values, shape.to_vec(), true)
+            } else {
+                s.tensor_variable(values.to_vec(), shape.to_vec(), true)
+            }
+            .unwrap()
+        };
+        let zs = leaf(&mut s, student);
+        let zt = leaf(&mut s, teacher);
+        let per_sample = if plain {
+            let p = s.tensor_softmax(zt, 1).unwrap();
+            s.tensor_cross_entropy_soft(zs, p, "none").unwrap()
+        } else {
+            s.tensor_soft_target_cross_entropy(zs, zt, "none").unwrap()
+        };
+        let loss = s.tensor_values_lossy_f64(per_sample).unwrap();
+        let total = s.tensor_sum(per_sample).unwrap();
+        let report = s.tensor_backward(total).unwrap();
+        let g_student = s.tensor_gradient(&report, zs).unwrap().to_vec();
+        let g_teacher = s.tensor_gradient(&report, zt).unwrap().to_vec();
+        (loss, g_student, g_teacher)
+    }
+
+    fn assert_close_to(what: &str, got: &[f64], want: &[f64], tol: impl Fn(f64) -> f64) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (k, (&a, &b)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (a - b).abs() <= tol(b),
+                "{what}[{k}]: got {a:e}, want {b:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_target_cross_entropy_avoids_softmax_cancellation() {
+        // Regression for frankentorch#8 ("softmax cancellation"). Through the plain
+        // composition the student gradient q - p was ~1e-8 (f32) / ~1e-17 (f64) for equal
+        // logits and lost most of its digits for nearly equal ones. References: q - p in
+        // 80-digit arithmetic from the (rounded) logits below.
+        let teacher = [2.0, 1.0, 0.0];
+        let f32_ulp = 2f64.powi(-23);
+        let cases: [(DType, [f64; 3], [f64; 3], f64); 7] = [
+            (DType::F32, teacher, [0.0; 3], 0.0),
+            (DType::F64, teacher, [0.0; 3], 0.0),
+            // A common offset changes nothing (softmax ignores it).
+            (DType::F32, [12.0, 11.0, 10.0], [0.0; 3], 0.0),
+            (DType::F64, [12.0, 11.0, 10.0], [0.0; 3], 0.0),
+            // The issue's f32 example: one ulp below 2 and above 1.
+            (
+                DType::F32,
+                [2.0 - f32_ulp, 1.0 + f32_ulp, 0.0],
+                [
+                    -4.595_504_334_917_698e-8,
+                    4.144_190_159_319_526_5e-8,
+                    4.513_141_755_981_719e-9,
+                ],
+                1e-6,
+            ),
+            // The same in f64, and with a common offset added.
+            (
+                DType::F64,
+                [2.0 - 2f64.powi(-51), 1.0 + 2f64.powi(-51), 0.0],
+                [
+                    -1.711_958_701_575_379_4e-16,
+                    1.543_831_056_326_642e-16,
+                    1.681_276_452_487_373_7e-17,
+                ],
+                1e-12,
+            ),
+            (
+                DType::F64,
+                [12.0 - 2f64.powi(-49), 11.0 + 2f64.powi(-49), 10.0],
+                [
+                    -6.847_834_806_301_521e-16,
+                    6.175_324_225_306_572e-16,
+                    6.725_105_809_949_488e-17,
+                ],
+                1e-12,
+            ),
+        ];
+        for (dtype, student, want, rel) in cases {
+            let (loss, g_student, g_teacher) =
+                soft_target_loss_and_grads(dtype, [1, 3], &student, &teacher, false);
+            let what = format!("{dtype:?} student {student:?}");
+            if rel == 0.0 {
+                assert_eq!(g_student, want, "{what}: gradient must be exactly 0");
+            } else {
+                assert_close_to(&what, &g_student, &want, |b| rel * b.abs());
+            }
+            // Same loss and teacher gradient as the plain composition.
+            let (plain_loss, _, plain_g_teacher) =
+                soft_target_loss_and_grads(dtype, [1, 3], &student, &teacher, true);
+            assert_eq!(loss, plain_loss, "{what}: loss");
+            assert_close_to(
+                &format!("{what} teacher grad"),
+                &g_teacher,
+                &plain_g_teacher,
+                |b| 1e-12 * b.abs().max(1e-300),
+            );
+        }
+    }
+
+    #[test]
+    fn soft_target_cross_entropy_matches_plain_gradient_away_from_cancellation() {
+        // Where q - p does not cancel, the rewritten gradient agrees with the plain
+        // composition. Rows: unrelated logits, a confident teacher, a student far from the
+        // teacher, a shared offset with a large difference, a tie, and teachers so confident
+        // that p underflows (in f32 for row 6, in f64 too for row 7), where the paper's
+        // p · expm1(s) alone would overflow or lose its digits.
+        let teacher: [f64; 21] = [
+            0.3, -1.2, 2.0, //
+            8.0, 0.0, -3.0, //
+            0.0, 0.0, 0.0, //
+            1.0, 2.0, 3.0, //
+            1.5, 1.5, -0.5, //
+            0.0, -100.0, -100.0, //
+            0.0, -800.0, -800.0,
+        ];
+        let student: [f64; 21] = [
+            -0.7, 0.4, 1.1, //
+            1.0, 0.5, 0.0, //
+            5.0, -5.0, 0.0, //
+            41.0, 40.0, 42.5, //
+            1.5, 0.5, 1.5, //
+            0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0,
+        ];
+        for (dtype, tol) in [(DType::F64, 1e-13), (DType::F32, 1e-6)] {
+            let (loss, g, g_teacher) =
+                soft_target_loss_and_grads(dtype, [7, 3], &student, &teacher, false);
+            let (plain_loss, plain_g, plain_g_teacher) =
+                soft_target_loss_and_grads(dtype, [7, 3], &student, &teacher, true);
+            assert_eq!(loss, plain_loss, "{dtype:?} loss");
+            assert_close_to(&format!("{dtype:?} student grad"), &g, &plain_g, |b| {
+                tol * b.abs().max(1.0)
+            });
+            assert_close_to(
+                &format!("{dtype:?} teacher grad"),
+                &g_teacher,
+                &plain_g_teacher,
+                |b| tol * b.abs().max(1.0),
+            );
+            for row in g.chunks(3) {
+                let sum: f64 = row.iter().sum();
+                assert!(sum.abs() <= tol, "{dtype:?}: row {row:?} sums to {sum:e}");
+            }
+        }
+
+        // Reductions agree with the per-sample loss.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (per_sample, _, _) =
+            soft_target_loss_and_grads(DType::F64, [7, 3], &student, &teacher, false);
+        let total: f64 = per_sample.iter().sum();
+        for (reduction, want) in [("sum", total), ("mean", total / 7.0)] {
+            let zs = s
+                .tensor_variable(student.to_vec(), vec![7, 3], false)
+                .unwrap();
+            let zt = s
+                .tensor_variable(teacher.to_vec(), vec![7, 3], false)
+                .unwrap();
+            let out = s
+                .tensor_soft_target_cross_entropy(zs, zt, reduction)
+                .unwrap();
+            let got = s.tensor_values_lossy_f64(out).unwrap();
+            assert_eq!(got.len(), 1, "{reduction}");
+            assert!((got[0] - want).abs() <= 1e-12 * want.abs(), "{reduction}");
+        }
+        let zs = s
+            .tensor_variable(student.to_vec(), vec![7, 3], false)
+            .unwrap();
+        let zt = s
+            .tensor_variable(teacher[..18].to_vec(), vec![6, 3], false)
+            .unwrap();
+        assert!(s.tensor_soft_target_cross_entropy(zs, zt, "sum").is_err());
+    }
+
+    #[test]
+    fn distillation_loss_soft_term_avoids_softmax_cancellation() {
+        // distillation_loss routes its soft term through tensor_soft_target_cross_entropy:
+        // same value as before, and an exactly zero student gradient for a student that
+        // matches its teacher (alpha = 1 drops the hard-label term).
+        let logits = [2.0, 1.0, 0.0, -0.5, 0.25, 3.0];
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let zs = s
+            .tensor_variable(logits.to_vec(), vec![2, 3], true)
+            .unwrap();
+        let zt = s
+            .tensor_variable(logits.to_vec(), vec![2, 3], false)
+            .unwrap();
+        let labels = s.tensor_variable(vec![0.0, 2.0], vec![2], false).unwrap();
+        let loss = s.distillation_loss(zs, zt, labels, 4.0, 1.0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert_eq!(s.tensor_gradient(&report, zs).unwrap(), [0.0; 6]);
+
+        // Value: alpha * T^2 * mean over N*C of -softmax(teacher/T) * log_softmax(student/T)
+        // + (1 - alpha) * cross_entropy(student, labels).
+        let (student, teacher) = (
+            [0.3, -1.2, 2.0, 1.0, 0.5, 0.0],
+            [1.0, 0.0, 0.5, 2.0, -1.0, 0.0],
+        );
+        let (t, alpha) = (2.0, 0.75);
+        let mut soft = 0.0;
+        let mut hard = 0.0;
+        for (row, label) in [(0, 0), (1, 2)] {
+            let zs = &student[3 * row..3 * row + 3];
+            let zt = &teacher[3 * row..3 * row + 3];
+            let lse =
+                |z: &[f64], scale: f64| z.iter().map(|&v| (v / scale).exp()).sum::<f64>().ln();
+            let (lse_s, lse_t) = (lse(zs, t), lse(zt, t));
+            for (&a, &b) in zs.iter().zip(zt) {
+                soft -= (b / t - lse_t).exp() * (a / t - lse_s);
+            }
+            hard += lse(zs, 1.0) - zs[label];
+        }
+        let want = alpha * t * t * soft / 6.0 + (1.0 - alpha) * hard / 2.0;
+        let zs = s
+            .tensor_variable(student.to_vec(), vec![2, 3], true)
+            .unwrap();
+        let zt = s
+            .tensor_variable(teacher.to_vec(), vec![2, 3], false)
+            .unwrap();
+        let labels = s.tensor_variable(vec![0.0, 2.0], vec![2], false).unwrap();
+        let loss = s.distillation_loss(zs, zt, labels, t, alpha).unwrap();
+        let got = s.tensor_values_lossy_f64(loss).unwrap()[0];
+        assert!(
+            (got - want).abs() <= 1e-12,
+            "distillation loss {got} vs {want}"
+        );
     }
 
     #[test]
