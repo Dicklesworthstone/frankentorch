@@ -25,6 +25,12 @@ jobs:
     name: G1..G8 gate topology
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    env:
+      # The full workspace links hundreds of examples; debug symbols exhausted
+      # the hosted runner before any tests ran (run 40248944783).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
 
     steps:
       - name: Checkout
