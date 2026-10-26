@@ -1112,6 +1112,8 @@ pub enum GridSamplePaddingMode {
 
 #[derive(Debug, Clone, Copy)]
 struct IstftReconstructPlan<'a> {
+    batches: usize,
+    freq_bins: usize,
     frames: usize,
     n_fft: usize,
     hop_length: usize,
@@ -3085,9 +3087,11 @@ impl FrankenTorchSession {
     /// distributing frames across Rayon is deterministic. The result equals the
     /// dense DFT up to FFT round-off (~ULP) — matching PyTorch, which is also
     /// FFT-based; the DC bin is a pure sum and stays exact. Returns bin-major
-    /// `[freq_bins, frames]` (re, im) pairs in f64.
+    /// `[batch, freq_bins, frames]` (re, im) pairs in f64, with one batch for
+    /// an unbatched signal.
     fn stft_fft_spectrogram(
         all_frames: &[f64],
+        batches: usize,
         frames: usize,
         n_fft: usize,
         freq_bins: usize,
@@ -3116,7 +3120,8 @@ impl FrankenTorchSession {
         };
         let full_tw =
             (!use_real && n_fft.is_power_of_two()).then(|| Self::fft_stage_twiddles(n_fft, false));
-        let mut frame_major = vec![(0.0_f64, 0.0_f64); frames * freq_bins];
+        let total_frames = batches * frames;
+        let mut frame_major = vec![(0.0_f64, 0.0_f64); total_frames * freq_bins];
         let compute = |frame_idx: usize, out_row: &mut [(f64, f64)]| {
             let fbase = frame_idx * n_fft;
             if use_real {
@@ -3142,7 +3147,7 @@ impl FrankenTorchSession {
                 }
             }
         };
-        if frames >= 2 && frames * freq_bins >= PARALLEL_ELEMENTWISE_MIN {
+        if total_frames >= 2 && total_frames * freq_bins >= PARALLEL_ELEMENTWISE_MIN {
             use rayon::prelude::*;
             frame_major
                 .par_chunks_mut(freq_bins)
@@ -3154,22 +3159,26 @@ impl FrankenTorchSession {
                 .enumerate()
                 .for_each(|(frame_idx, row)| compute(frame_idx, row));
         }
-        // Transpose frame-major [frames, freq_bins] -> bin-major [freq_bins, frames].
-        let mut bin_major = vec![(0.0_f64, 0.0_f64); freq_bins * frames];
-        for frame_idx in 0..frames {
-            let fb = frame_idx * freq_bins;
-            for k in 0..freq_bins {
-                bin_major[k * frames + frame_idx] = frame_major[fb + k];
+        // Transpose each batch's [frames, freq_bins] into [freq_bins, frames].
+        let mut bin_major = vec![(0.0_f64, 0.0_f64); total_frames * freq_bins];
+        for batch in 0..batches {
+            for frame_idx in 0..frames {
+                let fb = (batch * frames + frame_idx) * freq_bins;
+                for k in 0..freq_bins {
+                    bin_major[(batch * freq_bins + k) * frames + frame_idx] = frame_major[fb + k];
+                }
             }
         }
         bin_major
     }
 
-    /// Short-time Fourier transform for 1-D real signals.
+    /// Short-time Fourier transform for real signals of shape `[time]` or
+    /// `[batch, time]`, producing `[freq, frames]` or `[batch, freq, frames]`.
     ///
     /// Centered frames use constant zero padding. Both the signal and a real
     /// window support first-order gradients, including overlapping frames and
-    /// windows shorter than `n_fft`.
+    /// windows shorter than `n_fft`. Batched signals share the same window;
+    /// its gradient is summed over the batch.
     pub fn tensor_stft(
         &mut self,
         input: TensorNodeId,
@@ -3185,12 +3194,21 @@ impl FrankenTorchSession {
         }
         let input_tensor = self.tensor_tape.tensor(input)?;
         let input_meta = input_tensor.meta().clone();
-        if input_meta.shape().len() != 1 {
+        let input_shape = input_meta.shape();
+        if !matches!(input_shape.len(), 1 | 2) {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "stft: only 1-D real input is currently supported",
+                    reason: "stft: expected real input with shape [time] or [batch, time]",
                 },
             )));
+        }
+        let batched = input_shape.len() == 2;
+        let batches = if batched { input_shape[0] } else { 1 };
+        let signal_len = input_shape[input_shape.len() - 1];
+        if batches == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "stft: batch dimension must be nonzero",
+            ));
         }
 
         let hop_length = options.hop_length.unwrap_or(n_fft / 4);
@@ -3244,7 +3262,6 @@ impl FrankenTorchSession {
         let requires_grad = self.tensor_tape.is_grad_enabled() && (tracks_input || tracks_window);
 
         let pad = if options.center { n_fft / 2 } else { 0 };
-        let signal_len = signal.len();
         let padded_len = signal_len
             .checked_add(2 * pad)
             .ok_or_else(|| Self::incompatible_tensor_args("stft: padded signal length overflow"))?;
@@ -3253,10 +3270,16 @@ impl FrankenTorchSession {
                 "stft: n_fft exceeds the padded signal length",
             ));
         }
-        let mut padded = vec![0.0; padded_len];
-        padded[pad..pad + signal.len()].copy_from_slice(&signal);
+        let padded_numel =
+            Self::checked_shape_numel(&[batches, padded_len], "stft: padded signal size overflow")?;
+        let mut padded = vec![0.0; padded_numel];
+        for batch in 0..batches {
+            let dst = batch * padded_len + pad;
+            let src = batch * signal_len;
+            padded[dst..dst + signal_len].copy_from_slice(&signal[src..src + signal_len]);
+        }
 
-        let frames = (padded.len() - n_fft) / hop_length + 1;
+        let frames = (padded_len - n_fft) / hop_length + 1;
         let freq_bins = if options.onesided {
             n_fft / 2 + 1
         } else {
@@ -3268,20 +3291,27 @@ impl FrankenTorchSession {
             1.0
         };
         let window_pad = (n_fft - win_length) / 2;
-        let frame_numel = Self::checked_shape_numel(&[frames, n_fft], "stft: frame size overflow")?;
-        Self::checked_shape_numel(&[freq_bins, frames, 2], "stft: output size overflow")?;
+        let frame_numel =
+            Self::checked_shape_numel(&[batches, frames, n_fft], "stft: frame size overflow")?;
+        Self::checked_shape_numel(
+            &[batches, freq_bins, frames, 2],
+            "stft: output size overflow",
+        )?;
         let mut all_frames = vec![0.0_f64; frame_numel];
-        for frame_idx in 0..frames {
-            let start = frame_idx * hop_length;
-            let fbase = frame_idx * n_fft;
-            for i in 0..win_length {
-                // The window is centered inside the FFT frame; the signal is
-                // not shifted when the window is shorter than that frame.
-                let frame_pos = window_pad + i;
-                all_frames[fbase + frame_pos] = padded[start + frame_pos] * window_values[i];
+        for batch in 0..batches {
+            for frame_idx in 0..frames {
+                let start = batch * padded_len + frame_idx * hop_length;
+                let fbase = (batch * frames + frame_idx) * n_fft;
+                for i in 0..win_length {
+                    // The window is centered inside the FFT frame; the signal is
+                    // not shifted when the window is shorter than that frame.
+                    let frame_pos = window_pad + i;
+                    all_frames[fbase + frame_pos] = padded[start + frame_pos] * window_values[i];
+                }
             }
         }
-        let bin_major = Self::stft_fft_spectrogram(&all_frames, frames, n_fft, freq_bins, scale);
+        let bin_major =
+            Self::stft_fft_spectrogram(&all_frames, batches, frames, n_fft, freq_bins, scale);
         let storage = if base_dtype == DType::F32 {
             TensorStorage::Complex64(Arc::new(
                 bin_major
@@ -3299,7 +3329,11 @@ impl FrankenTorchSession {
         };
         let output = DenseTensor::from_typed_storage(
             TensorMeta::from_shape(
-                vec![freq_bins, frames],
+                if batched {
+                    vec![batches, freq_bins, frames]
+                } else {
+                    vec![freq_bins, frames]
+                },
                 storage.dtype(),
                 input_meta.device(),
             ),
@@ -3309,7 +3343,7 @@ impl FrankenTorchSession {
             self.tensor_tape
                 .apply_complex_bridge(&inputs, output, move |ctx, grad_outputs| {
                     let needs = ctx.needs_input_grad();
-                    let mut grad_signal = needs[0].then(|| vec![0.0; signal_len]);
+                    let mut grad_signal = needs[0].then(|| vec![0.0; batches * signal_len]);
                     let mut grad_window = needs
                         .get(1)
                         .copied()
@@ -3318,13 +3352,15 @@ impl FrankenTorchSession {
                     let inverse_twiddles = n_fft
                         .is_power_of_two()
                         .then(|| Self::fft_stage_twiddles(n_fft, true));
-                    for frame in 0..frames {
+                    for batch_frame in 0..batches * frames {
+                        let batch = batch_frame / frames;
+                        let frame = batch_frame % frames;
                         // rFFT's adjoint zero-fills omitted bins, without
                         // Hermitian doubling: each stored bin has one cotangent.
                         let mut re = vec![0.0; n_fft];
                         let mut im = vec![0.0; n_fft];
                         for k in 0..freq_bins {
-                            let index = 2 * (k * frames + frame);
+                            let index = 2 * ((batch * freq_bins + k) * frames + frame);
                             re[k] = grad_outputs[0][index];
                             im[k] = grad_outputs[0][index + 1];
                         }
@@ -3342,10 +3378,11 @@ impl FrankenTorchSession {
                                 && position >= pad
                                 && position - pad < signal_len
                             {
-                                grad[position - pad] += incoming * window_values[i];
+                                grad[batch * signal_len + position - pad] +=
+                                    incoming * window_values[i];
                             }
                             if let Some(grad) = &mut grad_window {
-                                grad[i] += incoming * padded[position];
+                                grad[i] += incoming * padded[batch * padded_len + position];
                             }
                         }
                     }
@@ -3382,12 +3419,14 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
-    /// Inverse short-time Fourier transform for 2-D complex spectrograms.
+    /// Inverse short-time Fourier transform for complex spectrograms of shape
+    /// `[freq, frames]` or `[batch, freq, frames]`.
     ///
     /// Returns a real signal and supports first-order gradients with respect to
     /// the spectrum and window. A full spectrum uses its nonnegative-frequency
     /// half, matching a real inverse FFT. Windows must satisfy nonzero overlap
-    /// add over the requested reconstructed samples.
+    /// add over the requested reconstructed samples. Batched input produces
+    /// `[batch, time]`, with shared-window gradients summed over the batch.
     pub fn tensor_istft(
         &mut self,
         input: TensorNodeId,
@@ -3403,12 +3442,20 @@ impl FrankenTorchSession {
         }
         let input_tensor = self.tensor_tape.tensor(input)?;
         let input_meta = input_tensor.meta().clone();
-        if input_meta.shape().len() != 2 {
+        let shape = input_meta.shape();
+        if !matches!(shape.len(), 2 | 3) {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "istft: only 2-D spectrogram input [freq, frames] is currently supported",
+                    reason: "istft: expected complex input with shape [freq, frames] or [batch, freq, frames]",
                 },
             )));
+        }
+        let batched = shape.len() == 3;
+        let batches = if batched { shape[0] } else { 1 };
+        if batches == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "istft: batch dimension must be nonzero",
+            ));
         }
 
         let hop_length = options.hop_length.unwrap_or(n_fft / 4);
@@ -3428,8 +3475,7 @@ impl FrankenTorchSession {
         let window_values = self.stft_window_values(options.window, win_length)?;
         let window_pad = (n_fft - win_length) / 2;
 
-        let shape = input_meta.shape().to_vec();
-        let (freq_bins, frames) = (shape[0], shape[1]);
+        let (freq_bins, frames) = (shape[shape.len() - 2], shape[shape.len() - 1]);
         if frames == 0 {
             return Err(Self::incompatible_tensor_args(
                 "istft: spectrogram must contain at least one frame",
@@ -3447,6 +3493,10 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        let spectrum_grad_len = Self::checked_shape_numel(
+            &[batches, freq_bins, frames, 2],
+            "istft: spectrum gradient size overflow",
+        )?;
 
         let (spectrogram, mut output_dtype) = match input_meta.dtype() {
             DType::Complex64 => (
@@ -3488,6 +3538,8 @@ impl FrankenTorchSession {
         let requires_grad = self.tensor_tape.is_grad_enabled() && (tracks_input || tracks_window);
         let needs_window = tracks_window && requires_grad;
         let plan = IstftReconstructPlan {
+            batches,
+            freq_bins,
             frames,
             n_fft,
             hop_length,
@@ -3513,21 +3565,29 @@ impl FrankenTorchSession {
         } else {
             Vec::new()
         };
-        let out_len = samples.len();
+        let out_len = samples.len() / batches;
         let storage = if output_dtype == DType::F32 {
             TensorStorage::F32(Arc::new(samples.into_iter().map(|v| v as f32).collect()))
         } else {
             TensorStorage::F64(Arc::new(samples))
         };
         let output = DenseTensor::from_typed_storage(
-            TensorMeta::from_shape(vec![out_len], output_dtype, input_meta.device()),
+            TensorMeta::from_shape(
+                if batched {
+                    vec![batches, out_len]
+                } else {
+                    vec![out_len]
+                },
+                output_dtype,
+                input_meta.device(),
+            ),
             storage,
         )?;
         let out = if requires_grad {
             self.tensor_tape
                 .apply_complex_bridge(&inputs, output, move |ctx, grad_outputs| {
                     let needs = ctx.needs_input_grad();
-                    let mut grad_spectrum = needs[0].then(|| vec![0.0; 2 * freq_bins * frames]);
+                    let mut grad_spectrum = needs[0].then(|| vec![0.0; spectrum_grad_len]);
                     let mut grad_window = needs_window.then(|| vec![0.0; win_length]);
                     let forward_twiddles = n_fft
                         .is_power_of_two()
@@ -3537,7 +3597,9 @@ impl FrankenTorchSession {
                     } else {
                         1.0 / n_fft as f64
                     };
-                    for frame in 0..frames {
+                    for batch_frame in 0..batches * frames {
+                        let batch = batch_frame / frames;
+                        let frame = batch_frame % frames;
                         let mut re = vec![0.0; n_fft];
                         let mut im = vec![0.0; n_fft];
                         for i in 0..win_length {
@@ -3546,14 +3608,14 @@ impl FrankenTorchSession {
                             if position < trim_start || position - trim_start >= out_len {
                                 continue;
                             }
-                            let out_index = position - trim_start;
+                            let out_index = batch * out_len + position - trim_start;
                             let incoming = grad_outputs[0][out_index] / envelope[position];
                             re[frame_pos] = incoming * window_values[i];
                             if let Some(grad) = &mut grad_window {
                                 // Differentiate BOTH overlap-add and its window
                                 // squared normalization: y = sum(u*w) / sum(w*w).
                                 grad[i] += incoming
-                                    * (frame_times[frame * n_fft + frame_pos]
+                                    * (frame_times[batch_frame * n_fft + frame_pos]
                                         - 2.0 * window_values[i] * saved_samples[out_index]);
                             }
                         }
@@ -3568,7 +3630,7 @@ impl FrankenTorchSession {
                                 let endpoint =
                                     k == 0 || (n_fft.is_multiple_of(2) && k == n_fft / 2);
                                 let factor = scale * if endpoint { 1.0 } else { 2.0 };
-                                let index = 2 * (k * frames + frame);
+                                let index = 2 * ((batch * freq_bins + k) * frames + frame);
                                 grad[index] = factor * re[k];
                                 grad[index + 1] = if endpoint { 0.0 } else { factor * im[k] };
                             }
@@ -48673,9 +48735,15 @@ impl FrankenTorchSession {
             .checked_mul(plan.frames - 1)
             .and_then(|tail| plan.n_fft.checked_add(tail))
             .ok_or_else(|| Self::incompatible_tensor_args("istft: output length overflow"))?;
-        let frame_numel =
-            Self::checked_shape_numel(&[plan.frames, plan.n_fft], "istft: frame size overflow")?;
-        let mut signal = vec![0.0; output_len];
+        let frame_numel = Self::checked_shape_numel(
+            &[plan.batches, plan.frames, plan.n_fft],
+            "istft: frame size overflow",
+        )?;
+        let signal_numel = Self::checked_shape_numel(
+            &[plan.batches, output_len],
+            "istft: reconstructed signal size overflow",
+        )?;
+        let mut signal = vec![0.0; signal_numel];
         let mut envelope = vec![0.0; output_len];
         let scale = if plan.normalized {
             1.0 / (plan.n_fft as f64).sqrt()
@@ -48701,7 +48769,9 @@ impl FrankenTorchSession {
         // into `signal`/`envelope` (a reduction over overlapping regions) stays
         // bit-for-bit identical to the original interleaved loop.
         let mut frame_times = vec![0.0_f64; frame_numel];
-        let compute_frame = |frame_idx: usize, ft_slice: &mut [f64]| {
+        let compute_frame = |batch_frame: usize, ft_slice: &mut [f64]| {
+            let batch = batch_frame / plan.frames;
+            let frame_idx = batch_frame % plan.frames;
             // Reconstruct the full Hermitian spectrum into re/im buffers.
             let mut re = vec![0.0_f64; plan.n_fft];
             let mut im = vec![0.0_f64; plan.n_fft];
@@ -48709,7 +48779,7 @@ impl FrankenTorchSession {
             // all frequencies, the redundant negative half is ignored, just
             // as in torch.istft(return_complex=False).
             for k in 0..=plan.n_fft / 2 {
-                let c = spectrogram[k * plan.frames + frame_idx];
+                let c = spectrogram[(batch * plan.freq_bins + k) * plan.frames + frame_idx];
                 re[k] = c.re;
                 im[k] = if k == 0 || (plan.n_fft.is_multiple_of(2) && k == plan.n_fft / 2) {
                     0.0
@@ -48732,7 +48802,7 @@ impl FrankenTorchSession {
                 *sample = re[n] * fft_post_scale;
             }
         };
-        if plan.frames >= 2 && plan.frames * plan.n_fft >= PARALLEL_ELEMENTWISE_MIN {
+        if plan.batches * plan.frames >= 2 && frame_numel >= PARALLEL_ELEMENTWISE_MIN {
             use rayon::prelude::*;
             frame_times
                 .par_chunks_mut(plan.n_fft)
@@ -48745,14 +48815,20 @@ impl FrankenTorchSession {
                 .for_each(|(frame_idx, ft_slice)| compute_frame(frame_idx, ft_slice));
         }
 
-        for frame_idx in 0..plan.frames {
+        for batch_frame in 0..plan.batches * plan.frames {
+            let batch = batch_frame / plan.frames;
+            let frame_idx = batch_frame % plan.frames;
             let start = frame_idx * plan.hop_length;
-            let frame_time = &frame_times[frame_idx * plan.n_fft..(frame_idx + 1) * plan.n_fft];
+            let frame_time = &frame_times[batch_frame * plan.n_fft..(batch_frame + 1) * plan.n_fft];
             for i in 0..plan.window_values.len() {
                 let sample = frame_time[plan.window_pad + i] * plan.window_values[i];
                 let position = start + plan.window_pad + i;
-                signal[position] += sample;
-                envelope[position] += plan.window_values[i] * plan.window_values[i];
+                signal[batch * output_len + position] += sample;
+                if batch == 0 {
+                    // The shared window defines one envelope, independent of
+                    // the number of signals in the batch.
+                    envelope[position] += plan.window_values[i] * plan.window_values[i];
+                }
             }
         }
 
@@ -48778,16 +48854,22 @@ impl FrankenTorchSession {
                 "istft: window overlap add envelope is zero over reconstructed samples",
             ));
         }
-        for position in trim_start..copied_end {
-            signal[position] /= envelope[position];
-        }
         // An explicit length retains the available right-side samples before
         // padding; trimming both sides first would discard valid tail samples.
-        signal.copy_within(trim_start..copied_end, 0);
-        signal.truncate(copied_end - trim_start);
-        signal.resize(requested_end - trim_start, 0.0);
+        let samples_per_batch = requested_end - trim_start;
+        let samples_numel = Self::checked_shape_numel(
+            &[plan.batches, samples_per_batch],
+            "istft: requested output size overflow",
+        )?;
+        let mut samples = vec![0.0; samples_numel];
+        for batch in 0..plan.batches {
+            for position in trim_start..copied_end {
+                samples[batch * samples_per_batch + position - trim_start] =
+                    signal[batch * output_len + position] / envelope[position];
+            }
+        }
         Ok(IstftReconstruction {
-            samples: signal,
+            samples,
             frame_times,
             envelope,
             trim_start,
@@ -136459,6 +136541,393 @@ mod tests {
     }
 
     #[test]
+    fn spectral_batched_stft_gradients_match_independent_signal_references() {
+        let signal = vec![
+            -0.8, 0.3, 1.2, -0.7, 2.0, 0.4, -0.1, 1.3, 0.9, 0.2, -1.1, 0.7, 1.4, -0.6, 1.8, 0.5,
+            -0.9, -0.3,
+        ];
+        let signal_len = 9;
+        for (n_fft, win_length, center, normalized, onesided) in [
+            (4, 4, false, false, true),
+            (4, 2, true, true, false),
+            (5, 3, false, true, true),
+            (5, 5, true, false, false),
+        ] {
+            let window: Vec<f64> = (0..win_length).map(|i| 0.6 + 0.13 * i as f64).collect();
+            let options = StftOptions {
+                hop_length: Some(2),
+                win_length: Some(win_length),
+                window: None,
+                center,
+                normalized,
+                onesided,
+            };
+            let reference = |signal: &[f64], window: &[f64]| -> Vec<f64> {
+                signal
+                    .chunks_exact(signal_len)
+                    .flat_map(|row| spectral_stft_reference(row, window, n_fft, options))
+                    .collect()
+            };
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s
+                .tensor_variable(signal.clone(), vec![2, signal_len], true)
+                .unwrap();
+            let window_id = s
+                .tensor_variable(window.clone(), vec![win_length], true)
+                .unwrap();
+            let spec = s
+                .tensor_stft(
+                    input,
+                    n_fft,
+                    StftOptions {
+                        window: Some(window_id),
+                        ..options
+                    },
+                )
+                .unwrap();
+            let bins = if onesided { n_fft / 2 + 1 } else { n_fft };
+            let pad = if center { n_fft / 2 } else { 0 };
+            let frames = (signal_len + 2 * pad - n_fft) / 2 + 1;
+            assert_eq!(s.tensor_shape(spec).unwrap(), vec![2, bins, frames]);
+            let packed = s.tensor_view_as_real(spec).unwrap();
+            let expected = reference(&signal, &window);
+            for (actual, expected) in s.tensor_values(packed).unwrap().iter().zip(&expected) {
+                assert!(
+                    (actual - expected).abs() < 1e-10,
+                    "{options:?}: {actual} != {expected}"
+                );
+            }
+            let loss = spectral_energy_node(&mut s, packed);
+            let report = s.tensor_backward(loss).unwrap();
+            for (target, gradient) in [
+                (0, s.tensor_gradient(&report, input).unwrap()),
+                (1, s.tensor_gradient(&report, window_id).unwrap()),
+            ] {
+                let epsilon = 1e-5;
+                for (i, &actual) in gradient.iter().enumerate() {
+                    let mut plus = [signal.clone(), window.clone()];
+                    let mut minus = plus.clone();
+                    plus[target][i] += epsilon;
+                    minus[target][i] -= epsilon;
+                    let expected = (spectral_weighted_energy(&reference(&plus[0], &plus[1]))
+                        - spectral_weighted_energy(&reference(&minus[0], &minus[1])))
+                        / (2.0 * epsilon);
+                    assert!(
+                        (actual - expected).abs() < 1e-7 * (1.0 + expected.abs()),
+                        "{options:?}, target={target}, gradient[{i}]={actual}, finite difference={expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_batched_istft_gradients_match_independent_signal_references() {
+        let frames = 3;
+        for (n_fft, win_length, center, normalized, onesided, length) in [
+            (4, 4, false, false, true, Some(10)),
+            (4, 2, true, true, false, None),
+            (5, 3, true, false, true, Some(6)),
+            (5, 5, true, true, false, None),
+        ] {
+            let bins = if onesided { n_fft / 2 + 1 } else { n_fft };
+            let row_numel = bins * frames;
+            let re: Vec<f64> = (0..2 * row_numel)
+                .map(|i| (0.37 * i as f64).sin())
+                .collect();
+            let im: Vec<f64> = (0..2 * row_numel)
+                .map(|i| (0.29 * i as f64).cos())
+                .collect();
+            let window: Vec<f64> = (0..win_length).map(|i| 0.7 + 0.11 * i as f64).collect();
+            let options = IstftOptions {
+                hop_length: Some(2),
+                win_length: Some(win_length),
+                window: None,
+                center,
+                normalized,
+                onesided,
+                length,
+            };
+            let reference = |re: &[f64], im: &[f64], window: &[f64]| -> Vec<f64> {
+                re.chunks_exact(row_numel)
+                    .zip(im.chunks_exact(row_numel))
+                    .flat_map(|(re, im)| {
+                        spectral_istft_reference(re, im, window, n_fft, frames, options)
+                    })
+                    .collect()
+            };
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let real = s
+                .tensor_variable(re.clone(), vec![2, bins, frames], true)
+                .unwrap();
+            let imag = s
+                .tensor_variable(im.clone(), vec![2, bins, frames], true)
+                .unwrap();
+            let window_id = s
+                .tensor_variable(window.clone(), vec![win_length], true)
+                .unwrap();
+            let spectrum = s.tensor_complex(real, imag).unwrap();
+            let output = s
+                .tensor_istft(
+                    spectrum,
+                    n_fft,
+                    IstftOptions {
+                        window: Some(window_id),
+                        ..options
+                    },
+                )
+                .unwrap();
+            let expected = reference(&re, &im, &window);
+            assert_eq!(s.tensor_shape(output).unwrap(), vec![2, expected.len() / 2]);
+            for (actual, expected) in s.tensor_values(output).unwrap().iter().zip(&expected) {
+                assert!(
+                    (actual - expected).abs() < 1e-11,
+                    "{options:?}: {actual} != {expected}"
+                );
+            }
+            let loss = spectral_energy_node(&mut s, output);
+            let report = s.tensor_backward(loss).unwrap();
+            for (target, gradient) in [
+                (0, s.tensor_gradient(&report, real).unwrap()),
+                (1, s.tensor_gradient(&report, imag).unwrap()),
+                (2, s.tensor_gradient(&report, window_id).unwrap()),
+            ] {
+                let epsilon = 1e-5;
+                for (i, &actual) in gradient.iter().enumerate() {
+                    let mut plus = [re.clone(), im.clone(), window.clone()];
+                    let mut minus = plus.clone();
+                    plus[target][i] += epsilon;
+                    minus[target][i] -= epsilon;
+                    let expected =
+                        (spectral_weighted_energy(&reference(&plus[0], &plus[1], &plus[2]))
+                            - spectral_weighted_energy(&reference(
+                                &minus[0], &minus[1], &minus[2],
+                            )))
+                            / (2.0 * epsilon);
+                    assert!(
+                        (actual - expected).abs() < 1e-7 * (1.0 + expected.abs()),
+                        "{options:?}, target={target}, gradient[{i}]={actual}, finite difference={expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_batched_gradients_match_pytorch_2_14_1_golden() {
+        // Live PyTorch 2.14.1+cpu, float64, deterministic, one CPU thread.
+        // Both transforms use n_fft=4, hop=2, win_length=4, center=True,
+        // normalized=True, onesided=True; STFT uses constant padding and
+        // ISTFT length=6. Nonuniform energy weights span the ENTIRE batch,
+        // so the shared-window derivative must reduce distinct row gradients.
+        let assert_close = |actual: &[f64], expected: &[f64]| {
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-10 * (1.0 + expected.abs()),
+                    "batched oracle[{i}]: actual={actual}, expected={expected}"
+                );
+            }
+        };
+        let window_values = vec![0.5, 0.75, 1.0, 0.625];
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(
+                vec![
+                    -0.5, 0.25, 1.25, -0.75, 2.0, 0.5, 0.5, -1.0, 0.375, 1.5, -0.25, -0.625,
+                ],
+                vec![2, 6],
+                true,
+            )
+            .unwrap();
+        let window = s
+            .tensor_variable(window_values.clone(), vec![4], true)
+            .unwrap();
+        let spectrum = s
+            .tensor_stft(
+                input,
+                4,
+                StftOptions {
+                    hop_length: Some(2),
+                    win_length: Some(4),
+                    window: Some(window),
+                    center: true,
+                    normalized: true,
+                    onesided: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(s.tensor_shape(spectrum).unwrap(), vec![2, 3, 4]);
+        let packed = s.tensor_view_as_real(spectrum).unwrap();
+        assert_close(
+            &s.tensor_values(packed).unwrap(),
+            &[
+                -0.171875, 0.0, 0.359375, 0.0, 1.1875, 0.0, 0.6875, 0.0, 0.25, 0.078125, -0.75,
+                -0.328125, -0.6875, 0.4375, 0.5, -0.1875, -0.328125, 0.0, 0.640625, 0.0, 1.4375,
+                0.0, 0.3125, 0.0, -0.0625, 0.0, 0.40625, 0.0, 0.3359375, 0.0, -0.296875, 0.0,
+                -0.25, -0.3125, -0.0625, 0.84375, 0.21875, -0.7578125, -0.0625, 0.234375, 0.5625,
+                0.0, 0.21875, 0.0, -0.3984375, 0.0, 0.171875, 0.0,
+            ],
+        );
+        let loss = spectral_energy_node(&mut s, packed);
+        let report = s.tensor_backward(loss).unwrap();
+        assert_close(
+            s.tensor_gradient(&report, input).unwrap(),
+            &[
+                -0.52875,
+                -0.06322265625000006,
+                3.081875,
+                -2.45849609375,
+                4.77125,
+                -0.636171875,
+                2.95625,
+                -3.3028125,
+                1.7521875000000002,
+                4.7675195312500005,
+                -1.350625,
+                -1.5733300781249997,
+            ],
+        );
+        assert_close(
+            s.tensor_gradient(&report, window).unwrap(),
+            &[
+                6.937578125000001,
+                11.55642578125,
+                12.66328125,
+                6.848134765625,
+            ],
+        );
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let real = s
+            .tensor_variable(
+                vec![
+                    -0.875, -0.5, -0.125, 0.25, 0.625, 1.0, -0.75, -0.375, 0.0, 0.375, 0.75, -1.0,
+                    -0.625, -0.25, 0.125, 0.5, 0.875, -0.875, -0.5, -0.125, 0.25, 0.625, 1.0,
+                    -0.75,
+                ],
+                vec![2, 3, 4],
+                true,
+            )
+            .unwrap();
+        let imag = s
+            .tensor_variable(
+                vec![
+                    -0.875, -0.25, 0.375, 1.0, -0.75, -0.125, 0.5, 1.125, -0.625, 0.0, 0.625,
+                    -1.125, -0.5, 0.125, 0.75, -1.0, -0.375, 0.25, 0.875, -0.875, -0.25, 0.375,
+                    1.0, -0.75,
+                ],
+                vec![2, 3, 4],
+                true,
+            )
+            .unwrap();
+        let spectrum = s.tensor_complex(real, imag).unwrap();
+        let window = s.tensor_variable(window_values, vec![4], true).unwrap();
+        let output = s
+            .tensor_istft(
+                spectrum,
+                4,
+                IstftOptions {
+                    hop_length: Some(2),
+                    win_length: Some(4),
+                    window: Some(window),
+                    center: true,
+                    normalized: true,
+                    onesided: true,
+                    length: Some(6),
+                },
+            )
+            .unwrap();
+        assert_eq!(s.tensor_shape(output).unwrap(), vec![2, 6]);
+        assert_close(
+            &s.tensor_values(output).unwrap(),
+            &[
+                -0.475,
+                -1.0245901639344261,
+                -1.025,
+                -1.1065573770491803,
+                0.55,
+                -0.3524590163934426,
+                -1.125,
+                -1.0737704918032787,
+                0.875,
+                -1.1557377049180328,
+                0.75,
+                1.4672131147540983,
+            ],
+        );
+        let loss = spectral_energy_node(&mut s, output);
+        let report = s.tensor_backward(loss).unwrap();
+        assert_close(
+            s.tensor_gradient(&report, real).unwrap(),
+            &[
+                -0.3625890889545821,
+                -1.0861687180865358,
+                -0.5195026068261219,
+                -0.05267411986025261,
+                0.22799999999999998,
+                0.6075999999999999,
+                -0.8712,
+                0.25520000000000004,
+                0.13458908895458208,
+                0.2505687180865359,
+                0.6691026068261221,
+                0.30787411986025265,
+                -1.2042483203439935,
+                -1.0943085192152648,
+                1.084681805966138,
+                1.5353453372749262,
+                1.2959999999999998,
+                -1.852,
+                -0.5979999999999999,
+                0.6,
+                -0.09175167965600628,
+                1.650308519215265,
+                0.717318194033862,
+                -0.9353453372749261,
+            ],
+        );
+        assert_close(
+            s.tensor_gradient(&report, imag).unwrap(),
+            &[
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -0.49717817790916413,
+                -0.1435098091910777,
+                0.5876914807847353,
+                0.36054823972050526,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -1.1124966406879873,
+                -0.07462510077936058,
+                3.750454178984145,
+                -2.4706906745498523,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+        );
+        assert_close(
+            s.tensor_gradient(&report, window).unwrap(),
+            &[
+                -4.1547600000000005,
+                -6.74481194461211,
+                -3.5978200000000005,
+                -9.66666425824188,
+            ],
+        );
+    }
+
+    #[test]
     fn linalg_eig_and_eigvals_differentiable_on_requires_grad() {
         // frankentorch-ng1hw: linalg_eigvals (general non-symmetric, complex
         // eigenvalues) is now differentiable (grad_A = Re(V⁻ᴴ diag(grad_λ) Vᴴ),
@@ -164071,24 +164540,233 @@ mod tests {
     }
 
     #[test]
-    fn tensor_stft_rejects_non_1d_input() {
+    fn spectral_batched_and_singleton_roundtrips_preserve_f32_and_grad_mode() {
+        for batches in [1, 2] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let values: Vec<f32> = [
+                1.0, -2.0, 3.0, 0.5, 4.0, -1.0, 2.5, -0.5, 1.5, -2.5, 3.5, 0.25, 0.75, -1.25,
+            ][..batches * 7]
+                .to_vec();
+            let input = s
+                .tensor_variable_f32(values.clone(), vec![batches, 7], true)
+                .unwrap();
+            let window = s
+                .tensor_variable_f32(vec![0.5, 1.0, 0.75, 0.6], vec![4], true)
+                .unwrap();
+            let forward = StftOptions {
+                hop_length: Some(2),
+                window: Some(window),
+                ..StftOptions::default()
+            };
+            let inverse = IstftOptions {
+                hop_length: Some(2),
+                window: Some(window),
+                length: Some(7),
+                ..IstftOptions::default()
+            };
+            let spec = s.tensor_stft(input, 4, forward).unwrap();
+            assert_eq!(s.tensor_shape(spec).unwrap(), vec![batches, 3, 4]);
+            assert_eq!(s.tensor_dtype(spec).unwrap(), DType::Complex64);
+            let output = s.tensor_istft(spec, 4, inverse).unwrap();
+            assert_eq!(s.tensor_shape(output).unwrap(), vec![batches, 7]);
+            assert_eq!(s.tensor_dtype(output).unwrap(), DType::F32);
+            for (actual, expected) in s
+                .tensor_values_lossy_f64(output)
+                .unwrap()
+                .iter()
+                .zip(&values)
+            {
+                assert!((actual - f64::from(*expected)).abs() < 1e-6);
+            }
+            let output_f64 = s.tensor_to_f64(output).unwrap();
+            let loss = spectral_energy_node(&mut s, output_f64);
+            let report = s.tensor_backward(loss).unwrap();
+            let grad = s.tensor_gradient(&report, input).unwrap();
+            assert_eq!(grad.len(), values.len());
+            for (i, &actual) in grad.iter().enumerate() {
+                let expected = 2.0 * f64::from(values[i]) * (0.3 + 0.07 * i as f64);
+                assert!(
+                    (actual - expected).abs() < 2e-5,
+                    "batch={batches}, grad[{i}]={actual}, expected={expected}"
+                );
+            }
+            let window_grad = s.tensor_gradient(&report, window).unwrap();
+            assert!(
+                window_grad.iter().all(|g| g.abs() < 3e-5),
+                "window cancellation: {window_grad:?}"
+            );
+            let (spec_no_grad, out_no_grad) = s.with_no_grad(|s| {
+                let spec = s.tensor_stft(input, 4, forward).unwrap();
+                let output = s.tensor_istft(spec, 4, inverse).unwrap();
+                (spec, output)
+            });
+            assert!(!s.tensor_requires_grad(spec_no_grad).unwrap());
+            assert!(!s.tensor_requires_grad(out_no_grad).unwrap());
+            assert_eq!(s.tensor_shape(out_no_grad).unwrap(), vec![batches, 7]);
+        }
+    }
+
+    #[test]
+    fn spectral_batched_centered_empty_signal_has_zero_gradients() {
+        // PyTorch accepts nonempty batches of zero-length signals when even
+        // n_fft and constant center padding provide a complete all-zero frame.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let input = s
-            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+        let input = s.tensor_variable(Vec::new(), vec![2, 0], true).unwrap();
+        let window = s
+            .tensor_variable(vec![0.5, 0.75, 1.0, 0.625], vec![4], true)
             .unwrap();
-        assert!(
-            s.tensor_stft(
+        let spec = s
+            .tensor_stft(
                 input,
                 4,
                 StftOptions {
-                    hop_length: Some(4),
-                    win_length: Some(4),
-                    center: false,
+                    hop_length: Some(2),
+                    window: Some(window),
                     ..StftOptions::default()
                 },
             )
-            .is_err()
-        );
+            .unwrap();
+        assert_eq!(s.tensor_shape(spec).unwrap(), vec![2, 3, 1]);
+        let packed = s.tensor_view_as_real(spec).unwrap();
+        assert_eq!(s.tensor_values(packed).unwrap(), vec![0.0; 12]);
+        let loss = s.tensor_sum(packed).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert!(s.tensor_gradient(&report, input).unwrap().is_empty());
+        assert_eq!(s.tensor_gradient(&report, window).unwrap(), &[0.0; 4]);
+    }
+
+    #[test]
+    fn spectral_batched_saved_values_and_create_graph_contract() {
+        let fixture = |inverse, input_grad, window_grad| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = if inverse {
+                s.tensor_tape.leaf_tensor(
+                    DenseTensor::from_contiguous_values_complex128(
+                        (0..12)
+                            .map(|i| Complex128::new(f64::from(i) * 0.2, 0.3))
+                            .collect(),
+                        vec![2, 3, 2],
+                        Device::Cpu,
+                    )
+                    .unwrap(),
+                    input_grad,
+                )
+            } else {
+                s.tensor_variable(
+                    (0..12).map(|i| f64::from(i) + 1.0).collect(),
+                    vec![2, 6],
+                    input_grad,
+                )
+                .unwrap()
+            };
+            let window = s
+                .tensor_variable(vec![1.0; 4], vec![4], window_grad)
+                .unwrap();
+            let output = if inverse {
+                s.tensor_istft(
+                    input,
+                    4,
+                    IstftOptions {
+                        hop_length: Some(2),
+                        window: Some(window),
+                        center: false,
+                        ..IstftOptions::default()
+                    },
+                )
+                .unwrap()
+            } else {
+                s.tensor_stft(
+                    input,
+                    4,
+                    StftOptions {
+                        hop_length: Some(2),
+                        window: Some(window),
+                        center: false,
+                        ..StftOptions::default()
+                    },
+                )
+                .unwrap()
+            };
+            (s, input, window, output)
+        };
+        for inverse in [false, true] {
+            for mutate_window in [false, true] {
+                let (mut s, input, window, output) = fixture(inverse, true, true);
+                let target = if mutate_window { window } else { input };
+                replace_spectral_values(&mut s, target);
+                if inverse && !mutate_window {
+                    // The inverse FFT already copied the spectrum's values.
+                    let report = s.tensor_backward(output).unwrap();
+                    let (mut clean, clean_input, clean_window, clean_output) =
+                        fixture(true, true, true);
+                    let clean_report = clean.tensor_backward(clean_output).unwrap();
+                    for (node, clean_node) in [(input, clean_input), (window, clean_window)] {
+                        assert_eq!(
+                            s.tensor_gradient(&report, node),
+                            clean.tensor_gradient(&clean_report, clean_node)
+                        );
+                    }
+                } else {
+                    assert!(matches!(
+                        s.tensor_backward(output),
+                        Err(AutogradError::BorrowedInputVersionMismatch { .. })
+                    ));
+                }
+            }
+            for (input_grad, window_grad) in [(true, false), (false, true)] {
+                let (mut s, _, _, output) = fixture(inverse, input_grad, window_grad);
+                let error = s
+                    .tensor_backward_with_options(
+                        output,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .expect_err("batched spectral bridges support first-order gradients only");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires a create_graph backward"),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_transforms_reject_unsupported_rank_and_empty_batches() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        for shape in [vec![], vec![2, 2, 4], vec![0, 4]] {
+            let input = s
+                .tensor_variable(vec![1.0; shape.iter().product()], shape.clone(), false)
+                .unwrap();
+            assert!(
+                s.tensor_stft(input, 4, StftOptions::default()).is_err(),
+                "shape={shape:?}"
+            );
+        }
+        for shape in [
+            vec![3],
+            vec![2, 2, 3, 2],
+            vec![0, 3, 2],
+            vec![2, 3, 0],
+            vec![2, 4, 2],
+        ] {
+            let input = s.tensor_tape.leaf_tensor(
+                DenseTensor::from_contiguous_values_complex128(
+                    vec![Complex128::new(1.0, 0.0); shape.iter().product()],
+                    shape.clone(),
+                    Device::Cpu,
+                )
+                .unwrap(),
+                false,
+            );
+            assert!(
+                s.tensor_istft(input, 4, IstftOptions::default()).is_err(),
+                "shape={shape:?}"
+            );
+        }
     }
 
     #[test]
@@ -176583,10 +177261,9 @@ mod tests {
     /// The mask is NON-UNIFORM on purpose: with an all-ones upstream gradient the adjoints replace
     /// both GEMMs and there would be no GEMM to skip, so the test would pass while proving nothing.
     ///
-    /// The two cases are single-output masks deliberately. `[true, true, _]` delegates to the
-    /// unmasked kernel, whose GEMMs are not instrumented, so it would read (0, 0) and could not
-    /// distinguish "skipped" from "counted elsewhere". Together these two show the mask VARIES
-    /// with the leaves, which is the claim.
+    /// The two cases request different single-output gradients. Together they show that the
+    /// GEMM skipped by the mask VARIES with the leaves, which is the claim. The local pool below
+    /// selects the panel route these sentinels measure, independently of the host's pool width.
     #[test]
     fn conv2d_f32_backward_computes_only_the_gradients_the_tape_wants() {
         let (n, cin, cout, ih, iw, k) = (2usize, 3usize, 4usize, 9usize, 10usize, 3usize);
@@ -176605,46 +177282,56 @@ mod tests {
              no GEMM to skip"
         );
 
-        // (x requires grad, w requires grad) -> expected (dweight GEMMs, dpanel GEMMs)
-        for (x_grad, w_grad, want) in [(true, false, (0usize, 1usize)), (false, true, (1, 0))] {
-            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let xt = s
-                .tensor_variable_f32(xv.clone(), vec![n, cin, ih, iw], x_grad)
-                .unwrap();
-            let wt = s
-                .tensor_variable_f32(wv.clone(), vec![cout, cin, k, k], w_grad)
-                .unwrap();
-            let mt = s
-                .tensor_variable_f32(mv.clone(), vec![n, cout, ih, iw], false)
-                .unwrap();
-            let o = s.functional_conv2d(xt, wt, None, (1, 1), (1, 1)).unwrap();
-            let scored = s.tensor_mul(o, mt).unwrap();
-            let loss = s.tensor_sum(scored).unwrap();
+        // The blocked dinput route can fill a pool with at most n * cin image/channel tasks.
+        // Above that width both the ordinary and loss-mask-fused backwards use the panel GEMM
+        // counted here. A smaller ambient pool legitimately bypasses that sentinel. Use a local
+        // pool instead of changing process-global route toggles that other tests may observe.
+        let panel_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n * cin + 1)
+            .build()
+            .unwrap();
+        panel_pool.install(|| {
+            // (x requires grad, w requires grad) -> expected (dweight GEMMs, dpanel GEMMs)
+            for (x_grad, w_grad, want) in [(true, false, (0usize, 1usize)), (false, true, (1, 0))] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let xt = s
+                    .tensor_variable_f32(xv.clone(), vec![n, cin, ih, iw], x_grad)
+                    .unwrap();
+                let wt = s
+                    .tensor_variable_f32(wv.clone(), vec![cout, cin, k, k], w_grad)
+                    .unwrap();
+                let mt = s
+                    .tensor_variable_f32(mv.clone(), vec![n, cout, ih, iw], false)
+                    .unwrap();
+                let o = s.functional_conv2d(xt, wt, None, (1, 1), (1, 1)).unwrap();
+                let scored = s.tensor_mul(o, mt).unwrap();
+                let loss = s.tensor_sum(scored).unwrap();
 
-            ft_kernel_cpu::reset_conv2d_backward_gemm_counts();
-            s.tensor_backward(loss).unwrap();
-            let counts = ft_kernel_cpu::conv2d_backward_gemm_counts();
+                ft_kernel_cpu::reset_conv2d_backward_gemm_counts();
+                s.tensor_backward(loss).unwrap();
+                let counts = ft_kernel_cpu::conv2d_backward_gemm_counts();
 
-            assert_eq!(
-                counts, want,
-                "x_grad={x_grad} w_grad={w_grad}: (dweight, dpanel) GEMM executions. A mask that \
-                 never varies would give the same pair for both cases."
-            );
-            // The gradient that WAS wanted must exist, so a zero count cannot be explained by the
-            // backward having quietly done nothing at all.
-            if x_grad {
-                assert!(
-                    s.tensor_grad(xt).unwrap().is_some(),
-                    "d_input was requested and not produced"
+                assert_eq!(
+                    counts, want,
+                    "x_grad={x_grad} w_grad={w_grad}: (dweight, dpanel) GEMM executions. A mask that \
+                     never varies would give the same pair for both cases."
                 );
+                // The gradient that WAS wanted must exist, so a zero count cannot be explained by the
+                // backward having quietly done nothing at all.
+                if x_grad {
+                    assert!(
+                        s.tensor_grad(xt).unwrap().is_some(),
+                        "d_input was requested and not produced"
+                    );
+                }
+                if w_grad {
+                    assert!(
+                        s.tensor_grad(wt).unwrap().is_some(),
+                        "d_weight was requested and not produced"
+                    );
+                }
             }
-            if w_grad {
-                assert!(
-                    s.tensor_grad(wt).unwrap().is_some(),
-                    "d_weight was requested and not produced"
-                );
-            }
-        }
+        });
     }
 
     fn assert_bits_eq(actual: &[f64], expected: &[f64]) {

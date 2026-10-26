@@ -1,4 +1,3 @@
-use std::fmt::Debug;
 use std::sync::Arc;
 
 use ft_api::{FrankenTorchSession, IstftOptions, StftOptions};
@@ -8,24 +7,24 @@ fn strict_session() -> FrankenTorchSession {
     FrankenTorchSession::new(ExecutionMode::Strict)
 }
 
-fn assert_fails_loud<T: Debug, E: Debug>(result: Result<T, E>, op: &str) {
-    let err = result.expect_err(op);
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("autograd") || msg.contains("requires_grad"),
-        "{op} should fail loud on unsupported autograd input, got {msg}"
-    );
+fn assert_close(actual: &[f64], expected: &[f64]) {
+    assert_eq!(actual.len(), expected.len());
+    for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-10,
+            "element {i}: actual={actual}, expected={expected}"
+        );
+    }
 }
 
 #[test]
-fn stft_requires_grad_input_fails_loud() {
+fn stft_requires_grad_input_has_analytical_gradient() {
     let mut session = strict_session();
     let input = session
         .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
         .unwrap();
-
-    assert_fails_loud(
-        session.tensor_stft(
+    let spectrum = session
+        .tensor_stft(
             input,
             4,
             StftOptions {
@@ -34,20 +33,47 @@ fn stft_requires_grad_input_fails_loud() {
                 center: false,
                 ..StftOptions::default()
             },
-        ),
-        "stft requires_grad input",
+        )
+        .unwrap();
+    assert!(session.tensor_requires_grad(spectrum).unwrap());
+    assert_eq!(session.tensor_dtype(spectrum).unwrap(), DType::Complex128);
+    assert_eq!(session.tensor_shape(spectrum).unwrap(), vec![3, 1]);
+    let packed = session.tensor_view_as_real(spectrum).unwrap();
+    assert_close(
+        &session.tensor_values(packed).unwrap(),
+        &[10.0, 0.0, -2.0, 2.0, -2.0, 0.0],
+    );
+    let weights = session
+        .tensor_variable(vec![1.0, 2.0, 3.0, 5.0, 7.0, 11.0], vec![3, 1, 2], false)
+        .unwrap();
+    let weighted = session.tensor_mul(packed, weights).unwrap();
+    let loss = session.tensor_sum(weighted).unwrap();
+    let report = session.tensor_backward(loss).unwrap();
+    // For N=4 the real/imaginary DFT rows are [1,1,1,1],
+    // [1,0,-1,0], [0,-1,0,1], and [1,-1,1,-1]. Their
+    // weighted transpose gives a nonuniform signal cotangent.
+    assert_close(
+        session.tensor_gradient(&report, input).unwrap(),
+        &[11.0, -11.0, 5.0, -1.0],
     );
 }
 
 #[test]
-fn istft_requires_grad_input_fails_loud() {
+fn istft_requires_grad_input_has_analytical_gradient() {
     let mut session = strict_session();
-    let spectrogram = session
-        .tensor_variable(vec![1.0; 8], vec![2, 4], true)
-        .unwrap();
-
-    assert_fails_loud(
-        session.tensor_istft(
+    let tensor = DenseTensor::from_contiguous_values_complex128(
+        vec![
+            Complex128::new(10.0, 0.0),
+            Complex128::new(-2.0, 2.0),
+            Complex128::new(-2.0, 0.0),
+        ],
+        vec![3, 1],
+        Device::Cpu,
+    )
+    .unwrap();
+    let spectrogram = session.tensor_variable_from_storage(tensor, true);
+    let output = session
+        .tensor_istft(
             spectrogram,
             4,
             IstftOptions {
@@ -57,13 +83,31 @@ fn istft_requires_grad_input_fails_loud() {
                 length: Some(4),
                 ..IstftOptions::default()
             },
-        ),
-        "istft requires_grad input",
+        )
+        .unwrap();
+    assert!(session.tensor_requires_grad(output).unwrap());
+    assert_eq!(session.tensor_dtype(output).unwrap(), DType::F64);
+    assert_eq!(session.tensor_shape(output).unwrap(), vec![4]);
+    assert_close(
+        &session.tensor_values(output).unwrap(),
+        &[1.0, 2.0, 3.0, 4.0],
+    );
+    let weights = session
+        .tensor_variable(vec![1.0, 2.0, 4.0, 8.0], vec![4], false)
+        .unwrap();
+    let weighted = session.tensor_mul(output, weights).unwrap();
+    let loss = session.tensor_sum(weighted).unwrap();
+    let report = session.tensor_backward(loss).unwrap();
+    // The real inverse has 1/N endpoint factors and 2/N interior
+    // factors; DC and Nyquist imaginary components have zero derivative.
+    assert_close(
+        session.tensor_gradient(&report, spectrogram).unwrap(),
+        &[3.75, 0.0, -1.5, 3.0, -1.25, 0.0],
     );
 }
 
 #[test]
-fn stft_requires_grad_window_fails_loud() {
+fn stft_requires_grad_window_has_analytical_gradient() {
     let mut session = strict_session();
     let input = session
         .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
@@ -72,8 +116,8 @@ fn stft_requires_grad_window_fails_loud() {
         .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![4], true)
         .unwrap();
 
-    assert_fails_loud(
-        session.tensor_stft(
+    let spectrum = session
+        .tensor_stft(
             input,
             4,
             StftOptions {
@@ -83,13 +127,32 @@ fn stft_requires_grad_window_fails_loud() {
                 center: false,
                 ..StftOptions::default()
             },
-        ),
-        "stft requires_grad window",
+        )
+        .unwrap();
+    assert!(session.tensor_requires_grad(spectrum).unwrap());
+    assert_eq!(session.tensor_dtype(spectrum).unwrap(), DType::Complex128);
+    assert_eq!(session.tensor_shape(spectrum).unwrap(), vec![3, 1]);
+    let packed = session.tensor_view_as_real(spectrum).unwrap();
+    assert_close(
+        &session.tensor_values(packed).unwrap(),
+        &[10.0, 0.0, -2.0, 2.0, -2.0, 0.0],
     );
+    let weights = session
+        .tensor_variable(vec![1.0, 2.0, 3.0, 5.0, 7.0, 11.0], vec![3, 1, 2], false)
+        .unwrap();
+    let weighted = session.tensor_mul(packed, weights).unwrap();
+    let loss = session.tensor_sum(weighted).unwrap();
+    let report = session.tensor_backward(loss).unwrap();
+    // Multiply the DFT adjoint [11,-11,5,-1] by the saved signal.
+    assert_close(
+        session.tensor_gradient(&report, window).unwrap(),
+        &[11.0, -22.0, 15.0, -4.0],
+    );
+    assert!(session.tensor_gradient(&report, input).is_none());
 }
 
 #[test]
-fn istft_requires_grad_window_fails_loud() {
+fn istft_requires_grad_window_has_analytical_gradient() {
     let mut session = strict_session();
     let input = session
         .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
@@ -110,8 +173,8 @@ fn istft_requires_grad_window_fails_loud() {
         .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![4], true)
         .unwrap();
 
-    assert_fails_loud(
-        session.tensor_istft(
+    let output = session
+        .tensor_istft(
             spectrogram,
             4,
             IstftOptions {
@@ -122,9 +185,28 @@ fn istft_requires_grad_window_fails_loud() {
                 length: Some(4),
                 ..IstftOptions::default()
             },
-        ),
-        "istft requires_grad window",
+        )
+        .unwrap();
+    assert!(session.tensor_requires_grad(output).unwrap());
+    assert_eq!(session.tensor_dtype(output).unwrap(), DType::F64);
+    assert_eq!(session.tensor_shape(output).unwrap(), vec![4]);
+    assert_close(
+        &session.tensor_values(output).unwrap(),
+        &[1.0, 2.0, 3.0, 4.0],
     );
+    let weights = session
+        .tensor_variable(vec![1.0, 2.0, 4.0, 8.0], vec![4], false)
+        .unwrap();
+    let weighted = session.tensor_mul(output, weights).unwrap();
+    let loss = session.tensor_sum(weighted).unwrap();
+    let report = session.tensor_backward(loss).unwrap();
+    // One nonoverlapping frame yields y=u*w/(w*w)=u/w.
+    // At w=1 its window gradient is -u times the output cotangent.
+    assert_close(
+        session.tensor_gradient(&report, window).unwrap(),
+        &[-1.0, -4.0, -12.0, -32.0],
+    );
+    assert!(session.tensor_gradient(&report, spectrogram).is_none());
 }
 
 #[test]

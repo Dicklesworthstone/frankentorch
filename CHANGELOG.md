@@ -50,8 +50,10 @@ waves below are capability clusters. Historical crate-line counts in
 - **Spectral training:** Add first-order STFT/ISTFT gradients for real signals,
   complex spectra, and real windows. Correct short-window alignment and
   explicit-length reconstruction tails, and reject zero overlap-add envelopes.
-  The supported surface remains one-dimensional signals and two-dimensional
-  spectra, with constant zero padding for centered STFT frames. Saved-value
+  Support individual and batched signals (`[time]` or `[batch, time]`) and
+  their two- or three-dimensional spectra, with a shared trainable window
+  whose gradients sum across the batch. Centered STFT frames use constant
+  zero padding. Saved-value
   mutation checks distinguish aliased operands from copied forward values;
   higher-order spectral gradients fail explicitly.
 - **Model APIs:** Linear layers accept a single-row bias while preserving
@@ -60,8 +62,9 @@ waves below are capability clusters. Historical crate-line counts in
 
 Regression coverage includes disjoint microbatches, multiple optimizers,
 sparse embedding updates, and spectral finite differences across normalization,
-window, and FFT-size choices. Spectral and linear gradient fixtures were checked
-against PyTorch 2.14.1 CPU.
+window, and FFT-size choices. Batched tests cover independent signal gradients,
+shared-window reductions, F32 roundtrips, and empty centered signals. Spectral
+and linear gradient fixtures were checked against PyTorch 2.14.1 CPU.
 
 ### 2026-08-19 — Repo-janitor docs-reorg
 
