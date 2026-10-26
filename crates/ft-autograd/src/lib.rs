@@ -6977,7 +6977,9 @@ impl TensorTape {
                 Ok(vec![grad_base, grad_exp])
             },
             move |_ctx, grad_outs, inputs, tape| {
-                let (x, e) = (inputs[0], inputs[1]);
+                let x = tape.cg_to_f64(inputs[0])?;
+                let e = tape.cg_to_f64(inputs[1])?;
+                let grad_out = tape.cg_to_f64(grad_outs[0])?;
                 let shape = tape.node(x)?.tensor.meta().shape().to_vec();
                 let numel = Self::checked_shape_numel(&shape, "pow_tensor create_graph overflow")?;
                 // TensorTape has no add_scalar, so e-1 comes from a constant leaf.
@@ -6985,11 +6987,11 @@ impl TensorTape {
                 let e_minus_one = tape.add(e, minus_one, mode)?.0;
                 let x_pow_e_minus_one = tape.pow_tensor(x, e_minus_one, mode)?;
                 let d_base = tape.mul(e, x_pow_e_minus_one, mode)?.0;
-                let grad_base = tape.mul(grad_outs[0], d_base, mode)?.0;
+                let grad_base = tape.mul(grad_out, d_base, mode)?.0;
                 let y = tape.pow_tensor(x, e, mode)?;
                 let ln_x = tape.log(x, mode)?.0;
                 let d_exp = tape.mul(y, ln_x, mode)?.0;
-                let grad_exp = tape.mul(grad_outs[0], d_exp, mode)?.0;
+                let grad_exp = tape.mul(grad_out, d_exp, mode)?.0;
                 Ok(vec![Some(grad_base), Some(grad_exp)])
             },
         )
@@ -11815,22 +11817,34 @@ impl TensorTape {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<(), AutogradError> {
-        if !matches!(op, BinaryOp::Mul | BinaryOp::Div | BinaryOp::MatMul)
-            || !self.node(output)?.requires_grad
+        if !matches!(
+            op,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::MatMul | BinaryOp::Bmm
+        ) || !self.node(output)?.requires_grad
         {
             return Ok(());
         }
         let lhs_needs_grad = self.node(lhs)?.requires_grad;
         let rhs_needs_grad = self.node(rhs)?.requires_grad;
-        let mut inputs = Vec::with_capacity(2);
+        let mut inputs = Vec::with_capacity(4);
         // Both rhs derivatives use lhs. A frozen lhs must still be saved
         // when it determines the gradient of a trainable rhs.
         if rhs_needs_grad {
             inputs.push(lhs);
+            if let TensorNodeOp::CastF64 { input: orig } = self.node(lhs)?.op
+                && !inputs.contains(&orig)
+            {
+                inputs.push(orig);
+            }
         }
-        // Mul/MatMul's lhs derivatives use rhs; both Div derivatives use rhs.
+        // Mul/MatMul/Bmm's lhs derivatives use rhs; both Div derivatives use rhs.
         if (lhs_needs_grad || (op == BinaryOp::Div && rhs_needs_grad)) && !inputs.contains(&rhs) {
             inputs.push(rhs);
+            if let TensorNodeOp::CastF64 { input: orig } = self.node(rhs)?.op
+                && !inputs.contains(&orig)
+            {
+                inputs.push(orig);
+            }
         }
         if !inputs.is_empty() {
             let versions = self.borrowed_input_versions(&inputs)?;
@@ -16402,7 +16416,7 @@ impl TensorTape {
             }
             execution_order.push(node_id);
             let incoming_id = match grad_nodes[node_id.0] {
-                Some(id) => id,
+                Some(id) => self.cg_to_f64(id)?,
                 None => continue,
             };
 
@@ -16592,12 +16606,11 @@ impl TensorTape {
                         interleaved.push(repeats[d]);
                         interleaved.push(repeat_shape[d]);
                     }
-                    let mut grad = self.reshape(incoming_id, interleaved)?;
+                    let mut grad = self.cg_reshape(incoming_id, interleaved)?;
                     for d in (0..ndim).rev() {
-                        let (summed, _) = self.sum_dim(grad, 2 * d, ExecutionMode::Strict)?;
-                        grad = summed;
+                        grad = self.cg_sum_dim(grad, 2 * d)?;
                     }
-                    let grad = self.reshape(grad, original_shape.clone())?;
+                    let grad = self.cg_reshape(grad, original_shape.clone())?;
                     self.cg_accumulate(input, &mut grad_nodes, grad)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -16866,7 +16879,7 @@ impl TensorTape {
                         }
                     }
                     let flat_grad = self.cg_reshape(incoming_id, vec![input_numel])?;
-                    let mut gathered = self.index_select(flat_grad, 0, &positions)?;
+                    let mut gathered = self.cg_index_select(flat_grad, 0, &positions)?;
                     if active.iter().any(|&a| !a) {
                         let mask_vals: Vec<f64> =
                             active.iter().map(|&a| if a { 1.0 } else { 0.0 }).collect();
@@ -16874,7 +16887,7 @@ impl TensorTape {
                         gathered = self.cg_mul(gathered, mask_node)?;
                     }
                     let grad_values = if scalar_broadcast {
-                        let (summed, _) = self.sum(gathered, ExecutionMode::Strict)?;
+                        let summed = self.cg_sum(gathered)?;
                         self.cg_reshape(summed, values_shape)?
                     } else if values_numel == values_needed {
                         self.cg_reshape(gathered, values_shape)?
@@ -16911,7 +16924,7 @@ impl TensorTape {
                     }
                     let gy_y = self.cg_mul(incoming_id, node_id)?;
                     let flipped = self.cg_flip(gy_y, vec![dim])?;
-                    let (cs, _) = self.cumsum(flipped, dim, ExecutionMode::Strict)?;
+                    let cs = self.cg_cumsum(flipped, dim)?;
                     let rev_cumsum = self.cg_flip(cs, vec![dim])?;
                     let grad_x = self.cg_div(rev_cumsum, input)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_x)?;
@@ -17386,7 +17399,7 @@ impl TensorTape {
                     // Shape ops preserve every element; the gradient is
                     // the incoming grad reshaped to the input's shape.
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let grad_in = self.reshape(incoming_id, input_shape)?;
+                    let grad_in = self.cg_reshape(incoming_id, input_shape)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -17511,10 +17524,10 @@ impl TensorTape {
                 }
                 TensorNodeOp::MatMul { lhs, rhs } => {
                     // d(A@B)/dA = grad @ B^T ; d(A@B)/dB = A^T @ grad.
-                    let rhs_t = self.transpose(rhs, 0, 1)?;
-                    let (grad_lhs, _) = self.matmul(incoming_id, rhs_t, ExecutionMode::Strict)?;
-                    let lhs_t = self.transpose(lhs, 0, 1)?;
-                    let (grad_rhs, _) = self.matmul(lhs_t, incoming_id, ExecutionMode::Strict)?;
+                    let rhs_t = self.cg_transpose_2d(rhs)?;
+                    let grad_lhs = self.cg_matmul_2d(incoming_id, rhs_t)?;
+                    let lhs_t = self.cg_transpose_2d(lhs)?;
+                    let grad_rhs = self.cg_matmul_2d(lhs_t, incoming_id)?;
                     self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
                     self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -17544,7 +17557,7 @@ impl TensorTape {
                         .contiguous_values_as_f64()?;
                     let mut bshape = input_shape.clone();
                     bshape[dim] = 1;
-                    let reshaped = self.reshape(incoming_id, bshape)?;
+                    let reshaped = self.cg_reshape(incoming_id, bshape)?;
                     let mut expanded = vec![0.0; input_numel];
                     for outer in 0..outer_size {
                         for inner in 0..inner_size {
@@ -17583,7 +17596,7 @@ impl TensorTape {
                         .contiguous_values_as_f64()?;
                     let mut bshape = input_shape.clone();
                     bshape[dim] = 1;
-                    let reshaped = self.reshape(incoming_id, bshape)?;
+                    let reshaped = self.cg_reshape(incoming_id, bshape)?;
                     let mut expanded = vec![0.0; input_numel];
                     for outer in 0..outer_size {
                         for inner in 0..inner_size {
@@ -18571,9 +18584,9 @@ impl TensorTape {
                     // the scan instead of dead-ending at a detached leaf. cumsum
                     // is linear (f'' w.r.t input is zero) but the routing must
                     // still carry a second loss back through it.
-                    let flipped = self.flip(incoming_id, vec![dim])?;
-                    let (scanned, _) = self.cumsum(flipped, dim, ExecutionMode::Strict)?;
-                    let grad_in = self.flip(scanned, vec![dim])?;
+                    let flipped = self.cg_flip(incoming_id, vec![dim])?;
+                    let scanned = self.cg_cumsum(flipped, dim)?;
+                    let grad_in = self.cg_flip(scanned, vec![dim])?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18680,7 +18693,7 @@ impl TensorTape {
                     let mut bshape = input_shape.clone();
                     bshape[dim] = 1;
                     // Broadcast incoming along dim.
-                    let reshaped_inc = self.reshape(incoming_id, bshape.clone())?;
+                    let reshaped_inc = self.cg_reshape(incoming_id, bshape.clone())?;
                     let mut inc_expanded = vec![0.0; input_numel];
                     for outer in 0..outer_size {
                         for inner in 0..inner_size {
@@ -18702,7 +18715,7 @@ impl TensorTape {
                             .tensor
                             .contiguous_values_as_f64()
                             .map_err(AutogradError::DenseTensor)?;
-                        let reshaped_norm = self.reshape(node_id, bshape)?;
+                        let reshaped_norm = self.cg_reshape(node_id, bshape)?;
                         // Substitute 1.0 for zero-norm slices to avoid div-by-zero;
                         // those slices have x=0 so the numerator is 0 and grad=0,
                         // matching the first-order backward.
@@ -18822,7 +18835,7 @@ impl TensorTape {
                         .map_err(AutogradError::DenseTensor)?;
                     let mut bshape = input_shape.clone();
                     bshape[dim] = 1;
-                    let reshaped_std = self.reshape(node_id, bshape)?;
+                    let reshaped_std = self.cg_reshape(node_id, bshape)?;
                     let mut std_expanded = vec![1.0; input_numel];
                     for outer in 0..outer_size {
                         for inner in 0..inner_size {
@@ -18874,7 +18887,11 @@ impl TensorTape {
                             .into(),
                         ));
                     };
-                    let grad_results = cg(&ctx, &[incoming_id], &inputs, self)?;
+                    let prev_grad_enabled = self.grad_enabled;
+                    self.grad_enabled = true;
+                    let grad_results = cg(&ctx, &[incoming_id], &inputs, self);
+                    self.grad_enabled = prev_grad_enabled;
+                    let grad_results = grad_results?;
                     if grad_results.len() != inputs.len() {
                         return Err(AutogradError::TensorGradientShapeMismatch {
                             node: node_id,
@@ -19326,6 +19343,7 @@ impl TensorTape {
         grad_nodes: &mut [Option<TensorNodeId>],
         contribution: TensorNodeId,
     ) -> Result<(), AutogradError> {
+        let contribution = self.cg_to_f64(contribution)?;
         match grad_nodes.get(target.0).copied().flatten() {
             None => {
                 if target.0 < grad_nodes.len() {
@@ -19346,27 +19364,36 @@ impl TensorTape {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
             let lhs_data = lhs_node.tensor.contiguous_values_as_f64()?;
             let rhs_data = rhs_node.tensor.contiguous_values_as_f64()?;
-            let shape = lhs_node.tensor.meta().shape().to_vec();
-            let dtype = lhs_node.tensor.meta().dtype();
+            let lhs_shape = lhs_node.tensor.meta().shape().to_vec();
+            let rhs_shape = rhs_node.tensor.meta().shape().to_vec();
             let device = lhs_node.tensor.meta().device();
             let rg = lhs_node.requires_grad || rhs_node.requires_grad;
 
             // Handle broadcast: scalar grad + tensor
-            let result = if lhs_data.len() == rhs_data.len() {
-                lhs_data
-                    .iter()
-                    .zip(rhs_data.iter())
-                    .map(|(&a, &b)| a + b)
-                    .collect()
+            let (result, shape) = if lhs_data.len() == rhs_data.len() {
+                (
+                    lhs_data
+                        .iter()
+                        .zip(rhs_data.iter())
+                        .map(|(&a, &b)| a + b)
+                        .collect(),
+                    lhs_shape,
+                )
             } else if rhs_data.len() == 1 {
-                lhs_data.iter().map(|&a| a + rhs_data[0]).collect()
+                (
+                    lhs_data.iter().map(|&a| a + rhs_data[0]).collect(),
+                    lhs_shape,
+                )
             } else if lhs_data.len() == 1 {
-                rhs_data.iter().map(|&b| lhs_data[0] + b).collect()
+                (
+                    rhs_data.iter().map(|&b| lhs_data[0] + b).collect(),
+                    rhs_shape,
+                )
             } else {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -19374,10 +19401,10 @@ impl TensorTape {
                     },
                 )));
             };
-            (rg, result, shape, dtype, device)
+            (rg, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19393,13 +19420,12 @@ impl TensorTape {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
             let lhs_data = lhs_node.tensor.contiguous_values_as_f64()?;
             let rhs_data = rhs_node.tensor.contiguous_values_as_f64()?;
             let shape = lhs_node.tensor.meta().shape().to_vec();
-            let dtype = lhs_node.tensor.meta().dtype();
             let device = lhs_node.tensor.meta().device();
             let rg = lhs_node.requires_grad || rhs_node.requires_grad;
             let result = lhs_data
@@ -19407,10 +19433,10 @@ impl TensorTape {
                 .zip(rhs_data.iter())
                 .map(|(&a, &b)| a - b)
                 .collect();
-            (rg, result, shape, dtype, device)
+            (rg, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19443,7 +19469,7 @@ impl TensorTape {
             .map_err(AutogradError::DenseTensor)?;
         let mut bshape = input_shape.to_vec();
         bshape[dim] = 1;
-        let reshaped = self.reshape(node, bshape)?;
+        let reshaped = self.cg_reshape(node, bshape)?;
         let mut expanded = vec![0.0; input_numel];
         for outer in 0..outer_size {
             for inner in 0..inner_size {
@@ -19465,7 +19491,7 @@ impl TensorTape {
         dim: usize,
         input_shape: &[usize],
     ) -> Result<TensorNodeId, AutogradError> {
-        let (mean_reduced, _) = self.mean_dim(input, dim, ExecutionMode::Strict)?;
+        let mean_reduced = self.cg_mean_dim(input, dim)?;
         let mean_full = self.cg_broadcast_along_dim(mean_reduced, dim, input_shape)?;
         self.cg_sub(input, mean_full)
     }
@@ -19476,14 +19502,13 @@ impl TensorTape {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
             let lhs_data = lhs_node.tensor.contiguous_values_as_f64()?;
             let rhs_data = rhs_node.tensor.contiguous_values_as_f64()?;
             let lhs_shape = lhs_node.tensor.meta().shape().to_vec();
             let rhs_shape = rhs_node.tensor.meta().shape().to_vec();
-            let dtype = lhs_node.tensor.meta().dtype();
             let device = lhs_node.tensor.meta().device();
             let rg = lhs_node.requires_grad || rhs_node.requires_grad;
 
@@ -19514,10 +19539,10 @@ impl TensorTape {
                     },
                 )));
             };
-            (rg, result, shape, dtype, device)
+            (rg, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19534,17 +19559,16 @@ impl TensorTape {
         input: TensorNodeId,
         scalar: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&value| value * scalar).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19559,13 +19583,12 @@ impl TensorTape {
     /// routes correctly. Materializes contiguous transposed storage, matching the
     /// eager-view convention used elsewhere in the tape.
     fn cg_transpose_last2(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, shape, data, dtype, device) = {
+        let (requires_grad, shape, data, device) = {
             let node = self.node(input)?;
             (
                 node.requires_grad,
                 node.tensor.meta().shape().to_vec(),
                 node.tensor.contiguous_values_as_f64()?,
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
@@ -19591,7 +19614,7 @@ impl TensorTape {
         }
         let mut new_shape = shape;
         new_shape.swap(d0, d1);
-        let meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(new_shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19602,6 +19625,15 @@ impl TensorTape {
                 dim1: d1,
             },
         });
+        if d0 == 0 && d1 == 1 {
+            self.transpose_input_versions.insert(
+                out.0,
+                (
+                    self.nodes[input.0].tensor.version(),
+                    self.nodes[out.0].tensor.version(),
+                ),
+            );
+        }
         Ok(out)
     }
 
@@ -19613,7 +19645,7 @@ impl TensorTape {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, lhs_shape, rhs_shape, lhs_data, rhs_data, dtype, device) = {
+        let (requires_grad, lhs_shape, rhs_shape, lhs_data, rhs_data, device) = {
             let l = self.node(lhs)?;
             let r = self.node(rhs)?;
             (
@@ -19622,7 +19654,6 @@ impl TensorTape {
                 r.tensor.meta().shape().to_vec(),
                 l.tensor.contiguous_values_as_f64()?,
                 r.tensor.contiguous_values_as_f64()?,
-                l.tensor.meta().dtype(),
                 l.tensor.meta().device(),
             )
         };
@@ -19655,13 +19686,14 @@ impl TensorTape {
             &rhs_k_meta,
         )
         .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
-        let meta = ft_core::TensorMeta::from_shape(vec![batch, m, n], dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(vec![batch, m, n], DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
             requires_grad,
             op: TensorNodeOp::Bmm { lhs, rhs },
         });
+        self.record_native_binary_versions(out, BinaryOp::Bmm, lhs, rhs)?;
         Ok(out)
     }
 
@@ -19670,13 +19702,12 @@ impl TensorTape {
     /// transpose rule (which is its own adjoint). Produces contiguous transposed
     /// values for downstream matmuls.
     fn cg_transpose_2d(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, data, shape, dtype, device) = {
+        let (requires_grad, data, shape, device) = {
             let node = self.node(input)?;
             (
                 node.requires_grad,
                 node.tensor.contiguous_values_as_f64()?,
                 node.tensor.meta().shape().to_vec(),
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
@@ -19688,7 +19719,7 @@ impl TensorTape {
                 result[j * r + i] = data[i * c + j];
             }
         }
-        let meta = ft_core::TensorMeta::from_shape(vec![c, r], dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(vec![c, r], DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19709,25 +19740,37 @@ impl TensorTape {
         Ok(out)
     }
 
-    /// Helper: 2-D matmul for create_graph backward, bridged through the rank-3
-    /// `cg_bmm` (reshape [m,k]->[1,m,k], [k,n]->[1,k,n], bmm, reshape [1,m,n]->[m,n]).
-    /// Records Reshape/Bmm ops, all differentiable for a further backward.
+    /// Helper: 2-D matmul for create_graph backward, recording a direct `MatMul`
+    /// node in F64 gradient space and tracking operand versions for mutation checks.
     fn cg_matmul_2d(
         &mut self,
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (lshape, rshape) = (
-            self.node(lhs)?.tensor.meta().shape().to_vec(),
-            self.node(rhs)?.tensor.meta().shape().to_vec(),
-        );
-        let m = lshape[0];
-        let k = lshape[1];
-        let n = rshape[1];
-        let l3 = self.cg_reshape(lhs, vec![1, m, k])?;
-        let r3 = self.cg_reshape(rhs, vec![1, k, n])?;
-        let out3 = self.cg_bmm(l3, r3)?;
-        self.cg_reshape(out3, vec![m, n])
+        let (requires_grad, lshape, rshape, lhs_data, rhs_data, device) = {
+            let l = self.node(lhs)?;
+            let r = self.node(rhs)?;
+            (
+                l.requires_grad || r.requires_grad,
+                l.tensor.meta().shape().to_vec(),
+                r.tensor.meta().shape().to_vec(),
+                l.tensor.contiguous_values_as_f64()?,
+                r.tensor.contiguous_values_as_f64()?,
+                l.tensor.meta().device(),
+            )
+        };
+        let (m, k, n) = Self::matmul_dims(&lshape, &rshape)?;
+        let result = ft_kernel_cpu::matmul_contiguous_f64_slices(m, k, n, &lhs_data, &rhs_data)
+            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+        let meta = ft_core::TensorMeta::from_shape(vec![m, n], DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::MatMul { lhs, rhs },
+        });
+        self.record_native_binary_versions(out, BinaryOp::MatMul, lhs, rhs)?;
+        Ok(out)
     }
 
     /// Helper: per-element product-excluding-self along `dim`, i.e. for each position
@@ -19754,7 +19797,7 @@ impl TensorTape {
         let pair = ndim - 1 - dim;
         // prefix_excl[i] = product of x[<i]: inclusive cumprod, drop the last, pad a
         // leading 1.0 along `dim`.
-        let (prefix_incl, _) = self.cumprod(x, dim, ExecutionMode::Strict)?;
+        let prefix_incl = self.cg_cumprod(x, dim)?;
         let prefix_drop = self.narrow(prefix_incl, dim, 0, n - 1)?;
         let mut pad_front = vec![0usize; 2 * (ndim - dim)];
         pad_front[2 * pair] = 1;
@@ -19762,13 +19805,195 @@ impl TensorTape {
         // suffix_excl[i] = product of x[>i]: reverse, inclusive cumprod, reverse, drop
         // the first, pad a trailing 1.0 along `dim`.
         let x_rev = self.cg_flip(x, vec![dim])?;
-        let (suffix_rev_incl, _) = self.cumprod(x_rev, dim, ExecutionMode::Strict)?;
+        let suffix_rev_incl = self.cg_cumprod(x_rev, dim)?;
         let suffix_incl = self.cg_flip(suffix_rev_incl, vec![dim])?;
         let suffix_drop = self.narrow(suffix_incl, dim, 1, n - 1)?;
         let mut pad_back = vec![0usize; 2 * (ndim - dim)];
         pad_back[2 * pair + 1] = 1;
         let suffix_excl = self.pad(suffix_drop, &pad_back, 1.0)?;
         self.cg_mul(prefix_excl, suffix_excl)
+    }
+
+    /// Helper: full-tensor sum for create_graph backward in F64 gradient space.
+    fn cg_sum(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, input_numel, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let input_shape = node.tensor.meta().shape().to_vec();
+            let device = node.tensor.meta().device();
+            let f64_meta = ft_core::TensorMeta::from_shape(input_shape, DType::F64, device);
+            let sum_val = ft_kernel_cpu::sum_tensor_contiguous_f64(&data, &f64_meta)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            (node.requires_grad, vec![sum_val], data.len(), device)
+        };
+        let meta = ft_core::TensorMeta::from_shape(vec![1], DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Sum { input, input_numel },
+        });
+        Ok(out)
+    }
+
+    /// Helper: dim-reduction sum for create_graph backward in F64 gradient space.
+    fn cg_sum_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, input_shape, out_shape, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let input_shape = node.tensor.meta().shape().to_vec();
+            let device = node.tensor.meta().device();
+            let f64_meta = ft_core::TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
+            let result = ft_kernel_cpu::sum_dim_tensor_contiguous_f64(&data, &f64_meta, dim)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let mut out_shape = input_shape.clone();
+            out_shape.remove(dim);
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            (node.requires_grad, result, input_shape, out_shape, device)
+        };
+        let meta = ft_core::TensorMeta::from_shape(out_shape, DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::SumDim {
+                input,
+                dim,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Helper: dim-reduction mean for create_graph backward in F64 gradient space.
+    fn cg_mean_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, input_shape, out_shape, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let input_shape = node.tensor.meta().shape().to_vec();
+            let device = node.tensor.meta().device();
+            let f64_meta = ft_core::TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
+            let result = ft_kernel_cpu::mean_dim_tensor_contiguous_f64(&data, &f64_meta, dim)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let mut out_shape = input_shape.clone();
+            out_shape.remove(dim);
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            (node.requires_grad, result, input_shape, out_shape, device)
+        };
+        let meta = ft_core::TensorMeta::from_shape(out_shape, DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::MeanDim {
+                input,
+                dim,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Helper: cumulative sum along `dim` for create_graph backward in F64 gradient space.
+    fn cg_cumsum(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, shape, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let shape = node.tensor.meta().shape().to_vec();
+            let device = node.tensor.meta().device();
+            let f64_meta = ft_core::TensorMeta::from_shape(shape.clone(), DType::F64, device);
+            let result = ft_kernel_cpu::cumsum_tensor_contiguous_f64(&data, &f64_meta, dim)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            (node.requires_grad, result, shape, device)
+        };
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::CumSum { input, dim },
+        });
+        Ok(out)
+    }
+
+    /// Helper: cumulative product along `dim` for create_graph backward in F64 gradient space.
+    fn cg_cumprod(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, shape, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let shape = node.tensor.meta().shape().to_vec();
+            let device = node.tensor.meta().device();
+            let f64_meta = ft_core::TensorMeta::from_shape(shape.clone(), DType::F64, device);
+            let result = ft_kernel_cpu::cumprod_tensor_contiguous_f64(&data, &f64_meta, dim)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            (node.requires_grad, result, shape, device)
+        };
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::CumProd { input, dim },
+        });
+        Ok(out)
+    }
+
+    /// Helper: index_select along `dim` for create_graph backward in F64 gradient space.
+    fn cg_index_select(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        indices: &[f64],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, input_shape, out_shape, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let input_shape = node.tensor.meta().shape().to_vec();
+            let device = node.tensor.meta().device();
+            let f64_meta = ft_core::TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
+            let result =
+                ft_kernel_cpu::index_select_tensor_contiguous_f64(&data, &f64_meta, dim, indices)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let mut out_shape = input_shape.clone();
+            if dim < out_shape.len() {
+                out_shape[dim] = indices.len();
+            }
+            (node.requires_grad, result, input_shape, out_shape, device)
+        };
+        let meta = ft_core::TensorMeta::from_shape(out_shape, DType::F64, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::IndexSelect {
+                input,
+                dim,
+                indices: indices.to_vec(),
+                input_shape,
+                sparse: false,
+            },
+        });
+        Ok(out)
     }
 
     /// Helper: reshape (same element order, same numel) for create_graph backward,
@@ -19779,17 +20004,16 @@ impl TensorTape {
         input: TensorNodeId,
         new_shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, original_shape, data, dtype, device) = {
+        let (requires_grad, original_shape, data, device) = {
             let node = self.node(input)?;
             (
                 node.requires_grad,
                 node.tensor.meta().shape().to_vec(),
                 node.tensor.contiguous_values_as_f64()?,
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
-        let meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(new_shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, data)?,
@@ -19814,13 +20038,12 @@ impl TensorTape {
         input: TensorNodeId,
         dims: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, data, shape, dtype, device) = {
+        let (requires_grad, data, shape, device) = {
             let node = self.node(input)?;
             (
                 node.requires_grad,
                 node.tensor.contiguous_values_as_f64()?,
                 node.tensor.meta().shape().to_vec(),
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
@@ -19843,7 +20066,7 @@ impl TensorTape {
             }
             result[flat] = data[src_flat];
         }
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19866,13 +20089,12 @@ impl TensorTape {
         shift: isize,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, data, shape, dtype, device) = {
+        let (requires_grad, data, shape, device) = {
             let node = self.node(input)?;
             (
                 node.requires_grad,
                 node.tensor.contiguous_values_as_f64()?,
                 node.tensor.meta().shape().to_vec(),
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
@@ -19907,7 +20129,7 @@ impl TensorTape {
                 result[dst_flat] = data[flat];
             }
         }
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19927,13 +20149,12 @@ impl TensorTape {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
             let lhs_data = lhs_node.tensor.contiguous_values_as_f64()?;
             let rhs_data = rhs_node.tensor.contiguous_values_as_f64()?;
             let shape = lhs_node.tensor.meta().shape().to_vec();
-            let dtype = lhs_node.tensor.meta().dtype();
             let device = lhs_node.tensor.meta().device();
             let rg = lhs_node.requires_grad || rhs_node.requires_grad;
             let result = lhs_data
@@ -19941,10 +20162,10 @@ impl TensorTape {
                 .zip(rhs_data.iter())
                 .map(|(&a, &b)| a / b)
                 .collect();
-            (rg, result, shape, dtype, device)
+            (rg, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19957,17 +20178,16 @@ impl TensorTape {
 
     /// Helper: elementwise neg for create_graph backward.
     fn cg_neg(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| -v).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -19979,17 +20199,16 @@ impl TensorTape {
 
     /// Helper: elementwise sin for create_graph backward.
     fn cg_sin(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| v.sin()).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20001,17 +20220,16 @@ impl TensorTape {
 
     /// Helper: elementwise cos for create_graph backward.
     fn cg_cos(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| v.cos()).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20023,17 +20241,16 @@ impl TensorTape {
 
     /// Helper: elementwise sinh for create_graph backward.
     fn cg_sinh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| v.sinh()).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20045,17 +20262,16 @@ impl TensorTape {
 
     /// Helper: elementwise cosh for create_graph backward.
     fn cg_cosh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| v.cosh()).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20067,17 +20283,16 @@ impl TensorTape {
 
     /// Helper: elementwise exp for create_graph backward.
     fn cg_exp(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| v.exp()).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20092,17 +20307,16 @@ impl TensorTape {
     /// `erf` (e.g. the exact GELU backward) stay connected to `input` and the
     /// second derivative survives double-backward.
     fn cg_erf(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let node = self.node(input)?;
             let data = node.tensor.contiguous_values_as_f64()?;
             let shape = node.tensor.meta().shape().to_vec();
-            let dtype = node.tensor.meta().dtype();
             let device = node.tensor.meta().device();
             let result = data.iter().map(|&v| libm::erf(v)).collect();
-            (node.requires_grad, result, shape, dtype, device)
+            (node.requires_grad, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20130,18 +20344,17 @@ impl TensorTape {
     /// (`d/de = x^e·ln x`), tracked as frankentorch-v8f5k. It must not be built by bending this
     /// one into the role.
     fn cg_pow(&mut self, base: TensorNodeId, exponent: f64) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device) = {
+        let (requires_grad, result, shape, device) = {
             let base_node = self.node(base)?;
             let base_data = base_node.tensor.contiguous_values_as_f64()?;
             let shape = base_node.tensor.meta().shape().to_vec();
-            let dtype = base_node.tensor.meta().dtype();
             let device = base_node.tensor.meta().device();
             let rg = base_node.requires_grad;
             let result: Vec<f64> = base_data.iter().map(|&b| b.powf(exponent)).collect();
-            (rg, result, shape, dtype, device)
+            (rg, result, shape, device)
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20159,7 +20372,7 @@ impl TensorTape {
         input: TensorNodeId,
         target_shape: &[usize],
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, input_shape, dtype, device) = {
+        let (requires_grad, result, input_shape, device) = {
             let node = self.node(input)?;
             let input_shape = node.tensor.meta().shape().to_vec();
             let input_data = node.tensor.contiguous_values_as_f64()?;
@@ -20168,12 +20381,11 @@ impl TensorTape {
                 node.requires_grad,
                 result,
                 input_shape,
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
 
-        let meta = ft_core::TensorMeta::from_shape(target_shape.to_vec(), dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(target_shape.to_vec(), DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
@@ -20310,17 +20522,16 @@ impl TensorTape {
         expanded_data: Vec<f64>,
         shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, original_shape, dtype, device) = {
+        let (requires_grad, original_shape, device) = {
             let node = self.node(input)?;
             (
                 node.requires_grad,
                 node.tensor.meta().shape().to_vec(),
-                node.tensor.meta().dtype(),
                 node.tensor.meta().device(),
             )
         };
 
-        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let meta = ft_core::TensorMeta::from_shape(shape, DType::F64, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, expanded_data)?,
@@ -36769,5 +36980,297 @@ mod tests {
     #[test]
     fn create_graph_hardtanh_boundary_nonfinite_upstreams() {
         check_piecewise_boundary_nonfinite_upstreams(2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_graph_f32_shared_helpers_match_f64_higher_derivatives() {
+        let unary_ops: usize = 27;
+        for op_idx in 0..unary_ops {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for disable_before_backward in [false, true] {
+                    let run_case = |f32_leaf: bool| -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+                        let mut tape = TensorTape::new();
+                        let x_vals = [0.25, 0.5, 0.75, 0.4];
+                        let u_vals = [1.25, -0.75, 0.5, 1.5];
+                        let v_vals = [0.5, -1.0, 0.75, -0.25];
+                        let x = routing_leaf(&mut tape, &x_vals, &[2, 2], f32_leaf);
+                        let upstream = routing_leaf(&mut tape, &u_vals, &[2, 2], f32_leaf);
+                        let y = match op_idx {
+                            0 => tape.sigmoid(x, mode).expect("sigmoid").0,
+                            1 => tape.tanh(x, mode).expect("tanh").0,
+                            2 => tape.gelu(x, mode).expect("gelu").0,
+                            3 => tape.silu(x, mode).expect("silu").0,
+                            4 => tape.elu(x, mode).expect("elu").0,
+                            5 => tape.hardswish(x, mode).expect("hardswish").0,
+                            6 => tape.softplus(x, mode).expect("softplus").0,
+                            7 => tape.mish(x, mode).expect("mish").0,
+                            8 => tape.rsqrt(x, mode).expect("rsqrt").0,
+                            9 => tape.reciprocal(x, mode).expect("reciprocal").0,
+                            10 => tape.square(x, mode).expect("square").0,
+                            11 => tape.pow(x, 2.5, mode).expect("pow").0,
+                            12 => tape.sin(x, mode).expect("sin").0,
+                            13 => tape.cos(x, mode).expect("cos").0,
+                            14 => tape.sinh(x, mode).expect("sinh").0,
+                            15 => tape.cosh(x, mode).expect("cosh").0,
+                            16 => tape.erf(x, mode).expect("erf").0,
+                            17 => tape.erfc(x, mode).expect("erfc").0,
+                            18 => tape.tan(x, mode).expect("tan").0,
+                            19 => tape.atan(x, mode).expect("atan").0,
+                            20 => tape.asin(x, mode).expect("asin").0,
+                            21 => tape.acos(x, mode).expect("acos").0,
+                            22 => tape.log(x, mode).expect("log").0,
+                            23 => tape.log1p(x, mode).expect("log1p").0,
+                            24 => tape.log2(x, mode).expect("log2").0,
+                            25 => tape.log10(x, mode).expect("log10").0,
+                            _ => tape.expm1(x, mode).expect("expm1").0,
+                        };
+                        let (weighted, _) = tape.mul(y, upstream, mode).expect("weighted unary");
+                        let (loss, _) = tape.sum(weighted, mode).expect("unary sum");
+                        let ordinary = tape
+                            .backward_with_options(loss, routing_options(mode, false))
+                            .expect("ordinary unary backward");
+                        if disable_before_backward {
+                            tape.set_grad_enabled(false);
+                        }
+                        let first = tape
+                            .backward_with_options(loss, routing_options(mode, true))
+                            .expect("create_graph unary backward");
+                        tape.set_grad_enabled(true);
+                        let gx_ord = ordinary.gradient(x).expect("ordinary gx").to_vec();
+                        let gx_cg = first.gradient(x).expect("cg gx").to_vec();
+                        for (a, b) in gx_ord.iter().zip(gx_cg.iter()) {
+                            assert!((a - b).abs() <= 1e-6, "op {op_idx}: {a} vs {b}");
+                        }
+                        let gx_node = first.gradient_node(x).expect("gx node");
+                        let objective = routing_contract(&mut tape, gx_node, &v_vals, mode);
+                        if disable_before_backward {
+                            tape.set_grad_enabled(false);
+                        }
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, true))
+                            .expect("second unary backward");
+                        tape.set_grad_enabled(true);
+                        let hvp = second.gradient(x).expect("unary hvp").to_vec();
+                        let mixed_u = second.gradient(upstream).expect("unary mixed u").to_vec();
+                        let hx_node = second.gradient_node(x).expect("hx node");
+                        let (third_loss, _) = tape.sum(hx_node, mode).expect("third sum");
+                        let third = tape
+                            .backward_with_options(third_loss, routing_options(mode, false))
+                            .expect("third unary backward");
+                        let third_x = if matches!(op_idx, 5 | 10) {
+                            third
+                                .gradient(x)
+                                .map_or_else(|| vec![0.0; 4], <[f64]>::to_vec)
+                        } else {
+                            third.gradient(x).expect("unary third").to_vec()
+                        };
+                        (gx_cg, hvp, mixed_u, third_x)
+                    };
+
+                    let (gx64, hvp64, mu64, th64) = run_case(false);
+                    let (gx32, hvp32, mu32, th32) = run_case(true);
+                    for i in 0..4 {
+                        assert!(
+                            (gx64[i] - gx32[i]).abs() <= 1e-5,
+                            "op {op_idx} first[{i}]: {} vs {}",
+                            gx64[i],
+                            gx32[i]
+                        );
+                        assert!(
+                            (hvp64[i] - hvp32[i]).abs() <= 1e-4,
+                            "op {op_idx} hvp[{i}]: {} vs {}",
+                            hvp64[i],
+                            hvp32[i]
+                        );
+                        assert!(
+                            (mu64[i] - mu32[i]).abs() <= 1e-5,
+                            "op {op_idx} mixed_u[{i}]: {} vs {}",
+                            mu64[i],
+                            mu32[i]
+                        );
+                        assert!(
+                            (th64[i] - th32[i]).abs() <= 1e-3,
+                            "op {op_idx} third[{i}]: {} vs {}",
+                            th64[i],
+                            th32[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_graph_f32_structured_and_binary_helpers_match_f64() {
+        for kind in 0..17 {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for disable_before_backward in [false, true] {
+                    let run_structured = |f32_leaf: bool| -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+                        let mut tape = TensorTape::new();
+                        let x = routing_leaf(&mut tape, &[1.25, 0.75, 1.5, 0.5], &[2, 2], f32_leaf);
+                        let y_partner =
+                            routing_leaf(&mut tape, &[0.5, 1.25, 0.75, 1.5], &[2, 2], f32_leaf);
+                        let out = match kind {
+                            0 => tape.pow_tensor(x, y_partner, mode).expect("pow_tensor"),
+                            1 => tape.tensor_atan2(x, y_partner, mode).expect("atan2").0,
+                            2 => tape.div(x, y_partner, mode).expect("div").0,
+                            3 => tape.matmul(x, y_partner, mode).expect("matmul").0,
+                            4 => {
+                                let x3 = tape.reshape(x, vec![1, 2, 2]).expect("x3");
+                                let y3 = tape.reshape(y_partner, vec![1, 2, 2]).expect("y3");
+                                let b = tape.bmm(x3, y3, mode).expect("bmm").0;
+                                tape.reshape(b, vec![2, 2]).expect("b2")
+                            }
+                            5 => {
+                                let bias = routing_leaf(
+                                    &mut tape,
+                                    &[0.25, -0.5, 0.75, 0.125],
+                                    &[2, 2],
+                                    f32_leaf,
+                                );
+                                tape.addmm(bias, x, y_partner, 0.5, 1.5, mode)
+                                    .expect("addmm")
+                                    .0
+                            }
+                            6 => {
+                                let vec_in = routing_leaf(&mut tape, &[0.5, 1.25], &[2], f32_leaf);
+                                let bias = routing_leaf(&mut tape, &[0.25, -0.5], &[2], f32_leaf);
+                                tape.addmv(bias, x, vec_in, 0.5, 1.5, mode)
+                                    .expect("addmv")
+                                    .0
+                            }
+                            7 => {
+                                let xv = tape.reshape(x, vec![4]).expect("xv");
+                                let yv = tape.reshape(y_partner, vec![4]).expect("yv");
+                                tape.dot(xv, yv, mode).expect("dot").0
+                            }
+                            8 => {
+                                let xv = routing_leaf(&mut tape, &[1.25, 0.75], &[2], f32_leaf);
+                                let yv = routing_leaf(&mut tape, &[0.5, 1.5], &[2], f32_leaf);
+                                let o = tape.outer(xv, yv, mode).expect("outer").0;
+                                let (prod, _) = tape.mul(o, x, mode).expect("outer*x");
+                                prod
+                            }
+                            9 => tape.sum_dim(x, 1, mode).expect("sum_dim").0,
+                            10 => tape.mean_dim(x, 1, mode).expect("mean_dim").0,
+                            11 => tape.var_dim(x, 1, mode).expect("var_dim").0,
+                            12 => tape.std_dim(x, 1, mode).expect("std_dim").0,
+                            13 => tape.norm_dim(x, 2.0, 1, mode).expect("norm_dim").0,
+                            14 => tape.prod_dim(x, 1, mode).expect("prod_dim").0,
+                            15 => {
+                                let cs = tape.cumsum(x, 1, mode).expect("cumsum").0;
+                                tape.cumprod(cs, 1, mode).expect("cumprod").0
+                            }
+                            _ => {
+                                let rep = tape.repeat(x, vec![2, 1]).expect("repeat");
+                                let vals = routing_leaf(&mut tape, &[2.0, 3.0], &[1, 2], f32_leaf);
+                                let ip = tape
+                                    .index_put(rep, vals, &[vec![1.0]], &[2.0, 3.0], true)
+                                    .expect("index_put");
+                                tape.norm(ip, 2.0, mode).expect("norm").0
+                            }
+                        };
+                        let loss = routing_cubic_loss(&mut tape, out, mode);
+                        if disable_before_backward {
+                            tape.set_grad_enabled(false);
+                        }
+                        let first = tape
+                            .backward_with_options(loss, routing_options(mode, true))
+                            .expect("first structured backward");
+                        tape.set_grad_enabled(true);
+                        let gx = first.gradient(x).expect("gx").to_vec();
+                        let gx_node = first.gradient_node(x).expect("gx_node");
+                        let objective =
+                            routing_contract(&mut tape, gx_node, &[0.5, -0.25, 0.75, 1.0], mode);
+                        if disable_before_backward {
+                            tape.set_grad_enabled(false);
+                        }
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, true))
+                            .expect("second structured backward");
+                        tape.set_grad_enabled(true);
+                        let hvp = second.gradient(x).expect("hvp").to_vec();
+                        let hx_node = second.gradient_node(x).expect("hx_node");
+                        let (third_loss, _) = tape.sum(hx_node, mode).expect("third_loss");
+                        let third = tape
+                            .backward_with_options(third_loss, routing_options(mode, false))
+                            .expect("third structured backward");
+                        let third_x = third.gradient(x).expect("third_x").to_vec();
+                        (gx, hvp, third_x)
+                    };
+
+                    let (gx64, hvp64, th64) = run_structured(false);
+                    let (gx32, hvp32, th32) = run_structured(true);
+                    for i in 0..4 {
+                        assert!(
+                            (gx64[i] - gx32[i]).abs() <= 1e-4,
+                            "kind {kind} gx[{i}]: {} vs {}",
+                            gx64[i],
+                            gx32[i]
+                        );
+                        assert!(
+                            (hvp64[i] - hvp32[i]).abs() <= 1e-3,
+                            "kind {kind} hvp[{i}]: {} vs {}",
+                            hvp64[i],
+                            hvp32[i]
+                        );
+                        assert!(
+                            (th64[i] - th32[i]).abs() <= 1e-2,
+                            "kind {kind} third[{i}]: {} vs {}",
+                            th64[i],
+                            th32[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_f32_saved_tensor_version_checks_reject_mutation_before_second_backward() {
+        for f32_leaf in [false, true] {
+            for kind in 0..3 {
+                let mode = ExecutionMode::Strict;
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(&mut tape, &[1.25, 0.75, 1.5, 0.5], &[2, 2], f32_leaf);
+                let y = routing_leaf(&mut tape, &[0.5, 1.25, 0.75, 1.5], &[2, 2], f32_leaf);
+                let out = match kind {
+                    0 => tape.pow_tensor(x, y, mode).expect("pow_tensor"),
+                    1 => tape.div(x, y, mode).expect("div").0,
+                    _ => {
+                        let (xy, _) = tape.mul(x, y, mode).expect("mul");
+                        tape.mul(xy, x, mode).expect("xy*x").0
+                    }
+                };
+                let (loss, _) = tape.sum(out, mode).expect("sum");
+                let first = tape
+                    .backward_with_options(loss, routing_options(mode, true))
+                    .expect("first backward");
+                let gx_node = first.gradient_node(x).expect("gx_node");
+                let (objective, _) = tape.sum(gx_node, mode).expect("objective");
+
+                let target_to_mutate = y;
+                if f32_leaf {
+                    tape.update_tensor_values_f32(target_to_mutate, vec![8.0f32, 9.0, 10.0, 11.0])
+                        .expect("in-place f32 mutation after first backward");
+                } else {
+                    tape.update_tensor_values(target_to_mutate, vec![8.0, 9.0, 10.0, 11.0])
+                        .expect("in-place f64 mutation after first backward");
+                }
+                let err = tape
+                    .backward_with_options(objective, routing_options(mode, false))
+                    .expect_err("second backward must reject mutated saved tensor");
+                assert!(
+                    matches!(
+                        err,
+                        AutogradError::BorrowedInputVersionMismatch { node, .. }
+                            if node == target_to_mutate
+                    ),
+                    "kind {kind} (f32={f32_leaf}): expected BorrowedInputVersionMismatch, got {err:?}"
+                );
+            }
+        }
     }
 }
