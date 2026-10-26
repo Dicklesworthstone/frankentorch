@@ -246,6 +246,27 @@ mod gemm {
         m.div_ceil(threads).max(MIN_BLOCK_ROWS)
     }
 
+    fn should_use_2d_dgemm(m: usize, n: usize) -> bool {
+        if n < 2 * MIN_BLOCK_COLS {
+            return false;
+        }
+        if super::matrix_exp_fast_kernel() {
+            let threads = rayon::current_num_threads().max(1);
+            let (p, q) = tile_grid(threads);
+            let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
+            let nb = if crate::gemm_tile_col_floor_adaptive() {
+                n.div_ceil(q).max(MIN_BLOCK_COLS_ADAPTIVE)
+            } else {
+                n.div_ceil(q).max(MIN_BLOCK_COLS)
+            };
+            let tiles_2d = m.div_ceil(mb) * n.div_ceil(nb);
+            let tiles_1d = m.div_ceil(block_rows(m));
+            tiles_2d >= tiles_1d.min(threads)
+        } else {
+            true
+        }
+    }
+
     fn should_use_f32_reused_output_2d_tiling(m: usize, k: usize, n: usize) -> bool {
         n >= 2 * MIN_BLOCK_COLS
             && k > F32_2D_MAX_K
@@ -268,7 +289,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
             dgemm_col_parallel(m, k, n, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS {
+            if should_use_2d_dgemm(m, n) {
                 // Square/wide-enough: 2-D tiling avoids the row-split's full-B
                 // re-streaming per thread (memory-bandwidth bound).
                 dgemm_2d_parallel(m, k, n, a, b, c);
@@ -305,7 +326,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) {
             dgemm_col_parallel_scaled(m, k, n, alpha, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS {
+            if should_use_2d_dgemm(m, n) {
                 dgemm_2d_parallel_scaled(m, k, n, alpha, a, b, c);
             } else {
                 let br = block_rows(m);
@@ -2767,7 +2788,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) {
             sgemm_col_parallel(m, k, n, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS && k <= F32_2D_MAX_K {
+            if should_use_2d_dgemm(m, n) && k <= F32_2D_MAX_K {
                 // Bandwidth-bound regime: 2-D tiling cuts the row-split's full-B
                 // re-streaming per thread (direct-write, bit-exact). K-gated so the
                 // compute-bound large-K case keeps the row split.
@@ -2803,7 +2824,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) {
             sgemm_col_parallel_scaled(m, k, n, alpha, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS && k <= F32_2D_MAX_K {
+            if should_use_2d_dgemm(m, n) && k <= F32_2D_MAX_K {
                 sgemm_2d_parallel_scaled(m, k, n, alpha, a, b, c);
             } else {
                 let br = block_rows(m);
@@ -30708,6 +30729,19 @@ pub fn matrix_exp_batched_contiguous_f32(
     Ok(out)
 }
 
+static MATRIX_EXP_FAST_KERNEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_matrix_exp_fast_kernel(on: bool) -> bool {
+    MATRIX_EXP_FAST_KERNEL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn matrix_exp_fast_kernel() -> bool {
+    MATRIX_EXP_FAST_KERNEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
@@ -30723,6 +30757,188 @@ pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
     }
 
     let offset = meta.storage_offset();
+    if matrix_exp_fast_kernel() {
+        let nn = n * n;
+        let src = &data[offset..offset + nn];
+        let mut col_sums = vec![0.0f64; n];
+        for row in src.chunks_exact(n) {
+            for (cs, &v) in col_sums.iter_mut().zip(row.iter()) {
+                *cs += v.abs();
+            }
+        }
+        let norm = col_sums.into_iter().fold(0.0f64, f64::max);
+        let s = if norm > 0.5 {
+            (norm / 0.5).log2().ceil() as u32
+        } else {
+            0
+        };
+        let scale = 0.5f64.powi(s as i32);
+        let b: Vec<f64> = if s == 0 {
+            src.to_vec()
+        } else {
+            src.iter().map(|&v| v * scale).collect()
+        };
+
+        // Paterson-Stockmeyer (q = 4) evaluation of the degree-12 Taylor polynomial
+        //   P_12(B) = sum_{k=0}^{12} B^k / k!
+        // using 5 n x n GEMMs (B^2, B^3, B^4, and two Horner steps in B^4) instead of
+        // 12 sequential Horner GEMMs, with adaptive lower degree (0..4 GEMMs) when s == 0
+        // and ||B||_1 is small enough that truncation error is strictly below 1e-17
+        // (Bader, Blanes & Casas 2019 Table 3 thresholds). frankentorch-q8y1p.
+        const C: [f64; 13] = [
+            1.0,
+            1.0,
+            1.0 / 2.0,
+            1.0 / 6.0,
+            1.0 / 24.0,
+            1.0 / 120.0,
+            1.0 / 720.0,
+            1.0 / 5040.0,
+            1.0 / 40_320.0,
+            1.0 / 362_880.0,
+            1.0 / 3_628_800.0,
+            1.0 / 39_916_800.0,
+            1.0 / 479_001_600.0,
+        ];
+        let scaled_norm = norm * scale;
+        let mut u = vec![0.0f64; nn];
+        let mut temp = vec![0.0f64; nn];
+        if s == 0 && scaled_norm == 0.0 && b.iter().all(|&v| v == 0.0) {
+            for i in 0..n {
+                u[i * n + i] = 1.0;
+            }
+            return Ok(u);
+        } else if s == 0 && scaled_norm <= 2.5e-8 {
+            gemm::dgemm(n, n, n, &b, &b, &mut temp);
+            for ((&v1, &v2), dst) in b.iter().zip(temp.iter()).zip(u.iter_mut()) {
+                *dst = C[2].mul_add(v2, v1);
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else if s == 0 && scaled_norm <= 3.4e-4 {
+            let mut b2 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            for ((&v1, &v2), dst) in b.iter().zip(b2.iter()).zip(u.iter_mut()) {
+                *dst = C[3].mul_add(v1, C[4] * v2);
+            }
+            for i in 0..n {
+                u[i * n + i] += C[2];
+            }
+            gemm::dgemm(n, n, n, &u, &b2, &mut temp);
+            for ((&v1, &t), dst) in b.iter().zip(temp.iter()).zip(u.iter_mut()) {
+                *dst = v1 + t;
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else if s == 0 && scaled_norm <= 9.0e-3 {
+            let mut b2 = vec![0.0f64; nn];
+            let mut b3 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            gemm::dgemm(n, n, n, &b2, &b, &mut b3);
+            for (((&v1, &v2), &v3), dst) in
+                b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
+            {
+                *dst = C[4].mul_add(v1, C[5].mul_add(v2, C[6] * v3));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[3];
+            }
+            gemm::dgemm(n, n, n, &u, &b3, &mut temp);
+            for (((&v1, &v2), &t), dst) in
+                b.iter().zip(b2.iter()).zip(temp.iter()).zip(u.iter_mut())
+            {
+                *dst = v1 + C[2].mul_add(v2, t);
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else if s == 0 && scaled_norm <= 8.9e-2 {
+            let mut b2 = vec![0.0f64; nn];
+            let mut b3 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            gemm::dgemm(n, n, n, &b2, &b, &mut b3);
+            for (((&v1, &v2), &v3), dst) in
+                b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
+            {
+                *dst = C[7].mul_add(v1, C[8].mul_add(v2, C[9] * v3));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[6];
+            }
+            gemm::dgemm(n, n, n, &u, &b3, &mut temp);
+            for (((&v1, &v2), &t), dst) in
+                b.iter().zip(b2.iter()).zip(temp.iter()).zip(u.iter_mut())
+            {
+                *dst = C[4].mul_add(v1, C[5].mul_add(v2, t));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[3];
+            }
+            gemm::dgemm(n, n, n, &u, &b3, &mut temp);
+            for (((&v1, &v2), &t), dst) in
+                b.iter().zip(b2.iter()).zip(temp.iter()).zip(u.iter_mut())
+            {
+                *dst = v1 + C[2].mul_add(v2, t);
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else {
+            let mut b2 = vec![0.0f64; nn];
+            let mut b3 = vec![0.0f64; nn];
+            let mut b4 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            gemm::dgemm(n, n, n, &b2, &b, &mut b3);
+            gemm::dgemm(n, n, n, &b2, &b2, &mut b4);
+            for ((((&v1, &v2), &v3), &v4), dst) in b
+                .iter()
+                .zip(b2.iter())
+                .zip(b3.iter())
+                .zip(b4.iter())
+                .zip(u.iter_mut())
+            {
+                *dst = C[9].mul_add(v1, C[10].mul_add(v2, C[11].mul_add(v3, C[12] * v4)));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[8];
+            }
+            gemm::dgemm(n, n, n, &u, &b4, &mut temp);
+            for ((((&v1, &v2), &v3), &t), dst) in b
+                .iter()
+                .zip(b2.iter())
+                .zip(b3.iter())
+                .zip(temp.iter())
+                .zip(u.iter_mut())
+            {
+                *dst = C[5].mul_add(v1, C[6].mul_add(v2, C[7].mul_add(v3, t)));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[4];
+            }
+            gemm::dgemm(n, n, n, &u, &b4, &mut temp);
+            for ((((&v1, &v2), &v3), &t), dst) in b
+                .iter()
+                .zip(b2.iter())
+                .zip(b3.iter())
+                .zip(temp.iter())
+                .zip(u.iter_mut())
+            {
+                *dst = v1 + C[2].mul_add(v2, C[3].mul_add(v3, t));
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        }
+
+        for _ in 0..s {
+            gemm::dgemm(n, n, n, &u, &u, &mut temp);
+            std::mem::swap(&mut u, &mut temp);
+        }
+
+        return Ok(u);
+    }
     let mut a = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -30813,6 +31029,95 @@ pub fn matrix_exp_contiguous_f32(data: &[f32], meta: &TensorMeta) -> Result<Vec<
     }
 
     let offset = meta.storage_offset();
+    if matrix_exp_fast_kernel() {
+        let nn = n * n;
+        let src = &data[offset..offset + nn];
+        let mut col_sums = vec![0.0f32; n];
+        for row in src.chunks_exact(n) {
+            for (cs, &v) in col_sums.iter_mut().zip(row.iter()) {
+                *cs += v.abs();
+            }
+        }
+        let norm = col_sums.into_iter().fold(0.0f32, f32::max);
+        let s = if norm > 0.5 {
+            (norm / 0.5).log2().ceil() as u32
+        } else {
+            0
+        };
+        let scale = 0.5f32.powi(s as i32);
+        let b: Vec<f32> = if s == 0 {
+            src.to_vec()
+        } else {
+            src.iter().map(|&v| v * scale).collect()
+        };
+
+        const C: [f32; 13] = [
+            1.0,
+            1.0,
+            1.0 / 2.0,
+            1.0 / 6.0,
+            1.0 / 24.0,
+            1.0 / 120.0,
+            1.0 / 720.0,
+            1.0 / 5040.0,
+            1.0 / 40_320.0,
+            1.0 / 362_880.0,
+            1.0 / 3_628_800.0,
+            1.0 / 39_916_800.0,
+            1.0 / 479_001_600.0,
+        ];
+        let mut b2 = vec![0.0f32; nn];
+        let mut b3 = vec![0.0f32; nn];
+        let mut b4 = vec![0.0f32; nn];
+        let mut u = vec![0.0f32; nn];
+        let mut temp = vec![0.0f32; nn];
+        gemm::sgemm(n, n, n, &b, &b, &mut b2);
+        gemm::sgemm(n, n, n, &b2, &b, &mut b3);
+        gemm::sgemm(n, n, n, &b2, &b2, &mut b4);
+        for ((((&v1, &v2), &v3), &v4), dst) in b
+            .iter()
+            .zip(b2.iter())
+            .zip(b3.iter())
+            .zip(b4.iter())
+            .zip(u.iter_mut())
+        {
+            *dst = C[9].mul_add(v1, C[10].mul_add(v2, C[11].mul_add(v3, C[12] * v4)));
+        }
+        for i in 0..n {
+            u[i * n + i] += C[8];
+        }
+        gemm::sgemm(n, n, n, &u, &b4, &mut temp);
+        for ((((&v1, &v2), &v3), &t), dst) in b
+            .iter()
+            .zip(b2.iter())
+            .zip(b3.iter())
+            .zip(temp.iter())
+            .zip(u.iter_mut())
+        {
+            *dst = C[5].mul_add(v1, C[6].mul_add(v2, C[7].mul_add(v3, t)));
+        }
+        for i in 0..n {
+            u[i * n + i] += C[4];
+        }
+        gemm::sgemm(n, n, n, &u, &b4, &mut temp);
+        for ((((&v1, &v2), &v3), &t), dst) in b
+            .iter()
+            .zip(b2.iter())
+            .zip(b3.iter())
+            .zip(temp.iter())
+            .zip(u.iter_mut())
+        {
+            *dst = v1 + C[2].mul_add(v2, C[3].mul_add(v3, t));
+        }
+        for i in 0..n {
+            u[i * n + i] += 1.0;
+        }
+        for _ in 0..s {
+            gemm::sgemm(n, n, n, &u, &u, &mut temp);
+            std::mem::swap(&mut u, &mut temp);
+        }
+        return Ok(u);
+    }
     let mut a = vec![0.0f32; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -31581,6 +31886,212 @@ pub fn tred2_stage_take_ns() -> (u64, u64) {
     )
 }
 
+static EIGH_FAST_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_eigh_fast_kernel(on: bool) -> bool {
+    EIGH_FAST_KERNEL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn eigh_fast_kernel() -> bool {
+    EIGH_FAST_KERNEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compute a contiguous chunk `out[0..len]` of the packed lower-triangular symmetric matvec
+/// `out[off] = sum_{k=0..=l} A(j_base + off, k) * row_i_ro[k]` using 16-wide (`4 x f64x4`)
+/// independent accumulators. Preserves each output element's strict ascending `k = 0..=l`
+/// accumulation order so it is 100% bit-for-bit identical to the scalar and 4-wide loops.
+fn packed_symmetric_ggs_chunk_f64(
+    j_base: usize,
+    out: &mut [f64],
+    prev_ro: &[f64],
+    row_i_ro: &[f64],
+) {
+    let l = row_i_ro.len().saturating_sub(1);
+    let len = out.len();
+    let mut off = 0usize;
+    while off + 16 <= len {
+        let j0 = j_base + off;
+        let j15 = j0 + 15;
+        let mut acc0 = wide::f64x4::ZERO;
+        let mut acc1 = wide::f64x4::ZERO;
+        let mut acc2 = wide::f64x4::ZERO;
+        let mut acc3 = wide::f64x4::ZERO;
+        let mut row_starts = [0usize; 16];
+        for (t, rs) in row_starts.iter_mut().enumerate() {
+            *rs = lower_packed_index(j0 + t, 0);
+        }
+        let mut row_k_start = 0usize;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(j15 + 1) {
+            let rk = wide::f64x4::splat(rik);
+            let mut lanes = [0.0f64; 16];
+            for t in 0..16 {
+                let j = j0 + t;
+                lanes[t] = if k <= j {
+                    prev_ro[row_starts[t] + k]
+                } else {
+                    prev_ro[row_k_start + j]
+                };
+            }
+            acc0 += wide::f64x4::from([lanes[0], lanes[1], lanes[2], lanes[3]]) * rk;
+            acc1 += wide::f64x4::from([lanes[4], lanes[5], lanes[6], lanes[7]]) * rk;
+            acc2 += wide::f64x4::from([lanes[8], lanes[9], lanes[10], lanes[11]]) * rk;
+            acc3 += wide::f64x4::from([lanes[12], lanes[13], lanes[14], lanes[15]]) * rk;
+            row_k_start += k + 1;
+        }
+        let mut row_k_j0 = row_k_start + j0;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(l + 1).skip(j15 + 1) {
+            let p = &prev_ro[row_k_j0..row_k_j0 + 16];
+            let rk = wide::f64x4::splat(rik);
+            acc0 += wide::f64x4::from([p[0], p[1], p[2], p[3]]) * rk;
+            acc1 += wide::f64x4::from([p[4], p[5], p[6], p[7]]) * rk;
+            acc2 += wide::f64x4::from([p[8], p[9], p[10], p[11]]) * rk;
+            acc3 += wide::f64x4::from([p[12], p[13], p[14], p[15]]) * rk;
+            row_k_j0 += k + 1;
+        }
+        out[off..off + 4].copy_from_slice(&acc0.to_array());
+        out[off + 4..off + 8].copy_from_slice(&acc1.to_array());
+        out[off + 8..off + 12].copy_from_slice(&acc2.to_array());
+        out[off + 12..off + 16].copy_from_slice(&acc3.to_array());
+        off += 16;
+    }
+    while off + 4 <= len {
+        let j0 = j_base + off;
+        let j3 = j0 + 3;
+        let mut acc = wide::f64x4::ZERO;
+        let mut row_k_start = 0usize;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(j3 + 1) {
+            let mut lane = [0.0f64; 4];
+            for (t, slot) in lane.iter_mut().enumerate() {
+                let j = j0 + t;
+                *slot = if k <= j {
+                    prev_ro[lower_packed_index(j, 0) + k]
+                } else {
+                    prev_ro[row_k_start + j]
+                };
+            }
+            acc += wide::f64x4::from(lane) * wide::f64x4::splat(rik);
+            row_k_start += k + 1;
+        }
+        let mut row_k_j0 = row_k_start + j0;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(l + 1).skip(j3 + 1) {
+            let p = &prev_ro[row_k_j0..row_k_j0 + 4];
+            acc += wide::f64x4::from([p[0], p[1], p[2], p[3]]) * wide::f64x4::splat(rik);
+            row_k_j0 += k + 1;
+        }
+        out[off..off + 4].copy_from_slice(&acc.to_array());
+        off += 4;
+    }
+    while off < len {
+        let j = j_base + off;
+        let mut gg = 0.0;
+        let row_j_start = lower_packed_index(j, 0);
+        let row_j = &prev_ro[row_j_start..=row_j_start + j];
+        for (k, &rik) in row_i_ro.iter().enumerate().take(j + 1) {
+            gg += row_j[k] * rik;
+        }
+        let mut lower_col_offset = lower_packed_index(j + 1, j);
+        for (k, &rik) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1) {
+            gg += prev_ro[lower_col_offset] * rik;
+            lower_col_offset += k + 1;
+        }
+        out[off] = gg;
+        off += 1;
+    }
+}
+
+fn packed_symmetric_ggs_into_f64(
+    out: &mut [f64],
+    prev_ro: &[f64],
+    row_i_ro: &[f64],
+    par_min_l: usize,
+) {
+    let l = row_i_ro.len().saturating_sub(1);
+    let out = &mut out[..=l];
+    let threads = rayon::current_num_threads().max(1);
+    if l < par_min_l || threads <= 1 {
+        packed_symmetric_ggs_chunk_f64(0, out, prev_ro, row_i_ro);
+    } else {
+        let chunk_len = (((l + 1).div_ceil(threads * 2)).max(64) + 15) & !15;
+        out.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                packed_symmetric_ggs_chunk_f64(ci * chunk_len, chunk, prev_ro, row_i_ro);
+            });
+    }
+}
+
+fn packed_symmetric_rank2_update_f64(
+    l: usize,
+    previous_rows: &mut [f64],
+    row_i_ro: &[f64],
+    e_ro: &[f64],
+    par_min_l: usize,
+) {
+    let threads = rayon::current_num_threads().max(1);
+    if l < par_min_l || threads <= 1 {
+        let mut offset = 0usize;
+        for j in 0..=l {
+            let row_len = j + 1;
+            let row_j = &mut previous_rows[offset..offset + row_len];
+            offset += row_len;
+            let fj = row_i_ro[j];
+            let ggj = e_ro[j];
+            for ((dst, &ek), &rik) in row_j
+                .iter_mut()
+                .zip(e_ro[..row_len].iter())
+                .zip(row_i_ro[..row_len].iter())
+            {
+                *dst -= fj * ek + ggj * rik;
+            }
+        }
+    } else {
+        let num_bands = (threads * 2).min(l + 1);
+        let total_elems = (l + 1) * (l + 2) / 2;
+        let mut bands: Vec<(usize, usize, &mut [f64])> = Vec::with_capacity(num_bands);
+        let mut rest = &mut previous_rows[..total_elems];
+        let mut j_start = 0usize;
+        for b in 0..num_bands {
+            if j_start > l {
+                break;
+            }
+            let j_end = if b + 1 == num_bands {
+                l + 1
+            } else {
+                let frac = ((b + 1) as f64 / num_bands as f64).sqrt();
+                let target = (frac * (l + 1) as f64).round() as usize;
+                target.clamp(j_start + 1, l + 1)
+            };
+            let elem_start = lower_packed_index(j_start, 0);
+            let elem_end = lower_packed_index(j_end, 0);
+            let (band_slice, tail) = rest.split_at_mut(elem_end - elem_start);
+            bands.push((j_start, j_end, band_slice));
+            rest = tail;
+            j_start = j_end;
+        }
+        bands
+            .into_par_iter()
+            .for_each(|(j_start, j_end, band_slice)| {
+                let mut offset = 0usize;
+                for j in j_start..j_end {
+                    let row_len = j + 1;
+                    let row_j = &mut band_slice[offset..offset + row_len];
+                    offset += row_len;
+                    let fj = row_i_ro[j];
+                    let ggj = e_ro[j];
+                    for ((dst, &ek), &rik) in row_j
+                        .iter_mut()
+                        .zip(e_ro[..row_len].iter())
+                        .zip(row_i_ro[..row_len].iter())
+                    {
+                        *dst -= fj * ek + ggj * rik;
+                    }
+                }
+            });
+    }
+}
+
 /// The reduction with its parallel gate exposed, so a same-process A/B can measure the
 /// serial and gated-parallel arms at one thread width instead of inferring across runs.
 fn eigh_tred2_reduce_packed_full_gated(
@@ -31636,6 +32147,34 @@ fn eigh_tred2_reduce_packed_full_gated(
                 // planes. Inner parallelism on planes that small would wreck it.
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
+                if eigh_fast_kernel() {
+                    let __t_ggs = std::time::Instant::now();
+                    packed_symmetric_ggs_into_f64(e, prev_ro, row_i_ro, par_min_l);
+                    TRED2_GGS_NS
+                        .fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                    f = 0.0;
+                    for j in 0..=l {
+                        scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
+                        e[j] /= h;
+                        f += e[j] * row_i[j];
+                    }
+                    let hh = f / (h + h);
+                    for j in 0..=l {
+                        e[j] -= hh * row_i[j];
+                    }
+                    let __t_upd = std::time::Instant::now();
+                    packed_symmetric_rank2_update_f64(
+                        l,
+                        previous_rows,
+                        row_i_ro,
+                        &e[..=l],
+                        par_min_l,
+                    );
+                    TRED2_UPD_NS
+                        .fetch_add(__t_upd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                    d[i] = h;
+                    continue;
+                }
                 let __t_ggs = std::time::Instant::now();
                 let grouped_ggs: Option<Vec<f64>> = if tred2_grouped_ggs() && l >= 8 {
                     // FOUR OUTPUTS IN FLIGHT — `frankentorch-wjrqt`, the item-254 lever applied
@@ -32002,6 +32541,36 @@ fn eigh_tred2_reduce_packed_blocked(
                         cswap[nb..].copy_from_slice(&c[..nb]);
                     }
                     let pm: &[f64] = &pmat;
+                    if eigh_fast_kernel() {
+                        packed_symmetric_ggs_into_f64(e, prev_ro, row_i_ro, par_min_l);
+                        if s > 0 {
+                            for (j, ej) in e.iter_mut().enumerate().take(l + 1) {
+                                *ej -= tred2_dot(&pm[j * m..(j + 1) * m], &cswap);
+                            }
+                        }
+                        TRED2_GGS_NS
+                            .fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                        f = 0.0;
+                        for j in 0..=l {
+                            scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
+                            e[j] /= h;
+                            f += e[j] * row_i[j];
+                        }
+                        let hh = f / (h + h);
+                        for j in 0..=l {
+                            e[j] -= hh * row_i[j];
+                        }
+                        for j in 0..=l {
+                            let vj = row_i[j];
+                            let wj = e[j];
+                            pmat[j * m + s] = vj;
+                            pmat[j * m + nb + s] = wj;
+                            qmat[j * m + s] = wj;
+                            qmat[j * m + nb + s] = vj;
+                        }
+                        d[i] = h;
+                        continue;
+                    }
                     let ggs_at = |j: usize| -> f64 {
                         let mut gg = 0.0;
                         let row_j_start = lower_packed_index(j, 0);
@@ -32476,6 +33045,33 @@ fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
                 row_i[l] = f - g;
                 f = 0.0;
                 observer.finished_reflector(reflector_started);
+                if eigh_fast_kernel() {
+                    let par_min_l = tred2_par_min_l();
+                    let row_i_ro: &[f64] = &row_i[..=l];
+                    let prev_ro: &[f64] = &previous_rows[..];
+                    let ggs_started = observer.started();
+                    packed_symmetric_ggs_into_f64(e, prev_ro, row_i_ro, par_min_l);
+                    for j in 0..=l {
+                        e[j] /= h;
+                        f += e[j] * row_i_ro[j];
+                    }
+                    observer.finished_ggs(ggs_started);
+                    let update_started = observer.started();
+                    let hh = f / (h + h);
+                    for j in 0..=l {
+                        e[j] -= hh * row_i_ro[j];
+                    }
+                    packed_symmetric_rank2_update_f64(
+                        l,
+                        previous_rows,
+                        row_i_ro,
+                        &e[..=l],
+                        par_min_l,
+                    );
+                    observer.finished_update(update_started);
+                    d[i] = h;
+                    continue;
+                }
                 let ggs_started = observer.started();
                 // `e` is overwritten for every j in 0..=l before the update.
                 // Reusing it for raw GGS results avoids one short-lived allocation and
@@ -71468,6 +72064,90 @@ mod tests {
                 }
                 let want = if i == j { 1.0 } else { 0.0 };
                 assert!((s - want).abs() < 1e-3, "expm(A)expm(-A)[{i},{j}]={s}");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_exp_fast_kernel_matches_shipped_across_scales_and_sizes() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &n in &[4usize, 17, 64, 256] {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            for &scale in &[0.0f64, 1e-10, 1e-5, 3e-3, 4e-2, 0.25, 2.0] {
+                let a: Vec<f64> = (0..n * n)
+                    .map(|idx| {
+                        let r = idx / n;
+                        let c = idx % n;
+                        let base = ((((r + 2) * (c + 3)) % 17) as f64 - 8.0) * 0.05
+                            + if r == c { 3.0 } else { 0.0 };
+                        base * scale / (n as f64)
+                    })
+                    .collect();
+                let prev = super::set_matrix_exp_fast_kernel(false);
+                let slow = super::matrix_exp_contiguous_f64(&a, &meta).expect("slow matrix_exp");
+                super::set_matrix_exp_fast_kernel(true);
+                let fast = super::matrix_exp_contiguous_f64(&a, &meta).expect("fast matrix_exp");
+                super::set_matrix_exp_fast_kernel(prev);
+                assert_mat_approx_eq(&fast, &slow, 1e-12, "matrix_exp_fast_kernel vs slow");
+            }
+        }
+    }
+
+    #[test]
+    fn eigh_fast_kernel_matches_shipped_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &n in &[9usize, 37, 128, 400] {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let mut a = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..=r {
+                    let v = ((((r + 2) * (c + 3) + (r * c) % 29) % 41) as f64 - 20.0) * 0.05
+                        + if r == c { 5.0 } else { 0.0 };
+                    a[r * n + c] = v;
+                    a[c * n + r] = v;
+                }
+            }
+            let prev = super::set_eigh_fast_kernel(false);
+            let slow_val = super::eigvalsh_contiguous_f64(&a, &meta).expect("slow eigvalsh");
+            let slow_eigh = super::eigh_contiguous_f64(&a, &meta).expect("slow eigh");
+            super::set_eigh_fast_kernel(true);
+            let fast_val = super::eigvalsh_contiguous_f64(&a, &meta).expect("fast eigvalsh");
+            let fast_eigh = super::eigh_contiguous_f64(&a, &meta).expect("fast eigh");
+            super::set_eigh_fast_kernel(prev);
+            for (i, (&s, &f)) in slow_val.iter().zip(fast_val.iter()).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    f.to_bits(),
+                    "eigvalsh_fast_kernel diverged at n={n} idx={i}: {s} vs {f}"
+                );
+            }
+            for (i, (&s, &f)) in slow_eigh
+                .eigenvalues
+                .iter()
+                .zip(fast_eigh.eigenvalues.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    s.to_bits(),
+                    f.to_bits(),
+                    "eigh_fast_kernel eigenvalues diverged at n={n} idx={i}: {s} vs {f}"
+                );
+            }
+            for (i, (&s, &f)) in slow_eigh
+                .eigenvectors
+                .iter()
+                .zip(fast_eigh.eigenvectors.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    s.to_bits(),
+                    f.to_bits(),
+                    "eigh_fast_kernel eigenvectors diverged at n={n} idx={i}: {s} vs {f}"
+                );
             }
         }
     }

@@ -288,6 +288,14 @@ struct Arm {
     /// `frankentorch-valnx`: whether `cholesky` uses the bit-exact 4-row TRSM + `dsyrk_lower_sub_into`
     /// fast kernel path. `FT_CHOL_FAST=0,1,0`.
     chol_fast: Option<bool>,
+    /// `frankentorch-q8y1p`: whether `matrix_exp` uses the Paterson-Stockmeyer degree-12 Taylor
+    /// evaluation + 2D-vs-1D GEMM saturation gate (`Some(true)`) or the 12-GEMM Horner path
+    /// (`Some(false)`). `FT_EXPM_FAST=0,1,0`.
+    expm_fast: Option<bool>,
+    /// `frankentorch-wjrqt` / `frankentorch-mdsmm`: whether `eigh` and `eigvalsh` use the bit-exact
+    /// 16-wide (`4 x f64x4`) grouped GGS + multi-threaded equal-area band rank-2 update fast path.
+    /// `FT_EIGH_FAST=0,1,0`.
+    eigh_fast: Option<bool>,
 }
 
 fn arm_label(arm: Arm, op: LinalgOp) -> String {
@@ -433,6 +441,16 @@ fn arm_label(arm: Arm, op: LinalgOp) -> String {
             Some(false) => "/cholLEGACY",
             None => "",
         }
+        + match arm.expm_fast {
+            Some(true) => "/expmFAST",
+            Some(false) => "/expmLEGACY",
+            None => "",
+        }
+        + match arm.eigh_fast {
+            Some(true) => "/eighFAST",
+            Some(false) => "/eighLEGACY",
+            None => "",
+        }
 }
 
 /// Deterministic and diagonally dominant, built by the SAME closed form on both arms so the
@@ -551,6 +569,8 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         .map(ft_kernel_cpu::bidiag_form_q_blocked_set);
     let previous_lu_fast = arm.lu_fast.map(ft_kernel_cpu::set_lu_fast_kernel);
     let previous_chol_fast = arm.chol_fast.map(ft_kernel_cpu::set_cholesky_fast_kernel);
+    let previous_expm_fast = arm.expm_fast.map(ft_kernel_cpu::set_matrix_exp_fast_kernel);
+    let previous_eigh_fast = arm.eigh_fast.map(ft_kernel_cpu::set_eigh_fast_kernel);
     let previous_panel = ft_kernel_cpu::bidiag_panel_output_blocked_set(arm.panel_output_blocked);
     let previous_replay = ft_kernel_cpu::set_svd_replay_transposed(arm.replay_transposed);
     let previous_ggs = ft_kernel_cpu::set_tred2_grouped_ggs(arm.grouped_ggs);
@@ -646,6 +666,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         if let Some(v) = previous_chol_fast {
             ft_kernel_cpu::set_cholesky_fast_kernel(v);
         }
+        if let Some(v) = previous_expm_fast {
+            ft_kernel_cpu::set_matrix_exp_fast_kernel(v);
+        }
+        if let Some(v) = previous_eigh_fast {
+            ft_kernel_cpu::set_eigh_fast_kernel(v);
+        }
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
         ft_kernel_cpu::set_tred2_grouped_ggs(previous_ggs);
@@ -720,6 +746,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
         }
         if let Some(v) = previous_chol_fast {
             ft_kernel_cpu::set_cholesky_fast_kernel(v);
+        }
+        if let Some(v) = previous_expm_fast {
+            ft_kernel_cpu::set_matrix_exp_fast_kernel(v);
+        }
+        if let Some(v) = previous_eigh_fast {
+            ft_kernel_cpu::set_eigh_fast_kernel(v);
         }
         ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
         ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
@@ -868,6 +900,12 @@ fn ft_one(n: usize, data: &[f64], arm: Arm, op: LinalgOp) -> (f64, f64) {
     }
     if let Some(v) = previous_chol_fast {
         ft_kernel_cpu::set_cholesky_fast_kernel(v);
+    }
+    if let Some(v) = previous_expm_fast {
+        ft_kernel_cpu::set_matrix_exp_fast_kernel(v);
+    }
+    if let Some(v) = previous_eigh_fast {
+        ft_kernel_cpu::set_eigh_fast_kernel(v);
     }
     ft_kernel_cpu::bidiag_panel_output_blocked_set(previous_panel);
     ft_kernel_cpu::set_svd_replay_transposed(previous_replay);
@@ -1170,6 +1208,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         Err(_) => vec![None],
     };
+    let expm_fasts: Vec<Option<bool>> = match std::env::var("FT_EXPM_FAST") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
+    let eigh_fasts: Vec<Option<bool>> = match std::env::var("FT_EIGH_FAST") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|t| match t.trim() {
+                "1" => Some(Some(true)),
+                "0" => Some(Some(false)),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => vec![None],
+    };
     let qrcs: Vec<Option<bool>> = match std::env::var("FT_QRC") {
         Ok(v) => v
             .split(',')
@@ -1348,6 +1408,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             && !form_q_blockeds.is_empty()
             && !lu_fasts.is_empty()
             && !chol_fasts.is_empty()
+            && !expm_fasts.is_empty()
+            && !eigh_fasts.is_empty()
             && !panel_outputs.is_empty()
             && !gate_hoists.is_empty()
             && !qtfs.is_empty()
@@ -1426,6 +1488,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         form_q_blocked: None,
                                         lu_fast: None,
                                         chol_fast: None,
+                                        expm_fast: None,
+                                        eigh_fast: None,
                                     });
                                     }
                                     }
@@ -1525,6 +1589,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chol_fasts
                 .iter()
                 .map(move |&chol_fast| Arm { chol_fast, ..arm })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            expm_fasts
+                .iter()
+                .map(move |&expm_fast| Arm { expm_fast, ..arm })
+        })
+        .collect();
+    arms = arms
+        .into_iter()
+        .flat_map(|arm| {
+            eigh_fasts
+                .iter()
+                .map(move |&eigh_fast| Arm { eigh_fast, ..arm })
         })
         .collect();
     // FT_VALUES_ARM=1 appends ONE extra arm running the values-only entry, with the shipped

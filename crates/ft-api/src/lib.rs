@@ -72385,10 +72385,16 @@ impl FrankenTorchSession {
             && !self.tensor_requires_grad(input)?
             && self.tensor_shape(input)?.len() == 2
         {
-            let iv = self.tensor_values_f32(input)?;
             let meta = self.tensor_tape.tensor_meta(input)?.clone();
-            let out = ft_kernel_cpu::matrix_exp_contiguous_f32(&iv, &meta)
-                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let out = if meta.is_contiguous() && meta.storage_offset() == 0 {
+                let iv = self.tensor_tape.tensor(input)?.contiguous_values_f32()?;
+                ft_kernel_cpu::matrix_exp_contiguous_f32(iv, &meta)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?
+            } else {
+                let iv = self.tensor_values_f32(input)?;
+                ft_kernel_cpu::matrix_exp_contiguous_f32(&iv, &meta)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?
+            };
             let shape = meta.shape().to_vec();
             return self.tensor_variable_f32(out, shape, false);
         }
@@ -72546,6 +72552,15 @@ impl FrankenTorchSession {
                     reason: "matrix_exp: autograd only supported for a square F64 matrix",
                 },
             )));
+        }
+        if input_meta.is_contiguous() && input_meta.storage_offset() == 0 {
+            let result = {
+                let values = self.tensor_tape.tensor(input)?.contiguous_values()?;
+                ft_kernel_cpu::matrix_exp_contiguous_f64(values, &input_meta)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?
+            };
+            let shape = input_meta.shape().to_vec();
+            return self.tensor_variable(result, shape, false);
         }
         let (values, meta) = self.tensor_values_meta(input)?;
         let result = ft_kernel_cpu::matrix_exp_contiguous_f64(&values, &meta)
