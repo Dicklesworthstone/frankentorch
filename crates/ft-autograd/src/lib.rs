@@ -4344,14 +4344,10 @@ pub struct TensorTape {
     consumed_boundary: usize,
     grad_enabled: bool,
     custom_functions: BTreeMap<usize, CustomFunctionRecord>,
-    /// Version of each borrowed input at the moment its forward ran, keyed by
-    /// custom-function id (frankentorch-9da7i).
-    ///
-    /// Only the BORROWED backward variants populate this. The owned variant
-    /// clones what it needs into its `ctx`, so a later in-place mutation cannot
-    /// reach it; the borrowed variants deliberately re-read the live leaf at
-    /// backward time, which is what makes a mutation in between observable — and,
-    /// before this guard, silent.
+    /// Forward versions of custom-function inputs, keyed by function id.
+    /// Borrowed backwards record their live inputs automatically. Owned
+    /// callbacks may opt in for selected saved values whose mutation must fail
+    /// instead of silently using a captured snapshot.
     custom_function_input_versions: BTreeMap<usize, Vec<(TensorNodeId, u64)>>,
     /// Versions needed by native Mul/Div/MatMul derivatives, keyed by output node.
     native_binary_input_versions: BTreeMap<usize, Vec<(TensorNodeId, u64)>>,
@@ -9078,6 +9074,40 @@ impl TensorTape {
             },
         });
         Ok(out)
+    }
+
+    /// Register selected saved inputs immediately after recording a custom
+    /// forward. Only operands whose values are needed by the derivative belong
+    /// here; a linear transform need not save its input. Frozen operands may
+    /// still be needed to differentiate another input and must be registered.
+    /// Existing version guards are retained if this is called more than once.
+    pub fn save_custom_function_input_versions(
+        &mut self,
+        output: TensorNodeId,
+        saved_inputs: &[TensorNodeId],
+    ) -> Result<(), AutogradError> {
+        let function_id = match &self.node(output)?.op {
+            TensorNodeOp::CustomFunction {
+                inputs,
+                function_id,
+            } if saved_inputs.iter().all(|input| inputs.contains(input)) => *function_id,
+            _ => {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "saved custom-function values must be declared inputs of that function",
+                    }
+                    .into(),
+                ));
+            }
+        };
+        let versions = self.borrowed_input_versions(saved_inputs)?;
+        if !versions.is_empty() {
+            self.custom_function_input_versions
+                .entry(function_id)
+                .or_default()
+                .extend(versions);
+        }
+        Ok(())
     }
 
     /// Like [`apply_function`], but also registers a tape-building create_graph
@@ -16111,6 +16141,10 @@ impl TensorTape {
                         let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
                         match &record.backward {
                             CustomFunctionBackward::Owned(backward_fn) => {
+                                Self::assert_borrowed_versions(
+                                    &self.nodes,
+                                    self.custom_function_input_versions.get(&function_id),
+                                )?;
                                 machinery.custom_function_prepare_ns =
                                     machinery.custom_function_prepare_ns.saturating_add(
                                         u64::try_from(custom_prepare_started.elapsed().as_nanos())

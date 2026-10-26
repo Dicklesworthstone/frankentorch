@@ -2,13 +2,13 @@
 
 All notable changes to [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) are documented in this file.
 
-Scope window: project inception on 2026-02-13 through HEAD on 2026-08-19.
+Scope: historical reconstruction through 2026-08-19, with subsequent capability updates below.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased | commits on `main` | 2026-03-15 → 2026-08-19 | Measurement integrity, Metal kernels, `ft-api` expansion, janitor docs-reorg |
+| Unreleased | commits on `main` | 2026-03-15 → 2026-10-26 | Training correctness, differentiable spectral transforms, measurement integrity, Metal kernels, `ft-api` expansion |
 | [`ft2-snapshot`](https://github.com/Dicklesworthstone/frankentorch/tree/ft2-snapshot) | Tag (not a GitHub Release) | 2026-06-27 | Snapshot tag only |
 
 FrankenTorch is a clean-room Rust reimplementation of PyTorch targeting complete drop-in replacement with semantic fidelity, mathematical rigor, operational safety, and profile-proven performance. The workspace enforces `unsafe_code = "forbid"` globally. There are no formal releases or tags yet; this changelog tracks development by capability milestones derived from the commit history.
@@ -28,7 +28,7 @@ under `crates/`.
 
 ## [Unreleased] — HEAD on main (workspace version 0.1.0)
 
-Latest commit: [`cb836c76cc`](https://github.com/Dicklesworthstone/frankentorch/commit/cb836c76cc3bcb2562eb6e92bad97df20cef341c)
+Historical reconstruction anchor: [`cb836c76cc`](https://github.com/Dicklesworthstone/frankentorch/commit/cb836c76cc3bcb2562eb6e92bad97df20cef341c)
 (2026-08-19). Do not dump the 5,453-commit window as a diff list; the
 waves below are capability clusters. Historical crate-line counts in
 "Crate Inventory" are the 2026-03-14 snapshot.
@@ -36,6 +36,32 @@ waves below are capability clusters. Historical crate-line counts in
 ### Closed workstreams
 
 - Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankentorch/blob/main/.beads/issues.jsonl).
+
+### 2026-10-26 — Mixed precision and spectral training
+
+- **Mixed precision:** `GradScaler` checks and unscales the optimizer's
+  complete persistent gradients, including parameters reached only by earlier
+  microbatches. Independent optimizers leave each other's gradients unchanged.
+  Scale backoff and growth occur once in `update()` after the iteration's
+  optimizer steps. Sparse backward reports now scale their values, and
+  `SparseAdam` respects accumulated or subsequently modified gradients.
+  Custom `Optimizer` implementations must provide `parameters()`;
+  `TensorBackwardReport::scaled_clone` now returns `Result`.
+- **Spectral training:** Add first-order STFT/ISTFT gradients for real signals,
+  complex spectra, and real windows. Correct short-window alignment and
+  explicit-length reconstruction tails, and reject zero overlap-add envelopes.
+  The supported surface remains one-dimensional signals and two-dimensional
+  spectra, with constant zero padding for centered STFT frames. Saved-value
+  mutation checks distinguish aliased operands from copied forward values;
+  higher-order spectral gradients fail explicitly.
+- **Model APIs:** Linear layers accept a single-row bias while preserving
+  first- and second-order gradients. Grouped-query attention validates all
+  three head axes and supports empty query-head dimensions without panicking.
+
+Regression coverage includes disjoint microbatches, multiple optimizers,
+sparse embedding updates, and spectral finite differences across normalization,
+window, and FFT-size choices. Spectral and linear gradient fixtures were checked
+against PyTorch 2.14.1 CPU.
 
 ### 2026-08-19 — Repo-janitor docs-reorg
 
