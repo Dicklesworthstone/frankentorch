@@ -59,6 +59,9 @@ waves below are capability clusters. Historical crate-line counts in
 - **Model APIs:** Linear layers accept a single-row bias while preserving
   first- and second-order gradients. Grouped-query attention validates all
   three head axes and supports empty query-head dimensions without panicking.
+- **CPU execution:** Automatic worker counts honor the process CPU budget as
+  well as physical topology. Explicit thread-count overrides retain their
+  requested width.
 
 Regression coverage includes disjoint microbatches, multiple optimizers,
 sparse embedding updates, and spectral finite differences across normalization,

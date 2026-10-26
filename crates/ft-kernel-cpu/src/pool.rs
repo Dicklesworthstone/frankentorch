@@ -89,7 +89,11 @@ pub fn physical_cores() -> Option<usize> {
     (!pairs.is_empty()).then_some(pairs.len())
 }
 
-/// Width to use for `FT_RAYON_WIDTH=auto`: `min(16, physical cores)`.
+/// Automatic width: `min(16, physical cores, available parallelism)`.
+///
+/// `available_cores` is the process budget reported by [`std::thread::available_parallelism`].
+/// Host topology can exceed that budget under CPU affinity or container quotas, so it must never
+/// replace the budget. Missing topology falls back to the budget; zero inputs select one worker.
 ///
 /// # This is fitted to exactly two machines, and it says so
 ///
@@ -109,13 +113,19 @@ pub fn physical_cores() -> Option<usize> {
 /// caps to 8, each landing on that machine's measured optimum.
 ///
 /// **Two points do not make a law.** This is a heuristic fitted to two machines that happen to
-/// disagree in the informative direction, and it is why `FT_RAYON_WIDTH` stays opt-in: a caller who
-/// has measured their own hardware should pass a number, and `auto` is for one who has not.
+/// disagree in the informative direction: a caller who has measured their own hardware should
+/// pass an explicit `FT_RAYON_WIDTH`, and `auto` is for one who has not.
 #[must_use]
-pub fn auto_width(logical_cores: usize) -> usize {
+pub fn auto_width(available_cores: usize) -> usize {
+    auto_width_from_counts(available_cores, physical_cores())
+}
+
+// Keep host discovery separate from policy so quota and fallback cases have deterministic tests.
+fn auto_width_from_counts(available_cores: usize, physical: Option<usize>) -> usize {
     const MEASURED_CAP: usize = 16;
-    let cores = physical_cores().unwrap_or(logical_cores).max(1);
-    MEASURED_CAP.min(cores)
+    let available = available_cores.max(1);
+    let physical = physical.unwrap_or(available).max(1);
+    MEASURED_CAP.min(physical).min(available)
 }
 
 /// Resolve the default width and explicit environment overrides without touching global state.
@@ -181,7 +191,9 @@ pub fn configure_global_pool() -> PoolOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{PoolOutcome, auto_width, configure_global_pool, resolve_width};
+    use super::{
+        PoolOutcome, auto_width, auto_width_from_counts, configure_global_pool, resolve_width,
+    };
 
     /// `RAYON_NUM_THREADS` is the width every banked row in this campaign was taken under.
     /// Overriding it would silently invalidate the provenance of those rows.
@@ -220,7 +232,31 @@ mod tests {
         );
     }
 
-    /// `auto` must never exceed the machine, and must never exceed the measured cap of 16.
+    /// Host topology must not override a smaller process budget. The two measured hosts retain
+    /// their original choices, and missing or zero counts still select at least one worker.
+    #[test]
+    fn auto_respects_available_parallelism_and_topology() {
+        for (available, physical, expected) in [
+            (64, Some(32), 16), // original Threadripper host
+            (16, Some(8), 8),   // original Ryzen host
+            (8, Some(9), 8),    // nine host cores, eight-CPU quota
+            (4, Some(32), 4),
+            (1, Some(32), 1),
+            (64, None, 16),
+            (4, None, 4),
+            (0, None, 1),
+            (0, Some(32), 1),
+            (8, Some(0), 1),
+        ] {
+            assert_eq!(
+                auto_width_from_counts(available, physical),
+                expected,
+                "available={available}, physical={physical:?}"
+            );
+        }
+    }
+
+    /// `auto` must never exceed the process budget, the machine, or the measured cap of 16.
     ///
     /// The exact value depends on the host's PHYSICAL core count, which the test cannot fake, so
     /// the assertions are the invariants rather than a number: bounded above by 16, bounded above
@@ -233,6 +269,10 @@ mod tests {
             assert!(
                 width <= 16,
                 "the measured cap is 16, got {width} for {logical}"
+            );
+            assert!(
+                width <= logical.max(1),
+                "auto must not exceed available parallelism ({logical}), got {width}"
             );
             if let Some(physical) = super::physical_cores() {
                 assert!(
@@ -249,17 +289,26 @@ mod tests {
     }
 
     /// The physical count must be plausible where it is readable at all: at least one, and never
-    /// more than the logical count, since SMT only ever adds logical CPUs.
+    /// more than the host logical count, since SMT only ever adds logical CPUs. The process's
+    /// available parallelism can be lower than either count under affinity or CPU quotas.
     #[test]
     fn physical_cores_is_plausible_or_absent() {
         let Some(physical) = super::physical_cores() else {
             return; // not a Linux /proc/cpuinfo with topology fields; nothing to check
         };
-        let logical = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .expect("physical topology was read from /proc/cpuinfo");
+        let host_logical = cpuinfo
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(key, value)| {
+                key.trim() == "processor" && value.trim().parse::<usize>().is_ok()
+            })
+            .count();
         assert!(physical >= 1);
         assert!(
-            physical <= logical,
-            "physical ({physical}) cannot exceed logical ({logical})"
+            physical <= host_logical,
+            "host physical ({physical}) cannot exceed host logical ({host_logical})"
         );
     }
 
@@ -302,6 +351,11 @@ mod tests {
         assert_eq!(
             resolve_width(Some("128"), None, 8),
             PoolOutcome::Configured(128)
+        );
+        assert_eq!(
+            resolve_width(Some("16"), None, 1),
+            PoolOutcome::Configured(16),
+            "an explicit override may exceed the process budget"
         );
     }
 

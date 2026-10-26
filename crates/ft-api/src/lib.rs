@@ -101,12 +101,14 @@ const NAN_TO_NUM_FLOAT_REASON: &str = "nan_to_num only supported for float32/flo
 ///
 /// MEASURED, not chosen (`examples/gradient_widen_probe.rs`, min-of-9, 64 threads):
 ///
+/// ```text
 ///     numel        serial ms   parallel ms   serial/parallel
 ///        16 384       0.0030        0.2993             0.01x
 ///       262 144       0.7365        2.1140             0.35x
 ///     1 048 576       3.8092        2.9133             1.31x   <- first win
 ///     4 194 304      15.5076        3.9979             3.88x
 ///     6 422 528      24.9170        4.5660             5.46x
+/// ```
 ///
 /// The crossover is FAR above the 8192 that `ft-kernel-cpu`'s older gates use: a 64-way
 /// fork/join costs 0.1-0.9 ms here, so a small widen loses by 100x. The gate is placed at
@@ -188,11 +190,13 @@ fn widen_f32_to_f64(values: &[f32]) -> Vec<f64> {
 /// the constant is the first size measured to win at BOTH the 64-thread default pool and
 /// the 8-thread budget the h2h board certifies at:
 ///
+/// ```text
 ///     numel        8 threads   64 threads
 ///     1 048 576        1.28x        0.23x   <- the widen's gate; a 4.3x LOSS at 64
 ///     2 097 152        2.28x        0.70x   <- still a loss at 64
 ///     4 194 304        3.49x        1.44x   <- first size winning at both
 ///     6 422 528        2.84x        1.68x   (the scored [32,64,56,56] lane)
+/// ```
 ///
 /// WHY IT IS NOT THE WIDEN'S 1<<20. A widen reads 4 bytes and writes 8; a narrow reads 8
 /// and writes 4. First-touching the fresh output allocation is the expensive half, so at
@@ -1232,7 +1236,7 @@ impl FrankenTorchSession {
     #[must_use]
     pub fn new(mode: ExecutionMode) -> Self {
         // Configure rayon before this session can create an operation that touches the global
-        // pool. The default is `min(16, physical cores)`; an explicit RAYON_NUM_THREADS still
+        // pool. The default is `min(16, physical cores, available parallelism)`; RAYON_NUM_THREADS
         // wins inside `configure_global_pool`, so benchmark and application overrides retain
         // their exact requested width. A competing global-pool initializer is reported there and
         // deliberately does not make session creation fail.

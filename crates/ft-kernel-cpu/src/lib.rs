@@ -169,8 +169,10 @@ mod gemm {
     /// and the arm turns into a loss. MEASURED, not guessed — the isolation sweep over an n=512
     /// LU's trailing updates (thinkstation1, rayon=16, min of 9) reads:
     ///
+    /// ```text
     ///     m=448  1.500x    m=384  1.780x    m=320  1.384x    m=256  1.178x
     ///     m=192  1.287x    m=128  1.013x    m=64   0.720x   <- the arm LOSES here
+    /// ```
     ///
     /// 128x128 is the last shape that does not lose, so the floor sits there. A gate fitted to one
     /// sweep is a gate fitted to one dataset, which is why the crossover is quoted above rather
@@ -385,10 +387,12 @@ mod gemm {
     /// this governs the APPLY side only; orgqr and ormqr each admit 32 calls at n>=512 and none at
     /// n=256. Route LIVE against route DEAD:
     ///
+    /// ```text
     ///     n=512   orgqr  12.46 vs 21.53 ms  paired 0.575  sign 0/12  TRUSTED
     ///             ormqr  12.59 vs 21.40 ms  paired 0.587  sign 0/12  TRUSTED
     ///     n=1024  orgqr  paired 0.973  sign 6/12  UNRESOLVED
     ///             ormqr  paired 1.000  sign 6/12  UNRESOLVED
+    /// ```
     ///
     /// **So the route is worth ~1.7x on orgqr/ormqr at n=512 and the shipped 32 is load-bearing.**
     ///
@@ -6699,9 +6703,11 @@ pub fn sdpa_br_current(seq_q: usize, num_bh: usize) -> usize {
 /// confirms the floor binds exactly where the arithmetic says — `floor_bound=1` at n=288/360/432,
 /// and `calls=0` at n=1152, which never reaches the 2-D grid at all:
 ///
+/// ```text
 ///     n=288  distortion 1.78x   paired 1.0716  12/12  p=0.0005  TRUSTED WIN
 ///     n=360  distortion 1.42x   paired 1.0519   8/12            UNRESOLVED (A/A 1.0462)
 ///     n=432  distortion 1.19x   paired 1.0231   7/12            UNRESOLVED
+/// ```
 ///
 /// where distortion is `MIN_BLOCK_COLS / n.div_ceil(q)`, how far the floor overrides the
 /// thread-aware split. **The effect tracks the distortion monotonically and vanishes with it**,
@@ -27391,7 +27397,9 @@ static LU_NB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 /// RE-MEASURED on the current path, three sizes, two runs, min of 9, guard PASS — nb=64 beats the
 /// shipped 128 in ALL SIX cells:
 ///
+/// ```text
 ///     n=256   1.576x / 1.813x     n=512   1.186x / 1.191x     n=1024   1.209x / 1.284x
+/// ```
 ///
 /// WHY THE OPTIMUM IS NOT CHOLESKY'S. LU's panel is `m x nb` with m ~ n, so its MACs are
 /// ~`n^2*nb/4` — LINEAR in nb — where cholesky's `nb x nb` panel gives `n*nb^2/6`, QUADRATIC. The
@@ -30069,7 +30077,9 @@ pub fn set_cholesky_nb(nb: usize) -> usize {
 /// MEASURED against the shipped 128 in ALL SIX cells of a three-size, two-run sweep
 /// (thinkstation1, rayon=16, min of 9, guard PASS):
 ///
+/// ```text
 ///     n=256   1.33x / 1.45x     n=512   1.27x / 1.22x     n=1024   1.39x / 1.11x
+/// ```
 ///
 /// median 1.30x, range 1.11-1.45. **64 rather than 32 deliberately**: nb=32 posts a higher single
 /// cell (1.60x at n=512) but is far less stable across the six (1.04-1.60) and its trailing rate
@@ -30191,12 +30201,14 @@ pub fn cholesky_nb() -> usize {
 /// MEASURED, AND BOTH ALTERNATIVES ARE REFUTED — ledger 292b. Isolation at real panel shapes,
 /// thinkstation1, rayon=16, n=512, min of 31, three runs, bitwise identical at every shape:
 ///
+/// ```text
 ///     nb      arm 1 (parallel rows)        arm 2 (level-2, 4 rows/pass)
 ///     16      0.011 / 0.010 / 0.010        1.053 / 1.199 / 1.234
 ///     32      0.036 / 0.028 / 0.023        1.326 / 0.985 / 0.940
 ///     64      0.089 / 0.082 / 0.086        0.794 / 0.976 / 1.014
 ///     96      0.207 / 0.162 / 0.176        1.115 / 0.945 / 1.023
 ///     128     0.318 / 0.261 / 0.280        1.047 / 1.014 / 1.015
+/// ```
 ///
 /// **Arm 1 is a 3.5x loss at the shipped nb=128 and a 100x loss at nb=16**, worsening as nb
 /// shrinks — the fork is the same order as the column's entire work, exactly as the pre-registered
@@ -43482,8 +43494,10 @@ pub struct QrStageProfile {
 /// that the left non-transpose path never materialises `T^T` read 30-40 ns of somebody else's
 /// transposing call instead of its own 0:
 ///
+/// ```text
 ///     assertion `left == right` failed: left non-transpose must not materialize T^T
 ///       left: 40   right: 0
+/// ```
 ///
 /// Green 3/3 on a 16-thread worker and red 2/2 on a 64-thread one, which is what a wider pool
 /// buys you: more concurrent tests inside the window.

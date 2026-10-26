@@ -18,9 +18,11 @@
 //! 11.4-12.0 ms and ONE at 6.075, and correctly, on that evidence, called the ~6 ms invocation
 //! the defect. Today the prevalence is INVERTED, twenty to two the other way:
 //!
+//! ```text
 //!     session        ~6 ms level    ~11 ms level
 //!     2026-08-19           1              7
 //!     2026-09-01          20              2
+//! ```
 //!
 //! Both readings were honest reads of their own session. So a disagreement with history is a
 //! NO-VERDICT, not a correction, and this module never calls a level correct. It answers one
