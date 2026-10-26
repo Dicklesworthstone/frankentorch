@@ -1289,9 +1289,9 @@ impl TensorBackwardReport {
     ///
     /// Used by mixed-precision GradScaler to unscale gradients before
     /// the optimizer step. The cloned report shares structural fields
-    /// (steps, telemetry) by clone but has independently scaled gradient buffers.
-    #[must_use]
-    pub fn scaled_clone(&self, factor: f64) -> Self {
+    /// (steps, telemetry) by clone but has independently scaled dense and sparse
+    /// gradient buffers. Sparse indices, shape, dtype, and coalescing are preserved.
+    pub fn scaled_clone(&self, factor: f64) -> Result<Self, AutogradError> {
         let scaled_gradients: Vec<Option<Arc<Vec<f64>>>> = self
             .gradients
             .iter()
@@ -1300,13 +1300,40 @@ impl TensorBackwardReport {
                     .map(|grad| Arc::new(grad.iter().map(|&g| g * factor).collect::<Vec<f64>>()))
             })
             .collect();
-        Self {
+        let sparse_gradients = self
+            .sparse_gradients
+            .iter()
+            .map(|gradient| {
+                let Some(gradient) = gradient else {
+                    return Ok(None);
+                };
+                let source_values = gradient.values();
+                let values = source_values
+                    .contiguous_values_as_f64()?
+                    .into_iter()
+                    .map(|value| value * factor)
+                    .collect();
+                let scaled_values = DenseTensor::from_contiguous_values(
+                    values,
+                    source_values.meta().shape().to_vec(),
+                    gradient.device(),
+                )?
+                .to_dtype(gradient.dtype())?;
+                Ok(Some(SparseCOOTensor::new(
+                    gradient.indices().clone(),
+                    scaled_values,
+                    gradient.dense_shape().to_vec(),
+                    gradient.is_coalesced(),
+                )?))
+            })
+            .collect::<Result<Vec<_>, AutogradError>>()?;
+        Ok(Self {
             gradients: scaled_gradients,
-            sparse_gradients: self.sparse_gradients.clone(),
+            sparse_gradients,
             gradient_nodes: self.gradient_nodes.clone(),
             steps: self.steps.clone(),
             telemetry: self.telemetry.clone(),
-        }
+        })
     }
 }
 

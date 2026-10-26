@@ -657,6 +657,13 @@ fn apply_param_update(
 
 /// Trait for parameter optimizers.
 pub trait Optimizer {
+    /// Parameter node IDs owned by this optimizer, in registration order.
+    ///
+    /// Gradient utilities use this set rather than the nodes reached by the
+    /// most recent backward pass: accumulated gradients may come from earlier
+    /// microbatches, and other parameters may belong to a different optimizer.
+    fn parameters(&self) -> &[TensorNodeId];
+
     /// Perform a single optimization step using persistent gradients stored in
     /// the session's autograd state.
     fn step(
@@ -846,6 +853,10 @@ impl SGD {
 }
 
 impl Optimizer for SGD {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn state_dict(
         &self,
         session: &FrankenTorchSession,
@@ -1124,6 +1135,10 @@ impl Adam {
 }
 
 impl Optimizer for Adam {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn state_dict(
         &self,
         session: &FrankenTorchSession,
@@ -1460,6 +1475,10 @@ impl AdamW {
 }
 
 impl Optimizer for AdamW {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn state_dict(
         &self,
         session: &FrankenTorchSession,
@@ -1817,6 +1836,10 @@ impl RMSprop {
 }
 
 impl Optimizer for RMSprop {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn state_dict(
         &self,
         session: &FrankenTorchSession,
@@ -2173,6 +2196,10 @@ impl Adagrad {
 }
 
 impl Optimizer for Adagrad {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn state_dict(
         &self,
         session: &FrankenTorchSession,
@@ -2442,6 +2469,10 @@ impl RAdam {
 }
 
 impl Optimizer for RAdam {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn state_dict(
         &self,
         session: &FrankenTorchSession,
@@ -3089,6 +3120,10 @@ impl LBFGS {
 }
 
 impl Optimizer for LBFGS {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
@@ -4338,6 +4373,10 @@ impl ShadowOptimizer {
 }
 
 impl Optimizer for ShadowOptimizer {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &[]
+    }
+
     fn step(
         &mut self,
         _session: &mut FrankenTorchSession,
@@ -5469,6 +5508,10 @@ impl Adamax {
 }
 
 impl Optimizer for Adamax {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -5642,6 +5685,10 @@ impl Adadelta {
 }
 
 impl Optimizer for Adadelta {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -5849,6 +5896,10 @@ impl NAdam {
 }
 
 impl Optimizer for NAdam {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6048,6 +6099,10 @@ impl ASGD {
 }
 
 impl Optimizer for ASGD {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6253,6 +6308,10 @@ impl Rprop {
 }
 
 impl Optimizer for Rprop {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6459,6 +6518,10 @@ impl SparseAdam {
 }
 
 impl Optimizer for SparseAdam {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6478,17 +6541,20 @@ impl Optimizer for SparseAdam {
         for i in 0..num_params {
             let param = self.params[i];
 
-            // Check for sparse gradient in the report first (more efficient)
-            if let Some(sparse_grad) = report.sparse_gradient(param) {
-                self.step_sparse_gradient(session, param, i, sparse_grad)?;
-                continue;
-            }
-
-            // Fall back to dense gradient from session
             let grad = match load_param_gradient(session, param)? {
                 Some(g) => g,
                 None => continue,
             };
+            // A report describes only its own backward pass. Reuse its sparse
+            // representation only when it still represents the persistent
+            // gradient, including any accumulation, unscaling, or clipping.
+            if report.gradient(param) == Some(grad.as_slice())
+                && let Some(sparse_grad) = report.sparse_gradient(param)
+            {
+                self.step_sparse_gradient(session, param, i, sparse_grad)?;
+                continue;
+            }
+
             let t = advance_param_step_count(
                 &mut self.step_counts,
                 i,
@@ -6754,6 +6820,10 @@ impl Muon {
 }
 
 impl Optimizer for Muon {
+    fn parameters(&self) -> &[TensorNodeId] {
+        &self.params
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6943,6 +7013,8 @@ pub struct GradScaler {
     growth_interval: usize,
     steps_since_growth: usize,
     steps_since_inf: usize,
+    found_overflow_since_update: bool,
+    stepped_since_update: bool,
     last_step_skipped: bool,
     enabled: bool,
 }
@@ -6964,6 +7036,8 @@ impl GradScaler {
             growth_interval: 2000,
             steps_since_growth: 0,
             steps_since_inf: 0,
+            found_overflow_since_update: false,
+            stepped_since_update: false,
             last_step_skipped: false,
             enabled: true,
         }
@@ -6984,6 +7058,8 @@ impl GradScaler {
             growth_interval,
             steps_since_growth: 0,
             steps_since_inf: 0,
+            found_overflow_since_update: false,
+            stepped_since_update: false,
             last_step_skipped: false,
             enabled: true,
         }
@@ -7032,10 +7108,14 @@ impl GradScaler {
 
     /// Step the optimizer with gradient unscaling and overflow detection.
     ///
-    /// 1. Reads gradients from the report
+    /// 1. Reads all persistent gradients for the optimizer's parameter set
     /// 2. Checks for any non-finite values (inf or nan)
-    /// 3. If found: skips the optimizer step entirely (gradients discarded)
-    /// 4. If not: unscales gradients in-place and runs the optimizer step
+    /// 3. If found: skips the optimizer step entirely
+    /// 4. If not: unscales those gradients and runs the optimizer step
+    ///
+    /// The scale stays fixed until [`Self::update`], which must be called once
+    /// after all optimizers have stepped for this iteration. An overflow skips
+    /// only the affected optimizer. Clear gradients before the next iteration.
     ///
     /// Returns `true` if the step was applied, `false` if skipped due to overflow.
     pub fn step(
@@ -7053,11 +7133,11 @@ impl GradScaler {
         let inv_scale = 1.0 / self.scale;
         let mut unscaled_persistent_gradients = Vec::new();
         let mut found_overflow = false;
-        for (node_idx, grad_opt) in report.tensor_gradients_iter() {
-            if grad_opt.is_none() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &node in optimizer.parameters() {
+            if !seen.insert(node.0) {
                 continue;
             }
-            let node = TensorNodeId(node_idx);
             if let Some(mut gradient) = session.tensor_accumulated_gradient(node)? {
                 if gradient.iter().any(|&v| !v.is_finite()) {
                     found_overflow = true;
@@ -7066,46 +7146,65 @@ impl GradScaler {
                 for value in &mut gradient {
                     *value *= inv_scale;
                 }
+                if gradient.iter().any(|value| !value.is_finite()) {
+                    found_overflow = true;
+                    break;
+                }
                 unscaled_persistent_gradients.push((node, gradient));
             }
         }
 
         if found_overflow {
-            // Skip step, decrease scale
-            self.scale *= self.backoff_factor;
-            self.steps_since_growth = 0;
-            self.steps_since_inf = 0;
+            // Defer backoff until every optimizer has used this iteration's
+            // original scale, including those with finite gradients.
+            self.found_overflow_since_update = true;
+            self.stepped_since_update = true;
             self.last_step_skipped = true;
             return Ok(false);
         }
 
+        // Build the report before mutating persistent gradients so a failed
+        // sparse conversion cannot leave a partially unscaled optimizer.
+        let unscaled = report.scaled_clone(inv_scale)?;
         for (node, gradient) in unscaled_persistent_gradients {
             session.tensor_set_accumulated_gradient(node, gradient)?;
         }
 
         // Keep report consumers consistent with the persistent tape consumed by
         // the optimizers in this crate.
-        let unscaled = report.scaled_clone(inv_scale);
         optimizer.step(session, &unscaled)?;
 
-        self.steps_since_inf += 1;
-        self.steps_since_growth += 1;
+        self.stepped_since_update = true;
         self.last_step_skipped = false;
         Ok(true)
     }
 
     /// Update the scale factor based on accumulated statistics.
     ///
-    /// Call this after each step. If `growth_interval` steps have passed without
-    /// overflow, the scale is multiplied by `growth_factor`.
+    /// Call this once after all optimizers have stepped for an iteration. Any
+    /// overflow backs off the scale once. Otherwise `growth_interval` successful
+    /// iterations grow the scale, regardless of how many optimizers were stepped.
     pub fn update(&mut self) {
-        if !self.enabled {
+        if !self.enabled || !self.stepped_since_update {
             return;
         }
-        if self.steps_since_growth >= self.growth_interval {
-            self.scale *= self.growth_factor;
+        if self.found_overflow_since_update {
+            self.scale *= self.backoff_factor;
             self.steps_since_growth = 0;
+            self.steps_since_inf = 0;
+        } else {
+            self.steps_since_inf = self.steps_since_inf.saturating_add(1);
+            self.steps_since_growth = self.steps_since_growth.saturating_add(1);
+            if self.steps_since_growth >= self.growth_interval {
+                let grown_scale = self.scale * self.growth_factor;
+                if grown_scale.is_finite() {
+                    self.scale = grown_scale;
+                }
+                self.steps_since_growth = 0;
+            }
         }
+        self.found_overflow_since_update = false;
+        self.stepped_since_update = false;
     }
 }
 
@@ -14715,7 +14814,7 @@ mod tests {
         }
 
         // Now use scaled_clone to verify unscaling produces the original gradient
-        let unscaled_report = report2.scaled_clone(0.25);
+        let unscaled_report = report2.scaled_clone(0.25).unwrap();
         let unscaled_grad_from_clone = unscaled_report.gradient(w2).unwrap();
         for (a, b) in unscaled_grad.iter().zip(unscaled_grad_from_clone.iter()) {
             assert!(
@@ -14820,6 +14919,253 @@ mod tests {
     }
 
     #[test]
+    fn grad_scaler_unscales_parameters_absent_from_the_last_microbatch() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let first = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let second = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
+            let mut optimizer = SGD::new(vec![first, second], 0.125);
+            let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 100);
+            let mut last_report = None;
+            for parameter in [first, second] {
+                let square = session.tensor_mul(parameter, parameter).unwrap();
+                let loss = session.tensor_sum(square).unwrap();
+                let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+                last_report = Some(session.tensor_backward(scaled).unwrap());
+            }
+            let report = last_report.unwrap();
+            assert!(report.gradient(first).is_none());
+            assert_eq!(
+                session.tensor_accumulated_gradient(first).unwrap(),
+                Some(vec![32.0])
+            );
+
+            assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+            assert_eq!(session.tensor_values(first).unwrap(), vec![1.5]);
+            assert_eq!(session.tensor_values(second).unwrap(), vec![2.25]);
+            assert_eq!(
+                session.tensor_accumulated_gradient(first).unwrap(),
+                Some(vec![4.0])
+            );
+            assert_eq!(
+                session.tensor_accumulated_gradient(second).unwrap(),
+                Some(vec![6.0])
+            );
+        }
+    }
+
+    #[test]
+    fn grad_scaler_checks_overflow_from_earlier_microbatches_before_any_update() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for nonfinite in [f64::INFINITY, f64::NAN] {
+                let mut session = FrankenTorchSession::new(mode);
+                let first = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+                let second = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
+                let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 100);
+                let first_loss = session.tensor_sum(first).unwrap();
+                let scaled = scaler.scale_loss(&mut session, first_loss).unwrap();
+                session.tensor_backward(scaled).unwrap();
+                session
+                    .tensor_set_accumulated_gradient(first, vec![nonfinite])
+                    .unwrap();
+                let second_loss = session.tensor_sum(second).unwrap();
+                let scaled = scaler.scale_loss(&mut session, second_loss).unwrap();
+                let report = session.tensor_backward(scaled).unwrap();
+                assert!(report.gradient(first).is_none());
+
+                // Scan the finite parameter first to verify all-or-nothing unscaling.
+                let mut optimizer = SGD::new(vec![second, first], 0.125);
+                assert!(!scaler.step(&mut session, &mut optimizer, &report).unwrap());
+                assert_eq!(session.tensor_values(first).unwrap(), vec![2.0]);
+                assert_eq!(session.tensor_values(second).unwrap(), vec![3.0]);
+                assert_eq!(
+                    session.tensor_accumulated_gradient(second).unwrap(),
+                    Some(vec![8.0])
+                );
+                assert_eq!(scaler.get_scale(), 8.0);
+                scaler.update();
+                assert_eq!(scaler.get_scale(), 4.0);
+            }
+        }
+    }
+
+    #[test]
+    fn grad_scaler_scopes_each_optimizer_and_counts_growth_once_per_iteration() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let first = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let second = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
+            let unrelated = session.tensor_variable(vec![5.0], vec![1], true).unwrap();
+            let mut first_optimizer = SGD::new(vec![first], 0.125);
+            let mut second_optimizer = SGD::new(vec![second], 0.125);
+            let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 2);
+            for iteration in 0..2 {
+                session
+                    .tensor_zero_grads(&[first, second, unrelated])
+                    .unwrap();
+                let first_square = session.tensor_mul(first, first).unwrap();
+                let second_square = session.tensor_mul(second, second).unwrap();
+                let combined = session.tensor_add(first_square, second_square).unwrap();
+                let combined = session.tensor_add(combined, unrelated).unwrap();
+                let loss = session.tensor_sum(combined).unwrap();
+                let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+                let report = session.tensor_backward(scaled).unwrap();
+                // An overflow owned by neither optimizer must not suppress their updates.
+                session
+                    .tensor_set_accumulated_gradient(unrelated, vec![f64::INFINITY])
+                    .unwrap();
+
+                assert!(
+                    scaler
+                        .step(&mut session, &mut first_optimizer, &report)
+                        .unwrap()
+                );
+                let first_gradient = session.tensor_accumulated_gradient(first).unwrap();
+                assert!(
+                    scaler
+                        .step(&mut session, &mut second_optimizer, &report)
+                        .unwrap()
+                );
+                assert_eq!(
+                    session.tensor_accumulated_gradient(first).unwrap(),
+                    first_gradient,
+                    "stepping another optimizer must not divide this gradient again"
+                );
+                assert_eq!(
+                    session.tensor_accumulated_gradient(unrelated).unwrap(),
+                    Some(vec![f64::INFINITY])
+                );
+                assert_eq!(scaler.get_scale(), 8.0);
+                scaler.update();
+                assert_eq!(scaler.get_scale(), if iteration == 0 { 8.0 } else { 16.0 });
+            }
+            assert_eq!(session.tensor_values(first).unwrap(), vec![1.125]);
+            assert_eq!(session.tensor_values(second).unwrap(), vec![1.6875]);
+            assert_eq!(session.tensor_values(unrelated).unwrap(), vec![5.0]);
+        }
+    }
+
+    #[test]
+    fn grad_scaler_keeps_scale_fixed_when_one_of_multiple_optimizers_overflows() {
+        for overflow_first in [false, true] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let finite = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
+            let overflowing = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let mut finite_optimizer = SGD::new(vec![finite], 0.125);
+            let mut overflowing_optimizer = SGD::new(vec![overflowing], 0.125);
+            let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 1);
+            let square = session.tensor_mul(finite, finite).unwrap();
+            let combined = session.tensor_add(square, overflowing).unwrap();
+            let loss = session.tensor_sum(combined).unwrap();
+            let scaled = scaler.scale_loss(&mut session, loss).unwrap();
+            let report = session.tensor_backward(scaled).unwrap();
+            session
+                .tensor_set_accumulated_gradient(overflowing, vec![f64::INFINITY])
+                .unwrap();
+
+            for is_overflow in [overflow_first, !overflow_first] {
+                let optimizer: &mut dyn Optimizer = if is_overflow {
+                    &mut overflowing_optimizer
+                } else {
+                    &mut finite_optimizer
+                };
+                assert_eq!(
+                    scaler.step(&mut session, optimizer, &report).unwrap(),
+                    !is_overflow
+                );
+                assert_eq!(scaler.get_scale(), 8.0);
+            }
+            assert_eq!(session.tensor_values(finite).unwrap(), vec![2.25]);
+            assert_eq!(session.tensor_values(overflowing).unwrap(), vec![2.0]);
+            scaler.update();
+            assert_eq!(scaler.get_scale(), 4.0);
+            assert_eq!(scaler.steps_since_growth, 0);
+            scaler.update();
+            assert_eq!(
+                scaler.get_scale(),
+                4.0,
+                "update without another step is inert"
+            );
+        }
+    }
+
+    #[test]
+    fn grad_scaler_sparse_embedding_updates_match_unscaled_accumulation() {
+        use ft_nn::{Embedding, Module};
+
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for accumulate in [false, true] {
+                let run = |scaled_training: bool| {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let embedding =
+                        Embedding::with_options(&mut session, 5, 2, None, None, 2.0, true).unwrap();
+                    let weight = embedding.weight();
+                    session
+                        .tensor_update_param_values(weight, vec![2.0; 10])
+                        .unwrap();
+                    // A sizeable epsilon makes an incorrect gradient scale
+                    // observable even in Adam's first normalized update.
+                    let mut optimizer = SparseAdam::new(vec![weight], 0.125).eps(0.5);
+                    let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 100);
+                    let indices: &[f64] = if accumulate { &[1.0, 3.0] } else { &[1.0] };
+                    for _ in 0..3 {
+                        optimizer.zero_grad(&mut session).unwrap();
+                        let mut last_report = None;
+                        for &row in indices {
+                            let index = session.tensor_variable(vec![row], vec![1], false).unwrap();
+                            let values = embedding.forward(&mut session, index).unwrap();
+                            let square = session.tensor_mul(values, values).unwrap();
+                            let loss = session.tensor_sum(square).unwrap();
+                            let loss = if scaled_training {
+                                scaler.scale_loss(&mut session, loss).unwrap()
+                            } else {
+                                loss
+                            };
+                            last_report = Some(session.tensor_backward(loss).unwrap());
+                        }
+                        let report = last_report.unwrap();
+                        assert!(report.is_sparse_gradient(weight));
+                        if scaled_training {
+                            let unscaled = report.scaled_clone(0.125).unwrap();
+                            let original_sparse = report.sparse_gradient(weight).unwrap();
+                            let unscaled_sparse = unscaled.sparse_gradient(weight).unwrap();
+                            assert_eq!(unscaled_sparse.indices(), original_sparse.indices());
+                            assert_eq!(
+                                unscaled_sparse.dense_shape(),
+                                original_sparse.dense_shape()
+                            );
+                            assert_eq!(unscaled_sparse.dtype(), original_sparse.dtype());
+                            assert_eq!(
+                                unscaled_sparse.is_coalesced(),
+                                original_sparse.is_coalesced()
+                            );
+                            assert_eq!(
+                                unscaled_sparse
+                                    .to_dense()
+                                    .unwrap()
+                                    .contiguous_values()
+                                    .unwrap(),
+                                unscaled.gradient(weight).unwrap()
+                            );
+                            assert!(scaler.step(&mut session, &mut optimizer, &report).unwrap());
+                            scaler.update();
+                        } else {
+                            optimizer.step(&mut session, &report).unwrap();
+                        }
+                    }
+                    let values = session.tensor_values(weight).unwrap();
+                    for row in 0..5 {
+                        let touched = row == 1 || (accumulate && row == 3);
+                        assert_eq!(values[row * 2] < 2.0, touched, "row {row}");
+                    }
+                    (values, optimizer.m, optimizer.v, optimizer.step_counts)
+                };
+                assert_eq!(run(true), run(false));
+            }
+        }
+    }
+
+    #[test]
     fn grad_scaler_skips_step_on_inf_gradient() {
         // Inject inf into gradients by using a large scale * a poorly-conditioned loss
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -14839,6 +15185,8 @@ mod tests {
         // Should detect overflow and skip
         assert!(!applied, "step should be skipped due to overflow");
         assert!(scaler.last_step_was_skipped());
+        assert_eq!(scaler.get_scale(), 1e300);
+        scaler.update();
         // Scale should be reduced
         assert!(
             scaler.get_scale() < 1e300,
@@ -14849,8 +15197,9 @@ mod tests {
     #[test]
     fn grad_scaler_update_grows_after_interval() {
         let mut scaler = GradScaler::with_config(1.0, 2.0, 0.5, 3);
-        // Manually simulate steps_since_growth reaching the interval
-        scaler.steps_since_growth = 3;
+        // Simulate the third successful iteration waiting for update().
+        scaler.steps_since_growth = 2;
+        scaler.stepped_since_update = true;
         scaler.update();
         assert_eq!(
             scaler.get_scale(),
@@ -14865,8 +15214,8 @@ mod tests {
         // Drive the growth schedule through REAL step()+update() calls (not by
         // manually setting the counter). With growth_interval=3 the scale must
         // hold for two clean steps then double on the third, and again on the
-        // sixth — verifying step() increments steps_since_growth and update()
-        // grows at the right cadence. frankentorch-uh7gd.
+        // sixth — verifying update() counts successful iterations and grows
+        // at the right cadence. frankentorch-uh7gd.
         let mut scaler = GradScaler::with_config(1.0, 2.0, 0.5, 3);
         let clean_step = |scaler: &mut GradScaler| {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -14915,6 +15264,8 @@ mod tests {
         let applied = scaler.step(&mut s, &mut opt, &report).unwrap();
         assert!(!applied, "overflowing gradient must skip the step");
         assert!(scaler.last_step_was_skipped());
+        assert_eq!(scaler.get_scale(), 1e300);
+        scaler.update();
         assert_eq!(
             scaler.get_scale(),
             1e300 * 0.5,
