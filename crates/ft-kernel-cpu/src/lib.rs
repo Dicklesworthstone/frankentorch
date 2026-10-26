@@ -18625,12 +18625,185 @@ pub fn conv3d_im2col_f32(
     })
 }
 
-/// f32 mirror of [`conv3d_forward_f64`]: fused 3-D im2col + `panel @ weight_flat^T`
-/// (via `sgemm_bt`) written straight to NCDHW, plus optional per-channel bias.
-/// Replaces the per-output narrow/cat/bmm op-graph the f32 path fell through to.
+/// Direct NCDHW f32 convolution for the 3x3x3 stride-1 route (`frankentorch-l2zki`),
+/// mirroring [`conv3d_forward_direct_3x3s1_f64`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_forward_direct_3x3s1_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    const KERNEL_WIDTH: usize = 3 * 3 * 3;
+    const OUT_CHANNEL_BLOCK: usize = 4;
+    let patch_width = in_ch * KERNEL_WIDTH;
+    let patch_count = od * oh * ow;
+    let plane_count = batch * out_ch;
+    let blocks = plane_count / OUT_CHANNEL_BLOCK;
+    let threads = rayon::current_num_threads().max(1);
+    const MIN_SPATIAL_TILE: usize = 64;
+    let tiles_per_block = (threads * 4).div_ceil(blocks.max(1)).max(1);
+    let spatial_tile = patch_count
+        .div_ceil(tiles_per_block)
+        .max(MIN_SPATIAL_TILE)
+        .min(patch_count.max(1));
+    build_uninit(plane_count * patch_count, |out: &mut [f32]| {
+        out.par_chunks_mut(OUT_CHANNEL_BLOCK * patch_count)
+            .enumerate()
+            .for_each(|(block, out_block)| {
+                let first_plane = block * OUT_CHANNEL_BLOCK;
+                let n = first_plane / out_ch;
+                let first_channel = first_plane % out_ch;
+                let batch_offset = n * in_ch * pd * ph * pw;
+                let weight_offset0 = first_channel * patch_width;
+                let weight_offset1 = weight_offset0 + patch_width;
+                let weight_offset2 = weight_offset1 + patch_width;
+                let weight_offset3 = weight_offset2 + patch_width;
+                let biases = bias.map_or([0.0f32; OUT_CHANNEL_BLOCK], |values| {
+                    [
+                        values[first_channel],
+                        values[first_channel + 1],
+                        values[first_channel + 2],
+                        values[first_channel + 3],
+                    ]
+                });
+                let (plane0, rest) = out_block.split_at_mut(patch_count);
+                let (plane1, rest) = rest.split_at_mut(patch_count);
+                let (plane2, plane3) = rest.split_at_mut(patch_count);
+                plane0
+                    .par_chunks_mut(spatial_tile)
+                    .zip(plane1.par_chunks_mut(spatial_tile))
+                    .zip(plane2.par_chunks_mut(spatial_tile))
+                    .zip(plane3.par_chunks_mut(spatial_tile))
+                    .enumerate()
+                    .for_each(|(tile, (((tile0, tile1), tile2), tile3))| {
+                        let start = tile * spatial_tile;
+                        for offset in 0..tile0.len() {
+                            let position = start + offset;
+                            let oz = position / (oh * ow);
+                            let rem = position % (oh * ow);
+                            let oy = rem / ow;
+                            let ox = rem % ow;
+                            let mut sums = [0.0f32; OUT_CHANNEL_BLOCK];
+                            for c in 0..in_ch {
+                                let input_channel = batch_offset + c * pd * ph * pw;
+                                let weight_channel = c * KERNEL_WIDTH;
+                                for kdd in 0..3 {
+                                    let input_depth = input_channel + (oz + kdd) * ph * pw;
+                                    let weight_depth = weight_channel + kdd * 3 * 3;
+                                    for kr in 0..3 {
+                                        let input_row = input_depth + (oy + kr) * pw + ox;
+                                        let weight_row = weight_depth + kr * 3;
+                                        for kc in 0..3 {
+                                            let value = padded[input_row + kc];
+                                            let weight_index = weight_row + kc;
+                                            sums[0] +=
+                                                value * weight_flat[weight_offset0 + weight_index];
+                                            sums[1] +=
+                                                value * weight_flat[weight_offset1 + weight_index];
+                                            sums[2] +=
+                                                value * weight_flat[weight_offset2 + weight_index];
+                                            sums[3] +=
+                                                value * weight_flat[weight_offset3 + weight_index];
+                                        }
+                                    }
+                                }
+                            }
+                            tile0[offset] = sums[0] + biases[0];
+                            tile1[offset] = sums[1] + biases[1];
+                            tile2[offset] = sums[2] + biases[2];
+                            tile3[offset] = sums[3] + biases[3];
+                        }
+                    });
+            });
+    })
+}
+
+/// f32 mirror of [`conv3d_forward_f64`]: routes shallow 3x3x3 stride-1 convolutions
+/// (`in_ch <= CONV3D_DIRECT_MAX_IN_CH`) to [`conv3d_forward_direct_3x3s1_f32`] and deeper
+/// or non-3x3x3 shapes to [`conv3d_forward_streamed_f32`]. `frankentorch-l2zki`.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv3d_forward_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    if kd == 3
+        && kh == 3
+        && kw == 3
+        && sd == 1
+        && sh == 1
+        && sw == 1
+        && in_ch >= 8
+        && in_ch <= CONV3D_DIRECT_MAX_IN_CH
+        && out_ch >= 8
+        && out_ch.is_multiple_of(4)
+    {
+        return conv3d_forward_direct_3x3s1_f32(
+            padded,
+            weight_flat,
+            bias,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            od,
+            oh,
+            ow,
+            out_ch,
+        );
+    }
+    conv3d_forward_streamed_f32(
+        padded,
+        weight_flat,
+        bias,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_forward_streamed_f32(
     padded: &[f32],
     weight_flat: &[f32],
     bias: Option<&[f32]>,
@@ -18869,6 +19042,298 @@ pub fn conv3d_backward_f32(
     )
 }
 
+/// f32 mirror of [`conv3d_backward_dinput_direct_f64`] (`frankentorch-l2zki`).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_backward_dinput_direct_f32(
+    dout_flat: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kd * kh * kw;
+    if batch >= rayon::current_num_threads().max(1) {
+        let block_rows = conv2d_dinput_block_rows(patch_width);
+        return conv3d_backward_dinput_blocked_rows_f32(
+            dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+            out_ch,
+            block_rows,
+        );
+    }
+    let cpg = conv2d_dinput_group_channels(in_ch, batch);
+    let group_width = cpg * kd * kh * kw;
+    let block_rows = conv2d_dinput_block_rows(group_width);
+    conv3d_backward_dinput_grouped_f32(
+        dout_flat,
+        weight_flat,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+        block_rows,
+        cpg,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_backward_dinput_grouped_f32(
+    dout_flat: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+    channels_per_group: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let tap = kd * kh * kw;
+    let patch_width = in_ch * tap;
+    let patch_count = od * oh * ow;
+    let block_rows = block_rows.max(1);
+    let total_out = batch * in_ch * pd * ph * pw;
+    if batch == 0
+        || in_ch == 0
+        || out_ch == 0
+        || patch_count == 0
+        || patch_width == 0
+        || total_out == 0
+    {
+        return vec![0.0f32; total_out];
+    }
+    let cpg = channels_per_group.clamp(1, in_ch);
+    if !in_ch.is_multiple_of(cpg) {
+        return conv3d_backward_dinput_blocked_rows_f32(
+            dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+            out_ch,
+            block_rows,
+        );
+    }
+    let groups = in_ch / cpg;
+    let group_width = cpg * tap;
+    let ohow = oh * ow;
+    let phpw = ph * pw;
+    let vol = pd * phpw;
+    let patch_origins: Vec<(usize, usize, usize)> = (0..patch_count)
+        .map(|pc| {
+            let base_d = (pc / ohow) * sd;
+            let rem = pc % ohow;
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            (base_d, base_h, base_w)
+        })
+        .collect();
+    build_uninit(total_out, |dpadded| {
+        dpadded
+            .par_chunks_mut(cpg * vol)
+            .enumerate()
+            .for_each(|(task, dst)| {
+                dst.fill(0.0);
+                let b = task / groups;
+                let g = task % groups;
+                let c0 = g * cpg;
+                let mut wsub = vec![0.0f32; out_ch * group_width];
+                for co in 0..out_ch {
+                    let src = co * patch_width + c0 * tap;
+                    wsub[co * group_width..(co + 1) * group_width]
+                        .copy_from_slice(&weight_flat[src..src + group_width]);
+                }
+                let mut scratch = vec![0.0f32; block_rows.min(patch_count) * group_width];
+                let mut start = 0usize;
+                while start < patch_count {
+                    let rows = block_rows.min(patch_count - start);
+                    let a = &dout_flat[(b * patch_count + start) * out_ch
+                        ..(b * patch_count + start + rows) * out_ch];
+                    let sc = &mut scratch[..rows * group_width];
+                    gemm::sgemm(rows, out_ch, group_width, a, &wsub, sc);
+                    for r in 0..rows {
+                        let (base_d, base_h, base_w) = patch_origins[start + r];
+                        let prow = r * group_width;
+                        for lc in 0..cpg {
+                            let ch_off = lc * vol;
+                            let pch = lc * tap;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * phpw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = prow + pkd + kr * kw;
+                                    for kc in 0..kw {
+                                        dst[irow + kc] += sc[prow_off + kc];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    start += rows;
+                }
+            });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_backward_dinput_blocked_rows_f32(
+    dout_flat: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let tap = kd * kh * kw;
+    let patch_width = in_ch * tap;
+    let patch_count = od * oh * ow;
+    let block_rows = block_rows.max(1);
+    let total_out = batch * in_ch * pd * ph * pw;
+    if batch == 0
+        || in_ch == 0
+        || out_ch == 0
+        || patch_count == 0
+        || patch_width == 0
+        || total_out == 0
+    {
+        return vec![0.0f32; total_out];
+    }
+    let ohow = oh * ow;
+    let phpw = ph * pw;
+    let vol = pd * phpw;
+    let patch_origins: Vec<(usize, usize, usize)> = (0..patch_count)
+        .map(|pc| {
+            let base_d = (pc / ohow) * sd;
+            let rem = pc % ohow;
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            (base_d, base_h, base_w)
+        })
+        .collect();
+    build_uninit(total_out, |dpadded| {
+        dpadded
+            .par_chunks_mut(in_ch * vol)
+            .enumerate()
+            .for_each(|(b, dpb)| {
+                dpb.fill(0.0);
+                let scatter = |block: &[f32], start: usize, rows: usize, dpb: &mut [f32]| {
+                    for r in 0..rows {
+                        let (base_d, base_h, base_w) = patch_origins[start + r];
+                        let prow = r * patch_width;
+                        for c in 0..in_ch {
+                            let ch_off = c * vol;
+                            let pch = c * tap;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * phpw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = prow + pkd + kr * kw;
+                                    for kc in 0..kw {
+                                        dpb[irow + kc] += block[prow_off + kc];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let first_rows = block_rows.min(patch_count);
+                let first =
+                    &dout_flat[(b * patch_count) * out_ch..(b * patch_count + first_rows) * out_ch];
+                let mut block = build_uninit(first_rows * patch_width, |block| {
+                    gemm::sgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
+                });
+                scatter(&block, 0, first_rows, dpb);
+                let mut start = first_rows;
+                while start < patch_count {
+                    let rows = block_rows.min(patch_count - start);
+                    let a = &dout_flat[(b * patch_count + start) * out_ch
+                        ..(b * patch_count + start + rows) * out_ch];
+                    let dp = &mut block[..rows * patch_width];
+                    gemm::sgemm(rows, out_ch, patch_width, a, weight_flat, dp);
+                    scatter(dp, start, rows, dpb);
+                    start += rows;
+                }
+            });
+    })
+}
+
 /// conv3d f32 backward computing ONLY the gradients asked for — `frankentorch-l2zki`, item 203.
 ///
 /// `output_mask` is `[d_input, d_weight, d_bias]`, mirroring PyTorch's `convolution_backward`.
@@ -18901,17 +19366,22 @@ pub fn conv3d_backward_masked_f32(
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let flat = batch * patch_count;
-    let mut dout_flat = vec![0.0f32; flat * out_ch];
-    dout_flat
-        .par_chunks_mut(out_ch)
-        .enumerate()
-        .for_each(|(row, dr)| {
-            let n = row / patch_count;
-            let p = row % patch_count;
-            for (oc, d) in dr.iter_mut().enumerate() {
-                *d = dout[(n * out_ch + oc) * patch_count + p];
-            }
-        });
+    let dout_flat = if output_mask[0] || output_mask[1] {
+        build_uninit(flat * out_ch, |dout_flat| {
+            dout_flat
+                .par_chunks_mut(out_ch)
+                .enumerate()
+                .for_each(|(row, dr)| {
+                    let n = row / patch_count;
+                    let p = row % patch_count;
+                    for (oc, d) in dr.iter_mut().enumerate() {
+                        *d = dout[(n * out_ch + oc) * patch_count + p];
+                    }
+                });
+        })
+    } else {
+        Vec::new()
+    };
     // dweight = dout_flat^T @ panel via sgemm_tb (strided-transpose read of
     // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     // UNBUILT (build freeze, /data 29G): not compiled, tested or measured.
@@ -18993,6 +19463,27 @@ pub fn conv3d_backward_masked_f32(
     // the same order; only the dead pass before it is gone.
     // item 203: dinput's half, gated. f32 mirror of item 195.
     let dpadded = output_mask[0].then(|| {
+        if conv3d_dinput_blocked() {
+            return conv3d_backward_dinput_direct_f32(
+                &dout_flat,
+                weight_flat,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+            );
+        }
         let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f32]| {
             if flat == 0 || patch_width == 0 {
                 dpanel.fill(0.0);
@@ -19411,6 +19902,334 @@ fn conv3d_backward_generic_f64(
     )
 }
 
+static CONV3D_DINPUT_BLOCKED_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[doc(hidden)]
+pub fn set_conv3d_dinput_blocked(on: bool) -> bool {
+    let prev = conv3d_dinput_blocked();
+    CONV3D_DINPUT_BLOCKED_OVERRIDE
+        .store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    prev
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn conv3d_dinput_blocked() -> bool {
+    match CONV3D_DINPUT_BLOCKED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static ENV_DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENV_DEFAULT.get_or_init(|| {
+                std::env::var("FT_CONV3D_DINPUT_BLOCKED")
+                    .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            })
+        }
+    }
+}
+
+/// 3-D sibling of [`conv2d_backward_dinput_direct_f64`] (`frankentorch-l2zki`).
+///
+/// Replaces `dgemm(flat, out_ch, patch_width) -> dpanel -> conv3d_col2im_f64(dpanel)` with
+/// a single wide parallel region over `(batch, channel_group)` (when `batch < current_num_threads()`)
+/// or `batch` (when `batch >= current_num_threads()`), streaming `block_rows`-row L2-resident
+/// tiles into the 3-D col2im scatter without ever materialising the 28.3 MB `dpanel` in DRAM.
+///
+/// 100% bit-identical (`to_bits()` equal) to the panel + `conv3d_col2im_f64` route: the GEMM
+/// splits only on `m` (patch rows) and `n` (channel group columns), never on `k` (`out_ch`),
+/// and each task scatters patches in strict ascending `pc = 0..patch_count`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_backward_dinput_direct_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f64> {
+    let patch_width = in_ch * kd * kh * kw;
+    if batch >= rayon::current_num_threads().max(1) {
+        let block_rows = conv2d_dinput_block_rows(patch_width);
+        return conv3d_backward_dinput_blocked_rows_f64(
+            dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+            out_ch,
+            block_rows,
+        );
+    }
+    let cpg = conv2d_dinput_group_channels(in_ch, batch);
+    let group_width = cpg * kd * kh * kw;
+    let block_rows = conv2d_dinput_block_rows(group_width);
+    conv3d_backward_dinput_grouped_f64(
+        dout_flat,
+        weight_flat,
+        batch,
+        in_ch,
+        pd,
+        ph,
+        pw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+        out_ch,
+        block_rows,
+        cpg,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_backward_dinput_grouped_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+    channels_per_group: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let tap = kd * kh * kw;
+    let patch_width = in_ch * tap;
+    let patch_count = od * oh * ow;
+    let block_rows = block_rows.max(1);
+    let total_out = batch * in_ch * pd * ph * pw;
+    if batch == 0
+        || in_ch == 0
+        || out_ch == 0
+        || patch_count == 0
+        || patch_width == 0
+        || total_out == 0
+    {
+        return vec![0.0f64; total_out];
+    }
+    let cpg = channels_per_group.clamp(1, in_ch);
+    if !in_ch.is_multiple_of(cpg) {
+        return conv3d_backward_dinput_blocked_rows_f64(
+            dout_flat,
+            weight_flat,
+            batch,
+            in_ch,
+            pd,
+            ph,
+            pw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+            out_ch,
+            block_rows,
+        );
+    }
+    let groups = in_ch / cpg;
+    let group_width = cpg * tap;
+    let ohow = oh * ow;
+    let phpw = ph * pw;
+    let vol = pd * phpw;
+    let patch_origins: Vec<(usize, usize, usize)> = (0..patch_count)
+        .map(|pc| {
+            let base_d = (pc / ohow) * sd;
+            let rem = pc % ohow;
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            (base_d, base_h, base_w)
+        })
+        .collect();
+    build_uninit(total_out, |dpadded| {
+        dpadded
+            .par_chunks_mut(cpg * vol)
+            .enumerate()
+            .for_each(|(task, dst)| {
+                dst.fill(0.0);
+                let b = task / groups;
+                let g = task % groups;
+                let c0 = g * cpg;
+                let mut wsub = vec![0.0f64; out_ch * group_width];
+                for co in 0..out_ch {
+                    let src = co * patch_width + c0 * tap;
+                    wsub[co * group_width..(co + 1) * group_width]
+                        .copy_from_slice(&weight_flat[src..src + group_width]);
+                }
+                let mut scratch = vec![0.0f64; block_rows.min(patch_count) * group_width];
+                let mut start = 0usize;
+                while start < patch_count {
+                    let rows = block_rows.min(patch_count - start);
+                    let a = &dout_flat[(b * patch_count + start) * out_ch
+                        ..(b * patch_count + start + rows) * out_ch];
+                    let sc = &mut scratch[..rows * group_width];
+                    gemm::dgemm(rows, out_ch, group_width, a, &wsub, sc);
+                    for r in 0..rows {
+                        let (base_d, base_h, base_w) = patch_origins[start + r];
+                        let prow = r * group_width;
+                        for lc in 0..cpg {
+                            let ch_off = lc * vol;
+                            let pch = lc * tap;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * phpw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = prow + pkd + kr * kw;
+                                    for kc in 0..kw {
+                                        dst[irow + kc] += sc[prow_off + kc];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    start += rows;
+                }
+            });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv3d_backward_dinput_blocked_rows_f64(
+    dout_flat: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    block_rows: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let tap = kd * kh * kw;
+    let patch_width = in_ch * tap;
+    let patch_count = od * oh * ow;
+    let block_rows = block_rows.max(1);
+    let total_out = batch * in_ch * pd * ph * pw;
+    if batch == 0
+        || in_ch == 0
+        || out_ch == 0
+        || patch_count == 0
+        || patch_width == 0
+        || total_out == 0
+    {
+        return vec![0.0f64; total_out];
+    }
+    let ohow = oh * ow;
+    let phpw = ph * pw;
+    let vol = pd * phpw;
+    let patch_origins: Vec<(usize, usize, usize)> = (0..patch_count)
+        .map(|pc| {
+            let base_d = (pc / ohow) * sd;
+            let rem = pc % ohow;
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            (base_d, base_h, base_w)
+        })
+        .collect();
+    build_uninit(total_out, |dpadded| {
+        dpadded
+            .par_chunks_mut(in_ch * vol)
+            .enumerate()
+            .for_each(|(b, dpb)| {
+                dpb.fill(0.0);
+                let scatter = |block: &[f64], start: usize, rows: usize, dpb: &mut [f64]| {
+                    for r in 0..rows {
+                        let (base_d, base_h, base_w) = patch_origins[start + r];
+                        let prow = r * patch_width;
+                        for c in 0..in_ch {
+                            let ch_off = c * vol;
+                            let pch = c * tap;
+                            for kdd in 0..kd {
+                                let d_off = ch_off + (base_d + kdd) * phpw;
+                                let pkd = pch + kdd * kh * kw;
+                                for kr in 0..kh {
+                                    let irow = d_off + (base_h + kr) * pw + base_w;
+                                    let prow_off = prow + pkd + kr * kw;
+                                    for kc in 0..kw {
+                                        dpb[irow + kc] += block[prow_off + kc];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let first_rows = block_rows.min(patch_count);
+                let first =
+                    &dout_flat[(b * patch_count) * out_ch..(b * patch_count + first_rows) * out_ch];
+                let mut block = build_uninit(first_rows * patch_width, |block| {
+                    gemm::dgemm(first_rows, out_ch, patch_width, first, weight_flat, block);
+                });
+                scatter(&block, 0, first_rows, dpb);
+                let mut start = first_rows;
+                while start < patch_count {
+                    let rows = block_rows.min(patch_count - start);
+                    let a = &dout_flat[(b * patch_count + start) * out_ch
+                        ..(b * patch_count + start + rows) * out_ch];
+                    let dp = &mut block[..rows * patch_width];
+                    gemm::dgemm(rows, out_ch, patch_width, a, weight_flat, dp);
+                    scatter(dp, start, rows, dpb);
+                    start += rows;
+                }
+            });
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn conv3d_backward_generic_masked_f64(
     dout: &[f64],
@@ -19440,48 +20259,28 @@ fn conv3d_backward_generic_masked_f64(
     // memset per call on the scored lane's shape, and this is the path REAL TRAINING takes
     // (the all-ones fast path above only fires for a `sum().backward()`). Same vein as
     // item 96, which did the forward; see NEGATIVE_EVIDENCE item 98.
-    //
-    // `dpanel` alone is 28.3 MB. Its safety rests on a fact that was CHECKED in the gemm
-    // source rather than inferred from the names: every dispatch path of `gemm::dgemm`
-    // (`dgemm_block`, `dgemm_col_parallel`, `dgemm_2d_parallel`) and `gemm::dgemm_tb`
-    // passes **beta = 0.0** to the microkernel, so C is OVERWRITTEN, never accumulated
-    // into. Had any path accumulated, dropping the zero-fill would have been a silent
-    // wrong-answer bug rather than a compile error.
-    let dout_flat = build_uninit(flat * out_ch, |dout_flat: &mut [f64]| {
-        dout_flat
-            .par_chunks_mut(out_ch)
-            .enumerate()
-            .for_each(|(row, dr)| {
-                let n = row / patch_count;
-                let p = row % patch_count;
-                for (oc, d) in dr.iter_mut().enumerate() {
-                    *d = dout[(n * out_ch + oc) * patch_count + p];
-                }
-            });
-    });
-    // dweight = dout_flat^T @ panel, WITHOUT ever materializing the panel.
-    //
-    // This used to build the whole 28.3 MB im2col panel (`flat x patch_width` on the scored
-    // lane) and hand it to one `dgemm_tb`. `dgemm_tb` computes `C = A^T·B` with k = `flat`,
-    // i.e. it consumes the panel along its ROW axis — exactly the axis item 97 showed is
-    // partitionable, because matrixmultiply already walks k in ascending `D_KC = 256` chunks
-    // and accumulates into C between them. Both operands are row-major in k, so a k-block is
-    // a contiguous row window of each: `dout_flat` rows `[t, t+rows)` and panel rows the
-    // same.
-    //
-    // So the panel is built one `DGEMM_KC`-row block at a time into a reused buffer —
-    // 256 x 864 f64 = 1.7 MB, cache-resident — and folded into `dweight` with beta=0 on the
-    // first block and beta=1 after. 28.3 MB of DRAM traffic becomes 1.7 MB of L2, and by
-    // item 97 the result is BIT-IDENTICAL rather than merely close, which is what makes it
-    // safe to land without touching a golden.
-    //
-    // Design banked by a peer as item 100 while builds were unavailable; implemented here.
-    // The generic path is the one REAL TRAINING takes — item 99 scoped item 98's removal to
-    // the `sum()`-loss branch only, and this closes the other half.
-    // frankentorch-l2zki, NEGATIVE_EVIDENCE items 97/99/100.
-    // item 195: the expensive half — a 28.3 MB im2col panel in D_KC blocks plus a 113M-MAC
-    // GEMM, ~41% of this backward by item 188's table. BOTH conv3d lanes freeze their weight,
-    // so on the certified conv3d_masked row every one of those MACs was computed and discarded.
+    let dout_flat = if output_mask[0] || output_mask[1] {
+        build_uninit(flat * out_ch, |dout_flat: &mut [f64]| {
+            if patch_count * out_ch == 0 {
+                return;
+            }
+            dout_flat
+                .par_chunks_mut(patch_count * out_ch)
+                .enumerate()
+                .for_each(|(n, df_batch)| {
+                    let base = n * out_ch * patch_count;
+                    transpose_2d_into_f64(
+                        &dout[base..base + out_ch * patch_count],
+                        df_batch,
+                        out_ch,
+                        patch_count,
+                    );
+                });
+        })
+    } else {
+        Vec::new()
+    };
+    // dweight = dout_flat^T @ panel.
     let dweight = output_mask[1].then(|| {
         build_uninit(out_ch * patch_width, |dweight: &mut [f64]| {
             if flat == 0 || patch_width == 0 {
@@ -19499,21 +20298,38 @@ fn conv3d_backward_generic_masked_f64(
             gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, dweight);
         })
     });
-    // frankentorch-l2zki / NEGATIVE_EVIDENCE item 116: the fused block-at-a-time form of the
-    // two steps below was tried and REVERTED. It removed the 28.3 MB `dpanel` and it was
-    // bit-exact, but it cost 1.7x ON THE LANE IT TARGETED: one `dgemm(flat, ..)` parallelises
-    // over all `flat` rows at once, while 16 sequential `dgemm(256, ..)` calls fragment that
-    // into 16 phases and leave each scatter with only `in_ch` tasks. Memory was not the
-    // binding constraint on this route; parallel WIDTH was. Do not re-fuse without a design
-    // that keeps one wide parallel region.
-    // item 195: dinput's half — the second GEMM and the col2im scatter.
+    // item 195 / frankentorch-l2zki: dinput's half — blocked `(batch, channel_group)` GEMM +
+    // 3D col2im scatter (`conv3d_backward_dinput_direct_f64`) eliminates the 28.3 MB `dpanel`
+    // materialisation and its 32x strided DRAM re-read while keeping one wide parallel region.
     let dpadded = output_mask[0].then(|| {
-        let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f64]| {
-            gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
-        });
-        conv3d_col2im_f64(
-            &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
-        )
+        if conv3d_dinput_blocked() {
+            conv3d_backward_dinput_direct_f64(
+                &dout_flat,
+                weight_flat,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+            )
+        } else {
+            let dpanel = build_uninit(flat * patch_width, |dpanel: &mut [f64]| {
+                gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, dpanel);
+            });
+            conv3d_col2im_f64(
+                &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            )
+        }
     });
     let dbias = if output_mask[2] {
         // Parallel over out_ch: each channel's bias gradient is an independent
@@ -64315,6 +65131,355 @@ mod tests {
         assert_close("dpadded", &got.0, &want.0);
         assert_close("dweight", &got.1, &want.1);
         assert_close("dbias", got.2.as_ref().unwrap(), want.2.as_ref().unwrap());
+    }
+
+    #[test]
+    fn conv3d_dinput_direct_matches_panel_col2im_bitwise() {
+        for &(batch, in_ch, out_ch, pd, ph, pw, kd, kh, kw, sd, sh, sw) in &[
+            (
+                2usize, 8usize, 8usize, 6usize, 7usize, 8usize, 3usize, 3usize, 3usize, 1usize,
+                1usize, 1usize,
+            ),
+            (
+                2usize, 16usize, 12usize, 7usize, 8usize, 9usize, 3usize, 2usize, 3usize, 1usize,
+                2usize, 1usize,
+            ),
+            (
+                9usize, 4usize, 6usize, 5usize, 6usize, 5usize, 2usize, 3usize, 2usize, 1usize,
+                1usize, 2usize,
+            ),
+        ] {
+            let od = (pd - kd) / sd + 1;
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_count = od * oh * ow;
+            let patch_width = in_ch * kd * kh * kw;
+            let flat = batch * patch_count;
+            let dout: Vec<f64> = (0..batch * out_ch * patch_count)
+                .map(|i| ((i as f64 * 0.031).sin() * 0.6) + (i % 13) as f64 * 0.02 - 0.1)
+                .collect();
+            let padded: Vec<f64> = (0..batch * in_ch * pd * ph * pw)
+                .map(|i| (i as f64 * 0.019).cos() * 0.4)
+                .collect();
+            let weight_flat: Vec<f64> = (0..out_ch * patch_width)
+                .map(|i| ((i as f64 * 0.041).cos() * 0.5) - (i % 7) as f64 * 0.02)
+                .collect();
+
+            let prev = super::set_conv3d_dinput_blocked(false);
+            let (want_dp, want_dw, _) = super::conv3d_backward_generic_masked_f64(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+                [true, true, false],
+            );
+            super::set_conv3d_dinput_blocked(true);
+            let (got_dp, got_dw, _) = super::conv3d_backward_generic_masked_f64(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+                [true, true, false],
+            );
+            super::set_conv3d_dinput_blocked(prev);
+
+            let want_dp = want_dp.unwrap();
+            let got_dp = got_dp.unwrap();
+            assert_eq!(want_dp.len(), got_dp.len());
+            for (i, (w, g)) in want_dp.iter().zip(got_dp.iter()).enumerate() {
+                assert_eq!(
+                    w.to_bits(),
+                    g.to_bits(),
+                    "dpadded[{i}] batch={batch} in_ch={in_ch}: want {w} vs got {g}"
+                );
+            }
+            let want_dw = want_dw.unwrap();
+            let got_dw = got_dw.unwrap();
+            for (i, (w, g)) in want_dw.iter().zip(got_dw.iter()).enumerate() {
+                assert_eq!(
+                    w.to_bits(),
+                    g.to_bits(),
+                    "dweight[{i}] batch={batch} in_ch={in_ch}: want {w} vs got {g}"
+                );
+            }
+
+            let mut dout_flat = vec![0.0f64; flat * out_ch];
+            for n in 0..batch {
+                super::transpose_2d_into_f64(
+                    &dout[n * out_ch * patch_count..(n + 1) * out_ch * patch_count],
+                    &mut dout_flat[n * patch_count * out_ch..(n + 1) * patch_count * out_ch],
+                    out_ch,
+                    patch_count,
+                );
+            }
+            for &block_rows in &[1usize, 3, 17, 256] {
+                let blocked = super::conv3d_backward_dinput_blocked_rows_f64(
+                    &dout_flat,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    pd,
+                    ph,
+                    pw,
+                    kd,
+                    kh,
+                    kw,
+                    od,
+                    oh,
+                    ow,
+                    sd,
+                    sh,
+                    sw,
+                    out_ch,
+                    block_rows,
+                );
+                for (i, (w, g)) in want_dp.iter().zip(blocked.iter()).enumerate() {
+                    assert_eq!(w.to_bits(), g.to_bits(), "blocked_rows({block_rows})[{i}]");
+                }
+                for &cpg in &[1usize, 2, 4, in_ch] {
+                    if !in_ch.is_multiple_of(cpg) {
+                        continue;
+                    }
+                    let grouped = super::conv3d_backward_dinput_grouped_f64(
+                        &dout_flat,
+                        &weight_flat,
+                        batch,
+                        in_ch,
+                        pd,
+                        ph,
+                        pw,
+                        kd,
+                        kh,
+                        kw,
+                        od,
+                        oh,
+                        ow,
+                        sd,
+                        sh,
+                        sw,
+                        out_ch,
+                        block_rows,
+                        cpg,
+                    );
+                    for (i, (w, g)) in want_dp.iter().zip(grouped.iter()).enumerate() {
+                        assert_eq!(
+                            w.to_bits(),
+                            g.to_bits(),
+                            "grouped(block_rows={block_rows}, cpg={cpg})[{i}]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conv3d_direct_3x3s1_f32_matches_streamed_reference_bits() {
+        let padded: Vec<f32> = (0..8 * 5 * 5 * 5)
+            .map(|index| (index % 31) as f32 * 0.03125 - 0.375)
+            .collect();
+        let weight: Vec<f32> = (0..8 * 8 * 3 * 3 * 3)
+            .map(|index| (index % 29) as f32 * 0.015625 - 0.21875)
+            .collect();
+        let bias: Vec<f32> = (0..8).map(|channel| channel as f32 * 0.25).collect();
+        let out = super::conv3d_forward_f32(
+            &padded,
+            &weight,
+            Some(&bias),
+            1,
+            8,
+            5,
+            5,
+            5,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            1,
+            1,
+            1,
+            8,
+        );
+        let streamed = super::conv3d_forward_streamed_f32(
+            &padded,
+            &weight,
+            Some(&bias),
+            1,
+            8,
+            5,
+            5,
+            5,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            1,
+            1,
+            1,
+            8,
+        );
+        assert_eq!(out.len(), streamed.len());
+        for (index, (direct, expected)) in out.iter().zip(streamed.iter()).enumerate() {
+            assert_eq!(direct.to_bits(), expected.to_bits(), "f32 output[{index}]");
+        }
+
+        let out_without_bias = super::conv3d_forward_f32(
+            &padded, &weight, None, 1, 8, 5, 5, 5, 3, 3, 3, 3, 3, 3, 1, 1, 1, 8,
+        );
+        let streamed_without_bias = super::conv3d_forward_streamed_f32(
+            &padded, &weight, None, 1, 8, 5, 5, 5, 3, 3, 3, 3, 3, 3, 1, 1, 1, 8,
+        );
+        assert_eq!(
+            out_without_bias
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            streamed_without_bias
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "f32 direct no-bias route must retain streamed bits"
+        );
+    }
+
+    #[test]
+    fn conv3d_forward_f32_routes_deep_reductions_to_the_streamed_kernel() {
+        const IN_CH: usize = 32;
+        const OUT_CH: usize = 8;
+        let (pd, ph, pw) = (5usize, 6usize, 6usize);
+        let (od, oh, ow) = (pd - 2, ph - 2, pw - 2);
+        let padded: Vec<f32> = (0..IN_CH * pd * ph * pw)
+            .map(|index| ((index % 251) as f32) * 0.001 - 0.12)
+            .collect();
+        let weight: Vec<f32> = (0..OUT_CH * IN_CH * 3 * 3 * 3)
+            .map(|index| ((index % 241) as f32) * 0.001 - 0.11)
+            .collect();
+        let dispatched = super::conv3d_forward_f32(
+            &padded, &weight, None, 1, IN_CH, pd, ph, pw, 3, 3, 3, od, oh, ow, 1, 1, 1, OUT_CH,
+        );
+        let streamed = super::conv3d_forward_streamed_f32(
+            &padded, &weight, None, 1, IN_CH, pd, ph, pw, 3, 3, 3, od, oh, ow, 1, 1, 1, OUT_CH,
+        );
+        for (index, (got, want)) in dispatched.iter().zip(streamed.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "conv3d_forward_f32 took the DIRECT route at in_ch={IN_CH} (element {index})"
+            );
+        }
+    }
+
+    #[test]
+    fn conv3d_dinput_direct_f32_matches_panel_col2im_bitwise() {
+        for (batch, in_ch, out_ch, pd, ph, pw, kd, kh, kw, sd, sh, sw) in [
+            (
+                2usize, 8usize, 6usize, 6usize, 7usize, 8usize, 3usize, 3usize, 3usize, 1usize,
+                1usize, 1usize,
+            ),
+            (
+                3usize, 6usize, 5usize, 7usize, 6usize, 5usize, 2usize, 3usize, 2usize, 2usize,
+                1usize, 2usize,
+            ),
+        ] {
+            let od = (pd - kd) / sd + 1;
+            let oh = (ph - kh) / sh + 1;
+            let ow = (pw - kw) / sw + 1;
+            let patch_count = od * oh * ow;
+            let patch_width = in_ch * kd * kh * kw;
+            let dout: Vec<f32> = (0..batch * out_ch * patch_count)
+                .map(|i| (i as f32 * 0.031).sin() * 0.6 + (i % 13) as f32 * 0.02 - 0.1)
+                .collect();
+            let padded: Vec<f32> = (0..batch * in_ch * pd * ph * pw)
+                .map(|i| (i as f32 * 0.019).cos() * 0.4)
+                .collect();
+            let weight_flat: Vec<f32> = (0..out_ch * patch_width)
+                .map(|i| (i as f32 * 0.041).cos() * 0.5 - (i % 7) as f32 * 0.02)
+                .collect();
+
+            let prev = super::set_conv3d_dinput_blocked(false);
+            let (want_dp, _, _) = super::conv3d_backward_masked_f32(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+                [true, false, false],
+            );
+            super::set_conv3d_dinput_blocked(true);
+            let (got_dp, _, _) = super::conv3d_backward_masked_f32(
+                &dout,
+                &padded,
+                &weight_flat,
+                batch,
+                in_ch,
+                pd,
+                ph,
+                pw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+                out_ch,
+                [true, false, false],
+            );
+            super::set_conv3d_dinput_blocked(prev);
+
+            let want_dp = want_dp.unwrap();
+            let got_dp = got_dp.unwrap();
+            for (i, (w, g)) in want_dp.iter().zip(got_dp.iter()).enumerate() {
+                assert_eq!(w.to_bits(), g.to_bits(), "f32 dpadded[{i}]");
+            }
+        }
     }
 
     #[test]

@@ -381,3 +381,12 @@
 {"host":"thinkstation1","torch":"2.8.0+cu128","lane":"batch_norm2d_f64_dense","fingerprint":"1.379436e4","incumbent_ms":89.641621,"rounds":16,"lane_count":2,"recorded_unix":1792507183}
 {"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_masked","fingerprint":"4.498600e5","incumbent_ms":37.159933,"rounds":16,"lane_count":2,"recorded_unix":1792507183}
 {"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv2d_f32_masked","fingerprint":"4.498600e5","incumbent_ms":37.086267,"rounds":24,"lane_count":1,"recorded_unix":1792507224}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"attention","fingerprint":"1.222348e4","incumbent_ms":114.279990,"rounds":16,"lane_count":5,"recorded_unix":1792989125}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"attention_dense","fingerprint":"1.249305e2","incumbent_ms":102.381185,"rounds":16,"lane_count":5,"recorded_unix":1792989125}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv3d_masked","fingerprint":"2.641925e4","incumbent_ms":46.145238,"rounds":16,"lane_count":5,"recorded_unix":1792989125}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv3d_masked_panel","fingerprint":"2.641925e4","incumbent_ms":47.727101,"rounds":16,"lane_count":5,"recorded_unix":1792989125}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"attention","fingerprint":"1.222348e4","incumbent_ms":40.756919,"rounds":16,"lane_count":5,"recorded_unix":1792991847}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"attention_dense","fingerprint":"1.249305e2","incumbent_ms":45.230977,"rounds":16,"lane_count":5,"recorded_unix":1792991847}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv3d_masked","fingerprint":"2.641925e4","incumbent_ms":37.322936,"rounds":16,"lane_count":5,"recorded_unix":1792991847}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"conv3d_masked_panel","fingerprint":"2.641925e4","incumbent_ms":36.235913,"rounds":16,"lane_count":5,"recorded_unix":1792991847}
+{"host":"thinkstation1","torch":"2.8.0+cu128","lane":"attention","fingerprint":"1.222348e4","incumbent_ms":34.557060,"rounds":16,"lane_count":2,"recorded_unix":1792992317}

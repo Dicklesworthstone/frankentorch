@@ -1671,6 +1671,27 @@ fn timed_conv3d_masked(
     mask: &[f64],
     out_shape: Vec<usize>,
 ) -> (f64, f64) {
+    timed_conv3d_masked_with_dinput_blocked(
+        values,
+        input_shape,
+        weights,
+        weight_shape,
+        mask,
+        out_shape,
+        true,
+    )
+}
+
+fn timed_conv3d_masked_with_dinput_blocked(
+    values: &[f64],
+    input_shape: Vec<usize>,
+    weights: &[f64],
+    weight_shape: Vec<usize>,
+    mask: &[f64],
+    out_shape: Vec<usize>,
+    blocked_dinput: bool,
+) -> (f64, f64) {
+    let prev = ft_kernel_cpu::set_conv3d_dinput_blocked(blocked_dinput);
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = session
         .tensor_variable(values.to_vec(), input_shape, true)
@@ -1691,6 +1712,7 @@ fn timed_conv3d_masked(
     let scaled = session.tensor_mul(out, mask_leaf).expect("mask multiply");
     let loss = session.tensor_sum(scaled).expect("sum");
     let report = session.tensor_backward(loss).expect("backward");
+    ft_kernel_cpu::set_conv3d_dinput_blocked(prev);
     let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
     let checksum = report
         .gradient(x)
@@ -2091,6 +2113,7 @@ LANES = {
     # change to the shared serve loop, which unpacks a 2-tuple for every lane. The multiply
     # is charged to both arms alike and the mask is built in setup, outside the timer.
     "conv3d_masked": (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))*c3m),
+    "conv3d_masked_panel": (c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))*c3m),
     "max_pool3d": (mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
     # frankentorch-9pafs: the same torch op under a second name. The FrankenTorch
     # side runs this lane with its buffer pool DISABLED, so the pair isolates the
@@ -3283,6 +3306,20 @@ LANES = {
                 )
             }),
         ),
+        (
+            "conv3d_masked_panel",
+            Box::new(|| {
+                timed_conv3d_masked_with_dinput_blocked(
+                    &c3x,
+                    vec![C3_N, C3_CI, C3_D, C3_H, C3_W],
+                    &c3w,
+                    vec![C3_CO, C3_CI, C3_K, C3_K, C3_K],
+                    &c3m,
+                    vec![C3_N, C3_CO, C3_D, C3_H, C3_W],
+                    false,
+                )
+            }),
+        ),
     ];
 
     // frankentorch-68pwz, NEGATIVE_EVIDENCE item 58: restrict the sweep to named
@@ -4380,6 +4417,10 @@ LANES = {
                 // pre-lever zeroed allocation, flipped per arm inside one process.
                 name.strip_suffix("_zeroed")
                     .map(|base| (base.to_owned(), "uninit output"))
+            })
+            .or_else(|| {
+                name.strip_suffix("_panel")
+                    .map(|base| (base.to_owned(), "blocked dinput"))
             })
         else {
             continue;
