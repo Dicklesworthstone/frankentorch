@@ -17882,37 +17882,42 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Softmax { input, dim } => {
-                    // grad_input_i = s_i * (grad_i - sum_dim_j(grad_j * s_j)), s = softmax output.
-                    // Compose from cg primitives so the gradient node depends on the output
-                    // `node_id` (hence the input); double-backward through softmax is then
-                    // correct instead of silently zero. (A detached leaf dropped the curvature.)
-                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let reduce_size = shape[dim];
-                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
-                        &shape,
-                        dim,
-                        "softmax cg backward shape volume overflow",
-                    )?;
-                    let mut reduced_shape = shape.clone();
-                    reduced_shape[dim] = 1;
-                    // dot = sum over `dim` of (grad ⊙ s), kept-dim, then broadcast back so the
-                    // elementwise cg_sub / cg_mul stay shape-aligned.
-                    let sg = self.cg_mul(node_id, incoming_id)?;
-                    let dot = self.cg_sum_to_shape(sg, &reduced_shape)?;
-                    let dot_vals = self.nodes[dot.0].tensor.contiguous_values_as_f64()?;
-                    let mut dot_full = vec![0.0; input_numel];
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let d = dot_vals[outer * inner_size + inner];
-                            for r in 0..reduce_size {
-                                dot_full
-                                    [outer * reduce_size * inner_size + r * inner_size + inner] = d;
-                            }
+                    // Work in the tape's f64 gradient space, retaining the edge to
+                    // the saved output even when the forward tensor is f32.
+                    let output = self.cg_to_f64(node_id)?;
+                    let sg = self.cg_mul(output, incoming_id)?;
+                    let dot = self.cg_sum_broadcast_along_dim(sg, dim)?;
+                    let diff = self.cg_sub(incoming_id, dot)?;
+                    let regular = self.cg_mul(output, diff)?;
+                    let s_dot = self.cg_mul(output, dot)?;
+                    let grad_in = if let Some((dominant, split_lane)) = self
+                        .cg_normalize_tail_masks(
+                            output,
+                            incoming_id,
+                            regular,
+                            (sg, s_dot),
+                            dim,
+                            NormalizeOp::Softmax,
+                        )? {
+                        // C replaces the dominant entry by minus the tail sum.
+                        // Its adjoint centers a second-pass direction BEFORE it
+                        // meets small probabilities, preserving tiny curvature.
+                        let factored = self.cg_conserve_along_dim(regular, dominant, dim)?;
+                        if let Some(split_lane) = split_lane {
+                            // Large signed tail gradients can swallow the small
+                            // dominant residual. Reduce the two terms separately
+                            // in those lanes; keep factor-before-multiply where
+                            // it better preserves small upstream residuals.
+                            let first = self.cg_conserve_along_dim(sg, dominant, dim)?;
+                            let second = self.cg_conserve_along_dim(s_dot, dominant, dim)?;
+                            let split = self.cg_sub(first, second)?;
+                            self.cg_where(split_lane, split, factored)?
+                        } else {
+                            factored
                         }
-                    }
-                    let dot_node = self.cg_expand(dot, dot_full, shape.clone())?;
-                    let diff = self.cg_sub(incoming_id, dot_node)?;
-                    let grad_in = self.cg_mul(node_id, diff)?;
+                    } else {
+                        regular
+                    };
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -17922,34 +17927,28 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::LogSoftmax { input, dim } => {
-                    // grad_input_i = grad_i - exp(out_i) * sum_dim_j(grad_j).
-                    // Compose from cg primitives: exp(out) = softmax depends on the input, so
-                    // double-backward is correct rather than silently zero.
-                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let reduce_size = shape[dim];
-                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
-                        &shape,
+                    let output = self.cg_to_f64(node_id)?;
+                    let gsum = self.cg_sum_broadcast_along_dim(incoming_id, dim)?;
+                    let exp_out = self.cg_exp(output)?;
+                    let term = self.cg_mul(exp_out, gsum)?;
+                    let regular = self.cg_sub(incoming_id, term)?;
+                    let grad_in = if let Some((dominant, _)) = self.cg_normalize_tail_masks(
+                        output,
+                        incoming_id,
+                        regular,
+                        (incoming_id, term),
                         dim,
-                        "log_softmax cg backward shape volume overflow",
-                    )?;
-                    let mut reduced_shape = shape.clone();
-                    reduced_shape[dim] = 1;
-                    let gsum = self.cg_sum_to_shape(incoming_id, &reduced_shape)?;
-                    let gsum_vals = self.nodes[gsum.0].tensor.contiguous_values_as_f64()?;
-                    let mut gsum_full = vec![0.0; input_numel];
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let v = gsum_vals[outer * inner_size + inner];
-                            for r in 0..reduce_size {
-                                gsum_full
-                                    [outer * reduce_size * inner_size + r * inner_size + inner] = v;
-                            }
-                        }
-                    }
-                    let gsum_node = self.cg_expand(gsum, gsum_full, shape.clone())?;
-                    let exp_out = self.cg_exp(node_id)?;
-                    let term = self.cg_mul(exp_out, gsum_node)?;
-                    let grad_in = self.cg_sub(incoming_id, term)?;
+                        NormalizeOp::LogSoftmax,
+                    )? {
+                        // C(g) - C(exp(out)*sum(g)), not C(g - exp(out)*sum(g)):
+                        // signed upstream tails such as [1, -1] must be reduced
+                        // separately from the tiny probability correction.
+                        let first = self.cg_conserve_along_dim(incoming_id, dominant, dim)?;
+                        let second = self.cg_conserve_along_dim(term, dominant, dim)?;
+                        self.cg_sub(first, second)?
+                    } else {
+                        regular
+                    };
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -19097,6 +19096,238 @@ impl TensorTape {
         })
     }
 
+    /// Widen a saved forward tensor into the f64 gradient space without
+    /// detaching it. Unlike a public cast, a backward helper must record its
+    /// dependency even if forward grad recording is currently disabled.
+    fn cg_to_f64(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let node = self.node(input)?;
+        let meta = node.tensor.meta();
+        if meta.dtype() == DType::F64 {
+            return Ok(input);
+        }
+        if !matches!(meta.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()).into());
+        }
+        let tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+            node.tensor.contiguous_values_as_f64()?,
+        )?;
+        let requires_grad = node.requires_grad;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor,
+            requires_grad,
+            op: TensorNodeOp::CastF64 { input },
+        });
+        Ok(out)
+    }
+
+    /// A real selection node, rather than multiplication by a zero/one mask:
+    /// zero times an unselected infinity or NaN would change IEEE semantics.
+    fn cg_where(
+        &mut self,
+        condition: TensorNodeId,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let condition_node = self.node(condition)?;
+        let x_node = self.node(x)?;
+        let y_node = self.node(y)?;
+        let shape = x_node.tensor.meta().shape();
+        if condition_node.tensor.meta().shape() != shape || y_node.tensor.meta().shape() != shape {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "create_graph: shape mismatch in gradient selection",
+                }
+                .into(),
+            ));
+        }
+        let meta =
+            TensorMeta::from_shape(shape.to_vec(), DType::F64, x_node.tensor.meta().device());
+        let values = where_tensor_contiguous_f64(
+            &condition_node.tensor.contiguous_values_as_f64()?,
+            &x_node.tensor.contiguous_values_as_f64()?,
+            &y_node.tensor.contiguous_values_as_f64()?,
+            &meta,
+        )
+        .map_err(|error| AutogradError::Dispatch(error.into()))?;
+        let requires_grad = x_node.requires_grad || y_node.requires_grad;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, values)?,
+            requires_grad,
+            op: TensorNodeOp::Where { condition, x, y },
+        });
+        Ok(out)
+    }
+
+    /// Reduce one dimension and broadcast it back, recording both operations.
+    fn cg_sum_broadcast_along_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.node(input)?.tensor.meta().shape().to_vec();
+        let (outer_size, inner_size, numel) = Self::checked_dim_loop_sizes(
+            &shape,
+            dim,
+            "normalize cg backward shape volume overflow",
+        )?;
+        let reduce_size = shape[dim];
+        let mut reduced_shape = shape.clone();
+        reduced_shape[dim] = 1;
+        let sum = self.cg_sum_to_shape(input, &reduced_shape)?;
+        let values = self.nodes[sum.0].tensor.contiguous_values_as_f64()?;
+        let mut expanded = vec![0.0; numel];
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let value = values[outer * inner_size + inner];
+                for r in 0..reduce_size {
+                    expanded[outer * reduce_size * inner_size + r * inner_size + inner] = value;
+                }
+            }
+        }
+        self.cg_expand(sum, expanded, shape)
+    }
+
+    /// For a lane with dominant index r, C(z)_r = -sum_{j != r}(z_j),
+    /// C(z)_j = z_j otherwise. Normalization gradients sum to zero, so C
+    /// preserves their exact value. Crucially, C^T v = v - v_r: the graph
+    /// centers a second-backward direction before multiplying by tiny tails.
+    /// All numerical terms remain differentiable; only the selector is fixed.
+    fn cg_conserve_along_dim(
+        &mut self,
+        input: TensorNodeId,
+        dominant: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let meta = self.node(input)?.tensor.meta();
+        let zeros = DenseTensor::from_storage(
+            TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+            vec![0.0; meta.numel()],
+        )?;
+        let zero = self.leaf_tensor(zeros, false);
+        let tail = self.cg_where(dominant, zero, input)?;
+        let tail_sum = self.cg_sum_broadcast_along_dim(tail, dim)?;
+        let negative_tail = self.cg_neg(tail_sum)?;
+        self.cg_where(dominant, negative_tail, input)
+    }
+
+    /// Choose algebraically equivalent graphs per lane, never detached
+    /// numerical corrections. Leave nonfinite lanes on the original formula.
+    /// For softmax, compare cancellation in the factored tail gradients with
+    /// cancellation in separately reduced products. Select the WHOLE lane:
+    /// mixing only the dominant entry would lose C's centering adjoint.
+    fn cg_normalize_tail_masks(
+        &mut self,
+        output: TensorNodeId,
+        incoming: TensorNodeId,
+        regular: TensorNodeId,
+        terms: (TensorNodeId, TensorNodeId),
+        dim: usize,
+        op: NormalizeOp,
+    ) -> Result<Option<(TensorNodeId, Option<TensorNodeId>)>, AutogradError> {
+        let output_node = self.node(output)?;
+        let meta = output_node.tensor.meta();
+        let shape = meta.shape().to_vec();
+        let device = meta.device();
+        let (outer_size, inner_size, numel) =
+            Self::checked_dim_loop_sizes(&shape, dim, "normalize cg tail shape volume overflow")?;
+        let reduce_size = shape[dim];
+        if reduce_size <= 1 {
+            // No tail cancellation is possible; preserve legacy signed zeros.
+            return Ok(None);
+        }
+        let output_values = output_node.tensor.contiguous_values_as_f64()?;
+        let incoming_values = self.node(incoming)?.tensor.contiguous_values_as_f64()?;
+        let regular_values = self.node(regular)?.tensor.contiguous_values_as_f64()?;
+        let left_values = self.node(terms.0)?.tensor.contiguous_values_as_f64()?;
+        let right_values = self.node(terms.1)?.tensor.contiguous_values_as_f64()?;
+        for (id, values) in [
+            (output, &output_values),
+            (incoming, &incoming_values),
+            (regular, &regular_values),
+            (terms.0, &left_values),
+            (terms.1, &right_values),
+        ] {
+            Self::ensure_tensor_len(id, numel, values.len())?;
+        }
+        let log = matches!(op, NormalizeOp::LogSoftmax);
+        let threshold = if log { -std::f64::consts::LN_2 } else { 0.5 };
+        let mut dominant_mask = vec![0.0; numel];
+        let mut split_mask = vec![0.0; numel];
+        let mut any_dominant = false;
+        let mut any_split = false;
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let base = outer * reduce_size * inner_size + inner;
+                let mut dominant = None;
+                let mut finite = true;
+                for r in 0..reduce_size {
+                    let idx = base + r * inner_size;
+                    let value = output_values[idx];
+                    // A masked -inf logit has log probability -inf and p=0.
+                    // It is legitimate, unlike NaN/+inf normalization outputs.
+                    finite &= (value.is_finite() || (log && value == f64::NEG_INFINITY))
+                        && incoming_values[idx].is_finite()
+                        && regular_values[idx].is_finite()
+                        && left_values[idx].is_finite()
+                        && right_values[idx].is_finite();
+                    if value > threshold && dominant.replace(idx).is_some() {
+                        // Require a unique dominant even for rounded half
+                        // precision outputs or malformed saved tensors.
+                        finite = false;
+                    }
+                }
+                let Some(dominant) = dominant.filter(|_| finite) else {
+                    continue;
+                };
+                let (mut left_tail, mut right_tail, mut regular_tail, mut factored_cost) =
+                    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                for r in 0..reduce_size {
+                    let idx = base + r * inner_size;
+                    if idx != dominant {
+                        left_tail += left_values[idx];
+                        right_tail += right_values[idx];
+                        regular_tail += regular_values[idx];
+                        factored_cost += regular_values[idx].abs();
+                    }
+                }
+                let separated_cost = left_tail.abs() + right_tail.abs();
+                if !left_tail.is_finite()
+                    || !right_tail.is_finite()
+                    || !regular_tail.is_finite()
+                    || !factored_cost.is_finite()
+                    || !separated_cost.is_finite()
+                    || !(right_tail - left_tail).is_finite()
+                {
+                    continue;
+                }
+                dominant_mask[dominant] = 1.0;
+                any_dominant = true;
+                if !log && separated_cost < factored_cost {
+                    for r in 0..reduce_size {
+                        split_mask[base + r * inner_size] = 1.0;
+                    }
+                    any_split = true;
+                }
+            }
+        }
+        if !any_dominant {
+            return Ok(None);
+        }
+        let meta = TensorMeta::from_shape(shape, DType::F64, device);
+        let dominant = self.leaf_tensor(
+            DenseTensor::from_storage(meta.clone(), dominant_mask)?,
+            false,
+        );
+        let split = if any_split {
+            Some(self.leaf_tensor(DenseTensor::from_storage(meta, split_mask)?, false))
+        } else {
+            None
+        };
+        Ok(Some((dominant, split)))
+    }
     /// Helper: accumulate a gradient node contribution for create_graph.
     fn cg_accumulate(
         &mut self,
@@ -32596,6 +32827,911 @@ mod tests {
         assert!(gx[0] > 0.5 && gx[0] < 1.0);
         assert!(gx[1] > 0.0 && gx[1] < 0.5);
         assert!(gx[2] < 0.0);
+    }
+
+    fn check_softmax_family_create_graph_collapse(f32_leaf: bool) {
+        // Decimal, 220 decimal digits, rounded once to f64. All input logits
+        // and weights are exactly representable in both tested dtypes.
+        let (margin, expected) = if f32_leaf {
+            (
+                9.0,
+                [
+                    [
+                        -3.045995763380708e-8,
+                        1.522997881690354e-8,
+                        1.522997881690354e-8,
+                    ],
+                    [
+                        -3.045995856161615e-8,
+                        1.5229979280808076e-8,
+                        1.5229979280808076e-8,
+                    ],
+                ],
+            )
+        } else {
+            (
+                20.0,
+                [[
+                    -8.496708510583178e-18,
+                    4.248354255291589e-18,
+                    4.248354255291589e-18,
+                ]; 2],
+            )
+        };
+        for (log, want) in [false, true].into_iter().zip(expected) {
+            for create_graph in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(
+                        vec![margin as f32, -margin as f32, -margin as f32],
+                        vec![3],
+                        true,
+                    )
+                } else {
+                    tape.leaf(vec![margin, -margin, -margin], vec![3], true)
+                }
+                .expect("logits");
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .expect("softmax family forward");
+                let weight = tape.leaf(vec![-1.0, 0.0, 0.0], vec![3], false).unwrap();
+                let (weighted, _) = tape.mul(y, weight, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let report = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .expect("backward must support both f32 and f64 logits");
+                let grad = report.gradient(x).unwrap();
+                let relative_tolerance = if f32_leaf { 2e-6 } else { 2e-14 };
+                for (i, (&got, reference)) in grad.iter().zip(want).enumerate() {
+                    assert!(
+                        (got - reference).abs() <= relative_tolerance * reference.abs(),
+                        "f32={f32_leaf}, log={log}, create_graph={create_graph}, gradient[{i}]={got:e}, reference={reference:e}"
+                    );
+                }
+                if create_graph {
+                    let grad_node = report.gradient_node(x).expect("differentiable gradient");
+                    assert_eq!(tape.tensor(grad_node).unwrap().meta().dtype(), DType::F64);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_collapse_f64() {
+        check_softmax_family_create_graph_collapse(false);
+    }
+
+    #[test]
+    fn create_graph_softmax_family_collapse_f32() {
+        check_softmax_family_create_graph_collapse(true);
+    }
+
+    struct SoftmaxCgReference {
+        logits: [f64; 3],
+        upstream: [f64; 3],
+        direction: [f64; 3],
+        // Index 0 is softmax, index 1 is log_softmax.
+        gradient: [[f64; 3]; 2],
+        hessian_vector: [[f64; 3]; 2],
+        upstream_derivative: [[f64; 3]; 2],
+    }
+
+    fn softmax_cg_references(f32_leaf: bool) -> [SoftmaxCgReference; 4] {
+        // Independent references generated using Python Decimal at precision 220:
+        // p_i = exp(x_i) / sum(exp(x)); A = sum(p*g); B = sum(p*v);
+        // q_i = p_i*(v_i-B), C = sum(g*q), G = sum(g).
+        // Softmax: grad_i=p_i*(g_i-A), Hv_i=q_i*(g_i-A)-p_i*C, d_g=q.
+        // Log-softmax: grad_i=g_i-p_i*G, Hv_i=-G*q_i, d_g_i=v_i-B.
+        // Only the final answers are rounded to f64, including the tiny dominant
+        // entries. Inputs/weights/directions are dyadic and exactly representable
+        // in both f32 and f64, so there is no hidden input-rounding discrepancy.
+        let collapse = if f32_leaf {
+            SoftmaxCgReference {
+                logits: [9.0, -9.0, -9.0],
+                upstream: [-1.0, 0.0, 0.0],
+                // This direction makes one tail curvature O(exp(-2*margin)).
+                // Keeping only the leading-order Hessian would silently zero it.
+                direction: [1.0, 1.0, 0.0],
+                gradient: [
+                    [
+                        -3.045995763380708e-8,
+                        1.522997881690354e-8,
+                        1.522997881690354e-8,
+                    ],
+                    [
+                        -3.045995856161615e-8,
+                        1.5229979280808076e-8,
+                        1.5229979280808076e-8,
+                    ],
+                ],
+                hessian_vector: [
+                    [
+                        1.522997788909449e-8,
+                        4.639045236571736e-16,
+                        -1.5229978352999016e-8,
+                    ],
+                    [
+                        1.522997881690354e-8,
+                        2.319522688938433e-16,
+                        -1.5229979048855806e-8,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        1.522997881690354e-8,
+                        2.319522688938433e-16,
+                        -1.5229979048855806e-8,
+                    ],
+                    [
+                        1.5229979280808076e-8,
+                        1.5229979280808076e-8,
+                        -0.9999999847700207,
+                    ],
+                ],
+            }
+        } else {
+            SoftmaxCgReference {
+                logits: [20.0, -20.0, -20.0],
+                upstream: [-1.0, 0.0, 0.0],
+                direction: [1.0, 1.0, 0.0],
+                gradient: [[
+                    -8.496708510583178e-18,
+                    4.248354255291589e-18,
+                    4.248354255291589e-18,
+                ]; 2],
+                hessian_vector: [
+                    [
+                        4.248354255291589e-18,
+                        3.60970277569083e-35,
+                        -4.248354255291589e-18,
+                    ],
+                    [
+                        4.248354255291589e-18,
+                        1.804851387845415e-35,
+                        -4.248354255291589e-18,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        4.248354255291589e-18,
+                        1.804851387845415e-35,
+                        -4.248354255291589e-18,
+                    ],
+                    [4.248354255291589e-18, 4.248354255291589e-18, -1.0],
+                ],
+            }
+        };
+        let large_margin = if f32_leaf {
+            SoftmaxCgReference {
+                logits: [-40.0, 40.0, -39.0],
+                upstream: [-1.0, 0.5, 1.25],
+                direction: [-1.5, 0.25, 2.0],
+                gradient: [
+                    [
+                        -2.7072770817681225e-35,
+                        -9.722939662188377e-36,
+                        3.6795710479869604e-35,
+                    ],
+                    [-1.0, -0.25, 1.25],
+                ],
+                hessian_vector: [
+                    [
+                        4.737734893094215e-35,
+                        -1.1176984227071396e-34,
+                        6.43924933397718e-35,
+                    ],
+                    [
+                        2.3688674465471074e-35,
+                        4.0703818874300733e-35,
+                        -6.43924933397718e-35,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        -3.1584899287294766e-35,
+                        -5.427175849906764e-35,
+                        8.585665778636241e-35,
+                    ],
+                    [-1.75, -5.427175849906764e-35, 1.75],
+                ],
+            }
+        } else {
+            SoftmaxCgReference {
+                logits: [-100.0, 100.0, -99.0],
+                upstream: [-1.0, 0.5, 1.25],
+                direction: [-1.5, 0.25, 2.0],
+                gradient: [
+                    [
+                        -2.075844790105106e-87,
+                        -7.455207957169393e-88,
+                        2.8213655858220456e-87,
+                    ],
+                    [-1.0, -0.25, 1.25],
+                ],
+                hessian_vector: [
+                    [
+                        3.632728382683936e-87,
+                        -8.570118157872516e-87,
+                        4.93738977518858e-87,
+                    ],
+                    [
+                        1.816364191341968e-87,
+                        3.121025583846612e-87,
+                        -4.93738977518858e-87,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        -2.421818921789291e-87,
+                        -4.161367445128816e-87,
+                        6.5831863669181065e-87,
+                    ],
+                    [-1.75, -4.161367445128816e-87, 1.75],
+                ],
+            }
+        };
+        [
+            collapse,
+            SoftmaxCgReference {
+                logits: [4.0, 4.0, -1.0],
+                upstream: [2.0, -3.0, 0.25],
+                direction: [1.25, 0.5, -1.0],
+                gradient: [
+                    [1.2445480275662826, -1.247057818367461, 0.002509790801178395],
+                    [2.3737408768900616, -2.6262591231099384, 0.25251824621987695],
+                ],
+                hessian_vector: [
+                    [
+                        0.011278257927308404,
+                        -0.0034667630296146665,
+                        -0.007811494897693737,
+                    ],
+                    [
+                        0.1425057577098778,
+                        -0.13779989995766834,
+                        -0.004705857752209491,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        0.19000767694650375,
+                        -0.18373319994355777,
+                        -0.006274477002945987,
+                    ],
+                    [0.3812956155496924, -0.3687043844503076, -1.8687043844503075],
+                ],
+            },
+            SoftmaxCgReference {
+                logits: [3.25, -1.5, 0.125],
+                upstream: [-0.75, 2.0, 0.5],
+                direction: [-0.25, 1.5, 0.75],
+                gradient: [
+                    [
+                        -0.07104457676687137,
+                        0.021988819975055276,
+                        0.0490557567918161,
+                    ],
+                    [-2.412567837115034, 1.9856159698187692, 0.4269518672962647],
+                ],
+                hessian_vector: [
+                    [
+                        -0.0791753402707056,
+                        0.03652679541269476,
+                        0.04264854485801084,
+                    ],
+                    [
+                        0.0933129836585726,
+                        -0.02436473732404613,
+                        -0.06894824633452648,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        -0.053321704947755774,
+                        0.013922707042312075,
+                        0.0393989979054437,
+                    ],
+                    [-0.056125820297650945, 1.693874179702349, 0.9438741797023491],
+                ],
+            },
+            large_margin,
+        ]
+    }
+
+    fn pack_softmax_reference_lanes(
+        references: &[SoftmaxCgReference],
+        shape: &[usize],
+        dim: usize,
+        select: impl Fn(&SoftmaxCgReference) -> [f64; 3],
+    ) -> Vec<f64> {
+        assert_eq!(shape[dim], 3);
+        let inner: usize = shape[dim + 1..].iter().product();
+        let numel: usize = shape.iter().product();
+        assert_eq!(numel, 3 * references.len());
+        let mut values = vec![0.0; numel];
+        for (lane, reference) in references.iter().enumerate() {
+            for (class, value) in select(reference).into_iter().enumerate() {
+                values[(lane / inner * 3 + class) * inner + lane % inner] = value;
+            }
+        }
+        values
+    }
+
+    fn assert_softmax_relative(label: &str, actual: &[f64], expected: &[f64], relative: f64) {
+        assert_eq!(actual.len(), expected.len(), "{label}: gradient length");
+        for (i, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+            // No absolute tolerance floor: a collapsed zero must fail even for
+            // the ~1e-87 f64 tails and the ~1e-35 f32 tails.
+            assert!(
+                (got - want).abs() <= relative * want.abs(),
+                "{label}[{i}]={got:e}, high-precision reference={want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_high_precision_hvps_all_dimensions() {
+        for f32_leaf in [false, true] {
+            let references = softmax_cg_references(f32_leaf);
+            let relative = if f32_leaf { 1e-5 } else { 3e-13 };
+            for log in [false, true] {
+                let op_index = usize::from(log);
+                for (shape, dim) in [
+                    (vec![4, 3], 1),
+                    (vec![3, 4], 0),
+                    (vec![2, 3, 2], 1),
+                    (vec![2, 2, 3], 2),
+                ] {
+                    let pack = |select: fn(&SoftmaxCgReference) -> [f64; 3]| {
+                        pack_softmax_reference_lanes(&references, &shape, dim, select)
+                    };
+                    let logits = pack(|r| r.logits);
+                    let upstream = pack(|r| r.upstream);
+                    let direction = pack(|r| r.direction);
+                    let gradient = pack_softmax_reference_lanes(&references, &shape, dim, |r| {
+                        r.gradient[op_index]
+                    });
+                    let hvp = pack_softmax_reference_lanes(&references, &shape, dim, |r| {
+                        r.hessian_vector[op_index]
+                    });
+                    let upstream_derivative =
+                        pack_softmax_reference_lanes(&references, &shape, dim, |r| {
+                            r.upstream_derivative[op_index]
+                        });
+                    let mut tape = TensorTape::new();
+                    let (x, g) = if f32_leaf {
+                        (
+                            tape.leaf_f32(
+                                logits.iter().map(|&v| v as f32).collect(),
+                                shape.clone(),
+                                true,
+                            )
+                            .unwrap(),
+                            tape.leaf_f32(
+                                upstream.iter().map(|&v| v as f32).collect(),
+                                shape.clone(),
+                                true,
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        (
+                            tape.leaf(logits, shape.clone(), true).unwrap(),
+                            tape.leaf(upstream, shape.clone(), true).unwrap(),
+                        )
+                    };
+                    let (y, _) = if log {
+                        tape.log_softmax(x, dim, ExecutionMode::Strict)
+                    } else {
+                        tape.softmax(x, dim, ExecutionMode::Strict)
+                    }
+                    .unwrap();
+                    let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                    let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                    let ordinary = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions::strict_default().with_retain_graph(true),
+                        )
+                        .unwrap();
+                    let first = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions {
+                                create_graph: true,
+                                ..BackwardOptions::strict_default()
+                            },
+                        )
+                        .unwrap();
+                    let context = format!("f32={f32_leaf}, log={log}, shape={shape:?}, dim={dim}");
+                    assert_softmax_relative(
+                        &format!("ordinary {context}"),
+                        ordinary.gradient(x).unwrap(),
+                        &gradient,
+                        relative,
+                    );
+                    assert_softmax_relative(
+                        &format!("graph {context}"),
+                        first.gradient(x).unwrap(),
+                        &gradient,
+                        relative,
+                    );
+                    assert_softmax_relative(
+                        &format!("graph/ordinary {context}"),
+                        first.gradient(x).unwrap(),
+                        ordinary.gradient(x).unwrap(),
+                        relative,
+                    );
+                    let dx = first.gradient_node(x).expect("connected gradient node");
+                    assert_eq!(tape.tensor(dx).unwrap().meta().shape(), shape.as_slice());
+                    assert_eq!(tape.tensor(dx).unwrap().meta().dtype(), DType::F64);
+                    let v = tape.leaf(direction, shape, false).unwrap();
+                    let (dot_terms, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                    let (dot, _) = tape.sum(dot_terms, ExecutionMode::Strict).unwrap();
+                    for second_create_graph in [false, true] {
+                        let second = tape
+                            .backward_with_options(
+                                dot,
+                                BackwardOptions {
+                                    create_graph: second_create_graph,
+                                    retain_graph: true,
+                                    ..BackwardOptions::strict_default()
+                                },
+                            )
+                            .unwrap();
+                        assert_softmax_relative(
+                            &format!("HVP cg={second_create_graph} {context}"),
+                            second.gradient(x).expect("HVP reaches original logits"),
+                            &hvp,
+                            relative,
+                        );
+                        // The first backward must also retain the arbitrary upstream
+                        // graph. A detached numerical correction loses this derivative.
+                        assert_softmax_relative(
+                            &format!("upstream cg={second_create_graph} {context}"),
+                            second
+                                .gradient(g)
+                                .expect("mixed derivative reaches upstream"),
+                            &upstream_derivative,
+                            relative,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_nonlinear_upstream_high_precision() {
+        // L = op(x)[0]^2, so the upstream gradient itself depends on x.
+        // These 220-digit Decimal references include both Hessian terms;
+        // detaching the incoming derivative loses the J^T H_L J term.
+        for f32_leaf in [false, true] {
+            let (margin, gradients, hvps) = if f32_leaf {
+                (
+                    9.0,
+                    [
+                        [
+                            6.091991341199607e-8,
+                            -3.045995670599803e-8,
+                            -3.045995670599803e-8,
+                        ],
+                        [
+                            -1.8556181794117727e-15,
+                            9.278090897058864e-16,
+                            9.278090897058864e-16,
+                        ],
+                    ],
+                    [
+                        [
+                            -2.284496544192823e-8,
+                            6.091991236821092e-8,
+                            -3.8074946926282684e-8,
+                        ],
+                        [
+                            1.3917136027651748e-15,
+                            -2.2035465721546528e-15,
+                            8.11832969389478e-16,
+                        ],
+                    ],
+                )
+            } else {
+                (
+                    20.0,
+                    [
+                        [
+                            1.6993417021166355e-17,
+                            -8.496708510583178e-18,
+                            -8.496708510583178e-18,
+                        ],
+                        [
+                            -1.443881110276332e-34,
+                            7.21940555138166e-35,
+                            7.21940555138166e-35,
+                        ],
+                    ],
+                    [
+                        [
+                            -6.372531382937383e-18,
+                            1.6993417021166355e-17,
+                            -1.0620885638228972e-17,
+                        ],
+                        [
+                            1.082910832707249e-34,
+                            -1.7146088184531443e-34,
+                            6.316979857458953e-35,
+                        ],
+                    ],
+                )
+            };
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(
+                        vec![margin as f32, -margin as f32, -margin as f32],
+                        vec![3],
+                        true,
+                    )
+                } else {
+                    tape.leaf(vec![margin, -margin, -margin], vec![3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let (squared, _) = tape.square(y, ExecutionMode::Strict).unwrap();
+                let mask = tape.leaf(vec![1.0, 0.0, 0.0], vec![3], false).unwrap();
+                let (picked, _) = tape.mul(squared, mask, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(picked, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let relative = if f32_leaf { 3e-6 } else { 3e-13 };
+                let context = format!("nonlinear f32={f32_leaf}, log={log}");
+                assert_softmax_relative(
+                    &context,
+                    first.gradient(x).unwrap(),
+                    &gradients[usize::from(log)],
+                    relative,
+                );
+                let dx = first.gradient_node(x).unwrap();
+                let v = tape.leaf(vec![0.75, -1.25, 2.0], vec![3], false).unwrap();
+                let (weighted, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                let (dot, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let second = tape.backward(dot).unwrap();
+                assert_softmax_relative(
+                    &context,
+                    second.gradient(x).expect("nonlinear HVP"),
+                    &hvps[usize::from(log)],
+                    relative,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_log_softmax_cancelling_tail_upstream_high_precision() {
+        // g=[1,1,-1] makes the two tail gradients round to +1 and -1 in
+        // f64. Recovering the head by summing those already-subtracted tail
+        // gradients would lose its nonzero 2*exp(-40) derivative again.
+        for f32_leaf in [false, true] {
+            let reference = &softmax_cg_references(f32_leaf)[0];
+            let expected = if f32_leaf {
+                [
+                    3.045995856161615e-8,
+                    0.9999999847700207,
+                    -1.0000000152299793,
+                ]
+            } else {
+                [8.496708510583178e-18, 1.0, -1.0]
+            };
+            let mut tape = TensorTape::new();
+            let x = if f32_leaf {
+                tape.leaf_f32(
+                    reference.logits.iter().map(|&v| v as f32).collect(),
+                    vec![3],
+                    true,
+                )
+            } else {
+                tape.leaf(reference.logits.to_vec(), vec![3], true)
+            }
+            .unwrap();
+            let (y, _) = tape.log_softmax(x, 0, ExecutionMode::Strict).unwrap();
+            let g = tape.leaf(vec![1.0, 1.0, -1.0], vec![3], true).unwrap();
+            let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+            let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+            let ordinary = tape
+                .backward_with_options(
+                    loss,
+                    BackwardOptions::strict_default().with_retain_graph(true),
+                )
+                .unwrap();
+            let first = tape
+                .backward_with_options(
+                    loss,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .unwrap();
+            let relative = if f32_leaf { 3e-6 } else { 3e-13 };
+            assert_softmax_relative(
+                "signed-tail ordinary",
+                ordinary.gradient(x).unwrap(),
+                &expected,
+                relative,
+            );
+            assert_softmax_relative(
+                "signed-tail graph",
+                first.gradient(x).unwrap(),
+                &expected,
+                relative,
+            );
+            let dx = first.gradient_node(x).unwrap();
+            let v = tape
+                .leaf(reference.direction.to_vec(), vec![3], false)
+                .unwrap();
+            let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+            let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+            // G=+1 here, versus G=-1 in the independently computed collapse
+            // fixture; the log-softmax Hessian therefore has the opposite sign.
+            let expected_hvp = reference.hessian_vector[1].map(|value| -value);
+            for second_create_graph in [false, true] {
+                let second = tape
+                    .backward_with_options(
+                        dot,
+                        BackwardOptions {
+                            create_graph: second_create_graph,
+                            retain_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                assert_softmax_relative(
+                    "signed-tail HVP",
+                    second.gradient(x).unwrap(),
+                    &expected_hvp,
+                    relative,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_isolates_nonfinite_lanes_and_masked_logits() {
+        for f32_leaf in [false, true] {
+            let reference = &softmax_cg_references(f32_leaf)[0];
+            let [max, min, _] = reference.logits;
+            // Lane 0 is finite; lane 1 has a legitimate -inf masked logit;
+            // lane 2 is poisoned. A global nonfinite fallback collapses lane 0.
+            let logits = [
+                max,
+                min,
+                min,
+                max,
+                min,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                0.0,
+                1.0,
+            ];
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(logits.iter().map(|&v| v as f32).collect(), vec![3, 3], true)
+                } else {
+                    tape.leaf(logits.to_vec(), vec![3, 3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 1, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 1, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape
+                    .leaf(
+                        vec![-1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+                        vec![3, 3],
+                        false,
+                    )
+                    .unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let got = first.gradient(x).unwrap();
+                let relative = if f32_leaf { 3e-6 } else { 3e-13 };
+                assert_softmax_relative(
+                    "finite lane",
+                    &got[..3],
+                    &reference.gradient[usize::from(log)],
+                    relative,
+                );
+                let masked_tail = if f32_leaf {
+                    if log {
+                        1.522997951276035e-8
+                    } else {
+                        1.5229979280808073e-8
+                    }
+                } else {
+                    4.248354255291589e-18
+                };
+                assert_softmax_relative(
+                    "masked lane",
+                    &got[3..6],
+                    &[-masked_tail, masked_tail, 0.0],
+                    relative,
+                );
+                assert!(
+                    got[6..].iter().all(|value| value.is_nan()),
+                    "poisoned lane must propagate NaNs: {got:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_preserves_nonfinite_formulas() {
+        // Preserve the pre-change graph path's IEEE classifications. Ordinary
+        // backward already uses another expression and is intentionally NOT an
+        // oracle for non-finite upstreams: for log_softmax([0,-inf,-inf]) with
+        // g=[1,+inf,0], the old graph gives [-inf,NaN,NaN], ordinary gives all NaN.
+        let cases = [
+            ([f64::NAN, 1.0, 0.0], [0.5, -2.0, 1.0]),
+            ([f64::INFINITY, 1.0, 0.0], [0.5, -2.0, 1.0]),
+            ([f64::NEG_INFINITY; 3], [0.5, -2.0, 1.0]),
+            (
+                [0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                [1.0, f64::INFINITY, 0.0],
+            ),
+            (
+                [0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                [f64::INFINITY, 1.0, 0.0],
+            ),
+            ([1.0, 0.0, -1.0], [f64::NAN, 1.0, 0.0]),
+            ([1.0, 0.0, -1.0], [f64::INFINITY, f64::NEG_INFINITY, 0.0]),
+            ([0.0, 0.0, 0.0], [f64::MAX; 3]),
+        ];
+        for f32_leaf in [false, true] {
+            for log in [false, true] {
+                for (case, (logits, upstream)) in cases.into_iter().enumerate() {
+                    let mut tape = TensorTape::new();
+                    let x = if f32_leaf {
+                        tape.leaf_f32(logits.iter().map(|&v| v as f32).collect(), vec![3], true)
+                    } else {
+                        tape.leaf(logits.to_vec(), vec![3], true)
+                    }
+                    .unwrap();
+                    let (y, _) = if log {
+                        tape.log_softmax(x, 0, ExecutionMode::Strict)
+                    } else {
+                        tape.softmax(x, 0, ExecutionMode::Strict)
+                    }
+                    .unwrap();
+                    let values = tape.values_lossy_f64(y).unwrap();
+                    let expected: Vec<f64> = if log {
+                        let sum: f64 = upstream.iter().sum();
+                        values
+                            .iter()
+                            .zip(upstream)
+                            .map(|(&out, g)| g - out.exp() * sum)
+                            .collect()
+                    } else {
+                        let dot: f64 = values.iter().zip(upstream).map(|(&p, g)| p * g).sum();
+                        values
+                            .iter()
+                            .zip(upstream)
+                            .map(|(&p, g)| p * (g - dot))
+                            .collect()
+                    };
+                    let g = tape.leaf(upstream.to_vec(), vec![3], false).unwrap();
+                    let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                    let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                    let report = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions {
+                                create_graph: true,
+                                ..BackwardOptions::strict_default()
+                            },
+                        )
+                        .unwrap();
+                    for (&got, &want) in report.gradient(x).unwrap().iter().zip(&expected) {
+                        if want.is_nan() {
+                            assert!(
+                                got.is_nan(),
+                                "case={case}, f32={f32_leaf}, log={log}: {got} must be NaN"
+                            );
+                        } else {
+                            assert_eq!(got, want, "case={case}, f32={f32_leaf}, log={log}");
+                        }
+                    }
+                    if expected.iter().any(|value| !value.is_finite()) {
+                        tape.set_detect_anomaly(true);
+                        let error = tape
+                            .backward_with_options(
+                                loss,
+                                BackwardOptions {
+                                    create_graph: true,
+                                    ..BackwardOptions::strict_default()
+                                },
+                            )
+                            .unwrap_err();
+                        assert!(error.to_string().contains("detect_anomaly"), "{error:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_rejects_modified_upstream_on_double_backward() {
+        for f32_leaf in [false, true] {
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(vec![9.0, -9.0, -9.0], vec![3], true)
+                } else {
+                    tape.leaf(vec![20.0, -20.0, -20.0], vec![3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape.leaf(vec![-1.0, 0.0, 0.0], vec![3], true).unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let dx = first.gradient_node(x).unwrap();
+                let v = tape.leaf(vec![1.0, 1.0, 0.0], vec![3], false).unwrap();
+                let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+                tape.update_tensor_values(g, vec![0.0, 1.0, 0.0]).unwrap();
+                let error = tape.backward(dot).unwrap_err();
+                assert!(
+                    matches!(error, AutogradError::BorrowedInputVersionMismatch { node, .. } if node == g),
+                    "{error:?}"
+                );
+            }
+        }
     }
 
     // Hessian-vector cross-check for create_graph second-order through a reduction op.
