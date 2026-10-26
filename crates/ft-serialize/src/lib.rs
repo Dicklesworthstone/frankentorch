@@ -3047,6 +3047,112 @@ impl<'a> TensorViewAdapter<'a> {
     }
 }
 
+enum TypedSafeTensorData<'a> {
+    Dense(TensorViewAdapter<'a>),
+    I64(&'a [i64]),
+    I32(&'a [i32]),
+    Bool(&'a [u8]),
+}
+
+/// A validated view over an entry's logical storage span. Integer payloads are
+/// emitted directly from their native values, never through a floating cast.
+struct TypedTensorViewAdapter<'a> {
+    shape: &'a [usize],
+    st_dtype: StDtype,
+    data: TypedSafeTensorData<'a>,
+    data_len: usize,
+}
+
+impl<'a> TypedTensorViewAdapter<'a> {
+    fn try_new(entry: &'a TypedStateEntry, name: &str) -> Result<Self, TensorIOError> {
+        let (st_dtype, data, numel, width) = match entry {
+            TypedStateEntry::Dense(tensor) => {
+                let dtype = ft_dtype_to_st(tensor.meta().dtype())?;
+                let view = TensorViewAdapter::try_new(tensor, dtype, name)?;
+                (
+                    dtype,
+                    TypedSafeTensorData::Dense(view),
+                    entry.meta().numel(),
+                    entry.dtype().element_size(),
+                )
+            }
+            TypedStateEntry::I64(tensor) => {
+                let values = tensor.contiguous_values()?;
+                (
+                    StDtype::I64,
+                    TypedSafeTensorData::I64(values),
+                    values.len(),
+                    8,
+                )
+            }
+            TypedStateEntry::I32(tensor) => {
+                let values = tensor.contiguous_values()?;
+                (
+                    StDtype::I32,
+                    TypedSafeTensorData::I32(values),
+                    values.len(),
+                    4,
+                )
+            }
+            TypedStateEntry::Bool(tensor) => {
+                let values = tensor.contiguous_values()?;
+                (
+                    StDtype::BOOL,
+                    TypedSafeTensorData::Bool(values),
+                    values.len(),
+                    1,
+                )
+            }
+        };
+        let data_len = numel
+            .checked_mul(width)
+            .ok_or_else(|| TensorIOError::Corrupt {
+                reason: format!("safetensors byte length overflow for tensor '{name}'"),
+            })?;
+        Ok(Self {
+            shape: entry.meta().shape(),
+            st_dtype,
+            data,
+            data_len,
+        })
+    }
+}
+
+impl st_tensor::View for TypedTensorViewAdapter<'_> {
+    fn dtype(&self) -> StDtype {
+        self.st_dtype
+    }
+
+    fn shape(&self) -> &[usize] {
+        self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        match &self.data {
+            TypedSafeTensorData::Dense(view) => st_tensor::View::data(view),
+            TypedSafeTensorData::I64(values) => {
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in *values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                Cow::Owned(bytes)
+            }
+            TypedSafeTensorData::I32(values) => {
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in *values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                Cow::Owned(bytes)
+            }
+            TypedSafeTensorData::Bool(values) => Cow::Borrowed(values),
+        }
+    }
+
+    fn data_len(&self) -> usize {
+        self.data_len
+    }
+}
+
 /// Save a state dict to a file in SafeTensors format.
 ///
 /// SafeTensors is the Hugging Face standard for safe, zero-copy tensor storage.
@@ -3084,6 +3190,45 @@ pub fn save_safetensors_to_bytes(
     })
 }
 
+/// Save floating, I64, I32, and Boolean tensors together in SafeTensors format.
+///
+/// All entries are validated and encoded before opening the destination, so an
+/// unsupported dtype or invalid layout leaves an existing checkpoint untouched.
+/// Complex and quantized tensors are rejected rather than converted lossily.
+pub fn save_typed_safetensors<P: AsRef<Path>>(
+    state_dict: &BTreeMap<String, TypedStateEntry>,
+    path: P,
+    metadata: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), TensorIOError> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
+    let data = save_typed_safetensors_to_bytes(state_dict, metadata)?;
+    std::fs::write(&path, data).map_err(|e| io_err(&path_str, e))
+}
+
+/// Encode a mixed-dtype SafeTensors state dict without file I/O.
+///
+/// Floating-point bit patterns and signed integer values are preserved exactly.
+/// Only the logical tensor span is saved when storage has a nonzero offset.
+pub fn save_typed_safetensors_to_bytes(
+    state_dict: &BTreeMap<String, TypedStateEntry>,
+    metadata: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Vec<u8>, TensorIOError> {
+    let views = state_dict
+        .iter()
+        .map(|(name, entry)| {
+            if name == "__metadata__" {
+                return Err(TensorIOError::Corrupt {
+                    reason: "'__metadata__' is reserved for SafeTensors metadata".to_string(),
+                });
+            }
+            TypedTensorViewAdapter::try_new(entry, name).map(|view| (name.as_str(), view))
+        })
+        .collect::<Result<Vec<_>, TensorIOError>>()?;
+    st_tensor::serialize(views, metadata.cloned()).map_err(|e| TensorIOError::Corrupt {
+        reason: format!("safetensors serialization failed: {e}"),
+    })
+}
+
 /// Load a state dict from a SafeTensors format file.
 pub fn load_safetensors<P: AsRef<Path>>(
     path: P,
@@ -3104,58 +3249,116 @@ pub fn load_safetensors_from_bytes(
     let mut result = BTreeMap::new();
 
     for (name, view) in tensors.tensors() {
-        let dtype = st_dtype_to_ft(view.dtype())?;
-        let shape: Vec<usize> = view.shape().to_vec();
-        let raw_data = view.data();
-
-        let tensor = match dtype {
-            DType::F64 => {
-                let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 8)?;
-                let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.as_chunks::<8>().0 {
-                    values.push(f64::from_le_bytes(*chunk));
-                }
-                let meta = TensorMeta::from_shape(shape, DType::F64, Device::Cpu);
-                DenseTensor::from_storage(meta, values)?
-            }
-            DType::F32 => {
-                let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 4)?;
-                let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.as_chunks::<4>().0 {
-                    values.push(f32::from_le_bytes(*chunk));
-                }
-                let meta = TensorMeta::from_shape(shape, DType::F32, Device::Cpu);
-                DenseTensor::from_storage_f32(meta, values)?
-            }
-            DType::F16 => {
-                let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 2)?;
-                let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.as_chunks::<2>().0 {
-                    values.push(ft_core::Float16::from_le_bytes(*chunk));
-                }
-                let meta = TensorMeta::from_shape(shape, DType::F16, Device::Cpu);
-                DenseTensor::from_storage_f16(meta, values)?
-            }
-            DType::BF16 => {
-                let numel = validate_safetensors_byte_width(&name, shape.as_slice(), raw_data, 2)?;
-                let mut values = Vec::with_capacity(numel);
-                for chunk in raw_data.as_chunks::<2>().0 {
-                    values.push(ft_core::BFloat16::from_le_bytes(*chunk));
-                }
-                let meta = TensorMeta::from_shape(shape, DType::BF16, Device::Cpu);
-                DenseTensor::from_storage_bf16(meta, values)?
-            }
-            _ => {
-                return Err(TensorIOError::Corrupt {
-                    reason: format!("unsupported dtype in SafeTensors file: {dtype:?}"),
-                });
-            }
-        };
-
+        let tensor = load_dense_safetensors_view(&name, &view)?;
         result.insert(name, tensor);
     }
 
     Ok(result)
+}
+
+/// Load a mixed floating/integer/Boolean SafeTensors state dict onto the CPU.
+pub fn load_typed_safetensors<P: AsRef<Path>>(
+    path: P,
+) -> Result<BTreeMap<String, TypedStateEntry>, TensorIOError> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
+    let data = std::fs::read(&path).map_err(|e| io_err(&path_str, e))?;
+    load_typed_safetensors_from_bytes(&data)
+}
+
+/// Decode a mixed-dtype SafeTensors file without converting integer or Boolean
+/// entries into floating tensors. Unsupported dtypes fail the entire load.
+pub fn load_typed_safetensors_from_bytes(
+    data: &[u8],
+) -> Result<BTreeMap<String, TypedStateEntry>, TensorIOError> {
+    let tensors = SafeTensors::deserialize(data).map_err(|e| TensorIOError::Corrupt {
+        reason: format!("safetensors deserialization failed: {e}"),
+    })?;
+    let mut result = BTreeMap::new();
+    for (name, view) in tensors.tensors() {
+        let shape = view.shape();
+        let raw_data = view.data();
+        let entry = match view.dtype() {
+            StDtype::I64 => {
+                let numel = validate_safetensors_byte_width(&name, shape, raw_data, 8)?;
+                let mut values = Vec::with_capacity(numel);
+                for chunk in raw_data.as_chunks::<8>().0 {
+                    values.push(i64::from_le_bytes(*chunk));
+                }
+                TypedStateEntry::I64(DenseI64Tensor::from_contiguous_values(
+                    values,
+                    shape.to_vec(),
+                    Device::Cpu,
+                )?)
+            }
+            StDtype::I32 => {
+                let numel = validate_safetensors_byte_width(&name, shape, raw_data, 4)?;
+                let mut values = Vec::with_capacity(numel);
+                for chunk in raw_data.as_chunks::<4>().0 {
+                    values.push(i32::from_le_bytes(*chunk));
+                }
+                TypedStateEntry::I32(DenseI32Tensor::from_contiguous_values(
+                    values,
+                    shape.to_vec(),
+                    Device::Cpu,
+                )?)
+            }
+            StDtype::BOOL => {
+                validate_safetensors_byte_width(&name, shape, raw_data, 1)?;
+                let meta = TensorMeta::from_shape(shape.to_vec(), DType::Bool, Device::Cpu);
+                TypedStateEntry::Bool(DenseBoolTensor::from_storage(meta, raw_data.to_vec())?)
+            }
+            _ => TypedStateEntry::Dense(load_dense_safetensors_view(&name, &view)?),
+        };
+        result.insert(name, entry);
+    }
+    Ok(result)
+}
+
+fn load_dense_safetensors_view(
+    name: &str,
+    view: &st_tensor::TensorView<'_>,
+) -> Result<DenseTensor, TensorIOError> {
+    let dtype = st_dtype_to_ft(view.dtype())?;
+    let shape = view.shape().to_vec();
+    let raw_data = view.data();
+    let numel = validate_safetensors_byte_width(name, &shape, raw_data, dtype.element_size())?;
+    let meta = TensorMeta::from_shape(shape, dtype, Device::Cpu);
+    let tensor = match dtype {
+        DType::F64 => {
+            let mut values = Vec::with_capacity(numel);
+            for chunk in raw_data.as_chunks::<8>().0 {
+                values.push(f64::from_le_bytes(*chunk));
+            }
+            DenseTensor::from_storage(meta, values)?
+        }
+        DType::F32 => {
+            let mut values = Vec::with_capacity(numel);
+            for chunk in raw_data.as_chunks::<4>().0 {
+                values.push(f32::from_le_bytes(*chunk));
+            }
+            DenseTensor::from_storage_f32(meta, values)?
+        }
+        DType::F16 => {
+            let mut values = Vec::with_capacity(numel);
+            for chunk in raw_data.as_chunks::<2>().0 {
+                values.push(Float16::from_le_bytes(*chunk));
+            }
+            DenseTensor::from_storage_f16(meta, values)?
+        }
+        DType::BF16 => {
+            let mut values = Vec::with_capacity(numel);
+            for chunk in raw_data.as_chunks::<2>().0 {
+                values.push(BFloat16::from_le_bytes(*chunk));
+            }
+            DenseTensor::from_storage_bf16(meta, values)?
+        }
+        _ => {
+            return Err(TensorIOError::Corrupt {
+                reason: format!("unsupported dtype in SafeTensors file: {dtype:?}"),
+            });
+        }
+    };
+    Ok(tensor)
 }
 
 fn validate_safetensors_byte_width(
@@ -5682,6 +5885,355 @@ mod tests {
     use super::{
         load_safetensors, load_safetensors_from_bytes, load_safetensors_metadata, save_safetensors,
     };
+
+    fn external_typed_safetensors_fixture() -> Vec<u8> {
+        // Written from the public wire format, independently of either encoder.
+        let header = br#"{"counter":{"dtype":"I64","shape":[],"data_offsets":[0,8]},"ids":{"dtype":"I32","shape":[2],"data_offsets":[8,16]},"mask":{"dtype":"BOOL","shape":[2,2],"data_offsets":[16,20]},"weight":{"dtype":"F32","shape":[2],"data_offsets":[20,28]},"empty":{"dtype":"I64","shape":[2,0,3],"data_offsets":[28,28]},"__metadata__":{"format":"pt","purpose":"mixed checkpoint"}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&9_007_199_254_740_993_i64.to_le_bytes());
+        bytes.extend_from_slice(&i32::MIN.to_le_bytes());
+        bytes.extend_from_slice(&i32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0, 1, 1, 0]);
+        bytes.extend_from_slice(&0x8000_0000_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x7fc0_1234_u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn typed_safetensors_loads_external_mixed_dtype_fixture_exactly() {
+        let state = super::load_typed_safetensors_from_bytes(&external_typed_safetensors_fixture())
+            .unwrap();
+        assert_eq!(state.len(), 5);
+        assert_eq!(state["counter"].dtype(), DType::I64);
+        assert!(state["counter"].meta().shape().is_empty());
+        assert_eq!(
+            state["counter"]
+                .as_i64()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            &[9_007_199_254_740_993_i64]
+        );
+        assert_eq!(state["ids"].dtype(), DType::I32);
+        assert_eq!(
+            state["ids"].as_i32().unwrap().contiguous_values().unwrap(),
+            &[i32::MIN, i32::MAX]
+        );
+        assert_eq!(state["mask"].meta().shape(), &[2, 2]);
+        assert_eq!(
+            state["mask"]
+                .as_bool()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            &[0, 1, 1, 0]
+        );
+        assert_eq!(
+            state["weight"]
+                .as_dense()
+                .unwrap()
+                .contiguous_values_f32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            [0x8000_0000, 0x7fc0_1234]
+        );
+        assert_eq!(state["empty"].meta().shape(), &[2, 0, 3]);
+        assert!(
+            state["empty"]
+                .as_i64()
+                .unwrap()
+                .contiguous_values()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state
+                .values()
+                .all(|entry| entry.meta().device() == Device::Cpu)
+        );
+        // The narrower API must continue rejecting files it cannot represent.
+        assert!(super::load_safetensors_from_bytes(&external_typed_safetensors_fixture()).is_err());
+    }
+
+    #[test]
+    fn typed_safetensors_exports_exact_wire_payloads_and_metadata() {
+        let state = super::load_typed_safetensors_from_bytes(&external_typed_safetensors_fixture())
+            .unwrap();
+        let metadata = std::collections::HashMap::from([
+            ("format".to_string(), "pt".to_string()),
+            ("purpose".to_string(), "mixed checkpoint".to_string()),
+        ]);
+        let bytes = super::save_typed_safetensors_to_bytes(&state, Some(&metadata)).unwrap();
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        let payload = &bytes[8 + header_len..];
+        let expected = [
+            (
+                "counter",
+                "I64",
+                json!([]),
+                9_007_199_254_740_993_i64.to_le_bytes().to_vec(),
+            ),
+            (
+                "ids",
+                "I32",
+                json!([2]),
+                [i32::MIN.to_le_bytes(), i32::MAX.to_le_bytes()].concat(),
+            ),
+            ("mask", "BOOL", json!([2, 2]), vec![0, 1, 1, 0]),
+            (
+                "weight",
+                "F32",
+                json!([2]),
+                [0x8000_0000_u32.to_le_bytes(), 0x7fc0_1234_u32.to_le_bytes()].concat(),
+            ),
+            ("empty", "I64", json!([2, 0, 3]), Vec::new()),
+        ];
+        for (name, dtype, shape, raw) in expected {
+            assert_eq!(header[name]["dtype"], dtype);
+            assert_eq!(header[name]["shape"], shape);
+            let start = header[name]["data_offsets"][0].as_u64().unwrap() as usize;
+            let end = header[name]["data_offsets"][1].as_u64().unwrap() as usize;
+            assert_eq!(&payload[start..end], raw.as_slice(), "payload for {name}");
+        }
+        assert_eq!(
+            header["__metadata__"],
+            serde_json::to_value(&metadata).unwrap()
+        );
+
+        let path = test_temp_path("typed_safetensors_mixed_checkpoint.safetensors");
+        super::save_typed_safetensors(&state, &path, Some(&metadata)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            super::load_safetensors_metadata(&path).unwrap(),
+            Some(metadata)
+        );
+        let loaded = super::load_typed_safetensors(&path).unwrap();
+        assert_eq!(
+            loaded["counter"]
+                .as_i64()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            &[9_007_199_254_740_993_i64]
+        );
+        assert_eq!(loaded.len(), state.len());
+    }
+
+    #[test]
+    fn typed_safetensors_preserves_offsets_integer_extremes_and_float_bits() {
+        use super::TypedStateEntry;
+        use ft_core::{DenseBoolTensor, DenseI32Tensor, DenseI64Tensor};
+
+        let mut state = BTreeMap::new();
+        state.insert(
+            "i64".to_string(),
+            TypedStateEntry::I64(
+                DenseI64Tensor::from_storage(
+                    TensorMeta::from_shape(vec![3], DType::I64, Device::Cpu).with_storage_offset(1),
+                    vec![17, i64::MIN, 9_007_199_254_740_993, i64::MAX, 18],
+                )
+                .unwrap(),
+            ),
+        );
+        state.insert(
+            "i32".to_string(),
+            TypedStateEntry::I32(
+                DenseI32Tensor::from_storage(
+                    TensorMeta::from_shape(vec![2], DType::I32, Device::Cpu).with_storage_offset(2),
+                    vec![17, 18, i32::MIN, i32::MAX, 19],
+                )
+                .unwrap(),
+            ),
+        );
+        state.insert(
+            "bool".to_string(),
+            TypedStateEntry::Bool(
+                DenseBoolTensor::from_storage(
+                    TensorMeta::from_shape(vec![1, 3], DType::Bool, Device::Cpu)
+                        .with_storage_offset(1),
+                    vec![0, 1, 0, 1, 0],
+                )
+                .unwrap(),
+            ),
+        );
+        let f64_bits = [0x8000_0000_0000_0000_u64, 0x7ff8_0000_0000_0042];
+        state.insert(
+            "f64".to_string(),
+            TypedStateEntry::Dense(
+                DenseTensor::from_storage(
+                    TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu).with_storage_offset(1),
+                    vec![
+                        17.0,
+                        f64::from_bits(f64_bits[0]),
+                        f64::from_bits(f64_bits[1]),
+                        18.0,
+                    ],
+                )
+                .unwrap(),
+            ),
+        );
+        let half_bits = [0x8000_u16, 1, 0x7c00, 0x7e35];
+        state.insert(
+            "f16".to_string(),
+            TypedStateEntry::Dense(
+                DenseTensor::from_storage_f16(
+                    TensorMeta::from_shape(vec![4], DType::F16, Device::Cpu).with_storage_offset(1),
+                    [0_u16]
+                        .into_iter()
+                        .chain(half_bits)
+                        .chain([0])
+                        .map(Float16::from_bits)
+                        .collect(),
+                )
+                .unwrap(),
+            ),
+        );
+        let bfloat_bits = [0x8000_u16, 1, 0x7f80, 0x7fc5];
+        state.insert(
+            "bf16".to_string(),
+            TypedStateEntry::Dense(
+                DenseTensor::from_storage_bf16(
+                    TensorMeta::from_shape(vec![4], DType::BF16, Device::Cpu)
+                        .with_storage_offset(1),
+                    [0_u16]
+                        .into_iter()
+                        .chain(bfloat_bits)
+                        .chain([0])
+                        .map(BFloat16::from_bits)
+                        .collect(),
+                )
+                .unwrap(),
+            ),
+        );
+
+        let bytes = super::save_typed_safetensors_to_bytes(&state, None).unwrap();
+        let loaded = super::load_typed_safetensors_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.len(), state.len());
+        for (name, original) in &state {
+            assert_eq!(loaded[name].dtype(), original.dtype());
+            assert_eq!(loaded[name].meta().shape(), original.meta().shape());
+            assert_eq!(loaded[name].meta().storage_offset(), 0);
+        }
+        assert_eq!(
+            loaded["i64"].as_i64().unwrap().contiguous_values().unwrap(),
+            &[i64::MIN, 9_007_199_254_740_993, i64::MAX]
+        );
+        assert_eq!(
+            loaded["i32"].as_i32().unwrap().contiguous_values().unwrap(),
+            &[i32::MIN, i32::MAX]
+        );
+        assert_eq!(
+            loaded["bool"]
+                .as_bool()
+                .unwrap()
+                .contiguous_values()
+                .unwrap(),
+            &[1, 0, 1]
+        );
+        assert_eq!(
+            loaded["f64"]
+                .as_dense()
+                .unwrap()
+                .contiguous_values()
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            f64_bits
+        );
+        let super::TensorStorage::F16(values) = loaded["f16"].as_dense().unwrap().typed_storage()
+        else {
+            unreachable!("F16 dtype must retain F16 storage")
+        };
+        assert_eq!(
+            values.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            half_bits
+        );
+        let super::TensorStorage::BF16(values) = loaded["bf16"].as_dense().unwrap().typed_storage()
+        else {
+            unreachable!("BF16 dtype must retain BF16 storage")
+        };
+        assert_eq!(
+            values.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            bfloat_bits
+        );
+
+        let empty = super::save_typed_safetensors_to_bytes(&BTreeMap::new(), None).unwrap();
+        assert!(
+            super::load_typed_safetensors_from_bytes(&empty)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn typed_safetensors_rejects_invalid_or_unsupported_files() {
+        let unsupported = malformed_safetensors_bytes("U8", &[2], &[1, 2]);
+        let wrong_width = malformed_safetensors_bytes("I64", &[1], &[0; 7]);
+        let wrong_bool_shape = malformed_safetensors_bytes("BOOL", &[2], &[1]);
+        let overflowing_shape = malformed_safetensors_bytes("I32", &[usize::MAX, 2], &[]);
+        for bytes in [
+            unsupported,
+            wrong_width,
+            wrong_bool_shape,
+            overflowing_shape,
+            b"not a safetensors file".to_vec(),
+        ] {
+            assert!(matches!(
+                super::load_typed_safetensors_from_bytes(&bytes),
+                Err(TensorIOError::Corrupt { .. })
+            ));
+        }
+        let valid = external_typed_safetensors_fixture();
+        for end in [0, 7, 8, valid.len() - 1] {
+            assert!(super::load_typed_safetensors_from_bytes(&valid[..end]).is_err());
+        }
+        let header = br#"{"first":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},"second":{"dtype":"I64","shape":[1],"data_offsets":[0,8]}}"#;
+        let mut overlap = (header.len() as u64).to_le_bytes().to_vec();
+        overlap.extend_from_slice(header);
+        overlap.extend_from_slice(&42_i64.to_le_bytes());
+        assert!(super::load_typed_safetensors_from_bytes(&overlap).is_err());
+    }
+
+    #[test]
+    fn typed_safetensors_validation_preserves_existing_checkpoint() {
+        use super::TypedStateEntry;
+
+        let path = test_temp_path("typed_safetensors_preserve_existing.safetensors");
+        let original = external_typed_safetensors_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let complex = DenseTensor::from_storage_complex64(
+            TensorMeta::from_shape(vec![1], DType::Complex64, Device::Cpu),
+            vec![ft_core::Complex64::new(1.0, 2.0)],
+        )
+        .unwrap();
+        let strided = DenseTensor::from_storage(
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![3, 1], 0, DType::F64, Device::Cpu)
+                .unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        )
+        .unwrap();
+        for (name, invalid) in [
+            ("z_complex", complex),
+            ("z_noncontiguous", strided),
+            ("__metadata__", make_f64_tensor(vec![1.0], vec![])),
+        ] {
+            let state = BTreeMap::from([
+                (
+                    "a_valid".to_string(),
+                    TypedStateEntry::Dense(make_f64_tensor(vec![3.0], vec![])),
+                ),
+                (name.to_string(), TypedStateEntry::Dense(invalid)),
+            ]);
+            assert!(super::save_typed_safetensors(&state, &path, None).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
 
     #[test]
     fn safetensors_round_trip_f64() {
