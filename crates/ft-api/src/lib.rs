@@ -7700,6 +7700,149 @@ impl FrankenTorchSession {
         self.tensor_add(scaled_input, scaled)
     }
 
+    /// Validate and normalize the inputs shared by both SDPA entry points.
+    /// Batch dimensions must broadcast axis by axis: equal flattened batch
+    /// volumes do not imply equal attention batches. Only actual broadcasts
+    /// allocate expanded inputs.
+    fn prepare_sdpa_inputs(
+        &mut self,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        attn_mask: Option<TensorNodeId>,
+        is_causal: bool,
+        broadcast_value_batch: bool,
+    ) -> Result<([TensorNodeId; 3], Option<TensorNodeId>), AutogradError> {
+        if is_causal && attn_mask.is_some() {
+            return Err(Self::incompatible_tensor_args(
+                "scaled_dot_product_attention: attn_mask cannot be combined with is_causal",
+            ));
+        }
+        let inputs = [query, key, value];
+        let shapes = [
+            self.tensor_shape(query)?,
+            self.tensor_shape(key)?,
+            self.tensor_shape(value)?,
+        ];
+        if shapes.iter().any(|shape| shape.len() < 2) {
+            return Err(Self::incompatible_tensor_args(
+                "scaled_dot_product_attention: query, key and value must be at least 2D",
+            ));
+        }
+        let dtype = self.tensor_dtype(query)?;
+        let device = self.tensor_device(query)?;
+        if !dtype.is_floating_point()
+            || self.tensor_dtype(key)? != dtype
+            || self.tensor_dtype(value)? != dtype
+        {
+            return Err(Self::incompatible_tensor_args(
+                "scaled_dot_product_attention: query, key and value must have the same floating dtype",
+            ));
+        }
+        if self.tensor_device(key)? != device || self.tensor_device(value)? != device {
+            return Err(Self::incompatible_tensor_args(
+                "scaled_dot_product_attention: query, key and value must have the same device",
+            ));
+        }
+        let q_shape = &shapes[0];
+        let k_shape = &shapes[1];
+        let v_shape = &shapes[2];
+        if q_shape[q_shape.len() - 1] != k_shape[k_shape.len() - 1]
+            || k_shape[k_shape.len() - 2] != v_shape[v_shape.len() - 2]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "scaled_dot_product_attention: Q/K head dimensions and K/V sequence lengths must match",
+            ));
+        }
+        let batch =
+            Self::broadcast_shape(&q_shape[..q_shape.len() - 2], &k_shape[..k_shape.len() - 2])?;
+        let output_batch = Self::broadcast_shape(&batch, &v_shape[..v_shape.len() - 2])?;
+        // The math SDPA contract samples dropout on QK scores before the
+        // final product broadcasts V. Expanding Q/K over V-only batch axes
+        // first would draw different masks for copies of the same score row.
+        let batch = if broadcast_value_batch {
+            output_batch.clone()
+        } else {
+            batch
+        };
+        let mut scores_shape = batch.clone();
+        scores_shape.extend_from_slice(&[q_shape[q_shape.len() - 2], k_shape[k_shape.len() - 2]]);
+        let mask = if let Some(mask) = attn_mask {
+            let mask_dtype = self.tensor_dtype(mask)?;
+            if mask_dtype != DType::F32 && mask_dtype != dtype {
+                return Err(Self::incompatible_tensor_args(
+                    "scaled_dot_product_attention: additive attn_mask must be float32 or the query dtype",
+                ));
+            }
+            if self.tensor_device(mask)? != device {
+                return Err(Self::incompatible_tensor_args(
+                    "scaled_dot_product_attention: attn_mask must be on the query device",
+                ));
+            }
+            let mask_shape = self.tensor_shape(mask)?;
+            if Self::broadcast_shape(&scores_shape, &mask_shape)? != scores_shape {
+                return Err(Self::incompatible_tensor_args(
+                    "scaled_dot_product_attention: attn_mask must broadcast to the attention scores",
+                ));
+            }
+            if mask_dtype != dtype {
+                Some(self.tensor_to_dtype(mask, dtype)?)
+            } else {
+                Some(mask)
+            }
+        } else {
+            None
+        };
+
+        let mut prepared = inputs;
+        for (i, shape) in shapes.iter().enumerate() {
+            let mut target = if i == 2 {
+                output_batch.clone()
+            } else {
+                batch.clone()
+            };
+            target.extend_from_slice(&shape[shape.len() - 2..]);
+            if *shape != target {
+                prepared[i] = self.tensor_broadcast_to(prepared[i], target)?;
+            }
+        }
+        Ok((prepared, mask))
+    }
+
+    /// SDPA uses a safe softmax: a row consisting entirely of -inf contributes
+    /// zeros, including in backward. Sanitize that row before softmax as well
+    /// as after it so a zero upstream gradient never multiplies a saved NaN.
+    /// Ordinary softmax retains its usual NaN behavior outside attention.
+    fn sdpa_softmax(&mut self, scores: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let mut row_shape = self.tensor_shape(scores)?;
+        let dim = row_shape.len() - 1;
+        let width = row_shape[dim];
+        if width == 0 {
+            return self.tensor_softmax(scores, dim);
+        }
+        let rows: Vec<f64> = self
+            .tensor_values_lossy_f64(scores)?
+            .chunks_exact(width)
+            .map(|row| {
+                if row.iter().all(|&x| x == f64::NEG_INFINITY) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        if !rows.contains(&1.0) {
+            return self.tensor_softmax(scores, dim);
+        }
+        row_shape[dim] = 1;
+        let masked_rows = self.tensor_variable(rows, row_shape, false)?;
+        let masked_rows = self.tensor_to_dtype(masked_rows, self.tensor_dtype(scores)?)?;
+        let zero = self.const_tensor_like(scores, Vec::new(), 0.0)?;
+        let safe_scores = self.tensor_where(masked_rows, zero, scores)?;
+        let weights = self.tensor_softmax(safe_scores, dim)?;
+        self.tensor_where(masked_rows, zero, weights)
+    }
+
     /// Scaled dot-product attention (PyTorch 2.0+).
     ///
     /// Equivalent to `torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal)`.
@@ -7707,7 +7850,9 @@ impl FrankenTorchSession {
     /// Computes: `softmax(Q @ K^T / sqrt(d_k) + mask) @ V`
     ///
     /// `query`: `[*, L, E]`, `key`: `[*, S, E]`, `value`: `[*, S, Ev]`.
-    /// Returns: `[*, L, Ev]`.
+    /// Returns: `[*, L, Ev]`, with broadcast batch dimensions. Floating masks
+    /// are additive (0 to attend, -inf to ignore a position).
+    /// An explicit mask cannot be combined with `is_causal`.
     pub fn scaled_dot_product_attention(
         &mut self,
         query: TensorNodeId,
@@ -7744,13 +7889,8 @@ impl FrankenTorchSession {
                 s.tensor_to_dtype(output, dtype)
             });
         }
-        if is_causal && attn_mask.is_some() {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "scaled_dot_product_attention: attn_mask cannot be combined with is_causal",
-                },
-            )));
-        }
+        let ([query, key, value], attn_mask) =
+            self.prepare_sdpa_inputs(query, key, value, attn_mask, is_causal, dropout_p == 0.0)?;
         let q_shape = self.tensor_shape(query)?;
         let k_shape = self.tensor_shape(key)?;
 
@@ -8204,10 +8344,10 @@ impl FrankenTorchSession {
             }
         }
 
-        // Q @ K^T — use bmm for 3D batched inputs, matmul for 2D
+        // bmm is strictly rank three; matmul handles 2D and arbitrary batch ranks.
         let ndim = k_shape.len();
         let key_t = self.tensor_transpose(key, ndim - 2, ndim - 1)?;
-        let attn_weights = if ndim >= 3 {
+        let attn_weights = if ndim == 3 {
             self.tensor_bmm(query, key_t)?
         } else {
             self.tensor_matmul(query, key_t)?
@@ -8215,7 +8355,6 @@ impl FrankenTorchSession {
 
         // Scale
         let aw_shape = self.tensor_shape(attn_weights)?;
-        let softmax_dim = aw_shape.len() - 1;
         let scale_tensor = self.const_tensor_like(attn_weights, aw_shape.clone(), scale)?;
         let scaled = self.tensor_mul(attn_weights, scale_tensor)?;
 
@@ -8264,7 +8403,7 @@ impl FrankenTorchSession {
         };
 
         // Softmax along last dim
-        let softmaxed = self.tensor_softmax(masked, softmax_dim)?;
+        let softmaxed = self.sdpa_softmax(masked)?;
 
         // Apply dropout
         let dropped = if dropout_p > 0.0 {
@@ -8274,7 +8413,8 @@ impl FrankenTorchSession {
         };
 
         // attn_weights @ V
-        if ndim >= 3 {
+        let value_shape = self.tensor_shape(value)?;
+        if ndim == 3 && value_shape.len() == 3 && value_shape[0] == k_shape[0] {
             self.tensor_bmm(dropped, value)
         } else {
             self.tensor_matmul(dropped, value)
@@ -30082,14 +30222,17 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.nn.functional.scaled_dot_product_attention`.
     ///
-    /// Computes: `softmax(Q @ K^T / sqrt(d_k)) @ V` with optional masking and dropout.
+    /// Computes: `softmax(Q @ K^T / sqrt(d_k)) @ V` with optional masking.
     ///
     /// - `query`: [..., seq_len, d_k]
     /// - `key`: [..., seq_len_kv, d_k]
     /// - `value`: [..., seq_len_kv, d_v]
-    /// - `attn_mask`: optional mask tensor (None for causal, or explicit mask)
+    /// - `attn_mask`: optional additive float mask broadcastable to the attention scores
     /// - `is_causal`: if true, applies causal (lower triangular) mask
     /// - `scale`: optional scale factor (default: 1/sqrt(d_k))
+    ///
+    /// Batch dimensions broadcast axis by axis. An explicit mask cannot be
+    /// combined with `is_causal`.
     pub fn tensor_scaled_dot_product_attention(
         &mut self,
         query: TensorNodeId,
@@ -30123,6 +30266,8 @@ impl FrankenTorchSession {
                 s.tensor_to_dtype(output, dtype)
             });
         }
+        let ([query, key, value], attn_mask) =
+            self.prepare_sdpa_inputs(query, key, value, attn_mask, is_causal, true)?;
         let query_shape = self.tensor_shape(query)?;
         let key_shape = self.tensor_shape(key)?;
         if query_shape.len() < 2 || key_shape.len() < 2 {
@@ -30555,7 +30700,7 @@ impl FrankenTorchSession {
         }
 
         let key_t = self.tensor_transpose(key, key_shape.len() - 2, key_shape.len() - 1)?;
-        let scores = if query_shape.len() >= 3 {
+        let scores = if query_shape.len() == 3 {
             self.tensor_bmm(query, key_t)?
         } else {
             self.tensor_matmul(query, key_t)?
@@ -30584,8 +30729,8 @@ impl FrankenTorchSession {
             scaled_scores
         };
         let ndim = scores_shape.len();
-        let attn_weights = self.tensor_softmax(masked_scores, ndim - 1)?;
-        if ndim >= 3 {
+        let attn_weights = self.sdpa_softmax(masked_scores)?;
+        if ndim == 3 {
             self.tensor_bmm(attn_weights, value)
         } else {
             self.tensor_matmul(attn_weights, value)
@@ -150481,6 +150626,380 @@ mod tests {
     // ── scaled_dot_product_attention tests ──────────────────────────
 
     #[test]
+    fn sdpa_dropout_is_shared_across_value_only_broadcast_batches() {
+        for dtype in [DType::F64, DType::F32] {
+            let tolerance = if dtype == DType::F64 { 1e-10 } else { 1e-5 };
+            for rank in [2_usize, 3, 4] {
+                let run = |value_heads: usize| {
+                    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let mut qshape = vec![1; rank - 2];
+                    qshape.extend_from_slice(&[3, 2]);
+                    let mut kshape = vec![1; rank - 2];
+                    kshape.extend_from_slice(&[4, 2]);
+                    let mut vshape = vec![1; rank.max(3) - 2];
+                    *vshape.last_mut().unwrap() = value_heads;
+                    vshape.extend_from_slice(&[4, 2]);
+                    let q = sdpa_test_tensor(
+                        &mut s,
+                        vec![0.1, -0.3, 0.4, 0.2, -0.2, 0.8],
+                        qshape,
+                        dtype,
+                        true,
+                    );
+                    let k = sdpa_test_tensor(
+                        &mut s,
+                        vec![0.7, -0.4, 0.1, 0.5, -0.2, 0.9, 0.3, 0.6],
+                        kshape,
+                        dtype,
+                        true,
+                    );
+                    let v = sdpa_test_tensor(
+                        &mut s,
+                        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].repeat(value_heads),
+                        vshape,
+                        dtype,
+                        true,
+                    );
+                    let output = s
+                        .scaled_dot_product_attention(q, k, v, None, 0.5, false)
+                        .unwrap();
+                    let values = s.tensor_values_lossy_f64(output).unwrap();
+                    let shape = s.tensor_shape(output).unwrap();
+                    let weights = sdpa_test_tensor(
+                        &mut s,
+                        [0.7, -1.1, 0.3, 1.4, -0.6, 0.2].repeat(value_heads),
+                        shape,
+                        dtype,
+                        false,
+                    );
+                    let weighted = s.tensor_mul(output, weights).unwrap();
+                    let loss = s.tensor_sum(weighted).unwrap();
+                    s.tensor_backward(loss).unwrap();
+                    (
+                        values,
+                        s.tensor_grad(q).unwrap().unwrap(),
+                        s.tensor_grad(k).unwrap().unwrap(),
+                        s.tensor_grad(v).unwrap().unwrap(),
+                    )
+                };
+                let (reference, rq, rk, rv) = run(1);
+                let (expanded, eq, ek, ev) = run(2);
+                assert_eq!(reference.len(), 6);
+                assert_eq!(expanded.len(), 12);
+                assert!(reference.iter().any(|x| x.abs() > 1e-6));
+                for head in expanded.chunks_exact(6) {
+                    for (actual, expected) in head.iter().zip(&reference) {
+                        assert!(
+                            (actual - expected).abs() < tolerance,
+                            "V-only broadcast changed dropout: {actual} != {expected}"
+                        );
+                    }
+                }
+                for (actual, expected) in [(eq, rq), (ek, rk)] {
+                    assert_eq!(actual.len(), expected.len());
+                    for (a, e) in actual.iter().zip(expected) {
+                        assert!(
+                            (a - 2.0 * e).abs() < tolerance,
+                            "shared Q/K dropout gradient: {a} != 2 * {e}"
+                        );
+                    }
+                }
+                assert_eq!(ev.len(), 2 * rv.len());
+                for head in ev.chunks_exact(rv.len()) {
+                    for (a, e) in head.iter().zip(&rv) {
+                        assert!(
+                            (a - e).abs() < tolerance,
+                            "per-batch V dropout gradient: {a} != {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn sdpa_test_tensor(
+        session: &mut FrankenTorchSession,
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        dtype: DType,
+        requires_grad: bool,
+    ) -> TensorNodeId {
+        if dtype == DType::F32 {
+            session
+                .tensor_variable_f32(
+                    values.into_iter().map(|x| x as f32).collect(),
+                    shape,
+                    requires_grad,
+                )
+                .unwrap()
+        } else {
+            session
+                .tensor_variable(values, shape, requires_grad)
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn sdpa_broadcast_batches_match_analytic_values_and_gradients() {
+        // Independent two-key logistic oracle. Equal flattened batch counts
+        // [2,1] and [1,2] broadcast to four batches, not two zipped pairs.
+        let qv = [0.2_f64, 0.8, -0.4, 0.6];
+        let kv = [1.1_f64, -0.3, 0.7, 1.4];
+        let vv = [2.0_f64, -1.0, 3.0, 0.5];
+        let upstream = [-0.3, 0.8, 1.2, -0.7, 0.2, 1.1, -0.9, 0.4];
+        let mut expected = vec![0.0; 8];
+        let (mut dq, mut dk, mut dv) = (vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]);
+        for b in 0..2 {
+            for h in 0..2 {
+                for l in 0..2 {
+                    let out = (b * 2 + h) * 2 + l;
+                    let qi = b * 2 + l;
+                    let ki = h * 2;
+                    let p = 1.0 / (1.0 + (-qv[qi] * (kv[ki] - kv[ki + 1])).exp());
+                    expected[out] = p * vv[ki] + (1.0 - p) * vv[ki + 1];
+                    let ds = upstream[out] * (vv[ki] - vv[ki + 1]) * p * (1.0 - p);
+                    dq[qi] += ds * (kv[ki] - kv[ki + 1]);
+                    dk[ki] += ds * qv[qi];
+                    dk[ki + 1] -= ds * qv[qi];
+                    dv[ki] += upstream[out] * p;
+                    dv[ki + 1] += upstream[out] * (1.0 - p);
+                }
+            }
+        }
+        for dtype in [DType::F64, DType::F32] {
+            let tolerance = if dtype == DType::F64 { 1e-11 } else { 2e-6 };
+            for with_grad in [false, true] {
+                for dropout_api in [false, true] {
+                    for value_rank in [3, 4] {
+                        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                        let q = sdpa_test_tensor(
+                            &mut s,
+                            qv.to_vec(),
+                            vec![2, 1, 2, 1],
+                            dtype,
+                            with_grad,
+                        );
+                        let k = sdpa_test_tensor(
+                            &mut s,
+                            kv.to_vec(),
+                            vec![1, 2, 2, 1],
+                            dtype,
+                            with_grad,
+                        );
+                        let vshape = if value_rank == 3 {
+                            vec![2, 2, 1]
+                        } else {
+                            vec![1, 2, 2, 1]
+                        };
+                        let v = sdpa_test_tensor(&mut s, vv.to_vec(), vshape, dtype, with_grad);
+                        let output = if dropout_api {
+                            s.scaled_dot_product_attention(q, k, v, None, 0.0, false)
+                        } else {
+                            s.tensor_scaled_dot_product_attention(q, k, v, None, false, None)
+                        }
+                        .unwrap();
+                        assert_eq!(s.tensor_shape(output).unwrap(), vec![2, 2, 2, 1]);
+                        assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                        let actual = s.tensor_values_lossy_f64(output).unwrap();
+                        for (got, want) in actual.iter().zip(&expected) {
+                            assert!((got - want).abs() < tolerance, "{dtype:?}: {got} != {want}");
+                        }
+                        if with_grad {
+                            let weights = sdpa_test_tensor(
+                                &mut s,
+                                upstream.to_vec(),
+                                vec![2, 2, 2, 1],
+                                dtype,
+                                false,
+                            );
+                            let weighted = s.tensor_mul(output, weights).unwrap();
+                            let loss = s.tensor_sum(weighted).unwrap();
+                            s.tensor_backward(loss).unwrap();
+                            for (input, want) in [(q, &dq), (k, &dk), (v, &dv)] {
+                                let got = s.tensor_grad(input).unwrap().unwrap();
+                                assert_eq!(got.len(), want.len());
+                                for (g, w) in got.iter().zip(want) {
+                                    assert!(
+                                        (g - w).abs() < tolerance,
+                                        "{dtype:?} broadcast gradient: {g} != {w}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sdpa_fully_masked_rows_have_zero_output_and_finite_gradients() {
+        // Exercise fused masked f64 and graph fallback (f32, 2D/4D, learnable mask).
+        for dtype in [DType::F64, DType::F32] {
+            let tolerance = if dtype == DType::F64 { 1e-11 } else { 2e-6 };
+            for rank in [2, 3, 4] {
+                for learnable_mask in [false, true] {
+                    for dropout_api in [false, true] {
+                        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                        let mut qshape = vec![1; rank - 2];
+                        qshape.extend_from_slice(&[3, 1]);
+                        let mut kvshape = vec![1; rank - 2];
+                        kvshape.extend_from_slice(&[2, 1]);
+                        let q = sdpa_test_tensor(
+                            &mut s,
+                            vec![0.2, 0.8, -0.4],
+                            qshape.clone(),
+                            dtype,
+                            true,
+                        );
+                        let k =
+                            sdpa_test_tensor(&mut s, vec![1.1, -0.3], kvshape.clone(), dtype, true);
+                        let v = sdpa_test_tensor(&mut s, vec![2.0, -1.0], kvshape, dtype, true);
+                        let mask = sdpa_test_tensor(
+                            &mut s,
+                            vec![
+                                f64::NEG_INFINITY,
+                                f64::NEG_INFINITY,
+                                0.0,
+                                f64::NEG_INFINITY,
+                                0.25,
+                                0.0,
+                            ],
+                            vec![3, 2],
+                            dtype,
+                            learnable_mask,
+                        );
+                        let output = if dropout_api {
+                            s.scaled_dot_product_attention(q, k, v, Some(mask), 0.0, false)
+                        } else {
+                            s.tensor_scaled_dot_product_attention(q, k, v, Some(mask), false, None)
+                        }
+                        .unwrap();
+                        let p = 1.0 / (1.0 + 0.31_f64.exp());
+                        let expected = [0.0, 2.0, 3.0 * p - 1.0];
+                        assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                        let actual = s.tensor_values_lossy_f64(output).unwrap();
+                        for (g, w) in actual.iter().zip(expected) {
+                            assert!((g - w).abs() < tolerance, "masked output {g} != {w}");
+                        }
+                        let weights =
+                            sdpa_test_tensor(&mut s, vec![2.0, -0.5, 1.3], qshape, dtype, false);
+                        let weighted = s.tensor_mul(output, weights).unwrap();
+                        let loss = s.tensor_sum(weighted).unwrap();
+                        s.tensor_backward(loss).unwrap();
+                        let ds = 1.3 * 3.0 * p * (1.0 - p);
+                        for (input, expected) in [
+                            (q, vec![0.0, 0.0, ds * 1.4]),
+                            (k, vec![-0.4 * ds, 0.4 * ds]),
+                            (v, vec![-0.5 + 1.3 * p, 1.3 * (1.0 - p)]),
+                        ] {
+                            let actual = s.tensor_grad(input).unwrap().unwrap();
+                            for (g, w) in actual.iter().zip(expected) {
+                                assert!(
+                                    (g - w).abs() < tolerance,
+                                    "{dtype:?} masked gradient {g} != {w}"
+                                );
+                            }
+                        }
+                        if learnable_mask {
+                            let actual = s.tensor_grad(mask).unwrap().unwrap();
+                            for (g, w) in actual.iter().zip([0.0, 0.0, 0.0, 0.0, ds, -ds]) {
+                                assert!((g - w).abs() < tolerance, "mask gradient {g} != {w}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sdpa_masked_rows_preserve_nan_inputs() {
+        for dtype in [DType::F64, DType::F32] {
+            for dropout_api in [false, true] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let q = sdpa_test_tensor(&mut s, vec![f64::NAN, 0.2], vec![1, 2, 1], dtype, false);
+                let k = sdpa_test_tensor(&mut s, vec![1.0, 0.0], vec![1, 2, 1], dtype, false);
+                let v = sdpa_test_tensor(&mut s, vec![2.0, -1.0], vec![1, 2, 1], dtype, false);
+                let mask =
+                    sdpa_test_tensor(&mut s, vec![f64::NEG_INFINITY; 4], vec![2, 2], dtype, false);
+                let out = if dropout_api {
+                    s.scaled_dot_product_attention(q, k, v, Some(mask), 0.0, false)
+                } else {
+                    s.tensor_scaled_dot_product_attention(q, k, v, Some(mask), false, None)
+                }
+                .unwrap();
+                let values = s.tensor_values_lossy_f64(out).unwrap();
+                assert!(
+                    values[0].is_nan(),
+                    "NaN query must not be sanitized as padding"
+                );
+                assert_eq!(values[1], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn sdpa_rejects_incompatible_batches_and_invalid_values_before_dispatch() {
+        for dropout_api in [false, true] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let q = s.tensor_zeros(vec![2, 3, 2, 1], false).unwrap();
+            let k = s.tensor_zeros(vec![3, 2, 2, 1], false).unwrap();
+            let v = s.tensor_zeros(vec![3, 2, 2, 1], false).unwrap();
+            // Both prefixes multiply to six, but [2,3] and [3,2] cannot broadcast.
+            let output = if dropout_api {
+                s.scaled_dot_product_attention(q, k, v, None, 0.0, false)
+            } else {
+                s.tensor_scaled_dot_product_attention(q, k, v, None, false, None)
+            };
+            assert!(output.is_err());
+            let scalar = s.tensor_variable(vec![1.0], Vec::new(), false).unwrap();
+            let output = if dropout_api {
+                s.scaled_dot_product_attention(q, q, scalar, None, 0.0, false)
+            } else {
+                s.tensor_scaled_dot_product_attention(q, q, scalar, None, false, None)
+            };
+            assert!(output.is_err());
+        }
+    }
+
+    #[test]
+    fn sdpa_transposed_inputs_and_f32_mask_preserve_f64_output() {
+        for dropout_api in [false, true] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let storage = s
+                .tensor_variable(vec![0.2, 0.8, 1.1, -0.3], vec![1, 2, 2], true)
+                .unwrap();
+            let q = s.tensor_transpose(storage, 1, 2).unwrap();
+            let k = s
+                .tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![1, 2, 2], true)
+                .unwrap();
+            let v = s
+                .tensor_variable(vec![2.0, -1.0, 3.0, 0.5], vec![1, 2, 2], true)
+                .unwrap();
+            let mask = s
+                .tensor_variable_f32(
+                    vec![0.0, f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY],
+                    vec![2, 2],
+                    false,
+                )
+                .unwrap();
+            let out = if dropout_api {
+                s.scaled_dot_product_attention(q, k, v, Some(mask), 0.0, false)
+            } else {
+                s.tensor_scaled_dot_product_attention(q, k, v, Some(mask), false, None)
+            }
+            .unwrap();
+            assert_eq!(s.tensor_dtype(out).unwrap(), DType::F64);
+            assert_eq!(s.tensor_values(out).unwrap(), vec![2.0, -1.0, 2.0, -1.0]);
+            let loss = s.tensor_sum(out).unwrap();
+            s.tensor_backward(loss).unwrap();
+            assert_eq!(s.tensor_grad(storage).unwrap().unwrap(), vec![0.0; 4]);
+            assert_eq!(s.tensor_grad(v).unwrap().unwrap(), vec![2.0, 2.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
     fn sdpa_explicit_additive_mask_3d_matches_torch() {
         // Regression for frankentorch-m4ur4: the masked op-graph path failed on
         // the 3-D [batch*heads, S, d] layout (tensor_matmul doesn't batch 3-D).
@@ -151176,6 +151695,10 @@ mod tests {
         let mask = s.zeros(vec![1, 2, 2], false).unwrap();
         assert!(
             s.scaled_dot_product_attention(q, k, v, Some(mask), 0.0, true)
+                .is_err()
+        );
+        assert!(
+            s.tensor_scaled_dot_product_attention(q, k, v, Some(mask), true, None)
                 .is_err()
         );
     }

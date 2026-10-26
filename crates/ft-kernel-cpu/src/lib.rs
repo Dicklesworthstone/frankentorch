@@ -6268,6 +6268,11 @@ pub fn sdpa_forward_masked_f64(
                     m = *s;
                 }
             }
+            // Fully masked rows contribute zero; genuine NaNs still propagate.
+            if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                row.fill(0.0);
+                continue;
+            }
             let mut sum = 0.0f64;
             for s in row.iter_mut() {
                 let e = (*s - m).exp();
@@ -6374,6 +6379,11 @@ pub fn sdpa_forward_masked_gqa_f64(
                 if *s > m {
                     m = *s;
                 }
+            }
+            // Fully masked rows contribute zero; genuine NaNs still propagate.
+            if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                row.fill(0.0);
+                continue;
             }
             let mut sum = 0.0f64;
             for s in row.iter_mut() {
@@ -7071,6 +7081,11 @@ pub fn sdpa_backward_masked_f64(
                     if *s > m {
                         m = *s;
                     }
+                }
+                // Fully masked rows contribute zero; genuine NaNs still propagate.
+                if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                    row.fill(0.0);
+                    continue;
                 }
                 let mut sum = 0.0f64;
                 for s in row.iter_mut() {
@@ -30851,8 +30866,7 @@ pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
             let mut b3 = vec![0.0f64; nn];
             gemm::dgemm(n, n, n, &b, &b, &mut b2);
             gemm::dgemm(n, n, n, &b2, &b, &mut b3);
-            for (((&v1, &v2), &v3), dst) in
-                b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
+            for (((&v1, &v2), &v3), dst) in b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
             {
                 *dst = C[4].mul_add(v1, C[5].mul_add(v2, C[6] * v3));
             }
@@ -30873,8 +30887,7 @@ pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
             let mut b3 = vec![0.0f64; nn];
             gemm::dgemm(n, n, n, &b, &b, &mut b2);
             gemm::dgemm(n, n, n, &b2, &b, &mut b3);
-            for (((&v1, &v2), &v3), dst) in
-                b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
+            for (((&v1, &v2), &v3), dst) in b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
             {
                 *dst = C[7].mul_add(v1, C[8].mul_add(v2, C[9] * v3));
             }
