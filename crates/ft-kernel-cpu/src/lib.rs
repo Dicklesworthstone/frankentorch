@@ -33023,7 +33023,14 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
                             );
                         });
                 } else {
-                    eigh_backtransform_project_chunk_f64(&mut projections[..i], 0, prev, row_i, n, i);
+                    eigh_backtransform_project_chunk_f64(
+                        &mut projections[..i],
+                        0,
+                        prev,
+                        row_i,
+                        n,
+                        i,
+                    );
                 }
                 let proj: &[f64] = &projections[..i];
                 if i >= 384 && threads > 1 {
