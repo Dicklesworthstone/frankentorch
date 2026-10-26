@@ -11350,6 +11350,13 @@ pub fn conv2d_backward_masked_f32(
     };
 
     let dweight = output_mask[1].then(|| {
+        // Frozen inputs still train weights. Reuse the same size-gated streamed
+        // reduction as the both-gradient route before allocating an im2col panel.
+        if let Some(dweight) = conv2d_dweight_streamed_f32_if_enabled(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        ) {
+            return dweight;
+        }
         let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         build_uninit(out_ch * patch_width, |dw: &mut [f32]| {
             if out_ch == 0 || patch_width == 0 || flat == 0 {
@@ -12818,6 +12825,13 @@ pub fn conv2d_backward_masked_f64(
     };
 
     let dweight = output_mask[1].then(|| {
+        // Keep frozen-input training on the same bounded-panel reduction as the
+        // both-gradient route, including its size gate and legacy fallback.
+        if let Some(dweight) = conv2d_dweight_streamed_f64_if_enabled(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        ) {
+            return dweight;
+        }
         let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         build_uninit(out_ch * patch_width, |dw: &mut [f64]| {
             if out_ch == 0 || patch_width == 0 {
@@ -54883,6 +54897,76 @@ mod tests {
                 );
             }
 
+            // Frozen inputs still train convolution weights (for example, the first layer).
+            // This output-mask entry does not delegate to the both-gradient route above.
+            for output_mask in [[false, true, false], [false, true, true]] {
+                super::set_conv2d_dweight_streamed(false);
+                super::reset_conv2d_backward_gemm_counts();
+                let (panel_dx, panel_dw, panel_db) = super::conv2d_backward_masked_f32(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (1, 0));
+                super::set_conv2d_dweight_streamed(true);
+                let _ = super::take_conv2d_dweight_streamed_calls();
+                super::reset_conv2d_backward_gemm_counts();
+                let (stream_dx, stream_dw, stream_db) = super::conv2d_backward_masked_f32(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(
+                    super::take_conv2d_dweight_streamed_calls(),
+                    1,
+                    "f32 frozen-input backward must reach streamed dweight: {output_mask:?}"
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (0, 0));
+                assert!(panel_dx.is_none() && stream_dx.is_none());
+                let panel_dw = panel_dw.expect("masked f32 panel dweight");
+                let stream_dw = stream_dw.expect("masked f32 streamed dweight");
+                assert_eq!(panel_dw.len(), stream_dw.len());
+                for (index, (&a, &b)) in panel_dw.iter().zip(&stream_dw).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "masked f32 dweight[{index}] differs at {batch}/{in_ch}/{out_ch}"
+                    );
+                }
+                assert_eq!(panel_db.is_some(), output_mask[2]);
+                assert_eq!(stream_db.is_some(), output_mask[2]);
+                if let (Some(panel_db), Some(stream_db)) = (panel_db, stream_db) {
+                    assert_eq!(panel_db.len(), stream_db.len());
+                    for (&a, &b) in panel_db.iter().zip(&stream_db) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+            }
+
             // THE FUSED MASKED f32 ENTRY, which keeps its own copy of the panel GEMM.
             super::set_conv2d_dweight_streamed(false);
             let _ = super::take_conv2d_dweight_streamed_calls();
@@ -55220,6 +55304,77 @@ mod tests {
                     "dpadded[{index}] moved at shape {batch}/{in_ch}/{out_ch}"
                 );
             }
+
+            // The weight-only output mask has its own dispatch, reached by frozen-input
+            // training. Exercise it separately from the unmasked and mask-fused entries.
+            for output_mask in [[false, true, false], [false, true, true]] {
+                super::set_conv2d_dweight_streamed(false);
+                super::reset_conv2d_backward_gemm_counts();
+                let (panel_dx, panel_dw, panel_db) = super::conv2d_backward_masked_f64(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (1, 0));
+                super::set_conv2d_dweight_streamed(true);
+                let _ = super::take_conv2d_dweight_streamed_calls();
+                super::reset_conv2d_backward_gemm_counts();
+                let (stream_dx, stream_dw, stream_db) = super::conv2d_backward_masked_f64(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(
+                    super::take_conv2d_dweight_streamed_calls(),
+                    1,
+                    "f64 frozen-input backward must reach streamed dweight: {output_mask:?}"
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (0, 0));
+                assert!(panel_dx.is_none() && stream_dx.is_none());
+                let panel_dw = panel_dw.expect("masked f64 panel dweight");
+                let stream_dw = stream_dw.expect("masked f64 streamed dweight");
+                assert_eq!(panel_dw.len(), stream_dw.len());
+                for (index, (&a, &b)) in panel_dw.iter().zip(&stream_dw).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "masked f64 dweight[{index}] differs at {batch}/{in_ch}/{out_ch}"
+                    );
+                }
+                assert_eq!(panel_db.is_some(), output_mask[2]);
+                assert_eq!(stream_db.is_some(), output_mask[2]);
+                if let (Some(panel_db), Some(stream_db)) = (panel_db, stream_db) {
+                    assert_eq!(panel_db.len(), stream_db.len());
+                    for (&a, &b) in panel_db.iter().zip(&stream_db) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+            }
+            super::set_conv2d_dweight_streamed(previous);
 
             // THE FUSED MASKED ENTRY, which is the route the h2h training lane actually takes.
             // It does NOT delegate to `conv2d_backward_f64`; it keeps its own copy of the panel
