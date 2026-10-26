@@ -17300,11 +17300,18 @@ impl FrankenTorchSession {
     /// u = p · expm1(s)   (= q - p, as s = log(q / p)),   g = u - q · Σ_i u_i
     /// ```
     ///
-    /// `δ` is first shifted by its value at the teacher's argmax, which is exact when the
-    /// logits differ by a common offset (softmax ignores it, but `Σ p δ` would round it
-    /// into `d`). An entry with `|s| > 1`, where `q` and `p` differ by more than a factor
-    /// `e` and `q - p` does not cancel, or with a non-finite `s` (an underflowed `p`, an
-    /// infinite logit) uses `q - p` directly.
+    /// `δ` is taken relative to its value at the teacher's argmax, exactly: each difference is
+    /// kept as its rounded value plus its rounding error, so a common offset (softmax ignores
+    /// it) neither rounds into `Σ p δ` nor hides the small differences between entries. An
+    /// entry with `|s| > 1`, where `q` and `p` differ by more than a factor
+    /// `e` and `q - p` does not cancel, or with a non-finite `s` (an infinite logit) uses
+    /// `q - p` directly.
+    ///
+    /// Entries the teacher gives no probability (a masked `-inf` logit, or `p` underflowing
+    /// to 0) are left out of the sums, where `p · δ` would be `0 · inf`. On the remaining
+    /// entries the formulas give `q' - p` for the student's softmax `q'` over just those
+    /// entries, and with `q_m` the student's probability on the left-out ones,
+    /// `q - p = (1 - q_m)(q' - p) - q_m · p`. A left-out entry's gradient is `q`.
     fn soft_target_student_gradient(student: &[f64], teacher: &[f64], cols: usize) -> Vec<f64> {
         fn softmax_row(z: &[f64]) -> Vec<f64> {
             let max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -17329,25 +17336,40 @@ impl FrankenTorchSession {
                     teacher_max = k;
                 }
             }
-            let delta_ref = zs[teacher_max] - zt[teacher_max];
+            // a - b as its rounded value and the rounding error (TwoSum). With a common
+            // offset the rounded values alone lose the small differences between entries.
+            let two_diff = |a: f64, b: f64| {
+                let s = a - b;
+                let back = s - a;
+                (s, (a - (s - back)) - (b + back))
+            };
+            let (ref_d, ref_err) = two_diff(zs[teacher_max], zt[teacher_max]);
             let delta: Vec<f64> = zs
                 .iter()
                 .zip(zt)
-                .map(|(&a, &b)| (a - b) - delta_ref)
+                .map(|(&a, &b)| {
+                    let (d, err) = two_diff(a, b);
+                    (d - ref_d) + (err - ref_err)
+                })
                 .collect();
-            let mean: f64 = p.iter().zip(&delta).map(|(&pi, &di)| pi * di).sum();
+            // Entries with p = 0 stay out of every sum: there δ is +inf (or NaN), and one
+            // NaN would send the whole row to the q - p fallback.
+            let kept = |k: &usize| p[*k] > 0.0;
+            let mean: f64 = (0..cols).filter(kept).map(|k| p[k] * delta[k]).sum();
             let d: Vec<f64> = delta.iter().map(|&di| di - mean).collect();
-            let log_norm = p
-                .iter()
-                .zip(&d)
-                .map(|(&pi, &di)| pi * di.exp_m1())
+            let log_norm = (0..cols)
+                .filter(kept)
+                .map(|k| p[k] * d[k].exp_m1())
                 .sum::<f64>()
                 .ln_1p();
+            // (1 - q_m)(q' - p) - q_m · p, with 1 - q_m summed from the kept q.
+            let q_kept: f64 = (0..cols).filter(kept).map(|k| q[k]).sum();
+            let q_m: f64 = (0..cols).filter(|k| !kept(k)).map(|k| q[k]).sum();
             let u: Vec<f64> = (0..cols)
                 .map(|k| {
                     let s = d[k] - log_norm;
-                    if s.abs() <= 1.0 {
-                        p[k] * s.exp_m1()
+                    if kept(&k) && s.abs() <= 1.0 {
+                        q_kept * p[k] * s.exp_m1() - q_m * p[k]
                     } else {
                         q[k] - p[k]
                     }
@@ -108375,6 +108397,88 @@ mod tests {
                 &plain_g_teacher,
                 |b| 1e-12 * b.abs().max(1e-300),
             );
+        }
+    }
+
+    #[test]
+    fn soft_target_cross_entropy_keeps_precision_with_offset_logits() {
+        // References: q - p in 90-digit arithmetic.
+        let cases: [([f64; 3], [f64; 3]); 2] = [
+            // Logits offset by 40 and by 1000 from a teacher whose entries are not dyadic, with
+            // one student logit a single ulp up: the rounded differences student - teacher
+            // carry errors of ~ulp(offset), about the size of the gradient itself.
+            (
+                [40.300_000_000_000_004, 38.8, 42.0],
+                [
+                    5.573_012_991_539_11e-16,
+                    -1.142_341_387_622_264_6e-16,
+                    -4.430_671_603_916_845_6e-16,
+                ],
+            ),
+            (
+                [1_000.300_000_000_000_1, 998.8, 1_002.0],
+                [
+                    8.892_353_276_909_566e-15,
+                    -1.805_463_233_137_68e-15,
+                    -7.086_890_043_771_887e-15,
+                ],
+            ),
+        ];
+        for (student, want) in cases {
+            let (_, g, _) =
+                soft_target_loss_and_grads(DType::F64, [1, 3], &student, &[0.3, -1.2, 2.0], false);
+            assert_close_to(&format!("offset student {student:?}"), &g, &want, |b| {
+                1e-12 * b.abs()
+            });
+        }
+    }
+
+    #[test]
+    fn soft_target_cross_entropy_keeps_precision_with_masked_teacher_entries() {
+        // A teacher logit of -inf (top-k or padding masks), or one whose probability underflows
+        // to 0 while δ overflows expm1, used to make 0 · inf = NaN and send the whole row to the
+        // plain q - p, which loses most digits on the nearly equal logits before it. The masked
+        // entry still has student mass (e^-40 of it). References: q - p in 90-digit arithmetic.
+        let cases: [(DType, f64, [f64; 4], f64); 2] = [
+            (
+                DType::F64,
+                2f64.powi(-51),
+                [
+                    -1.714_503_126_948_709_5e-16,
+                    1.542_895_014_542_199e-16,
+                    1.677_832_947_201_633e-17,
+                    3.824_817_686_347_266_6e-19,
+                ],
+                1e-12,
+            ),
+            (
+                DType::F32,
+                2f64.powi(-23),
+                [
+                    -4.595_504_334_943_142_6e-8,
+                    4.144_190_159_310_166e-8,
+                    4.513_141_755_947_284e-9,
+                    3.824_817_878_081_516e-19,
+                ],
+                1e-6,
+            ),
+        ];
+        for (dtype, ulp, want, rel) in cases {
+            for masked in [f64::NEG_INFINITY, -800.0] {
+                let (_, g, _) = soft_target_loss_and_grads(
+                    dtype,
+                    [1, 4],
+                    &[2.0 - ulp, 1.0 + ulp, 0.0, -40.0],
+                    &[2.0, 1.0, 0.0, masked],
+                    false,
+                );
+                assert_close_to(
+                    &format!("{dtype:?} teacher logit {masked}"),
+                    &g,
+                    &want,
+                    |b| rel * b.abs(),
+                );
+            }
         }
     }
 
