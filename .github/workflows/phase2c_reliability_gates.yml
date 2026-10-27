@@ -71,6 +71,21 @@ jobs:
           run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo fmt --check
           run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Training library regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          # Package names differ from the ft-api/ft-autograd directory names.
+          # Keep this result visible before the full workspace's long kernel suite.
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test -j 2 -p frankentorch-api -p frankentorch-autograd -p ft-nn -p ft-optim --lib
+
       - name: G2 unit/property + structured log contract
         shell: bash
         run: |
@@ -88,9 +103,6 @@ jobs:
             exit "$status"
           }
           trap gate_fail ERR
-          # Report training regressions before building the workspace's many
-          # examples and running its long kernel suite. The full gate still runs.
-          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-api -p ft-autograd -p ft-nn -p ft-optim --lib
           run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test --workspace
 
       - name: G3 differential/metamorphic/adversarial parity
