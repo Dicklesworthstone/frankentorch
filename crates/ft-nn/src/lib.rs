@@ -12604,6 +12604,47 @@ fn recurrent_parameter_slots(
     parameters
 }
 
+fn recurrent_zero_state(
+    session: &mut FrankenTorchSession,
+    input: TensorNodeId,
+    shape: Vec<usize>,
+) -> Result<TensorNodeId, AutogradError> {
+    let dtype = session.tensor_dtype(input)?;
+    let device = session.tensor_device(input)?;
+    if dtype == DType::F64 && device == Device::Cpu {
+        return session.zeros(shape, false);
+    }
+    let numel = checked_shape_numel(&shape, "recurrent state size overflow")?;
+    let zeros =
+        DenseTensor::from_contiguous_values(vec![0.0; numel], shape, device)?.to_dtype(dtype)?;
+    Ok(session.tensor_variable_from_storage(zeros, false))
+}
+
+fn recurrent_cpu_f64(
+    session: &FrankenTorchSession,
+    nodes: &[TensorNodeId],
+) -> Result<bool, AutogradError> {
+    for &node in nodes {
+        if session.tensor_dtype(node)? != DType::F64 || session.tensor_device(node)? != Device::Cpu
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn recurrent_dropout(
+    session: &mut FrankenTorchSession,
+    dropout: &Dropout,
+    input: TensorNodeId,
+) -> Result<TensorNodeId, AutogradError> {
+    if session.tensor_dtype(input)? == DType::F64 {
+        dropout.forward(session, input)
+    } else {
+        session.functional_dropout(input, dropout.p, dropout.training.get())
+    }
+}
+
 struct PackedRecurrentSpec<'a> {
     input_size: usize,
     hidden_size: usize,
@@ -13199,6 +13240,22 @@ impl LSTMCell {
         let sum2 = session.tensor_add(sum1, b_ih_exp)?;
         let gates = session.tensor_add(sum2, b_hh_exp)?;
 
+        // The custom fused function below consumes and returns F64 storage.
+        // Typed activations keep the same gate equations on the tensor tape.
+        if session.tensor_dtype(gates)? != DType::F64 || session.tensor_dtype(cx)? != DType::F64 {
+            let chunks = session.tensor_chunk(gates, 4, 1)?;
+            let i_gate = session.tensor_sigmoid(chunks[0])?;
+            let f_gate = session.tensor_sigmoid(chunks[1])?;
+            let g_gate = session.tensor_tanh(chunks[2])?;
+            let o_gate = session.tensor_sigmoid(chunks[3])?;
+            let fc = session.tensor_mul(f_gate, cx)?;
+            let ig = session.tensor_mul(i_gate, g_gate)?;
+            let cx_new = session.tensor_add(fc, ig)?;
+            let tanh_cx = session.tensor_tanh(cx_new)?;
+            let hx_new = session.tensor_mul(o_gate, tanh_cx)?;
+            return Ok((hx_new, cx_new));
+        }
+
         // Fused gate soup: the chunk + 4 activations + cell/hidden update (~11
         // op-graph ops over [batch, 4*hidden]/[batch, hidden]) collapse into ONE
         // custom op over the raw gate buffer. Outputs are packed as
@@ -13671,10 +13728,7 @@ impl LSTM {
             input
         };
 
-        let input_shape = {
-            let (_, meta) = session.tensor_values_meta(working_input)?;
-            meta.shape().to_vec()
-        };
+        let input_shape = session.tensor_shape(working_input)?;
         if input_shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -13700,11 +13754,11 @@ impl LSTM {
 
         let h_init = match h_0 {
             Some(h) => h,
-            None => session.zeros(state_shape.clone(), false)?,
+            None => recurrent_zero_state(session, input, state_shape.clone())?,
         };
         let c_init = match c_0 {
             Some(c) => c,
-            None => session.zeros(state_shape, false)?,
+            None => recurrent_zero_state(session, input, state_shape)?,
         };
 
         // Unbind initial states along dim=0 to get per-layer-direction states
@@ -13777,7 +13831,7 @@ impl LSTM {
             if layer < self.num_layers - 1 {
                 let mut dropped = Vec::with_capacity(layer_output.len());
                 for &step_out in &layer_output {
-                    let d = self.dropout_layers[layer].forward(session, step_out)?;
+                    let d = recurrent_dropout(session, &self.dropout_layers[layer], step_out)?;
                     dropped.push(d);
                 }
                 layer_input = dropped;
@@ -13826,7 +13880,14 @@ impl LSTM {
         // Inference fast path: when gradients are off, run the whole direction in
         // raw f64 — no per-timestep op-graph nodes, intermediates, or tape. See
         // `run_direction_no_grad`.
-        if !session.is_grad_enabled() {
+        if !session.is_grad_enabled()
+            && recurrent_cpu_f64(
+                session,
+                &[
+                    inputs[0], h_0, c_0, cell.w_ih, cell.w_hh, cell.b_ih, cell.b_hh,
+                ],
+            )?
+        {
             return self.run_direction_no_grad(session, cell, inputs, h_0, c_0, reverse);
         }
 
@@ -13839,10 +13900,7 @@ impl LSTM {
         // projection is bit-for-bit identical to the per-timestep matmul.
         let w_ih_t = cell.w_ih_transposed(session)?;
         let w_hh_t = cell.w_hh_transposed(session)?;
-        let batch_size = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            meta.shape()[0]
-        };
+        let batch_size = session.tensor_shape(inputs[0])?[0];
         let stacked = session.tensor_cat(inputs, 0)?;
         let xw_all = session.tensor_matmul(stacked, w_ih_t)?;
 
@@ -13892,14 +13950,9 @@ impl LSTM {
         let seq_len = inputs.len();
         let h_size = self.hidden_size;
         let four_h = 4 * h_size;
-        let in_features = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            meta.shape()[1]
-        };
-        let batch = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            meta.shape()[0]
-        };
+        let input_shape = session.tensor_shape(inputs[0])?;
+        let in_features = input_shape[1];
+        let batch = input_shape[0];
 
         // Raw weight/bias/state buffers (fetched once).
         let stacked = session.tensor_cat(inputs, 0)?;
@@ -14228,10 +14281,7 @@ impl GRU {
             input
         };
 
-        let input_shape = {
-            let (_, meta) = session.tensor_values_meta(working_input)?;
-            meta.shape().to_vec()
-        };
+        let input_shape = session.tensor_shape(working_input)?;
         if input_shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -14255,7 +14305,7 @@ impl GRU {
 
         let h_init = match h_0 {
             Some(h) => h,
-            None => session.zeros(state_shape, false)?,
+            None => recurrent_zero_state(session, input, state_shape)?,
         };
 
         let h_states = session.tensor_unbind(h_init, 0)?;
@@ -14305,7 +14355,7 @@ impl GRU {
             if layer < self.num_layers - 1 {
                 let mut dropped = Vec::with_capacity(layer_output.len());
                 for &step_out in &layer_output {
-                    let d = self.dropout_layers[layer].forward(session, step_out)?;
+                    let d = recurrent_dropout(session, &self.dropout_layers[layer], step_out)?;
                     dropped.push(d);
                 }
                 layer_input = dropped;
@@ -14344,7 +14394,12 @@ impl GRU {
         }
 
         // Inference fast path: raw f64 sweep, no per-timestep op-graph/tape.
-        if !session.is_grad_enabled() {
+        if !session.is_grad_enabled()
+            && recurrent_cpu_f64(
+                session,
+                &[inputs[0], h_0, cell.w_ih, cell.w_hh, cell.b_ih, cell.b_hh],
+            )?
+        {
             return self.run_direction_no_grad(session, cell, inputs, h_0, reverse);
         }
 
@@ -14355,10 +14410,7 @@ impl GRU {
         // step then only runs its recurrent matmul plus the elementwise gates.
         let w_ih_t = cell.w_ih_transposed(session)?;
         let w_hh_t = cell.w_hh_transposed(session)?;
-        let batch_size = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            meta.shape()[0]
-        };
+        let batch_size = session.tensor_shape(inputs[0])?[0];
         let stacked = session.tensor_cat(inputs, 0)?;
         let x_gates_all = cell.project_inputs(session, stacked, w_ih_t)?;
 
@@ -14403,10 +14455,8 @@ impl GRU {
         let seq_len = inputs.len();
         let h_size = self.hidden_size;
         let three_h = 3 * h_size;
-        let (in_features, batch) = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            (meta.shape()[1], meta.shape()[0])
-        };
+        let input_shape = session.tensor_shape(inputs[0])?;
+        let (in_features, batch) = (input_shape[1], input_shape[0]);
 
         let stacked = session.tensor_cat(inputs, 0)?;
         let stacked_vals = session.tensor_values(stacked)?;
@@ -14749,10 +14799,7 @@ impl RNN {
             input
         };
 
-        let input_shape = {
-            let (_, meta) = session.tensor_values_meta(working_input)?;
-            meta.shape().to_vec()
-        };
+        let input_shape = session.tensor_shape(working_input)?;
         if input_shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -14776,7 +14823,7 @@ impl RNN {
 
         let h_init = match h_0 {
             Some(h) => h,
-            None => session.zeros(state_shape, false)?,
+            None => recurrent_zero_state(session, input, state_shape)?,
         };
 
         let h_states = session.tensor_unbind(h_init, 0)?;
@@ -14826,7 +14873,7 @@ impl RNN {
             if layer < self.num_layers - 1 {
                 let mut dropped = Vec::with_capacity(layer_output.len());
                 for &step_out in &layer_output {
-                    let d = self.dropout_layers[layer].forward(session, step_out)?;
+                    let d = recurrent_dropout(session, &self.dropout_layers[layer], step_out)?;
                     dropped.push(d);
                 }
                 layer_input = dropped;
@@ -14865,7 +14912,12 @@ impl RNN {
         }
 
         // Inference fast path: raw f64 sweep, no per-timestep op-graph/tape.
-        if !session.is_grad_enabled() {
+        if !session.is_grad_enabled()
+            && recurrent_cpu_f64(
+                session,
+                &[inputs[0], h_0, cell.w_ih, cell.w_hh, cell.b_ih, cell.b_hh],
+            )?
+        {
             return self.run_direction_no_grad(session, cell, inputs, h_0, reverse);
         }
 
@@ -14876,10 +14928,7 @@ impl RNN {
         // identical to the per-step matmul (row-independent reduction).
         let w_ih_t = cell.w_ih_transposed(session)?;
         let w_hh_t = cell.w_hh_transposed(session)?;
-        let batch_size = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            meta.shape()[0]
-        };
+        let batch_size = session.tensor_shape(inputs[0])?[0];
         let stacked = session.tensor_cat(inputs, 0)?;
         let xw_all = session.tensor_matmul(stacked, w_ih_t)?;
 
@@ -14922,10 +14971,8 @@ impl RNN {
         let seq_len = inputs.len();
         let h_size = self.hidden_size;
         let use_tanh = cell.use_tanh;
-        let (in_features, batch) = {
-            let (_, meta) = session.tensor_values_meta(inputs[0])?;
-            (meta.shape()[1], meta.shape()[0])
-        };
+        let input_shape = session.tensor_shape(inputs[0])?;
+        let (in_features, batch) = (input_shape[1], input_shape[0]);
 
         let stacked = session.tensor_cat(inputs, 0)?;
         let stacked_vals = session.tensor_values(stacked)?;
@@ -34102,7 +34149,7 @@ mod tests {
                         "transformer must drop attention weights"
                     );
                 } else {
-                    for row in values.chunks_exact(3) {
+                    for row in values.as_chunks::<3>().0 {
                         assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-12);
                         assert!(row.iter().all(|&v| v > 0.0));
                     }
@@ -38913,6 +38960,34 @@ mod tests {
             }
         }
 
+        fn set_batch_first(&mut self, batch_first: bool) {
+            match self {
+                Self::Lstm(m) => m.batch_first = batch_first,
+                Self::Gru(m) => m.batch_first = batch_first,
+                Self::Rnn(m) => m.batch_first = batch_first,
+            }
+        }
+
+        fn forward_dense(
+            &self,
+            session: &mut FrankenTorchSession,
+            input: TensorNodeId,
+            h: Option<TensorNodeId>,
+            c: Option<TensorNodeId>,
+        ) -> Result<Vec<TensorNodeId>, AutogradError> {
+            match self {
+                Self::Lstm(m) => m
+                    .forward_lstm(session, input, h, c)
+                    .map(|o| vec![o.output, o.h_n, o.c_n]),
+                Self::Gru(m) => m
+                    .forward_gru(session, input, h)
+                    .map(|o| vec![o.output, o.h_n]),
+                Self::Rnn(m) => m
+                    .forward_rnn(session, input, h)
+                    .map(|o| vec![o.output, o.h_n]),
+            }
+        }
+
         fn last_input_weight_mut(&mut self) -> &mut TensorNodeId {
             match self {
                 Self::Lstm(m) => &mut m.cells.last_mut().unwrap().w_ih,
@@ -38966,17 +39041,25 @@ mod tests {
         }
     }
 
-    /// Independent scalar recurrence for three separately processed sequences
-    /// of lengths [2,3,1]. No tensor API, packing, or recurrent-module code is
-    /// used to compute the oracle. Data contains padded input, h0, c0, then
-    /// four parameter arrays per cell in layer/direction order.
     fn packed_recurrent_scalar_reference(
         kind: usize,
         data: &[Vec<f64>],
         bidirectional: bool,
     ) -> Vec<Vec<f64>> {
+        recurrent_scalar_reference(kind, data, bidirectional, [2, 3, 1])
+    }
+
+    /// Independent scalar recurrence for three separately processed sequences.
+    /// No tensor API, packing, or recurrent-module code computes the oracle.
+    /// Data contains padded input, h0, c0, then four parameter arrays per cell
+    /// in layer/direction order. Equal lengths yield ordinary time-first data.
+    fn recurrent_scalar_reference(
+        kind: usize,
+        data: &[Vec<f64>],
+        bidirectional: bool,
+        lengths: [usize; 3],
+    ) -> Vec<Vec<f64>> {
         let directions = if bidirectional { 2 } else { 1 };
-        let lengths = [2, 3, 1];
         let gates = match kind {
             0 => 4,
             1 => 3,
@@ -39057,8 +39140,10 @@ mod tests {
             }
         }
         let mut packed = Vec::new();
+        let mut order = [0, 1, 2];
+        order.sort_by_key(|&batch| std::cmp::Reverse(lengths[batch]));
         for t in 0..3 {
-            for batch in [1, 0, 2] {
+            for batch in order {
                 if t < lengths[batch] {
                     let start = (t * 3 + batch) * 2 * directions;
                     packed.extend_from_slice(&output[start..start + 2 * directions]);
@@ -39070,6 +39155,214 @@ mod tests {
             result.push(cn);
         }
         result
+    }
+
+    #[test]
+    fn dense_recurrent_f32_outputs_and_gradients_match_independent_reference() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for kind in 0..4 {
+                for bidirectional in [false, true] {
+                    for batch_first in [false, true] {
+                        let directions = if bidirectional { 2 } else { 1 };
+                        let mut s = FrankenTorchSession::new(mode);
+                        let mut model = PackedRecurrentTestModel::new(
+                            &mut s,
+                            kind,
+                            DType::F32,
+                            bidirectional,
+                            0.0,
+                        );
+                        model.set_batch_first(batch_first);
+                        let input = packed_recurrent_test_leaf(
+                            &mut s,
+                            (0..18).map(|i| (i as f64 - 7.0) * 0.07).collect(),
+                            vec![3, 3, 2],
+                            DType::F32,
+                            true,
+                        );
+                        let h0 = packed_recurrent_test_leaf(
+                            &mut s,
+                            (0..12 * directions)
+                                .map(|i| (i as f64 - 5.0) * 0.021)
+                                .collect(),
+                            vec![2 * directions, 3, 2],
+                            DType::F32,
+                            true,
+                        );
+                        let c0 = packed_recurrent_test_leaf(
+                            &mut s,
+                            (0..12 * directions)
+                                .map(|i| (i as f64 + 1.0) * 0.017)
+                                .collect(),
+                            vec![2 * directions, 3, 2],
+                            DType::F32,
+                            true,
+                        );
+                        let nodes: Vec<_> = [input, h0, c0]
+                            .into_iter()
+                            .chain(model.module().parameters())
+                            .collect();
+                        let data: Vec<_> = nodes
+                            .iter()
+                            .map(|&id| s.tensor_values_lossy_f64(id).unwrap())
+                            .collect();
+                        let dense_input = if batch_first {
+                            s.tensor_transpose(input, 0, 1).unwrap()
+                        } else {
+                            input
+                        };
+                        let mut results = model
+                            .forward_dense(&mut s, dense_input, Some(h0), Some(c0))
+                            .unwrap();
+                        if batch_first {
+                            results[0] = s.tensor_transpose(results[0], 0, 1).unwrap();
+                        }
+                        let expected =
+                            recurrent_scalar_reference(kind, &data, bidirectional, [3; 3]);
+                        let mut loss = None;
+                        for (part, (&result, expected)) in results.iter().zip(expected).enumerate()
+                        {
+                            assert_eq!(s.tensor_dtype(result).unwrap(), DType::F32);
+                            let actual = s.tensor_values_lossy_f64(result).unwrap();
+                            assert_eq!(actual.len(), expected.len());
+                            for (&actual, expected) in actual.iter().zip(expected) {
+                                assert!(
+                                    (actual - expected).abs() < 2e-5,
+                                    "kind {kind}, {mode:?}, bidirectional={bidirectional}, batch_first={batch_first}: {actual} != {expected}"
+                                );
+                            }
+                            let shape = s.tensor_shape(result).unwrap();
+                            let weights = packed_recurrent_test_leaf(
+                                &mut s,
+                                (0..actual.len())
+                                    .map(|i| ((i + part * 3) % 11) as f64 * 0.13 - 0.4)
+                                    .collect(),
+                                shape,
+                                DType::F32,
+                                false,
+                            );
+                            let weighted = s.tensor_mul(result, weights).unwrap();
+                            let part_loss = s.tensor_sum(weighted).unwrap();
+                            loss = Some(match loss {
+                                Some(previous) => s.tensor_add(previous, part_loss).unwrap(),
+                                None => part_loss,
+                            });
+                        }
+                        let report = s.tensor_backward(loss.unwrap()).unwrap();
+                        let reference_loss = |data: &[Vec<f64>]| -> f64 {
+                            recurrent_scalar_reference(kind, data, bidirectional, [3; 3])
+                                .iter()
+                                .enumerate()
+                                .map(|(part, values)| {
+                                    values
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, value)| {
+                                            value * (((i + part * 3) % 11) as f64 * 0.13 - 0.4)
+                                        })
+                                        .sum::<f64>()
+                                })
+                                .sum()
+                        };
+                        for (n, &node) in nodes.iter().enumerate() {
+                            if n == 2 && kind != 0 {
+                                continue;
+                            }
+                            let gradient = s.tensor_gradient(&report, node).expect("dense recurrent inputs, states, and parameters must receive gradients");
+                            for (i, &analytic) in gradient.iter().enumerate() {
+                                let mut plus = data.clone();
+                                let mut minus = data.clone();
+                                plus[n][i] += 1e-6;
+                                minus[n][i] -= 1e-6;
+                                let numeric =
+                                    (reference_loss(&plus) - reference_loss(&minus)) / 2e-6;
+                                assert!(
+                                    (analytic - numeric).abs() < 2e-4 * (1.0 + numeric.abs()),
+                                    "kind {kind}, {mode:?}, node {n}[{i}]: {analytic} != {numeric}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_recurrent_f32_defaults_dropout_frozen_inputs_and_no_grad() {
+        for kind in 0..4 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mut model = PackedRecurrentTestModel::new(&mut s, kind, DType::F32, true, 0.0);
+            let input = packed_recurrent_test_leaf(
+                &mut s,
+                (0..18).map(|i| i as f64 * 0.07 - 0.4).collect(),
+                vec![3, 3, 2],
+                DType::F32,
+                false,
+            );
+            let implicit = model.forward_dense(&mut s, input, None, None).unwrap();
+            let values: Vec<_> = implicit
+                .iter()
+                .map(|&id| s.tensor_values_lossy_f64(id).unwrap())
+                .collect();
+            let zeros =
+                packed_recurrent_test_leaf(&mut s, vec![0.0; 24], vec![4, 3, 2], DType::F32, false);
+            let explicit = model
+                .forward_dense(&mut s, input, Some(zeros), Some(zeros))
+                .unwrap();
+            let inferred = s
+                .with_no_grad(|s| model.forward_dense(s, input, None, None))
+                .unwrap();
+            for ((&implicit, explicit), (inferred, expected)) in implicit
+                .iter()
+                .zip(explicit)
+                .zip(inferred.into_iter().zip(&values))
+            {
+                assert_eq!(s.tensor_dtype(implicit).unwrap(), DType::F32);
+                assert_eq!(s.tensor_dtype(inferred).unwrap(), DType::F32);
+                assert!(!s.tensor_requires_grad(inferred).unwrap());
+                assert_eq!(&s.tensor_values_lossy_f64(explicit).unwrap(), expected);
+                assert_eq!(&s.tensor_values_lossy_f64(inferred).unwrap(), expected);
+            }
+            let trait_output = model.module().forward(&mut s, input).unwrap();
+            assert_eq!(s.tensor_values_lossy_f64(trait_output).unwrap(), values[0]);
+            let loss = s.tensor_sum(implicit[0]).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            assert!(s.tensor_gradient(&report, input).is_none());
+            for parameter in model.module().parameters() {
+                assert!(s.tensor_gradient(&report, parameter).is_some());
+            }
+            for probability in [0.5, 1.0] {
+                model.dropout_mut().p = probability;
+                model.module().train(true);
+                let mut replay = s.clone();
+                let trained = model.forward_dense(&mut s, input, None, None).unwrap();
+                let inferred = replay
+                    .with_no_grad(|s| model.forward_dense(s, input, None, None))
+                    .unwrap();
+                for (&trained, inferred) in trained.iter().zip(inferred) {
+                    assert_eq!(s.tensor_dtype(trained).unwrap(), DType::F32);
+                    assert_eq!(replay.tensor_dtype(inferred).unwrap(), DType::F32);
+                    assert!(!replay.tensor_requires_grad(inferred).unwrap());
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(trained).unwrap(),
+                        replay.tensor_values_lossy_f64(inferred).unwrap()
+                    );
+                }
+                assert_ne!(s.tensor_values_lossy_f64(trained[0]).unwrap(), values[0]);
+                let loss = s.tensor_sum(trained[0]).unwrap();
+                let report = s.tensor_backward(loss).unwrap();
+                for (i, parameter) in model.module().parameters().into_iter().enumerate() {
+                    let gradient = s.tensor_gradient(&report, parameter).unwrap();
+                    if probability == 1.0 && i < 8 {
+                        assert!(gradient.iter().all(|&value| value == 0.0));
+                    }
+                }
+                model.module().eval();
+                let evaluated = model.forward_dense(&mut s, input, None, None).unwrap();
+                assert_eq!(s.tensor_values_lossy_f64(evaluated[0]).unwrap(), values[0]);
+            }
+        }
     }
 
     #[test]

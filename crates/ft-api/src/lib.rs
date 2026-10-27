@@ -4860,41 +4860,95 @@ impl FrankenTorchSession {
         self.tensor_variable(values, vec![n, cols], requires_grad)
     }
 
+    /// Allocate zeros with a new shape and the source tensor's dtype and device.
     pub fn tensor_new_zeros(
         &mut self,
-        _source: TensorNodeId,
+        source: TensorNodeId,
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.zeros(shape, requires_grad)
+        self.tensor_new_full(source, shape, 0.0, requires_grad)
     }
 
+    /// Allocate ones with a new shape and the source tensor's dtype and device.
     pub fn tensor_new_ones(
         &mut self,
-        _source: TensorNodeId,
+        source: TensorNodeId,
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.ones(shape, requires_grad)
+        self.tensor_new_full(source, shape, 1.0, requires_grad)
     }
 
+    /// Allocate an independent, contiguous leaf using only the source's dtype
+    /// and device. Source values, layout, and gradient history are not copied.
+    /// The explicit `requires_grad` flag also applies inside `with_no_grad`,
+    /// matching the factory-function exception in PyTorch.
     pub fn tensor_new_full(
         &mut self,
-        _source: TensorNodeId,
+        source: TensorNodeId,
         shape: Vec<usize>,
         fill_value: f64,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.full(shape, fill_value, requires_grad)
+        let meta = self.tensor_tape.tensor_meta(source)?;
+        let dtype = meta.dtype();
+        let device = meta.device();
+        let numel = Self::checked_shape_numel(
+            &shape,
+            "tensor factory shape volume overflow in tensor_new_full",
+        )?;
+        let tensor = match dtype {
+            DType::F64 => {
+                DenseTensor::from_contiguous_values(vec![fill_value; numel], shape, device)?
+            }
+            DType::F32 => DenseTensor::from_contiguous_values_f32(
+                vec![fill_value as f32; numel],
+                shape,
+                device,
+            )?,
+            DType::F16 => DenseTensor::from_contiguous_values_f16(
+                vec![Float16::from_f32(fill_value as f32); numel],
+                shape,
+                device,
+            )?,
+            DType::BF16 => DenseTensor::from_contiguous_values_bf16(
+                vec![BFloat16::from_f32(fill_value as f32); numel],
+                shape,
+                device,
+            )?,
+            DType::Complex64 => DenseTensor::from_contiguous_values_complex64(
+                vec![Complex64::new(fill_value as f32, 0.0); numel],
+                shape,
+                device,
+            )?,
+            DType::Complex128 => DenseTensor::from_contiguous_values_complex128(
+                vec![Complex128::new(fill_value, 0.0); numel],
+                shape,
+                device,
+            )?,
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "tensor_new_full: unsupported source dtype",
+                    },
+                )));
+            }
+        };
+        Ok(self.with_enable_grad(|session| {
+            session.tensor_variable_from_storage(tensor, requires_grad)
+        }))
     }
 
+    /// Allocate initialized storage with the source's dtype and device.
+    /// As with `empty`, this safe Rust implementation initializes values to zero.
     pub fn tensor_new_empty(
         &mut self,
-        _source: TensorNodeId,
+        source: TensorNodeId,
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.zeros(shape, requires_grad)
+        self.tensor_new_full(source, shape, 0.0, requires_grad)
     }
 
     pub fn arange(
@@ -174631,6 +174685,162 @@ mod tests {
         assert_eq!(s.tensor_values(f).unwrap(), vec![5.0, 5.0, 5.0]);
         let e = s.tensor_new_empty(source, vec![2], false).unwrap();
         assert_eq!(s.tensor_shape(e).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn new_factories_preserve_source_dtype_device_without_copying_views() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [
+                DType::F64,
+                DType::F32,
+                DType::F16,
+                DType::BF16,
+                DType::Complex64,
+                DType::Complex128,
+            ] {
+                for device in [Device::Cpu, Device::Cuda, Device::Metal] {
+                    let mut s = FrankenTorchSession::new(mode);
+                    let storage =
+                        DenseTensor::from_contiguous_values(vec![f64::NAN; 12], vec![3, 4], device)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let view = DenseTensor::from_typed_storage(
+                        ft_core::TensorMeta::from_shape_and_strides(
+                            vec![4, 2],
+                            vec![1, 4],
+                            4,
+                            dtype,
+                            device,
+                        )
+                        .unwrap(),
+                        storage.typed_storage().clone(),
+                    )
+                    .unwrap();
+                    let source = s.tensor_variable_from_storage(view, true);
+                    let source_meta = s.tensor_snapshot(source).unwrap();
+                    assert_eq!(source_meta.meta().storage_offset(), 4);
+                    assert!(!source_meta.meta().is_contiguous());
+                    for shape in [vec![], vec![2, 3], vec![2, 0, 3]] {
+                        let nodes = [
+                            (
+                                s.tensor_new_zeros(source, shape.clone(), false).unwrap(),
+                                0.0,
+                            ),
+                            (
+                                s.tensor_new_ones(source, shape.clone(), false).unwrap(),
+                                1.0,
+                            ),
+                            (
+                                s.tensor_new_full(source, shape.clone(), 5.25, false)
+                                    .unwrap(),
+                                5.25,
+                            ),
+                            (
+                                s.tensor_new_empty(source, shape.clone(), false).unwrap(),
+                                0.0,
+                            ),
+                        ];
+                        for (node, value) in nodes {
+                            assert_ne!(node, source);
+                            assert!(!s.tensor_requires_grad(node).unwrap());
+                            let tensor = s.tensor_snapshot(node).unwrap();
+                            assert_eq!(tensor.meta().shape(), shape);
+                            assert_eq!(tensor.meta().dtype(), dtype);
+                            assert_eq!(tensor.meta().device(), device);
+                            assert_eq!(tensor.meta().storage_offset(), 0);
+                            assert!(tensor.meta().is_contiguous());
+                            let count: usize = shape.iter().product();
+                            match dtype {
+                                DType::Complex64 => assert_eq!(
+                                    tensor.contiguous_values_complex64().unwrap(),
+                                    vec![Complex64::new(value as f32, 0.0); count]
+                                ),
+                                DType::Complex128 => assert_eq!(
+                                    tensor.contiguous_values_complex128().unwrap(),
+                                    vec![Complex128::new(value, 0.0); count]
+                                ),
+                                _ => assert_eq!(
+                                    tensor.contiguous_values_as_f64().unwrap(),
+                                    vec![value; count]
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_factories_honor_explicit_leaf_gradients_inside_no_grad() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for factory in 0..4 {
+                    let mut s = FrankenTorchSession::new(mode);
+                    let storage =
+                        DenseTensor::from_contiguous_values(vec![7.0; 2], vec![2], Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let source = s.tensor_variable_from_storage(storage, true);
+                    let fresh = s.with_no_grad(|s| {
+                        let fresh = match factory {
+                            0 => s.tensor_new_zeros(source, vec![3], true),
+                            1 => s.tensor_new_ones(source, vec![3], true),
+                            2 => s.tensor_new_full(source, vec![3], 2.5, true),
+                            _ => s.tensor_new_empty(source, vec![3], true),
+                        }
+                        .unwrap();
+                        assert!(s.tensor_requires_grad(fresh).unwrap());
+                        assert!(!s.is_grad_enabled());
+                        let detached = s.tensor_mul(fresh, fresh).unwrap();
+                        assert!(!s.tensor_requires_grad(detached).unwrap());
+                        fresh
+                    });
+                    assert!(s.is_grad_enabled());
+                    assert_eq!(s.tensor_dtype(fresh).unwrap(), dtype);
+                    let loss = s.tensor_sum(fresh).unwrap();
+                    let report = s.tensor_backward(loss).unwrap();
+                    assert_eq!(s.tensor_gradient(&report, fresh).unwrap(), &[1.0; 3]);
+                    assert!(s.tensor_gradient(&report, source).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_factories_validate_source_and_shape_before_recording() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut s = FrankenTorchSession::new(mode);
+            let source = s.tensor_variable_f32(vec![1.0], vec![1], true).unwrap();
+            let quantized = s.tensor_variable_from_storage(
+                DenseTensor::from_contiguous_values_qint8(vec![2], vec![1], Device::Cpu, 0.5, 0)
+                    .unwrap(),
+                false,
+            );
+            for (source, shape) in [
+                (TensorNodeId(usize::MAX), vec![0]),
+                (source, vec![usize::MAX, 2]),
+                (quantized, vec![2]),
+            ] {
+                for factory in 0..4 {
+                    let before = s.autograd_graph_node_count();
+                    s.with_no_grad(|s| {
+                        let result = match factory {
+                            0 => s.tensor_new_zeros(source, shape.clone(), true),
+                            1 => s.tensor_new_ones(source, shape.clone(), true),
+                            2 => s.tensor_new_full(source, shape.clone(), 1.0, true),
+                            _ => s.tensor_new_empty(source, shape.clone(), true),
+                        };
+                        assert!(result.is_err());
+                        assert!(!s.is_grad_enabled());
+                    });
+                    assert!(s.is_grad_enabled());
+                    assert_eq!(s.autograd_graph_node_count(), before);
+                }
+            }
+        }
     }
 
     #[test]
