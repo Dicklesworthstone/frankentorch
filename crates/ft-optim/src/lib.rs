@@ -67,6 +67,8 @@ pub enum OptimizerState {
     Rmsprop(RmspropState),
     Adagrad(AdagradState),
     RAdam(RadamState),
+    SparseAdam(SparseAdamState),
+    NAdam(NadamState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,6 +165,48 @@ pub struct RadamParameterState {
     pub step: u64,
     pub exp_avg: Vec<f64>,
     pub exp_avg_sq: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparseAdamState {
+    pub lr: f64,
+    pub betas: [f64; 2],
+    pub eps: f64,
+    /// `None` distinguishes an untouched parameter from initialized zero moments.
+    pub parameters: Vec<Option<SparseAdamParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparseAdamParameterState {
+    pub step: u64,
+    /// Full-size buffers retain moments for rows absent from the current batch.
+    pub exp_avg: Vec<f64>,
+    pub exp_avg_sq: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NadamState {
+    pub lr: f64,
+    pub betas: [f64; 2],
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub momentum_decay: f64,
+    pub decoupled_weight_decay: bool,
+    pub maximize: bool,
+    pub parameters: Vec<Option<NadamParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NadamParameterState {
+    pub step: u64,
+    pub exp_avg: Vec<f64>,
+    pub exp_avg_sq: Vec<f64>,
+    /// Cumulative momentum schedule product, advanced only on this parameter's gradient steps.
+    pub mu_product: f64,
 }
 
 fn optimizer_parameter_metadata(
@@ -415,6 +459,59 @@ fn validate_radam_state_buffers(state: &RadamState, sizes: &[usize]) -> Result<(
     Ok(())
 }
 
+fn validate_sparse_adam_state_buffers(
+    state: &SparseAdamState,
+    sizes: &[usize],
+) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "sparse_adam state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized sparse_adam state requires a positive step",
+            ));
+        }
+        validate_optimizer_buffer(&parameter.exp_avg, numel)?;
+        validate_nonnegative_optimizer_buffer(&parameter.exp_avg_sq, numel)?;
+    }
+    Ok(())
+}
+
+fn validate_nadam_state_buffers(state: &NadamState, sizes: &[usize]) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "nadam state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized nadam state requires a positive step",
+            ));
+        }
+        validate_optimizer_buffer(&parameter.exp_avg, numel)?;
+        validate_nonnegative_optimizer_buffer(&parameter.exp_avg_sq, numel)?;
+        // Zero is valid when beta1 is zero or the accumulated product underflows.
+        // One is reserved for an uninitialized parameter and would invalidate the
+        // bias-correction denominator for an initialized state.
+        if !parameter.mu_product.is_finite() || !(0.0..1.0).contains(&parameter.mu_product) {
+            return Err(optimizer_state_error(
+                "nadam state momentum product must be finite and in [0, 1)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn build_optimizer_state_dict(
     session: &FrankenTorchSession,
     params: &[TensorNodeId],
@@ -434,6 +531,8 @@ fn build_optimizer_state_dict(
         OptimizerState::Rmsprop(state) => validate_rmsprop_state_buffers(state, &sizes)?,
         OptimizerState::Adagrad(state) => validate_adagrad_state_buffers(state, &sizes)?,
         OptimizerState::RAdam(state) => validate_radam_state_buffers(state, &sizes)?,
+        OptimizerState::SparseAdam(state) => validate_sparse_adam_state_buffers(state, &sizes)?,
+        OptimizerState::NAdam(state) => validate_nadam_state_buffers(state, &sizes)?,
     }
     Ok(result)
 }
@@ -5989,6 +6088,11 @@ impl NAdam {
                 "nadam requires finite non-negative weight_decay",
             ));
         }
+        if !self.momentum_decay.is_finite() || self.momentum_decay < 0.0 {
+            return Err(optimizer_hparam_error(
+                "nadam requires finite non-negative momentum_decay",
+            ));
+        }
         Ok(())
     }
 }
@@ -6000,6 +6104,91 @@ impl Optimizer for NAdam {
 
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
+    }
+
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [
+            self.step_counts.len(),
+            self.m.len(),
+            self.v.len(),
+            self.mu_products.len(),
+        ] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "nadam state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_counts
+            .iter()
+            .zip(&self.m)
+            .zip(&self.v)
+            .zip(&self.mu_products)
+            .map(
+                |(((&step, first), second), &mu_product)| match (first, second) {
+                    (None, None) if step == 0 && mu_product == 1.0 => Ok(None),
+                    (Some(first), Some(second)) => Ok(Some(NadamParameterState {
+                        step,
+                        exp_avg: first.clone(),
+                        exp_avg_sq: second.clone(),
+                        mu_product,
+                    })),
+                    _ => Err(optimizer_state_error(
+                        "nadam state has inconsistent moments or momentum products",
+                    )),
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::NAdam(NadamState {
+                lr: self.lr,
+                betas: [self.beta1, self.beta2],
+                eps: self.eps,
+                weight_decay: self.weight_decay,
+                momentum_decay: self.momentum_decay,
+                decoupled_weight_decay: self.decoupled_weight_decay,
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::NAdam(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_nadam_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .betas(saved.betas[0], saved.betas[1])
+            .eps(saved.eps)
+            .weight_decay(saved.weight_decay)
+            .momentum_decay(saved.momentum_decay)
+            .decoupled_weight_decay(saved.decoupled_weight_decay)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_counts[index] = parameter.step;
+                restored.m[index] = Some(parameter.exp_avg.clone());
+                restored.v[index] = Some(parameter.exp_avg_sq.clone());
+                restored.mu_products[index] = parameter.mu_product;
+            }
+        }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
     }
 
     fn get_lr(&self) -> f64 {
@@ -6642,6 +6831,73 @@ impl Optimizer for SparseAdam {
         &self.params
     }
 
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [self.step_counts.len(), self.m.len(), self.v.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "sparse_adam state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_counts
+            .iter()
+            .zip(&self.m)
+            .zip(&self.v)
+            .map(|((&step, first), second)| match (first, second) {
+                (None, None) if step == 0 => Ok(None),
+                (Some(first), Some(second)) => Ok(Some(SparseAdamParameterState {
+                    step,
+                    exp_avg: first.clone(),
+                    exp_avg_sq: second.clone(),
+                })),
+                _ => Err(optimizer_state_error(
+                    "sparse_adam state has inconsistent moments",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::SparseAdam(SparseAdamState {
+                lr: self.lr,
+                betas: [self.beta1, self.beta2],
+                eps: self.eps,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::SparseAdam(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_sparse_adam_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .betas(saved.betas[0], saved.betas[1])
+            .eps(saved.eps);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_counts[index] = parameter.step;
+                restored.m[index] = Some(parameter.exp_avg.clone());
+                restored.v[index] = Some(parameter.exp_avg_sq.clone());
+            }
+        }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6683,8 +6939,8 @@ impl Optimizer for SparseAdam {
             let bias_correction1 = adam_bias_correction(self.beta1, t);
             let bias_correction2 = adam_bias_correction(self.beta2, t);
 
-            let param_values = session.tensor_values(param)?;
-            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
+            let param_len = session.tensor_values_len(param)?;
+            ensure_grad_len_matches_param(param, param_len, grad.len())?;
 
             let m = self.m[i].get_or_insert_with(|| vec![0.0; grad.len()]);
             ensure_state_len(
@@ -6735,8 +6991,8 @@ impl SparseAdam {
         param_idx: usize,
         sparse_grad: &ft_core::SparseCOOTensor,
     ) -> Result<(), AutogradError> {
-        let (param_values, param_meta) = session.tensor_values_meta(param)?;
-        let param_numel = param_values.len();
+        let param_numel = session.tensor_values_len(param)?;
+        let param_shape = session.tensor_shape(param)?;
 
         // Get the sparse indices and values
         let indices = sparse_grad.indices();
@@ -6747,7 +7003,7 @@ impl SparseAdam {
         let nnz = sparse_grad.nnz();
         let sparse_dim = sparse_grad.sparse_dim();
         let dense_shape = sparse_grad.dense_shape();
-        if dense_shape.cmp(param_meta.shape()).is_ne() {
+        if dense_shape.cmp(param_shape.as_slice()).is_ne() {
             return Err(optimizer_hparam_error(
                 "sparse_adam sparse gradient shape must match parameter shape",
             ));
@@ -7595,7 +7851,12 @@ mod tests {
         for (index, &param) in params.iter().enumerate() {
             // The second parameter first receives a gradient after restoration.
             // This distinguishes absent state from an initialized zero buffer.
-            if index == 1 && round < 3 {
+            if (index == 1 && round < 3) || (index == 0 && round == 4) || (index == 1 && round == 5)
+            {
+                // zero_grad retains existing zero-filled buffers. Clear this
+                // leaf's buffer to model a genuinely absent gradient instead.
+                session.tensor_requires_grad_(param, false).unwrap();
+                session.tensor_requires_grad_(param, true).unwrap();
                 continue;
             }
             let square = session.tensor_mul(param, param).unwrap();
@@ -7652,6 +7913,8 @@ mod tests {
                 OptimizerState::Rmsprop(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::Adagrad(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::RAdam(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::SparseAdam(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::NAdam(state) => assert!(state.parameters[1].is_none()),
             }
             let encoded = serde_json::to_vec(&saved).unwrap();
             let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
@@ -7672,7 +7935,10 @@ mod tests {
                 .collect();
             assert_ne!(params[0], restored_params[0]);
             let mut restored = make_optimizer(restored_params.clone(), false);
+            let identity = Arc::clone(&restored.identity().0);
             restored.load_state_dict(&resumed, &decoded).unwrap();
+            assert!(Arc::ptr_eq(&identity, &restored.identity().0));
+            assert_eq!(restored.parameters(), restored_params.as_slice());
             assert_eq!(restored.state_dict(&resumed).unwrap(), saved);
             for round in 2..7 {
                 checkpoint_training_step(&mut uninterrupted, optimizer.as_mut(), &params, round);
@@ -7820,6 +8086,389 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_checkpoint_nadam_resume_preserves_momentum_schedule_and_decay() {
+        for (decoupled, maximize, momentum_decay, beta1) in [
+            (false, false, 0.0, 0.7),
+            (false, true, 0.04, 0.7),
+            (true, false, 0.02, 0.7),
+            (true, true, 0.02, 0.0),
+        ] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    NAdam::new(params, 0.03)
+                        .betas(beta1, 0.8)
+                        .eps(1e-4)
+                        .weight_decay(0.07)
+                        .momentum_decay(momentum_decay)
+                        .decoupled_weight_decay(decoupled)
+                        .maximize(maximize)
+                } else {
+                    NAdam::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_sparse_adam_resume_preserves_dense_fallback() {
+        assert_optimizer_checkpoint_resume(|params, configured| {
+            Box::new(if configured {
+                SparseAdam::new(params, 0.03).betas(0.7, 0.8).eps(1e-4)
+            } else {
+                SparseAdam::new(params, 0.9)
+            })
+        });
+    }
+
+    fn sparse_checkpoint_training_step(
+        session: &mut FrankenTorchSession,
+        optimizer: &mut SparseAdam,
+        round: usize,
+    ) {
+        optimizer.zero_grad(session).unwrap();
+        let previous_steps = optimizer.step_counts.clone();
+        let previous_moments = (optimizer.m.clone(), optimizer.v.clone());
+        let previous_values: Vec<_> = optimizer
+            .params
+            .iter()
+            .map(|&parameter| session.tensor_values_lossy_f64(parameter).unwrap())
+            .collect();
+        let mut loss = None;
+        let mut active = Vec::new();
+        for (index, &parameter) in optimizer.params.iter().enumerate() {
+            // Repeated and changing rows, a late first gradient, intermittent
+            // missing gradients, and all-zero sparse gradients cross the save point.
+            let rows: &[f64] = match (index, round) {
+                (0, 0) => &[1.0, 1.0, 4.0],
+                (0, 1 | 2 | 6) => &[2.0, 4.0],
+                (0, 3) => &[4.0, 2.0, 2.0],
+                (0, 5) => &[1.0],
+                (1, 3) => &[1.0, 3.0],
+                (1, 4) => &[3.0, 3.0],
+                (1, 6) => &[0.0, 2.0],
+                _ => {
+                    // Distinguish a skipped parameter from a present zero
+                    // gradient; zero_grad intentionally retains its buffer.
+                    session.tensor_requires_grad_(parameter, false).unwrap();
+                    session.tensor_requires_grad_(parameter, true).unwrap();
+                    continue;
+                }
+            };
+            active.push(index);
+            let indices = session
+                .tensor_variable(rows.to_vec(), vec![rows.len()], false)
+                .unwrap();
+            let selected = session
+                .tensor_index_select_sparse(parameter, 0, indices)
+                .unwrap();
+            let square = session.tensor_mul(selected, selected).unwrap();
+            let sum = session.tensor_sum(square).unwrap();
+            let factor = if round == 2 || round == 5 {
+                0.0
+            } else {
+                0.5 + round as f64 * 0.1
+            };
+            let factor = session
+                .tensor_variable(vec![factor], vec![], false)
+                .unwrap();
+            let term = session.tensor_mul(sum, factor).unwrap();
+            loss = Some(match loss {
+                Some(previous) => session.tensor_add(previous, term).unwrap(),
+                None => term,
+            });
+        }
+        let report = session.tensor_backward(loss.unwrap()).unwrap();
+        for &index in &active {
+            let parameter = optimizer.params[index];
+            assert!(report.is_sparse_gradient(parameter));
+            assert_eq!(
+                session
+                    .tensor_accumulated_gradient(parameter)
+                    .unwrap()
+                    .as_deref(),
+                report.gradient(parameter),
+                "the report must select SparseAdam's sparse update path"
+            );
+            if round == 2 || round == 5 {
+                assert_eq!(report.sparse_gradient(parameter).unwrap().nnz(), 0);
+            }
+        }
+        optimizer.step(session, &report).unwrap();
+        for (index, &parameter) in optimizer.params.iter().enumerate() {
+            let values = session.tensor_values_lossy_f64(parameter).unwrap();
+            if active.contains(&index) {
+                assert_eq!(optimizer.step_counts[index], previous_steps[index] + 1);
+                let gradient = report.gradient(parameter).unwrap();
+                for (element, (&value, &gradient)) in values.iter().zip(gradient).enumerate() {
+                    if gradient == 0.0 {
+                        assert_eq!(value.to_bits(), previous_values[index][element].to_bits());
+                        if let (Some(first), Some(second)) =
+                            (&previous_moments.0[index], &previous_moments.1[index])
+                        {
+                            assert_eq!(
+                                optimizer.m[index].as_ref().unwrap()[element],
+                                first[element]
+                            );
+                            assert_eq!(
+                                optimizer.v[index].as_ref().unwrap()[element],
+                                second[element]
+                            );
+                        }
+                    }
+                }
+            } else {
+                assert!(report.gradient(parameter).is_none());
+                assert_eq!(optimizer.step_counts[index], previous_steps[index]);
+                assert_eq!(optimizer.m[index], previous_moments.0[index]);
+                assert_eq!(optimizer.v[index], previous_moments.1[index]);
+                assert_eq!(values, previous_values[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_sparse_adam_resume_preserves_sparse_rows_and_lazy_state() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                let mut uninterrupted = FrankenTorchSession::new(mode);
+                let params: Vec<_> = [6, 5]
+                    .into_iter()
+                    .map(|rows| {
+                        let values: Vec<_> = (0..rows * 2)
+                            .map(|index| (index as f64 - 3.0) * 0.25)
+                            .collect();
+                        if dtype == ft_core::DType::F32 {
+                            uninterrupted
+                                .tensor_variable_f32(
+                                    values.into_iter().map(|value| value as f32).collect(),
+                                    vec![rows, 2],
+                                    true,
+                                )
+                                .unwrap()
+                        } else {
+                            uninterrupted
+                                .tensor_variable(values, vec![rows, 2], true)
+                                .unwrap()
+                        }
+                    })
+                    .collect();
+                let mut optimizer = SparseAdam::new(params.clone(), 0.03)
+                    .betas(0.7, 0.8)
+                    .eps(1e-4);
+                for round in 0..2 {
+                    sparse_checkpoint_training_step(&mut uninterrupted, &mut optimizer, round);
+                }
+                let saved = optimizer.state_dict(&uninterrupted).unwrap();
+                let OptimizerState::SparseAdam(sparse) = &saved.state else {
+                    unreachable!()
+                };
+                assert_eq!(sparse.parameters[0].as_ref().unwrap().step, 2);
+                assert!(sparse.parameters[1].is_none());
+                let encoded = serde_json::to_vec(&saved).unwrap();
+                let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(decoded, saved);
+                let mut resumed = FrankenTorchSession::new(mode);
+                resumed.tensor_variable(vec![99.0], vec![1], false).unwrap();
+                let restored_params: Vec<_> = params
+                    .iter()
+                    .map(|&parameter| {
+                        resumed.tensor_variable_from_storage(
+                            uninterrupted.tensor_snapshot(parameter).unwrap(),
+                            true,
+                        )
+                    })
+                    .collect();
+                assert_ne!(params[0], restored_params[0]);
+                let mut restored = SparseAdam::new(restored_params.clone(), 0.9);
+                let identity = Arc::clone(&restored.identity().0);
+                restored.load_state_dict(&resumed, &decoded).unwrap();
+                assert!(Arc::ptr_eq(&identity, &restored.identity().0));
+                assert_eq!(restored.state_dict(&resumed).unwrap(), saved);
+                for round in 2..7 {
+                    sparse_checkpoint_training_step(&mut uninterrupted, &mut optimizer, round);
+                    sparse_checkpoint_training_step(&mut resumed, &mut restored, round);
+                    for (&original, &copy) in params.iter().zip(&restored_params) {
+                        let bits = |values: Vec<f64>| {
+                            values.into_iter().map(f64::to_bits).collect::<Vec<_>>()
+                        };
+                        assert_eq!(
+                            bits(uninterrupted.tensor_values_lossy_f64(original).unwrap()),
+                            bits(resumed.tensor_values_lossy_f64(copy).unwrap()),
+                            "dtype {dtype:?}, round {round}"
+                        );
+                        assert_eq!(resumed.tensor_dtype(copy).unwrap(), dtype);
+                    }
+                    assert_eq!(
+                        restored.state_dict(&resumed).unwrap(),
+                        optimizer.state_dict(&uninterrupted).unwrap()
+                    );
+                }
+                assert_eq!(optimizer.step_counts, vec![6, 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_sparse_and_nadam_reject_invalid_state_atomically() {
+        for algorithm in 0..2 {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let params: Vec<_> = [vec![2.0, -3.0], vec![0.75, -1.25]]
+                    .into_iter()
+                    .map(|values| {
+                        if dtype == ft_core::DType::F32 {
+                            session
+                                .tensor_variable_f32(
+                                    values.into_iter().map(|value| value as f32).collect(),
+                                    vec![2],
+                                    true,
+                                )
+                                .unwrap()
+                        } else {
+                            session.tensor_variable(values, vec![2], true).unwrap()
+                        }
+                    })
+                    .collect();
+                let mut optimizer: Box<dyn Optimizer> = if algorithm == 0 {
+                    Box::new(SparseAdam::new(params.clone(), 0.03).betas(0.7, 0.8))
+                } else {
+                    Box::new(
+                        NAdam::new(params.clone(), 0.03)
+                            .betas(0.7, 0.8)
+                            .momentum_decay(0.02)
+                            .weight_decay(0.07),
+                    )
+                };
+                checkpoint_training_step(&mut session, optimizer.as_mut(), &params, 3);
+                let before = optimizer.state_dict(&session).unwrap();
+                let identity = Arc::clone(&optimizer.identity().0);
+                let values: Vec<_> = params
+                    .iter()
+                    .map(|&param| session.tensor_values_lossy_f64(param).unwrap())
+                    .collect();
+                let gradients: Vec<_> = params
+                    .iter()
+                    .map(|&param| session.tensor_grad(param).unwrap())
+                    .collect();
+                let cases = if algorithm == 0 { 16 } else { 24 };
+                for case in 0..cases {
+                    let mut invalid = before.clone();
+                    match case {
+                        0 => invalid.version += 1,
+                        1 => {
+                            invalid.parameters.pop();
+                        }
+                        2 => invalid.parameters[1].shape = vec![1, 2],
+                        3 => {
+                            invalid.parameters[1].dtype = if dtype == ft_core::DType::F32 {
+                                ft_core::DType::F64
+                            } else {
+                                ft_core::DType::F32
+                            };
+                        }
+                        4 => {
+                            invalid = Adam::new(params.clone(), 0.1).state_dict(&session).unwrap();
+                        }
+                        _ => match &mut invalid.state {
+                            OptimizerState::SparseAdam(saved) => match case {
+                                5 => {
+                                    saved.parameters.pop();
+                                }
+                                6 => saved.lr = f64::NAN,
+                                7 => saved.betas[0] = 1.0,
+                                8 => saved.betas[1] = f64::NAN,
+                                9 => saved.eps = 0.0,
+                                _ => {
+                                    let parameter = saved.parameters[1].as_mut().unwrap();
+                                    match case {
+                                        10 => parameter.exp_avg.clear(),
+                                        11 => parameter.exp_avg[0] = f64::INFINITY,
+                                        12 => parameter.exp_avg_sq[0] = -1.0,
+                                        13 => parameter.exp_avg_sq[0] = f64::NAN,
+                                        14 => parameter.step = 0,
+                                        15 => parameter.exp_avg_sq.clear(),
+                                        _ => unreachable!(),
+                                    }
+                                }
+                            },
+                            OptimizerState::NAdam(saved) => match case {
+                                5 => {
+                                    saved.parameters.pop();
+                                }
+                                6 => saved.lr = f64::NAN,
+                                7 => saved.betas[0] = 1.0,
+                                8 => saved.betas[1] = f64::NAN,
+                                9 => saved.eps = 0.0,
+                                16 => saved.weight_decay = -1.0,
+                                17 => saved.momentum_decay = -0.1,
+                                18 => saved.momentum_decay = f64::NAN,
+                                23 => saved.weight_decay = f64::NAN,
+                                _ => {
+                                    let parameter = saved.parameters[1].as_mut().unwrap();
+                                    match case {
+                                        10 => parameter.exp_avg.clear(),
+                                        11 => parameter.exp_avg[0] = f64::INFINITY,
+                                        12 => parameter.exp_avg_sq[0] = -1.0,
+                                        13 => parameter.exp_avg_sq[0] = f64::NAN,
+                                        14 => parameter.step = 0,
+                                        15 => parameter.exp_avg_sq.clear(),
+                                        19 => parameter.mu_product = -0.1,
+                                        20 => parameter.mu_product = 1.0,
+                                        21 => parameter.mu_product = f64::INFINITY,
+                                        22 => parameter.mu_product = f64::NAN,
+                                        _ => unreachable!(),
+                                    }
+                                }
+                            },
+                            _ => unreachable!(),
+                        },
+                    }
+                    assert!(
+                        optimizer.load_state_dict(&session, &invalid).is_err(),
+                        "algorithm {algorithm}, dtype {dtype:?}, case {case}"
+                    );
+                    assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+                    assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+                    for (index, &param) in params.iter().enumerate() {
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(param).unwrap(),
+                            values[index]
+                        );
+                        assert_eq!(session.tensor_grad(param).unwrap(), gradients[index]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_distinguishes_sparse_nadam_and_dense_adam_algorithms() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let parameter = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut optimizers: Vec<Box<dyn Optimizer>> = vec![
+            Box::new(SparseAdam::new(vec![parameter], 0.03)),
+            Box::new(NAdam::new(vec![parameter], 0.03)),
+            Box::new(Adam::new(vec![parameter], 0.03)),
+            Box::new(AdamW::new(vec![parameter], 0.03)),
+            Box::new(RAdam::new(vec![parameter], 0.03)),
+        ];
+        let checkpoints: Vec<_> = optimizers
+            .iter()
+            .map(|optimizer| optimizer.state_dict(&session).unwrap())
+            .collect();
+        for (target, optimizer) in optimizers.iter_mut().enumerate() {
+            let identity = Arc::clone(&optimizer.identity().0);
+            for (source, checkpoint) in checkpoints.iter().enumerate() {
+                if source != target {
+                    assert!(optimizer.load_state_dict(&session, checkpoint).is_err());
+                    assert_eq!(optimizer.state_dict(&session).unwrap(), checkpoints[target]);
+                    assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn adagrad_late_first_gradient_uses_initial_learning_rate() {
         // PyTorch v2.9.0 torch/optim/adagrad.py increments state_steps only for
         // parameters in params_with_grad, then uses lr / (1 + (step - 1)*decay).
@@ -7943,19 +8592,23 @@ mod tests {
 
     #[test]
     fn optimizer_checkpoint_adaptive_integer_steps_roundtrip_and_fail_on_overflow() {
-        for algorithm in 0..3 {
+        for algorithm in 0..5 {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
             let mut optimizer: Box<dyn Optimizer> = match algorithm {
                 0 => Box::new(RMSprop::new(vec![param], 0.03)),
                 1 => Box::new(Adagrad::new(vec![param], 0.03)),
-                _ => Box::new(RAdam::new(vec![param], 0.03)),
+                2 => Box::new(RAdam::new(vec![param], 0.03)),
+                3 => Box::new(SparseAdam::new(vec![param], 0.03)),
+                _ => Box::new(NAdam::new(vec![param], 0.03)),
             };
             checkpoint_training_step(&mut session, optimizer.as_mut(), &[param], 0);
             let variant = match algorithm {
                 0 => "Rmsprop",
                 1 => "Adagrad",
-                _ => "RAdam",
+                2 => "RAdam",
+                3 => "SparseAdam",
+                _ => "NAdam",
             };
             let mut json = serde_json::to_value(optimizer.state_dict(&session).unwrap()).unwrap();
             json["state"][variant]["parameters"][0]["unexpected"] = true.into();
@@ -7970,6 +8623,12 @@ mod tests {
                         saved.parameters[0].as_mut().unwrap().step = step
                     }
                     OptimizerState::RAdam(saved) => {
+                        saved.parameters[0].as_mut().unwrap().step = step
+                    }
+                    OptimizerState::SparseAdam(saved) => {
+                        saved.parameters[0].as_mut().unwrap().step = step
+                    }
+                    OptimizerState::NAdam(saved) => {
                         saved.parameters[0].as_mut().unwrap().step = step
                     }
                     _ => unreachable!(),
@@ -8124,6 +8783,8 @@ mod tests {
             Box::new(RMSprop::new(vec![], 0.1)),
             Box::new(Adagrad::new(vec![], 0.1)),
             Box::new(RAdam::new(vec![], 0.1)),
+            Box::new(SparseAdam::new(vec![], 0.1)),
+            Box::new(NAdam::new(vec![], 0.1)),
         ];
         for optimizer in &mut optimizers {
             let state = optimizer.state_dict(&session).unwrap();
@@ -14009,6 +14670,24 @@ mod tests {
         let loss_sum = session.tensor_sum(loss).expect("sum");
         let report = session.tensor_backward(loss_sum).expect("backward");
         assert!(opt.step(&mut session, &report).is_err());
+    }
+
+    #[test]
+    fn nadam_invalid_momentum_decay_fails_before_mutation() {
+        for momentum_decay in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let parameter = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let loss = session.tensor_sum(parameter).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            let mut optimizer = NAdam::new(vec![parameter], 0.03).momentum_decay(momentum_decay);
+            assert!(optimizer.step(&mut session, &report).is_err());
+            assert_eq!(session.tensor_values(parameter).unwrap(), vec![2.0]);
+            assert_eq!(optimizer.step_counts, vec![0]);
+            assert_eq!(optimizer.mu_products, vec![1.0]);
+            assert!(optimizer.m[0].is_none());
+            assert!(optimizer.v[0].is_none());
+            assert!(optimizer.state_dict(&session).is_err());
+        }
     }
 
     #[test]
