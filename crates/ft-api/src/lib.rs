@@ -48916,7 +48916,7 @@ impl FrankenTorchSession {
         // block copy (`inner` elements) per (outer, picked-index) — out[o,i,k] = in[o,idx[i],k].
         // Borrow the contiguous storage and parallelize over output blocks (one cheap
         // division per BLOCK, not per element). Bit-exact. Non-contiguous / grad fall through.
-        if !self.tensor_requires_grad(input)? {
+        if !self.tensor_requires_grad(input)? && self.tensor_device(input)? == Device::Cpu {
             let n_idx = indices_data.len();
             let mid = input_shape[dim];
             let inner: usize = input_shape[dim + 1..].iter().product();
@@ -50966,7 +50966,10 @@ impl FrankenTorchSession {
                 .all(|&id| matches!(self.tensor_requires_grad(id), Ok(false)))
             && inputs
                 .iter()
-                .all(|&id| matches!(self.tensor_dtype(id), Ok(DType::F64)));
+                .all(|&id| matches!(self.tensor_dtype(id), Ok(DType::F64)))
+            && inputs
+                .iter()
+                .all(|&id| matches!(self.tensor_device(id), Ok(Device::Cpu)));
         if fast_ok {
             let shapes: Vec<Vec<usize>> = inputs
                 .iter()

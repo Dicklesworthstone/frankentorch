@@ -10192,6 +10192,7 @@ impl TensorTape {
         let refs: Vec<(&TensorStorage, &ft_core::TensorMeta)> =
             dispatch_inputs.iter().map(|(s, m)| (s, m)).collect();
 
+        let requires_grad = requires_grad && self.grad_enabled;
         let outcome =
             dispatch_tensor_join_contiguous_typed(JoinOp::Stack, mode, &refs, dim, requires_grad)
                 .map_err(AutogradError::Dispatch)?;
@@ -11530,7 +11531,7 @@ impl TensorTape {
         let (requires_grad, storage, shape, device) = {
             let node = self.node(input)?;
             (
-                node.requires_grad,
+                node.requires_grad && self.grad_enabled,
                 Self::compact_typed_storage(&node.tensor)?,
                 node.tensor.meta().shape().to_vec(),
                 node.tensor.meta().device(),
@@ -11627,7 +11628,7 @@ impl TensorTape {
         let (requires_grad, shape, device, dtype) = {
             let node = self.node(input)?;
             (
-                node.requires_grad,
+                node.requires_grad && self.grad_enabled,
                 node.tensor.meta().shape().to_vec(),
                 node.tensor.meta().device(),
                 node.tensor.meta().dtype(),

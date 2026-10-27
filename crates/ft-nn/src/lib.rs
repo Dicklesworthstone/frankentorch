@@ -4733,6 +4733,8 @@ pub struct MultiheadAttention {
     num_heads: usize,
     head_dim: usize,
     scale: f64,
+    dropout_p: f64,
+    training: std::cell::Cell<bool>,
 }
 
 impl MultiheadAttention {
@@ -4744,6 +4746,25 @@ impl MultiheadAttention {
         embed_dim: usize,
         num_heads: usize,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dropout(session, embed_dim, num_heads, 0.0)
+    }
+
+    /// Create multi-head attention with dropout on the attention probabilities.
+    ///
+    /// During training, each softmax weight is independently dropped with
+    /// probability `dropout_p`, and retained weights are scaled by
+    /// `1 / (1 - dropout_p)`. Evaluation disables dropout. As with PyTorch,
+    /// disabling gradient recording alone does not disable training dropout.
+    pub fn new_with_dropout(
+        session: &mut FrankenTorchSession,
+        embed_dim: usize,
+        num_heads: usize,
+        dropout_p: f64,
+    ) -> Result<Self, AutogradError> {
+        validate_dropout_probability(
+            dropout_p,
+            "MultiheadAttention dropout probability must be finite and in [0, 1]",
+        )?;
         if embed_dim == 0 || num_heads == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -4773,6 +4794,8 @@ impl MultiheadAttention {
             num_heads,
             head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
+            dropout_p,
+            training: std::cell::Cell::new(true),
         })
     }
 
@@ -4907,7 +4930,7 @@ impl MultiheadAttention {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<Option<TensorNodeId>, AutogradError> {
-        if session.is_grad_enabled() {
+        if session.is_grad_enabled() || (self.training.get() && self.dropout_p > 0.0) {
             return Ok(None);
         }
 
@@ -5252,14 +5275,25 @@ impl MultiheadAttention {
         // by mha_no_grad_self_attention_fast_path_matches_forward_qkv_bits, same
         // sdpa_forward_f64 kernel); the fused backward matches the op-graph
         // gradients to f64 round-off (MHA parity is tolerance).
-        let head_out = session.tensor_scaled_dot_product_attention(
-            q_heads,
-            k_heads,
-            v_heads,
-            attn_mask,
-            is_causal,
-            Some(self.scale),
-        )?;
+        let head_out = if self.training.get() && self.dropout_p > 0.0 {
+            session.scaled_dot_product_attention(
+                q_heads,
+                k_heads,
+                v_heads,
+                attn_mask,
+                self.dropout_p,
+                is_causal,
+            )?
+        } else {
+            session.tensor_scaled_dot_product_attention(
+                q_heads,
+                k_heads,
+                v_heads,
+                attn_mask,
+                is_causal,
+                Some(self.scale),
+            )?
+        };
         let head_out = session.tensor_reshape(
             head_out,
             vec![batch_size, self.num_heads, seq_len_q, self.head_dim],
@@ -5280,7 +5314,8 @@ impl MultiheadAttention {
     ///
     /// The output uses the returned attention weights, which are the
     /// `softmax(scale * Q_h @ K_h^T + mask)` matrix over the same projected heads,
-    /// reshaped to `[N, num_heads, S_q, S_k]`. When `average_attn_weights` is true
+    /// after applying attention dropout during training, reshaped to
+    /// `[N, num_heads, S_q, S_k]`. When `average_attn_weights` is true
     /// (torch's default) they are averaged over heads to `[N, S_q, S_k]`.
     /// `attn_mask` / `is_causal` are honored identically in both the output and
     /// the returned weights.
@@ -5344,6 +5379,8 @@ impl MultiheadAttention {
             None => scaled,
         };
         let weights_bh = session.tensor_softmax(masked, 2)?;
+        let weights_bh =
+            session.functional_dropout(weights_bh, self.dropout_p, self.training.get())?;
         let head_out = session.tensor_bmm(weights_bh, v_heads)?;
         let head_out = session.tensor_reshape(
             head_out,
@@ -5396,6 +5433,17 @@ impl Module for MultiheadAttention {
             ("v_proj".to_string(), &self.v_proj as &dyn Module),
             ("out_proj".to_string(), &self.out_proj as &dyn Module),
         ]
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+        for (_, child) in self.named_children() {
+            child.train(mode);
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
     }
 }
 
@@ -12518,6 +12566,29 @@ impl Module for ConvTranspose3d {
 
 // ── Recurrent Cell Modules ─────────────────────────────────────────────
 
+fn recurrent_parameter_slots(
+    cells: impl IntoIterator<Item = [TensorNodeId; 4]>,
+    bidirectional: bool,
+) -> Vec<(String, Option<TensorNodeId>)> {
+    let directions = if bidirectional { 2 } else { 1 };
+    let mut parameters = Vec::new();
+    for (index, cell) in cells.into_iter().enumerate() {
+        let layer = index / directions;
+        let suffix = if index % directions == 1 {
+            "_reverse"
+        } else {
+            ""
+        };
+        for (name, parameter) in ["weight_ih", "weight_hh", "bias_ih", "bias_hh"]
+            .into_iter()
+            .zip(cell)
+        {
+            parameters.push((format!("{name}_l{layer}{suffix}"), Some(parameter)));
+        }
+    }
+    parameters
+}
+
 /// Elman RNN cell: `h' = activation(x @ W_ih^T + h @ W_hh^T + b_ih + b_hh)`.
 ///
 /// Input shape: `[batch, input_size]`. Hidden state shape: `[batch, hidden_size]`.
@@ -13680,9 +13751,13 @@ impl Module for LSTM {
         params
     }
 
-    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
-        // Parameters are exposed through named_children -> cells
-        Vec::new()
+    fn named_parameter_slots_own(&self) -> Vec<(String, Option<TensorNodeId>)> {
+        recurrent_parameter_slots(
+            self.cells
+                .iter()
+                .map(|cell| [cell.w_ih, cell.w_hh, cell.b_ih, cell.b_hh]),
+            self.bidirectional,
+        )
     }
 
     fn named_children(&self) -> Vec<(String, &dyn Module)> {
@@ -14120,8 +14195,13 @@ impl Module for GRU {
         params
     }
 
-    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
-        Vec::new()
+    fn named_parameter_slots_own(&self) -> Vec<(String, Option<TensorNodeId>)> {
+        recurrent_parameter_slots(
+            self.cells
+                .iter()
+                .map(|cell| [cell.w_ih, cell.w_hh, cell.b_ih, cell.b_hh]),
+            self.bidirectional,
+        )
     }
 
     fn named_children(&self) -> Vec<(String, &dyn Module)> {
@@ -14574,8 +14654,13 @@ impl Module for RNN {
         params
     }
 
-    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
-        Vec::new()
+    fn named_parameter_slots_own(&self) -> Vec<(String, Option<TensorNodeId>)> {
+        recurrent_parameter_slots(
+            self.cells
+                .iter()
+                .map(|cell| [cell.w_ih, cell.w_hh, cell.b_ih, cell.b_hh]),
+            self.bidirectional,
+        )
     }
 
     fn named_children(&self) -> Vec<(String, &dyn Module)> {
@@ -14660,7 +14745,7 @@ impl TransformerEncoderLayer {
             dropout_p,
             "TransformerEncoderLayer dropout probability must be finite and in [0, 1]",
         )?;
-        let self_attn = MultiheadAttention::new(session, d_model, nhead)?;
+        let self_attn = MultiheadAttention::new_with_dropout(session, d_model, nhead, dropout_p)?;
         let linear1 = Linear::new(session, d_model, dim_feedforward, true)?;
         let linear2 = Linear::new(session, dim_feedforward, d_model, true)?;
         let norm1 = LayerNorm::new(session, vec![d_model], 1e-5)?;
@@ -14823,6 +14908,7 @@ impl Module for TransformerEncoderLayer {
 
     fn train(&self, mode: bool) {
         self.training.set(mode);
+        self.self_attn.train(mode);
         self.dropout.train(mode);
         self.dropout1.train(mode);
         self.dropout2.train(mode);
@@ -15022,8 +15108,8 @@ impl TransformerDecoderLayer {
             dropout_p,
             "TransformerDecoderLayer dropout probability must be finite and in [0, 1]",
         )?;
-        let self_attn = MultiheadAttention::new(session, d_model, nhead)?;
-        let cross_attn = MultiheadAttention::new(session, d_model, nhead)?;
+        let self_attn = MultiheadAttention::new_with_dropout(session, d_model, nhead, dropout_p)?;
+        let cross_attn = MultiheadAttention::new_with_dropout(session, d_model, nhead, dropout_p)?;
         let linear1 = Linear::new(session, d_model, dim_feedforward, true)?;
         let linear2 = Linear::new(session, dim_feedforward, d_model, true)?;
         let norm1 = LayerNorm::new(session, vec![d_model], 1e-5)?;
@@ -15256,6 +15342,8 @@ impl Module for TransformerDecoderLayer {
 
     fn train(&self, mode: bool) {
         self.training.set(mode);
+        self.self_attn.train(mode);
+        self.cross_attn.train(mode);
         self.dropout.train(mode);
         self.dropout1.train(mode);
         self.dropout2.train(mode);
@@ -19063,17 +19151,83 @@ impl Module for PairwiseDistance {
 /// A packed representation of variable-length sequences.
 ///
 /// Equivalent to `torch.nn.utils.rnn.PackedSequence`.
-/// Stores all sequence elements sorted by length in a flat tensor,
-/// along with batch sizes at each timestep.
+/// Stores active timesteps in descending sequence-length order. The first
+/// data dimension is `sum(batch_sizes)`; trailing feature dimensions are
+/// preserved, including singleton and zero-sized dimensions.
 pub struct PackedSequence {
-    /// Flattened packed data as a tensor node.
+    /// Packed data of shape `[sum(batch_sizes), *features]`.
     pub data: TensorNodeId,
     /// Number of active sequences at each timestep (descending).
     pub batch_sizes: Vec<usize>,
-    /// Original indices to unsort the sequences.
+    /// Original batch index for each sorted batch position.
     pub sorted_indices: Vec<usize>,
     /// Inverse of sorted_indices to restore original order.
     pub unsorted_indices: Vec<usize>,
+}
+
+impl PackedSequence {
+    /// Validate packed row counts and the reversible batch permutation.
+    ///
+    /// Call this before consuming a manually constructed packed sequence.
+    /// Validation does not record any tensor operations.
+    pub fn validate(&self, session: &FrankenTorchSession) -> Result<(), AutogradError> {
+        let Some(&batch_size) = self.batch_sizes.first() else {
+            return Err(incompatible_error(
+                "PackedSequence: batch_sizes must not be empty",
+            ));
+        };
+        if batch_size == 0 {
+            return Err(incompatible_error(
+                "PackedSequence: batch size must be greater than zero",
+            ));
+        }
+        if self
+            .batch_sizes
+            .iter()
+            .any(|&size| size == 0 || size > batch_size)
+        {
+            return Err(incompatible_error(
+                "PackedSequence: batch_sizes must be positive and bounded by batch size",
+            ));
+        }
+        if self.batch_sizes.windows(2).any(|pair| pair[1] > pair[0]) {
+            return Err(incompatible_error(
+                "PackedSequence: batch_sizes must be non-increasing",
+            ));
+        }
+        if self.sorted_indices.len() != batch_size || self.unsorted_indices.len() != batch_size {
+            return Err(incompatible_error(
+                "PackedSequence: index metadata must match batch size",
+            ));
+        }
+        if self
+            .sorted_indices
+            .iter()
+            .chain(&self.unsorted_indices)
+            .any(|&index| index >= batch_size)
+        {
+            return Err(incompatible_error(
+                "PackedSequence: index metadata out of range",
+            ));
+        }
+        for (sorted, &original) in self.sorted_indices.iter().enumerate() {
+            if self.unsorted_indices[original] != sorted {
+                return Err(incompatible_error(
+                    "PackedSequence: sorted_indices and unsorted_indices must be inverse permutations",
+                ));
+            }
+        }
+        let total_rows = self.batch_sizes.iter().try_fold(0usize, |total, &size| {
+            checked_add(total, size, "PackedSequence: packed row count overflow")
+        })?;
+        let shape = session.tensor_shape(self.data)?;
+        if shape.first().copied() != Some(total_rows) {
+            return Err(incompatible_error(
+                "PackedSequence: data must have sum(batch_sizes) rows",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Pack a padded batch of variable-length sequences.
@@ -19173,13 +19327,6 @@ pub fn pack_padded_sequence(
         unsorted_indices[orig_idx] = new_pos;
     }
 
-    // Feature size (product of dimensions after [T, B] or [B, T])
-    let mut feature_size =
-        checked_shape_numel(&shape[2..], "pack_padded_sequence feature shape overflow")?;
-    if feature_size == 0 {
-        feature_size = 1;
-    }
-
     // Compute batch_sizes: at timestep t, how many sequences are still active
     let mut batch_sizes = Vec::with_capacity(max_len);
     for t in 0..max_len {
@@ -19190,15 +19337,18 @@ pub fn pack_padded_sequence(
         batch_sizes.push(count);
     }
 
-    // Compose via tensor_index_select so gradients flow back to input.
-    // Tracked under frankentorch-tp3r. Previous body extracted
-    // tensor_values + rebuilt a non-grad leaf, severing autograd
-    // through every RNN/LSTM/GRU pipeline using packed sequences.
-    //
-    // Strategy: normalize input to time-first [T, B, F] (permute if
-    // batch_first), reshape to [T*B, F], then index_select rows in
-    // pack order. For each (t, s) where 0 <= s < batch_sizes[t],
-    // the source row in the [T*B, F] flat is `t*B + sorted_indices[s]`.
+    let total_packed = batch_sizes.iter().try_fold(0usize, |total, &size| {
+        checked_add(
+            total,
+            size,
+            "pack_padded_sequence packed row count overflow",
+        )
+    })?;
+    let t_b = checked_mul(max_len, batch_size, "pack_padded_sequence T*B overflow")?;
+
+    // Flatten only the time and batch dimensions. Keeping the trailing
+    // dimensions distinguishes scalar features from [1] and supports [C,H,W]
+    // sequences without flattening their public data shape.
     let time_first = if batch_first {
         // Permute [B, T, ...] -> [T, B, ...]
         let mut perm: Vec<usize> = vec![1, 0];
@@ -19207,12 +19357,11 @@ pub fn pack_padded_sequence(
     } else {
         input
     };
-    // Flatten to [T*B, F]
-    let t_b = checked_mul(max_len, batch_size, "pack_padded_sequence T*B overflow")?;
-    let flat = session.tensor_reshape(time_first, vec![t_b, feature_size])?;
+    let mut flat_shape = vec![t_b];
+    flat_shape.extend_from_slice(&shape[2..]);
+    let flat = session.tensor_reshape(time_first, flat_shape)?;
 
     // Build the gather index list of length sum(batch_sizes).
-    let total_packed: usize = batch_sizes.iter().sum();
     let mut idx_vals: Vec<f64> = Vec::with_capacity(total_packed);
     for (t, &bs) in batch_sizes.iter().enumerate() {
         for &orig_batch in sorted_indices.iter().take(bs) {
@@ -19221,18 +19370,8 @@ pub fn pack_padded_sequence(
             idx_vals.push(row);
         }
     }
-    let data = if total_packed == 0 {
-        // Empty packed sequence — preserve [0, F] (or [0]) shape.
-        session.tensor_variable(Vec::new(), vec![0, feature_size], false)?
-    } else {
-        let idx_t = session.tensor_variable(idx_vals, vec![total_packed], false)?;
-        session.tensor_index_select(flat, 0, idx_t)?
-    };
-    let data = if feature_size == 1 {
-        session.tensor_reshape(data, vec![total_packed])?
-    } else {
-        data
-    };
+    let idx_t = session.tensor_variable(idx_vals, vec![total_packed], false)?;
+    let data = session.tensor_index_select(flat, 0, idx_t)?;
 
     Ok(PackedSequence {
         data,
@@ -19254,75 +19393,10 @@ pub fn pad_packed_sequence(
     padding_value: f64,
     total_length: Option<usize>,
 ) -> Result<(TensorNodeId, Vec<usize>), AutogradError> {
-    if packed.batch_sizes.is_empty() {
-        return Err(AutogradError::Dispatch(DispatchError::Key(
-            DispatchKeyError::IncompatibleSet {
-                reason: "pad_packed_sequence: batch_sizes must not be empty",
-            },
-        )));
-    }
-
+    packed.validate(session)?;
     let batch_size = packed.batch_sizes[0]; // first timestep has all sequences
-    if batch_size == 0 {
-        return Err(AutogradError::Dispatch(DispatchError::Key(
-            DispatchKeyError::IncompatibleSet {
-                reason: "pad_packed_sequence: batch size must be greater than zero",
-            },
-        )));
-    }
-
-    if packed.sorted_indices.len() != batch_size || packed.unsorted_indices.len() != batch_size {
-        return Err(AutogradError::Dispatch(DispatchError::Key(
-            DispatchKeyError::IncompatibleSet {
-                reason: "pad_packed_sequence: index metadata must match batch size",
-            },
-        )));
-    }
-
-    if packed
-        .batch_sizes
-        .iter()
-        .any(|&size| size == 0 || size > batch_size)
-    {
-        return Err(AutogradError::Dispatch(DispatchError::Key(
-            DispatchKeyError::IncompatibleSet {
-                reason: "pad_packed_sequence: batch_sizes must be positive and bounded by batch size",
-            },
-        )));
-    }
-
-    if packed
-        .batch_sizes
-        .windows(2)
-        .any(|window| window[1] > window[0])
-    {
-        return Err(AutogradError::Dispatch(DispatchError::Key(
-            DispatchKeyError::IncompatibleSet {
-                reason: "pad_packed_sequence: batch_sizes must be non-increasing",
-            },
-        )));
-    }
-
-    if packed
-        .sorted_indices
-        .iter()
-        .chain(packed.unsorted_indices.iter())
-        .any(|&index| index >= batch_size)
-    {
-        return Err(AutogradError::Dispatch(DispatchError::Key(
-            DispatchKeyError::IncompatibleSet {
-                reason: "pad_packed_sequence: index metadata out of range",
-            },
-        )));
-    }
-
     let packed_shape = session.tensor_shape(packed.data)?;
-
-    let feature_size = if packed_shape.len() > 1 {
-        packed_shape[1]
-    } else {
-        1
-    };
+    let total_packed = packed_shape[0];
 
     let max_len = packed.batch_sizes.len();
     if let Some(total_length) = total_length
@@ -19351,36 +19425,28 @@ pub fn pad_packed_sequence(
         .map(|&sorted_pos| sorted_lengths[sorted_pos])
         .collect();
 
-    let total_packed: usize = packed.batch_sizes.iter().sum();
-
-    // Compose via tensor_index_select + autograd-aware blending so
-    // gradients flow back to packed.data. Tracked under
-    // frankentorch-tp3r. Previous body extracted tensor_values +
-    // rebuilt a non-grad leaf, severing autograd.
-    //
-    // Strategy: for every output position d in [0, B*out_len),
-    //   - if d corresponds to an active (orig_batch, t) pair, look up
-    //     the packed-row index k that produced it; gather row k from
-    //     packed.data (reshaped to [P, F]).
-    //   - otherwise pick row 0 as a placeholder and zero it out via
-    //     a non-grad mask.
-    // Then blend `gathered * mask + padding_value * (1 - mask)` so the
-    // padding cells take the configured constant while autograd
-    // routes only through active cells.
     let total_out = checked_mul(
         batch_size,
         out_len,
         "pad_packed_sequence output size overflow",
     )?;
-    let mut dst_to_packed_row: Vec<f64> = vec![0.0; total_out];
-    let mut mask_vals: Vec<f64> = vec![0.0; total_out];
+    let mut out_shape = if batch_first {
+        vec![batch_size, out_len]
+    } else {
+        vec![out_len, batch_size]
+    };
+    out_shape.extend_from_slice(&packed_shape[1..]);
+    checked_shape_numel(&out_shape, "pad_packed_sequence output shape overflow")?;
+    checked_add(total_packed, 1, "pad_packed_sequence padding row overflow")?;
+
+    // Gather from one additional constant row for padding positions. This
+    // preserves dtype and avoids arithmetic masking: 0 * NaN/Inf from either
+    // the first packed row or the padding value must not poison other rows.
+    #[allow(clippy::cast_precision_loss)]
+    let mut dst_to_packed_row = vec![total_packed as f64; total_out];
 
     let mut packed_offset = 0usize;
     for (t, &bs) in packed.batch_sizes.iter().enumerate() {
-        if t >= out_len {
-            packed_offset += bs;
-            continue;
-        }
         for (s, &orig_batch) in packed.sorted_indices.iter().enumerate().take(bs) {
             let d = if batch_first {
                 orig_batch * out_len + t
@@ -19390,50 +19456,16 @@ pub fn pad_packed_sequence(
             #[allow(clippy::cast_precision_loss)]
             let k = (packed_offset + s) as f64;
             dst_to_packed_row[d] = k;
-            mask_vals[d] = 1.0;
         }
         packed_offset += bs;
     }
 
-    // Reshape packed data to [P, F].
-    let packed_2d = if packed_shape.len() == 1 {
-        session.tensor_reshape(packed.data, vec![total_packed, 1])?
-    } else {
-        packed.data
-    };
-
-    let gathered_2d = if total_packed == 0 {
-        // No active rows; produce an all-padding output.
-        session.full(vec![total_out, feature_size], padding_value, false)?
-    } else {
-        let idx_t = session.tensor_variable(dst_to_packed_row, vec![total_out], false)?;
-        let g = session.tensor_index_select(packed_2d, 0, idx_t)?; // [total_out, F]
-        // mask: [total_out, 1] expanded to [total_out, F].
-        let mask = session.tensor_variable(mask_vals.clone(), vec![total_out], false)?;
-        let mask_kd = session.tensor_unsqueeze(mask, 1)?;
-        let mask_b = session.tensor_expand(mask_kd, vec![total_out, feature_size])?;
-        let active_part = session.tensor_mul(g, mask_b)?;
-        let pad_const = session.full(vec![total_out, feature_size], padding_value, false)?;
-        let inv_mask_vals: Vec<f64> = mask_vals.iter().map(|&v| 1.0 - v).collect();
-        let inv_mask = session.tensor_variable(inv_mask_vals, vec![total_out], false)?;
-        let inv_mask_kd = session.tensor_unsqueeze(inv_mask, 1)?;
-        let inv_mask_b = session.tensor_expand(inv_mask_kd, vec![total_out, feature_size])?;
-        let pad_part = session.tensor_mul(pad_const, inv_mask_b)?;
-        session.tensor_add(active_part, pad_part)?
-    };
-
-    let out_shape = if batch_first {
-        if feature_size > 1 {
-            vec![batch_size, out_len, feature_size]
-        } else {
-            vec![batch_size, out_len]
-        }
-    } else if feature_size > 1 {
-        vec![out_len, batch_size, feature_size]
-    } else {
-        vec![out_len, batch_size]
-    };
-    let padded = session.tensor_reshape(gathered_2d, out_shape)?;
+    let mut padding = vec![0usize; 2 * packed_shape.len()];
+    padding[2 * packed_shape.len() - 1] = 1;
+    let with_padding_row = session.tensor_pad(packed.data, &padding, padding_value)?;
+    let idx_t = session.tensor_variable(dst_to_packed_row, vec![total_out], false)?;
+    let gathered = session.tensor_index_select(with_padding_row, 0, idx_t)?;
+    let padded = session.tensor_reshape(gathered, out_shape)?;
     Ok((padded, lengths))
 }
 
@@ -19458,14 +19490,36 @@ pub fn pad_sequence(
     }
 
     let mut max_len = 0usize;
-    let mut shapes = Vec::with_capacity(sequences.len());
+    let mut shapes: Vec<Vec<usize>> = Vec::with_capacity(sequences.len());
+    let dtype = session.tensor_dtype(sequences[0])?;
+    let device = session.tensor_device(sequences[0])?;
     for &seq in sequences {
         let s = session.tensor_shape(seq)?;
+        if s.is_empty() {
+            return Err(incompatible_error(
+                "pad_sequence: each sequence must have a length dimension",
+            ));
+        }
+        if let Some(first) = shapes.first()
+            && s[1..] != first[1..]
+        {
+            return Err(incompatible_error(
+                "pad_sequence: trailing feature dimensions must match",
+            ));
+        }
+        if session.tensor_dtype(seq)? != dtype || session.tensor_device(seq)? != device {
+            return Err(incompatible_error(
+                "pad_sequence: sequence dtypes and devices must match",
+            ));
+        }
         if s[0] > max_len {
             max_len = s[0];
         }
         shapes.push(s);
     }
+    let mut output_shape = vec![sequences.len(), max_len];
+    output_shape.extend_from_slice(&shapes[0][1..]);
+    checked_shape_numel(&output_shape, "pad_sequence output shape overflow")?;
 
     // Compose via tensor_pad + tensor_stack so gradients flow back to
     // every input sequence. Tracked under frankentorch-7oyn. Previous
@@ -24462,6 +24516,390 @@ mod tests {
             num_heads: 2,
             head_dim: 2,
             scale: 1.0 / 2.0_f64.sqrt(),
+            dropout_p: 0.0,
+            training: std::cell::Cell::new(true),
+        }
+    }
+
+    #[test]
+    fn mha_dropout_weights_drive_masked_output_and_value_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let mut mha = identity_mha_for_mask_tests(&mut session);
+            mha.dropout_p = 0.5;
+            let query = session
+                .tensor_variable(vec![0.0; 24], vec![2, 3, 4], true)
+                .unwrap();
+            let key = session
+                .tensor_variable(vec![0.0; 24], vec![2, 3, 4], true)
+                .unwrap();
+            let values: Vec<f64> = (1..=24).map(|i| i as f64 * 0.1).collect();
+            let value = session
+                .tensor_variable(values.clone(), vec![2, 3, 4], true)
+                .unwrap();
+            let mask = session
+                .tensor_variable(vec![0.0, f64::NEG_INFINITY, 0.0], vec![1, 3], false)
+                .unwrap();
+            let padding = session
+                .tensor_variable(
+                    vec![0.0, f64::NEG_INFINITY, 0.0, 0.0, f64::NEG_INFINITY, 0.0],
+                    vec![2, 3],
+                    false,
+                )
+                .unwrap();
+            let mut direct_session = session.clone();
+            let mut averaged_session = session.clone();
+            let (output, weights) = mha
+                .forward_qkv_with_weights(&mut session, query, key, value, Some(mask), true, false)
+                .unwrap();
+            let weights = session.tensor_values(weights).unwrap();
+            let mut expected = vec![0.0; 24];
+            let upstream: Vec<f64> = (1..=24).map(|i| (i as f64 - 10.0) * 0.1).collect();
+            let mut expected_value_grad = vec![0.0; 24];
+            let mut kept = 0;
+            let mut dropped = 0;
+            for batch in 0..2 {
+                for head in 0..2 {
+                    for q in 0..3 {
+                        for k in 0..3 {
+                            let w = weights[((batch * 2 + head) * 3 + q) * 3 + k];
+                            if k > q || k == 1 {
+                                assert_eq!(w, 0.0, "masked attention must stay zero");
+                            } else {
+                                let retained = if q == 2 { 1.0 } else { 2.0 };
+                                assert!(w == 0.0 || w == retained);
+                                if w == 0.0 {
+                                    dropped += 1;
+                                } else {
+                                    kept += 1;
+                                }
+                            }
+                            for dim in 0..2 {
+                                let oi = batch * 12 + q * 4 + head * 2 + dim;
+                                let vi = batch * 12 + k * 4 + head * 2 + dim;
+                                expected[oi] += w * values[vi];
+                                expected_value_grad[vi] += w * upstream[oi];
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(kept > 0 && dropped > 0);
+            assert_eq!(session.tensor_values(output).unwrap(), expected);
+
+            // Both output forms consume the same random mask. Key padding and
+            // causality must compose before dropout, which never revives a key.
+            let direct = mha
+                .forward_qkv_key_padding(
+                    &mut direct_session,
+                    query,
+                    key,
+                    value,
+                    None,
+                    padding,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(direct_session.tensor_values(direct).unwrap(), expected);
+            let (averaged_output, averaged) = mha
+                .forward_qkv_with_weights(
+                    &mut averaged_session,
+                    query,
+                    key,
+                    value,
+                    Some(mask),
+                    true,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                averaged_session.tensor_values(averaged_output).unwrap(),
+                expected
+            );
+            let averaged = averaged_session.tensor_values(averaged).unwrap();
+            for batch in 0..2 {
+                for position in 0..9 {
+                    assert_eq!(
+                        averaged[batch * 9 + position],
+                        (weights[batch * 18 + position] + weights[batch * 18 + 9 + position]) * 0.5
+                    );
+                }
+            }
+            let upstream = session
+                .tensor_variable(upstream, vec![2, 3, 4], false)
+                .unwrap();
+            let weighted = session.tensor_mul(output, upstream).unwrap();
+            let loss = session.tensor_sum(weighted).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            for (actual, expected) in session
+                .tensor_gradient(&report, value)
+                .unwrap()
+                .iter()
+                .zip(expected_value_grad)
+            {
+                assert!((actual - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn mha_dropout_training_without_grad_and_eval_have_distinct_behavior() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mha = identity_mha_for_mask_tests(&mut session);
+        mha.dropout_p = 0.5;
+        let input = session
+            .tensor_variable(
+                (1..=24).map(|i| i as f64 * 0.1).collect(),
+                vec![2, 3, 4],
+                true,
+            )
+            .unwrap();
+        let baseline = session.clone();
+        let trained = session
+            .with_no_grad(|s| {
+                assert!(
+                    mha.no_grad_f64_self_attention_fast_path(s, input)?
+                        .is_none()
+                );
+                mha.forward(s, input)
+            })
+            .unwrap();
+        let trained = session.tensor_values(trained).unwrap();
+        let mut replay = baseline.clone();
+        let replayed = replay.with_no_grad(|s| mha.forward(s, input)).unwrap();
+        assert_eq!(trained, replay.tensor_values(replayed).unwrap());
+
+        mha.eval();
+        assert!(!mha.is_training());
+        let mut evaluated = baseline.clone();
+        let eval_output = evaluated
+            .with_no_grad(|s| {
+                assert!(
+                    mha.no_grad_f64_self_attention_fast_path(s, input)?
+                        .is_some()
+                );
+                mha.forward(s, input)
+            })
+            .unwrap();
+        let eval_values = evaluated.tensor_values(eval_output).unwrap();
+        assert_ne!(trained, eval_values);
+        let ordinary = mha.forward(&mut evaluated, input).unwrap();
+        for (actual, expected) in evaluated
+            .tensor_values(ordinary)
+            .unwrap()
+            .iter()
+            .zip(eval_values)
+        {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        // Evaluation consumes no randomness, even when configured with dropout.
+        let next = evaluated.rand(vec![8], false).unwrap();
+        let mut untouched = baseline;
+        let expected_next = untouched.rand(vec![8], false).unwrap();
+        assert_eq!(
+            evaluated.tensor_values(next).unwrap(),
+            untouched.tensor_values(expected_next).unwrap()
+        );
+        mha.train(true);
+        assert!(mha.is_training());
+    }
+
+    #[test]
+    fn mha_dropout_one_preserves_zero_gradient_edges_and_output_bias() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let mha = MultiheadAttention::new_with_dropout(&mut session, 4, 2, 1.0).unwrap();
+            let input = session
+                .tensor_variable(vec![0.2; 12], vec![1, 3, 4], true)
+                .unwrap();
+            let baseline = session.clone();
+            let (output, weights) = mha
+                .forward_qkv_with_weights(&mut session, input, input, input, None, false, false)
+                .unwrap();
+            assert!(
+                session
+                    .tensor_values(weights)
+                    .unwrap()
+                    .iter()
+                    .all(|&v| v == 0.0)
+            );
+            let bias = mha.out_proj.bias.unwrap();
+            let bias_values = session.tensor_values(bias).unwrap();
+            assert_eq!(
+                session.tensor_values(output).unwrap(),
+                bias_values.repeat(3)
+            );
+            let loss = session.tensor_sum(output).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            assert_eq!(session.tensor_gradient(&report, bias).unwrap(), &[3.0; 4]);
+            for node in mha.parameters().into_iter().chain([input]) {
+                if node != bias {
+                    assert!(
+                        session
+                            .tensor_gradient(&report, node)
+                            .unwrap()
+                            .iter()
+                            .all(|&g| g == 0.0)
+                    );
+                }
+            }
+            let mut direct = baseline;
+            let direct_output = mha.forward(&mut direct, input).unwrap();
+            assert_eq!(
+                direct.tensor_values(direct_output).unwrap(),
+                bias_values.repeat(3)
+            );
+            let direct_loss = direct.tensor_sum(direct_output).unwrap();
+            let direct_report = direct.tensor_backward(direct_loss).unwrap();
+            assert!(
+                direct
+                    .tensor_gradient(&direct_report, input)
+                    .unwrap()
+                    .iter()
+                    .all(|&g| g == 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn mha_dropout_rejects_invalid_probabilities_before_allocating_parameters() {
+        for p in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let before = session.autograd_graph_node_count();
+            assert!(MultiheadAttention::new_with_dropout(&mut session, 4, 2, p).is_err());
+            assert_eq!(session.autograd_graph_node_count(), before);
+        }
+    }
+
+    fn mha_dropout_gradient_case(
+        mode: ExecutionMode,
+        dtype: DType,
+        data: &[Vec<f64>],
+        input_grad: bool,
+        backward: bool,
+    ) -> (f64, Vec<Option<Vec<f64>>>) {
+        // Every evaluation starts with the same RNG state and explicit weights,
+        // so finite differences hold the sampled dropout mask fixed.
+        let mut session = FrankenTorchSession::new(mode);
+        let shapes = [
+            vec![1, 2, 2],
+            vec![1, 3, 2],
+            vec![1, 3, 2],
+            vec![2, 2],
+            vec![2],
+            vec![2, 2],
+            vec![2],
+            vec![2, 2],
+            vec![2],
+            vec![2, 2],
+            vec![2],
+        ];
+        let nodes: Vec<_> = data
+            .iter()
+            .zip(shapes)
+            .enumerate()
+            .map(|(i, (values, shape))| {
+                if dtype == DType::F32 {
+                    session
+                        .tensor_variable_f32(
+                            values.iter().map(|&v| v as f32).collect(),
+                            shape,
+                            i >= 3 || input_grad,
+                        )
+                        .unwrap()
+                } else {
+                    session
+                        .tensor_variable(values.clone(), shape, i >= 3 || input_grad)
+                        .unwrap()
+                }
+            })
+            .collect();
+        let mha = MultiheadAttention {
+            q_proj: Linear::from_parameters(&session, nodes[3], Some(nodes[4])).unwrap(),
+            k_proj: Linear::from_parameters(&session, nodes[5], Some(nodes[6])).unwrap(),
+            v_proj: Linear::from_parameters(&session, nodes[7], Some(nodes[8])).unwrap(),
+            out_proj: Linear::from_parameters(&session, nodes[9], Some(nodes[10])).unwrap(),
+            num_heads: 1,
+            head_dim: 2,
+            scale: 1.0 / 2.0_f64.sqrt(),
+            dropout_p: 0.4,
+            training: std::cell::Cell::new(true),
+        };
+        let output = mha
+            .forward_qkv(&mut session, nodes[0], nodes[1], nodes[2])
+            .unwrap();
+        assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+        let upstream = session
+            .tensor_variable(vec![0.3, -0.7, 1.1, 0.2], vec![1, 2, 2], false)
+            .unwrap();
+        let upstream = session.tensor_to_dtype(upstream, dtype).unwrap();
+        let weighted = session.tensor_mul(output, upstream).unwrap();
+        let loss = session.tensor_sum(weighted).unwrap();
+        let value = session.tensor_values(loss).unwrap()[0];
+        let grads = if backward {
+            let report = session.tensor_backward(loss).unwrap();
+            nodes
+                .iter()
+                .map(|&node| session.tensor_gradient(&report, node).map(<[f64]>::to_vec))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (value, grads)
+    }
+
+    #[test]
+    fn mha_dropout_gradients_match_fixed_mask_finite_differences() {
+        let data = vec![
+            vec![0.4, -0.7, 0.2, 0.9],
+            vec![0.8, -0.5, -0.4, 0.1, 0.7, 0.3],
+            vec![-0.2, 0.6, 0.8, 0.4, -0.3, -0.9],
+            vec![0.5, -0.4, 0.2, 0.6],
+            vec![0.1, -0.2],
+            vec![-0.3, 0.7, 0.8, 0.1],
+            vec![0.2, 0.3],
+            vec![0.4, -0.6, 0.3, 0.8],
+            vec![-0.1, 0.2],
+            vec![0.7, 0.2, -0.4, 0.5],
+            vec![0.3, -0.1],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                let (_, grads) = mha_dropout_gradient_case(mode, dtype, &data, true, true);
+                let (epsilon, tolerance) = if dtype == DType::F32 {
+                    (2e-3, 2e-3)
+                } else {
+                    (1e-6, 1e-7)
+                };
+                for (i, values) in data.iter().enumerate() {
+                    let analytic = grads[i].as_ref().expect("input and projection gradients");
+                    for (j, &gradient) in analytic.iter().enumerate() {
+                        assert!(gradient.is_finite());
+                        let mut plus = data.clone();
+                        let mut minus = data.clone();
+                        plus[i][j] = values[j] + epsilon;
+                        minus[i][j] = values[j] - epsilon;
+                        let lp = mha_dropout_gradient_case(mode, dtype, &plus, false, false).0;
+                        let lm = mha_dropout_gradient_case(mode, dtype, &minus, false, false).0;
+                        let numeric = (lp - lm) / (2.0 * epsilon);
+                        assert!(
+                            (gradient - numeric).abs() < tolerance * (1.0 + numeric.abs()),
+                            "{mode:?} {dtype:?}, node {i}[{j}]: analytic={gradient}, numeric={numeric}"
+                        );
+                    }
+                }
+                let (_, frozen) = mha_dropout_gradient_case(mode, dtype, &data, false, true);
+                assert!(frozen[..3].iter().all(Option::is_none));
+                for i in 3..data.len() {
+                    assert_eq!(
+                        frozen[i], grads[i],
+                        "frozen inputs must still train projection {i}"
+                    );
+                }
+                for i in [3, 5, 7, 9] {
+                    assert!(frozen[i].as_ref().unwrap().iter().any(|&g| g.abs() > 1e-8));
+                }
+            }
         }
     }
 
@@ -31242,6 +31680,143 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recurrent_state_dict_roundtrip_restores_every_layer_and_direction() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for bidirectional in [false, true] {
+                let mut session = FrankenTorchSession::new(mode);
+                let models: Vec<Box<dyn Module>> = vec![
+                    Box::new(LSTM::new(&mut session, 2, 3, 2, bidirectional, 0.0, false).unwrap()),
+                    Box::new(GRU::new(&mut session, 2, 3, 2, bidirectional, 0.0, false).unwrap()),
+                    Box::new(
+                        RNN::new(
+                            &mut session,
+                            2,
+                            3,
+                            RNNConfig {
+                                num_layers: 2,
+                                bidirectional,
+                                ..RNNConfig::default()
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                ];
+                let input = session
+                    .tensor_variable(
+                        (0..12).map(|i| (i as f64 - 5.0) / 7.0).collect(),
+                        vec![3, 2, 2],
+                        true,
+                    )
+                    .unwrap();
+                for model in models {
+                    let parameters = named_parameters(model.as_ref(), "");
+                    assert_eq!(
+                        parameters.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+                        model.parameters(),
+                        "checkpoint traversal must include every trainable recurrent parameter"
+                    );
+                    let directions = if bidirectional { 2 } else { 1 };
+                    assert_eq!(parameters.len(), 8 * directions);
+                    let mut expected_keys = Vec::new();
+                    for layer in 0..2 {
+                        for direction in 0..directions {
+                            let suffix = if direction == 1 { "_reverse" } else { "" };
+                            for name in ["weight_ih", "weight_hh", "bias_ih", "bias_hh"] {
+                                expected_keys.push(format!("{name}_l{layer}{suffix}"));
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        parameters
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>(),
+                        expected_keys,
+                        "keys and registration order must match torch.nn recurrent modules"
+                    );
+
+                    let output = model.forward(&mut session, input).unwrap();
+                    let expected_output = session.tensor_values(output).unwrap();
+                    let original = module_state_dict(model.as_ref(), &session).unwrap();
+                    let typed = original
+                        .iter()
+                        .map(|(name, tensor)| {
+                            (
+                                name.clone(),
+                                ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                            )
+                        })
+                        .collect();
+                    let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+                    let saved = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+
+                    session.no_grad_enter();
+                    for (_, parameter) in &parameters {
+                        session.tensor_fill_(*parameter, 0.0).unwrap();
+                    }
+                    session.no_grad_exit();
+                    let empty_output = model.forward(&mut session, input).unwrap();
+                    assert!(
+                        session
+                            .tensor_values(empty_output)
+                            .unwrap()
+                            .iter()
+                            .all(|v| *v == 0.0)
+                    );
+                    assert!(expected_output.iter().any(|v| v.abs() > 1e-8));
+
+                    let restored =
+                        module_load_state_dict(model.as_ref(), &mut session, &saved, true).unwrap();
+                    assert!(restored.missing_keys.is_empty());
+                    assert!(restored.unexpected_keys.is_empty());
+                    let restored_state = module_state_dict(model.as_ref(), &session).unwrap();
+                    assert_eq!(
+                        restored_state.keys().collect::<Vec<_>>(),
+                        original.keys().collect::<Vec<_>>()
+                    );
+                    for (name, tensor) in &restored_state {
+                        assert_eq!(tensor.meta(), original[name].meta(), "{name}");
+                        assert_eq!(
+                            model_state_storage_bits(tensor),
+                            model_state_storage_bits(&original[name]),
+                            "{name}"
+                        );
+                    }
+                    let resumed_output = model.forward(&mut session, input).unwrap();
+                    assert_eq!(
+                        session.tensor_values(resumed_output).unwrap(),
+                        expected_output
+                    );
+                    let loss = session.tensor_sum(resumed_output).unwrap();
+                    let backward = session.tensor_backward(loss).unwrap();
+                    for (name, parameter) in parameters {
+                        assert!(
+                            session.tensor_gradient(&backward, parameter).is_some(),
+                            "{name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recurrent_state_dict_strict_restore_rejects_missing_reverse_weights_atomically() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let model = LSTM::new(&mut session, 2, 3, 2, true, 0.0, false).unwrap();
+        let original = model.state_dict(&session).unwrap();
+        assert_eq!(original.len(), 16);
+        let mut broken = original.clone();
+        broken.remove("weight_hh_l1_reverse");
+        broken.insert(
+            "weight_ih_l0".to_string(),
+            DenseTensor::from_contiguous_values(vec![99.0; 24], vec![12, 2], Device::Cpu).unwrap(),
+        );
+        assert!(model.load_state_dict(&mut session, &broken, true).is_err());
+        assert_eq!(model.state_dict(&session).unwrap(), original);
+    }
+
     fn model_state_storage_bits(tensor: &DenseTensor) -> Vec<u64> {
         use ft_core::TensorStorage;
         match tensor.typed_storage() {
@@ -33066,6 +33641,65 @@ mod tests {
     }
 
     // ── Transformer Encoder Tests ──────────────────────────────────────
+
+    #[test]
+    fn transformer_attention_dropout_configuration_and_modes_propagate() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let model = Transformer::new(
+            &mut session,
+            4,
+            2,
+            2,
+            2,
+            8,
+            0.5,
+            TransformerActivation::Relu,
+            false,
+        )
+        .unwrap();
+        let input = session
+            .tensor_variable(
+                (1..=12).map(|i| i as f64 * 0.1).collect(),
+                vec![1, 3, 4],
+                false,
+            )
+            .unwrap();
+        for training in [false, true] {
+            model.train(training);
+            assert_eq!(model.is_training(), training);
+            let attentions = model
+                .encoder
+                .layers
+                .iter()
+                .map(|layer| &layer.self_attn)
+                .chain(
+                    model
+                        .decoder
+                        .layers
+                        .iter()
+                        .flat_map(|layer| [&layer.self_attn, &layer.cross_attn]),
+                );
+            for attention in attentions {
+                assert_eq!(attention.dropout_p, 0.5);
+                assert_eq!(attention.is_training(), training);
+                let (_, weights) = attention
+                    .forward_qkv_with_weights(&mut session, input, input, input, None, false, false)
+                    .unwrap();
+                let values = session.tensor_values(weights).unwrap();
+                if training {
+                    assert!(
+                        values.contains(&0.0),
+                        "transformer must drop attention weights"
+                    );
+                } else {
+                    for row in values.chunks_exact(3) {
+                        assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+                        assert!(row.iter().all(|&v| v > 0.0));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn transformer_encoder_layer_forward_shape() {
@@ -38025,6 +38659,271 @@ mod tests {
         let g2 = s.tensor_gradient(&report, seq2).expect("seq2 grad");
         assert_eq!(g1, &vec![1.0, 1.0]);
         assert_eq!(g2, &vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn packed_sequences_preserve_feature_rank_dtype_and_weighted_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for batch_first in [false, true] {
+                    for features in [vec![], vec![1], vec![2, 1, 2]] {
+                        let mut s = FrankenTorchSession::new(mode);
+                        let width: usize = features.iter().product();
+                        let lengths = [1usize, 3, 2];
+                        let mut shape = if batch_first { vec![3, 4] } else { vec![4, 3] };
+                        shape.extend_from_slice(&features);
+                        let values: Vec<f64> = (1..=12 * width).map(|i| i as f64).collect();
+                        let leaf = s.tensor_variable(values.clone(), shape, true).unwrap();
+                        let input = s.tensor_to_dtype(leaf, dtype).unwrap();
+                        let packed =
+                            pack_padded_sequence(&mut s, input, &lengths, batch_first, false)
+                                .unwrap();
+                        packed.validate(&s).unwrap();
+                        assert_eq!(packed.batch_sizes, [3, 2, 1]);
+                        assert_eq!(packed.sorted_indices, [1, 2, 0]);
+                        assert_eq!(packed.unsorted_indices, [2, 0, 1]);
+                        let mut packed_shape = vec![6];
+                        packed_shape.extend_from_slice(&features);
+                        assert_eq!(s.tensor_shape(packed.data).unwrap(), packed_shape);
+                        assert_eq!(s.tensor_dtype(packed.data).unwrap(), dtype);
+
+                        let mut expected_packed = Vec::new();
+                        for (time, batches) in
+                            [&[1usize, 2, 0][..], &[1, 2], &[1]].iter().enumerate()
+                        {
+                            for &batch in *batches {
+                                let row = if batch_first {
+                                    batch * 4 + time
+                                } else {
+                                    time * 3 + batch
+                                };
+                                expected_packed
+                                    .extend_from_slice(&values[row * width..(row + 1) * width]);
+                            }
+                        }
+                        assert_eq!(s.tensor_values(packed.data).unwrap(), expected_packed);
+
+                        let (padded, restored_lengths) =
+                            pad_packed_sequence(&mut s, &packed, batch_first, -7.0, Some(5))
+                                .unwrap();
+                        assert_eq!(restored_lengths, lengths);
+                        assert_eq!(s.tensor_dtype(padded).unwrap(), dtype);
+                        let mut output_shape = if batch_first { vec![3, 5] } else { vec![5, 3] };
+                        output_shape.extend_from_slice(&features);
+                        assert_eq!(s.tensor_shape(padded).unwrap(), output_shape);
+                        let seed: Vec<f64> = (0..15 * width).map(|i| (i % 7 + 1) as f64).collect();
+                        let mut expected_output = vec![-7.0; 15 * width];
+                        let mut expected_gradient = vec![0.0; 12 * width];
+                        for (batch, &length) in lengths.iter().enumerate() {
+                            for time in 0..length {
+                                let input_row = if batch_first {
+                                    batch * 4 + time
+                                } else {
+                                    time * 3 + batch
+                                };
+                                let output_row = if batch_first {
+                                    batch * 5 + time
+                                } else {
+                                    time * 3 + batch
+                                };
+                                for feature in 0..width {
+                                    expected_output[output_row * width + feature] =
+                                        values[input_row * width + feature];
+                                    expected_gradient[input_row * width + feature] =
+                                        seed[output_row * width + feature];
+                                }
+                            }
+                        }
+                        assert_eq!(s.tensor_values(padded).unwrap(), expected_output);
+                        let seed = s.tensor_variable(seed, output_shape, false).unwrap();
+                        let seed = s.tensor_to_dtype(seed, dtype).unwrap();
+                        let weighted = s.tensor_mul(padded, seed).unwrap();
+                        let loss = s.tensor_sum(weighted).unwrap();
+                        let report = s.tensor_backward(loss).unwrap();
+                        assert_eq!(
+                            s.tensor_gradient(&report, leaf).unwrap(),
+                            &expected_gradient
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_sequences_keep_empty_feature_dimensions_and_gradient_edges() {
+        for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let leaf = s
+                .tensor_variable(Vec::new(), vec![3, 2, 2, 0, 1], true)
+                .unwrap();
+            let input = s.tensor_to_dtype(leaf, dtype).unwrap();
+            let packed = pack_padded_sequence(&mut s, input, &[3, 1], false, true).unwrap();
+            assert_eq!(s.tensor_shape(packed.data).unwrap(), [4, 2, 0, 1]);
+            let (padded, lengths) =
+                pad_packed_sequence(&mut s, &packed, true, 9.0, Some(5)).unwrap();
+            assert_eq!(lengths, [3, 1]);
+            assert_eq!(s.tensor_shape(padded).unwrap(), [2, 5, 2, 0, 1]);
+            assert_eq!(s.tensor_dtype(padded).unwrap(), dtype);
+            assert!(s.tensor_requires_grad(padded).unwrap());
+            let loss = s.tensor_sum(padded).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            assert_eq!(s.tensor_gradient(&report, leaf).unwrap(), &[]);
+        }
+    }
+
+    #[test]
+    fn pad_packed_nonfinite_values_do_not_contaminate_other_rows_or_gradients() {
+        for dtype in [DType::F64, DType::F32] {
+            for (first, padding_value) in [
+                (f64::NAN, 7.0),
+                (f64::INFINITY, -2.0),
+                (1.0, f64::INFINITY),
+                (1.0, f64::NAN),
+            ] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let leaf = s
+                    .tensor_variable(vec![first, 2.0, 3.0], vec![3, 1], true)
+                    .unwrap();
+                let data = s.tensor_to_dtype(leaf, dtype).unwrap();
+                let packed = PackedSequence {
+                    data,
+                    batch_sizes: vec![2, 1],
+                    sorted_indices: vec![0, 1],
+                    unsorted_indices: vec![0, 1],
+                };
+                let (padded, _) =
+                    pad_packed_sequence(&mut s, &packed, false, padding_value, Some(3)).unwrap();
+                let actual = s.tensor_values(padded).unwrap();
+                let expected = [first, 2.0, 3.0, padding_value, padding_value, padding_value];
+                for (got, want) in actual.iter().zip(expected) {
+                    assert!(if want.is_nan() {
+                        got.is_nan()
+                    } else {
+                        *got == want
+                    });
+                }
+                let loss = s.tensor_sum(padded).unwrap();
+                let report = s.tensor_backward(loss).unwrap();
+                assert_eq!(s.tensor_gradient(&report, leaf).unwrap(), &[1.0, 1.0, 1.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_sequence_validation_rejects_malformed_metadata_before_recording_nodes() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3, 1], true)
+            .unwrap();
+        let short = s.tensor_variable(vec![1.0, 2.0], vec![2, 1], true).unwrap();
+        let scalar = s.tensor_variable(vec![1.0], vec![], true).unwrap();
+        let cases = [
+            (data, vec![2, 1], vec![0, 0], vec![0, 1]),
+            (data, vec![2, 1], vec![1, 0], vec![0, 1]),
+            (data, vec![2, 1], vec![0, 2], vec![0, 1]),
+            (data, vec![2, 1], vec![0, 1], vec![0]),
+            (data, vec![2, 0], vec![0, 1], vec![0, 1]),
+            (data, vec![2, 1, 2], vec![0, 1], vec![0, 1]),
+            (short, vec![2, 1], vec![0, 1], vec![0, 1]),
+            (scalar, vec![1], vec![0], vec![0]),
+        ];
+        for (data, batch_sizes, sorted_indices, unsorted_indices) in cases {
+            let packed = PackedSequence {
+                data,
+                batch_sizes,
+                sorted_indices,
+                unsorted_indices,
+            };
+            let before = s.autograd_graph_node_count();
+            assert!(packed.validate(&s).is_err());
+            assert!(pad_packed_sequence(&mut s, &packed, false, 0.0, None).is_err());
+            assert_eq!(s.autograd_graph_node_count(), before);
+        }
+        let valid = PackedSequence {
+            data,
+            batch_sizes: vec![2, 1],
+            sorted_indices: vec![1, 0],
+            unsorted_indices: vec![1, 0],
+        };
+        let before = s.autograd_graph_node_count();
+        assert!(pad_packed_sequence(&mut s, &valid, false, 0.0, Some(usize::MAX)).is_err());
+        assert_eq!(s.autograd_graph_node_count(), before);
+    }
+
+    #[test]
+    fn packed_sequences_preserve_device_metadata_without_executing_device_kernels() {
+        for dtype in [DType::F64, DType::F32] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let meta = ft_core::TensorMeta::from_shape(vec![3, 2, 1], dtype, Device::Metal);
+            let tensor = if dtype == DType::F64 {
+                DenseTensor::from_storage(meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
+            } else {
+                DenseTensor::from_storage_f32(meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()
+            };
+            let input = s.tensor_variable_from_storage(tensor, false);
+            let packed = pack_padded_sequence(&mut s, input, &[1, 3], false, false).unwrap();
+            let (padded, _) = pad_packed_sequence(&mut s, &packed, false, -1.0, None).unwrap();
+            assert_eq!(s.tensor_device(packed.data).unwrap(), Device::Metal);
+            assert_eq!(s.tensor_device(padded).unwrap(), Device::Metal);
+            assert_eq!(
+                s.tensor_values(padded).unwrap(),
+                [1.0, 2.0, -1.0, 4.0, -1.0, 6.0]
+            );
+            // Stack has no Metal implementation; it must fail closed rather
+            // than returning a silently moved CPU tensor via its fast path.
+            assert!(pad_sequence(&mut s, &[input, input], false, 0.0).is_err());
+        }
+    }
+
+    #[test]
+    fn pad_sequence_validates_all_inputs_before_padding_and_keeps_empty_sequences() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let first = s.tensor_variable(vec![1.0, 2.0], vec![1, 2], true).unwrap();
+        let wrong_features = s.tensor_variable(vec![3.0; 9], vec![3, 3], true).unwrap();
+        let scalar = s.tensor_variable(vec![1.0], vec![], true).unwrap();
+        let wrong_dtype = s
+            .tensor_variable_f32(vec![1.0, 2.0], vec![1, 2], true)
+            .unwrap();
+        for second in [wrong_features, scalar, wrong_dtype] {
+            let before = s.autograd_graph_node_count();
+            assert!(pad_sequence(&mut s, &[first, second], true, 0.0).is_err());
+            assert_eq!(s.autograd_graph_node_count(), before);
+        }
+        let empty = s.tensor_variable(Vec::new(), vec![0, 2], true).unwrap();
+        let output = pad_sequence(&mut s, &[empty, first], true, -5.0).unwrap();
+        assert_eq!(s.tensor_shape(output).unwrap(), [2, 1, 2]);
+        assert_eq!(s.tensor_values(output).unwrap(), [-5.0, -5.0, 1.0, 2.0]);
+        let loss = s.tensor_sum(output).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert_eq!(s.tensor_gradient(&report, empty).unwrap(), &[]);
+        assert_eq!(s.tensor_gradient(&report, first).unwrap(), &[1.0, 1.0]);
+        let all_empty = pad_sequence(&mut s, &[empty, empty], false, 0.0).unwrap();
+        assert_eq!(s.tensor_shape(all_empty).unwrap(), [0, 2, 2]);
+    }
+
+    #[test]
+    fn sequence_padding_respects_no_grad_for_typed_and_precomputed_paths() {
+        for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let long = s.tensor_variable(vec![1.0, 2.0], vec![2, 1], true).unwrap();
+            let short = s.tensor_variable(vec![3.0], vec![1, 1], true).unwrap();
+            let long = s.tensor_to_dtype(long, dtype).unwrap();
+            let short = s.tensor_to_dtype(short, dtype).unwrap();
+            let (padded, stacked, direct) = s.with_no_grad(|s| {
+                (
+                    pad_sequence(s, &[long, short], true, -1.0).unwrap(),
+                    pad_sequence(s, &[long, long], false, 0.0).unwrap(),
+                    s.tensor_pad(short, &[0, 0, 0, 1], 0.0).unwrap(),
+                )
+            });
+            for output in [padded, stacked, direct] {
+                assert!(!s.tensor_requires_grad(output).unwrap());
+                assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+            }
+            assert!(s.tensor_requires_grad(long).unwrap());
+            assert!(s.is_grad_enabled());
+        }
     }
 
     // ── nn.init Tests ──────────────────────────────────────────────────
