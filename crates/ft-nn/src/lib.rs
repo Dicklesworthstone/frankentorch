@@ -12727,6 +12727,25 @@ fn recurrent_parameter_slots(
     parameters
 }
 
+fn validate_recurrent_initial_state(
+    session: &FrankenTorchSession,
+    input: TensorNodeId,
+    state: Option<TensorNodeId>,
+    expected_shape: &[usize],
+) -> Result<(), AutogradError> {
+    checked_shape_numel(expected_shape, "recurrent state size overflow")?;
+    if let Some(state) = state
+        && (session.tensor_shape(state)? != expected_shape
+            || session.tensor_dtype(state)? != session.tensor_dtype(input)?
+            || session.tensor_device(state)? != session.tensor_device(input)?)
+    {
+        return Err(incompatible_error(
+            "recurrent initial state must match [layers * directions, batch, hidden_size], input dtype, and device",
+        ));
+    }
+    Ok(())
+}
+
 fn recurrent_zero_state(
     session: &mut FrankenTorchSession,
     input: TensorNodeId,
@@ -13916,15 +13935,9 @@ impl LSTM {
     ) -> Result<LSTMOutput, AutogradError> {
         let num_directions: usize = if self.bidirectional { 2 } else { 1 };
 
-        // Get input shape and transpose if batch_first
-        let working_input = if self.batch_first {
-            // [batch, seq_len, input_size] -> [seq_len, batch, input_size]
-            session.tensor_transpose(input, 0, 1)?
-        } else {
-            input
-        };
-
-        let input_shape = session.tensor_shape(working_input)?;
+        // Validate the original input and both states before recording a layout
+        // transform or allocating either default state.
+        let input_shape = session.tensor_shape(input)?;
         if input_shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -13932,8 +13945,11 @@ impl LSTM {
                 },
             )));
         }
-        let seq_len = input_shape[0];
-        let batch_size = input_shape[1];
+        let (seq_len, batch_size) = if self.batch_first {
+            (input_shape[1], input_shape[0])
+        } else {
+            (input_shape[0], input_shape[1])
+        };
 
         if input_shape[2] != self.input_size {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -13947,6 +13963,14 @@ impl LSTM {
         let total_layers =
             checked_mul(self.num_layers, num_directions, "LSTM state size overflow")?;
         let state_shape = vec![total_layers, batch_size, self.hidden_size];
+        validate_recurrent_initial_state(session, input, h_0, &state_shape)?;
+        validate_recurrent_initial_state(session, input, c_0, &state_shape)?;
+
+        let working_input = if self.batch_first {
+            session.tensor_transpose(input, 0, 1)?
+        } else {
+            input
+        };
 
         let h_init = match h_0 {
             Some(h) => h,
@@ -14508,13 +14532,7 @@ impl GRU {
     ) -> Result<GRUOutput, AutogradError> {
         let num_directions: usize = if self.bidirectional { 2 } else { 1 };
 
-        let working_input = if self.batch_first {
-            session.tensor_transpose(input, 0, 1)?
-        } else {
-            input
-        };
-
-        let input_shape = session.tensor_shape(working_input)?;
+        let input_shape = session.tensor_shape(input)?;
         if input_shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -14522,8 +14540,11 @@ impl GRU {
                 },
             )));
         }
-        let seq_len = input_shape[0];
-        let batch_size = input_shape[1];
+        let (seq_len, batch_size) = if self.batch_first {
+            (input_shape[1], input_shape[0])
+        } else {
+            (input_shape[0], input_shape[1])
+        };
 
         if input_shape[2] != self.input_size {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -14535,6 +14556,13 @@ impl GRU {
 
         let total_layers = checked_mul(self.num_layers, num_directions, "GRU state size overflow")?;
         let state_shape = vec![total_layers, batch_size, self.hidden_size];
+        validate_recurrent_initial_state(session, input, h_0, &state_shape)?;
+
+        let working_input = if self.batch_first {
+            session.tensor_transpose(input, 0, 1)?
+        } else {
+            input
+        };
 
         let h_init = match h_0 {
             Some(h) => h,
@@ -15042,13 +15070,7 @@ impl RNN {
     ) -> Result<RNNOutput, AutogradError> {
         let num_directions: usize = if self.bidirectional { 2 } else { 1 };
 
-        let working_input = if self.batch_first {
-            session.tensor_transpose(input, 0, 1)?
-        } else {
-            input
-        };
-
-        let input_shape = session.tensor_shape(working_input)?;
+        let input_shape = session.tensor_shape(input)?;
         if input_shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -15056,8 +15078,11 @@ impl RNN {
                 },
             )));
         }
-        let seq_len = input_shape[0];
-        let batch_size = input_shape[1];
+        let (seq_len, batch_size) = if self.batch_first {
+            (input_shape[1], input_shape[0])
+        } else {
+            (input_shape[0], input_shape[1])
+        };
 
         if input_shape[2] != self.input_size {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -15069,6 +15094,13 @@ impl RNN {
 
         let total_layers = checked_mul(self.num_layers, num_directions, "RNN state size overflow")?;
         let state_shape = vec![total_layers, batch_size, self.hidden_size];
+        validate_recurrent_initial_state(session, input, h_0, &state_shape)?;
+
+        let working_input = if self.batch_first {
+            session.tensor_transpose(input, 0, 1)?
+        } else {
+            input
+        };
 
         let h_init = match h_0 {
             Some(h) => h,
@@ -40226,6 +40258,175 @@ mod tests {
             result.push(cn);
         }
         result
+    }
+
+    #[test]
+    fn dense_recurrent_rejects_malformed_initial_states_before_graph_or_rng_changes() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for kind in 0..4 {
+                    for bidirectional in [false, true] {
+                        for batch_first in [false, true] {
+                            let directions = if bidirectional { 2 } else { 1 };
+                            let cells = 2 * directions;
+                            let mut session = FrankenTorchSession::new(mode);
+                            let mut model = PackedRecurrentTestModel::new(
+                                &mut session,
+                                kind,
+                                dtype,
+                                bidirectional,
+                                0.35,
+                            );
+                            model.set_batch_first(batch_first);
+                            // Unequal time/batch sizes exercise both layout paths.
+                            let input_shape = if batch_first {
+                                vec![2, 3, 2]
+                            } else {
+                                vec![3, 2, 2]
+                            };
+                            let input = packed_recurrent_test_leaf(
+                                &mut session,
+                                vec![0.1; 12],
+                                input_shape,
+                                dtype,
+                                true,
+                            );
+                            let state_shape = vec![cells, 2, 2];
+                            let valid_state = packed_recurrent_test_leaf(
+                                &mut session,
+                                vec![0.2; cells * 4],
+                                state_shape.clone(),
+                                dtype,
+                                true,
+                            );
+                            let mut malformed = Vec::new();
+                            for shape in [
+                                vec![0, 2, 2],
+                                vec![cells - 1, 2, 2],
+                                vec![cells + 1, 2, 2],
+                                vec![cells, 1, 2],
+                                vec![cells, 3, 2],
+                                vec![cells, 2, 1],
+                                vec![cells, 2, 3],
+                                vec![cells, 4],
+                            ] {
+                                let count = shape.iter().product();
+                                malformed.push(packed_recurrent_test_leaf(
+                                    &mut session,
+                                    vec![0.3; count],
+                                    shape,
+                                    dtype,
+                                    true,
+                                ));
+                            }
+                            let wrong_dtype = if dtype == DType::F32 {
+                                DType::F64
+                            } else {
+                                DType::F32
+                            };
+                            malformed.push(packed_recurrent_test_leaf(
+                                &mut session,
+                                vec![0.3; cells * 4],
+                                state_shape.clone(),
+                                wrong_dtype,
+                                true,
+                            ));
+                            let wrong_device = DenseTensor::from_contiguous_values(
+                                vec![0.3; cells * 4],
+                                state_shape.clone(),
+                                Device::Cuda,
+                            )
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                            malformed
+                                .push(session.tensor_variable_from_storage(wrong_device, true));
+                            malformed.push(TensorNodeId(usize::MAX));
+
+                            let mut cases = Vec::new();
+                            for bad in malformed {
+                                cases.push((input, Some(bad), None));
+                                if kind == 0 {
+                                    // An invalid c0 must fail before allocating a
+                                    // default h0 or unbinding an otherwise valid h0.
+                                    cases.push((input, None, Some(bad)));
+                                    cases.push((input, Some(valid_state), Some(bad)));
+                                }
+                            }
+                            let wrong_features = if batch_first {
+                                vec![2, 3, 3]
+                            } else {
+                                vec![3, 2, 3]
+                            };
+                            for shape in [vec![], vec![2, 2], vec![1, 3, 2, 2], wrong_features] {
+                                let count = shape.iter().product();
+                                let bad_input = packed_recurrent_test_leaf(
+                                    &mut session,
+                                    vec![0.1; count],
+                                    shape,
+                                    dtype,
+                                    true,
+                                );
+                                cases.push((bad_input, None, None));
+                            }
+                            cases.push((TensorNodeId(usize::MAX), None, None));
+                            let mut untouched = session.clone();
+                            for (candidate_input, h, c) in cases {
+                                for no_grad in [false, true] {
+                                    let before = session.autograd_graph_node_count();
+                                    let result = if no_grad {
+                                        session.with_no_grad(|s| {
+                                            model.forward_dense(s, candidate_input, h, c)
+                                        })
+                                    } else {
+                                        model.forward_dense(&mut session, candidate_input, h, c)
+                                    };
+                                    assert!(
+                                        result.is_err(),
+                                        "kind {kind}, {mode:?}/{dtype:?}, bidirectional={bidirectional}, batch_first={batch_first}"
+                                    );
+                                    assert_eq!(session.autograd_graph_node_count(), before);
+                                    assert!(session.is_grad_enabled());
+                                }
+                            }
+                            let next = session.rand(vec![8], false).unwrap();
+                            let expected = untouched.rand(vec![8], false).unwrap();
+                            assert_eq!(
+                                session.tensor_values(next).unwrap(),
+                                untouched.tensor_values(expected).unwrap()
+                            );
+
+                            // Correct non-square layouts and supplied states
+                            // still enter the usual F32/F64 inference paths.
+                            model.module().eval();
+                            let outputs = session
+                                .with_no_grad(|s| {
+                                    model.forward_dense(
+                                        s,
+                                        input,
+                                        Some(valid_state),
+                                        Some(valid_state),
+                                    )
+                                })
+                                .unwrap();
+                            let output_shape = if batch_first {
+                                vec![2, 3, 2 * directions]
+                            } else {
+                                vec![3, 2, 2 * directions]
+                            };
+                            assert_eq!(session.tensor_shape(outputs[0]).unwrap(), output_shape);
+                            for &state in &outputs[1..] {
+                                assert_eq!(session.tensor_shape(state).unwrap(), state_shape);
+                            }
+                            for output in outputs {
+                                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                                assert!(!session.tensor_requires_grad(output).unwrap());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
