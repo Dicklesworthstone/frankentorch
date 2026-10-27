@@ -24,6 +24,35 @@ fn validate_dropout_probability(dropout: f64, reason: &'static str) -> Result<()
     Ok(())
 }
 
+fn validate_parameter_dtype(dtype: DType) -> Result<(), AutogradError> {
+    if !matches!(dtype, DType::F32 | DType::F64) {
+        return Err(incompatible_error(
+            "module parameters require F32 or F64 dtype",
+        ));
+    }
+    Ok(())
+}
+
+/// Parameters are fresh leaves, including inside a no-grad construction region.
+/// Initializers use the same F64 random stream for both supported precisions and
+/// round only when creating the final parameter storage.
+fn initialized_parameter(
+    session: &mut FrankenTorchSession,
+    values: Vec<f64>,
+    shape: Vec<usize>,
+    dtype: DType,
+) -> Result<TensorNodeId, AutogradError> {
+    validate_parameter_dtype(dtype)?;
+    session.with_enable_grad(|session| match dtype {
+        DType::F32 => session.tensor_variable_f32(
+            values.into_iter().map(|value| value as f32).collect(),
+            shape,
+            true,
+        ),
+        _ => session.tensor_variable(values, shape, true),
+    })
+}
+
 fn validate_positive_pooling_dims(
     dims: &[usize],
     reason: &'static str,
@@ -902,6 +931,20 @@ impl Linear {
         out_features: usize,
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, in_features, out_features, use_bias, DType::F64)
+    }
+
+    /// Create a Linear layer with trainable F32 or F64 leaf parameters.
+    /// Unsupported dtypes are rejected before initialization consumes RNG or
+    /// records tensor nodes. Parameters remain trainable inside `with_no_grad`.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        in_features: usize,
+        out_features: usize,
+        use_bias: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if in_features == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -920,8 +963,12 @@ impl Linear {
         let weight_shifted = session.tensor_sub(weight_scaled, shift_tensor)?;
 
         let weight_values = session.tensor_values(weight_shifted)?;
-        let weight =
-            session.tensor_variable(weight_values, vec![out_features, in_features], true)?;
+        let weight = initialized_parameter(
+            session,
+            weight_values,
+            vec![out_features, in_features],
+            dtype,
+        )?;
 
         // Initialize bias
         let bias = if use_bias {
@@ -932,7 +979,12 @@ impl Linear {
             let bias_shifted = session.tensor_sub(bias_scaled, bias_shift)?;
 
             let bias_values = session.tensor_values(bias_shifted)?;
-            Some(session.tensor_variable(bias_values, vec![out_features], true)?)
+            Some(initialized_parameter(
+                session,
+                bias_values,
+                vec![out_features],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -2099,6 +2151,18 @@ impl LayerNorm {
         normalized_shape: Vec<usize>,
         eps: f64,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, normalized_shape, eps, DType::F64)
+    }
+
+    /// Create LayerNorm with trainable F32 or F64 weight and bias leaves.
+    /// Parameters remain trainable when constructed inside `with_no_grad`.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        normalized_shape: Vec<usize>,
+        eps: f64,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if normalized_shape.is_empty() {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -2120,10 +2184,18 @@ impl LayerNorm {
         }
 
         // Weight (gamma) initialized to ones, bias (beta) to zeros
-        let weight =
-            session.tensor_variable(vec![1.0; norm_numel], normalized_shape.clone(), true)?;
-        let bias =
-            session.tensor_variable(vec![0.0; norm_numel], normalized_shape.clone(), true)?;
+        let weight = initialized_parameter(
+            session,
+            vec![1.0; norm_numel],
+            normalized_shape.clone(),
+            dtype,
+        )?;
+        let bias = initialized_parameter(
+            session,
+            vec![0.0; norm_numel],
+            normalized_shape.clone(),
+            dtype,
+        )?;
 
         Ok(Self {
             weight,
@@ -2217,7 +2289,7 @@ impl Module for LayerNorm {
         let var_exp = session.tensor_expand(var_us, vec![batch_numel, norm_numel])?;
 
         // std = sqrt(var + eps)
-        let eps_t = session.full(vec![batch_numel, norm_numel], self.eps, false)?;
+        let eps_t = session.full_like(var_exp, self.eps, false)?;
         let var_eps = session.tensor_add(var_exp, eps_t)?;
         let std = session.tensor_sqrt(var_eps)?;
 
@@ -2388,12 +2460,11 @@ impl Module for Dropout {
                 },
             )));
         }
-        if !self.training.get() || self.p == 0.0 {
+        if !self.training.get() || self.p == 0.0 || session.tensor_numel(input)? == 0 {
             return Ok(input);
         }
         if self.p >= 1.0 {
-            let shape = { session.tensor_shape(input)? };
-            let zeros = session.zeros(shape, false)?;
+            let zeros = session.zeros_like(input, false)?;
             return session.tensor_mul(input, zeros);
         }
 
@@ -2412,6 +2483,7 @@ impl Module for Dropout {
         let scale = 1.0 / (1.0 - self.p);
         let scale_tensor = session.full(shape, scale, false)?;
         let scaled_mask = session.tensor_mul(mask, scale_tensor)?;
+        let scaled_mask = session.tensor_to_dtype(scaled_mask, session.tensor_dtype(input)?)?;
 
         session.tensor_mul(input, scaled_mask)
     }
@@ -2481,8 +2553,12 @@ impl Module for Dropout1d {
             }
         };
 
+        if session.tensor_numel(input)? == 0 {
+            return Ok(input);
+        }
+
         if self.p >= 1.0 {
-            let zeros = session.zeros(shape, false)?;
+            let zeros = session.zeros_like(input, false)?;
             return session.tensor_mul(input, zeros);
         }
 
@@ -2502,6 +2578,7 @@ impl Module for Dropout1d {
             }
         }
         let mask = session.tensor_variable(mask_data, shape, false)?;
+        let mask = session.tensor_to_dtype(mask, session.tensor_dtype(input)?)?;
         session.tensor_mul(input, mask)
     }
 
@@ -2569,8 +2646,11 @@ impl Module for Dropout2d {
                 },
             )));
         }
+        if session.tensor_numel(input)? == 0 {
+            return Ok(input);
+        }
         if self.p >= 1.0 {
-            let zeros = session.zeros(shape, false)?;
+            let zeros = session.zeros_like(input, false)?;
             return session.tensor_mul(input, zeros);
         }
         let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
@@ -2590,6 +2670,7 @@ impl Module for Dropout2d {
             }
         }
         let mask = session.tensor_variable(mask_data, shape, false)?;
+        let mask = session.tensor_to_dtype(mask, session.tensor_dtype(input)?)?;
         session.tensor_mul(input, mask)
     }
 
@@ -2656,8 +2737,11 @@ impl Module for Dropout3d {
                 },
             )));
         }
+        if session.tensor_numel(input)? == 0 {
+            return Ok(input);
+        }
         if self.p >= 1.0 {
-            let zeros = session.zeros(shape, false)?;
+            let zeros = session.zeros_like(input, false)?;
             return session.tensor_mul(input, zeros);
         }
         let (n, c) = (shape[0], shape[1]);
@@ -2679,6 +2763,7 @@ impl Module for Dropout3d {
             }
         }
         let mask = session.tensor_variable(mask_data, shape, false)?;
+        let mask = session.tensor_to_dtype(mask, session.tensor_dtype(input)?)?;
         session.tensor_mul(input, mask)
     }
 
@@ -2746,8 +2831,12 @@ impl Module for AlphaDropout {
                 },
             )));
         }
-        if !self.training.get() || self.p == 0.0 {
+        if !self.training.get() || self.p == 0.0 || session.tensor_numel(input)? == 0 {
             return Ok(input);
+        }
+        if self.p == 1.0 {
+            let zeros = session.zeros_like(input, false)?;
+            return session.tensor_mul(input, zeros);
         }
         let shape = session.tensor_shape(input)?;
         let numel = checked_shape_numel(&shape, "AlphaDropout input shape overflow")?;
@@ -2755,7 +2844,7 @@ impl Module for AlphaDropout {
         let alpha_p = -Self::SAT;
         let a = ((1.0 - self.p) * (1.0 + self.p * alpha_p * alpha_p)).sqrt();
         let a = 1.0 / a;
-        let b = a * self.p * Self::SAT;
+        let b = -a * self.p * Self::SAT;
 
         // Sample the keep-mask (random, non-grad). Each entry is
         // 1.0 if rand_i > p else 0.0.
@@ -2765,23 +2854,24 @@ impl Module for AlphaDropout {
             .iter()
             .map(|&r| if r > self.p { 1.0 } else { 0.0 })
             .collect();
-        let mask = session.tensor_variable(mask_vals, shape.clone(), false)?;
+        let mask = session.tensor_variable(mask_vals, shape, false)?;
+        let mask = session.tensor_to_dtype(mask, session.tensor_dtype(input)?)?;
 
         // Compose through autograd primitives so gradients flow.
-        // y = a * (mask * x + (1 - mask) * sat) + a * p * sat
+        // y = a * (mask * x + (1 - mask) * sat) - a * p * sat
         //   = a * mask * x + a * (1 - mask) * sat + b
         // Tracked under frankentorch-734h. Previously this body
         // extracted values, applied the transform in plain f64, and
         // rebuilt a requires_grad=false leaf.
-        let ones_t = session.full(shape.clone(), 1.0, false)?;
+        let ones_t = session.ones_like(input, false)?;
         let one_minus_mask = session.tensor_sub(ones_t, mask)?;
-        let sat_t = session.full(shape.clone(), Self::SAT, false)?;
+        let sat_t = session.full_like(input, Self::SAT, false)?;
         let drop_branch = session.tensor_mul(one_minus_mask, sat_t)?;
         let keep_branch = session.tensor_mul(mask, input)?;
         let pre_affine = session.tensor_add(keep_branch, drop_branch)?;
-        let a_t = session.full(shape.clone(), a, false)?;
+        let a_t = session.full_like(input, a, false)?;
         let scaled = session.tensor_mul(pre_affine, a_t)?;
-        let b_t = session.full(shape, b, false)?;
+        let b_t = session.full_like(input, b, false)?;
         session.tensor_add(scaled, b_t)
     }
 
@@ -2856,10 +2946,19 @@ impl Module for FeatureAlphaDropout {
             }
         };
 
+        if session.tensor_numel(input)? == 0 {
+            return Ok(input);
+        }
+
+        if self.p == 1.0 {
+            let zeros = session.zeros_like(input, false)?;
+            return session.tensor_mul(input, zeros);
+        }
+
         let alpha_p = -AlphaDropout::SAT;
         let a = ((1.0 - self.p) * (1.0 + self.p * alpha_p * alpha_p)).sqrt();
         let a = 1.0 / a;
-        let b = a * self.p * AlphaDropout::SAT;
+        let b = -a * self.p * AlphaDropout::SAT;
 
         let rand_vals_id = session.rand(vec![feature_maps], false)?;
         let rand = session.tensor_values(rand_vals_id)?;
@@ -2878,17 +2977,18 @@ impl Module for FeatureAlphaDropout {
                 chunk.fill(keep);
             }
         }
-        let mask = session.tensor_variable(mask_vals, shape.clone(), false)?;
+        let mask = session.tensor_variable(mask_vals, shape, false)?;
+        let mask = session.tensor_to_dtype(mask, session.tensor_dtype(input)?)?;
 
-        let ones_t = session.full(shape.clone(), 1.0, false)?;
+        let ones_t = session.ones_like(input, false)?;
         let one_minus_mask = session.tensor_sub(ones_t, mask)?;
-        let sat_t = session.full(shape.clone(), AlphaDropout::SAT, false)?;
+        let sat_t = session.full_like(input, AlphaDropout::SAT, false)?;
         let drop_branch = session.tensor_mul(one_minus_mask, sat_t)?;
         let keep_branch = session.tensor_mul(mask, input)?;
         let pre_affine = session.tensor_add(keep_branch, drop_branch)?;
-        let a_t = session.full(shape.clone(), a, false)?;
+        let a_t = session.full_like(input, a, false)?;
         let scaled = session.tensor_mul(pre_affine, a_t)?;
-        let b_t = session.full(shape, b, false)?;
+        let b_t = session.full_like(input, b, false)?;
         session.tensor_add(scaled, b_t)
     }
 
@@ -4749,6 +4849,16 @@ impl MultiheadAttention {
         Self::new_with_dropout(session, embed_dim, num_heads, 0.0)
     }
 
+    /// Create attention with trainable F32 or F64 parameters and no dropout.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        embed_dim: usize,
+        num_heads: usize,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        Self::new_with_dropout_and_dtype(session, embed_dim, num_heads, 0.0, dtype)
+    }
+
     /// Create multi-head attention with dropout on the attention probabilities.
     ///
     /// During training, each softmax weight is independently dropped with
@@ -4761,6 +4871,19 @@ impl MultiheadAttention {
         num_heads: usize,
         dropout_p: f64,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dropout_and_dtype(session, embed_dim, num_heads, dropout_p, DType::F64)
+    }
+
+    /// Create attention with probability dropout and trainable F32 or F64
+    /// parameter leaves. Unsupported dtypes are rejected before initialization.
+    pub fn new_with_dropout_and_dtype(
+        session: &mut FrankenTorchSession,
+        embed_dim: usize,
+        num_heads: usize,
+        dropout_p: f64,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         validate_dropout_probability(
             dropout_p,
             "MultiheadAttention dropout probability must be finite and in [0, 1]",
@@ -4781,10 +4904,10 @@ impl MultiheadAttention {
         }
 
         let head_dim = embed_dim / num_heads;
-        let q_proj = Linear::new(session, embed_dim, embed_dim, true)?;
-        let k_proj = Linear::new(session, embed_dim, embed_dim, true)?;
-        let v_proj = Linear::new(session, embed_dim, embed_dim, true)?;
-        let out_proj = Linear::new(session, embed_dim, embed_dim, true)?;
+        let q_proj = Linear::new_with_dtype(session, embed_dim, embed_dim, true, dtype)?;
+        let k_proj = Linear::new_with_dtype(session, embed_dim, embed_dim, true, dtype)?;
+        let v_proj = Linear::new_with_dtype(session, embed_dim, embed_dim, true, dtype)?;
+        let out_proj = Linear::new_with_dtype(session, embed_dim, embed_dim, true, dtype)?;
 
         Ok(Self {
             q_proj,
@@ -12906,12 +13029,24 @@ impl RNNCell {
         hidden_size: usize,
         use_tanh: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, input_size, hidden_size, use_tanh, DType::F64)
+    }
+
+    /// Create an RNN cell with trainable F32 or F64 parameter leaves.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        use_tanh: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let bound = 1.0 / (hidden_size as f64).sqrt();
 
-        let w_ih = Self::init_weight(session, hidden_size, input_size, bound)?;
-        let w_hh = Self::init_weight(session, hidden_size, hidden_size, bound)?;
-        let b_ih = Self::init_bias(session, hidden_size, bound)?;
-        let b_hh = Self::init_bias(session, hidden_size, bound)?;
+        let w_ih = Self::init_weight(session, hidden_size, input_size, bound, dtype)?;
+        let w_hh = Self::init_weight(session, hidden_size, hidden_size, bound, dtype)?;
+        let b_ih = Self::init_bias(session, hidden_size, bound, dtype)?;
+        let b_hh = Self::init_bias(session, hidden_size, bound, dtype)?;
 
         Ok(Self {
             w_ih,
@@ -12929,6 +13064,7 @@ impl RNNCell {
         rows: usize,
         cols: usize,
         bound: f64,
+        dtype: DType,
     ) -> Result<TensorNodeId, AutogradError> {
         let numel = rows * cols;
         let r = session.rand(vec![numel], false)?;
@@ -12937,13 +13073,14 @@ impl RNNCell {
         let shift = session.full(vec![numel], bound, false)?;
         let shifted = session.tensor_sub(scaled, shift)?;
         let vals = session.tensor_values(shifted)?;
-        session.tensor_variable(vals, vec![rows, cols], true)
+        initialized_parameter(session, vals, vec![rows, cols], dtype)
     }
 
     fn init_bias(
         session: &mut FrankenTorchSession,
         size: usize,
         bound: f64,
+        dtype: DType,
     ) -> Result<TensorNodeId, AutogradError> {
         // Cell biases are 1-D `[size]`, matching PyTorch's
         // `RNNCell.bias_ih` / `bias_hh` so a torch `state_dict` loads
@@ -12954,7 +13091,7 @@ impl RNNCell {
         let shift = session.full(vec![size], bound, false)?;
         let shifted = session.tensor_sub(scaled, shift)?;
         let vals = session.tensor_values(shifted)?;
-        session.tensor_variable(vals, vec![size], true)
+        initialized_parameter(session, vals, vec![size], dtype)
     }
 
     /// Broadcasts a 1-D `[size]` cell bias to a gate tensor's shape.
@@ -13109,16 +13246,27 @@ impl LSTMCell {
         input_size: usize,
         hidden_size: usize,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, input_size, hidden_size, DType::F64)
+    }
+
+    /// Create an LSTM cell with trainable F32 or F64 parameter leaves.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let bound = 1.0 / (hidden_size as f64).sqrt();
         let gate_size = 4 * hidden_size;
 
         // W_ih: [4*hidden_size, input_size]
-        let w_ih = RNNCell::init_weight(session, gate_size, input_size, bound)?;
+        let w_ih = RNNCell::init_weight(session, gate_size, input_size, bound, dtype)?;
         // W_hh: [4*hidden_size, hidden_size]
-        let w_hh = RNNCell::init_weight(session, gate_size, hidden_size, bound)?;
+        let w_hh = RNNCell::init_weight(session, gate_size, hidden_size, bound, dtype)?;
         // b_ih, b_hh: [4*hidden_size]
-        let b_ih = RNNCell::init_bias(session, gate_size, bound)?;
-        let b_hh = RNNCell::init_bias(session, gate_size, bound)?;
+        let b_ih = RNNCell::init_bias(session, gate_size, bound, dtype)?;
+        let b_hh = RNNCell::init_bias(session, gate_size, bound, dtype)?;
 
         Ok(Self {
             w_ih,
@@ -13370,13 +13518,24 @@ impl GRUCell {
         input_size: usize,
         hidden_size: usize,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, input_size, hidden_size, DType::F64)
+    }
+
+    /// Create a GRU cell with trainable F32 or F64 parameter leaves.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let bound = 1.0 / (hidden_size as f64).sqrt();
         let gate_size = 3 * hidden_size;
 
-        let w_ih = RNNCell::init_weight(session, gate_size, input_size, bound)?;
-        let w_hh = RNNCell::init_weight(session, gate_size, hidden_size, bound)?;
-        let b_ih = RNNCell::init_bias(session, gate_size, bound)?;
-        let b_hh = RNNCell::init_bias(session, gate_size, bound)?;
+        let w_ih = RNNCell::init_weight(session, gate_size, input_size, bound, dtype)?;
+        let w_hh = RNNCell::init_weight(session, gate_size, hidden_size, bound, dtype)?;
+        let b_ih = RNNCell::init_bias(session, gate_size, bound, dtype)?;
+        let b_hh = RNNCell::init_bias(session, gate_size, bound, dtype)?;
 
         Ok(Self {
             w_ih,
@@ -13611,6 +13770,33 @@ impl LSTM {
         dropout: f64,
         batch_first: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            input_size,
+            hidden_size,
+            num_layers,
+            bidirectional,
+            dropout,
+            batch_first,
+            DType::F64,
+        )
+    }
+
+    /// Create a stacked LSTM with trainable F32 or F64 parameter leaves.
+    /// Construct at the required dtype before creating an optimizer or loading
+    /// a typed state dict; no parameter IDs are replaced after construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        num_layers: usize,
+        bidirectional: bool,
+        dropout: f64,
+        batch_first: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_layers == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -13633,11 +13819,21 @@ impl LSTM {
             let layer_input_size = if layer == 0 { input_size } else { hidden_dir };
 
             // Forward direction cell
-            cells.push(LSTMCell::new(session, layer_input_size, hidden_size)?);
+            cells.push(LSTMCell::new_with_dtype(
+                session,
+                layer_input_size,
+                hidden_size,
+                dtype,
+            )?);
 
             // Reverse direction cell (if bidirectional)
             if bidirectional {
-                cells.push(LSTMCell::new(session, layer_input_size, hidden_size)?);
+                cells.push(LSTMCell::new_with_dtype(
+                    session,
+                    layer_input_size,
+                    hidden_size,
+                    dtype,
+                )?);
             }
         }
 
@@ -14173,6 +14369,33 @@ impl GRU {
         dropout: f64,
         batch_first: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            input_size,
+            hidden_size,
+            num_layers,
+            bidirectional,
+            dropout,
+            batch_first,
+            DType::F64,
+        )
+    }
+
+    /// Create a stacked GRU with trainable F32 or F64 parameter leaves.
+    /// Construct at the required dtype before creating an optimizer or loading
+    /// a typed state dict; no parameter IDs are replaced after construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        num_layers: usize,
+        bidirectional: bool,
+        dropout: f64,
+        batch_first: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_layers == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -14194,10 +14417,20 @@ impl GRU {
         for layer in 0..num_layers {
             let layer_input_size = if layer == 0 { input_size } else { hidden_dir };
 
-            cells.push(GRUCell::new(session, layer_input_size, hidden_size)?);
+            cells.push(GRUCell::new_with_dtype(
+                session,
+                layer_input_size,
+                hidden_size,
+                dtype,
+            )?);
 
             if bidirectional {
-                cells.push(GRUCell::new(session, layer_input_size, hidden_size)?);
+                cells.push(GRUCell::new_with_dtype(
+                    session,
+                    layer_input_size,
+                    hidden_size,
+                    dtype,
+                )?);
             }
         }
 
@@ -14676,6 +14909,20 @@ impl RNN {
         hidden_size: usize,
         config: RNNConfig,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, input_size, hidden_size, config, DType::F64)
+    }
+
+    /// Create a stacked tanh or ReLU RNN with trainable F32 or F64 leaves.
+    /// Construct at the required dtype before creating an optimizer or loading
+    /// a typed state dict; no parameter IDs are replaced after construction.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        config: RNNConfig,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let num_layers = config.num_layers;
         let use_tanh = config.use_tanh;
         let bidirectional = config.bidirectional;
@@ -14702,19 +14949,21 @@ impl RNN {
         for layer in 0..num_layers {
             let layer_input_size = if layer == 0 { input_size } else { hidden_dir };
 
-            cells.push(RNNCell::new(
+            cells.push(RNNCell::new_with_dtype(
                 session,
                 layer_input_size,
                 hidden_size,
                 use_tanh,
+                dtype,
             )?);
 
             if bidirectional {
-                cells.push(RNNCell::new(
+                cells.push(RNNCell::new_with_dtype(
                     session,
                     layer_input_size,
                     hidden_size,
                     use_tanh,
+                    dtype,
                 )?);
             }
         }
@@ -15155,15 +15404,47 @@ impl TransformerEncoderLayer {
         activation: TransformerActivation,
         norm_first: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout_p,
+            activation,
+            norm_first,
+            DType::F64,
+        )
+    }
+
+    /// Create an encoder layer with trainable F32 or F64 parameter leaves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        dim_feedforward: usize,
+        dropout_p: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         validate_dropout_probability(
             dropout_p,
             "TransformerEncoderLayer dropout probability must be finite and in [0, 1]",
         )?;
-        let self_attn = MultiheadAttention::new_with_dropout(session, d_model, nhead, dropout_p)?;
-        let linear1 = Linear::new(session, d_model, dim_feedforward, true)?;
-        let linear2 = Linear::new(session, dim_feedforward, d_model, true)?;
-        let norm1 = LayerNorm::new(session, vec![d_model], 1e-5)?;
-        let norm2 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        if dim_feedforward == 0 {
+            return Err(incompatible_error(
+                "Transformer feedforward dimension must be positive",
+            ));
+        }
+        let self_attn = MultiheadAttention::new_with_dropout_and_dtype(
+            session, d_model, nhead, dropout_p, dtype,
+        )?;
+        let linear1 = Linear::new_with_dtype(session, d_model, dim_feedforward, true, dtype)?;
+        let linear2 = Linear::new_with_dtype(session, dim_feedforward, d_model, true, dtype)?;
+        let norm1 = LayerNorm::new_with_dtype(session, vec![d_model], 1e-5, dtype)?;
+        let norm2 = LayerNorm::new_with_dtype(session, vec![d_model], 1e-5, dtype)?;
         let dropout = Dropout::new(dropout_p);
         let dropout1 = Dropout::new(dropout_p);
         let dropout2 = Dropout::new(dropout_p);
@@ -15189,10 +15470,7 @@ impl TransformerEncoderLayer {
         session: &mut FrankenTorchSession,
         x: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = {
-            let (_, meta) = session.tensor_values_meta(x)?;
-            meta.shape().to_vec()
-        };
+        let shape = session.tensor_shape(x)?;
         // x is [batch, seq_len, d_model], Linear expects [batch, features]
         // Reshape to [batch*seq_len, d_model]
         let batch_seq = shape[0] * shape[1];
@@ -15367,13 +15645,43 @@ impl TransformerEncoder {
         norm_first: bool,
         final_layer_norm: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            d_model,
+            nhead,
+            num_layers,
+            dim_feedforward,
+            dropout,
+            activation,
+            norm_first,
+            final_layer_norm,
+            DType::F64,
+        )
+    }
+
+    /// Create an encoder stack with F32 or F64 parameters, including its
+    /// optional final normalization. Parameters are trainable leaf tensors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        num_layers: usize,
+        dim_feedforward: usize,
+        dropout: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        final_layer_norm: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         validate_dropout_probability(
             dropout,
             "TransformerEncoder dropout probability must be finite and in [0, 1]",
         )?;
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            layers.push(TransformerEncoderLayer::new(
+            layers.push(TransformerEncoderLayer::new_with_dtype(
                 session,
                 d_model,
                 nhead,
@@ -15381,11 +15689,17 @@ impl TransformerEncoder {
                 dropout,
                 activation,
                 norm_first,
+                dtype,
             )?);
         }
 
         let final_norm = if final_layer_norm {
-            Some(LayerNorm::new(session, vec![d_model], 1e-5)?)
+            Some(LayerNorm::new_with_dtype(
+                session,
+                vec![d_model],
+                1e-5,
+                dtype,
+            )?)
         } else {
             None
         };
@@ -15518,17 +15832,51 @@ impl TransformerDecoderLayer {
         activation: TransformerActivation,
         norm_first: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout_p,
+            activation,
+            norm_first,
+            DType::F64,
+        )
+    }
+
+    /// Create a decoder layer with trainable F32 or F64 parameter leaves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        dim_feedforward: usize,
+        dropout_p: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         validate_dropout_probability(
             dropout_p,
             "TransformerDecoderLayer dropout probability must be finite and in [0, 1]",
         )?;
-        let self_attn = MultiheadAttention::new_with_dropout(session, d_model, nhead, dropout_p)?;
-        let cross_attn = MultiheadAttention::new_with_dropout(session, d_model, nhead, dropout_p)?;
-        let linear1 = Linear::new(session, d_model, dim_feedforward, true)?;
-        let linear2 = Linear::new(session, dim_feedforward, d_model, true)?;
-        let norm1 = LayerNorm::new(session, vec![d_model], 1e-5)?;
-        let norm2 = LayerNorm::new(session, vec![d_model], 1e-5)?;
-        let norm3 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        if dim_feedforward == 0 {
+            return Err(incompatible_error(
+                "Transformer feedforward dimension must be positive",
+            ));
+        }
+        let self_attn = MultiheadAttention::new_with_dropout_and_dtype(
+            session, d_model, nhead, dropout_p, dtype,
+        )?;
+        let cross_attn = MultiheadAttention::new_with_dropout_and_dtype(
+            session, d_model, nhead, dropout_p, dtype,
+        )?;
+        let linear1 = Linear::new_with_dtype(session, d_model, dim_feedforward, true, dtype)?;
+        let linear2 = Linear::new_with_dtype(session, dim_feedforward, d_model, true, dtype)?;
+        let norm1 = LayerNorm::new_with_dtype(session, vec![d_model], 1e-5, dtype)?;
+        let norm2 = LayerNorm::new_with_dtype(session, vec![d_model], 1e-5, dtype)?;
+        let norm3 = LayerNorm::new_with_dtype(session, vec![d_model], 1e-5, dtype)?;
         let dropout = Dropout::new(dropout_p);
         let dropout1 = Dropout::new(dropout_p);
         let dropout2 = Dropout::new(dropout_p);
@@ -15558,10 +15906,7 @@ impl TransformerDecoderLayer {
         session: &mut FrankenTorchSession,
         x: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = {
-            let (_, meta) = session.tensor_values_meta(x)?;
-            meta.shape().to_vec()
-        };
+        let shape = session.tensor_shape(x)?;
         let batch_seq = shape[0] * shape[1];
         let d_model = shape[2];
 
@@ -15792,13 +16137,43 @@ impl TransformerDecoder {
         norm_first: bool,
         final_layer_norm: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            d_model,
+            nhead,
+            num_layers,
+            dim_feedforward,
+            dropout,
+            activation,
+            norm_first,
+            final_layer_norm,
+            DType::F64,
+        )
+    }
+
+    /// Create a decoder stack with F32 or F64 parameters, including its
+    /// optional final normalization. Parameters are trainable leaf tensors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        num_layers: usize,
+        dim_feedforward: usize,
+        dropout: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        final_layer_norm: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         validate_dropout_probability(
             dropout,
             "TransformerDecoder dropout probability must be finite and in [0, 1]",
         )?;
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            layers.push(TransformerDecoderLayer::new(
+            layers.push(TransformerDecoderLayer::new_with_dtype(
                 session,
                 d_model,
                 nhead,
@@ -15806,11 +16181,17 @@ impl TransformerDecoder {
                 dropout,
                 activation,
                 norm_first,
+                dtype,
             )?);
         }
 
         let final_norm = if final_layer_norm {
-            Some(LayerNorm::new(session, vec![d_model], 1e-5)?)
+            Some(LayerNorm::new_with_dtype(
+                session,
+                vec![d_model],
+                1e-5,
+                dtype,
+            )?)
         } else {
             None
         };
@@ -15955,11 +16336,41 @@ impl Transformer {
         activation: TransformerActivation,
         norm_first: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            d_model,
+            nhead,
+            num_encoder_layers,
+            num_decoder_layers,
+            dim_feedforward,
+            dropout,
+            activation,
+            norm_first,
+            DType::F64,
+        )
+    }
+
+    /// Create an encoder-decoder Transformer with trainable F32 or F64 leaves.
+    /// All attention, feedforward, and normalization parameters share `dtype`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        num_encoder_layers: usize,
+        num_decoder_layers: usize,
+        dim_feedforward: usize,
+        dropout: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         validate_dropout_probability(
             dropout,
             "Transformer dropout probability must be finite and in [0, 1]",
         )?;
-        let encoder = TransformerEncoder::new(
+        let encoder = TransformerEncoder::new_with_dtype(
             session,
             d_model,
             nhead,
@@ -15969,9 +16380,10 @@ impl Transformer {
             activation,
             norm_first,
             norm_first, // final_layer_norm when using pre-norm
+            dtype,
         )?;
 
-        let decoder = TransformerDecoder::new(
+        let decoder = TransformerDecoder::new_with_dtype(
             session,
             d_model,
             nhead,
@@ -15981,6 +16393,7 @@ impl Transformer {
             activation,
             norm_first,
             norm_first,
+            dtype,
         )?;
 
         Ok(Self {
@@ -21258,6 +21671,302 @@ mod tests {
 
     use super::*;
 
+    fn typed_constructor_parameters(
+        session: &mut FrankenTorchSession,
+        kind: usize,
+        dtype: Option<DType>,
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        macro_rules! construct {
+            ($module:ident, $($argument:expr),* $(,)?) => {{
+                let module = match dtype {
+                    Some(dtype) => $module::new_with_dtype(session, $($argument,)* dtype)?,
+                    None => $module::new(session, $($argument),*)?,
+                };
+                module.parameters()
+            }};
+        }
+        let activation = TransformerActivation::Gelu;
+        Ok(match kind {
+            0 => construct!(Linear, 2, 3, true),
+            1 => construct!(LayerNorm, vec![2], 1e-5),
+            2 => construct!(MultiheadAttention, 2, 1),
+            3 => {
+                let module = match dtype {
+                    Some(dtype) => {
+                        MultiheadAttention::new_with_dropout_and_dtype(session, 2, 1, 0.2, dtype)?
+                    }
+                    None => MultiheadAttention::new_with_dropout(session, 2, 1, 0.2)?,
+                };
+                module.parameters()
+            }
+            4 => construct!(RNNCell, 2, 3, true),
+            5 => construct!(LSTMCell, 2, 3),
+            6 => construct!(GRUCell, 2, 3),
+            7 => construct!(
+                RNN,
+                2,
+                3,
+                RNNConfig {
+                    num_layers: 2,
+                    bidirectional: true,
+                    ..RNNConfig::default()
+                }
+            ),
+            8 => construct!(LSTM, 2, 3, 2, true, 0.0, true),
+            9 => construct!(GRU, 2, 3, 2, true, 0.0, true),
+            10 => construct!(TransformerEncoderLayer, 2, 1, 3, 0.2, activation, true),
+            11 => construct!(TransformerDecoderLayer, 2, 1, 3, 0.2, activation, true),
+            12 => construct!(TransformerEncoder, 2, 1, 2, 3, 0.2, activation, true, true),
+            13 => construct!(TransformerDecoder, 2, 1, 2, 3, 0.2, activation, true, true),
+            _ => construct!(Transformer, 2, 1, 2, 2, 3, 0.2, activation, true),
+        })
+    }
+
+    #[test]
+    fn typed_model_constructors_preserve_seeded_values_and_trainable_leaves() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for kind in 0..15 {
+                let baseline = FrankenTorchSession::new(mode);
+                let mut original = baseline.clone();
+                let default = typed_constructor_parameters(&mut original, kind, None).unwrap();
+                let expected_values: Vec<_> = default
+                    .iter()
+                    .map(|&id| original.tensor_values(id).unwrap())
+                    .collect();
+                let expected_nodes = original.autograd_graph_node_count();
+                let next = original.rand(vec![8], false).unwrap();
+                let expected_rng = original.tensor_values(next).unwrap();
+                for dtype in [DType::F64, DType::F32] {
+                    let mut typed = baseline.clone();
+                    let parameters = typed.with_no_grad(|session| {
+                        let parameters =
+                            typed_constructor_parameters(session, kind, Some(dtype)).unwrap();
+                        assert!(!session.is_grad_enabled());
+                        parameters
+                    });
+                    assert!(typed.is_grad_enabled());
+                    assert_eq!(parameters.len(), default.len());
+                    assert_eq!(typed.autograd_graph_node_count(), expected_nodes);
+                    for (&parameter, expected) in parameters.iter().zip(&expected_values) {
+                        assert_eq!(typed.tensor_dtype(parameter).unwrap(), dtype);
+                        assert!(typed.tensor_is_leaf(parameter).unwrap());
+                        assert!(typed.tensor_requires_grad(parameter).unwrap());
+                        let expected: Vec<_> = expected
+                            .iter()
+                            .map(|&value| {
+                                if dtype == DType::F32 {
+                                    value as f32 as f64
+                                } else {
+                                    value
+                                }
+                            })
+                            .collect();
+                        assert_eq!(typed.tensor_values_lossy_f64(parameter).unwrap(), expected);
+                    }
+                    let next = typed.rand(vec![8], false).unwrap();
+                    assert_eq!(typed.tensor_values(next).unwrap(), expected_rng);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_model_constructors_reject_unsupported_dtype_without_nodes_or_rng() {
+        for kind in 0..15 {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mut untouched = session.clone();
+            for dtype in [
+                DType::F16,
+                DType::BF16,
+                DType::I64,
+                DType::Bool,
+                DType::Complex64,
+                DType::QInt8,
+            ] {
+                let before = session.autograd_graph_node_count();
+                session.with_no_grad(|session| {
+                    assert!(typed_constructor_parameters(session, kind, Some(dtype)).is_err());
+                    assert!(!session.is_grad_enabled());
+                });
+                assert!(session.is_grad_enabled());
+                assert_eq!(session.autograd_graph_node_count(), before);
+            }
+            let next = session.rand(vec![8], false).unwrap();
+            let expected = untouched.rand(vec![8], false).unwrap();
+            assert_eq!(
+                session.tensor_values(next).unwrap(),
+                untouched.tensor_values(expected).unwrap()
+            );
+        }
+        for dtype in [DType::F64, DType::F32] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mut untouched = session.clone();
+            let before = session.autograd_graph_node_count();
+            assert!(
+                TransformerEncoderLayer::new_with_dtype(
+                    &mut session,
+                    4,
+                    2,
+                    0,
+                    0.0,
+                    TransformerActivation::Relu,
+                    false,
+                    dtype,
+                )
+                .is_err()
+            );
+            assert!(
+                TransformerDecoderLayer::new_with_dtype(
+                    &mut session,
+                    4,
+                    2,
+                    0,
+                    0.0,
+                    TransformerActivation::Relu,
+                    false,
+                    dtype,
+                )
+                .is_err()
+            );
+            assert_eq!(session.autograd_graph_node_count(), before);
+            let next = session.rand(vec![8], false).unwrap();
+            let expected = untouched.rand(vec![8], false).unwrap();
+            assert_eq!(
+                session.tensor_values(next).unwrap(),
+                untouched.tensor_values(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn f32_transformer_public_constructor_trains_and_restores_typed_checkpoint() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let make = |session: &mut FrankenTorchSession| {
+                Transformer::new_with_dtype(
+                    session,
+                    4,
+                    2,
+                    1,
+                    1,
+                    6,
+                    0.0,
+                    TransformerActivation::Gelu,
+                    true,
+                    DType::F32,
+                )
+            };
+            let mut session = FrankenTorchSession::new(mode);
+            let model = session.with_no_grad(make).unwrap();
+            let initial = model.state_dict(&session).unwrap();
+            let source_values: Vec<_> = (0..12).map(|i| (i as f32 - 4.0) * 0.17).collect();
+            let target_values: Vec<_> = (0..8).map(|i| (i as f32 - 3.0) * 0.11).collect();
+            let source = session
+                .tensor_variable_f32(source_values.clone(), vec![1, 3, 4], false)
+                .unwrap();
+            let target = session
+                .tensor_variable_f32(target_values.clone(), vec![1, 2, 4], false)
+                .unwrap();
+            let output = model
+                .forward_transformer(&mut session, source, target)
+                .unwrap();
+            assert_eq!(session.tensor_dtype(output).unwrap(), DType::F32);
+            let upstream = session
+                .tensor_variable_f32(
+                    vec![0.2, -0.7, 1.3, 0.5, -0.4, 0.9, 0.1, -0.3],
+                    vec![1, 2, 4],
+                    false,
+                )
+                .unwrap();
+            let weighted = session.tensor_mul(output, upstream).unwrap();
+            let loss = session.tensor_sum(weighted).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            assert!(session.tensor_gradient(&report, source).is_none());
+            assert!(session.tensor_gradient(&report, target).is_none());
+            // A stateless SGD update through the public parameter API; ft-nn
+            // deliberately does not depend on the optimizer crate.
+            for parameter in model.parameters() {
+                assert!(session.tensor_is_leaf(parameter).unwrap());
+                assert!(session.tensor_requires_grad(parameter).unwrap());
+                let gradient = session.tensor_gradient(&report, parameter).unwrap();
+                assert!(gradient.iter().all(|value| value.is_finite()));
+                let values = session.tensor_values_lossy_f64(parameter).unwrap();
+                let updated = values
+                    .iter()
+                    .zip(gradient)
+                    .map(|(&value, &gradient)| value - 0.025 * gradient)
+                    .collect();
+                session
+                    .tensor_update_param_values(parameter, updated)
+                    .unwrap();
+            }
+            let trained = model.state_dict(&session).unwrap();
+            assert!(
+                trained
+                    .values()
+                    .all(|tensor| tensor.meta().dtype() == DType::F32)
+            );
+            assert!(trained.iter().any(|(name, tensor)| {
+                model_state_storage_bits(tensor) != model_state_storage_bits(&initial[name])
+            }));
+            let typed = trained
+                .iter()
+                .map(|(name, tensor)| {
+                    (
+                        name.clone(),
+                        ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                    )
+                })
+                .collect();
+            let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+            let checkpoint = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+
+            let mut resumed = FrankenTorchSession::new(mode);
+            let _different_ids = resumed.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+            let restored = resumed.with_no_grad(make).unwrap();
+            assert_ne!(model.parameters(), restored.parameters());
+            let report = restored
+                .load_state_dict(&mut resumed, &checkpoint, true)
+                .unwrap();
+            assert!(report.missing_keys.is_empty());
+            assert!(report.unexpected_keys.is_empty());
+            let restored_state = restored.state_dict(&resumed).unwrap();
+            for (name, tensor) in &trained {
+                assert_eq!(
+                    model_state_storage_bits(&restored_state[name]),
+                    model_state_storage_bits(tensor)
+                );
+            }
+            let restored_source = resumed
+                .tensor_variable_f32(source_values, vec![1, 3, 4], false)
+                .unwrap();
+            let restored_target = resumed
+                .tensor_variable_f32(target_values, vec![1, 2, 4], false)
+                .unwrap();
+            model.eval();
+            restored.eval();
+            let expected = session
+                .with_no_grad(|s| model.forward_transformer(s, source, target))
+                .unwrap();
+            let actual = resumed
+                .with_no_grad(|s| restored.forward_transformer(s, restored_source, restored_target))
+                .unwrap();
+            assert_eq!(resumed.tensor_dtype(actual).unwrap(), DType::F32);
+            assert!(!resumed.tensor_requires_grad(actual).unwrap());
+            assert_eq!(
+                session.tensor_values_lossy_f64(expected).unwrap(),
+                resumed.tensor_values_lossy_f64(actual).unwrap()
+            );
+            let output = restored
+                .forward_transformer(&mut resumed, restored_source, restored_target)
+                .unwrap();
+            let loss = resumed.tensor_sum(output).unwrap();
+            let report = resumed.tensor_backward(loss).unwrap();
+            for parameter in restored.parameters() {
+                assert!(resumed.tensor_gradient(&report, parameter).is_some());
+            }
+        }
+    }
+
     struct DummyLeafModule;
 
     impl Module for DummyLeafModule {
@@ -22585,6 +23294,405 @@ mod tests {
             weight_grad.is_some(),
             "weight gradient should flow through Sequential"
         );
+    }
+
+    #[test]
+    fn dropout_family_preserves_dtype_mask_gradients_and_rng() {
+        let cases = [
+            (0, vec![4, 8], 1),
+            (1, vec![8, 4], 4),
+            (1, vec![2, 8, 4], 4),
+            (2, vec![2, 8, 2, 3], 6),
+            (3, vec![2, 8, 2, 2, 2], 8),
+            (4, vec![4, 8], 1),
+            (5, vec![8, 2, 2, 2], 8),
+            (5, vec![2, 8, 2, 2, 2], 8),
+            (0, vec![0], 0),
+            (1, vec![2, 3, 0], 0),
+            (1, vec![0, 4], 4),
+            (2, vec![2, 3, 0, 4], 0),
+            (3, vec![2, 3, 0, 2, 2], 0),
+            (4, vec![0, 3], 3),
+            (5, vec![3, 0, 2, 2], 0),
+            (5, vec![2, 3, 0, 2, 2], 0),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for (kind, shape, spatial) in &cases {
+                    for probability in [0.0, 0.3, 1.0] {
+                        let module: Box<dyn Module> = match kind {
+                            0 => Box::new(Dropout::new(probability)),
+                            1 => Box::new(Dropout1d::new(probability)),
+                            2 => Box::new(Dropout2d::new(probability)),
+                            3 => Box::new(Dropout3d::new(probability)),
+                            4 => Box::new(AlphaDropout::new(probability)),
+                            _ => Box::new(FeatureAlphaDropout::new(probability)),
+                        };
+                        let count: usize = shape.iter().product();
+                        let mut s = FrankenTorchSession::new(mode);
+                        let values: Vec<_> =
+                            (0..count).map(|i| (i % 13) as f64 * 0.125 - 0.75).collect();
+                        let input = packed_recurrent_test_leaf(
+                            &mut s,
+                            values.clone(),
+                            shape.clone(),
+                            dtype,
+                            true,
+                        );
+                        let baseline = s.clone();
+                        let output = module.forward(&mut s, input).unwrap();
+                        assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                        let mut reference = baseline.clone();
+                        if count == 0 {
+                            assert_eq!(output, input);
+                            assert!(s.tensor_requires_grad(output).unwrap());
+                            assert_eq!(
+                                s.autograd_graph_node_count(),
+                                baseline.autograd_graph_node_count()
+                            );
+                            let inferred = s.with_no_grad(|s| module.forward(s, input)).unwrap();
+                            assert_eq!(inferred, input);
+                            assert!(s.tensor_requires_grad(inferred).unwrap());
+                            let next = s.rand(vec![8], false).unwrap();
+                            let expected_next = reference.rand(vec![8], false).unwrap();
+                            assert_eq!(
+                                s.tensor_values(next).unwrap(),
+                                reference.tensor_values(expected_next).unwrap()
+                            );
+                            module.eval();
+                            assert_eq!(module.forward(&mut s, input).unwrap(), input);
+                            continue;
+                        }
+                        let samples = if probability > 0.0 && probability < 1.0 {
+                            let random = reference.rand(vec![count / spatial], false).unwrap();
+                            reference.tensor_values(random).unwrap()
+                        } else {
+                            vec![1.0; count / spatial]
+                        };
+                        let quantize = |value: f64| {
+                            if dtype == DType::F32 {
+                                value as f32 as f64
+                            } else {
+                                value
+                            }
+                        };
+                        let sat = -1.7580993408473766_f64;
+                        let alpha = if probability < 1.0 {
+                            1.0 / ((1.0 - probability) * (1.0 + probability * sat * sat)).sqrt()
+                        } else {
+                            0.0
+                        };
+                        let offset = -alpha * probability * sat;
+                        let mut expected = Vec::with_capacity(count);
+                        let mut derivative = Vec::with_capacity(count);
+                        for (i, &value) in values.iter().enumerate() {
+                            let keep = probability < 1.0 && samples[i / spatial] > probability;
+                            let (value, gradient) = if probability == 0.0 {
+                                (value, 1.0)
+                            } else if probability == 1.0 {
+                                (0.0, 0.0)
+                            } else if *kind >= 4 {
+                                let unscaled = if keep { value } else { quantize(sat) };
+                                (
+                                    quantize(
+                                        quantize(unscaled * quantize(alpha)) + quantize(offset),
+                                    ),
+                                    if keep { quantize(alpha) } else { 0.0 },
+                                )
+                            } else {
+                                let scale = if keep {
+                                    quantize(1.0 / (1.0 - probability))
+                                } else {
+                                    0.0
+                                };
+                                (quantize(value * scale), scale)
+                            };
+                            expected.push(value);
+                            derivative.push(gradient * (i % 5 + 1) as f64);
+                        }
+                        let actual = s.tensor_values_lossy_f64(output).unwrap();
+                        let tolerance = if dtype == DType::F32 { 2e-6 } else { 1e-12 };
+                        for (&actual, &expected) in actual.iter().zip(&expected) {
+                            assert!(
+                                (actual - expected).abs() < tolerance,
+                                "kind {kind}, {dtype:?}, p={probability}: {actual} != {expected}"
+                            );
+                        }
+                        let upstream = packed_recurrent_test_leaf(
+                            &mut s,
+                            (0..count).map(|i| (i % 5 + 1) as f64).collect(),
+                            shape.clone(),
+                            dtype,
+                            false,
+                        );
+                        let weighted = s.tensor_mul(output, upstream).unwrap();
+                        let loss = s.tensor_sum(weighted).unwrap();
+                        let report = s.tensor_backward(loss).unwrap();
+                        for (&actual, expected) in s
+                            .tensor_gradient(&report, input)
+                            .unwrap()
+                            .iter()
+                            .zip(derivative)
+                        {
+                            assert!((actual - expected).abs() < tolerance);
+                        }
+                        let next = s.rand(vec![8], false).unwrap();
+                        let expected_next = reference.rand(vec![8], false).unwrap();
+                        assert_eq!(
+                            s.tensor_values(next).unwrap(),
+                            reference.tensor_values(expected_next).unwrap(),
+                            "dropout must consume exactly one draw per element or channel"
+                        );
+                        let mut inferred = baseline.clone();
+                        let no_grad = inferred.with_no_grad(|s| module.forward(s, input)).unwrap();
+                        assert_eq!(inferred.tensor_values_lossy_f64(no_grad).unwrap(), actual);
+                        if probability > 0.0 {
+                            assert!(!inferred.tensor_requires_grad(no_grad).unwrap());
+                        }
+                        module.eval();
+                        let before = s.autograd_graph_node_count();
+                        assert_eq!(module.forward(&mut s, input).unwrap(), input);
+                        assert_eq!(s.autograd_graph_node_count(), before);
+                        module.train(true);
+                        assert!(module.is_training());
+                    }
+                }
+            }
+        }
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable_f32(Vec::new(), vec![0], true)
+            .unwrap();
+        let mut untouched = session.clone();
+        for probability in [0.3, 1.0] {
+            let spatial_modules: [Box<dyn Module>; 4] = [
+                Box::new(Dropout1d::new(probability)),
+                Box::new(Dropout2d::new(probability)),
+                Box::new(Dropout3d::new(probability)),
+                Box::new(FeatureAlphaDropout::new(probability)),
+            ];
+            for module in spatial_modules {
+                let before = session.autograd_graph_node_count();
+                assert!(
+                    module.forward(&mut session, input).is_err(),
+                    "empty inputs still validate spatial rank"
+                );
+                assert_eq!(session.autograd_graph_node_count(), before);
+            }
+        }
+        let next = session.rand(vec![8], false).unwrap();
+        let expected = untouched.rand(vec![8], false).unwrap();
+        assert_eq!(
+            session.tensor_values(next).unwrap(),
+            untouched.tensor_values(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn alpha_dropout_preserves_theoretical_mean_and_variance() {
+        for dtype in [DType::F64, DType::F32] {
+            for featurewise in [false, true] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let probability = 0.25;
+                let shape = if featurewise {
+                    vec![1, 128, 1, 1, 2]
+                } else {
+                    vec![256]
+                };
+                let input = packed_recurrent_test_leaf(
+                    &mut s,
+                    (0..256)
+                        .map(|i| if i % 2 == 0 { -1.0 } else { 1.0 })
+                        .collect(),
+                    shape,
+                    dtype,
+                    true,
+                );
+                let module: Box<dyn Module> = if featurewise {
+                    Box::new(FeatureAlphaDropout::new(probability))
+                } else {
+                    Box::new(AlphaDropout::new(probability))
+                };
+                let output = module.forward(&mut s, input).unwrap();
+                let values = s.tensor_values_lossy_f64(output).unwrap();
+                let loss = s.tensor_sum(output).unwrap();
+                let report = s.tensor_backward(loss).unwrap();
+                let gradient = s.tensor_gradient(&report, input).unwrap();
+                let mut kept_minus = None;
+                let mut kept_plus = None;
+                let mut dropped = None;
+                for (i, (&value, &gradient)) in values.iter().zip(gradient).enumerate() {
+                    if gradient == 0.0 {
+                        dropped = Some(value);
+                    } else if i % 2 == 0 {
+                        kept_minus = Some(value);
+                    } else {
+                        kept_plus = Some(value);
+                    }
+                }
+                let (minus, plus, dropped) =
+                    (kept_minus.unwrap(), kept_plus.unwrap(), dropped.unwrap());
+                let mean = (1.0 - probability) * 0.5 * (minus + plus) + probability * dropped;
+                let variance =
+                    (1.0 - probability) * 0.5 * ((minus - mean).powi(2) + (plus - mean).powi(2))
+                        + probability * (dropped - mean).powi(2);
+                let tolerance = if dtype == DType::F32 { 2e-6 } else { 1e-12 };
+                assert!(
+                    mean.abs() < tolerance,
+                    "alpha dropout must preserve zero mean: {mean}"
+                );
+                assert!(
+                    (variance - 1.0).abs() < tolerance,
+                    "alpha dropout must preserve unit variance: {variance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f32_mlp_dropout_trains_from_frozen_inputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w1 = s
+            .tensor_variable_f32((1..=8).map(|i| i as f32 * 0.1).collect(), vec![4, 2], true)
+            .unwrap();
+        let b1 = s.tensor_variable_f32(vec![0.1; 4], vec![4], true).unwrap();
+        let w2 = s
+            .tensor_variable_f32((1..=8).map(|i| i as f32 * 0.1).collect(), vec![2, 4], true)
+            .unwrap();
+        let b2 = s.tensor_variable_f32(vec![0.2; 2], vec![2], true).unwrap();
+        let mut model = Sequential::new();
+        model.push(Box::new(Linear::from_parameters(&s, w1, Some(b1)).unwrap()));
+        model.push(Box::new(ReLU));
+        model.push(Box::new(Dropout::new(0.3)));
+        model.push(Box::new(Linear::from_parameters(&s, w2, Some(b2)).unwrap()));
+        let input = s
+            .tensor_variable_f32(vec![0.5; 16], vec![8, 2], false)
+            .unwrap();
+        let output = model.forward(&mut s, input).unwrap();
+        assert_eq!(s.tensor_dtype(output).unwrap(), DType::F32);
+        let loss = s.tensor_sum(output).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert!(s.tensor_gradient(&report, input).is_none());
+        for parameter in [w1, b1, w2, b2] {
+            let gradient = s.tensor_gradient(&report, parameter).unwrap();
+            assert!(gradient.iter().all(|value| value.is_finite()));
+            assert!(gradient.iter().any(|&value| value != 0.0));
+        }
+        model.eval();
+        let evaluated = model.forward(&mut s, input).unwrap();
+        let inferred = s.with_no_grad(|s| model.forward(s, input)).unwrap();
+        assert_eq!(s.tensor_dtype(inferred).unwrap(), DType::F32);
+        assert!(!s.tensor_requires_grad(inferred).unwrap());
+        assert_eq!(
+            s.tensor_values_lossy_f64(evaluated).unwrap(),
+            s.tensor_values_lossy_f64(inferred).unwrap()
+        );
+    }
+
+    #[test]
+    fn f32_transformer_dropout_trains_encoder_decoder_with_frozen_inputs() {
+        for norm_first in [false, true] {
+            for activation in [TransformerActivation::Relu, TransformerActivation::Gelu] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let encoder = TransformerEncoderLayer::new_with_dtype(
+                    &mut s,
+                    4,
+                    2,
+                    6,
+                    0.3,
+                    activation,
+                    norm_first,
+                    DType::F32,
+                )
+                .unwrap();
+                let decoder = TransformerDecoderLayer::new_with_dtype(
+                    &mut s,
+                    4,
+                    2,
+                    6,
+                    0.3,
+                    activation,
+                    norm_first,
+                    DType::F32,
+                )
+                .unwrap();
+                let src = s
+                    .tensor_variable_f32(
+                        (0..12).map(|i| (i as f32 - 4.0) * 0.17).collect(),
+                        vec![1, 3, 4],
+                        false,
+                    )
+                    .unwrap();
+                let tgt = s
+                    .tensor_variable_f32(
+                        (0..8).map(|i| (i as f32 - 3.0) * 0.11).collect(),
+                        vec![1, 2, 4],
+                        false,
+                    )
+                    .unwrap();
+                let upstream = s
+                    .tensor_variable_f32(
+                        vec![0.2, -0.7, 1.3, 0.5, -0.4, 0.9, 0.1, -0.3],
+                        vec![1, 2, 4],
+                        false,
+                    )
+                    .unwrap();
+                let baseline = s.clone();
+                let memory = encoder.forward_layer(&mut s, src).unwrap();
+                let output = decoder.forward_layer(&mut s, tgt, memory).unwrap();
+                assert_eq!(s.tensor_dtype(memory).unwrap(), DType::F32);
+                assert_eq!(s.tensor_dtype(output).unwrap(), DType::F32);
+                let values = s.tensor_values_lossy_f64(output).unwrap();
+                assert!(values.iter().all(|value| value.is_finite()));
+                let weighted = s.tensor_mul(output, upstream).unwrap();
+                let loss = s.tensor_sum(weighted).unwrap();
+                let report = s.tensor_backward(loss).unwrap();
+                assert!(s.tensor_gradient(&report, src).is_none());
+                assert!(s.tensor_gradient(&report, tgt).is_none());
+                for parameter in encoder.parameters().into_iter().chain(decoder.parameters()) {
+                    assert!(
+                        s.tensor_gradient(&report, parameter)
+                            .expect("all Transformer parameters retain a gradient path")
+                            .iter()
+                            .all(|gradient| gradient.is_finite())
+                    );
+                }
+                let mut replay = baseline.clone();
+                let inferred = replay
+                    .with_no_grad(|s| {
+                        let memory = encoder.forward_layer(s, src)?;
+                        decoder.forward_layer(s, tgt, memory)
+                    })
+                    .unwrap();
+                assert_eq!(replay.tensor_dtype(inferred).unwrap(), DType::F32);
+                assert!(!replay.tensor_requires_grad(inferred).unwrap());
+                for (actual, expected) in replay
+                    .tensor_values_lossy_f64(inferred)
+                    .unwrap()
+                    .iter()
+                    .zip(&values)
+                {
+                    assert!((actual - expected).abs() < 1e-5 * (1.0 + expected.abs()));
+                }
+                encoder.eval();
+                decoder.eval();
+                let mut evaluation = baseline.clone();
+                let memory = encoder.forward_layer(&mut evaluation, src).unwrap();
+                let evaluated = decoder.forward_layer(&mut evaluation, tgt, memory).unwrap();
+                assert_eq!(evaluation.tensor_dtype(evaluated).unwrap(), DType::F32);
+                assert_ne!(
+                    evaluation.tensor_values_lossy_f64(evaluated).unwrap(),
+                    values
+                );
+                let next = evaluation.rand(vec![8], false).unwrap();
+                let mut untouched = baseline;
+                let expected_next = untouched.rand(vec![8], false).unwrap();
+                assert_eq!(
+                    evaluation.tensor_values(next).unwrap(),
+                    untouched.tensor_values(expected_next).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -25121,21 +26229,9 @@ mod tests {
     #[test]
     fn mha_dropout_f32_eval_and_no_grad_preserve_dtype() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let mut mha = identity_mha_for_mask_tests(&mut session);
-        mha.dropout_p = 0.5;
-        for projection in [
-            &mut mha.q_proj,
-            &mut mha.k_proj,
-            &mut mha.v_proj,
-            &mut mha.out_proj,
-        ] {
-            projection.weight = session
-                .tensor_to_dtype(projection.weight, DType::F32)
+        let mha =
+            MultiheadAttention::new_with_dropout_and_dtype(&mut session, 4, 2, 0.5, DType::F32)
                 .unwrap();
-            if let Some(bias) = projection.bias {
-                projection.bias = Some(session.tensor_to_dtype(bias, DType::F32).unwrap());
-            }
-        }
         let input = session
             .tensor_variable_f32(vec![0.25; 12], vec![1, 3, 4], true)
             .unwrap();
@@ -38878,11 +39974,17 @@ mod tests {
             bidirectional: bool,
             dropout: f64,
         ) -> Self {
-            let mut model = match kind {
-                0 => Self::Lstm(LSTM::new(session, 2, 2, 2, bidirectional, dropout, true).unwrap()),
-                1 => Self::Gru(GRU::new(session, 2, 2, 2, bidirectional, dropout, true).unwrap()),
+            let model = match kind {
+                0 => Self::Lstm(
+                    LSTM::new_with_dtype(session, 2, 2, 2, bidirectional, dropout, true, dtype)
+                        .unwrap(),
+                ),
+                1 => Self::Gru(
+                    GRU::new_with_dtype(session, 2, 2, 2, bidirectional, dropout, true, dtype)
+                        .unwrap(),
+                ),
                 _ => Self::Rnn(
-                    RNN::new(
+                    RNN::new_with_dtype(
                         session,
                         2,
                         2,
@@ -38893,61 +39995,30 @@ mod tests {
                             batch_first: true,
                             use_tanh: kind == 2,
                         },
+                        dtype,
                     )
                     .unwrap(),
                 ),
             };
             // Explicit, distinct parameters for every layer/direction. Positive
             // biases keep the ReLU case away from nondifferentiable boundaries.
-            let mut cell_index = 0;
-            let mut replace = |parameters: [&mut TensorNodeId; 4]| {
-                for (slot, parameter) in parameters.into_iter().enumerate() {
-                    let shape = session.tensor_shape(*parameter).unwrap();
-                    let count: usize = shape.iter().product();
-                    let values = (0..count)
-                        .map(|i| {
-                            if slot >= 2 {
-                                0.12 + (i + cell_index + slot) as f64 * 0.013
-                            } else {
-                                (((i * 7 + cell_index * 3 + slot * 5) % 17) as f64 - 8.0) * 0.027
-                            }
-                        })
-                        .collect();
-                    *parameter = packed_recurrent_test_leaf(session, values, shape, dtype, true);
-                }
-                cell_index += 1;
-            };
-            match &mut model {
-                Self::Lstm(model) => {
-                    for cell in &mut model.cells {
-                        replace([
-                            &mut cell.w_ih,
-                            &mut cell.w_hh,
-                            &mut cell.b_ih,
-                            &mut cell.b_hh,
-                        ]);
-                    }
-                }
-                Self::Gru(model) => {
-                    for cell in &mut model.cells {
-                        replace([
-                            &mut cell.w_ih,
-                            &mut cell.w_hh,
-                            &mut cell.b_ih,
-                            &mut cell.b_hh,
-                        ]);
-                    }
-                }
-                Self::Rnn(model) => {
-                    for cell in &mut model.cells {
-                        replace([
-                            &mut cell.w_ih,
-                            &mut cell.w_hh,
-                            &mut cell.b_ih,
-                            &mut cell.b_hh,
-                        ]);
-                    }
-                }
+            for (index, parameter) in model.module().parameters().into_iter().enumerate() {
+                let cell_index = index / 4;
+                let slot = index % 4;
+                let shape = session.tensor_shape(parameter).unwrap();
+                let count: usize = shape.iter().product();
+                let values = (0..count)
+                    .map(|i| {
+                        if slot >= 2 {
+                            0.12 + (i + cell_index + slot) as f64 * 0.013
+                        } else {
+                            (((i * 7 + cell_index * 3 + slot * 5) % 17) as f64 - 8.0) * 0.027
+                        }
+                    })
+                    .collect();
+                session
+                    .tensor_update_param_values(parameter, values)
+                    .unwrap();
             }
             model
         }
