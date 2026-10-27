@@ -88,6 +88,9 @@ jobs:
             exit "$status"
           }
           trap gate_fail ERR
+          # Report training regressions before building the workspace's many
+          # examples and running its long kernel suite. The full gate still runs.
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-autograd -p ft-nn -p ft-optim --lib
           run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test --workspace
 
       - name: G3 differential/metamorphic/adversarial parity

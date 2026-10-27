@@ -8409,11 +8409,15 @@ impl TensorTape {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
+            // The contiguous accessors already slice away storage_offset.
+            // Kernels must see that compact buffer at offset zero, including
+            // when a packed input or initial hidden state is a narrow view.
+            let selection_meta = meta.clone().with_storage_offset(0);
             let storage = match meta.dtype() {
                 DType::F64 => {
                     let values = index_select_tensor_contiguous_f64(
                         &input_node.tensor.contiguous_values_as_f64()?,
-                        &meta,
+                        &selection_meta,
                         dim,
                         indices,
                     )
@@ -8423,7 +8427,7 @@ impl TensorTape {
                 DType::F32 => {
                     let values = index_select_tensor_contiguous_f32(
                         input_node.tensor.contiguous_values_f32()?,
-                        &meta,
+                        &selection_meta,
                         dim,
                         indices,
                     )
@@ -10128,6 +10132,7 @@ impl TensorTape {
         let refs: Vec<(&TensorStorage, &ft_core::TensorMeta)> =
             dispatch_inputs.iter().map(|(s, m)| (s, m)).collect();
 
+        let requires_grad = requires_grad && self.grad_enabled;
         let outcome =
             dispatch_tensor_join_contiguous_typed(JoinOp::Cat, mode, &refs, dim, requires_grad)
                 .map_err(AutogradError::Dispatch)?;
@@ -27048,6 +27053,135 @@ mod tests {
     }
 
     // ── cat/stack tensor tests ──────────────────────────
+
+    #[test]
+    fn index_select_offset_views_support_packed_rows_and_hidden_state_permutations() {
+        // A time slice flattened for packing, and a layer slice whose batch
+        // axis is sorted before recurrence. Source positions are in the base
+        // tensor, so the expected adjoint also verifies narrow's zero padding.
+        let cases = [
+            (
+                3,
+                vec![9, 2],
+                0,
+                vec![1.0, 2.0, 0.0, 4.0, 5.0, 7.0],
+                vec![8, 9, 10, 11, 6, 7, 14, 15, 16, 17, 20, 21],
+            ),
+            (
+                2,
+                vec![2, 3, 2],
+                1,
+                vec![1.0, 2.0, 0.0],
+                vec![8, 9, 10, 11, 6, 7, 14, 15, 16, 17, 12, 13],
+            ),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for (length, shape, dim, indices, source_positions) in &cases {
+                    for empty in [false, true] {
+                        let mut tape = TensorTape::new();
+                        let storage = DenseTensor::from_contiguous_values(
+                            (1..=30).map(f64::from).collect(),
+                            vec![5, 3, 2],
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                        let base = tape.leaf_tensor(storage, true);
+                        let sliced = tape.narrow(base, 0, 1, *length).unwrap();
+                        let view = tape.reshape(sliced, shape.clone()).unwrap();
+                        assert_eq!(tape.tensor_meta(view).unwrap().storage_offset(), 6);
+                        let indices = if empty { &[][..] } else { indices.as_slice() };
+                        let selected = tape.index_select(view, *dim, indices).unwrap();
+                        let mut output_shape = shape.clone();
+                        output_shape[*dim] = indices.len();
+                        let expected: Vec<f64> = if empty {
+                            Vec::new()
+                        } else {
+                            source_positions.iter().map(|&i| (i + 1) as f64).collect()
+                        };
+                        assert_eq!(tape.tensor_meta(selected).unwrap().shape(), output_shape);
+                        assert_eq!(tape.tensor_meta(selected).unwrap().dtype(), dtype);
+                        assert_eq!(
+                            tape.tensor(selected)
+                                .unwrap()
+                                .contiguous_values_as_f64()
+                                .unwrap(),
+                            expected
+                        );
+                        assert!(tape.node(selected).unwrap().requires_grad);
+                        tape.set_grad_enabled(false);
+                        let detached = tape.index_select(view, *dim, indices).unwrap();
+                        assert!(!tape.node(detached).unwrap().requires_grad);
+                        tape.set_grad_enabled(true);
+
+                        let weights: Vec<f64> = (1..=expected.len()).map(|i| i as f64).collect();
+                        let seed = DenseTensor::from_contiguous_values(
+                            weights.clone(),
+                            output_shape,
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                        let seed = tape.leaf_tensor(seed, false);
+                        let (weighted, _) = tape.mul(selected, seed, mode).unwrap();
+                        let (loss, _) = tape.sum(weighted, mode).unwrap();
+                        let report = tape.backward(loss).unwrap();
+                        let mut expected_gradient = vec![0.0; 30];
+                        if !empty {
+                            for (&position, weight) in source_positions.iter().zip(weights) {
+                                expected_gradient[position] += weight;
+                            }
+                        }
+                        assert_eq!(report.gradient(base).unwrap(), expected_gradient);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_cat_of_offset_views_respects_no_grad_and_restores_recording() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let mut tape = TensorTape::new();
+                let storage = DenseTensor::from_contiguous_values(
+                    (0..8).map(f64::from).collect(),
+                    vec![4, 2],
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let base = tape.leaf_tensor(storage, true);
+                tape.set_grad_enabled(false);
+                let view = tape.narrow(base, 0, 1, 2).unwrap();
+                let (detached, _) = tape.cat(&[view, view], 0, mode).unwrap();
+                assert!(!tape.node(detached).unwrap().requires_grad);
+                assert!(tape.node(base).unwrap().requires_grad);
+                assert_eq!(tape.tensor_meta(detached).unwrap().dtype(), dtype);
+                assert_eq!(
+                    tape.tensor(detached)
+                        .unwrap()
+                        .contiguous_values_as_f64()
+                        .unwrap(),
+                    [2.0, 3.0, 4.0, 5.0, 2.0, 3.0, 4.0, 5.0]
+                );
+                tape.set_grad_enabled(true);
+                let view = tape.narrow(base, 0, 1, 2).unwrap();
+                let (joined, _) = tape.cat(&[view, view], 0, mode).unwrap();
+                let (loss, _) = tape.sum(joined, mode).unwrap();
+                let report = tape.backward(loss).unwrap();
+                assert_eq!(
+                    report.gradient(base).unwrap(),
+                    [0.0, 0.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0]
+                );
+                assert!(report.gradient(detached).is_none());
+            }
+        }
+    }
 
     #[test]
     fn tensor_cat_dim0_forward() {
