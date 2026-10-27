@@ -29828,6 +29828,9 @@ impl FrankenTorchSession {
             return Ok(input);
         }
         let shape = self.tensor_shape(input)?;
+        if shape.contains(&0) {
+            return Ok(input);
+        }
         if p >= 1.0 {
             // p >= 1 → all elements dropped → output is zero, with
             // gradient also zero. Preserve the input's tape edge by
@@ -29880,6 +29883,13 @@ impl FrankenTorchSession {
             return Ok(input);
         }
         let shape = self.tensor_shape(input)?;
+        if shape.contains(&0) {
+            return Ok(input);
+        }
+        if p == 1.0 {
+            let zeros = self.zeros_like(input, false)?;
+            return self.tensor_mul(input, zeros);
+        }
         let numel = Self::checked_shape_numel(&shape, "alpha_dropout: shape overflow")?;
         let alpha = 1.6732632423543772;
         let scale = 1.0507009873554805;
@@ -29887,19 +29897,24 @@ impl FrankenTorchSession {
         let a = ((1.0 - p) * (1.0 + p * alpha_p * alpha_p)).sqrt().recip();
         let b = -a * alpha_p * p;
         let mask_vals: Vec<f64> = (0..numel)
-            .map(|_| {
-                if self.rng.next_f64() < p {
-                    alpha_p
-                } else {
-                    1.0
-                }
-            })
+            .map(|_| if self.rng.next_f64() < p { 0.0 } else { 1.0 })
             .collect();
-        let mask = self.tensor_variable(mask_vals, shape.clone(), false)?;
+        let mask = self.tensor_variable(mask_vals, shape, false)?;
+        let mask = match self.tensor_dtype(input)? {
+            dtype @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_to_dtype(mask, dtype)?,
+            _ => mask,
+        };
+        // Dropped elements saturate at SELU's negative fixed point. Their
+        // values and derivatives must be independent of the input.
         let masked = self.tensor_mul(input, mask)?;
-        let a_t = self.full(shape.clone(), a, false)?;
-        let b_t = self.full(shape, b, false)?;
-        let scaled = self.tensor_mul(masked, a_t)?;
+        let ones = self.ones_like(input, false)?;
+        let dropped = self.tensor_sub(ones, mask)?;
+        let saturation = self.full_like(input, alpha_p, false)?;
+        let dropped = self.tensor_mul(dropped, saturation)?;
+        let saturated = self.tensor_add(masked, dropped)?;
+        let a_t = self.full_like(input, a, false)?;
+        let b_t = self.full_like(input, b, false)?;
+        let scaled = self.tensor_mul(saturated, a_t)?;
         self.tensor_add(scaled, b_t)
     }
 
@@ -29927,6 +29942,13 @@ impl FrankenTorchSession {
                 "dropout1d: input must be 3-D [N, C, L]",
             ));
         }
+        if shape.contains(&0) {
+            return Ok(input);
+        }
+        if p == 1.0 {
+            let zeros = self.zeros_like(input, false)?;
+            return self.tensor_mul(input, zeros);
+        }
         let (n, c, l) = (shape[0], shape[1], shape[2]);
         let scale = 1.0 / (1.0 - p);
 
@@ -29941,6 +29963,10 @@ impl FrankenTorchSession {
         }
 
         let mask = self.tensor_variable(mask_vals, shape, false)?;
+        let mask = match self.tensor_dtype(input)? {
+            dtype @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_to_dtype(mask, dtype)?,
+            _ => mask,
+        };
         self.tensor_mul(input, mask)
     }
 
@@ -29968,6 +29994,13 @@ impl FrankenTorchSession {
                 "dropout2d: input must be 4-D [N, C, H, W]",
             ));
         }
+        if shape.contains(&0) {
+            return Ok(input);
+        }
+        if p == 1.0 {
+            let zeros = self.zeros_like(input, false)?;
+            return self.tensor_mul(input, zeros);
+        }
         let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         let spatial = h * w;
         let scale = 1.0 / (1.0 - p);
@@ -29983,6 +30016,10 @@ impl FrankenTorchSession {
         }
 
         let mask = self.tensor_variable(mask_vals, shape, false)?;
+        let mask = match self.tensor_dtype(input)? {
+            dtype @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_to_dtype(mask, dtype)?,
+            _ => mask,
+        };
         self.tensor_mul(input, mask)
     }
 
@@ -30010,6 +30047,13 @@ impl FrankenTorchSession {
                 "dropout3d: input must be 5-D [N, C, D, H, W]",
             ));
         }
+        if shape.contains(&0) {
+            return Ok(input);
+        }
+        if p == 1.0 {
+            let zeros = self.zeros_like(input, false)?;
+            return self.tensor_mul(input, zeros);
+        }
         let (n, c, d, h, w) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
         let spatial = d * h * w;
         let scale = 1.0 / (1.0 - p);
@@ -30025,6 +30069,10 @@ impl FrankenTorchSession {
         }
 
         let mask = self.tensor_variable(mask_vals, shape, false)?;
+        let mask = match self.tensor_dtype(input)? {
+            dtype @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_to_dtype(mask, dtype)?,
+            _ => mask,
+        };
         self.tensor_mul(input, mask)
     }
 
@@ -146619,6 +146667,287 @@ mod tests {
             .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
             .unwrap();
         assert!(s.functional_dropout(t, 1.1, true).is_err());
+    }
+
+    #[test]
+    fn functional_alpha_dropout_matches_seeded_saturation_and_weighted_gradient() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for p in [0.25_f64, 0.65] {
+                    let mut s = FrankenTorchSession::new(mode);
+                    s.rng = super::Xoshiro256PlusPlus::new(314);
+                    let shape = vec![2, 3, 4];
+                    let values: Vec<f64> = (0..24).map(|i| (i as f64 - 12.0) / 4.0).collect();
+                    let input = s.tensor_variable_from_storage(
+                        DenseTensor::from_contiguous_values(
+                            values.clone(),
+                            shape.clone(),
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap(),
+                        true,
+                    );
+                    let saved_rng = s.rng.clone();
+                    let mut oracle_rng = saved_rng.clone();
+                    let kept: Vec<bool> =
+                        values.iter().map(|_| oracle_rng.next_f64() >= p).collect();
+                    assert!(kept.iter().any(|&keep| keep));
+                    assert!(kept.iter().any(|&keep| !keep));
+
+                    // Independently select either x or SELU's saturation value;
+                    // dropped values never multiply the input in this oracle.
+                    let saturation = -1.7580993408473766_f64;
+                    let a = ((1.0 - p) * (1.0 + p * saturation * saturation))
+                        .sqrt()
+                        .recip();
+                    let b = -a * saturation * p;
+                    let expected: Vec<f64> = values
+                        .iter()
+                        .zip(&kept)
+                        .map(|(&x, &keep)| {
+                            let selected = if keep { x } else { saturation };
+                            if dtype == DType::F32 {
+                                f64::from((selected as f32) * (a as f32) + (b as f32))
+                            } else {
+                                selected * a + b
+                            }
+                        })
+                        .collect();
+                    let output = s.functional_alpha_dropout(input, p, true).unwrap();
+                    assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                    assert_eq!(s.tensor_values_lossy_f64(output).unwrap(), expected);
+                    assert_eq!(s.rng.s, oracle_rng.s, "one draw per input element");
+
+                    let weights: Vec<f64> = (0..24).map(|i| (i % 7) as f64 / 4.0 - 0.5).collect();
+                    let upstream = s.tensor_variable_from_storage(
+                        DenseTensor::from_contiguous_values(weights.clone(), shape, Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap(),
+                        false,
+                    );
+                    let weighted = s.tensor_mul(output, upstream).unwrap();
+                    let loss = s.tensor_sum(weighted).unwrap();
+                    let report = s.tensor_backward(loss).unwrap();
+                    let gradient = s.tensor_gradient(&report, input).unwrap();
+                    let a_typed = if dtype == DType::F32 {
+                        f64::from(a as f32)
+                    } else {
+                        a
+                    };
+                    for ((&actual, &weight), &keep) in gradient.iter().zip(&weights).zip(&kept) {
+                        let expected = if keep { weight * a_typed } else { 0.0 };
+                        assert!((actual - expected).abs() < 1e-12);
+                    }
+
+                    s.rng = saved_rng;
+                    let untracked = s
+                        .with_no_grad(|s| s.functional_alpha_dropout(input, p, true))
+                        .unwrap();
+                    assert!(!s.tensor_requires_grad(untracked).unwrap());
+                    assert_eq!(s.tensor_values_lossy_f64(untracked).unwrap(), expected);
+                    assert!(s.is_grad_enabled());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn functional_channel_dropout_preserves_dtype_seeded_channels_and_gradients() {
+        type Dropout = fn(
+            &mut FrankenTorchSession,
+            TensorNodeId,
+            f64,
+            bool,
+        ) -> Result<TensorNodeId, AutogradError>;
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for spatial_dims in 1..=3 {
+                    let dropout: Dropout = match spatial_dims {
+                        1 => FrankenTorchSession::functional_dropout1d,
+                        2 => FrankenTorchSession::functional_dropout2d,
+                        _ => FrankenTorchSession::functional_dropout3d,
+                    };
+                    let mut s = FrankenTorchSession::new(mode);
+                    s.rng = super::Xoshiro256PlusPlus::new(314);
+                    let mut shape = vec![2, 4];
+                    shape.extend(std::iter::repeat_n(2, spatial_dims));
+                    let spatial = 1usize << spatial_dims;
+                    let values: Vec<f64> =
+                        (0..8 * spatial).map(|i| (i as f64 - 15.0) / 8.0).collect();
+                    let input = s.tensor_variable_from_storage(
+                        DenseTensor::from_contiguous_values(
+                            values.clone(),
+                            shape.clone(),
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap(),
+                        true,
+                    );
+                    let p = 0.375;
+                    let scale = 1.0 / (1.0 - p);
+                    let scale = if dtype == DType::F32 {
+                        f64::from(scale as f32)
+                    } else {
+                        scale
+                    };
+                    let saved_rng = s.rng.clone();
+                    let mut oracle_rng = saved_rng.clone();
+                    let channel_mask: Vec<f64> = (0..8)
+                        .map(|_| {
+                            if oracle_rng.next_f64() < p {
+                                0.0
+                            } else {
+                                scale
+                            }
+                        })
+                        .collect();
+                    let expected: Vec<f64> = values
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &x)| {
+                            let mask = channel_mask[i / spatial];
+                            if dtype == DType::F32 {
+                                f64::from((x as f32) * (mask as f32))
+                            } else {
+                                x * mask
+                            }
+                        })
+                        .collect();
+                    let output = dropout(&mut s, input, p, true).unwrap();
+                    assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                    assert_eq!(s.tensor_values_lossy_f64(output).unwrap(), expected);
+                    assert_eq!(s.rng.s, oracle_rng.s, "one draw per batch/channel pair");
+
+                    let weights: Vec<f64> = (0..values.len())
+                        .map(|i| (i % 7) as f64 / 4.0 - 0.5)
+                        .collect();
+                    let upstream = s.tensor_variable_from_storage(
+                        DenseTensor::from_contiguous_values(weights.clone(), shape, Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap(),
+                        false,
+                    );
+                    let weighted = s.tensor_mul(output, upstream).unwrap();
+                    let loss = s.tensor_sum(weighted).unwrap();
+                    let report = s.tensor_backward(loss).unwrap();
+                    let gradient = s.tensor_gradient(&report, input).unwrap();
+                    for (i, (&actual, &weight)) in gradient.iter().zip(&weights).enumerate() {
+                        assert!((actual - weight * channel_mask[i / spatial]).abs() < 1e-12);
+                    }
+
+                    s.rng = saved_rng;
+                    let untracked = s.with_no_grad(|s| dropout(s, input, p, true)).unwrap();
+                    assert!(!s.tensor_requires_grad(untracked).unwrap());
+                    assert_eq!(s.tensor_values_lossy_f64(untracked).unwrap(), expected);
+                    assert!(s.is_grad_enabled());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn functional_alpha_and_channel_dropout_endpoints_keep_gradient_edges_and_rng() {
+        type Dropout = fn(
+            &mut FrankenTorchSession,
+            TensorNodeId,
+            f64,
+            bool,
+        ) -> Result<TensorNodeId, AutogradError>;
+        let dropouts: [Dropout; 5] = [
+            FrankenTorchSession::functional_alpha_dropout,
+            FrankenTorchSession::functional_dropout1d,
+            FrankenTorchSession::functional_dropout2d,
+            FrankenTorchSession::functional_dropout3d,
+            FrankenTorchSession::functional_dropout,
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for (kind, dropout) in dropouts.iter().enumerate() {
+                    let mut s = FrankenTorchSession::new(mode);
+                    let shape = vec![2; kind + 2];
+                    let numel = 1usize << shape.len();
+                    let input = s.tensor_variable_from_storage(
+                        DenseTensor::from_contiguous_values(
+                            vec![1.25; numel],
+                            shape.clone(),
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap(),
+                        true,
+                    );
+                    let saved_rng = s.rng.clone();
+                    for (p, training) in [(0.0, true), (0.6, false), (1.0, false)] {
+                        assert_eq!(dropout(&mut s, input, p, training).unwrap(), input);
+                        assert_eq!(s.rng.s, saved_rng.s);
+                    }
+                    let output = dropout(&mut s, input, 1.0, true).unwrap();
+                    assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                    assert!(s.tensor_requires_grad(output).unwrap());
+                    assert_eq!(s.tensor_values_lossy_f64(output).unwrap(), vec![0.0; numel]);
+                    assert_eq!(s.rng.s, saved_rng.s);
+                    let loss = s.tensor_sum(output).unwrap();
+                    let report = s.tensor_backward(loss).unwrap();
+                    assert_eq!(
+                        s.tensor_gradient(&report, input).unwrap(),
+                        &vec![0.0; numel]
+                    );
+                    let untracked = s.with_no_grad(|s| dropout(s, input, 1.0, true)).unwrap();
+                    assert!(!s.tensor_requires_grad(untracked).unwrap());
+                    assert_eq!(
+                        s.tensor_values_lossy_f64(untracked).unwrap(),
+                        vec![0.0; numel]
+                    );
+                    assert_eq!(s.rng.s, saved_rng.s);
+                    for p in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                        let before = s.autograd_graph_node_count();
+                        assert!(dropout(&mut s, input, p, false).is_err());
+                        assert_eq!(s.autograd_graph_node_count(), before);
+                        assert_eq!(s.rng.s, saved_rng.s);
+                    }
+                    // Empty batches and empty spatial dimensions are identity
+                    // operations, including p=1 and no_grad, with no RNG draws.
+                    for empty_dim in [0, shape.len() - 1] {
+                        let mut empty_shape = shape.clone();
+                        empty_shape[empty_dim] = 0;
+                        let empty = s.tensor_variable_from_storage(
+                            DenseTensor::from_contiguous_values(
+                                Vec::new(),
+                                empty_shape,
+                                Device::Cpu,
+                            )
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap(),
+                            true,
+                        );
+                        let before = s.autograd_graph_node_count();
+                        for p in [0.0, 0.6, 1.0] {
+                            for training in [false, true] {
+                                assert_eq!(dropout(&mut s, empty, p, training).unwrap(), empty);
+                                assert_eq!(
+                                    s.with_no_grad(|s| dropout(s, empty, p, training)).unwrap(),
+                                    empty,
+                                );
+                            }
+                        }
+                        for p in [-0.1, 1.1, f64::NAN] {
+                            assert!(dropout(&mut s, empty, p, true).is_err());
+                        }
+                        assert_eq!(s.autograd_graph_node_count(), before);
+                        assert_eq!(s.rng.s, saved_rng.s);
+                        assert!(s.tensor_requires_grad(empty).unwrap());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

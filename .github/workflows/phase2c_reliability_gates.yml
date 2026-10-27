@@ -84,7 +84,7 @@ jobs:
           }
           # Package names differ from the ft-api/ft-autograd directory names.
           # Keep this result visible before the full workspace's long kernel suite.
-          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test -j 2 -p frankentorch-api -p frankentorch-autograd -p ft-nn -p ft-optim --lib
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test -j 2 -p frankentorch-api -p frankentorch-autograd -p ft-nn -p ft-optim --lib --no-fail-fast
 
       - name: G2 unit/property + structured log contract
         shell: bash

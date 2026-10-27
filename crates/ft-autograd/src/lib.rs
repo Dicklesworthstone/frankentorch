@@ -12117,7 +12117,20 @@ impl TensorTape {
         options: BackwardOptions,
     ) -> Result<TensorBackwardReport, AutogradError> {
         if options.create_graph {
-            return self.backward_create_graph(root, options);
+            // Differentiable backward builds a graph even when the caller has
+            // disabled forward recording. Routing adjoints use ordinary tensor
+            // operations (for example, Narrow backward records a Pad), which
+            // must see recording enabled just like the dedicated cg_* helpers.
+            let previous = self.grad_enabled;
+            self.grad_enabled = true;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.backward_create_graph(root, options)
+            }));
+            self.grad_enabled = previous;
+            return match result {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
         }
         if self.consumed && root.0 < self.consumed_boundary {
             return Err(AutogradError::TensorGraphConsumed);
@@ -36487,6 +36500,40 @@ mod tests {
     #[test]
     fn create_graph_index_select_gradient_penalty_third_derivative() {
         check_selection_gradient_penalty_third_derivative(false);
+    }
+
+    #[test]
+    fn create_graph_restores_forward_recording_after_callback_error_or_panic() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for enabled in [false, true] {
+                for should_panic in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let input = tape.leaf(vec![2.0], vec![1], true).unwrap();
+                    let output = tape
+                        .apply_function_with_create_graph(
+                            &[input],
+                            |_ctx, inputs| Ok((inputs[0].0.to_vec(), inputs[0].1.to_vec())),
+                            |_ctx, gradients| Ok(vec![Some(gradients[0].to_vec())]),
+                            move |_ctx, _gradients, _inputs, tape| {
+                                assert!(tape.is_grad_enabled());
+                                assert!(!should_panic, "deliberate create_graph callback panic");
+                                Err(AutogradError::UnknownTensorNode(TensorNodeId(usize::MAX)))
+                            },
+                        )
+                        .unwrap();
+                    tape.set_grad_enabled(enabled);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tape.backward_with_options(output, routing_options(mode, true))
+                    }));
+                    if should_panic {
+                        assert!(result.is_err());
+                    } else {
+                        assert!(result.unwrap().is_err());
+                    }
+                    assert_eq!(tape.is_grad_enabled(), enabled);
+                }
+            }
+        }
     }
 
     #[test]
