@@ -3774,6 +3774,90 @@ impl Module for EmbeddingBag {
     }
 }
 
+fn validate_batch_norm_operands(
+    session: &FrankenTorchSession,
+    input: TensorNodeId,
+    num_features: usize,
+    parameters: [TensorNodeId; 2],
+    buffers: [TensorNodeId; 3],
+) -> Result<(), AutogradError> {
+    if session.tensor_shape(input)?.get(1).copied() != Some(num_features) {
+        return Err(incompatible_error(
+            "BatchNorm input channel dimension does not match num_features",
+        ));
+    }
+    let dtype = session.tensor_dtype(input)?;
+    let device = session.tensor_device(input)?;
+    validate_parameter_dtype(dtype)?;
+    for node in parameters.into_iter().chain(buffers[..2].iter().copied()) {
+        if session.tensor_shape(node)? != [num_features]
+            || session.tensor_dtype(node)? != dtype
+            || session.tensor_device(node)? != device
+        {
+            return Err(incompatible_error(
+                "BatchNorm parameters and running moments must match the input dtype, device, and channels",
+            ));
+        }
+    }
+    if session.tensor_shape(buffers[2])? != [1]
+        || session.tensor_dtype(buffers[2])? != DType::F64
+        || session.tensor_device(buffers[2])? != device
+        || buffers
+            .iter()
+            .any(|&node| session.tensor_requires_grad(node).unwrap_or(true))
+    {
+        return Err(incompatible_error(
+            "BatchNorm running buffers must be non-differentiable with an F64 batch counter",
+        ));
+    }
+    let count = session.tensor_values(buffers[2])?[0];
+    if !count.is_finite() || count < 0.0 || count.fract() != 0.0 {
+        return Err(incompatible_error(
+            "BatchNorm batch counter must be a finite nonnegative integer",
+        ));
+    }
+    Ok(())
+}
+
+fn update_batch_norm_statistics(
+    session: &mut FrankenTorchSession,
+    batch_mean: TensorNodeId,
+    batch_var: TensorNodeId,
+    samples: usize,
+    momentum: Option<f64>,
+    buffers: [TensorNodeId; 3],
+) -> Result<(Vec<f64>, Vec<f64>, u64), AutogradError> {
+    let mean = session.tensor_values_lossy_f64(batch_mean)?;
+    let variance = session.tensor_values_lossy_f64(batch_var)?;
+    // Serialized buffers are authoritative, including after a state-dict load
+    // into a fresh module. Cached getters must not reset restored history.
+    let mut running_mean = session.tensor_values_lossy_f64(buffers[0])?;
+    let mut running_var = session.tensor_values_lossy_f64(buffers[1])?;
+    let count = (session.tensor_values(buffers[2])?[0] as u64).saturating_add(1);
+    let factor = momentum.unwrap_or_else(|| 1.0 / count as f64);
+    let bessel_factor = if samples > 1 {
+        samples as f64 / (samples as f64 - 1.0)
+    } else {
+        1.0
+    };
+    for i in 0..running_mean.len() {
+        running_mean[i] = (1.0 - factor) * running_mean[i] + factor * mean[i];
+        running_var[i] = (1.0 - factor) * running_var[i] + factor * variance[i] * bessel_factor;
+    }
+    // Keep registered buffer IDs stable and round F32 running moments on each
+    // write, so resumed and uninterrupted training use identical stored state.
+    session.with_no_grad(|session| -> Result<(), AutogradError> {
+        session.tensor_update_param_values(buffers[0], running_mean)?;
+        session.tensor_update_param_values(buffers[1], running_var)?;
+        session.tensor_update_param_values(buffers[2], vec![count as f64])
+    })?;
+    Ok((
+        session.tensor_values_lossy_f64(buffers[0])?,
+        session.tensor_values_lossy_f64(buffers[1])?,
+        count,
+    ))
+}
+
 /// Batch Normalization over a batch of 2D inputs `[N, C]`.
 ///
 /// Normalizes each feature across the batch dimension using batch statistics
@@ -3814,6 +3898,20 @@ impl BatchNorm1d {
         eps: f64,
         momentum: Option<f64>,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, num_features, eps, momentum, DType::F64)
+    }
+
+    /// Create F32 or F64 affine parameters and running moments. Parameters
+    /// remain trainable leaves inside no-grad construction regions. The batch
+    /// counter retains the existing F64 checkpoint representation.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        momentum: Option<f64>,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_features == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -3822,12 +3920,12 @@ impl BatchNorm1d {
             )));
         }
 
-        let weight = session.tensor_variable(vec![1.0; num_features], vec![num_features], true)?;
-        let bias = session.tensor_variable(vec![0.0; num_features], vec![num_features], true)?;
-        let running_mean_buffer =
-            session.tensor_variable(vec![0.0; num_features], vec![num_features], false)?;
-        let running_var_buffer =
-            session.tensor_variable(vec![1.0; num_features], vec![num_features], false)?;
+        let weight =
+            initialized_parameter(session, vec![1.0; num_features], vec![num_features], dtype)?;
+        let bias =
+            initialized_parameter(session, vec![0.0; num_features], vec![num_features], dtype)?;
+        let running_mean_buffer = session.zeros_like(weight, false)?;
+        let running_var_buffer = session.ones_like(weight, false)?;
         let num_batches_tracked_buffer = session.tensor_variable(vec![0.0], vec![1], false)?;
 
         Ok(Self {
@@ -3937,64 +4035,24 @@ impl BatchNorm1d {
         let diff_sq = session.tensor_mul(diff, diff)?;
         let batch_var = session.tensor_mean_dim(diff_sq, 0)?;
 
-        // Update running statistics
-        {
-            let mean_vals = session.tensor_values(batch_mean)?;
-            let var_vals = session.tensor_values(batch_var)?;
-            let mut rm = self.running_mean.borrow_mut();
-            let mut rv = self.running_var.borrow_mut();
-            // PyTorch increments num_batches_tracked first, then derives
-            // the averaging factor: `self.momentum` when set, else the
-            // cumulative moving average factor 1/num_batches_tracked.
-            let num_batches_tracked = self.num_batches_tracked.get().saturating_add(1);
-            self.num_batches_tracked.set(num_batches_tracked);
-            let factor = self
-                .momentum
-                .unwrap_or_else(|| 1.0 / num_batches_tracked as f64);
-            // Unbiased variance for running stats: var * N / (N-1)
-            let bessel_factor = if n > 1 {
-                n as f64 / (n as f64 - 1.0)
-            } else {
-                1.0
-            };
-            for i in 0..c {
-                rm[i] = (1.0 - factor) * rm[i] + factor * mean_vals[i];
-                rv[i] = (1.0 - factor) * rv[i] + factor * var_vals[i] * bessel_factor;
-            }
-
-            let running_mean_buffer = session.tensor_variable(rm.clone(), vec![c], false)?;
-            let running_var_buffer = session.tensor_variable(rv.clone(), vec![c], false)?;
-            let num_batches_tracked_buffer =
-                session.tensor_variable(vec![num_batches_tracked as f64], vec![1], false)?;
-
-            self.running_mean_buffer.replace(running_mean_buffer);
-            self.running_var_buffer.replace(running_var_buffer);
-            self.num_batches_tracked_buffer
-                .replace(num_batches_tracked_buffer);
-
-            let mut registered_buffers = self.registered_buffers.borrow_mut();
-            upsert_registered_buffer(
-                &mut registered_buffers,
-                "running_mean",
-                Some(running_mean_buffer),
-                true,
-            );
-            upsert_registered_buffer(
-                &mut registered_buffers,
-                "running_var",
-                Some(running_var_buffer),
-                true,
-            );
-            upsert_registered_buffer(
-                &mut registered_buffers,
-                "num_batches_tracked",
-                Some(num_batches_tracked_buffer),
-                true,
-            );
-        }
+        let (mean, variance, count) = update_batch_norm_statistics(
+            session,
+            batch_mean,
+            batch_var,
+            n,
+            self.momentum,
+            [
+                *self.running_mean_buffer.borrow(),
+                *self.running_var_buffer.borrow(),
+                *self.num_batches_tracked_buffer.borrow(),
+            ],
+        )?;
+        self.running_mean.replace(mean);
+        self.running_var.replace(variance);
+        self.num_batches_tracked.set(count);
 
         // std = sqrt(var + eps) -> [C]
-        let eps_t = session.full(vec![c], self.eps, false)?;
+        let eps_t = session.full_like(batch_var, self.eps, false)?;
         let var_eps = session.tensor_add(batch_var, eps_t)?;
         let std_t = session.tensor_sqrt(var_eps)?;
 
@@ -4027,6 +4085,10 @@ impl BatchNorm1d {
         // Running-stat buffers are maintained as non-grad tensors.
         let mean_t = *self.running_mean_buffer.borrow();
         let var_t = *self.running_var_buffer.borrow();
+        self.running_mean
+            .replace(session.tensor_values_lossy_f64(mean_t)?);
+        self.running_var
+            .replace(session.tensor_values_lossy_f64(var_t)?);
 
         // Expand mean to [N, C]
         let mean_us = session.tensor_unsqueeze(mean_t, 0)?;
@@ -4036,7 +4098,7 @@ impl BatchNorm1d {
         let diff = session.tensor_sub(input, mean_exp)?;
 
         // std = sqrt(var + eps) -> [C]
-        let eps_t = session.full(vec![c], self.eps, false)?;
+        let eps_t = session.full_like(var_t, self.eps, false)?;
         let var_eps = session.tensor_add(var_t, eps_t)?;
         let std_t = session.tensor_sqrt(var_eps)?;
 
@@ -4086,6 +4148,18 @@ impl Module for BatchNorm1d {
                 },
             )));
         }
+
+        validate_batch_norm_operands(
+            session,
+            input,
+            self.num_features,
+            [self.weight, self.bias],
+            [
+                *self.running_mean_buffer.borrow(),
+                *self.running_var_buffer.borrow(),
+                *self.num_batches_tracked_buffer.borrow(),
+            ],
+        )?;
 
         // Fold the optional length dim into the batch: `[N, C, L]` is
         // permuted to `[N, L, C]` and flattened to `[N*L, C]` so the
@@ -9967,6 +10041,19 @@ impl BatchNorm2d {
         eps: f64,
         momentum: Option<f64>,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, num_features, eps, momentum, DType::F64)
+    }
+
+    /// Create F32 or F64 affine parameters and running moments, preserving
+    /// trainable leaves inside no-grad construction regions.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        momentum: Option<f64>,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_features == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -9975,12 +10062,12 @@ impl BatchNorm2d {
             )));
         }
 
-        let weight = session.tensor_variable(vec![1.0; num_features], vec![num_features], true)?;
-        let bias = session.tensor_variable(vec![0.0; num_features], vec![num_features], true)?;
-        let running_mean_buffer =
-            session.tensor_variable(vec![0.0; num_features], vec![num_features], false)?;
-        let running_var_buffer =
-            session.tensor_variable(vec![1.0; num_features], vec![num_features], false)?;
+        let weight =
+            initialized_parameter(session, vec![1.0; num_features], vec![num_features], dtype)?;
+        let bias =
+            initialized_parameter(session, vec![0.0; num_features], vec![num_features], dtype)?;
+        let running_mean_buffer = session.zeros_like(weight, false)?;
+        let running_var_buffer = session.ones_like(weight, false)?;
         let num_batches_tracked_buffer = session.tensor_variable(vec![0.0], vec![1], false)?;
 
         Ok(Self {
@@ -10097,64 +10184,24 @@ impl BatchNorm2d {
         let diff_sq = session.tensor_mul(diff, diff)?;
         let batch_var = session.tensor_mean_dim(diff_sq, 0)?;
 
-        // Update running statistics
-        {
-            let mean_vals = session.tensor_values(batch_mean)?;
-            let var_vals = session.tensor_values(batch_var)?;
-            let mut rm = self.running_mean.borrow_mut();
-            let mut rv = self.running_var.borrow_mut();
-            // PyTorch increments num_batches_tracked first, then derives
-            // the averaging factor: `self.momentum` when set, else the
-            // cumulative moving average factor 1/num_batches_tracked.
-            let num_batches_tracked = self.num_batches_tracked.get().saturating_add(1);
-            self.num_batches_tracked.set(num_batches_tracked);
-            let factor = self
-                .momentum
-                .unwrap_or_else(|| 1.0 / num_batches_tracked as f64);
-            // Unbiased variance for running stats: var * m / (m-1)
-            let bessel_factor = if m > 1 {
-                m as f64 / (m as f64 - 1.0)
-            } else {
-                1.0
-            };
-            for i in 0..c {
-                rm[i] = (1.0 - factor) * rm[i] + factor * mean_vals[i];
-                rv[i] = (1.0 - factor) * rv[i] + factor * var_vals[i] * bessel_factor;
-            }
-
-            let running_mean_buffer = session.tensor_variable(rm.clone(), vec![c], false)?;
-            let running_var_buffer = session.tensor_variable(rv.clone(), vec![c], false)?;
-            let num_batches_tracked_buffer =
-                session.tensor_variable(vec![num_batches_tracked as f64], vec![1], false)?;
-
-            self.running_mean_buffer.replace(running_mean_buffer);
-            self.running_var_buffer.replace(running_var_buffer);
-            self.num_batches_tracked_buffer
-                .replace(num_batches_tracked_buffer);
-
-            let mut registered_buffers = self.registered_buffers.borrow_mut();
-            upsert_registered_buffer(
-                &mut registered_buffers,
-                "running_mean",
-                Some(running_mean_buffer),
-                true,
-            );
-            upsert_registered_buffer(
-                &mut registered_buffers,
-                "running_var",
-                Some(running_var_buffer),
-                true,
-            );
-            upsert_registered_buffer(
-                &mut registered_buffers,
-                "num_batches_tracked",
-                Some(num_batches_tracked_buffer),
-                true,
-            );
-        }
+        let (mean, variance, count) = update_batch_norm_statistics(
+            session,
+            batch_mean,
+            batch_var,
+            m,
+            self.momentum,
+            [
+                *self.running_mean_buffer.borrow(),
+                *self.running_var_buffer.borrow(),
+                *self.num_batches_tracked_buffer.borrow(),
+            ],
+        )?;
+        self.running_mean.replace(mean);
+        self.running_var.replace(variance);
+        self.num_batches_tracked.set(count);
 
         // std = sqrt(var + eps) -> [C]
-        let eps_t = session.full(vec![c], self.eps, false)?;
+        let eps_t = session.full_like(batch_var, self.eps, false)?;
         let var_eps = session.tensor_add(batch_var, eps_t)?;
         let std_t = session.tensor_sqrt(var_eps)?;
 
@@ -10198,6 +10245,10 @@ impl BatchNorm2d {
         // Running-stat buffers are maintained as non-grad tensors.
         let mean_t = *self.running_mean_buffer.borrow();
         let var_t = *self.running_var_buffer.borrow();
+        self.running_mean
+            .replace(session.tensor_values_lossy_f64(mean_t)?);
+        self.running_var
+            .replace(session.tensor_values_lossy_f64(var_t)?);
 
         // Expand mean to [m, C]
         let mean_us = session.tensor_unsqueeze(mean_t, 0)?;
@@ -10207,7 +10258,7 @@ impl BatchNorm2d {
         let diff = session.tensor_sub(flat, mean_exp)?;
 
         // std = sqrt(var + eps) -> [C]
-        let eps_t = session.full(vec![c], self.eps, false)?;
+        let eps_t = session.full_like(var_t, self.eps, false)?;
         let var_eps = session.tensor_add(var_t, eps_t)?;
         let std_t = session.tensor_sqrt(var_eps)?;
 
@@ -10256,6 +10307,18 @@ impl Module for BatchNorm2d {
                 },
             )));
         }
+
+        validate_batch_norm_operands(
+            session,
+            input,
+            self.num_features,
+            [self.weight, self.bias],
+            [
+                *self.running_mean_buffer.borrow(),
+                *self.running_var_buffer.borrow(),
+                *self.num_batches_tracked_buffer.borrow(),
+            ],
+        )?;
 
         if self.training.get() {
             self.forward_train(session, input, &input_shape)
@@ -10409,8 +10472,19 @@ impl BatchNorm3d {
         eps: f64,
         momentum: Option<f64>,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, num_features, eps, momentum, DType::F64)
+    }
+
+    /// Create F32 or F64 affine parameters and running moments.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        momentum: Option<f64>,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
         Ok(Self {
-            inner: BatchNorm2d::new(session, num_features, eps, momentum)?,
+            inner: BatchNorm2d::new_with_dtype(session, num_features, eps, momentum, dtype)?,
         })
     }
 
@@ -10453,6 +10527,18 @@ impl Module for BatchNorm3d {
                 },
             )));
         }
+
+        validate_batch_norm_operands(
+            session,
+            input,
+            self.inner.num_features,
+            [self.inner.weight, self.inner.bias],
+            [
+                *self.inner.running_mean_buffer.borrow(),
+                *self.inner.running_var_buffer.borrow(),
+                *self.inner.num_batches_tracked_buffer.borrow(),
+            ],
+        )?;
 
         let (n, c, d, h, w) = (
             input_shape[0],
@@ -26097,6 +26183,461 @@ mod tests {
     }
 
     // ---- BatchNorm1d tests ----
+
+    fn typed_batchnorm_test_module(
+        session: &mut FrankenTorchSession,
+        kind: usize,
+        features: usize,
+        momentum: Option<f64>,
+        dtype: DType,
+    ) -> Result<Box<dyn Module>, AutogradError> {
+        let module: Box<dyn Module> = match kind {
+            0 | 1 => Box::new(BatchNorm1d::new_with_dtype(
+                session, features, 0.1, momentum, dtype,
+            )?),
+            2 => Box::new(BatchNorm2d::new_with_dtype(
+                session, features, 0.1, momentum, dtype,
+            )?),
+            3 => Box::new(BatchNorm3d::new_with_dtype(
+                session, features, 0.1, momentum, dtype,
+            )?),
+            _ => unreachable!(),
+        };
+        Ok(module)
+    }
+
+    fn typed_batchnorm_test_shape(kind: usize) -> Vec<usize> {
+        match kind {
+            0 => vec![3, 2],
+            1 => vec![2, 2, 3],
+            2 => vec![2, 2, 1, 3],
+            3 => vec![2, 2, 1, 1, 3],
+            _ => unreachable!(),
+        }
+    }
+
+    fn assert_batchnorm_test_state_equal(actual: &StateDict, expected: &StateDict) {
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (name, tensor) in actual {
+            let expected = &expected[name];
+            assert_eq!(tensor.meta().shape(), expected.meta().shape(), "{name}");
+            assert_eq!(tensor.meta().dtype(), expected.meta().dtype(), "{name}");
+            assert_eq!(
+                model_state_storage_bits(tensor),
+                model_state_storage_bits(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn batchnorm_typed_training_and_eval_match_pytorch_numerics() {
+        // Independent CPU PyTorch 2.15 oracle, eps=0.1, momentum=0.25,
+        // gamma=[1.5,-0.5], beta=[0.25,0.75], x=1..numel.
+        // The spatial layouts contain identical channel populations.
+        let flat_output = [
+            -1.5536108361264556,
+            1.3512036120421518,
+            0.25,
+            0.75,
+            2.053610836126455,
+            0.14879638795784822,
+        ];
+        let flat_dx = [
+            -0.024446532417376557,
+            0.13098512431038853,
+            0.0,
+            -0.27555165551931954,
+            0.024446532417376557,
+            0.1445665312089311,
+        ];
+        let spatial_output = [
+            -1.6698976081912718,
+            -1.1899232061434537,
+            -0.7099488040956359,
+            1.3899658693970907,
+            1.229974402047818,
+            1.0699829346985452,
+            1.209948804095636,
+            1.6899232061434541,
+            2.169897608191272,
+            0.43001706530145467,
+            0.270025597952182,
+            0.11003413060290934,
+        ];
+        let spatial_dx = [
+            -0.4180664409190679,
+            0.40141203902776135,
+            -0.09903908665690898,
+            -0.10716152036619371,
+            0.029622993527979674,
+            0.16640750742215307,
+            0.5390156218674087,
+            0.038564496182738515,
+            -0.4618866295019318,
+            -0.16640750742215307,
+            -0.029622993527979674,
+            0.10716152036619371,
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for kind in 0..4 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let model = session
+                        .with_no_grad(|session| {
+                            typed_batchnorm_test_module(session, kind, 2, Some(0.25), dtype)
+                        })
+                        .unwrap();
+                    let parameters = model.parameters();
+                    for &parameter in &parameters {
+                        assert!(session.tensor_is_leaf(parameter).unwrap());
+                        assert!(session.tensor_requires_grad(parameter).unwrap());
+                        assert_eq!(session.tensor_dtype(parameter).unwrap(), dtype);
+                    }
+                    session
+                        .tensor_update_param_values(parameters[0], vec![1.5, -0.5])
+                        .unwrap();
+                    session
+                        .tensor_update_param_values(parameters[1], vec![0.25, 0.75])
+                        .unwrap();
+                    let buffers = named_buffers(model.as_ref(), "");
+                    for (_, buffer) in &buffers {
+                        assert!(!session.tensor_requires_grad(*buffer).unwrap());
+                    }
+                    let shape = typed_batchnorm_test_shape(kind);
+                    let numel: usize = shape.iter().product();
+                    let values: Vec<_> = (1..=numel).map(|i| i as f64).collect();
+                    let input = packed_recurrent_test_leaf(
+                        &mut session,
+                        values.clone(),
+                        shape.clone(),
+                        dtype,
+                        true,
+                    );
+                    let output = model.forward(&mut session, input).unwrap();
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert_eq!(session.tensor_shape(output).unwrap(), shape);
+                    let upstream = packed_recurrent_test_leaf(
+                        &mut session,
+                        (0..numel)
+                            .map(|i| (i * 7 % 11) as f64 / 4.0 - 1.0)
+                            .collect(),
+                        shape.clone(),
+                        dtype,
+                        false,
+                    );
+                    let weighted = session.tensor_mul(output, upstream).unwrap();
+                    let loss = session.tensor_sum(weighted).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    let tolerance = if dtype == DType::F32 { 2e-6 } else { 1e-12 };
+                    let close = |actual: &[f64], expected: &[f64]| {
+                        assert_eq!(actual.len(), expected.len());
+                        for (&actual, &expected) in actual.iter().zip(expected) {
+                            assert!(
+                                (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
+                                "kind={kind} dtype={dtype:?}: {actual} != {expected}",
+                            );
+                        }
+                    };
+                    let (expected_output, expected_dx): (&[f64], &[f64]) = if kind == 0 {
+                        (&flat_output, &flat_dx)
+                    } else {
+                        (&spatial_output, &spatial_dx)
+                    };
+                    close(
+                        &session.tensor_values_lossy_f64(output).unwrap(),
+                        expected_output,
+                    );
+                    close(
+                        session.tensor_gradient(&report, input).unwrap(),
+                        expected_dx,
+                    );
+                    let (dw, db, mean, variance) = if kind == 0 {
+                        (
+                            [1.8036108361264553, -1.5030090301053796],
+                            [-0.75, 1.75],
+                            [0.75, 1.0],
+                            [1.75, 1.75],
+                        )
+                    } else {
+                        (
+                            [0.7999573367463633, -2.7198549449376355],
+                            [0.25, 1.5],
+                            [1.25, 2.0],
+                            [3.65, 3.65],
+                        )
+                    };
+                    close(
+                        session.tensor_gradient(&report, parameters[0]).unwrap(),
+                        &dw,
+                    );
+                    close(
+                        session.tensor_gradient(&report, parameters[1]).unwrap(),
+                        &db,
+                    );
+                    let state = module_state_dict(model.as_ref(), &session).unwrap();
+                    assert_eq!(state.len(), 5);
+                    for name in ["weight", "bias", "running_mean", "running_var"] {
+                        assert_eq!(state[name].meta().dtype(), dtype);
+                    }
+                    assert_eq!(state["num_batches_tracked"].meta().dtype(), DType::F64);
+                    close(
+                        &state["running_mean"].contiguous_values_as_f64().unwrap(),
+                        &mean,
+                    );
+                    close(
+                        &state["running_var"].contiguous_values_as_f64().unwrap(),
+                        &variance,
+                    );
+                    assert_eq!(
+                        state["num_batches_tracked"].contiguous_values().unwrap(),
+                        &[1.0]
+                    );
+                    assert_eq!(named_buffers(model.as_ref(), ""), buffers);
+                    assert_eq!(model.parameters(), parameters);
+
+                    model.eval();
+                    let evaluation = session.with_no_grad(|s| model.forward(s, input)).unwrap();
+                    assert!(!session.tensor_requires_grad(evaluation).unwrap());
+                    assert_eq!(session.tensor_dtype(evaluation).unwrap(), dtype);
+                    let spatial = if kind == 0 { 1 } else { 3 };
+                    let expected: Vec<_> = values
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &value)| {
+                            let channel = i / spatial % 2;
+                            [1.5, -0.5][channel] * (value - mean[channel])
+                                / (variance[channel] + 0.1).sqrt()
+                                + [0.25, 0.75][channel]
+                        })
+                        .collect();
+                    close(
+                        &session.tensor_values_lossy_f64(evaluation).unwrap(),
+                        &expected,
+                    );
+                    assert_batchnorm_test_state_equal(
+                        &module_state_dict(model.as_ref(), &session).unwrap(),
+                        &state,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batchnorm_typed_checkpoints_preserve_running_history_and_buffer_identity() {
+        for dtype in [DType::F32, DType::F64] {
+            for momentum in [Some(0.25), None] {
+                for kind in 0..4 {
+                    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let model = typed_batchnorm_test_module(&mut session, kind, 2, momentum, dtype)
+                        .unwrap();
+                    let buffers = named_buffers(model.as_ref(), "");
+                    let parameters = model.parameters();
+                    let shape = typed_batchnorm_test_shape(kind);
+                    let numel: usize = shape.iter().product();
+                    let first = packed_recurrent_test_leaf(
+                        &mut session,
+                        (1..=numel).map(|i| i as f64).collect(),
+                        shape.clone(),
+                        dtype,
+                        false,
+                    );
+                    model.forward(&mut session, first).unwrap();
+                    let state = module_state_dict(model.as_ref(), &session).unwrap();
+                    let typed = state
+                        .iter()
+                        .map(|(name, tensor)| {
+                            (
+                                name.clone(),
+                                ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                            )
+                        })
+                        .collect();
+                    let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+                    let saved = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+                    let mut resumed = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let _different_ids =
+                        resumed.tensor_variable(vec![1.0], vec![1], false).unwrap();
+                    let restored = resumed
+                        .with_no_grad(|s| typed_batchnorm_test_module(s, kind, 2, momentum, dtype))
+                        .unwrap();
+                    let restored_parameters = restored.parameters();
+                    let restored_buffers = named_buffers(restored.as_ref(), "");
+                    assert_ne!(parameters, restored_parameters);
+                    module_load_state_dict(restored.as_ref(), &mut resumed, &saved, true).unwrap();
+                    assert_batchnorm_test_state_equal(
+                        &module_state_dict(restored.as_ref(), &resumed).unwrap(),
+                        &state,
+                    );
+
+                    let values: Vec<_> = (1..=numel).map(|i| (i * i) as f64 / 10.0 - 2.0).collect();
+                    let input = packed_recurrent_test_leaf(
+                        &mut session,
+                        values.clone(),
+                        shape.clone(),
+                        dtype,
+                        true,
+                    );
+                    let restored_input = packed_recurrent_test_leaf(
+                        &mut resumed,
+                        values,
+                        shape.clone(),
+                        dtype,
+                        true,
+                    );
+                    let output = model.forward(&mut session, input).unwrap();
+                    let restored_output = restored.forward(&mut resumed, restored_input).unwrap();
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(output).unwrap(),
+                        resumed.tensor_values_lossy_f64(restored_output).unwrap(),
+                    );
+                    let updated = module_state_dict(model.as_ref(), &session).unwrap();
+                    assert_batchnorm_test_state_equal(
+                        &module_state_dict(restored.as_ref(), &resumed).unwrap(),
+                        &updated,
+                    );
+                    assert_eq!(
+                        updated["num_batches_tracked"].contiguous_values().unwrap(),
+                        &[2.0]
+                    );
+                    assert_eq!(named_buffers(model.as_ref(), ""), buffers);
+                    assert_eq!(named_buffers(restored.as_ref(), ""), restored_buffers);
+                    assert_eq!(model.parameters(), parameters);
+                    assert_eq!(restored.parameters(), restored_parameters);
+                    let seed: Vec<_> = (0..numel)
+                        .map(|i| (i * 7 % 11) as f64 / 4.0 - 1.0)
+                        .collect();
+                    let seed_original = packed_recurrent_test_leaf(
+                        &mut session,
+                        seed.clone(),
+                        shape.clone(),
+                        dtype,
+                        false,
+                    );
+                    let seed_restored =
+                        packed_recurrent_test_leaf(&mut resumed, seed, shape, dtype, false);
+                    let weighted = session.tensor_mul(output, seed_original).unwrap();
+                    let restored_weighted =
+                        resumed.tensor_mul(restored_output, seed_restored).unwrap();
+                    let loss = session.tensor_sum(weighted).unwrap();
+                    let restored_loss = resumed.tensor_sum(restored_weighted).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    let restored_report = resumed.tensor_backward(restored_loss).unwrap();
+                    for (original, restored) in parameters
+                        .iter()
+                        .zip(&restored_parameters)
+                        .chain(std::iter::once((&input, &restored_input)))
+                    {
+                        assert_eq!(
+                            session.tensor_gradient(&report, *original),
+                            resumed.tensor_gradient(&restored_report, *restored),
+                        );
+                    }
+                    model.eval();
+                    restored.eval();
+                    let evaluation = session.with_no_grad(|s| model.forward(s, input)).unwrap();
+                    let restored_evaluation = resumed
+                        .with_no_grad(|s| restored.forward(s, restored_input))
+                        .unwrap();
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(evaluation).unwrap(),
+                        resumed
+                            .tensor_values_lossy_f64(restored_evaluation)
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batchnorm_typed_preflight_rejects_invalid_models_and_inputs_before_mutation() {
+        for kind in 0..4 {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let nodes = session.autograd_graph_node_count();
+            for dtype in [DType::F16, DType::BF16, DType::I64] {
+                assert!(typed_batchnorm_test_module(&mut session, kind, 2, None, dtype).is_err());
+            }
+            assert!(typed_batchnorm_test_module(&mut session, kind, 0, None, DType::F32).is_err());
+            assert_eq!(session.autograd_graph_node_count(), nodes);
+            for dtype in [DType::F32, DType::F64] {
+                let model =
+                    typed_batchnorm_test_module(&mut session, kind, 2, None, dtype).unwrap();
+                let shape = typed_batchnorm_test_shape(kind);
+                let numel: usize = shape.iter().product();
+                let other_dtype = if dtype == DType::F32 {
+                    DType::F64
+                } else {
+                    DType::F32
+                };
+                let wrong_dtype = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![1.0; numel],
+                    shape.clone(),
+                    other_dtype,
+                    true,
+                );
+                let storage = DenseTensor::from_contiguous_values(
+                    vec![1.0; numel],
+                    shape.clone(),
+                    Device::Metal,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let wrong_device = session.tensor_variable_from_storage(storage, true);
+                let mut wrong_channels = shape.clone();
+                wrong_channels[1] = 3;
+                let wrong_channels = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![1.0; wrong_channels.iter().product()],
+                    wrong_channels,
+                    dtype,
+                    true,
+                );
+                for input in [
+                    wrong_dtype,
+                    wrong_device,
+                    wrong_channels,
+                    TensorNodeId(usize::MAX),
+                ] {
+                    let before = module_state_dict(model.as_ref(), &session).unwrap();
+                    let nodes = session.autograd_graph_node_count();
+                    session.with_no_grad(|s| {
+                        assert!(model.forward(s, input).is_err());
+                        assert!(!s.is_grad_enabled());
+                    });
+                    assert_eq!(session.autograd_graph_node_count(), nodes);
+                    assert_batchnorm_test_state_equal(
+                        &module_state_dict(model.as_ref(), &session).unwrap(),
+                        &before,
+                    );
+                }
+                let input =
+                    packed_recurrent_test_leaf(&mut session, vec![1.0; numel], shape, dtype, false);
+                let counter = named_buffers(model.as_ref(), "")
+                    .into_iter()
+                    .find(|(name, _)| name == "num_batches_tracked")
+                    .unwrap()
+                    .1;
+                session
+                    .tensor_update_param_values(counter, vec![-1.0])
+                    .unwrap();
+                let nodes = session.autograd_graph_node_count();
+                let before = module_state_dict(model.as_ref(), &session).unwrap();
+                assert!(model.forward(&mut session, input).is_err());
+                assert_eq!(session.autograd_graph_node_count(), nodes);
+                assert_batchnorm_test_state_equal(
+                    &module_state_dict(model.as_ref(), &session).unwrap(),
+                    &before,
+                );
+            }
+        }
+    }
 
     #[test]
     fn batchnorm1d_forward_training() {
