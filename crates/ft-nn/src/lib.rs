@@ -3035,7 +3035,21 @@ impl Embedding {
         num_embeddings: usize,
         embedding_dim: usize,
     ) -> Result<Self, AutogradError> {
-        Self::with_options(
+        Self::new_with_dtype(session, num_embeddings, embedding_dim, DType::F64)
+    }
+
+    /// Create an embedding table with trainable F32 or F64 parameters.
+    ///
+    /// Initialization consumes the same random stream as [`Self::new`], then
+    /// rounds to the requested storage dtype. The weight is a trainable leaf
+    /// even when the module is constructed inside a no-grad region.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_embeddings: usize,
+        embedding_dim: usize,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        Self::with_options_and_dtype(
             session,
             num_embeddings,
             embedding_dim,
@@ -3043,13 +3057,16 @@ impl Embedding {
             None,
             2.0,
             false,
+            dtype,
         )
     }
 
-    /// Create a new Embedding with full PyTorch option parity.
+    /// Create an embedding with padding, norm, and sparse-gradient options.
     ///
     /// * `padding_idx` — if set, `weight[padding_idx]` is zeroed and its
     ///   gradient stays zero, matching `torch.nn.Embedding(padding_idx=)`.
+    ///   Loading or explicitly changing this row changes the padding value
+    ///   returned by subsequent lookups without enabling its gradient.
     /// * `max_norm` / `norm_type` — if `max_norm` is set, accessed rows
     ///   whose `norm_type`-norm exceeds it are renormalised in place on
     ///   forward (`torch.embedding_renorm_`).
@@ -3065,6 +3082,33 @@ impl Embedding {
         norm_type: f64,
         sparse: bool,
     ) -> Result<Self, AutogradError> {
+        Self::with_options_and_dtype(
+            session,
+            num_embeddings,
+            embedding_dim,
+            padding_idx,
+            max_norm,
+            norm_type,
+            sparse,
+            DType::F64,
+        )
+    }
+
+    /// Create an F32 or F64 embedding with padding, norm, and sparse-gradient
+    /// options. Invalid options and unsupported dtypes are rejected before
+    /// allocating parameters or consuming randomness.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_options_and_dtype(
+        session: &mut FrankenTorchSession,
+        num_embeddings: usize,
+        embedding_dim: usize,
+        padding_idx: Option<usize>,
+        max_norm: Option<f64>,
+        norm_type: f64,
+        sparse: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_embeddings == 0 || embedding_dim == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -3097,6 +3141,11 @@ impl Embedding {
                 },
             )));
         }
+        checked_mul(
+            num_embeddings,
+            embedding_dim,
+            "Embedding weight size overflow",
+        )?;
 
         // PyTorch default: N(0, 1) initialization
         let weight_init = session.randn(vec![num_embeddings, embedding_dim], false)?;
@@ -3107,8 +3156,12 @@ impl Embedding {
                 *v = 0.0;
             }
         }
-        let weight =
-            session.tensor_variable(weight_values, vec![num_embeddings, embedding_dim], true)?;
+        let weight = initialized_parameter(
+            session,
+            weight_values,
+            vec![num_embeddings, embedding_dim],
+            dtype,
+        )?;
 
         Ok(Self {
             weight,
@@ -3133,29 +3186,22 @@ impl Embedding {
         self.max_norm
     }
 
-    /// Renormalises the rows of `weight` accessed by `flat_indices` in
+    /// Renormalises the rows of `weight` accessed by validated `indices` in
     /// place, matching PyTorch's `torch.embedding_renorm_`: a row whose
     /// `norm_type`-norm exceeds `max_norm` is scaled by
     /// `max_norm / (norm + 1e-7)`. Unaccessed rows are left untouched.
     fn renorm_accessed_rows(
         &self,
         session: &mut FrankenTorchSession,
-        flat_indices: TensorNodeId,
+        indices: &[f64],
         max_norm: f64,
     ) -> Result<(), AutogradError> {
         let dim = self.embedding_dim;
-        let idx_vals = session.tensor_values(flat_indices)?;
-        let mut accessed: Vec<usize> = idx_vals
-            .iter()
-            .filter_map(|&f| {
-                let i = f as usize;
-                (f >= 0.0 && f.fract() == 0.0 && i < self.num_embeddings).then_some(i)
-            })
-            .collect();
+        let mut accessed: Vec<usize> = indices.iter().map(|&index| index as usize).collect();
         accessed.sort_unstable();
         accessed.dedup();
 
-        let mut weight_values = session.tensor_values(self.weight)?;
+        let mut weight_values = session.tensor_values_lossy_f64(self.weight)?;
         let mut changed = false;
         for r in accessed {
             let row = &mut weight_values[r * dim..(r + 1) * dim];
@@ -3176,23 +3222,26 @@ impl Embedding {
             }
         }
         if changed {
-            // Write the renormalised rows back into the leaf weight in
-            // place, under no_grad so the renorm is not taped.
-            session.no_grad_enter();
-            let outcome = (|| -> Result<(), AutogradError> {
-                let renormed = session.tensor_variable(
-                    weight_values,
-                    vec![self.num_embeddings, dim],
-                    false,
-                )?;
-                session.tensor_zero_(self.weight)?;
-                session.tensor_add_(self.weight, renormed)?;
-                Ok(())
-            })();
-            session.no_grad_exit();
-            outcome?;
+            // Retain the leaf identity and storage dtype. This is one
+            // versioned write, with no recorded arithmetic or temporary
+            // zeroing that could corrupt nonfinite unaccessed rows.
+            session.with_no_grad(|session| {
+                session.tensor_update_param_values(self.weight, weight_values)
+            })?;
         }
         Ok(())
+    }
+
+    fn select_rows(
+        &self,
+        session: &mut FrankenTorchSession,
+        indices: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.sparse {
+            session.tensor_index_select_sparse(self.weight, 0, indices)
+        } else {
+            session.tensor_index_select(self.weight, 0, indices)
+        }
     }
 
     /// Access the weight parameter node ID.
@@ -3226,49 +3275,64 @@ impl Module for Embedding {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_shape = { session.tensor_shape(input)? };
-
+        let input_shape = session.tensor_shape(input)?;
         let total = checked_shape_numel(&input_shape, "Embedding input shape overflow")?;
-
-        // Flatten indices to 1D for index_select
-        let flat_indices = session.tensor_reshape(input, vec![total])?;
+        checked_mul(total, self.embedding_dim, "Embedding output size overflow")?;
+        let indices = session.tensor_values(input)?;
+        // Validate before max_norm can mutate the weight or a shape operation
+        // can add a graph node. Generic index_select permits negative indices;
+        // an embedding lookup, like PyTorch, does not.
+        if indices.iter().any(|&index| {
+            !index.is_finite()
+                || index < 0.0
+                || index.fract() != 0.0
+                || index >= self.num_embeddings as f64
+        }) {
+            return Err(incompatible_error(
+                "Embedding indices must be finite nonnegative integers below num_embeddings",
+            ));
+        }
 
         // max_norm: PyTorch renormalises the accessed rows of `weight`
         // in place before the lookup (torch.embedding_renorm_).
         if let Some(max_norm) = self.max_norm {
-            self.renorm_accessed_rows(session, flat_indices, max_norm)?;
+            self.renorm_accessed_rows(session, &indices, max_norm)?;
         }
 
-        // index_select(weight, dim=0, flat_indices) -> [total, embedding_dim]
-        let selected = if self.sparse {
-            session.tensor_index_select_sparse(self.weight, 0, flat_indices)?
-        } else {
-            session.tensor_index_select(self.weight, 0, flat_indices)?
-        };
-
-        // padding_idx: zero the looked-up rows whose index is the
-        // padding index via a non-grad multiplicative mask. This forces
-        // those output rows to the zero vector AND zeroes the gradient
-        // that flows back into `weight[padding_idx]` (d/dselected = mask),
-        // matching PyTorch. Masking the output works for both the dense
-        // and sparse lookup paths.
+        // Exclude padding from the differentiable lookup itself, then restore
+        // the original token order with a detached copy of the padding row.
+        // A zero mask would lose a loaded padding vector and contaminate
+        // nonfinite values; it would also incorrectly include padding in the
+        // support of a sparse gradient. Pure gathers preserve all row values.
         let selected = match self.padding_idx {
-            Some(p) => {
-                let idx_vals = session.tensor_values(flat_indices)?;
-                let mut mask = vec![1.0_f64; total * self.embedding_dim];
-                for (row, &idx_f) in idx_vals.iter().enumerate() {
-                    if idx_f >= 0.0 && idx_f.fract() == 0.0 && idx_f as usize == p {
-                        for v in &mut mask[row * self.embedding_dim..(row + 1) * self.embedding_dim]
-                        {
-                            *v = 0.0;
-                        }
+            Some(p) if indices.contains(&(p as f64)) => {
+                let non_padding_count = indices.iter().filter(|&&index| index != p as f64).count();
+                let mut non_padding = Vec::with_capacity(non_padding_count);
+                let mut positions = Vec::with_capacity(total);
+                for index in indices {
+                    if index == p as f64 {
+                        positions.push(non_padding_count as f64);
+                    } else {
+                        positions.push(non_padding.len() as f64);
+                        non_padding.push(index);
                     }
                 }
-                let mask_node =
-                    session.tensor_variable(mask, vec![total, self.embedding_dim], false)?;
-                session.tensor_mul(selected, mask_node)?
+                let live_indices =
+                    session.tensor_variable(non_padding, vec![non_padding_count], false)?;
+                // Even an all-padding batch retains an empty differentiable
+                // lookup, so backward produces a zero (or empty sparse) weight
+                // gradient rather than dropping the parameter from the graph.
+                let live = self.select_rows(session, live_indices)?;
+                let padding = session.tensor_narrow(self.weight, 0, p, 1)?;
+                let padding = session.tensor_detach(padding)?;
+                let rows = session.tensor_cat(&[live, padding], 0)?;
+                let positions = session.tensor_variable(positions, vec![total], false)?;
+                session.tensor_index_select(rows, 0, positions)?
             }
-            None => selected,
+            _ => {
+                let flat_indices = session.tensor_reshape(input, vec![total])?;
+                self.select_rows(session, flat_indices)?
+            }
         };
 
         // Reshape to [*input_shape, embedding_dim]
@@ -12704,6 +12768,77 @@ impl Module for ConvTranspose3d {
 
 // ── Recurrent Cell Modules ─────────────────────────────────────────────
 
+fn recurrent_cell_gate_size(
+    input_size: usize,
+    hidden_size: usize,
+    gates: usize,
+) -> Result<usize, AutogradError> {
+    let gate_size = checked_mul(hidden_size, gates, "recurrent cell gate size overflow")?;
+    checked_mul(
+        gate_size,
+        input_size,
+        "recurrent cell input weight size overflow",
+    )?;
+    checked_mul(
+        gate_size,
+        hidden_size,
+        "recurrent cell hidden weight size overflow",
+    )?;
+    Ok(gate_size)
+}
+
+/// Check every operand before recording a projection. Ordinary binary tensor
+/// operations broadcast, but cell states may not broadcast across batch rows
+/// or hidden features: that would silently train a different recurrence.
+fn validate_recurrent_cell_inputs(
+    session: &FrankenTorchSession,
+    input: TensorNodeId,
+    states: &[TensorNodeId],
+    parameters: [TensorNodeId; 4],
+    input_size: usize,
+    hidden_size: usize,
+    gates: usize,
+) -> Result<usize, AutogradError> {
+    let input_shape = session.tensor_shape(input)?;
+    if input_shape.len() != 2 || input_shape[1] != input_size {
+        return Err(incompatible_error(
+            "recurrent cell expects input shape [batch, input_size]",
+        ));
+    }
+    let dtype = session.tensor_dtype(input)?;
+    let device = session.tensor_device(input)?;
+    let batch = input_shape[0];
+    let state_shape = [batch, hidden_size];
+    for &state in states {
+        if session.tensor_shape(state)? != state_shape
+            || session.tensor_dtype(state)? != dtype
+            || session.tensor_device(state)? != device
+        {
+            return Err(incompatible_error(
+                "recurrent cell states must match [batch, hidden_size], input dtype, and device",
+            ));
+        }
+    }
+    let gate_size = recurrent_cell_gate_size(input_size, hidden_size, gates)?;
+    let shapes = [
+        vec![gate_size, input_size],
+        vec![gate_size, hidden_size],
+        vec![gate_size],
+        vec![gate_size],
+    ];
+    for (parameter, shape) in parameters.into_iter().zip(shapes) {
+        if session.tensor_shape(parameter)? != shape
+            || session.tensor_dtype(parameter)? != dtype
+            || session.tensor_device(parameter)? != device
+        {
+            return Err(incompatible_error(
+                "recurrent cell parameter shape, dtype, or device does not match the input",
+            ));
+        }
+    }
+    Ok(batch)
+}
+
 fn recurrent_parameter_slots(
     cells: impl IntoIterator<Item = [TensorNodeId; 4]>,
     bidirectional: bool,
@@ -13060,7 +13195,12 @@ impl RNNCell {
         dtype: DType,
     ) -> Result<Self, AutogradError> {
         validate_parameter_dtype(dtype)?;
-        let bound = 1.0 / (hidden_size as f64).sqrt();
+        recurrent_cell_gate_size(input_size, hidden_size, 1)?;
+        let bound = if hidden_size == 0 {
+            0.0
+        } else {
+            1.0 / (hidden_size as f64).sqrt()
+        };
 
         let w_ih = Self::init_weight(session, hidden_size, input_size, bound, dtype)?;
         let w_hh = Self::init_weight(session, hidden_size, hidden_size, bound, dtype)?;
@@ -13085,7 +13225,7 @@ impl RNNCell {
         bound: f64,
         dtype: DType,
     ) -> Result<TensorNodeId, AutogradError> {
-        let numel = rows * cols;
+        let numel = checked_mul(rows, cols, "recurrent cell weight size overflow")?;
         let r = session.rand(vec![numel], false)?;
         let scale = session.full(vec![numel], 2.0 * bound, false)?;
         let scaled = session.tensor_mul(r, scale)?;
@@ -13143,14 +13283,15 @@ impl RNNCell {
         input: TensorNodeId,
         hx: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_shape = { session.tensor_shape(input)? };
-        if input_shape.len() != 2 || input_shape[1] != self.input_size {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "RNNCell expects input shape [batch, input_size]",
-                },
-            )));
-        }
+        validate_recurrent_cell_inputs(
+            session,
+            input,
+            &[hx],
+            [self.w_ih, self.w_hh, self.b_ih, self.b_hh],
+            self.input_size,
+            self.hidden_size,
+            1,
+        )?;
 
         // x @ W_ih^T
         let w_ih_t = session.tensor_transpose(self.w_ih, 0, 1)?;
@@ -13276,8 +13417,12 @@ impl LSTMCell {
         dtype: DType,
     ) -> Result<Self, AutogradError> {
         validate_parameter_dtype(dtype)?;
-        let bound = 1.0 / (hidden_size as f64).sqrt();
-        let gate_size = 4 * hidden_size;
+        let gate_size = recurrent_cell_gate_size(input_size, hidden_size, 4)?;
+        let bound = if hidden_size == 0 {
+            0.0
+        } else {
+            1.0 / (hidden_size as f64).sqrt()
+        };
 
         // W_ih: [4*hidden_size, input_size]
         let w_ih = RNNCell::init_weight(session, gate_size, input_size, bound, dtype)?;
@@ -13311,15 +13456,15 @@ impl LSTMCell {
         hx: TensorNodeId,
         cx: TensorNodeId,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
-        let input_shape = { session.tensor_shape(input)? };
-        if input_shape.len() != 2 || input_shape[1] != self.input_size {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "LSTMCell expects input shape [batch, input_size]",
-                },
-            )));
-        }
-        let batch_size = input_shape[0];
+        let batch_size = validate_recurrent_cell_inputs(
+            session,
+            input,
+            &[hx, cx],
+            [self.w_ih, self.w_hh, self.b_ih, self.b_hh],
+            self.input_size,
+            self.hidden_size,
+            4,
+        )?;
 
         // gates = x @ W_ih^T + h @ W_hh^T + b_ih + b_hh
         let w_ih_t = session.tensor_transpose(self.w_ih, 0, 1)?;
@@ -13337,8 +13482,8 @@ impl LSTMCell {
         let gates = session.tensor_add(sum2, b_hh_exp)?;
         // gates shape: [batch, 4*hidden_size]
 
-        // Split into 4 chunks along dim=1
-        let chunks = session.tensor_chunk(gates, 4, 1)?;
+        // Explicit sizes preserve all four gates even when hidden_size is zero.
+        let chunks = session.tensor_split(gates, &[self.hidden_size; 4], 1)?;
         let i_gate = session.tensor_sigmoid(chunks[0])?;
         let f_gate = session.tensor_sigmoid(chunks[1])?;
         let g_gate = session.tensor_tanh(chunks[2])?;
@@ -13409,8 +13554,11 @@ impl LSTMCell {
 
         // The custom fused function below consumes and returns F64 storage.
         // Typed activations keep the same gate equations on the tensor tape.
-        if session.tensor_dtype(gates)? != DType::F64 || session.tensor_dtype(cx)? != DType::F64 {
-            let chunks = session.tensor_chunk(gates, 4, 1)?;
+        if self.hidden_size == 0
+            || session.tensor_dtype(gates)? != DType::F64
+            || session.tensor_dtype(cx)? != DType::F64
+        {
+            let chunks = session.tensor_split(gates, &[self.hidden_size; 4], 1)?;
             let i_gate = session.tensor_sigmoid(chunks[0])?;
             let f_gate = session.tensor_sigmoid(chunks[1])?;
             let g_gate = session.tensor_tanh(chunks[2])?;
@@ -13548,8 +13696,12 @@ impl GRUCell {
         dtype: DType,
     ) -> Result<Self, AutogradError> {
         validate_parameter_dtype(dtype)?;
-        let bound = 1.0 / (hidden_size as f64).sqrt();
-        let gate_size = 3 * hidden_size;
+        let gate_size = recurrent_cell_gate_size(input_size, hidden_size, 3)?;
+        let bound = if hidden_size == 0 {
+            0.0
+        } else {
+            1.0 / (hidden_size as f64).sqrt()
+        };
 
         let w_ih = RNNCell::init_weight(session, gate_size, input_size, bound, dtype)?;
         let w_hh = RNNCell::init_weight(session, gate_size, hidden_size, bound, dtype)?;
@@ -13578,14 +13730,15 @@ impl GRUCell {
         input: TensorNodeId,
         hx: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_shape = { session.tensor_shape(input)? };
-        if input_shape.len() != 2 || input_shape[1] != self.input_size {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "GRUCell expects input shape [batch, input_size]",
-                },
-            )));
-        }
+        validate_recurrent_cell_inputs(
+            session,
+            input,
+            &[hx],
+            [self.w_ih, self.w_hh, self.b_ih, self.b_hh],
+            self.input_size,
+            self.hidden_size,
+            3,
+        )?;
         // Compute input-side gates: x @ W_ih^T + b_ih
         let w_ih_t = session.tensor_transpose(self.w_ih, 0, 1)?;
         let x_gates = session.tensor_matmul(input, w_ih_t)?;
@@ -13601,9 +13754,9 @@ impl GRUCell {
         let h_gates = session.tensor_add(h_gates, b_hh_exp)?;
 
         // Split x_gates into 3 chunks: [x_r, x_z, x_n]
-        let x_chunks = session.tensor_chunk(x_gates, 3, 1)?;
+        let x_chunks = session.tensor_split(x_gates, &[self.hidden_size; 3], 1)?;
         // Split h_gates into 3 chunks: [h_r, h_z, h_n]
-        let h_chunks = session.tensor_chunk(h_gates, 3, 1)?;
+        let h_chunks = session.tensor_split(h_gates, &[self.hidden_size; 3], 1)?;
 
         // r = sigmoid(x_r + h_r) — reset gate
         let r_sum = session.tensor_add(x_chunks[0], h_chunks[0])?;
@@ -13677,8 +13830,8 @@ impl GRUCell {
         let b_hh_exp = RNNCell::expand_bias(session, self.b_hh, h_gates_shape)?;
         let h_gates = session.tensor_add(h_gates, b_hh_exp)?;
 
-        let x_chunks = session.tensor_chunk(x_gates, 3, 1)?;
-        let h_chunks = session.tensor_chunk(h_gates, 3, 1)?;
+        let x_chunks = session.tensor_split(x_gates, &[self.hidden_size; 3], 1)?;
+        let h_chunks = session.tensor_split(h_gates, &[self.hidden_size; 3], 1)?;
 
         // r = sigmoid(x_r + h_r) — reset gate
         let r_sum = session.tensor_add(x_chunks[0], h_chunks[0])?;
@@ -24455,6 +24608,513 @@ mod tests {
     // ---- Embedding tests ----
 
     #[test]
+    fn embedding_typed_construction_preserves_initialization_and_leaf_training() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for options in [false, true] {
+                let baseline = FrankenTorchSession::new(mode);
+                let mut original = baseline.clone();
+                let default = if options {
+                    Embedding::with_options(&mut original, 4, 3, Some(1), Some(2.0), 2.0, true)
+                } else {
+                    Embedding::new(&mut original, 4, 3)
+                }
+                .unwrap();
+                let expected = original.tensor_values(default.weight()).unwrap();
+                let nodes = original.autograd_graph_node_count();
+                let next = original.rand(vec![4], false).unwrap();
+                let next_values = original.tensor_values(next).unwrap();
+                for dtype in [DType::F32, DType::F64] {
+                    let mut session = baseline.clone();
+                    let embedding = session
+                        .with_no_grad(|session| {
+                            if options {
+                                Embedding::with_options_and_dtype(
+                                    session,
+                                    4,
+                                    3,
+                                    Some(1),
+                                    Some(2.0),
+                                    2.0,
+                                    true,
+                                    dtype,
+                                )
+                            } else {
+                                Embedding::new_with_dtype(session, 4, 3, dtype)
+                            }
+                        })
+                        .unwrap();
+                    assert!(session.is_grad_enabled());
+                    assert!(session.tensor_is_leaf(embedding.weight()).unwrap());
+                    assert!(session.tensor_requires_grad(embedding.weight()).unwrap());
+                    assert_eq!(session.tensor_dtype(embedding.weight()).unwrap(), dtype);
+                    assert_eq!(session.autograd_graph_node_count(), nodes);
+                    let expected: Vec<_> = expected
+                        .iter()
+                        .map(|&value| {
+                            if dtype == DType::F32 {
+                                f64::from(value as f32)
+                            } else {
+                                value
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(embedding.weight()).unwrap(),
+                        expected
+                    );
+                    let next = session.rand(vec![4], false).unwrap();
+                    assert_eq!(session.tensor_values(next).unwrap(), next_values);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_typed_rejects_invalid_configuration_before_nodes_or_randomness() {
+        let invalid = [
+            (4, 2, None, None, 2.0, DType::F16),
+            (4, 2, None, None, 2.0, DType::BF16),
+            (4, 2, None, None, 2.0, DType::I64),
+            (0, 2, None, None, 2.0, DType::F32),
+            (4, 0, None, None, 2.0, DType::F64),
+            (usize::MAX, 2, None, None, 2.0, DType::F32),
+            (4, 2, Some(4), None, 2.0, DType::F32),
+            (4, 2, None, Some(f64::NAN), 2.0, DType::F64),
+            (4, 2, None, Some(0.0), 2.0, DType::F32),
+            (4, 2, None, None, f64::NAN, DType::F64),
+            (4, 2, None, None, 0.0, DType::F32),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let mut untouched = session.clone();
+            let nodes = session.autograd_graph_node_count();
+            for (rows, width, padding, max_norm, norm, dtype) in invalid {
+                assert!(
+                    session
+                        .with_no_grad(|session| Embedding::with_options_and_dtype(
+                            session, rows, width, padding, max_norm, norm, true, dtype,
+                        ))
+                        .is_err()
+                );
+                assert_eq!(session.autograd_graph_node_count(), nodes);
+                assert!(session.is_grad_enabled());
+            }
+            let next = session.rand(vec![4], false).unwrap();
+            let expected = untouched.rand(vec![4], false).unwrap();
+            assert_eq!(
+                session.tensor_values(next).unwrap(),
+                untouched.tensor_values(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_typed_padding_preserves_values_and_dense_or_sparse_gradient_support() {
+        let weights = [0.25, -0.5, 7.5, -2.0, 0.75, 1.25, -1.5, 2.5];
+        let cases = [
+            (
+                vec![2, 1, 0, 2, 3, 1],
+                vec![2, 3],
+                vec![
+                    1.0, -2.0, 8.0, -9.0, 0.5, 1.5, -1.0, 2.0, 0.0, 0.0, 3.0, 4.0,
+                ],
+            ),
+            (vec![1, 1], vec![2], vec![2.0, -3.0, 4.0, 5.0]),
+            (vec![], vec![0, 2], vec![]),
+            (vec![2], vec![], vec![0.25, -0.75]),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for sparse in [false, true] {
+                    for (indices, shape, upstream) in &cases {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let embedding = Embedding::with_options_and_dtype(
+                            &mut session,
+                            4,
+                            2,
+                            Some(1),
+                            None,
+                            2.0,
+                            sparse,
+                            dtype,
+                        )
+                        .unwrap();
+                        session
+                            .tensor_update_param_values(embedding.weight(), weights.to_vec())
+                            .unwrap();
+                        let input = session
+                            .tensor_variable(
+                                indices.iter().map(|&index| index as f64).collect(),
+                                shape.clone(),
+                                false,
+                            )
+                            .unwrap();
+                        let output = embedding.forward(&mut session, input).unwrap();
+                        let mut output_shape = shape.clone();
+                        output_shape.push(2);
+                        assert_eq!(session.tensor_shape(output).unwrap(), output_shape);
+                        assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                        let expected_values: Vec<_> = indices
+                            .iter()
+                            .flat_map(|&index| weights[2 * index..2 * index + 2].iter().copied())
+                            .collect();
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(output).unwrap(),
+                            expected_values
+                        );
+                        let seed = packed_recurrent_test_leaf(
+                            &mut session,
+                            upstream.clone(),
+                            output_shape,
+                            dtype,
+                            false,
+                        );
+                        let weighted = session.tensor_mul(output, seed).unwrap();
+                        let loss = session.tensor_sum(weighted).unwrap();
+                        let report = session.tensor_backward(loss).unwrap();
+                        let mut expected_gradient = vec![0.0; weights.len()];
+                        let mut expected_rows = std::collections::BTreeSet::new();
+                        for (position, &index) in indices.iter().enumerate() {
+                            if index != 1 {
+                                expected_rows.insert(index as i64);
+                                for column in 0..2 {
+                                    expected_gradient[2 * index + column] +=
+                                        upstream[2 * position + column];
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            session
+                                .tensor_gradient(&report, embedding.weight())
+                                .unwrap(),
+                            expected_gradient
+                        );
+                        assert!(session.tensor_gradient(&report, input).is_none());
+                        if sparse {
+                            let gradient = report.sparse_gradient(embedding.weight()).unwrap();
+                            assert_eq!(gradient.dense_shape(), &[4, 2]);
+                            let actual_rows: std::collections::BTreeSet<_> =
+                                gradient.indices().storage().iter().copied().collect();
+                            assert_eq!(actual_rows, expected_rows);
+                            let values = gradient.values().typed_storage().to_f64_vec();
+                            for (row, pair) in
+                                gradient.indices().storage().iter().zip(values.chunks(2))
+                            {
+                                assert_eq!(
+                                    pair,
+                                    &expected_gradient[*row as usize * 2..*row as usize * 2 + 2]
+                                );
+                            }
+                        } else {
+                            assert!(report.sparse_gradient(embedding.weight()).is_none());
+                        }
+                        let inference = session
+                            .with_no_grad(|session| embedding.forward(session, input))
+                            .unwrap();
+                        assert!(!session.tensor_requires_grad(inference).unwrap());
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(inference).unwrap(),
+                            expected_values
+                        );
+                        session
+                            .tensor_requires_grad_(embedding.weight(), false)
+                            .unwrap();
+                        let frozen = embedding.forward(&mut session, input).unwrap();
+                        assert!(!session.tensor_requires_grad(frozen).unwrap());
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(frozen).unwrap(),
+                            expected_values
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_typed_padding_preserves_nonfinite_rows_without_gradient_contamination() {
+        for dtype in [DType::F32, DType::F64] {
+            for sparse in [false, true] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let embedding = Embedding::with_options_and_dtype(
+                    &mut session,
+                    3,
+                    2,
+                    Some(1),
+                    None,
+                    2.0,
+                    sparse,
+                    dtype,
+                )
+                .unwrap();
+                session
+                    .tensor_update_param_values(
+                        embedding.weight(),
+                        vec![2.0, -3.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0],
+                    )
+                    .unwrap();
+                let input = session
+                    .tensor_variable(vec![1.0, 0.0, 2.0], vec![3], false)
+                    .unwrap();
+                let output = embedding.forward(&mut session, input).unwrap();
+                let values = session.tensor_values_lossy_f64(output).unwrap();
+                assert!(values[0].is_nan());
+                assert_eq!(
+                    &values[1..5],
+                    &[f64::INFINITY, 2.0, -3.0, f64::NEG_INFINITY]
+                );
+                assert_eq!(values[5].to_bits(), (-0.0_f64).to_bits());
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert_eq!(
+                    session
+                        .tensor_gradient(&report, embedding.weight())
+                        .unwrap(),
+                    [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_typed_max_norm_updates_accessed_rows_without_changing_padding_gradients() {
+        for dtype in [DType::F32, DType::F64] {
+            for sparse in [false, true] {
+                for norm in [1.0, 2.0, f64::INFINITY] {
+                    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let embedding = Embedding::with_options_and_dtype(
+                        &mut session,
+                        4,
+                        2,
+                        Some(2),
+                        Some(1.0),
+                        norm,
+                        sparse,
+                        dtype,
+                    )
+                    .unwrap();
+                    session
+                        .tensor_update_param_values(
+                            embedding.weight(),
+                            vec![3.0, 4.0, 0.0, 0.5, 6.0, 8.0, f64::NAN, f64::INFINITY],
+                        )
+                        .unwrap();
+                    let version = session
+                        .tensor_snapshot(embedding.weight())
+                        .unwrap()
+                        .version();
+                    let indices = session
+                        .tensor_variable(vec![0.0, 1.0, 0.0, 2.0], vec![4], false)
+                        .unwrap();
+                    let output = embedding.forward(&mut session, indices).unwrap();
+                    let norm0 = if norm == 1.0 {
+                        7.0
+                    } else if norm == 2.0 {
+                        5.0
+                    } else {
+                        4.0
+                    };
+                    let norm2 = 2.0 * norm0;
+                    let expected = [
+                        3.0 / (norm0 + 1e-7),
+                        4.0 / (norm0 + 1e-7),
+                        0.0,
+                        0.5,
+                        3.0 / (norm0 + 1e-7),
+                        4.0 / (norm0 + 1e-7),
+                        6.0 / (norm2 + 1e-7),
+                        8.0 / (norm2 + 1e-7),
+                    ];
+                    let actual = session.tensor_values_lossy_f64(output).unwrap();
+                    let tolerance = if dtype == DType::F32 { 1e-7 } else { 1e-14 };
+                    for (&actual, expected) in actual.iter().zip(expected) {
+                        assert!((actual - expected).abs() < tolerance);
+                    }
+                    let weight = session.tensor_snapshot(embedding.weight()).unwrap();
+                    assert_eq!(weight.meta().dtype(), dtype);
+                    assert_eq!(weight.version(), version + 1);
+                    let values = session.tensor_values_lossy_f64(embedding.weight()).unwrap();
+                    assert!(values[6].is_nan());
+                    assert_eq!(values[7], f64::INFINITY);
+                    assert!(session.tensor_is_leaf(embedding.weight()).unwrap());
+                    assert!(session.is_grad_enabled());
+                    let loss = session.tensor_sum(output).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert_eq!(
+                        session
+                            .tensor_gradient(&report, embedding.weight())
+                            .unwrap(),
+                        [2.0, 2.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_rejects_bad_indices_before_max_norm_or_graph_mutation() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let embedding = Embedding::with_options_and_dtype(
+                &mut session,
+                3,
+                2,
+                Some(1),
+                Some(1.0),
+                2.0,
+                true,
+                dtype,
+            )
+            .unwrap();
+            session
+                .tensor_update_param_values(embedding.weight(), vec![3.0; 6])
+                .unwrap();
+            for invalid in [
+                -1.0,
+                -0.5,
+                0.5,
+                3.0,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ] {
+                let input = session
+                    .tensor_variable(vec![0.0, invalid], vec![2], false)
+                    .unwrap();
+                let before = session.tensor_snapshot(embedding.weight()).unwrap();
+                let nodes = session.autograd_graph_node_count();
+                let mut unchanged = session.clone();
+                assert!(embedding.forward(&mut session, input).is_err());
+                assert_eq!(session.autograd_graph_node_count(), nodes);
+                let after = session.tensor_snapshot(embedding.weight()).unwrap();
+                assert_eq!(before.version(), after.version());
+                assert_eq!(
+                    model_state_storage_bits(&before),
+                    model_state_storage_bits(&after)
+                );
+                let next = session.rand(vec![4], false).unwrap();
+                let expected = unchanged.rand(vec![4], false).unwrap();
+                assert_eq!(
+                    session.tensor_values(next).unwrap(),
+                    unchanged.tensor_values(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_f32_transformer_training_and_checkpoint_roundtrip() {
+        let make = |session: &mut FrankenTorchSession| {
+            let mut model = Sequential::new();
+            model.push(Box::new(
+                Embedding::with_options_and_dtype(
+                    session,
+                    5,
+                    4,
+                    Some(0),
+                    None,
+                    2.0,
+                    false,
+                    DType::F32,
+                )
+                .unwrap(),
+            ));
+            model.push(Box::new(
+                TransformerEncoderLayer::new_with_dtype(
+                    session,
+                    4,
+                    2,
+                    6,
+                    0.0,
+                    TransformerActivation::Gelu,
+                    true,
+                    DType::F32,
+                )
+                .unwrap(),
+            ));
+            model
+        };
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let model = session.with_no_grad(make);
+            let weight = model.parameters()[0];
+            let mut initial_values = session.tensor_values_lossy_f64(weight).unwrap();
+            initial_values[..4].copy_from_slice(&[0.5, -0.25, 0.75, -1.0]);
+            session
+                .tensor_update_param_values(weight, initial_values.clone())
+                .unwrap();
+            let indices = session
+                .tensor_variable(vec![1.0, 0.0, 2.0, 3.0, 1.0, 0.0], vec![2, 3], false)
+                .unwrap();
+            let output = model.forward(&mut session, indices).unwrap();
+            assert_eq!(session.tensor_dtype(output).unwrap(), DType::F32);
+            let loss = session.tensor_sum(output).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            for parameter in model.parameters() {
+                assert!(session.tensor_is_leaf(parameter).unwrap());
+                assert!(session.tensor_requires_grad(parameter).unwrap());
+                let values = session.tensor_values_lossy_f64(parameter).unwrap();
+                let gradient = session.tensor_gradient(&report, parameter).unwrap();
+                assert!(gradient.iter().all(|value| value.is_finite()));
+                let updated = values
+                    .iter()
+                    .zip(gradient)
+                    .map(|(&v, &g)| v - 0.01 * g)
+                    .collect();
+                session
+                    .tensor_update_param_values(parameter, updated)
+                    .unwrap();
+            }
+            let trained = session.tensor_values_lossy_f64(weight).unwrap();
+            assert_eq!(&trained[..4], &initial_values[..4]);
+            assert!(
+                trained[4..16]
+                    .iter()
+                    .zip(&initial_values[4..16])
+                    .any(|(a, b)| a != b)
+            );
+            let snapshot = model.state_dict(&session).unwrap();
+            let typed = snapshot
+                .iter()
+                .map(|(name, tensor)| {
+                    (
+                        name.clone(),
+                        ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                    )
+                })
+                .collect();
+            let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+            let checkpoint = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+            let mut resumed = FrankenTorchSession::new(mode);
+            let _different_ids = resumed.tensor_variable(vec![1.0], vec![1], false).unwrap();
+            let restored = resumed.with_no_grad(make);
+            assert_ne!(model.parameters(), restored.parameters());
+            restored
+                .load_state_dict(&mut resumed, &checkpoint, true)
+                .unwrap();
+            let resumed_indices = resumed
+                .tensor_variable(vec![1.0, 0.0, 2.0, 3.0, 1.0, 0.0], vec![2, 3], false)
+                .unwrap();
+            let expected = model.forward(&mut session, indices).unwrap();
+            let actual = restored.forward(&mut resumed, resumed_indices).unwrap();
+            assert_eq!(
+                session.tensor_values_lossy_f64(expected).unwrap(),
+                resumed.tensor_values_lossy_f64(actual).unwrap()
+            );
+            let loss = session.tensor_sum(expected).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            let restored_loss = resumed.tensor_sum(actual).unwrap();
+            let restored_report = resumed.tensor_backward(restored_loss).unwrap();
+            for (original, restored) in model.parameters().into_iter().zip(restored.parameters()) {
+                assert_eq!(
+                    session.tensor_gradient(&report, original),
+                    resumed.tensor_gradient(&restored_report, restored)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn embedding_forward_basic() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let emb = Embedding::new(&mut session, 5, 3).expect("embedding");
@@ -31654,6 +32314,200 @@ mod tests {
     }
 
     // ── RNN Cell Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn recurrent_cells_reject_invalid_operands_before_graph_or_rng_mutation() {
+        fn reject<T>(
+            session: &mut FrankenTorchSession,
+            operation: impl FnOnce(&mut FrankenTorchSession) -> Result<T, AutogradError>,
+        ) {
+            let nodes = session.autograd_graph_node_count();
+            let mode = session.is_grad_enabled();
+            let mut unchanged = session.clone();
+            assert!(operation(session).is_err());
+            assert_eq!(session.autograd_graph_node_count(), nodes);
+            assert_eq!(session.is_grad_enabled(), mode);
+            let next = session.rand(vec![3], false).unwrap();
+            let expected = unchanged.rand(vec![3], false).unwrap();
+            assert_eq!(
+                session.tensor_values(next).unwrap(),
+                unchanged.tensor_values(expected).unwrap()
+            );
+        }
+
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let rnn = RNNCell::new_with_dtype(&mut session, 2, 2, true, dtype).unwrap();
+                let lstm = LSTMCell::new_with_dtype(&mut session, 2, 2, dtype).unwrap();
+                let gru = GRUCell::new_with_dtype(&mut session, 2, 2, dtype).unwrap();
+                let input =
+                    packed_recurrent_test_leaf(&mut session, vec![0.1; 4], vec![2, 2], dtype, true);
+                let valid =
+                    packed_recurrent_test_leaf(&mut session, vec![0.2; 4], vec![2, 2], dtype, true);
+                let mut invalid = Vec::new();
+                for shape in [
+                    vec![1, 2],
+                    vec![3, 2],
+                    vec![2, 1],
+                    vec![2],
+                    vec![1, 2, 2],
+                    vec![0, 2],
+                ] {
+                    let values = vec![0.3; shape.iter().product()];
+                    invalid.push(packed_recurrent_test_leaf(
+                        &mut session,
+                        values,
+                        shape,
+                        dtype,
+                        true,
+                    ));
+                }
+                let other_dtype = if dtype == DType::F32 {
+                    DType::F64
+                } else {
+                    DType::F32
+                };
+                invalid.push(packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![0.3; 4],
+                    vec![2, 2],
+                    other_dtype,
+                    true,
+                ));
+                let wrong_device =
+                    DenseTensor::from_contiguous_values(vec![0.3; 4], vec![2, 2], Device::Metal)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                invalid.push(session.tensor_variable_from_storage(wrong_device, true));
+                invalid.push(TensorNodeId(usize::MAX));
+                for &state in &invalid {
+                    reject(&mut session, |s| rnn.forward_cell(s, input, state));
+                    reject(&mut session, |s| gru.forward_cell(s, input, state));
+                    reject(&mut session, |s| lstm.forward_cell(s, input, state, valid));
+                    reject(&mut session, |s| lstm.forward_cell(s, input, valid, state));
+                    session.with_no_grad(|session| {
+                        reject(session, |s| rnn.forward_cell(s, input, state));
+                        reject(session, |s| gru.forward_cell(s, input, state));
+                        reject(session, |s| lstm.forward_cell(s, input, valid, state));
+                    });
+                }
+                // Wrong input batch, rank, dtype, device, and IDs must fail at
+                // the same boundary, before transposing any model parameter.
+                for &bad_input in &invalid {
+                    reject(&mut session, |s| rnn.forward_cell(s, bad_input, valid));
+                    reject(&mut session, |s| gru.forward_cell(s, bad_input, valid));
+                    reject(&mut session, |s| {
+                        lstm.forward_cell(s, bad_input, valid, valid)
+                    });
+                }
+                let mut rnn = rnn;
+                let mut lstm = lstm;
+                let mut gru = gru;
+                // A malformed late bias must also be rejected before an
+                // otherwise valid input projection adds nodes.
+                rnn.b_hh = invalid[0];
+                lstm.b_hh = invalid[0];
+                gru.b_hh = invalid[0];
+                reject(&mut session, |s| rnn.forward_cell(s, input, valid));
+                reject(&mut session, |s| lstm.forward_cell(s, input, valid, valid));
+                reject(&mut session, |s| gru.forward_cell(s, input, valid));
+            }
+        }
+    }
+
+    #[test]
+    fn recurrent_cells_reject_overflowing_parameter_shapes_without_initialization() {
+        for dtype in [DType::F32, DType::F64] {
+            for (input, hidden) in [(usize::MAX, 2), (2, usize::MAX), (1, usize::MAX / 2)] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let mut unchanged = session.clone();
+                let nodes = session.autograd_graph_node_count();
+                assert!(RNNCell::new_with_dtype(&mut session, input, hidden, true, dtype).is_err());
+                assert!(LSTMCell::new_with_dtype(&mut session, input, hidden, dtype).is_err());
+                assert!(GRUCell::new_with_dtype(&mut session, input, hidden, dtype).is_err());
+                assert_eq!(session.autograd_graph_node_count(), nodes);
+                let next = session.rand(vec![3], false).unwrap();
+                let expected = unchanged.rand(vec![3], false).unwrap();
+                assert_eq!(
+                    session.tensor_values(next).unwrap(),
+                    unchanged.tensor_values(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recurrent_cells_allow_empty_batches_features_and_hidden_widths() {
+        for dtype in [DType::F32, DType::F64] {
+            for (batch, input_size, hidden_size) in [(0, 2, 3), (2, 0, 3), (2, 3, 0)] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let rnn =
+                    RNNCell::new_with_dtype(&mut session, input_size, hidden_size, true, dtype)
+                        .unwrap();
+                let lstm =
+                    LSTMCell::new_with_dtype(&mut session, input_size, hidden_size, dtype).unwrap();
+                let gru =
+                    GRUCell::new_with_dtype(&mut session, input_size, hidden_size, dtype).unwrap();
+                let input = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![0.0; batch * input_size],
+                    vec![batch, input_size],
+                    dtype,
+                    true,
+                );
+                let hidden = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![0.0; batch * hidden_size],
+                    vec![batch, hidden_size],
+                    dtype,
+                    true,
+                );
+                let cell = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![0.0; batch * hidden_size],
+                    vec![batch, hidden_size],
+                    dtype,
+                    true,
+                );
+                let r = rnn.forward_cell(&mut session, input, hidden).unwrap();
+                let (h, c) = lstm
+                    .forward_cell(&mut session, input, hidden, cell)
+                    .unwrap();
+                let g = gru.forward_cell(&mut session, input, hidden).unwrap();
+                for output in [r, h, c, g] {
+                    assert_eq!(session.tensor_shape(output).unwrap(), [batch, hidden_size]);
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert!(
+                        session
+                            .tensor_values_lossy_f64(output)
+                            .unwrap()
+                            .iter()
+                            .all(|x| x.is_finite())
+                    );
+                }
+                let outputs = session.tensor_cat(&[r, h, c, g], 1).unwrap();
+                let loss = session.tensor_sum(outputs).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                for parameter in rnn
+                    .parameters()
+                    .into_iter()
+                    .chain(lstm.parameters())
+                    .chain(gru.parameters())
+                {
+                    let gradient = session.tensor_gradient(&report, parameter).unwrap();
+                    assert!(gradient.iter().all(|x| x.is_finite()));
+                    if batch == 0 || hidden_size == 0 {
+                        assert!(gradient.iter().all(|&x| x == 0.0));
+                    }
+                }
+                for node in [input, hidden, cell] {
+                    assert!(session.tensor_gradient(&report, node).is_some());
+                }
+            }
+        }
+    }
 
     #[test]
     fn rnn_cell_forward_tanh() {
