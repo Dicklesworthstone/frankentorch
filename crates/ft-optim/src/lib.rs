@@ -6911,7 +6911,7 @@ impl Optimizer for SparseAdam {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
 
@@ -6919,19 +6919,16 @@ impl Optimizer for SparseAdam {
         for i in 0..num_params {
             let param = self.params[i];
 
+            // The tape owns accumulated support. The latest report may omit a
+            // parameter, precede clipping, or describe only the last microbatch.
+            if let Some(sparse_grad) = session.tensor_accumulated_sparse_gradient(param)? {
+                self.step_sparse_gradient(session, param, i, &sparse_grad)?;
+                continue;
+            }
             let grad = match load_param_gradient(session, param)? {
                 Some(g) => g,
                 None => continue,
             };
-            // A report describes only its own backward pass. Reuse its sparse
-            // representation only when it still represents the persistent
-            // gradient, including any accumulation, unscaling, or clipping.
-            if report.gradient(param) == Some(grad.as_slice())
-                && let Some(sparse_grad) = report.sparse_gradient(param)
-            {
-                self.step_sparse_gradient(session, param, i, sparse_grad)?;
-                continue;
-            }
 
             let t = advance_param_step_count(
                 &mut self.step_counts,
@@ -7699,7 +7696,8 @@ impl GradScaler {
         // All node IDs and lengths have been checked before the first mutation.
         if !found_overflow {
             for (node, gradient) in gradients {
-                session.tensor_set_accumulated_gradient(node, gradient)?;
+                session
+                    .tensor_set_accumulated_gradient_preserving_sparse_support(node, gradient)?;
             }
         }
         self.found_overflow_since_update |= found_overflow;
@@ -15241,6 +15239,224 @@ mod tests {
     }
 
     // ── SparseAdam tests ───────────────────────────────────────────────
+
+    fn sparse_optimizer_weighted_loss(
+        session: &mut FrankenTorchSession,
+        parameter: TensorNodeId,
+        rows: &[f64],
+        weights: &[f64],
+    ) -> TensorNodeId {
+        let indices = session
+            .tensor_variable(rows.to_vec(), vec![rows.len()], false)
+            .unwrap();
+        let selected = session
+            .tensor_index_select_sparse(parameter, 0, indices)
+            .unwrap();
+        let shape = session.tensor_shape(selected).unwrap();
+        let weights = if session.tensor_dtype(parameter).unwrap() == ft_core::DType::F32 {
+            session.tensor_variable_f32(
+                weights.iter().map(|&value| value as f32).collect(),
+                shape,
+                false,
+            )
+        } else {
+            session.tensor_variable(weights.to_vec(), shape, false)
+        }
+        .unwrap();
+        let weighted = session.tensor_mul(selected, weights).unwrap();
+        session.tensor_sum(weighted).unwrap()
+    }
+
+    #[test]
+    fn sparse_adam_uses_accumulated_zero_support_instead_of_stale_reports() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F64, ft_core::DType::F32] {
+                let mut session = FrankenTorchSession::new(mode);
+                let unrelated = session.tensor_variable(vec![9.0], vec![1], true).unwrap();
+                let stale_report = session.tensor_backward(unrelated).unwrap();
+                let parameter = if dtype == ft_core::DType::F32 {
+                    session.tensor_variable_f32(vec![2.0, 3.0, 4.0], vec![3, 1], true)
+                } else {
+                    session.tensor_variable(vec![2.0, 3.0, 4.0], vec![3, 1], true)
+                }
+                .unwrap();
+                let mut optimizer = SparseAdam::new(vec![parameter], 0.2)
+                    .betas(0.5, 0.75)
+                    .eps(0.5);
+                let prime = sparse_optimizer_weighted_loss(&mut session, parameter, &[1.0], &[2.0]);
+                session.tensor_backward(prime).unwrap();
+                optimizer.step(&mut session, &stale_report).unwrap();
+                optimizer.zero_grad(&mut session).unwrap();
+                for gradient in [1.0, -1.0] {
+                    let loss = sparse_optimizer_weighted_loss(
+                        &mut session,
+                        parameter,
+                        &[1.0],
+                        &[gradient],
+                    );
+                    session.tensor_backward(loss).unwrap();
+                }
+                let sparse = session
+                    .tensor_accumulated_sparse_gradient(parameter)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sparse.indices().storage(), &[1]);
+                assert_eq!(
+                    sparse.values().contiguous_values_as_f64().unwrap(),
+                    vec![0.0]
+                );
+                let refreshed = session
+                    .tensor_refresh_backward_report(&stale_report, &[parameter])
+                    .unwrap();
+                assert_eq!(
+                    refreshed
+                        .sparse_gradient(parameter)
+                        .unwrap()
+                        .indices()
+                        .storage(),
+                    &[1]
+                );
+                assert_eq!(
+                    refreshed.gradient(parameter),
+                    Some([0.0, 0.0, 0.0].as_slice())
+                );
+                assert!(stale_report.gradient(parameter).is_none());
+                optimizer.step(&mut session, &stale_report).unwrap();
+                let actual = session.tensor_values_lossy_f64(parameter).unwrap();
+                // Live torch 2.15.0+cpu: the cancelled row still decays its
+                // moments and moves; absent rows 0 and 2 do not participate.
+                let tolerance = if dtype == ft_core::DType::F32 {
+                    2e-6
+                } else {
+                    2e-15
+                };
+                assert!(
+                    (actual[1] - 2.802105853870292).abs() <= tolerance,
+                    "{mode:?} {dtype:?}: {actual:?}"
+                );
+                assert_eq!(actual[0], 2.0);
+                assert_eq!(actual[2], 4.0);
+                assert_eq!(optimizer.m[0].as_deref(), Some([0.0, 0.5, 0.0].as_slice()));
+                assert_eq!(optimizer.v[0].as_deref(), Some([0.0, 0.75, 0.0].as_slice()));
+
+                optimizer.zero_grad(&mut session).unwrap();
+                assert_eq!(
+                    session
+                        .tensor_accumulated_sparse_gradient(parameter)
+                        .unwrap()
+                        .unwrap()
+                        .nnz(),
+                    0
+                );
+                optimizer.step(&mut session, &stale_report).unwrap();
+                assert_eq!(session.tensor_values_lossy_f64(parameter).unwrap(), actual);
+                assert_eq!(optimizer.m[0].as_deref(), Some([0.0, 0.5, 0.0].as_slice()));
+                assert_eq!(optimizer.step_counts, vec![3]);
+
+                // Explicit replacement deliberately loses sparse provenance;
+                // an old sparse report must not resurrect its old row support.
+                session
+                    .tensor_set_accumulated_gradient(parameter, vec![0.0; 3])
+                    .unwrap();
+                assert!(
+                    session
+                        .tensor_accumulated_sparse_gradient(parameter)
+                        .unwrap()
+                        .is_none()
+                );
+                optimizer.step(&mut session, &refreshed).unwrap();
+                assert_eq!(session.tensor_values_lossy_f64(parameter).unwrap(), actual);
+                assert_eq!(optimizer.m[0].as_deref(), Some([0.0, 0.5, 0.0].as_slice()));
+                session.tensor_requires_grad_(parameter, false).unwrap();
+                optimizer.step(&mut session, &refreshed).unwrap();
+                assert_eq!(optimizer.step_counts, vec![4]);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_adam_accumulated_support_survives_unscaling_and_both_clippers() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F64, ft_core::DType::F32] {
+                // value clip; norm clip; explicit unscale + each clip; and
+                // implicit unscale with stored zeros from earlier microbatches.
+                for treatment in 0..5 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let parameter = if dtype == ft_core::DType::F32 {
+                        session.tensor_variable_f32(vec![2.0, 3.0, 4.0], vec![3, 1], true)
+                    } else {
+                        session.tensor_variable(vec![2.0, 3.0, 4.0], vec![3, 1], true)
+                    }
+                    .unwrap();
+                    let mut optimizer = SparseAdam::new(vec![parameter], 0.2)
+                        .betas(0.5, 0.75)
+                        .eps(0.5);
+                    let mut scaler = GradScaler::with_config(8.0, 2.0, 0.5, 100);
+                    let prime =
+                        sparse_optimizer_weighted_loss(&mut session, parameter, &[1.0], &[2.0]);
+                    let old_report = session.tensor_backward(prime).unwrap();
+                    optimizer.step(&mut session, &old_report).unwrap();
+                    optimizer.zero_grad(&mut session).unwrap();
+                    let last_gradient = if treatment == 4 { 0.0 } else { 4.0 };
+                    for (row, gradient) in [(1.0, 1.0), (1.0, -1.0), (2.0, last_gradient)] {
+                        let mut loss = sparse_optimizer_weighted_loss(
+                            &mut session,
+                            parameter,
+                            &[row],
+                            &[gradient],
+                        );
+                        if treatment >= 2 {
+                            loss = scaler.scale_loss(&mut session, loss).unwrap();
+                        }
+                        session.tensor_backward(loss).unwrap();
+                    }
+                    if treatment == 2 || treatment == 3 {
+                        scaler.unscale_(&mut session, &optimizer).unwrap();
+                    }
+                    match treatment {
+                        0 | 2 => session.clip_grad_value_(&[parameter], 0.0).unwrap(),
+                        1 | 3 => {
+                            session.clip_grad_norm_(&[parameter], 0.0, 2.0).unwrap();
+                        }
+                        _ => {}
+                    }
+                    let sparse = session
+                        .tensor_accumulated_sparse_gradient(parameter)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(sparse.indices().storage(), &[1, 2]);
+                    assert_eq!(
+                        sparse.values().contiguous_values_as_f64().unwrap(),
+                        vec![0.0, 0.0]
+                    );
+                    if treatment >= 2 {
+                        assert!(
+                            scaler
+                                .step(&mut session, &mut optimizer, &old_report)
+                                .unwrap()
+                        );
+                        scaler.update();
+                    } else {
+                        optimizer.step(&mut session, &old_report).unwrap();
+                    }
+                    let values = session.tensor_values_lossy_f64(parameter).unwrap();
+                    let tolerance = if dtype == ft_core::DType::F32 {
+                        2e-6
+                    } else {
+                        2e-15
+                    };
+                    assert!(
+                        (values[1] - 2.802105853870292).abs() <= tolerance,
+                        "{mode:?} {dtype:?} treatment {treatment}: {values:?}"
+                    );
+                    assert_eq!(values[0], 2.0);
+                    assert_eq!(values[2], 4.0);
+                    assert_eq!(optimizer.m[0].as_deref(), Some([0.0, 0.5, 0.0].as_slice()));
+                    assert_eq!(optimizer.v[0].as_deref(), Some([0.0, 0.75, 0.0].as_slice()));
+                }
+            }
+        }
+    }
 
     #[test]
     fn sparse_adam_matches_masked_multistep_reference_with_stored_zeros() {

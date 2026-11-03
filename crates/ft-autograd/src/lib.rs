@@ -4338,6 +4338,10 @@ pub struct TensorTape {
     // frankentorch-05upk: Arc so a leaf grad can be shared with the backward report
     // (Arc::clone on first store, Arc::make_mut for cross-backward accumulation).
     persistent_grads: BTreeMap<usize, Arc<Vec<f64>>>,
+    /// Present only for accumulated gradients composed entirely of sparse
+    /// dim-0 selections. Row support survives numerical cancellation; the
+    /// dense gradient buffer above remains the sole owner of gradient values.
+    persistent_sparse_rows: BTreeMap<usize, BTreeSet<usize>>,
     tensor_hooks: BTreeMap<usize, Vec<TensorHookRegistration>>,
     next_tensor_hook_id: u64,
     consumed: bool,
@@ -4404,6 +4408,7 @@ impl Default for TensorTape {
         Self {
             nodes: Vec::new(),
             persistent_grads: BTreeMap::new(),
+            persistent_sparse_rows: BTreeMap::new(),
             tensor_hooks: BTreeMap::new(),
             next_tensor_hook_id: 1,
             consumed: false,
@@ -4510,6 +4515,7 @@ impl TensorTape {
             .retain(|&id, _| id < boundary);
         self.transpose_input_versions.retain(|&id, _| id < boundary);
         self.persistent_grads.retain(|&id, _| id < boundary);
+        self.persistent_sparse_rows.retain(|&id, _| id < boundary);
         self.tensor_hooks.retain(|&id, _| id < boundary);
         self.retains_grad.retain(|&id| id < boundary);
         if self.consumed_boundary > boundary {
@@ -4623,6 +4629,7 @@ impl TensorTape {
         node.requires_grad = requires_grad;
         if !requires_grad {
             self.persistent_grads.remove(&id.0);
+            self.persistent_sparse_rows.remove(&id.0);
         }
         Ok(())
     }
@@ -4632,6 +4639,7 @@ impl TensorTape {
         node.requires_grad = false;
         node.op = TensorNodeOp::Leaf;
         self.persistent_grads.remove(&id.0);
+        self.persistent_sparse_rows.remove(&id.0);
         Ok(())
     }
 
@@ -4742,6 +4750,23 @@ impl TensorTape {
             .map(|gradient| gradient.to_vec()))
     }
 
+    /// Snapshot the actual accumulated sparse gradient, including stored zero
+    /// rows from earlier backward calls. Dense or mixed gradients return None.
+    pub fn tensor_accumulated_sparse_gradient(
+        &self,
+        node: TensorNodeId,
+    ) -> Result<Option<SparseCOOTensor>, AutogradError> {
+        let tensor = &self.node(node)?.tensor;
+        let (Some(values), Some(rows)) = (
+            self.persistent_grads.get(&node.0),
+            self.persistent_sparse_rows.get(&node.0),
+        ) else {
+            return Ok(None);
+        };
+        Self::build_sparse_grad_dim0(values, tensor.meta().shape(), tensor.meta().device(), rows)
+            .map(Some)
+    }
+
     /// Refresh selected parameter gradients from the current accumulated tape.
     ///
     /// Optimizer reports must reflect unscaling, clipping, and earlier
@@ -4766,27 +4791,13 @@ impl TensorTape {
         }
         for &parameter in parameters {
             let current = self.persistent_grads.get(&parameter.0);
-            let keep_sparse = match (current, report.sparse_gradient(parameter)) {
-                (Some(values), Some(sparse)) => {
-                    let tensor = &self.nodes[parameter.0].tensor;
-                    if sparse.dense_shape() != tensor.meta().shape()
-                        || sparse.device() != tensor.meta().device()
-                    {
-                        false
-                    } else {
-                        let dense = sparse.to_dense()?.contiguous_values_as_f64()?;
-                        dense.len() == values.len()
-                            && dense
-                                .iter()
-                                .zip(values.iter())
-                                .all(|(a, b)| a.to_bits() == b.to_bits())
-                    }
-                }
-                _ => false,
-            };
+            let sparse = self.tensor_accumulated_sparse_gradient(parameter)?;
             refreshed.gradients[parameter.0] = current.cloned();
-            if !keep_sparse && let Some(sparse) = refreshed.sparse_gradients.get_mut(parameter.0) {
-                *sparse = None;
+            if sparse.is_some() && refreshed.sparse_gradients.len() <= parameter.0 {
+                refreshed.sparse_gradients.resize(parameter.0 + 1, None);
+            }
+            if let Some(target) = refreshed.sparse_gradients.get_mut(parameter.0) {
+                *target = sparse;
             }
             if let Some(gradient_node) = refreshed.gradient_nodes.get_mut(parameter.0) {
                 *gradient_node = None;
@@ -4811,6 +4822,9 @@ impl TensorTape {
         if let Some(grad) = self.persistent_grads.get_mut(&node.0) {
             Arc::make_mut(grad).fill(0.0);
         }
+        if let Some(rows) = self.persistent_sparse_rows.get_mut(&node.0) {
+            rows.clear();
+        }
         Ok(())
     }
 
@@ -4821,6 +4835,37 @@ impl TensorTape {
     ) -> Result<(), AutogradError> {
         let expected = self.node(node)?.tensor.meta().numel();
         Self::ensure_tensor_len(node, expected, gradient.len())?;
+        self.persistent_grads.insert(node.0, Arc::new(gradient));
+        self.persistent_sparse_rows.remove(&node.0);
+        Ok(())
+    }
+
+    /// Store the result of a zero-preserving transform such as unscaling or
+    /// clipping. Existing sparse support is retained, including zero rows.
+    /// A transform that creates values outside that support becomes dense.
+    /// Arbitrary gradient replacement should use `set_tensor_accumulated_gradient`.
+    pub fn set_tensor_accumulated_gradient_preserving_sparse_support(
+        &mut self,
+        node: TensorNodeId,
+        gradient: Vec<f64>,
+    ) -> Result<(), AutogradError> {
+        let meta = self.node(node)?.tensor.meta();
+        Self::ensure_tensor_len(node, meta.numel(), gradient.len())?;
+        if let Some(rows) = self.persistent_sparse_rows.get(&node.0) {
+            let row_width =
+                Self::checked_shape_numel(&meta.shape()[1..], "sparse gradient row size overflow")?;
+            let remains_sparse = self.persistent_grads.contains_key(&node.0)
+                && (row_width == 0
+                    || gradient
+                        .chunks_exact(row_width)
+                        .enumerate()
+                        .all(|(row, values)| {
+                            rows.contains(&row) || values.iter().all(|&value| value == 0.0)
+                        }));
+            if !remains_sparse {
+                self.persistent_sparse_rows.remove(&node.0);
+            }
+        }
         self.persistent_grads.insert(node.0, Arc::new(gradient));
         Ok(())
     }
@@ -12212,6 +12257,7 @@ impl TensorTape {
         // across all sparse selections, including empty selections. This stays
         // empty for the common dense backward.
         let mut sparse_grad_requested: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        let mut sparse_or_absent_contributions: BTreeMap<usize, usize> = BTreeMap::new();
 
         let mut queue = TensorReadyQueue::with_capacity(self.nodes.len().max(1));
         queue.push(root);
@@ -15313,6 +15359,7 @@ impl TensorTape {
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let mut contrib = vec![0.0; input_numel];
                     let mut selected_rows = if sparse && dim == 0 {
+                        *sparse_or_absent_contributions.entry(input.0).or_default() += 1;
                         Some(sparse_grad_requested.entry(input.0).or_default())
                     } else {
                         None
@@ -16350,6 +16397,13 @@ impl TensorTape {
                                     u64::try_from(accumulation_started.elapsed().as_nanos())
                                         .unwrap_or(u64::MAX),
                                 );
+                        } else {
+                            // None is an absent contribution, unlike an
+                            // explicitly returned dense zero gradient. It must
+                            // not turn another branch's sparse gradient dense.
+                            *sparse_or_absent_contributions
+                                .entry(input_id.0)
+                                .or_default() += 1;
                         }
                         let dependency_started = std::time::Instant::now();
                         Self::complete_dependency(&mut pending, input_id, &mut queue)?;
@@ -16435,6 +16489,18 @@ impl TensorTape {
         }
         machinery.loop_ns = u64::try_from(loop_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
+        // A dense contribution, even an all-zero one, changes the gradient's
+        // representation. Only retain sparse support when every incoming edge
+        // is a sparse dim-0 selection or an absent custom-function gradient;
+        // dependency counts include all reachable uses and repeated operands.
+        sparse_grad_requested.retain(|idx, _| {
+            sparse_or_absent_contributions
+                .get(idx)
+                .copied()
+                .unwrap_or(0)
+                == dependency_snapshot[*idx]
+        });
+
         let telemetry = TensorSchedulerTelemetry {
             execution_order,
             queue_pushes: queue.pushes,
@@ -16446,13 +16512,6 @@ impl TensorTape {
             hardened_fallback_used,
             machinery,
         };
-
-        self.accumulate_persistent_gradients(&gradients, accumulate_grad)?;
-
-        if !options.retain_graph {
-            self.consumed = true;
-            self.consumed_boundary = self.nodes.len();
-        }
 
         // Only materialize the per-node sparse-gradient vector when some input
         // actually requested a sparse-gradient surfacing (IndexSelect sparse path —
@@ -16478,6 +16537,12 @@ impl TensorTape {
                 device,
                 selected_rows,
             )?);
+        }
+
+        self.accumulate_persistent_gradients(&gradients, &sparse_gradients, accumulate_grad)?;
+        if !options.retain_graph {
+            self.consumed = true;
+            self.consumed_boundary = self.nodes.len();
         }
 
         // First-order backward never produces differentiable gradient *nodes* (only the
@@ -16517,7 +16582,7 @@ impl TensorTape {
         let mut nz_rows: Vec<usize> = Vec::new();
         for r in 0..num_rows {
             let row = &dense_grad[r * row_stride..(r + 1) * row_stride];
-            if selected_rows.contains(&r) || row.iter().any(|v| *v != 0.0) {
+            if row_stride != 0 && (selected_rows.contains(&r) || row.iter().any(|v| *v != 0.0)) {
                 nz_rows.push(r);
             }
         }
@@ -19152,6 +19217,9 @@ impl TensorTape {
                     .tensor
                     .contiguous_values_as_f64()
                     .map_err(AutogradError::DenseTensor)?;
+                // Differentiable backward currently materializes dense gradient
+                // nodes, so it must not retain support from an older sparse pass.
+                self.persistent_sparse_rows.remove(&idx);
                 // frankentorch-05upk: persistent_grads is now Arc<Vec<f64>>. A match
                 // (not entry().and_modify().or_insert_with(|| Arc::new(vals))) is required:
                 // the or_insert_with closure would MOVE `vals` while and_modify borrows it
@@ -22396,6 +22464,7 @@ impl TensorTape {
     fn accumulate_persistent_gradients(
         &mut self,
         gradients: &[Option<Arc<Vec<f64>>>],
+        sparse_gradients: &[Option<SparseCOOTensor>],
         accumulate_grad: bool,
     ) -> Result<(), AutogradError> {
         for (idx, gradient) in gradients.iter().enumerate() {
@@ -22416,6 +22485,19 @@ impl TensorTape {
                 continue;
             }
             let node = TensorNodeId(idx);
+            let incoming_rows = sparse_gradients
+                .get(idx)
+                .and_then(Option::as_ref)
+                .map(|sparse| {
+                    sparse.indices().contiguous_values().map(|indices| {
+                        indices
+                            .iter()
+                            .map(|&row| row as usize)
+                            .collect::<BTreeSet<_>>()
+                    })
+                })
+                .transpose()?;
+            let had_gradient = self.persistent_grads.contains_key(&idx);
             match self.persistent_grads.get_mut(&idx) {
                 Some(existing) => {
                     Self::accumulate_existing_tensor_gradient(
@@ -22428,6 +22510,21 @@ impl TensorTape {
                     // frankentorch-05upk: share the report's leaf-grad buffer via
                     // Arc::clone (refcount bump) instead of a numel `to_vec` clone.
                     self.persistent_grads.insert(idx, Arc::clone(arc));
+                }
+            }
+            match incoming_rows {
+                Some(rows) if !had_gradient => {
+                    self.persistent_sparse_rows.insert(idx, rows);
+                }
+                Some(rows) => {
+                    if let Some(existing) = self.persistent_sparse_rows.get_mut(&idx) {
+                        existing.extend(rows);
+                    }
+                    // An existing dense buffer stays dense when sparse values
+                    // are added to it, even if that buffer contains only zeros.
+                }
+                None => {
+                    self.persistent_sparse_rows.remove(&idx);
                 }
             }
         }
@@ -27171,7 +27268,13 @@ mod tests {
                 let (loss, _) = tape.sum(selected, ExecutionMode::Strict).unwrap();
                 let report = tape.backward(loss).unwrap();
                 let sparse = report.sparse_gradient(weight).unwrap();
-                let expected_rows: &[i64] = if indices.is_empty() { &[] } else { &[1, 2] };
+                // PyTorch 2.15 embedding backward emits empty sparse support
+                // when the feature axis is empty, even for selected rows.
+                let expected_rows: &[i64] = if indices.is_empty() || feature_count == 0 {
+                    &[]
+                } else {
+                    &[1, 2]
+                };
                 assert_eq!(sparse.indices().storage(), expected_rows);
                 assert_eq!(sparse.dense_shape(), &[3, feature_count]);
                 assert_eq!(
@@ -27879,7 +27982,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_parameter_gradients_keeps_only_consistent_sparse_payloads() {
+    fn refresh_parameter_gradients_rebuilds_sparse_payloads_from_accumulated_support() {
         let mut tape = TensorTape::new();
         let weight = tape.leaf(vec![1.0; 6], vec![3, 2], true).unwrap();
         let selected = tape.index_select_sparse(weight, 0, &[1.0, 1.0]).unwrap();
@@ -27890,8 +27993,21 @@ mod tests {
             .refresh_parameter_gradients(&report, &[weight])
             .unwrap();
         assert_eq!(
-            unchanged.sparse_gradient(weight),
-            report.sparse_gradient(weight)
+            unchanged
+                .sparse_gradient(weight)
+                .unwrap()
+                .indices()
+                .storage(),
+            &[1]
+        );
+        assert_eq!(
+            unchanged
+                .sparse_gradient(weight)
+                .unwrap()
+                .values()
+                .contiguous_values_as_f64()
+                .unwrap(),
+            vec![2.0, 2.0]
         );
 
         // Dense equality alone cannot establish that an accompanying sparse
@@ -27909,7 +28025,23 @@ mod tests {
         let corrected = tape
             .refresh_parameter_gradients(&mismatched, &[weight])
             .unwrap();
-        assert!(!corrected.is_sparse_gradient(weight));
+        assert_eq!(
+            corrected
+                .sparse_gradient(weight)
+                .unwrap()
+                .indices()
+                .storage(),
+            &[1]
+        );
+        assert_eq!(
+            corrected
+                .sparse_gradient(weight)
+                .unwrap()
+                .values()
+                .contiguous_values_as_f64()
+                .unwrap(),
+            vec![2.0, 2.0]
+        );
         assert_eq!(corrected.gradient(weight), report.gradient(weight));
 
         let clipped = vec![0.0, 0.0, 0.25, 0.75, 0.0, 0.0];
@@ -27931,6 +28063,319 @@ mod tests {
             .unwrap();
         assert!(cleared.gradient(weight).is_none());
         assert!(cleared.gradient_value(weight).is_none());
+    }
+
+    fn sparse_support_backward(
+        tape: &mut TensorTape,
+        weight: TensorNodeId,
+        rows: &[f64],
+        coefficient: f64,
+        mode: ExecutionMode,
+    ) -> TensorBackwardReport {
+        let selected = tape.index_select_sparse(weight, 0, rows).unwrap();
+        let (weighted, _) = tape.mul_scalar(selected, coefficient).unwrap();
+        let (loss, _) = tape.sum(weighted, mode).unwrap();
+        tape.backward_with_options(loss, BackwardOptions::for_mode(mode))
+            .unwrap()
+    }
+
+    #[test]
+    fn accumulated_sparse_support_survives_cancellation_and_respects_gradient_lifecycle() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                let mut tape = TensorTape::new();
+                let storage = DenseTensor::from_contiguous_values(
+                    vec![2.0, 3.0, 4.0],
+                    vec![3, 1],
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let weight = tape.leaf_tensor(storage, true);
+                let first = sparse_support_backward(&mut tape, weight, &[1.0], 1.0, mode);
+                let last = sparse_support_backward(&mut tape, weight, &[1.0], -1.0, mode);
+                assert_eq!(first.gradient(weight), Some([0.0, 1.0, 0.0].as_slice()));
+                assert_eq!(last.gradient(weight), Some([0.0, -1.0, 0.0].as_slice()));
+                assert_eq!(
+                    tape.tensor_accumulated_gradient(weight).unwrap(),
+                    Some([0.0, 0.0, 0.0].as_slice())
+                );
+                let sparse = tape
+                    .tensor_accumulated_sparse_gradient(weight)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sparse.indices().storage(), &[1]);
+                assert_eq!(
+                    sparse.values().contiguous_values_as_f64().unwrap(),
+                    vec![0.0]
+                );
+
+                // Functional gradient queries have per-pass sparse support but
+                // must not alter either persistent values or their support.
+                let selected = tape.index_select_sparse(weight, 0, &[2.0]).unwrap();
+                let (loss, _) = tape.sum(selected, mode).unwrap();
+                let query = tape
+                    .grad_with_options(loss, BackwardOptions::for_mode(mode))
+                    .unwrap();
+                assert_eq!(
+                    query.sparse_gradient(weight).unwrap().indices().storage(),
+                    &[2]
+                );
+                assert_eq!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .unwrap()
+                        .indices()
+                        .storage(),
+                    &[1]
+                );
+                assert_eq!(
+                    tape.tensor_accumulated_gradient(weight).unwrap(),
+                    Some([0.0, 0.0, 0.0].as_slice())
+                );
+
+                tape.zero_tensor_accumulated_gradient(weight).unwrap();
+                assert_eq!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .unwrap()
+                        .nnz(),
+                    0
+                );
+                sparse_support_backward(&mut tape, weight, &[0.0], 1.0, mode);
+                assert_eq!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .unwrap()
+                        .indices()
+                        .storage(),
+                    &[0]
+                );
+                assert!(
+                    tape.set_tensor_accumulated_gradient_preserving_sparse_support(
+                        weight,
+                        vec![0.0; 2]
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    tape.tensor_accumulated_gradient(weight).unwrap(),
+                    Some([1.0, 0.0, 0.0].as_slice())
+                );
+                tape.set_tensor_accumulated_gradient_preserving_sparse_support(
+                    weight,
+                    vec![0.0; 3],
+                )
+                .unwrap();
+                assert_eq!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .unwrap()
+                        .indices()
+                        .storage(),
+                    &[0]
+                );
+                tape.set_tensor_accumulated_gradient_preserving_sparse_support(
+                    weight,
+                    vec![0.0, 0.0, 2.0],
+                )
+                .unwrap();
+                assert!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .is_none()
+                );
+
+                // Adding sparse values to a dense replacement stays dense.
+                tape.zero_tensor_accumulated_gradient(weight).unwrap();
+                let sparse_pass = sparse_support_backward(&mut tape, weight, &[2.0], 1.0, mode);
+                assert!(sparse_pass.is_sparse_gradient(weight));
+                assert!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .is_none()
+                );
+                tape.set_tensor_requires_grad(weight, false).unwrap();
+                tape.set_tensor_requires_grad(weight, true).unwrap();
+                sparse_support_backward(&mut tape, weight, &[2.0], 1.0, mode);
+                assert_eq!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .unwrap()
+                        .indices()
+                        .storage(),
+                    &[2]
+                );
+                let mut detached = tape.clone();
+                detached.detach_tensor_in_place(weight).unwrap();
+                assert!(
+                    detached
+                        .tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .is_none()
+                );
+                tape.set_tensor_accumulated_gradient(weight, vec![0.0, 0.0, 1.0])
+                    .unwrap();
+                assert!(
+                    tape.tensor_accumulated_sparse_gradient(weight)
+                        .unwrap()
+                        .is_none()
+                );
+                detached.truncate_graph_to(0);
+                assert!(detached.persistent_sparse_rows.is_empty());
+                assert!(detached.persistent_grads.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn dense_zero_contributions_degrade_sparse_support_in_both_accumulation_orders() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for order in 0..3 {
+                    let mut tape = TensorTape::new();
+                    let storage =
+                        DenseTensor::from_contiguous_values(vec![2.0; 3], vec![3, 1], Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let weight = tape.leaf_tensor(storage, true);
+                    match order {
+                        0 => {
+                            let sparse = tape.index_select_sparse(weight, 0, &[1.0]).unwrap();
+                            let (sparse_loss, _) = tape.sum(sparse, mode).unwrap();
+                            let (dense, _) = tape.mul_scalar(weight, 0.0).unwrap();
+                            let (dense_loss, _) = tape.sum(dense, mode).unwrap();
+                            let (loss, _) = tape.add(sparse_loss, dense_loss, mode).unwrap();
+                            let report = tape
+                                .backward_with_options(loss, BackwardOptions::for_mode(mode))
+                                .unwrap();
+                            assert!(
+                                !report.is_sparse_gradient(weight),
+                                "mixed incoming edges make this pass dense"
+                            );
+                        }
+                        1 => {
+                            sparse_support_backward(&mut tape, weight, &[1.0], 1.0, mode);
+                            let (dense, _) = tape.mul_scalar(weight, 0.0).unwrap();
+                            let (loss, _) = tape.sum(dense, mode).unwrap();
+                            tape.backward_with_options(loss, BackwardOptions::for_mode(mode))
+                                .unwrap();
+                        }
+                        _ => {
+                            let (dense, _) = tape.mul_scalar(weight, 0.0).unwrap();
+                            let (loss, _) = tape.sum(dense, mode).unwrap();
+                            tape.backward_with_options(loss, BackwardOptions::for_mode(mode))
+                                .unwrap();
+                            let report =
+                                sparse_support_backward(&mut tape, weight, &[1.0], 1.0, mode);
+                            assert!(
+                                report.is_sparse_gradient(weight),
+                                "reports remain per-pass snapshots"
+                            );
+                        }
+                    }
+                    assert!(
+                        tape.tensor_accumulated_sparse_gradient(weight)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        tape.tensor_accumulated_gradient(weight).unwrap(),
+                        Some([0.0, 1.0, 0.0].as_slice())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_custom_gradients_preserve_sparse_support_but_dense_zeros_do_not() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for dense_input in [None, Some(0), Some(1)] {
+                    let mut tape = TensorTape::new();
+                    let storage = DenseTensor::from_contiguous_values(
+                        vec![2.0, 3.0, 4.0],
+                        vec![3, 1],
+                        Device::Cpu,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                    let weight = tape.leaf_tensor(storage, true);
+                    let selected = tape.index_select_sparse(weight, 0, &[1.0, 1.0]).unwrap();
+                    let coefficients = DenseTensor::from_contiguous_values(
+                        vec![1.0, -1.0],
+                        vec![2, 1],
+                        Device::Cpu,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                    let coefficients = tape.leaf_tensor(coefficients, false);
+                    let (weighted, _) = tape.mul(selected, coefficients, mode).unwrap();
+                    let (sparse_loss, _) = tape.sum(weighted, mode).unwrap();
+                    // Repeated inputs exercise every dependency edge. None
+                    // contributes nothing; Some([0, 0, 0]) is explicitly dense.
+                    let custom = tape
+                        .apply_function(
+                            &[weight, weight],
+                            |_ctx, _inputs| Ok((vec![0.0], vec![])),
+                            move |_ctx, _grad_outputs| {
+                                Ok((0..2)
+                                    .map(|index| (dense_input == Some(index)).then(|| vec![0.0; 3]))
+                                    .collect())
+                            },
+                        )
+                        .unwrap();
+                    let (loss, _) = tape.add(sparse_loss, custom, mode).unwrap();
+                    let report = tape
+                        .backward_with_options(loss, BackwardOptions::for_mode(mode))
+                        .unwrap();
+                    assert_eq!(report.gradient(weight), Some([0.0; 3].as_slice()));
+                    let accumulated = tape.tensor_accumulated_sparse_gradient(weight).unwrap();
+                    assert_eq!(report.is_sparse_gradient(weight), dense_input.is_none());
+                    assert_eq!(accumulated.is_some(), dense_input.is_none());
+                    if let Some(sparse) = accumulated {
+                        assert_eq!(sparse.indices().storage(), &[1]);
+                        assert_eq!(
+                            sparse.values().contiguous_values_as_f64().unwrap(),
+                            vec![0.0]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn differentiable_dense_backward_clears_old_sparse_support() {
+        let mut tape = TensorTape::new();
+        let weight = tape.leaf(vec![2.0; 3], vec![3, 1], true).unwrap();
+        sparse_support_backward(&mut tape, weight, &[1.0], 1.0, ExecutionMode::Strict);
+        assert!(
+            tape.tensor_accumulated_sparse_gradient(weight)
+                .unwrap()
+                .is_some()
+        );
+        let (dense, _) = tape.mul_scalar(weight, 0.0).unwrap();
+        let (loss, _) = tape.sum(dense, ExecutionMode::Strict).unwrap();
+        tape.backward_with_options(
+            loss,
+            BackwardOptions::strict_default().with_create_graph(true),
+        )
+        .unwrap();
+        assert!(
+            tape.tensor_accumulated_sparse_gradient(weight)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            tape.tensor_accumulated_gradient(weight).unwrap(),
+            Some([0.0, 1.0, 0.0].as_slice())
+        );
     }
 
     #[test]

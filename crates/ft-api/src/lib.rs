@@ -15163,7 +15163,8 @@ impl FrankenTorchSession {
     ///
     /// - `input`: Indices into the embedding table, any shape
     /// - `weight`: Embedding weight matrix, shape (num_embeddings, embedding_dim)
-    /// - `padding_idx`: If set, entries at this index are zeroed
+    /// - `padding_idx`: If set, this row receives no gradient. Its stored
+    ///   values are still returned, including a custom loaded padding vector.
     pub fn tensor_embedding(
         &mut self,
         input: TensorNodeId,
@@ -15181,11 +15182,25 @@ impl FrankenTorchSession {
         }
         let num_embeddings = weight_shape[0];
         let embedding_dim = weight_shape[1];
+        if padding_idx.is_some_and(|index| index >= num_embeddings) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding: padding index out of range",
+                },
+            )));
+        }
         let input_vals = self.tensor_values(input)?;
         let num_indices: usize = input_shape.iter().product();
         // Resolve + bounds-check the (non-differentiable) lookup indices.
         let mut idx_usize: Vec<usize> = Vec::with_capacity(num_indices);
         for &v in &input_vals {
+            if !v.is_finite() || v < 0.0 || v.fract() != 0.0 {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "embedding: indices must be non-negative integer-valued",
+                    },
+                )));
+            }
             let idx = v as usize;
             if idx >= num_embeddings {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -15199,66 +15214,36 @@ impl FrankenTorchSession {
         let mut out_shape = input_shape;
         out_shape.push(embedding_dim);
 
-        if self.tensor_requires_grad(weight)? {
-            // Embedding lookup is differentiable w.r.t. `weight`: the gradient
-            // scatter-adds the upstream gradient back to each looked-up row
-            // (accumulating for repeated indices; padding rows get none). The
-            // indices are non-differentiable. The forward gathers the same rows,
-            // so the value is bit-identical; the previous body rebuilt a
-            // requires_grad=false leaf, silently severing the embedding gradient.
-            let pad = padding_idx;
-            let dim = embedding_dim;
-            let ne = num_embeddings;
-            let idx_fwd = idx_usize.clone();
-            let out_shape_fwd = out_shape.clone();
-            return self.tensor_apply_function(
-                &[weight],
-                move |ctx, inputs| {
-                    let (wv, _wshape) = inputs[0];
-                    // Each output row is an independent weight-row copy (or zeros for padding) →
-                    // pre-alloc + parallel per-row copy_from_slice. Parallelizes both the gather and
-                    // its page-faulting. Bit-identical to the serial extend (disjoint rows).
-                    let mut result = vec![0.0_f64; idx_fwd.len() * dim];
-                    let fill = |k: usize, row: &mut [f64]| {
-                        let idx = idx_fwd[k];
-                        if pad != Some(idx) {
-                            let start = idx * dim;
-                            row.copy_from_slice(&wv[start..start + dim]);
-                        }
-                    };
-                    if dim > 0 {
-                        if idx_fwd.len() * dim >= PARALLEL_ELEMENTWISE_MIN && idx_fwd.len() > 1 {
-                            use rayon::prelude::*;
-                            result
-                                .par_chunks_mut(dim)
-                                .enumerate()
-                                .for_each(|(k, row)| fill(k, row));
-                        } else {
-                            for (k, row) in result.chunks_mut(dim).enumerate() {
-                                fill(k, row);
-                            }
-                        }
-                    }
-                    let idx_f: Vec<f64> = idx_fwd.iter().map(|&i| i as f64).collect();
-                    ctx.save_for_backward(idx_f, vec![idx_fwd.len()]);
-                    Ok((result, out_shape_fwd.clone()))
-                },
-                move |ctx, grad_outputs| {
-                    let saved = &ctx.saved_tensors()[0];
-                    let g = grad_outputs[0];
-                    let mut grad_w = vec![0.0_f64; ne * dim];
-                    for (k, &idxf) in saved.iter().enumerate() {
-                        let idx = idxf as usize;
-                        if pad == Some(idx) {
-                            continue;
-                        }
-                        for d in 0..dim {
-                            grad_w[idx * dim + d] += g[k * dim + d];
-                        }
-                    }
-                    Ok(vec![Some(grad_w)])
-                },
-            );
+        let weight_meta = self.tensor_tape.tensor(weight)?.meta().clone();
+        if self.tensor_requires_grad(weight)?
+            || !matches!(weight_meta.dtype(), DType::F64 | DType::F32)
+            || !weight_meta.is_contiguous()
+        {
+            // Native gather preserves the weight dtype and its differentiable
+            // scatter-add adjoint. A detached branch suppresses only padding's
+            // gradient; multiplication by a zero mask would corrupt nonfinite
+            // padding values and would not preserve a loaded padding vector.
+            let selected = self.tensor_tape.index_select(weight, 0, &input_vals)?;
+            let selected = if let Some(padding) = padding_idx {
+                let detached = self.tensor_detach(selected)?;
+                let mask = idx_usize
+                    .iter()
+                    .flat_map(|&index| {
+                        std::iter::repeat_n(if index == padding { 1.0 } else { 0.0 }, embedding_dim)
+                    })
+                    .collect();
+                let mask = DenseTensor::from_contiguous_values(
+                    mask,
+                    vec![num_indices, embedding_dim],
+                    weight_meta.device(),
+                )?
+                .to_dtype(weight_meta.dtype())?;
+                let mask = self.tensor_variable_from_storage(mask, false);
+                self.tensor_where(mask, detached, selected)?
+            } else {
+                selected
+            };
+            return self.tensor_reshape(selected, out_shape);
         }
 
         // f32 no-grad fast path (correctness bug + asymmetric-dtype): the f64 path below reads the
@@ -15275,10 +15260,8 @@ impl FrankenTorchSession {
                     if embedding_dim > 0 && num_indices > 0 {
                         let fill = |i: usize, row: &mut [f32]| {
                             let idx = idx_usize[i];
-                            if padding_idx != Some(idx) {
-                                let start = idx * embedding_dim;
-                                row.copy_from_slice(&weight_f32[start..start + embedding_dim]);
-                            }
+                            let start = idx * embedding_dim;
+                            row.copy_from_slice(&weight_f32[start..start + embedding_dim]);
                         };
                         if num_indices * embedding_dim >= PARALLEL_ELEMENTWISE_MIN
                             && num_indices > 1
@@ -15307,8 +15290,7 @@ impl FrankenTorchSession {
         // No-grad gather. For a contiguous F64 weight, BORROW the table instead of cloning it via
         // tensor_values — that clone materializes the whole [num_embeddings, embedding_dim] table per
         // forward, a large dead copy when few of many rows are looked up (same gap the f32 fast path
-        // above fixed, and embedding_bag). Non-contiguous / non-F64 falls back to the tensor_values
-        // clone. Each output row is an independent weight-row copy (or zeros for padding) → pre-alloc
+        // above fixed, and embedding_bag). Each output row is an independent weight-row copy → pre-alloc
         // + parallel per-row copy_from_slice. Bit-identical to the clone path (disjoint rows).
         let weight_contiguous_f64 = self.tensor_dtype(weight)? == DType::F64
             && self.tensor_tape.tensor(weight)?.meta().is_contiguous();
@@ -15323,10 +15305,8 @@ impl FrankenTorchSession {
         if embedding_dim > 0 && num_indices > 0 {
             let fill = |i: usize, row: &mut [f64]| {
                 let idx = idx_usize[i];
-                if padding_idx != Some(idx) {
-                    let start = idx * embedding_dim;
-                    row.copy_from_slice(&weight_vals[start..start + embedding_dim]);
-                }
+                let start = idx * embedding_dim;
+                row.copy_from_slice(&weight_vals[start..start + embedding_dim]);
             };
             if num_indices * embedding_dim >= PARALLEL_ELEMENTWISE_MIN && num_indices > 1 {
                 use rayon::prelude::*;
@@ -55715,6 +55695,15 @@ impl FrankenTorchSession {
         self.tensor_tape.tensor_accumulated_gradient_values(node)
     }
 
+    /// Snapshot accumulated sparse support and values across backward calls.
+    /// Returns None when the current gradient is dense or has been replaced.
+    pub fn tensor_accumulated_sparse_gradient(
+        &self,
+        node: TensorNodeId,
+    ) -> Result<Option<ft_core::SparseCOOTensor>, AutogradError> {
+        self.tensor_tape.tensor_accumulated_sparse_gradient(node)
+    }
+
     /// Copy a backward report with selected gradients refreshed from the tape.
     /// This exposes current accumulated, unscaled, or clipped parameter values
     /// to optimizers that consume reports instead of reading persistent gradients.
@@ -55749,15 +55738,19 @@ impl FrankenTorchSession {
         Ok(())
     }
 
-    /// Compute gradients of outputs w.r.t. inputs without accumulating into .grad.
+    /// Compute gradients of outputs w.r.t. inputs without accumulating leaf `.grad`.
     ///
     /// Equivalent to `torch.autograd.grad(outputs, inputs, grad_outputs, retain_graph, create_graph)`.
-    /// Unlike `backward()` which accumulates gradients, this returns them directly.
+    /// Unlike `backward()` which accumulates leaf gradients, this returns them
+    /// directly. Explicit non-leaf `retain_grad` still accumulates; tensor hooks
+    /// execute on first-order queries. For differentiable gradient tensors, use
+    /// [`Self::tensor_autograd_grad_report`] with `create_graph = true`.
     ///
     /// # Arguments
     /// * `outputs` - Tensors from which to differentiate (must have requires_grad=True)
     /// * `inputs` - Tensors w.r.t. which to differentiate
-    /// * `grad_outputs` - Gradients for outputs (defaults to ones if None)
+    /// * `grad_outputs` - Gradients for outputs (implicit ones require real scalar outputs).
+    ///   Complex gradients use interleaved real/imaginary components, like backward reports.
     /// * `retain_graph` - Keep the computation graph for multiple backward passes
     /// * `create_graph` - Allow higher-order derivatives
     ///
@@ -55771,8 +55764,44 @@ impl FrankenTorchSession {
         retain_graph: bool,
         create_graph: bool,
     ) -> Result<Vec<Option<Vec<f64>>>, AutogradError> {
-        if outputs.is_empty() {
-            return Ok(vec![]);
+        let report = self.tensor_autograd_grad_report(
+            outputs,
+            inputs,
+            grad_outputs,
+            retain_graph,
+            create_graph,
+        )?;
+        Ok(inputs
+            .iter()
+            .map(|&input| report.gradient(input).map(<[f64]>::to_vec))
+            .collect())
+    }
+
+    /// Compute gradients without accumulating leaf `.grad`, retaining access
+    /// to differentiable gradient tensors when `create_graph` is true.
+    ///
+    /// This accepts the same arguments as [`Self::tensor_autograd_grad`]. The
+    /// returned report contains gradients for reachable graph nodes; an unused
+    /// input has neither a gradient nor a gradient node. With `create_graph`,
+    /// `report.gradient_node(input)` can be used in subsequent tensor operations
+    /// and backward passes, for example to train with an input-gradient penalty.
+    /// Gradient nodes use the tape's F64 gradient space, including for inputs
+    /// with lower-precision storage. `create_graph` also retains the graph.
+    ///
+    /// Leaf gradient buffers are unchanged. Explicit non-leaf `retain_grad`
+    /// still accumulates, and tensor hooks execute on first-order queries.
+    pub fn tensor_autograd_grad_report(
+        &mut self,
+        outputs: &[TensorNodeId],
+        inputs: &[TensorNodeId],
+        grad_outputs: Option<&[Vec<f64>]>,
+        retain_graph: bool,
+        create_graph: bool,
+    ) -> Result<TensorBackwardReport, AutogradError> {
+        if outputs.is_empty() || inputs.is_empty() {
+            return Err(Self::incompatible_tensor_args(
+                "autograd_grad: outputs and inputs must not be empty",
+            ));
         }
 
         // The vector-Jacobian product torch.autograd.grad returns is
@@ -55791,43 +55820,79 @@ impl FrankenTorchSession {
                 ));
             }
         }
-
-        let mut surrogate: Option<TensorNodeId> = None;
-        for (k, &output) in outputs.iter().enumerate() {
-            let weighted = match grad_outputs {
-                Some(go) => {
-                    let v = &go[k];
-                    let out_shape = self.tensor_shape(output)?;
-                    let out_numel: usize = out_shape.iter().product();
-                    if v.len() != out_numel {
-                        return Err(Self::incompatible_tensor_args(
-                            "autograd_grad: each grad_outputs entry must match its output's element count",
-                        ));
-                    }
-                    let v_tensor = self.tensor_variable(v.clone(), out_shape, false)?;
-                    let prod = self.tensor_mul(output, v_tensor)?;
-                    self.tensor_sum(prod)?
-                }
-                None => self.tensor_sum(output)?,
-            };
-            surrogate = Some(match surrogate {
-                Some(acc) => self.tensor_add(acc, weighted)?,
-                None => weighted,
-            });
+        // Validate the complete request before recording any surrogate nodes or
+        // running hooks. In particular, a newly created surrogate must not make
+        // an already-consumed output appear differentiable again.
+        for &input in inputs {
+            if !self.tensor_requires_grad(input)? {
+                return Err(Self::incompatible_tensor_args(
+                    "autograd_grad: every input must require gradients",
+                ));
+            }
         }
-
-        let surrogate = surrogate.expect("outputs is non-empty");
+        for (k, &output) in outputs.iter().enumerate() {
+            self.tensor_tape.validate_backward_root(output)?;
+            let meta = self.tensor_tape.tensor(output)?.meta();
+            let gradient_len = if meta.dtype().is_complex() {
+                meta.numel().checked_mul(2).ok_or_else(|| {
+                    Self::incompatible_tensor_args("autograd_grad: complex gradient size overflow")
+                })?
+            } else {
+                meta.numel()
+            };
+            match grad_outputs {
+                Some(go) if go[k].len() != gradient_len => {
+                    return Err(Self::incompatible_tensor_args(
+                        "autograd_grad: each grad_outputs entry must match its output's gradient size",
+                    ));
+                }
+                None if meta.numel() != 1 || meta.dtype().is_complex() => {
+                    return Err(Self::incompatible_tensor_args(
+                        "autograd_grad: implicit gradients require real scalar outputs",
+                    ));
+                }
+                _ => {}
+            }
+        }
         let options = BackwardOptions::for_mode(self.mode())
             .with_retain_graph(retain_graph)
             .with_create_graph(create_graph);
-        let report = self.tensor_tape.backward_with_options(surrogate, options)?;
-
-        let mut result = Vec::with_capacity(inputs.len());
-        for &inp in inputs {
-            result.push(report.gradient(inp).map(<[f64]>::to_vec));
-        }
-
-        Ok(result)
+        // Backward queries work inside no_grad too. Only this internal
+        // surrogate needs forward recording; the caller's mode is restored even
+        // on errors or panics. Work in the tape's F64 gradient space so an F32,
+        // F16 or BF16 output can accept a lossless Vec<f64> cotangent.
+        self.with_enable_grad(|session| {
+            let mut surrogate: Option<TensorNodeId> = None;
+            for (k, &output) in outputs.iter().enumerate() {
+                let real_output = if session.tensor_dtype(output)?.is_complex() {
+                    session.tensor_view_as_real(output)?
+                } else {
+                    output
+                };
+                let real_output = session.tensor_to_f64(real_output)?;
+                let weighted = match grad_outputs {
+                    Some(go) => {
+                        let meta = session.tensor_tape.tensor(real_output)?.meta();
+                        let seed = DenseTensor::from_contiguous_values(
+                            go[k].clone(),
+                            meta.shape().to_vec(),
+                            meta.device(),
+                        )?;
+                        let seed = session.tensor_variable_from_storage(seed, false);
+                        let prod = session.tensor_mul(real_output, seed)?;
+                        session.tensor_sum(prod)?
+                    }
+                    None => session.tensor_sum(real_output)?,
+                };
+                surrogate = Some(match surrogate {
+                    Some(acc) => session.tensor_add(acc, weighted)?,
+                    None => weighted,
+                });
+            }
+            session
+                .tensor_tape
+                .grad_with_options(surrogate.expect("outputs is non-empty"), options)
+        })
     }
 
     /// Compute the vector-Jacobian product (VJP).
@@ -55853,61 +55918,133 @@ impl FrankenTorchSession {
         self.tensor_autograd_grad(&[output], inputs, Some(&[v]), true, false)
     }
 
-    /// Compute the Jacobian-vector product (JVP) via forward-mode AD approximation.
+    /// Compute the exact Jacobian-vector product (JVP).
     ///
     /// Equivalent to `torch.autograd.functional.jvp(func, inputs, v)`.
     /// Given a function f and a vector v with same shape as inputs,
     /// computes J @ v where J is the Jacobian of f.
     ///
-    /// Note: This uses numerical differentiation since FrankenTorch doesn't have
-    /// forward-mode AD. For exact JVP, use finite differences with small epsilon.
+    /// Uses reverse-over-reverse differentiation: differentiating `Jᵀ u` with
+    /// respect to an auxiliary cotangent `u` yields `J v`. The closure runs once,
+    /// so stochastic functions use the same random sample for output and JVP.
+    /// Its operations must support higher-order differentiation.
+    ///
+    /// Inputs and output must have real floating-point dtype. Inputs are
+    /// evaluated as fresh gradient-enabled leaves preserving their storage
+    /// dtype, device, shape, and strides, including inputs that do not originally
+    /// require gradients. The returned output is detached, as in PyTorch's
+    /// default `create_graph = false` mode, and the JVP uses F64 gradient values.
+    /// Input-independent outputs yield zeros. The caller's gradient mode and
+    /// existing leaf gradient buffers are preserved.
     ///
     /// # Arguments
     /// * `func` - A closure that computes the forward pass
     /// * `inputs` - The input tensors
-    /// * `v` - Tangent vectors (perturbation directions), one per input
-    /// * `eps` - Epsilon for finite differences (default: 1e-6)
+    /// * `v` - Tangent vectors, one per input, matching its logical element count
     pub fn tensor_functional_jvp<F>(
         &mut self,
         func: F,
         inputs: &[TensorNodeId],
         v: &[Vec<f64>],
-        eps: Option<f64>,
     ) -> Result<(TensorNodeId, Vec<f64>), AutogradError>
     where
         F: Fn(&mut Self, &[TensorNodeId]) -> Result<TensorNodeId, AutogradError>,
     {
-        let eps = eps.unwrap_or(1e-6);
-
-        // Compute f(x)
-        let output = func(self, inputs)?;
-        let out_vals = self.tensor_values(output)?;
-
-        // Compute f(x + eps*v) using finite differences
-        let mut perturbed_inputs = Vec::with_capacity(inputs.len());
-        for (i, &inp) in inputs.iter().enumerate() {
-            let inp_vals = self.tensor_values(inp)?;
-            let shape = self.tensor_shape(inp)?;
-            let perturbed: Vec<f64> = inp_vals
-                .iter()
-                .zip(v.get(i).unwrap_or(&vec![0.0; inp_vals.len()]).iter())
-                .map(|(x, vi)| x + eps * vi)
-                .collect();
-            let p = self.tensor_variable(perturbed, shape, false)?;
-            perturbed_inputs.push(p);
+        if inputs.is_empty() || v.len() != inputs.len() {
+            return Err(Self::incompatible_tensor_args(
+                "jvp: one tangent vector required per input",
+            ));
+        }
+        // Validate every input and tangent before recording nodes or evaluating
+        // user code (which may consume randomness or have other side effects).
+        let mut input_storage = Vec::with_capacity(inputs.len());
+        for (&input, tangent) in inputs.iter().zip(v) {
+            let tensor = self.tensor_tape.tensor(input)?;
+            if !tensor.meta().dtype().is_floating_point() {
+                return Err(Self::incompatible_tensor_args(
+                    "jvp: inputs must have real floating-point dtype",
+                ));
+            }
+            if tangent.len() != tensor.meta().numel() {
+                return Err(Self::incompatible_tensor_args(
+                    "jvp: each tangent must match its input's element count",
+                ));
+            }
+            input_storage.push(tensor.clone());
         }
 
-        let perturbed_output = func(self, &perturbed_inputs)?;
-        let perturbed_vals = self.tensor_values(perturbed_output)?;
-
-        // JVP = (f(x + eps*v) - f(x)) / eps
-        let jvp: Vec<f64> = perturbed_vals
-            .iter()
-            .zip(out_vals.iter())
-            .map(|(p, o)| (p - o) / eps)
-            .collect();
-
-        Ok((output, jvp))
+        self.with_enable_grad(|session| {
+            let differentiable_inputs: Vec<_> = input_storage
+                .into_iter()
+                .map(|tensor| session.tensor_variable_from_storage(tensor, true))
+                .collect();
+            let output = func(session, &differentiable_inputs)?;
+            let output_storage = session.tensor_snapshot(output)?;
+            let output_meta = output_storage.meta();
+            if !output_meta.dtype().is_floating_point() {
+                return Err(Self::incompatible_tensor_args(
+                    "jvp: output must have real floating-point dtype",
+                ));
+            }
+            let output_numel = output_meta.numel();
+            let mut jvp = vec![0.0; output_numel];
+            if session.tensor_requires_grad(output)? && output_numel != 0 {
+                let cotangent = DenseTensor::from_contiguous_values(
+                    vec![0.0; output_numel],
+                    output_meta.shape().to_vec(),
+                    output_meta.device(),
+                )?;
+                let cotangent = session.tensor_variable_from_storage(cotangent, true);
+                let real_output = session.tensor_to_f64(output)?;
+                let weighted = session.tensor_mul(real_output, cotangent)?;
+                let scalar = session.tensor_sum(weighted)?;
+                // d<f(x),u>/dx = Jᵀu, with u retained in the derivative graph.
+                let first = session.tensor_autograd_grad_report(
+                    &[scalar],
+                    &differentiable_inputs,
+                    None,
+                    true,
+                    true,
+                )?;
+                let mut contraction = None;
+                for (&input, tangent) in differentiable_inputs.iter().zip(v) {
+                    let Some(gradient) = first.gradient_node(input) else {
+                        continue;
+                    };
+                    let meta = session.tensor_tape.tensor(gradient)?.meta();
+                    let tangent = DenseTensor::from_contiguous_values(
+                        tangent.clone(),
+                        meta.shape().to_vec(),
+                        meta.device(),
+                    )?;
+                    let tangent = session.tensor_variable_from_storage(tangent, false);
+                    let product = session.tensor_mul(gradient, tangent)?;
+                    let scalar = session.tensor_sum(product)?;
+                    contraction = Some(match contraction {
+                        Some(previous) => session.tensor_add(previous, scalar)?,
+                        None => scalar,
+                    });
+                }
+                if let Some(contraction) = contraction {
+                    if session.tensor_requires_grad(contraction)? {
+                        // d< Jᵀu, v >/du = Jv. Retain the graph so this query
+                        // does not consume other training graphs on the tape.
+                        let second = session.tensor_autograd_grad_report(
+                            &[contraction],
+                            &[cotangent],
+                            None,
+                            true,
+                            false,
+                        )?;
+                        if let Some(gradient) = second.gradient(cotangent) {
+                            jvp.copy_from_slice(gradient);
+                        }
+                    }
+                }
+            }
+            let detached_output = session.tensor_variable_from_storage(output_storage, false);
+            Ok((detached_output, jvp))
+        })
     }
 
     /// Compute the Hessian-vector product (HVP).
@@ -55961,44 +56098,81 @@ impl FrankenTorchSession {
         inputs: &[TensorNodeId],
         v: &[Vec<f64>],
     ) -> Result<Vec<Option<Vec<f64>>>, AutogradError> {
+        let output_meta = self.tensor_tape.tensor(output)?.meta();
+        if output_meta.numel() != 1 || output_meta.dtype().is_complex() {
+            return Err(Self::incompatible_tensor_args(
+                "hessian product: output must be a real scalar (one element)",
+            ));
+        }
+        if inputs.is_empty() || v.len() != inputs.len() {
+            return Err(Self::incompatible_tensor_args(
+                "hessian product: one v vector required per input",
+            ));
+        }
+        let mut input_numels = Vec::with_capacity(inputs.len());
+        for (&input, vector) in inputs.iter().zip(v) {
+            if !self.tensor_requires_grad(input)? {
+                return Err(Self::incompatible_tensor_args(
+                    "hessian product: every input must require gradients",
+                ));
+            }
+            let meta = self.tensor_tape.tensor(input)?.meta();
+            if meta.dtype().is_complex() || vector.len() != meta.numel() {
+                return Err(Self::incompatible_tensor_args(
+                    "hessian product: each v vector must match a real input's element count",
+                ));
+            }
+            input_numels.push(meta.numel());
+        }
         let first = BackwardOptions::for_mode(self.mode())
             .with_create_graph(true)
             .with_retain_graph(true);
-        let report1 = self.tensor_backward_with_options(output, first)?;
+        let report1 = self.tensor_tape.grad_with_options(output, first)?;
 
-        let mut s_node: Option<TensorNodeId> = None;
-        for (i, &inp) in inputs.iter().enumerate() {
-            let Some(grad_node) = report1.gradient_node(inp) else {
-                continue;
-            };
-            let shape = self.tensor_shape(inp)?;
-            let numel: usize = shape.iter().product();
-            let vi = v.get(i).ok_or_else(|| {
-                Self::incompatible_tensor_args("hessian product: one v vector required per input")
-            })?;
-            if vi.len() != numel {
-                return Err(Self::incompatible_tensor_args(
-                    "hessian product: each v vector must match its input's element count",
-                ));
+        let s_node = self.with_enable_grad(|session| {
+            let mut s_node: Option<TensorNodeId> = None;
+            for (i, &inp) in inputs.iter().enumerate() {
+                let Some(grad_node) = report1.gradient_node(inp) else {
+                    continue;
+                };
+                let meta = session.tensor_tape.tensor(grad_node)?.meta();
+                let seed = DenseTensor::from_contiguous_values(
+                    v[i].clone(),
+                    meta.shape().to_vec(),
+                    meta.device(),
+                )?;
+                let v_tensor = session.tensor_variable_from_storage(seed, false);
+                let prod = session.tensor_mul(grad_node, v_tensor)?;
+                let dotted = session.tensor_sum(prod)?;
+                s_node = Some(match s_node {
+                    Some(acc) => session.tensor_add(acc, dotted)?,
+                    None => dotted,
+                });
             }
-            let v_tensor = self.tensor_variable(vi.clone(), shape, false)?;
-            let prod = self.tensor_mul(grad_node, v_tensor)?;
-            let dotted = self.tensor_sum(prod)?;
-            s_node = Some(match s_node {
-                Some(acc) => self.tensor_add(acc, dotted)?,
-                None => dotted,
-            });
-        }
+            Ok::<_, AutogradError>(s_node)
+        })?;
 
         let Some(s_node) = s_node else {
             return Ok(inputs.iter().map(|_| None).collect());
         };
 
-        let report2 =
-            self.tensor_backward_with_options(s_node, BackwardOptions::for_mode(self.mode()))?;
+        let report2 = if self.tensor_requires_grad(s_node)? {
+            let second = BackwardOptions::for_mode(self.mode()).with_retain_graph(true);
+            Some(self.tensor_tape.grad_with_options(s_node, second)?)
+        } else {
+            None
+        };
         Ok(inputs
             .iter()
-            .map(|&inp| report2.gradient(inp).map(<[f64]>::to_vec))
+            .zip(input_numels)
+            .map(|(&inp, numel)| {
+                report1.gradient_node(inp).map(|_| {
+                    report2
+                        .as_ref()
+                        .and_then(|report| report.gradient(inp))
+                        .map_or_else(|| vec![0.0; numel], <[f64]>::to_vec)
+                })
+            })
             .collect())
     }
 
@@ -56058,22 +56232,35 @@ impl FrankenTorchSession {
         output: TensorNodeId,
         input: TensorNodeId,
     ) -> Result<Vec<f64>, AutogradError> {
-        let out_numel: usize = self.tensor_shape(output)?.iter().product();
-        if out_numel != 1 {
+        let output_meta = self.tensor_tape.tensor(output)?.meta();
+        if output_meta.numel() != 1 || output_meta.dtype().is_complex() {
             return Err(Self::incompatible_tensor_args(
-                "hessian: output must be a scalar (one element)",
+                "hessian: output must be a real scalar (one element)",
             ));
+        }
+        if !self.tensor_requires_grad(input)? || self.tensor_dtype(input)?.is_complex() {
+            return Err(Self::incompatible_tensor_args(
+                "hessian: input must be real and require gradients",
+            ));
+        }
+        let n = self.tensor_tape.tensor(input)?.meta().numel();
+        let size = n
+            .checked_mul(n)
+            .ok_or_else(|| Self::incompatible_tensor_args("hessian: output shape overflow"))?;
+        let mut hess = vec![0.0; size];
+        if !self.tensor_requires_grad(output)? {
+            return Ok(hess);
         }
         let first = BackwardOptions::for_mode(self.mode())
             .with_create_graph(true)
             .with_retain_graph(true);
-        let report1 = self.tensor_backward_with_options(output, first)?;
-        let grad_node = report1.gradient_node(input).ok_or_else(|| {
-            Self::incompatible_tensor_args("hessian: output does not depend on input")
-        })?;
-
-        let n: usize = self.tensor_shape(input)?.iter().product();
-        let mut hess = vec![0.0; n * n];
+        let report1 = self.tensor_tape.grad_with_options(output, first)?;
+        let Some(grad_node) = report1.gradient_node(input) else {
+            return Ok(hess);
+        };
+        if !self.tensor_requires_grad(grad_node)? {
+            return Ok(hess);
+        }
         for k in 0..n {
             let mut seed = vec![0.0; n];
             seed[k] = 1.0;
@@ -56094,6 +56281,18 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         self.tensor_tape
             .set_tensor_accumulated_gradient(node, gradient)
+    }
+
+    /// Update gradient values after a zero-preserving transform while retaining
+    /// sparse row support. Values outside that support deliberately make the
+    /// gradient dense. Use `tensor_set_accumulated_gradient` for replacement.
+    pub fn tensor_set_accumulated_gradient_preserving_sparse_support(
+        &mut self,
+        node: TensorNodeId,
+        gradient: Vec<f64>,
+    ) -> Result<(), AutogradError> {
+        self.tensor_tape
+            .set_tensor_accumulated_gradient_preserving_sparse_support(node, gradient)
     }
 
     /// Update a parameter's values directly, bypassing the leaf-grad in-place guard.
@@ -56236,7 +56435,7 @@ impl FrankenTorchSession {
             for &p in params {
                 if let Some(grad) = self.tensor_accumulated_gradient(p)? {
                     let clipped: Vec<f64> = grad.iter().map(|&g| g * clip_coef).collect();
-                    self.tensor_set_accumulated_gradient(p, clipped)?;
+                    self.tensor_set_accumulated_gradient_preserving_sparse_support(p, clipped)?;
                 }
             }
         }
@@ -56267,7 +56466,7 @@ impl FrankenTorchSession {
                     .iter()
                     .map(|&g| g.clamp(-clip_value, clip_value))
                     .collect();
-                self.tensor_set_accumulated_gradient(p, clipped)?;
+                self.tensor_set_accumulated_gradient_preserving_sparse_support(p, clipped)?;
             }
         }
 
@@ -147043,7 +147242,7 @@ mod tests {
         // Row 0 used 2x → [2,2]; row 2 once → [1,1]; rows 1,3 unused → 0.
         assert_eq!(g, &vec![2.0, 2.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
 
-        // padding_idx=1: index 1 lookups output zeros and receive no gradient.
+        // padding_idx=1: index 1 lookups preserve the stored row and receive no gradient.
         let weight2 = s.tensor_variable(w, vec![4, 2], true).unwrap();
         let idx2 = s
             .tensor_variable(vec![1.0, 0.0, 1.0], vec![3], false)
@@ -147051,7 +147250,7 @@ mod tests {
         let out2 = s.tensor_embedding(idx2, weight2, Some(1)).unwrap();
         assert_eq!(
             s.tensor_values(out2).unwrap(),
-            vec![0.0, 0.0, 1.0, 2.0, 0.0, 0.0]
+            vec![3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
         );
         let loss2 = s.tensor_sum(out2).unwrap();
         let report2 = s.tensor_backward(loss2).unwrap();
@@ -147060,6 +147259,109 @@ mod tests {
             .expect("padding grad present");
         // Only row 0 (the non-padding lookup) gets gradient [1,1]; row 1 padding → 0.
         assert_eq!(g2, &vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn tensor_embedding_typed_padding_preserves_values_and_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for requires_grad in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let weight = DenseTensor::from_contiguous_values(
+                        (1..=8).map(f64::from).collect(),
+                        vec![4, 2],
+                        Device::Cpu,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                    let weight = session.tensor_variable_from_storage(weight, requires_grad);
+                    let indices = session
+                        .tensor_variable(vec![1.0, 0.0, 1.0, 2.0], vec![2, 2], false)
+                        .unwrap();
+                    let output = session.tensor_embedding(indices, weight, Some(1)).unwrap();
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert_eq!(session.tensor_shape(output).unwrap(), [2, 2, 2]);
+                    assert_eq!(
+                        session
+                            .tensor_tape
+                            .tensor(output)
+                            .unwrap()
+                            .contiguous_values_as_f64()
+                            .unwrap(),
+                        [3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+                    );
+                    assert_eq!(session.tensor_requires_grad(output).unwrap(), requires_grad);
+                    if requires_grad {
+                        let cotangent = DenseTensor::from_contiguous_values(
+                            (1..=8).map(f64::from).collect(),
+                            vec![2, 2, 2],
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                        let cotangent = session.tensor_variable_from_storage(cotangent, false);
+                        let weighted = session.tensor_mul(output, cotangent).unwrap();
+                        let loss = session.tensor_sum(weighted).unwrap();
+                        let report = session.tensor_backward(loss).unwrap();
+                        assert_eq!(
+                            report.gradient(weight).unwrap(),
+                            [3.0, 4.0, 0.0, 0.0, 7.0, 8.0, 0.0, 0.0]
+                        );
+                    }
+                    let inference = session
+                        .with_no_grad(|session| session.tensor_embedding(indices, weight, Some(1)))
+                        .unwrap();
+                    assert!(!session.tensor_requires_grad(inference).unwrap());
+                    assert_eq!(session.tensor_dtype(inference).unwrap(), dtype);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_embedding_nonfinite_padding_and_invalid_indices_are_safe() {
+        for dtype in [DType::F64, DType::F32] {
+            for requires_grad in [false, true] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let weight = DenseTensor::from_contiguous_values(
+                    vec![1.0, 2.0, f64::NAN, f64::INFINITY],
+                    vec![2, 2],
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let weight = session.tensor_variable_from_storage(weight, requires_grad);
+                let indices = session.tensor_variable(vec![1.0], vec![1], false).unwrap();
+                let output = session.tensor_embedding(indices, weight, Some(1)).unwrap();
+                let values = session
+                    .tensor_tape
+                    .tensor(output)
+                    .unwrap()
+                    .contiguous_values_as_f64()
+                    .unwrap();
+                assert!(values[0].is_nan());
+                assert_eq!(values[1], f64::INFINITY);
+                if requires_grad {
+                    let loss = session.tensor_sum(output).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert_eq!(report.gradient(weight).unwrap(), [0.0; 4]);
+                }
+                for value in [-1.0, 0.5, 2.0, f64::NAN, f64::INFINITY] {
+                    let invalid = session
+                        .tensor_variable(vec![value], vec![1], false)
+                        .unwrap();
+                    let count = session.autograd_graph_node_count();
+                    assert!(session.tensor_embedding(invalid, weight, None).is_err());
+                    assert_eq!(session.autograd_graph_node_count(), count);
+                }
+                let count = session.autograd_graph_node_count();
+                assert!(session.tensor_embedding(indices, weight, Some(2)).is_err());
+                assert_eq!(session.autograd_graph_node_count(), count);
+            }
+        }
     }
 
     #[test]
@@ -175616,9 +175918,597 @@ mod tests {
         assert_eq!(grads.len(), 1);
         assert_eq!(grads[0].as_ref().unwrap(), &[4.0, 6.0]);
 
-        // The accumulated gradient should NOT be set (autograd_grad doesn't accumulate)
-        // But after calling autograd_grad, the backward was run so gradients ARE accumulated
-        // This is a simplification - full PyTorch autograd.grad has separate code paths
+        assert_eq!(s.tensor_grad(x).unwrap(), None);
+    }
+
+    #[test]
+    fn autograd_grad_preserves_leaf_buffers_and_executes_retained_nonleaf_hooks() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut s = FrankenTorchSession::new(mode);
+            let x = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+            let unused = s.tensor_variable(vec![9.0], vec![1], true).unwrap();
+            let y = s.tensor_mul(x, x).unwrap();
+            let loss = s.tensor_sum(y).unwrap();
+            s.tensor_retain_grad(y).unwrap();
+            s.tensor_set_accumulated_gradient(x, vec![7.0, 11.0])
+                .unwrap();
+            s.tensor_set_accumulated_gradient(y, vec![13.0, 17.0])
+                .unwrap();
+            s.tensor_register_hook(y, |grad| {
+                Ok(Some(grad.iter().map(|value| 2.0 * value).collect()))
+            })
+            .unwrap();
+
+            for query in 1..=2 {
+                let grads = s
+                    .tensor_autograd_grad(&[loss], &[x, unused, x], None, true, false)
+                    .unwrap();
+                assert_eq!(
+                    grads,
+                    vec![Some(vec![8.0, 12.0]), None, Some(vec![8.0, 12.0])]
+                );
+                assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![7.0, 11.0]));
+                assert_eq!(s.tensor_grad(unused).unwrap(), None);
+                // retain_grad is an explicit non-leaf hook in PyTorch, and
+                // intentionally runs for autograd.grad as well as backward.
+                assert_eq!(
+                    s.tensor_grad(y).unwrap(),
+                    Some(vec![
+                        13.0 + f64::from(query) * 2.0,
+                        17.0 + f64::from(query) * 2.0
+                    ])
+                );
+            }
+            s.tensor_backward(loss).unwrap();
+            assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![15.0, 23.0]));
+        }
+    }
+
+    #[test]
+    fn autograd_grad_typed_weighted_queries_work_inside_no_grad() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let mut s = FrankenTorchSession::new(mode);
+                let raw = s.tensor_variable(vec![2.0, 3.0], vec![2], false).unwrap();
+                let typed = s.tensor_to_dtype(raw, dtype).unwrap();
+                let storage = s.tensor_tape.tensor(typed).unwrap().clone();
+                let x = s.tensor_variable_from_storage(storage, true);
+                let square = s.tensor_mul(x, x).unwrap();
+                let neg = s.tensor_neg(x).unwrap();
+                s.tensor_set_accumulated_gradient(x, vec![5.0, 7.0])
+                    .unwrap();
+                let tiny = 2.0_f64.powi(-30);
+                let seeds = [vec![0.25, tiny], vec![2.0, -3.0]];
+                for create_graph in [false, true] {
+                    let grads = s.with_no_grad(|s| {
+                        assert!(!s.is_grad_enabled());
+                        let grads = s
+                            .tensor_autograd_grad(
+                                &[square, neg],
+                                &[x],
+                                Some(&seeds),
+                                true,
+                                create_graph,
+                            )
+                            .unwrap();
+                        assert!(!s.is_grad_enabled());
+                        grads
+                    });
+                    // d(<x²,a> + <-x,b>)/dx = 2*x*a-b. Cotangents
+                    // live in F64 gradient space, including sub-half-ULP seeds.
+                    assert_eq!(grads, vec![Some(vec![-1.0, 3.0 + 6.0 * tiny])]);
+                    assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![5.0, 7.0]));
+                    assert_eq!(s.tensor_dtype(x).unwrap(), dtype);
+                    assert!(s.is_grad_enabled());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn autograd_grad_cotangents_are_contiguous_for_offset_and_strided_outputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable((0..12).map(f64::from).collect(), vec![3, 4], true)
+            .unwrap();
+        let offset = s.tensor_narrow(x, 0, 1, 2).unwrap();
+        assert_eq!(
+            s.tensor_snapshot(offset).unwrap().meta().storage_offset(),
+            4
+        );
+        let seed: Vec<_> = (1..=8).map(f64::from).collect();
+        let grads = s
+            .tensor_autograd_grad(&[offset], &[x], Some(&[seed]), true, false)
+            .unwrap();
+        assert_eq!(
+            grads,
+            vec![Some(vec![
+                0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
+            ])]
+        );
+
+        let meta = ft_core::TensorMeta::from_shape_and_strides(
+            vec![2, 2],
+            vec![1, 3],
+            1,
+            DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+        let storage = DenseTensor::from_storage(meta, (0..9).map(f64::from).collect()).unwrap();
+        let strided = s.tensor_variable_from_storage(storage, true);
+        assert!(!s.tensor_snapshot(strided).unwrap().meta().is_contiguous());
+        let grads = s
+            .tensor_autograd_grad(
+                &[strided],
+                &[strided],
+                Some(&[vec![2.0, 3.0, 5.0, 7.0]]),
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(grads, vec![Some(vec![2.0, 3.0, 5.0, 7.0])]);
+        assert_eq!(s.tensor_grad(x).unwrap(), None);
+        assert_eq!(s.tensor_grad(strided).unwrap(), None);
+    }
+
+    #[test]
+    fn autograd_grad_complex_cotangents_use_interleaved_components() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let real = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let imag = s.tensor_variable(vec![3.0, 4.0], vec![2], true).unwrap();
+        let z = s.tensor_complex(real, imag).unwrap();
+        let conjugate = s.tensor_conj(z).unwrap();
+        let grads = s
+            .tensor_autograd_grad(
+                &[conjugate],
+                &[real, imag, z],
+                Some(&[vec![2.0, -3.0, 5.0, 7.0]]),
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(grads[0], Some(vec![2.0, 5.0]));
+        assert_eq!(grads[1], Some(vec![3.0, -7.0]));
+        assert_eq!(grads[2], Some(vec![2.0, 3.0, 5.0, -7.0]));
+        assert_eq!(s.tensor_grad(real).unwrap(), None);
+        assert_eq!(s.tensor_grad(imag).unwrap(), None);
+    }
+
+    #[test]
+    fn autograd_grad_preflight_is_atomic_and_consumed_outputs_stay_consumed() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+        let frozen = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let y = s.tensor_mul(x, x).unwrap();
+        let loss = s.tensor_sum(y).unwrap();
+        s.tensor_set_accumulated_gradient(x, vec![7.0, 11.0])
+            .unwrap();
+        let boundary = s.autograd_graph_node_count();
+        assert!(
+            s.tensor_autograd_grad(&[y], &[x], None, true, false)
+                .is_err()
+        );
+        assert!(
+            s.tensor_autograd_grad(&[loss], &[frozen], None, true, false)
+                .is_err()
+        );
+        assert!(
+            s.tensor_autograd_grad(&[loss], &[TensorNodeId(usize::MAX)], None, true, false)
+                .is_err()
+        );
+        assert!(
+            s.tensor_autograd_grad(&[loss, y], &[x], Some(&[vec![1.0], vec![1.0]]), true, false)
+                .is_err()
+        );
+        assert!(
+            s.tensor_autograd_grad(&[loss, frozen], &[x], None, true, false)
+                .is_err()
+        );
+        assert_eq!(s.autograd_graph_node_count(), boundary);
+        assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![7.0, 11.0]));
+        let grads = s
+            .tensor_autograd_grad(&[loss], &[x], None, false, false)
+            .unwrap();
+        assert_eq!(grads, vec![Some(vec![4.0, 6.0])]);
+        let consumed_boundary = s.autograd_graph_node_count();
+        assert!(matches!(
+            s.tensor_autograd_grad(&[loss], &[x], None, true, false),
+            Err(AutogradError::TensorGraphConsumed)
+        ));
+        assert_eq!(s.autograd_graph_node_count(), consumed_boundary);
+    }
+
+    #[test]
+    fn autograd_grad_report_trains_through_an_input_gradient_penalty() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                let mut s = FrankenTorchSession::new(mode);
+                let raw_x = s.tensor_variable(vec![2.0, -3.0], vec![2], false).unwrap();
+                let raw_w = s.tensor_variable(vec![2.0], vec![], false).unwrap();
+                let typed_x = s.tensor_to_dtype(raw_x, dtype).unwrap();
+                let typed_w = s.tensor_to_dtype(raw_w, dtype).unwrap();
+                let x_storage = s.tensor_snapshot(typed_x).unwrap();
+                let w_storage = s.tensor_snapshot(typed_w).unwrap();
+                let x = s.tensor_variable_from_storage(x_storage, true);
+                let w = s.tensor_variable_from_storage(w_storage, true);
+                let unused = s.tensor_variable(vec![9.0], vec![1], true).unwrap();
+                let squared = s.tensor_mul(x, x).unwrap();
+                let output = s.tensor_mul(w, squared).unwrap();
+                s.tensor_set_accumulated_gradient(x, vec![5.0, 7.0])
+                    .unwrap();
+                s.tensor_set_accumulated_gradient(w, vec![11.0]).unwrap();
+
+                let report = s.with_no_grad(|s| {
+                    let report = s
+                        .tensor_autograd_grad_report(
+                            &[output],
+                            &[x, unused],
+                            Some(&[vec![1.0, 1.0]]),
+                            false,
+                            true,
+                        )
+                        .unwrap();
+                    assert!(!s.is_grad_enabled());
+                    report
+                });
+                assert_eq!(report.gradient(x), Some([8.0, -12.0].as_slice()));
+                assert_eq!(report.gradient(unused), None);
+                assert_eq!(report.gradient_node(unused), None);
+                let gradient = report
+                    .gradient_node(x)
+                    .expect("differentiable input gradient");
+                assert_eq!(s.tensor_dtype(gradient).unwrap(), DType::F64);
+                assert!(s.tensor_requires_grad(gradient).unwrap());
+                let numeric = s
+                    .tensor_autograd_grad(&[output], &[x], Some(&[vec![1.0, 1.0]]), true, false)
+                    .unwrap();
+                assert_eq!(numeric, vec![Some(vec![8.0, -12.0])]);
+                assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![5.0, 7.0]));
+                assert_eq!(s.tensor_grad(w).unwrap(), Some(vec![11.0]));
+
+                // f(x,w)=w*x²; ||df/dx||²=4*w²*sum(x²).
+                // d(penalty)/dx=8*w²*x; d(penalty)/dw=8*w*sum(x²).
+                let squared_gradient = s.tensor_mul(gradient, gradient).unwrap();
+                let penalty = s.tensor_sum(squared_gradient).unwrap();
+                assert_eq!(s.tensor_values(penalty).unwrap(), vec![208.0]);
+                drop(report); // Gradient nodes belong to the session, not the report.
+                s.tensor_backward(penalty).unwrap();
+                assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![69.0, -89.0]));
+                assert_eq!(s.tensor_grad(w).unwrap(), Some(vec![219.0]));
+                assert_eq!(s.tensor_grad(unused).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn functional_jvp_exact_polynomial_preserves_typed_inputs_and_no_grad() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let mut s = FrankenTorchSession::new(mode);
+                let raw_x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+                let raw_y = s.tensor_variable(vec![2.0, -1.0], vec![2], false).unwrap();
+                let typed_x = s.tensor_to_dtype(raw_x, dtype).unwrap();
+                let typed_y = s.tensor_to_dtype(raw_y, dtype).unwrap();
+                let x_storage = s.tensor_snapshot(typed_x).unwrap();
+                let y_storage = s.tensor_snapshot(typed_y).unwrap();
+                let x = s.tensor_variable_from_storage(x_storage, false);
+                let y = s.tensor_variable_from_storage(y_storage, true);
+                s.tensor_set_accumulated_gradient(y, vec![5.0, 7.0])
+                    .unwrap();
+                let calls = std::cell::Cell::new(0);
+                let (output, jvp) = s.with_no_grad(|s| {
+                    let result = s
+                        .tensor_functional_jvp(
+                            |s, inputs| {
+                                calls.set(calls.get() + 1);
+                                assert!(s.is_grad_enabled());
+                                assert_ne!(inputs, &[x, y]);
+                                for &input in inputs {
+                                    assert!(s.tensor_requires_grad(input)?);
+                                    assert_eq!(s.tensor_dtype(input)?, dtype);
+                                    assert_eq!(s.tensor_device(input)?, Device::Cpu);
+                                }
+                                let x2 = s.tensor_mul(inputs[0], inputs[0])?;
+                                let x2y = s.tensor_mul(x2, inputs[1])?;
+                                let y2 = s.tensor_mul(inputs[1], inputs[1])?;
+                                let y3 = s.tensor_mul(y2, inputs[1])?;
+                                s.tensor_add(x2y, y3)
+                            },
+                            &[x, y],
+                            &[vec![3.0, -2.0], vec![-1.0, 0.5]],
+                        )
+                        .unwrap();
+                    assert!(!s.is_grad_enabled());
+                    result
+                });
+                // f=x²*y+y³; Jv=2*x*y*vx+(x²+3*y²)*vy.
+                assert_eq!(jvp, vec![-1.0, 11.5]);
+                assert_eq!(calls.get(), 1);
+                assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                assert_eq!(s.tensor_shape(output).unwrap(), vec![2]);
+                assert_eq!(
+                    s.tensor_snapshot(output)
+                        .unwrap()
+                        .contiguous_values_as_f64()
+                        .unwrap(),
+                    vec![10.0, -5.0],
+                );
+                assert!(!s.tensor_requires_grad(output).unwrap());
+                assert!(!s.tensor_requires_grad(x).unwrap());
+                assert!(s.tensor_requires_grad(y).unwrap());
+                assert_eq!(s.tensor_grad(x).unwrap(), None);
+                assert_eq!(s.tensor_grad(y).unwrap(), Some(vec![5.0, 7.0]));
+                assert!(s.is_grad_enabled());
+            }
+        }
+    }
+
+    #[test]
+    fn functional_jvp_linear_large_values_constant_and_empty_outputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1e16, -1e16], vec![2, 1], true)
+            .unwrap();
+        let w = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        s.tensor_set_accumulated_gradient(x, vec![7.0, 11.0])
+            .unwrap();
+        s.tensor_set_accumulated_gradient(w, vec![1.0, 2.0, 3.0, 4.0])
+            .unwrap();
+        let existing_loss = s.tensor_sum(x).unwrap();
+        // A finite perturbation of 1e-6 cannot change either large input.
+        let (_, jvp) = s
+            .tensor_functional_jvp(
+                |s, inputs| s.tensor_matmul(w, inputs[0]),
+                &[x],
+                &[vec![2.0, -1.0]],
+            )
+            .unwrap();
+        assert_eq!(jvp, vec![0.0, 2.0]);
+        assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![7.0, 11.0]));
+        assert_eq!(s.tensor_grad(w).unwrap(), Some(vec![1.0, 2.0, 3.0, 4.0]));
+
+        // Captured trainable parameters can be independent of the inputs.
+        let (constant, jvp) = s
+            .tensor_functional_jvp(|_, _| Ok(w), &[x], &[vec![2.0, -1.0]])
+            .unwrap();
+        assert_eq!(jvp, vec![0.0; 4]);
+        assert!(!s.tensor_requires_grad(constant).unwrap());
+        let empty = s
+            .tensor_variable_f32(Vec::new(), vec![0, 2], false)
+            .unwrap();
+        let (empty_output, jvp) = s
+            .tensor_functional_jvp(|_, inputs| Ok(inputs[0]), &[empty], &[Vec::new()])
+            .unwrap();
+        assert!(jvp.is_empty());
+        assert_eq!(s.tensor_shape(empty_output).unwrap(), vec![0, 2]);
+        assert_eq!(s.tensor_dtype(empty_output).unwrap(), DType::F32);
+        let scalar = s.tensor_variable(vec![3.0], vec![], false).unwrap();
+        let (scalar_output, jvp) = s
+            .tensor_functional_jvp(
+                |s, inputs| s.tensor_mul(inputs[0], inputs[0]),
+                &[scalar],
+                &[vec![2.0]],
+            )
+            .unwrap();
+        assert_eq!(jvp, vec![12.0]);
+        assert!(s.tensor_shape(scalar_output).unwrap().is_empty());
+
+        // Queries leave pre-existing training graphs available to backward.
+        s.tensor_backward(existing_loss).unwrap();
+        assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![8.0, 12.0]));
+    }
+
+    #[test]
+    fn functional_jvp_preserves_offset_views_and_uses_logical_tangents() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let backing = s
+            .tensor_variable(vec![9.0, 1.0, 2.0, 3.0, 4.0, 9.0], vec![6], false)
+            .unwrap();
+        let offset = s.tensor_narrow(backing, 0, 1, 4).unwrap();
+        let (output, jvp) = s
+            .tensor_functional_jvp(
+                |s, inputs| {
+                    let snapshot = s.tensor_snapshot(inputs[0])?;
+                    assert_eq!(snapshot.meta().storage_offset(), 1);
+                    assert_eq!(snapshot.meta().strides(), &[1]);
+                    Ok(inputs[0])
+                },
+                &[offset],
+                &[vec![2.0, 3.0, 5.0, 7.0]],
+            )
+            .unwrap();
+        assert_eq!(jvp, vec![2.0, 3.0, 5.0, 7.0]);
+        let snapshot = s.tensor_snapshot(output).unwrap();
+        assert_eq!(
+            snapshot.contiguous_values_as_f64().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(snapshot.meta().storage_offset(), 1);
+        assert_eq!(snapshot.meta().strides(), &[1]);
+
+        let x = s
+            .tensor_variable((0..12).map(f64::from).collect(), vec![3, 4], false)
+            .unwrap();
+        let (output, jvp) = s
+            .tensor_functional_jvp(
+                |s, inputs| s.tensor_narrow(inputs[0], 0, 1, 2),
+                &[x],
+                &[(1..=12).map(f64::from).collect()],
+            )
+            .unwrap();
+        assert_eq!(s.tensor_shape(output).unwrap(), vec![2, 4]);
+        assert_eq!(
+            s.tensor_snapshot(output).unwrap().meta().storage_offset(),
+            4
+        );
+        assert_eq!(jvp, (5..=12).map(f64::from).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn functional_jvp_evaluates_stochastic_function_once() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut s = FrankenTorchSession::new(mode);
+            let mut reference = FrankenTorchSession::new(mode);
+            s.rng = super::Xoshiro256PlusPlus::new(1729);
+            reference.rng = super::Xoshiro256PlusPlus::new(1729);
+            let mask = reference.tensor_rand(vec![3], false).unwrap();
+            let mask = reference.tensor_values(mask).unwrap();
+            let x = s
+                .tensor_variable(vec![2.0, 4.0, 8.0], vec![3], true)
+                .unwrap();
+            s.tensor_set_accumulated_gradient(x, vec![5.0, 7.0, 11.0])
+                .unwrap();
+            let calls = std::cell::Cell::new(0);
+            let (output, jvp) = s
+                .tensor_functional_jvp(
+                    |s, inputs| {
+                        calls.set(calls.get() + 1);
+                        let mask = s.tensor_rand(vec![3], false)?;
+                        s.tensor_mul(inputs[0], mask)
+                    },
+                    &[x],
+                    &[vec![1.0, -2.0, 0.5]],
+                )
+                .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(
+                s.tensor_values(output).unwrap(),
+                vec![2.0 * mask[0], 4.0 * mask[1], 8.0 * mask[2]]
+            );
+            assert_eq!(jvp, vec![mask[0], -2.0 * mask[1], 0.5 * mask[2]]);
+            assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![5.0, 7.0, 11.0]));
+            let next = s.tensor_rand(vec![4], false).unwrap();
+            let expected_next = reference.tensor_rand(vec![4], false).unwrap();
+            assert_eq!(
+                s.tensor_values(next).unwrap(),
+                reference.tensor_values(expected_next).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn functional_jvp_preflight_and_closure_errors_preserve_grad_mode() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let complex = s.tensor_cdouble(x).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let func = |_: &mut FrankenTorchSession, inputs: &[TensorNodeId]| {
+            calls.set(calls.get() + 1);
+            Ok(inputs[0])
+        };
+        let boundary = s.autograd_graph_node_count();
+        s.with_no_grad(|s| {
+            assert!(s.tensor_functional_jvp(func, &[], &[]).is_err());
+            assert!(s.tensor_functional_jvp(func, &[x], &[]).is_err());
+            assert!(s.tensor_functional_jvp(func, &[x], &[vec![1.0]]).is_err());
+            assert!(
+                s.tensor_functional_jvp(func, &[x, x], &[vec![1.0, 1.0], vec![1.0]])
+                    .is_err()
+            );
+            assert!(
+                s.tensor_functional_jvp(func, &[complex], &[vec![1.0, 1.0]])
+                    .is_err()
+            );
+            assert!(
+                s.tensor_functional_jvp(func, &[TensorNodeId(usize::MAX)], &[Vec::new()])
+                    .is_err()
+            );
+            assert_eq!(calls.get(), 0);
+            assert_eq!(s.autograd_graph_node_count(), boundary);
+            assert!(!s.is_grad_enabled());
+            assert!(
+                s.tensor_functional_jvp(
+                    |_, _| Err(AutogradError::UnknownTensorNode(TensorNodeId(usize::MAX))),
+                    &[x],
+                    &[vec![1.0, 1.0]],
+                )
+                .is_err()
+            );
+            assert!(!s.is_grad_enabled());
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.tensor_functional_jvp(
+                    |_, _| panic!("JVP closure panic"),
+                    &[x],
+                    &[vec![1.0, 1.0]],
+                );
+            }));
+            assert!(panic.is_err());
+            assert!(!s.is_grad_enabled());
+        });
+        assert!(s.is_grad_enabled());
+        assert_eq!(s.tensor_grad(x).unwrap(), None);
+    }
+
+    #[test]
+    fn functional_derivative_queries_preserve_training_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for use_f32 in [false, true] {
+                let mut s = FrankenTorchSession::new(mode);
+                let x = if use_f32 {
+                    s.tensor_variable_f32(vec![2.0, 3.0], vec![2], true)
+                        .unwrap()
+                } else {
+                    s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap()
+                };
+                let squared = s.tensor_mul(x, x).unwrap();
+                let loss = s.tensor_sum(squared).unwrap();
+                s.tensor_set_accumulated_gradient(x, vec![7.0, 11.0])
+                    .unwrap();
+                s.with_no_grad(|s| {
+                    let vjp = s
+                        .tensor_functional_vjp(squared, &[x], vec![0.5, -2.0])
+                        .unwrap();
+                    assert_eq!(vjp, vec![Some(vec![2.0, -12.0])]);
+                    let jac = s.tensor_functional_jacobian(squared, &[x]).unwrap();
+                    assert_eq!(jac, vec![vec![4.0, 0.0, 0.0, 6.0]]);
+                    for _ in 0..2 {
+                        let hvp = s
+                            .tensor_functional_hvp(loss, &[x], &[vec![3.0, -1.0]])
+                            .unwrap();
+                        assert_eq!(hvp, vec![Some(vec![6.0, -2.0])]);
+                        let vhp = s
+                            .tensor_functional_vhp(loss, &[x], &[vec![3.0, -1.0]])
+                            .unwrap();
+                        assert_eq!(vhp, hvp);
+                        let hessian = s.tensor_functional_hessian(loss, x).unwrap();
+                        assert_eq!(hessian, vec![2.0, 0.0, 0.0, 2.0]);
+                    }
+                    assert!(!s.is_grad_enabled());
+                });
+                assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![7.0, 11.0]));
+                s.tensor_backward(loss).unwrap();
+                assert_eq!(s.tensor_grad(x).unwrap(), Some(vec![11.0, 17.0]));
+            }
+        }
+    }
+
+    #[test]
+    fn functional_hessian_and_hvp_handle_linear_and_unused_inputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+        let unused = s.tensor_variable(vec![7.0], vec![1], true).unwrap();
+        let linear = s.tensor_sum(x).unwrap();
+        assert_eq!(
+            s.tensor_functional_hessian(linear, x).unwrap(),
+            vec![0.0; 4]
+        );
+        assert_eq!(
+            s.tensor_functional_hessian(linear, unused).unwrap(),
+            vec![0.0]
+        );
+        let hvp = s
+            .tensor_functional_hvp(linear, &[x, unused], &[vec![1.0, 2.0], vec![3.0]])
+            .unwrap();
+        assert_eq!(hvp, vec![Some(vec![0.0, 0.0]), None]);
+        assert_eq!(s.tensor_grad(x).unwrap(), None);
+        let boundary = s.autograd_graph_node_count();
+        assert!(s.tensor_functional_hvp(x, &[x], &[vec![1.0, 2.0]]).is_err());
+        assert!(s.tensor_functional_hvp(linear, &[x], &[]).is_err());
+        assert!(s.tensor_functional_hvp(linear, &[x], &[vec![1.0]]).is_err());
+        assert_eq!(s.autograd_graph_node_count(), boundary);
     }
 
     #[test]
