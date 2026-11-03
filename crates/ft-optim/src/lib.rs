@@ -5745,9 +5745,9 @@ impl Optimizer for Adamax {
             let weight_decay = self.weight_decay;
             let maximize = self.maximize;
             // Single fused in-place pass (Adam optpar pattern): no grad/param clones
-            // + write-back. Bit-for-bit identical per element (same ops + order):
-            // maximize -> +wd*p -> m EMA -> u = max(beta2*u, |g|) -> p -= lr*m_hat/(u+eps).
-            // frankentorch-optpar.
+            // + write-back. Epsilon belongs inside the infinity-norm maximum:
+            // it decays with a retained historical maximum on subsequent steps.
+            // Adding it only at division changes the trajectory when |g| falls.
             session.tensor_update_param_values_f64_with_accumulated_gradient(
                 param,
                 |grad, param_values| {
@@ -5759,9 +5759,9 @@ impl Optimizer for Adamax {
                             g
                         };
                         *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
-                        *u_val = f64::max(beta2 * *u_val, g_eff.abs());
+                        *u_val = f64::max(beta2 * *u_val, g_eff.abs() + eps);
                         let m_hat = *m_val / bias_correction1;
-                        *p -= lr * m_hat / (*u_val + eps);
+                        *p -= lr * m_hat / *u_val;
                     };
                     if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
                         use rayon::prelude::*;
@@ -6722,8 +6722,10 @@ impl Optimizer for Rprop {
 /// embedding layers in NLP models.
 ///
 /// The key difference from dense Adam: moment estimates `m` and `v` are only
-/// updated at indices where the gradient is non-zero. Bias correction uses
-/// each parameter's applied-step count.
+/// updated at stored sparse coordinates, including explicitly stored zeros;
+/// absent coordinates retain their moments and parameter values. The dense
+/// fallback treats non-zero elements as its sparse support. Bias correction
+/// uses each parameter's applied-step count.
 pub struct SparseAdam {
     identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
@@ -6938,6 +6940,7 @@ impl Optimizer for SparseAdam {
             )?;
             let bias_correction1 = adam_bias_correction(self.beta1, t);
             let bias_correction2 = adam_bias_correction(self.beta2, t);
+            let step_size = self.lr * bias_correction2.sqrt() / bias_correction1;
 
             let param_len = session.tensor_values_len(param)?;
             ensure_grad_len_matches_param(param, param_len, grad.len())?;
@@ -6963,12 +6966,10 @@ impl Optimizer for SparseAdam {
                     continue;
                 }
                 // Update moments only at sparse indices
-                m[j] = self.beta1 * m[j] + (1.0 - self.beta1) * grad[j];
-                v[j] = self.beta2 * v[j] + (1.0 - self.beta2) * grad[j] * grad[j];
-
-                let m_hat = m[j] / bias_correction1;
-                let v_hat = v[j] / bias_correction2;
-                update[j] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                m[j] += (grad[j] - m[j]) * (1.0 - self.beta1);
+                v[j] += (grad[j] * grad[j] - v[j]) * (1.0 - self.beta2);
+                // SparseAdam adds epsilon to the uncorrected second moment.
+                update[j] = step_size * m[j] / (v[j].sqrt() + self.eps);
             }
 
             apply_param_update(session, param, &update)?;
@@ -6982,8 +6983,8 @@ impl Optimizer for SparseAdam {
 }
 
 impl SparseAdam {
-    /// Process a sparse COO gradient more efficiently by iterating only
-    /// over the non-zero entries rather than the full parameter space.
+    /// Apply a sparse COO gradient at its stored coordinates. Coalesce duplicate
+    /// coordinates before the nonlinear moment update, retaining zero sums.
     fn step_sparse_gradient(
         &mut self,
         session: &mut FrankenTorchSession,
@@ -6996,9 +6997,9 @@ impl SparseAdam {
 
         // Get the sparse indices and values
         let indices = sparse_grad.indices();
-        let indices_storage = indices.storage();
+        let indices_storage = indices.contiguous_values()?;
         let values_tensor = sparse_grad.values();
-        let grad_values = values_tensor.typed_storage().to_f64_vec();
+        let grad_values = values_tensor.contiguous_values_as_f64()?;
 
         let nnz = sparse_grad.nnz();
         let sparse_dim = sparse_grad.sparse_dim();
@@ -7034,22 +7035,10 @@ impl SparseAdam {
             ));
         }
 
-        let t = advance_param_step_count(
-            &mut self.step_counts,
-            param_idx,
-            "sparse_adam step counter overflow",
-        )?;
-        let bias_correction1 = adam_bias_correction(self.beta1, t);
-        let bias_correction2 = adam_bias_correction(self.beta2, t);
-
-        // Initialize moment buffers only after the sparse gradient has passed validation.
-        let m = self.m[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
-        let v = self.v[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
-
-        // Build update vector (sparse: only touched indices)
-        let mut update = vec![0.0; param_numel];
-
-        // For each non-zero entry in the sparse gradient
+        // Validate and coalesce the complete gradient before advancing state.
+        // Support is determined by coordinates, not by values: a zero in a
+        // stored row must still decay its historical moments and may move p.
+        let mut rows = std::collections::BTreeMap::<usize, Vec<f64>>::new();
         for nz_idx in 0..nnz {
             let flat_idx = Self::sparse_flat_index(
                 indices_storage,
@@ -7060,54 +7049,56 @@ impl SparseAdam {
                 dense_inner,
             )?;
 
-            // Get the gradient value (handle dense dimensions if any)
-            let grad_val = if sparse_dim < dense_shape.len() {
-                // Has dense dimensions - grad_values is [nnz, *dense_dims]
-                for dense_offset in 0..dense_inner {
-                    let g_idx = nz_idx
-                        .checked_mul(dense_inner)
-                        .and_then(|base| base.checked_add(dense_offset))
-                        .ok_or_else(|| {
-                            optimizer_state_error(
-                                "sparse_adam sparse gradient value index overflow",
-                            )
-                        })?;
-                    let p_idx = flat_idx.checked_add(dense_offset).ok_or_else(|| {
-                        optimizer_state_error("sparse_adam sparse parameter index overflow")
-                    })?;
-                    if p_idx >= param_numel {
-                        return Err(optimizer_hparam_error(
-                            "sparse_adam sparse gradient coordinate maps outside parameter",
-                        ));
-                    }
-                    let g = grad_values[g_idx];
-                    if g != 0.0 {
-                        m[p_idx] = self.beta1 * m[p_idx] + (1.0 - self.beta1) * g;
-                        v[p_idx] = self.beta2 * v[p_idx] + (1.0 - self.beta2) * g * g;
-                        let m_hat = m[p_idx] / bias_correction1;
-                        let v_hat = v[p_idx] / bias_correction2;
-                        update[p_idx] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                    }
-                }
-                continue; // Already processed all dense dims
-            } else {
-                grad_values[nz_idx]
-            };
-
-            if flat_idx >= param_numel {
+            let end = flat_idx.checked_add(dense_inner).ok_or_else(|| {
+                optimizer_state_error("sparse_adam sparse parameter index overflow")
+            })?;
+            if end > param_numel {
                 return Err(optimizer_hparam_error(
                     "sparse_adam sparse gradient coordinate maps outside parameter",
                 ));
             }
-            if grad_val != 0.0 {
-                m[flat_idx] = self.beta1 * m[flat_idx] + (1.0 - self.beta1) * grad_val;
-                v[flat_idx] = self.beta2 * v[flat_idx] + (1.0 - self.beta2) * grad_val * grad_val;
-                let m_hat = m[flat_idx] / bias_correction1;
-                let v_hat = v[flat_idx] / bias_correction2;
-                update[flat_idx] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+            let row = rows
+                .entry(flat_idx)
+                .or_insert_with(|| vec![0.0; dense_inner]);
+            let start = nz_idx * dense_inner;
+            for (total, &value) in row.iter_mut().zip(&grad_values[start..start + dense_inner]) {
+                *total += value;
             }
         }
 
+        for moment in [&self.m[param_idx], &self.v[param_idx]]
+            .into_iter()
+            .flatten()
+        {
+            ensure_state_len(
+                param_numel,
+                moment.len(),
+                "sparse_adam moment state length mismatch",
+            )?;
+        }
+        let t = advance_param_step_count(
+            &mut self.step_counts,
+            param_idx,
+            "sparse_adam step counter overflow",
+        )?;
+        let bias_correction1 = adam_bias_correction(self.beta1, t);
+        let bias_correction2 = adam_bias_correction(self.beta2, t);
+        let step_size = self.lr * bias_correction2.sqrt() / bias_correction1;
+        let m = self.m[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
+        let v = self.v[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
+        if grad_values.is_empty() {
+            return Ok(());
+        }
+
+        let mut update = vec![0.0; param_numel];
+        for (start, row) in rows {
+            for (offset, gradient) in row.into_iter().enumerate() {
+                let index = start + offset;
+                m[index] += (gradient - m[index]) * (1.0 - self.beta1);
+                v[index] += (gradient * gradient - v[index]) * (1.0 - self.beta2);
+                update[index] = step_size * m[index] / (v[index].sqrt() + self.eps);
+            }
+        }
         apply_param_update(session, param, &update)
     }
 }
@@ -8154,7 +8145,12 @@ mod tests {
                     continue;
                 }
             };
-            active.push(index);
+            active.push((
+                index,
+                rows.iter()
+                    .map(|&row| row as i64)
+                    .collect::<std::collections::BTreeSet<_>>(),
+            ));
             let indices = session
                 .tensor_variable(rows.to_vec(), vec![rows.len()], false)
                 .unwrap();
@@ -8178,7 +8174,8 @@ mod tests {
             });
         }
         let report = session.tensor_backward(loss.unwrap()).unwrap();
-        for &index in &active {
+        for (index, rows) in &active {
+            let index = *index;
             let parameter = optimizer.params[index];
             assert!(report.is_sparse_gradient(parameter));
             assert_eq!(
@@ -8189,18 +8186,28 @@ mod tests {
                 report.gradient(parameter),
                 "the report must select SparseAdam's sparse update path"
             );
-            if round == 2 || round == 5 {
-                assert_eq!(report.sparse_gradient(parameter).unwrap().nnz(), 0);
-            }
+            assert_eq!(
+                report
+                    .sparse_gradient(parameter)
+                    .unwrap()
+                    .indices()
+                    .contiguous_values()
+                    .unwrap(),
+                rows.iter().copied().collect::<Vec<_>>(),
+                "all touched rows survive, including all-zero gradients"
+            );
         }
         optimizer.step(session, &report).unwrap();
         for (index, &parameter) in optimizer.params.iter().enumerate() {
             let values = session.tensor_values_lossy_f64(parameter).unwrap();
-            if active.contains(&index) {
+            if let Some((_, rows)) = active
+                .iter()
+                .find(|(active_index, _)| *active_index == index)
+            {
                 assert_eq!(optimizer.step_counts[index], previous_steps[index] + 1);
-                let gradient = report.gradient(parameter).unwrap();
-                for (element, (&value, &gradient)) in values.iter().zip(gradient).enumerate() {
-                    if gradient == 0.0 {
+                let row_width = session.tensor_shape(parameter).unwrap()[1];
+                for (element, &value) in values.iter().enumerate() {
+                    if !rows.contains(&((element / row_width) as i64)) {
                         assert_eq!(value.to_bits(), previous_values[index][element].to_bits());
                         if let (Some(first), Some(second)) =
                             (&previous_moments.0[index], &previous_moments.1[index])
@@ -14433,6 +14440,82 @@ mod tests {
     // ---- Adamax tests ----
 
     #[test]
+    fn adamax_retains_epsilon_in_decaying_infinity_norm() {
+        // Independent scalar evaluation of torch.optim.Adamax's published
+        // recurrence, with eps=0.5 so an epsilon outside max is observable.
+        // The falling gradients exercise historical maxima and zero gradients.
+        let gradients = [
+            [4.0, -2.0, 0.0],
+            [0.25, 0.0, 1.5],
+            [-2.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let expected_values = [
+            [0.8222222222222222, -1.84, 0.5],
+            [0.7333333333333333, -1.768888888888889, 0.4],
+            [0.7728395061728395, -1.8069841269841271, 0.34285714285714286],
+            [0.7974211248285322, -1.830687830687831, 0.3073015873015873],
+        ];
+        let expected_infinity_norm = [
+            [4.5, 2.5, 0.5],
+            [3.375, 1.875, 2.0],
+            [2.53125, 1.5, 1.5],
+            [1.8984375, 1.125, 1.125],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F64, ft_core::DType::F32] {
+                // Exercise both the serial and Rayon update paths.
+                for count in [3, 3 * (OPTIM_PARALLEL_THRESHOLD / 3 + 1)] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let initial: Vec<_> = (0..count).map(|i| [1.0, -2.0, 0.5][i % 3]).collect();
+                    let parameter = if dtype == ft_core::DType::F32 {
+                        session.tensor_variable_f32(
+                            initial.into_iter().map(|value| value as f32).collect(),
+                            vec![count],
+                            true,
+                        )
+                    } else {
+                        session.tensor_variable(initial, vec![count], true)
+                    }
+                    .unwrap();
+                    let loss = session.tensor_sum(parameter).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    let mut optimizer = Adamax::new(vec![parameter], 0.2).betas(0.5, 0.75).eps(0.5);
+                    let tolerance = if dtype == ft_core::DType::F32 {
+                        2e-6
+                    } else {
+                        2e-15
+                    };
+                    for round in 0..gradients.len() {
+                        session
+                            .tensor_set_accumulated_gradient(
+                                parameter,
+                                (0..count).map(|i| gradients[round][i % 3]).collect(),
+                            )
+                            .unwrap();
+                        optimizer.step(&mut session, &report).unwrap();
+                        for (index, value) in session
+                            .tensor_values_lossy_f64(parameter)
+                            .unwrap()
+                            .into_iter()
+                            .enumerate()
+                        {
+                            assert!(
+                                (value - expected_values[round][index % 3]).abs() <= tolerance,
+                                "{mode:?} {dtype:?} step {round}, element {index}: {value}"
+                            );
+                            assert_eq!(
+                                optimizer.u[0].as_ref().unwrap()[index],
+                                expected_infinity_norm[round][index % 3]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn adamax_basic_step_reduces_loss() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -15158,6 +15241,163 @@ mod tests {
     }
 
     // ── SparseAdam tests ───────────────────────────────────────────────
+
+    #[test]
+    fn sparse_adam_matches_masked_multistep_reference_with_stored_zeros() {
+        // Independent scalar torch.optim.SparseAdam recurrence: mask by stored
+        // rows, m += (g-m)*(1-beta1), v += (g*g-v)*(1-beta2), and add epsilon
+        // before bias correction. Each row has two dense feature components.
+        let steps: &[(&[f64], &[f64])] = &[
+            (&[0.0, 2.0], &[2.0, 4.0, -3.0, 1.0]),
+            (&[0.0, 1.0, 0.0], &[2.0, 0.0, 1.0, -2.0, -2.0, 3.0]),
+            (&[2.0, 1.0], &[0.0, -1.0, 0.0, 2.0]),
+            (&[0.0, 2.0], &[-1.0, 0.0, 2.0, 0.0]),
+        ];
+        let expected_values = [
+            [0.8666666666666667, 1.84, 3.0, 4.0, 5.15, 5.9],
+            [
+                0.8021058538702917,
+                1.682023260968041,
+                2.91180828963118,
+                4.117588947158426,
+                5.15,
+                5.9,
+            ],
+            [
+                0.8021058538702917,
+                1.682023260968041,
+                2.86524053798136,
+                4.069918878543508,
+                5.222452557259485,
+                5.937409065512711,
+            ],
+            [
+                0.8335717012187381,
+                1.5932746882117086,
+                2.86524053798136,
+                4.069918878543508,
+                5.167475659585352,
+                5.9579604042956955,
+            ],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F64, ft_core::DType::F32] {
+                let mut session = FrankenTorchSession::new(mode);
+                let parameter = if dtype == ft_core::DType::F32 {
+                    session.tensor_variable_f32(
+                        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        vec![3, 2],
+                        true,
+                    )
+                } else {
+                    session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2], true)
+                }
+                .unwrap();
+                let mut optimizer = SparseAdam::new(vec![parameter], 0.2)
+                    .betas(0.5, 0.75)
+                    .eps(0.5);
+                let tolerance = if dtype == ft_core::DType::F32 {
+                    2e-6
+                } else {
+                    2e-15
+                };
+                for (round, &(rows, coefficients)) in steps.iter().enumerate() {
+                    optimizer.zero_grad(&mut session).unwrap();
+                    let indices = session
+                        .tensor_variable(rows.to_vec(), vec![rows.len()], false)
+                        .unwrap();
+                    let selected = session
+                        .tensor_index_select_sparse(parameter, 0, indices)
+                        .unwrap();
+                    let coefficients = if dtype == ft_core::DType::F32 {
+                        session.tensor_variable_f32(
+                            coefficients.iter().map(|&value| value as f32).collect(),
+                            vec![rows.len(), 2],
+                            false,
+                        )
+                    } else {
+                        session.tensor_variable(coefficients.to_vec(), vec![rows.len(), 2], false)
+                    }
+                    .unwrap();
+                    let weighted = session.tensor_mul(selected, coefficients).unwrap();
+                    let loss = session.tensor_sum(weighted).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    let sparse = report.sparse_gradient(parameter).expect("sparse report");
+                    assert_eq!(sparse.nnz(), 2, "the public sparse path must execute");
+                    if round == 1 {
+                        assert_eq!(
+                            sparse.values().contiguous_values_as_f64().unwrap(),
+                            vec![0.0, 3.0, 1.0, -2.0]
+                        );
+                    }
+                    optimizer.step(&mut session, &report).unwrap();
+                    for (&actual, &expected) in session
+                        .tensor_values_lossy_f64(parameter)
+                        .unwrap()
+                        .iter()
+                        .zip(&expected_values[round])
+                    {
+                        assert!(
+                            (actual - expected).abs() <= tolerance,
+                            "{mode:?} {dtype:?} step {round}: got {actual}, expected {expected}"
+                        );
+                    }
+                }
+                assert_eq!(optimizer.step_counts, vec![4]);
+                assert_eq!(
+                    optimizer.m[0].as_ref().unwrap(),
+                    &vec![-0.25, 1.25, 0.25, 0.5, 0.625, -0.125]
+                );
+                assert_eq!(
+                    optimizer.v[0].as_ref().unwrap(),
+                    &vec![0.8125, 3.9375, 0.1875, 1.75, 2.265625, 0.328125]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_adam_coalesces_duplicate_coordinates_without_dropping_zero_sums() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let parameter = session
+            .tensor_variable(vec![2.0, 3.0, 4.0], vec![3], true)
+            .unwrap();
+        let mut optimizer = SparseAdam::new(vec![parameter], 0.2)
+            .betas(0.5, 0.75)
+            .eps(0.5);
+        let initial = SparseCOOTensor::from_coords(
+            &[vec![2], vec![0], vec![0]],
+            vec![4.0, 3.0, -1.0],
+            vec![3],
+            ft_core::DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+        optimizer
+            .step_sparse_gradient(&mut session, parameter, 0, &initial)
+            .unwrap();
+        let cancellation = SparseCOOTensor::from_coords(
+            &[vec![0], vec![0]],
+            vec![1.0, -1.0],
+            vec![3],
+            ft_core::DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+        optimizer
+            .step_sparse_gradient(&mut session, parameter, 0, &cancellation)
+            .unwrap();
+        let actual = session.tensor_values(parameter).unwrap();
+        for (&value, expected) in actual.iter().zip([1.8021058538702917, 3.0, 3.84]) {
+            assert!(
+                (value - expected).abs() <= 2e-15,
+                "got {value}, expected {expected}"
+            );
+        }
+        assert_eq!(optimizer.m[0].as_ref().unwrap(), &vec![0.5, 0.0, 2.0]);
+        assert_eq!(optimizer.v[0].as_ref().unwrap(), &vec![0.75, 0.0, 4.0]);
+        assert_eq!(optimizer.step_counts, vec![2]);
+    }
 
     #[test]
     fn sparse_adam_basic_step() {

@@ -12110,12 +12110,50 @@ impl TensorTape {
         self.backward_with_options(root, BackwardOptions::strict_default())
     }
 
-    #[allow(clippy::needless_range_loop)]
     pub fn backward_with_options(
         &mut self,
         root: TensorNodeId,
         options: BackwardOptions,
     ) -> Result<TensorBackwardReport, AutogradError> {
+        self.backward_impl(root, options, true)
+    }
+
+    /// Compute a backward report without accumulating into leaf `.grad` buffers.
+    ///
+    /// Tensor hooks still run, and non-leaf tensors explicitly marked with
+    /// `retain_grad` still retain their gradients, just as in `autograd.grad`.
+    /// Graph retention and differentiable gradient nodes follow `options`.
+    pub fn grad_with_options(
+        &mut self,
+        root: TensorNodeId,
+        options: BackwardOptions,
+    ) -> Result<TensorBackwardReport, AutogradError> {
+        self.backward_impl(root, options, false)
+    }
+
+    /// Validate an existing output before a caller records a VJP surrogate.
+    ///
+    /// Checking only the newly recorded surrogate would let callers bypass the
+    /// consumed-graph guard by wrapping an old output in another operation.
+    pub fn validate_backward_root(&self, root: TensorNodeId) -> Result<(), AutogradError> {
+        if self.consumed && root.0 < self.consumed_boundary {
+            return Err(AutogradError::TensorGraphConsumed);
+        }
+        let node = self.node(root)?;
+        if !node.requires_grad {
+            return Err(AutogradError::TensorRootDoesNotRequireGrad { node: root });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn backward_impl(
+        &mut self,
+        root: TensorNodeId,
+        options: BackwardOptions,
+        accumulate_grad: bool,
+    ) -> Result<TensorBackwardReport, AutogradError> {
+        self.validate_backward_root(root)?;
         if options.create_graph {
             // Differentiable backward builds a graph even when the caller has
             // disabled forward recording. Routing adjoints use ordinary tensor
@@ -12124,7 +12162,7 @@ impl TensorTape {
             let previous = self.grad_enabled;
             self.grad_enabled = true;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.backward_create_graph(root, options)
+                self.backward_create_graph(root, options, accumulate_grad)
             }));
             self.grad_enabled = previous;
             return match result {
@@ -12132,16 +12170,6 @@ impl TensorTape {
                 Err(payload) => std::panic::resume_unwind(payload),
             };
         }
-        if self.consumed && root.0 < self.consumed_boundary {
-            return Err(AutogradError::TensorGraphConsumed);
-        }
-        if root.0 >= self.nodes.len() {
-            return Err(AutogradError::UnknownTensorNode(root));
-        }
-        if !self.nodes[root.0].requires_grad {
-            return Err(AutogradError::TensorRootDoesNotRequireGrad { node: root });
-        }
-
         let setup_started = std::time::Instant::now();
         let mut reentrant_guard_triggered = false;
         let mut hardened_fallback_used = false;
@@ -12178,14 +12206,12 @@ impl TensorTape {
         // the recycling pool — `take_filled` is observably identical to `vec![1.0; n]`.
         grads[root.0].values =
             ft_core::buffer_pool::take_filled(self.nodes[root.0].tensor.meta().numel(), 1.0);
-        // Tracks IndexSelect inputs that requested a sparse-gradient surfacing.
-        // Populated at the end with a SparseCOOTensor extracted from the
-        // dense gradient (sparse_dim=1, dim=0).
-        // Set of input nodes that requested sparse-gradient surfacing (IndexSelect
-        // sparse path — rare). Lazily grown: empty for the common dense backward, so we
-        // skip the per-backward `vec![false; nodes.len()]` allocation entirely.
-        // frankentorch-cuqzu.
-        let mut sparse_grad_requested: BTreeSet<usize> = BTreeSet::new();
+        // Sparse support is determined by the selected rows, not by their final
+        // values. A selected row whose contributions cancel still participates
+        // in SparseAdam's moment decay; an absent row does not. Keep the union
+        // across all sparse selections, including empty selections. This stays
+        // empty for the common dense backward.
+        let mut sparse_grad_requested: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
 
         let mut queue = TensorReadyQueue::with_capacity(self.nodes.len().max(1));
         queue.push(root);
@@ -15286,6 +15312,11 @@ impl TensorTape {
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let mut contrib = vec![0.0; input_numel];
+                    let mut selected_rows = if sparse && dim == 0 {
+                        Some(sparse_grad_requested.entry(input.0).or_default())
+                    } else {
+                        None
+                    };
 
                     for outer in 0..outer_size {
                         for (r, &idx_f) in indices.iter().enumerate() {
@@ -15304,6 +15335,9 @@ impl TensorTape {
                                 "index_select backward received out-of-bounds index value",
                                 "index_select backward index conversion overflow",
                             )?;
+                            if let Some(rows) = selected_rows.as_mut() {
+                                rows.insert(idx);
+                            }
                             for inner in 0..inner_size {
                                 let grad_pos =
                                     outer * num_indices * inner_size + r * inner_size + inner;
@@ -15314,9 +15348,6 @@ impl TensorTape {
                         }
                     }
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
-                    if sparse && dim == 0 {
-                        sparse_grad_requested.insert(input.0);
-                    }
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -16416,7 +16447,7 @@ impl TensorTape {
             machinery,
         };
 
-        self.accumulate_persistent_gradients(&gradients)?;
+        self.accumulate_persistent_gradients(&gradients, accumulate_grad)?;
 
         if !options.retain_graph {
             self.consumed = true;
@@ -16435,13 +16466,18 @@ impl TensorTape {
         } else {
             vec![None; gradients.len()]
         };
-        for &idx in &sparse_grad_requested {
+        for (&idx, selected_rows) in &sparse_grad_requested {
             let Some(dense_grad) = gradients[idx].as_deref() else {
                 continue;
             };
             let shape = self.nodes[idx].tensor.meta().shape().to_vec();
             let device = self.nodes[idx].tensor.meta().device();
-            sparse_gradients[idx] = Some(Self::build_sparse_grad_dim0(dense_grad, &shape, device)?);
+            sparse_gradients[idx] = Some(Self::build_sparse_grad_dim0(
+                dense_grad,
+                &shape,
+                device,
+                selected_rows,
+            )?);
         }
 
         // First-order backward never produces differentiable gradient *nodes* (only the
@@ -16458,14 +16494,15 @@ impl TensorTape {
     }
 
     /// Build a `SparseCOOTensor` (sparse_dim=1) from a dense gradient
-    /// laid out as `[shape[0], shape[1..]]`. Rows whose elements are all
-    /// zero are dropped. Used to surface sparse gradients from
+    /// laid out as `[shape[0], shape[1..]]`. Selected rows are retained even
+    /// when their elements are all zero. Used to surface sparse gradients from
     /// `IndexSelect` (e.g., embedding tables) without scanning the full
     /// dense parameter when applying `SparseAdam`.
     fn build_sparse_grad_dim0(
         dense_grad: &[f64],
         shape: &[usize],
         device: Device,
+        selected_rows: &BTreeSet<usize>,
     ) -> Result<SparseCOOTensor, AutogradError> {
         if shape.is_empty() {
             return Err(AutogradError::Dispatch(
@@ -16480,7 +16517,7 @@ impl TensorTape {
         let mut nz_rows: Vec<usize> = Vec::new();
         for r in 0..num_rows {
             let row = &dense_grad[r * row_stride..(r + 1) * row_stride];
-            if row.iter().any(|v| *v != 0.0) {
+            if selected_rows.contains(&r) || row.iter().any(|v| *v != 0.0) {
                 nz_rows.push(r);
             }
         }
@@ -16508,6 +16545,7 @@ impl TensorTape {
         &mut self,
         root: TensorNodeId,
         options: BackwardOptions,
+        accumulate_grad: bool,
     ) -> Result<TensorBackwardReport, AutogradError> {
         // create_graph implies retain_graph
         if self.consumed && root.0 < self.consumed_boundary {
@@ -19107,7 +19145,7 @@ impl TensorTape {
             let is_leaf = self.nodes[idx].op == TensorNodeOp::Leaf;
             let has_retain_grad = self.retains_grad.contains(&idx);
             if let Some(gid) = grad_opt
-                && (is_leaf || has_retain_grad)
+                && ((is_leaf && accumulate_grad) || (!is_leaf && has_retain_grad))
                 && self.nodes[idx].requires_grad
             {
                 let vals = self.nodes[gid.0]
@@ -22358,6 +22396,7 @@ impl TensorTape {
     fn accumulate_persistent_gradients(
         &mut self,
         gradients: &[Option<Arc<Vec<f64>>>],
+        accumulate_grad: bool,
     ) -> Result<(), AutogradError> {
         for (idx, gradient) in gradients.iter().enumerate() {
             let Some(arc) = gradient.as_ref() else {
@@ -22373,7 +22412,7 @@ impl TensorTape {
             // backward. frankentorch-pwjrs.
             let is_leaf = self.nodes[idx].op == TensorNodeOp::Leaf;
             let has_retain_grad = self.retains_grad.contains(&idx);
-            if !(is_leaf || has_retain_grad) {
+            if (is_leaf && !accumulate_grad) || (!is_leaf && !has_retain_grad) {
                 continue;
             }
             let node = TensorNodeId(idx);
@@ -22633,7 +22672,7 @@ impl TensorTape {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
 
     static BUFFER_POOL_TEST_GUARD: Mutex<()> = Mutex::new(());
@@ -27068,6 +27107,82 @@ mod tests {
     // ── cat/stack tensor tests ──────────────────────────
 
     #[test]
+    fn sparse_index_select_preserves_selected_zero_and_cancelled_rows() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                let mut tape = TensorTape::new();
+                let storage =
+                    DenseTensor::from_contiguous_values(vec![1.0; 10], vec![5, 2], Device::Cpu)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                let weight = tape.leaf_tensor(storage, true);
+                let selected = tape
+                    .index_select_sparse(weight, 0, &[3.0, 1.0, 3.0, 4.0])
+                    .unwrap();
+                let seed = DenseTensor::from_contiguous_values(
+                    vec![1.0, 2.0, 0.0, 0.0, -1.0, -2.0, 3.0, 4.0],
+                    vec![4, 2],
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let seed = tape.leaf_tensor(seed, false);
+                let (weighted, _) = tape.mul(selected, seed, mode).unwrap();
+                let (first_loss, _) = tape.sum(weighted, mode).unwrap();
+                let other = tape.index_select_sparse(weight, 0, &[2.0]).unwrap();
+                let (other_zero, _) = tape.mul_scalar(other, 0.0).unwrap();
+                let (second_loss, _) = tape.sum(other_zero, mode).unwrap();
+                let (loss, _) = tape.add(first_loss, second_loss, mode).unwrap();
+                let report = tape.backward(loss).unwrap();
+                let sparse = report.sparse_gradient(weight).unwrap();
+                assert_eq!(sparse.indices().storage(), &[1, 2, 3, 4]);
+                assert_eq!(
+                    sparse.values().contiguous_values_as_f64().unwrap(),
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0]
+                );
+                assert_eq!(
+                    sparse
+                        .to_dense()
+                        .unwrap()
+                        .contiguous_values_as_f64()
+                        .unwrap(),
+                    report.gradient(weight).unwrap()
+                );
+                let scaled = report.scaled_clone(0.0).unwrap();
+                assert_eq!(
+                    scaled.sparse_gradient(weight).unwrap().indices().storage(),
+                    &[1, 2, 3, 4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_index_select_preserves_empty_selection_and_empty_feature_axes() {
+        for indices in [vec![], vec![2.0, 1.0, 2.0]] {
+            for feature_count in [0, 2] {
+                let mut tape = TensorTape::new();
+                let weight = tape
+                    .leaf(vec![1.0; 3 * feature_count], vec![3, feature_count], true)
+                    .unwrap();
+                let selected = tape.index_select_sparse(weight, 0, &indices).unwrap();
+                let (loss, _) = tape.sum(selected, ExecutionMode::Strict).unwrap();
+                let report = tape.backward(loss).unwrap();
+                let sparse = report.sparse_gradient(weight).unwrap();
+                let expected_rows: &[i64] = if indices.is_empty() { &[] } else { &[1, 2] };
+                assert_eq!(sparse.indices().storage(), expected_rows);
+                assert_eq!(sparse.dense_shape(), &[3, feature_count]);
+                assert_eq!(
+                    sparse.values().meta().shape(),
+                    &[expected_rows.len(), feature_count]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn index_select_offset_views_support_packed_rows_and_hidden_state_permutations() {
         // A time slice flattened for packing, and a layer slice whose batch
         // axis is sorted before recurrence. Source positions are in the base
@@ -27787,6 +27902,7 @@ mod tests {
                 &[0.0, 0.0, 7.0, 7.0, 0.0, 0.0],
                 &[3, 2],
                 Device::Cpu,
+                &BTreeSet::from([1]),
             )
             .unwrap(),
         );
@@ -27858,6 +27974,60 @@ mod tests {
     }
 
     // ---- Graph consumption tests (bd-3dpn.2) ----
+
+    #[test]
+    fn grad_with_options_leaves_training_buffers_unchanged_at_both_orders() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for create_graph in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = tape.leaf(vec![2.0, 3.0], vec![2], true).unwrap();
+                let (square, _) = tape.mul(x, x, mode).unwrap();
+                let (loss, _) = tape.sum(square, mode).unwrap();
+                tape.tensor_retain_grad(square).unwrap();
+                tape.set_tensor_accumulated_gradient(x, vec![7.0, 11.0])
+                    .unwrap();
+                let options = BackwardOptions::for_mode(mode)
+                    .with_retain_graph(true)
+                    .with_create_graph(create_graph);
+                let report = tape.grad_with_options(loss, options).unwrap();
+                assert_eq!(report.gradient(x), Some(&[4.0, 6.0][..]));
+                assert_eq!(
+                    tape.tensor_accumulated_gradient(x).unwrap(),
+                    Some(&[7.0, 11.0][..])
+                );
+                assert_eq!(
+                    tape.tensor_accumulated_gradient(square).unwrap(),
+                    Some(&[1.0, 1.0][..])
+                );
+                if create_graph {
+                    let derivative = report.gradient_node(x).unwrap();
+                    let second = tape
+                        .grad_with_options(
+                            derivative,
+                            BackwardOptions::for_mode(mode).with_retain_graph(true),
+                        )
+                        .unwrap();
+                    assert_eq!(second.gradient(x), Some(&[2.0, 2.0][..]));
+                    assert_eq!(
+                        tape.tensor_accumulated_gradient(x).unwrap(),
+                        Some(&[7.0, 11.0][..])
+                    );
+                } else {
+                    assert!(report.gradient_node(x).is_none());
+                }
+                tape.backward_with_options(loss, BackwardOptions::for_mode(mode))
+                    .unwrap();
+                assert_eq!(
+                    tape.tensor_accumulated_gradient(x).unwrap(),
+                    Some(&[11.0, 17.0][..])
+                );
+                assert!(matches!(
+                    tape.grad_with_options(loss, BackwardOptions::for_mode(mode)),
+                    Err(AutogradError::TensorGraphConsumed)
+                ));
+            }
+        }
+    }
 
     #[test]
     fn default_backward_consumes_scalar_graph() {
