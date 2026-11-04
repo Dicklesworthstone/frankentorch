@@ -22995,8 +22995,8 @@ mod tests {
 
     use super::{
         AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
-        TensorBackwardStep, TensorHookHandle, TensorNode, TensorNodeId, TensorNodeOp,
-        TensorSchedulerTelemetry, TensorTape,
+        TensorBackwardReport, TensorBackwardStep, TensorHookHandle, TensorNode, TensorNodeId,
+        TensorNodeOp, TensorSchedulerTelemetry, TensorTape,
     };
 
     fn as_u64(value: usize) -> u64 {

@@ -69,6 +69,7 @@ pub enum OptimizerState {
     RAdam(RadamState),
     SparseAdam(SparseAdamState),
     NAdam(NadamState),
+    Asgd(AsgdState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -207,6 +208,29 @@ pub struct NadamParameterState {
     pub exp_avg_sq: Vec<f64>,
     /// Cumulative momentum schedule product, advanced only on this parameter's gradient steps.
     pub mu_product: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsgdState {
+    pub lr: f64,
+    pub lambd: f64,
+    pub alpha: f64,
+    pub t0: f64,
+    pub weight_decay: f64,
+    pub maximize: bool,
+    /// A parameter's schedule starts when it first receives a gradient.
+    pub parameters: Vec<Option<AsgdParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsgdParameterState {
+    pub step: u64,
+    /// Learning rate and averaging coefficient to use on the next update.
+    pub eta: f64,
+    pub mu: f64,
+    pub ax: Vec<f64>,
 }
 
 fn optimizer_parameter_metadata(
@@ -512,6 +536,36 @@ fn validate_nadam_state_buffers(state: &NadamState, sizes: &[usize]) -> Result<(
     Ok(())
 }
 
+fn validate_asgd_state_buffers(state: &AsgdState, sizes: &[usize]) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "asgd state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized asgd state requires a positive step",
+            ));
+        }
+        if !parameter.eta.is_finite() || parameter.eta < 0.0 {
+            return Err(optimizer_state_error(
+                "asgd state learning rate must be finite and non-negative",
+            ));
+        }
+        if !parameter.mu.is_finite() || parameter.mu <= 0.0 || parameter.mu > 1.0 {
+            return Err(optimizer_state_error(
+                "asgd state averaging coefficient must be finite and in (0, 1]",
+            ));
+        }
+        validate_optimizer_buffer(&parameter.ax, numel)?;
+    }
+    Ok(())
+}
+
 fn build_optimizer_state_dict(
     session: &FrankenTorchSession,
     params: &[TensorNodeId],
@@ -533,6 +587,7 @@ fn build_optimizer_state_dict(
         OptimizerState::RAdam(state) => validate_radam_state_buffers(state, &sizes)?,
         OptimizerState::SparseAdam(state) => validate_sparse_adam_state_buffers(state, &sizes)?,
         OptimizerState::NAdam(state) => validate_nadam_state_buffers(state, &sizes)?,
+        OptimizerState::Asgd(state) => validate_asgd_state_buffers(state, &sizes)?,
     }
     Ok(result)
 }
@@ -6311,10 +6366,7 @@ pub struct ASGD {
     t0: f64,
     weight_decay: f64,
     maximize: bool,
-    step_count: u64,
-    ax: Vec<Option<Vec<f64>>>,
-    eta: f64,
-    mu: f64,
+    state: Vec<Option<AsgdParameterState>>,
 }
 
 impl ASGD {
@@ -6332,10 +6384,7 @@ impl ASGD {
             t0: 1e6,
             weight_decay: 0.0,
             maximize: false,
-            step_count: 0,
-            ax: vec![None; n],
-            eta: lr,
-            mu: 1.0,
+            state: vec![None; n],
         }
     }
 
@@ -6382,6 +6431,14 @@ impl ASGD {
                 "asgd requires finite non-negative lambd",
             ));
         }
+        if !self.alpha.is_finite() || self.alpha < 0.0 {
+            return Err(optimizer_hparam_error(
+                "asgd requires finite non-negative alpha",
+            ));
+        }
+        if !self.t0.is_finite() {
+            return Err(optimizer_hparam_error("asgd requires finite t0"));
+        }
         if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
             return Err(optimizer_hparam_error(
                 "asgd requires finite non-negative weight_decay",
@@ -6400,6 +6457,49 @@ impl Optimizer for ASGD {
         &self.params
     }
 
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Asgd(AsgdState {
+                lr: self.lr,
+                lambd: self.lambd,
+                alpha: self.alpha,
+                t0: self.t0,
+                weight_decay: self.weight_decay,
+                maximize: self.maximize,
+                parameters: self.state.clone(),
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Asgd(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_asgd_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .lambd(saved.lambd)
+            .alpha(saved.alpha)
+            .t0(saved.t0)
+            .weight_decay(saved.weight_decay)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        restored.state.clone_from(&saved.parameters);
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -6414,40 +6514,65 @@ impl Optimizer for ASGD {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-        let t = checked_next_step_count(self.step_count, "asgd step counter overflow")?;
-        self.step_count = t;
+        ensure_state_len(
+            self.params.len(),
+            self.state.len(),
+            "asgd state parameter count mismatch",
+        )?;
 
-        // torch ASGD applies the CURRENT eta (initialised to lr) and mu for this
-        // step, then decays them for the NEXT step. The previous code decayed eta
-        // one step early AND omitted the (1 - lambd*eta) shrinkage below.
-        let eta = self.eta;
+        // Validate every active parameter before updating any values or clocks.
+        // An absent gradient is a skipped step; a present zero gradient still
+        // advances that parameter's decay and averaging schedule.
+        let mut updates = Vec::with_capacity(self.params.len());
+        for (i, &param) in self.params.iter().enumerate() {
+            let Some(grad_len) = session.tensor_accumulated_gradient_len(param)? else {
+                updates.push(None);
+                continue;
+            };
+            if session.tensor_accumulated_sparse_gradient(param)?.is_some() {
+                return Err(optimizer_state_error(
+                    "asgd does not support sparse gradients",
+                ));
+            }
+            if !matches!(
+                session.tensor_dtype(param)?,
+                ft_core::DType::F32 | ft_core::DType::F64
+            ) {
+                return Err(optimizer_state_error("asgd requires F32 or F64 parameters"));
+            }
+            ensure_grad_len_matches_param(param, session.tensor_values_len(param)?, grad_len)?;
+            let step = if let Some(state) = &self.state[i] {
+                ensure_state_len(
+                    grad_len,
+                    state.ax.len(),
+                    "asgd average state length mismatch",
+                )?;
+                state.step
+            } else {
+                0
+            };
+            let next_step = checked_next_step_count(step, "asgd step counter overflow")?;
+            updates.push(Some((grad_len, next_step)));
+        }
+
         let lambd = self.lambd;
-
-        let mu = self.mu;
         let weight_decay = self.weight_decay;
         let maximize = self.maximize;
         for (i, &param) in self.params.iter().enumerate() {
-            let grad_len = match session.tensor_accumulated_gradient_len(param)? {
-                Some(len) => len,
-                None => continue,
+            let Some((grad_len, next_step)) = updates[i] else {
+                continue;
             };
-            let param_len = session.tensor_values_len(param)?;
-            ensure_grad_len_matches_param(param, param_len, grad_len)?;
-
-            let is_first = self.ax[i].is_none();
-            let ax = self.ax[i].get_or_insert_with(|| vec![0.0; grad_len]);
-            ensure_state_len(grad_len, ax.len(), "asgd average state length mismatch")?;
-
-            // Single fused in-place pass (Adam optpar pattern): the old path cloned
-            // grad + read the param TWICE (once for the step, once post-update for the
-            // averaging) + built an update Vec + apply_param_update — ~6 numel copies.
-            // Apply the step to the param buffer, then fold the running average using
-            // the UPDATED param in the same traversal, fanned over rayon above
-            // OPTIM_PARALLEL_THRESHOLD. Bit-for-bit identical per element (same ops +
-            // order): wd uses the OLD param; param = old*(1-lambd*eta) - eta*g_eff;
-            // ax = old_ax + mu*(new_param - old_ax) — and on the FIRST step ax is
-            // seeded to the post-update param (== torch's ax init, where the +mu*0
-            // term is a no-op). frankentorch-optpar.
+            let state = self.state[i].get_or_insert_with(|| AsgdParameterState {
+                step: 0,
+                eta: self.lr,
+                mu: 1.0,
+                ax: vec![0.0; grad_len],
+            });
+            // Schedules are per parameter and apply their current values first.
+            // A late first gradient uses the current configured learning rate.
+            let eta = state.eta;
+            let mu = state.mu;
+            let ax = &mut state.ax;
             session.tensor_update_param_values_f64_with_accumulated_gradient(
                 param,
                 |grad, param_values| {
@@ -6458,9 +6583,9 @@ impl Optimizer for ASGD {
                         } else {
                             g
                         };
-                        // param -= lambd*eta*param + eta*g_eff (uses OLD param).
-                        *p -= lambd * eta * *p + eta * g_eff;
-                        if is_first {
+                        *p *= 1.0 - lambd * eta;
+                        *p -= eta * g_eff;
+                        if mu == 1.0 {
                             *a = *p;
                         } else {
                             *a += mu * (*p - *a);
@@ -6482,13 +6607,10 @@ impl Optimizer for ASGD {
                     }
                 },
             )?;
+            state.step = next_step;
+            state.eta = self.lr / (1.0 + self.lambd * self.lr * next_step as f64).powf(self.alpha);
+            state.mu = 1.0 / f64::max(1.0, next_step as f64 - self.t0);
         }
-
-        // Decay eta and mu for the NEXT step (torch updates these post-step):
-        //   eta_t = lr / (1 + lambd * lr * t)^alpha
-        //   mu_t  = 1 / max(1, t - t0)
-        self.eta = self.lr / (1.0 + self.lambd * self.lr * t as f64).powf(self.alpha);
-        self.mu = 1.0 / f64::max(1.0, t as f64 - self.t0);
         Ok(())
     }
 
@@ -6503,16 +6625,37 @@ impl ASGD {
         &self,
         session: &mut FrankenTorchSession,
     ) -> Result<Vec<TensorNodeId>, AutogradError> {
-        let mut result = Vec::with_capacity(self.params.len());
+        ensure_state_len(
+            self.params.len(),
+            self.state.len(),
+            "asgd state parameter count mismatch",
+        )?;
+        let mut tensors = Vec::with_capacity(self.params.len());
         for (i, &param) in self.params.iter().enumerate() {
-            let shape = session.tensor_values_meta(param)?.1.shape().to_vec();
-            let values = match &self.ax[i] {
-                Some(ax) => ax.clone(),
-                None => session.tensor_values(param)?,
+            let tensor = session.tensor_snapshot(param)?;
+            let shape = tensor.meta().shape().to_vec();
+            let device = tensor.meta().device();
+            let values = match &self.state[i] {
+                Some(state) => state.ax.clone(),
+                None => session.tensor_values_lossy_f64(param)?,
             };
-            result.push(session.tensor_variable(values, shape, false)?);
+            let tensor = match tensor.meta().dtype() {
+                ft_core::DType::F64 => {
+                    ft_core::DenseTensor::from_contiguous_values(values, shape, device)
+                }
+                ft_core::DType::F32 => ft_core::DenseTensor::from_contiguous_values_f32(
+                    values.into_iter().map(|value| value as f32).collect(),
+                    shape,
+                    device,
+                ),
+                _ => return Err(optimizer_state_error("asgd requires F32 or F64 parameters")),
+            };
+            tensors.push(tensor?);
         }
-        Ok(result)
+        Ok(tensors
+            .into_iter()
+            .map(|tensor| session.tensor_variable_from_storage(tensor, false))
+            .collect())
     }
 }
 
@@ -7904,6 +8047,7 @@ mod tests {
                 OptimizerState::RAdam(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::SparseAdam(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::NAdam(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::Asgd(state) => assert!(state.parameters[1].is_none()),
             }
             let encoded = serde_json::to_vec(&saved).unwrap();
             let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
@@ -14796,6 +14940,365 @@ mod tests {
     }
 
     // ---- ASGD tests ----
+
+    #[test]
+    fn asgd_parameter_schedules_ignore_missing_gradients_and_follow_lr_changes() {
+        // Independent scalar recurrence from torch.optim.ASGD: the schedule is
+        // indexed by this parameter's gradients, not optimizer.step calls.
+        let gradients = [
+            [None, None],
+            [Some([1.0, -2.0]), None],
+            [Some([0.0, 0.0]), None],
+            [None, Some([-1.0, 0.5])],
+            [Some([-0.25, 1.0]), Some([0.0, 0.0])],
+            [None, None],
+            [Some([0.75, -0.125]), None],
+            [Some([0.0, 1.0]), Some([1.0, -1.0])],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for maximize in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let initial = [[1.5, -0.75], [2.25, 0.5]];
+                    let params: Vec<_> = initial
+                        .iter()
+                        .map(|values| {
+                            if dtype == ft_core::DType::F32 {
+                                session
+                                    .tensor_variable_f32(
+                                        values.iter().map(|&value| value as f32).collect(),
+                                        vec![2],
+                                        true,
+                                    )
+                                    .unwrap()
+                            } else {
+                                session
+                                    .tensor_variable(values.to_vec(), vec![2], true)
+                                    .unwrap()
+                            }
+                        })
+                        .collect();
+                    let mut optimizer = ASGD::new(params.clone(), 0.125)
+                        .lambd(0.2)
+                        .alpha(0.75)
+                        .t0(0.0)
+                        .weight_decay(0.1)
+                        .maximize(maximize);
+                    // The supplied report is deliberately unrelated: step reads
+                    // current persistent gradients, including an all-missing call.
+                    let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                    let report = session.tensor_backward(dummy).unwrap();
+                    let mut values = initial;
+                    let mut averages = [[0.0; 2]; 2];
+                    let mut counts = [0u64; 2];
+                    let mut rates = [0.0; 2];
+                    let mut coefficients = [1.0; 2];
+                    for (round, row) in gradients.iter().enumerate() {
+                        if round == 2 {
+                            optimizer.set_lr(0.04);
+                        }
+                        if round == 5 {
+                            optimizer.set_lr(0.09);
+                        }
+                        let previous = optimizer.state_dict(&session).unwrap();
+                        for (index, &param) in params.iter().enumerate() {
+                            session.tensor_requires_grad_(param, false).unwrap();
+                            session.tensor_requires_grad_(param, true).unwrap();
+                            if let Some(gradient) = row[index] {
+                                session
+                                    .tensor_set_accumulated_gradient(param, gradient.to_vec())
+                                    .unwrap();
+                                if counts[index] == 0 {
+                                    rates[index] = optimizer.get_lr();
+                                }
+                                for (element, &gradient) in gradient.iter().enumerate() {
+                                    let old = values[index][element];
+                                    let directed = if maximize { -gradient } else { gradient };
+                                    let next = old * (1.0 - 0.2 * rates[index])
+                                        - rates[index] * (directed + 0.1 * old);
+                                    averages[index][element] = if coefficients[index] == 1.0 {
+                                        next
+                                    } else {
+                                        averages[index][element]
+                                            + coefficients[index]
+                                                * (next - averages[index][element])
+                                    };
+                                    values[index][element] = if dtype == ft_core::DType::F32 {
+                                        f64::from(next as f32)
+                                    } else {
+                                        next
+                                    };
+                                }
+                                counts[index] += 1;
+                                rates[index] = optimizer.get_lr()
+                                    / (1.0 + 0.2 * optimizer.get_lr() * counts[index] as f64)
+                                        .powf(0.75);
+                                coefficients[index] = 1.0 / (counts[index] as f64).max(1.0);
+                            }
+                        }
+                        optimizer.step(&mut session, &report).unwrap();
+                        let saved = optimizer.state_dict(&session).unwrap();
+                        let OptimizerState::Asgd(saved_state) = &saved.state else {
+                            unreachable!()
+                        };
+                        let OptimizerState::Asgd(previous_state) = &previous.state else {
+                            unreachable!()
+                        };
+                        let average_nodes = optimizer.averaged_parameters(&mut session).unwrap();
+                        for (index, &param) in params.iter().enumerate() {
+                            assert_eq!(
+                                session.tensor_values_lossy_f64(param).unwrap(),
+                                values[index]
+                            );
+                            if row[index].is_none() {
+                                assert_eq!(
+                                    saved_state.parameters[index],
+                                    previous_state.parameters[index]
+                                );
+                            }
+                            if let Some(state) = &saved_state.parameters[index] {
+                                assert_eq!(state.step, counts[index]);
+                                assert_eq!(state.eta, rates[index]);
+                                assert_eq!(state.mu, coefficients[index]);
+                                assert_eq!(state.ax, averages[index]);
+                            } else {
+                                assert_eq!(counts[index], 0);
+                            }
+                            let expected: Vec<_> = if counts[index] == 0 {
+                                values[index]
+                            } else {
+                                averages[index]
+                            }
+                            .into_iter()
+                            .map(|value| {
+                                if dtype == ft_core::DType::F32 {
+                                    f64::from(value as f32)
+                                } else {
+                                    value
+                                }
+                            })
+                            .collect();
+                            assert_eq!(session.tensor_dtype(average_nodes[index]).unwrap(), dtype);
+                            assert!(!session.tensor_requires_grad(average_nodes[index]).unwrap());
+                            assert_eq!(
+                                session
+                                    .tensor_values_lossy_f64(average_nodes[index])
+                                    .unwrap(),
+                                expected
+                            );
+                        }
+                    }
+                    assert_eq!(counts, [5, 3]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_asgd_resume_preserves_per_parameter_schedules_and_averages() {
+        for maximize in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, original| {
+                if original {
+                    Box::new(
+                        ASGD::new(params, 0.07)
+                            .lambd(0.13)
+                            .alpha(0.5)
+                            .t0(0.0)
+                            .weight_decay(0.09)
+                            .maximize(maximize),
+                    )
+                } else {
+                    Box::new(ASGD::new(params, 0.8))
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_asgd_rejects_invalid_state_atomically() {
+        for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let param = if dtype == ft_core::DType::F32 {
+                session
+                    .tensor_variable_f32(vec![2.0, -1.0], vec![2], true)
+                    .unwrap()
+            } else {
+                session
+                    .tensor_variable(vec![2.0, -1.0], vec![2], true)
+                    .unwrap()
+            };
+            let mut optimizer = ASGD::new(vec![param], 0.07).lambd(0.1).t0(-0.5);
+            let report = backward_sum_sq(&mut session, param);
+            optimizer.step(&mut session, &report).unwrap();
+            let before = optimizer.state_dict(&session).unwrap();
+            let identity = Arc::clone(&optimizer.identity().0);
+            let values = session.tensor_values_lossy_f64(param).unwrap();
+            let gradient = session.tensor_grad(param).unwrap();
+            for case in 0..23 {
+                let mut invalid = before.clone();
+                match case {
+                    0 => invalid.version += 1,
+                    1 => invalid.parameters.clear(),
+                    2 => invalid.parameters[0].shape = vec![1, 2],
+                    3 => invalid.parameters[0].dtype = ft_core::DType::F16,
+                    4 => invalid = SGD::new(vec![param], 0.1).state_dict(&session).unwrap(),
+                    _ => {
+                        let OptimizerState::Asgd(state) = &mut invalid.state else {
+                            unreachable!()
+                        };
+                        match case {
+                            5 => state.parameters.clear(),
+                            6 => state.lr = f64::NAN,
+                            7 => state.lr = -1.0,
+                            8 => state.lambd = -1.0,
+                            9 => state.alpha = -1.0,
+                            10 => state.alpha = f64::INFINITY,
+                            11 => state.t0 = f64::NAN,
+                            12 => state.weight_decay = -1.0,
+                            _ => {
+                                let parameter = state.parameters[0].as_mut().unwrap();
+                                match case {
+                                    13 => parameter.step = 0,
+                                    14 => parameter.ax.clear(),
+                                    15 => parameter.ax[0] = f64::NAN,
+                                    16 => parameter.ax[0] = f64::INFINITY,
+                                    17 => parameter.eta = -1.0,
+                                    18 => parameter.eta = f64::INFINITY,
+                                    19 => parameter.mu = 0.0,
+                                    20 => parameter.mu = -0.1,
+                                    21 => parameter.mu = 1.1,
+                                    22 => parameter.mu = f64::NAN,
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    optimizer.load_state_dict(&session, &invalid).is_err(),
+                    "case {case}"
+                );
+                assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+                assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+                assert_eq!(session.tensor_values_lossy_f64(param).unwrap(), values);
+                assert_eq!(session.tensor_grad(param).unwrap(), gradient);
+            }
+            let mut encoded = serde_json::to_value(&before).unwrap();
+            encoded["state"]["Asgd"]["parameters"][0]["unexpected"] = true.into();
+            assert!(serde_json::from_value::<OptimizerStateDict>(encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn asgd_checkpoint_integer_counters_and_overflow_are_atomic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let first = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let second = session.tensor_variable(vec![3.0], vec![1], true).unwrap();
+        let mut optimizer = ASGD::new(vec![first, second], 0.1);
+        let sum = session.tensor_add(first, second).unwrap();
+        let loss = session.tensor_sum(sum).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        optimizer.step(&mut session, &report).unwrap();
+        let mut saved = optimizer.state_dict(&session).unwrap();
+        let OptimizerState::Asgd(state) = &mut saved.state else {
+            unreachable!()
+        };
+        state.parameters[0].as_mut().unwrap().step = (1u64 << 53) + 1;
+        state.parameters[1].as_mut().unwrap().step = u64::MAX;
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, saved);
+        optimizer.load_state_dict(&session, &decoded).unwrap();
+        let values = [
+            session.tensor_values(first).unwrap(),
+            session.tensor_values(second).unwrap(),
+        ];
+        assert!(optimizer.step(&mut session, &report).is_err());
+        assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+        assert_eq!(session.tensor_values(first).unwrap(), values[0]);
+        assert_eq!(session.tensor_values(second).unwrap(), values[1]);
+        // A saturated counter on a skipped parameter does not stop another one.
+        session.tensor_requires_grad_(second, false).unwrap();
+        session.tensor_requires_grad_(second, true).unwrap();
+        optimizer.step(&mut session, &report).unwrap();
+        assert_eq!(optimizer.state[0].as_ref().unwrap().step, (1u64 << 53) + 2);
+        assert_eq!(optimizer.state[1].as_ref().unwrap().step, u64::MAX);
+    }
+
+    #[test]
+    fn asgd_empty_parameters_and_uninitialized_averages_preserve_metadata() {
+        for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let tensor = if dtype == ft_core::DType::F32 {
+                ft_core::DenseTensor::from_contiguous_values_f32(
+                    vec![],
+                    vec![0, 3],
+                    ft_core::Device::Metal,
+                )
+                .unwrap()
+            } else {
+                ft_core::DenseTensor::from_contiguous_values(
+                    vec![],
+                    vec![0, 3],
+                    ft_core::Device::Metal,
+                )
+                .unwrap()
+            };
+            let param = session.tensor_variable_from_storage(tensor, true);
+            let optimizer = ASGD::new(vec![param], 0.1);
+            let saved = optimizer.state_dict(&session).unwrap();
+            let averages = optimizer.averaged_parameters(&mut session).unwrap();
+            let average = session.tensor_snapshot(averages[0]).unwrap();
+            assert_eq!(average.meta().dtype(), dtype);
+            assert_eq!(average.meta().device(), ft_core::Device::Metal);
+            assert_eq!(average.meta().shape(), &[0, 3]);
+            assert_ne!(averages[0], param);
+            assert!(!session.tensor_requires_grad(averages[0]).unwrap());
+            assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+        }
+        let session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let optimizer = ASGD::new(vec![], 0.0);
+        let saved = optimizer.state_dict(&session).unwrap();
+        ASGD::new(vec![], 1.0)
+            .load_state_dict(&session, &saved)
+            .unwrap();
+    }
+
+    #[test]
+    fn asgd_sparse_gradients_and_invalid_schedules_fail_before_any_update() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let dense = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let sparse = session
+            .tensor_variable(vec![1.0; 6], vec![3, 2], true)
+            .unwrap();
+        let indices = session.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let selected = session
+            .tensor_index_select_sparse(sparse, 0, indices)
+            .unwrap();
+        let loss = session.tensor_sum(selected).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        session
+            .tensor_set_accumulated_gradient(dense, vec![4.0])
+            .unwrap();
+        let mut optimizer = ASGD::new(vec![dense, sparse], 0.1);
+        let before = optimizer.state_dict(&session).unwrap();
+        assert!(optimizer.step(&mut session, &report).is_err());
+        assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+        assert_eq!(session.tensor_values(dense).unwrap(), vec![2.0]);
+        assert_eq!(session.tensor_values(sparse).unwrap(), vec![1.0; 6]);
+        for value in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = ASGD::new(vec![dense], 0.1).alpha(value);
+            assert!(invalid.step(&mut session, &report).is_err());
+            assert!(invalid.state[0].is_none());
+            assert_eq!(session.tensor_values(dense).unwrap(), vec![2.0]);
+        }
+        for value in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            let mut invalid = ASGD::new(vec![dense], 0.1).t0(value);
+            assert!(invalid.step(&mut session, &report).is_err());
+            assert!(invalid.state[0].is_none());
+            assert_eq!(session.tensor_values(dense).unwrap(), vec![2.0]);
+        }
+    }
 
     #[test]
     fn asgd_basic_step_reduces_loss() {
