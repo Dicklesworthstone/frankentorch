@@ -7050,6 +7050,21 @@ impl GroupNorm {
         eps: f64,
         affine: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, num_groups, num_channels, eps, affine, DType::F64)
+    }
+
+    /// Create GroupNorm with F32 or F64 affine parameters.
+    /// Parameters are trainable leaves even when constructed inside `with_no_grad`.
+    /// Without affine parameters, the input determines the computation dtype.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_groups: usize,
+        num_channels: usize,
+        eps: f64,
+        affine: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_groups == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -7073,8 +7088,10 @@ impl GroupNorm {
         }
 
         let (weight, bias) = if affine {
-            let w = session.tensor_variable(vec![1.0; num_channels], vec![num_channels], true)?;
-            let b = session.tensor_variable(vec![0.0; num_channels], vec![num_channels], true)?;
+            let w =
+                initialized_parameter(session, vec![1.0; num_channels], vec![num_channels], dtype)?;
+            let b =
+                initialized_parameter(session, vec![0.0; num_channels], vec![num_channels], dtype)?;
             (Some(w), Some(b))
         } else {
             (None, None)
@@ -7087,6 +7104,34 @@ impl GroupNorm {
             weight,
             bias,
         })
+    }
+
+    /// Validate before any reshaping, including InstanceNorm's unbatched path.
+    fn validate_input(
+        &self,
+        session: &FrankenTorchSession,
+        input: TensorNodeId,
+        channel_dim: usize,
+    ) -> Result<(), AutogradError> {
+        if session.tensor_shape(input)?.get(channel_dim).copied() != Some(self.num_channels) {
+            return Err(incompatible_error(
+                "GroupNorm input channels do not match num_channels",
+            ));
+        }
+        let dtype = session.tensor_dtype(input)?;
+        let device = session.tensor_device(input)?;
+        validate_parameter_dtype(dtype)?;
+        for parameter in self.weight.into_iter().chain(self.bias) {
+            if session.tensor_shape(parameter)? != [self.num_channels]
+                || session.tensor_dtype(parameter)? != dtype
+                || session.tensor_device(parameter)? != device
+            {
+                return Err(incompatible_error(
+                    "GroupNorm parameters must match the input dtype, device, and channels",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7109,13 +7154,7 @@ impl Module for GroupNorm {
         let batch_size = input_shape[0];
         let channels = input_shape[1];
 
-        if channels != self.num_channels {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "GroupNorm input channels do not match num_channels",
-                },
-            )));
-        }
+        self.validate_input(session, input, 1)?;
 
         let channels_per_group = channels / self.num_groups;
         // Compute spatial size (product of dims after N, C)
@@ -7149,11 +7188,7 @@ impl Module for GroupNorm {
             session.tensor_expand(var_us, vec![batch_size, self.num_groups, group_numel])?;
 
         // std = sqrt(var + eps)
-        let eps_t = session.full(
-            vec![batch_size, self.num_groups, group_numel],
-            self.eps,
-            false,
-        )?;
+        let eps_t = session.full_like(var_exp, self.eps, false)?;
         let var_eps = session.tensor_add(var_exp, eps_t)?;
         let std = session.tensor_sqrt(var_eps)?;
 
@@ -7226,11 +7261,29 @@ impl RMSNorm {
         normalized_shape: Vec<usize>,
         eps: f64,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, normalized_shape, eps, DType::F64)
+    }
+
+    /// Create RMSNorm with a trainable F32 or F64 weight leaf.
+    /// Invalid shapes and dtypes are rejected before any tensor is created.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        normalized_shape: Vec<usize>,
+        eps: f64,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
+        if normalized_shape.is_empty() {
+            return Err(incompatible_error(
+                "RMSNorm requires non-empty normalized_shape",
+            ));
+        }
         let total = checked_shape_numel(
             &normalized_shape,
             "RMSNorm normalized_shape volume overflow",
         )?;
-        let weight = session.tensor_variable(vec![1.0; total], normalized_shape.clone(), true)?;
+        let weight =
+            initialized_parameter(session, vec![1.0; total], normalized_shape.clone(), dtype)?;
         Ok(Self {
             normalized_shape,
             eps,
@@ -7286,6 +7339,17 @@ impl Module for RMSNorm {
             )));
         }
 
+        let dtype = session.tensor_dtype(input)?;
+        validate_parameter_dtype(dtype)?;
+        if session.tensor_shape(self.weight)? != self.normalized_shape
+            || session.tensor_dtype(self.weight)? != dtype
+            || session.tensor_device(self.weight)? != session.tensor_device(input)?
+        {
+            return Err(incompatible_error(
+                "RMSNorm weight must match normalized_shape and the input dtype and device",
+            ));
+        }
+
         let batch_dims = if ndim == norm_ndim {
             1
         } else {
@@ -7318,7 +7382,7 @@ impl Module for RMSNorm {
         let x_flat = session.tensor_reshape(input, vec![batch_dims, norm_dims])?;
         let sq = session.tensor_mul(x_flat, x_flat)?;
         let mean_sq = session.tensor_mean_dim(sq, 1)?; // [batch_dims]
-        let eps_t = session.full(vec![batch_dims], self.eps, false)?;
+        let eps_t = session.full_like(mean_sq, self.eps, false)?;
         let var_eps = session.tensor_add(mean_sq, eps_t)?;
         let rms = session.tensor_sqrt(var_eps)?;
         let rms_kd = session.tensor_unsqueeze(rms, 1)?;
@@ -7360,8 +7424,20 @@ impl InstanceNorm1d {
         eps: f64,
         affine: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(session, num_features, eps, affine, DType::F64)
+    }
+
+    /// Create InstanceNorm1d with optional trainable F32 or F64 affine leaves.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        affine: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
         // InstanceNorm = GroupNorm where each channel is its own group
-        let inner = GroupNorm::new(session, num_features, num_features, eps, affine)?;
+        let inner =
+            GroupNorm::new_with_dtype(session, num_features, num_features, eps, affine, dtype)?;
         Ok(Self { inner })
     }
 }
@@ -7372,10 +7448,18 @@ impl Module for InstanceNorm1d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        let rank = session.tensor_shape(input)?.len();
+        if rank != 2 && rank != 3 {
+            return Err(incompatible_error(
+                "InstanceNorm1d expects 2D or 3D input ([C, L] or [N, C, L])",
+            ));
+        }
+        self.inner
+            .validate_input(session, input, usize::from(rank == 3))?;
         // torch nn.InstanceNorm1d accepts an unbatched [C, L] input and returns
         // [C, L]. The inner GroupNorm treats dim 0 as the batch, so unbatched input
         // must be unsqueezed first: unsqueeze(0) -> norm -> squeeze(0).
-        if session.tensor_shape(input)?.len() == 2 {
+        if rank == 2 {
             let batched = session.tensor_unsqueeze(input, 0)?;
             let out = self.inner.forward(session, batched)?;
             return session.tensor_squeeze(out, 0);
@@ -7415,7 +7499,19 @@ impl InstanceNorm2d {
         eps: f64,
         affine: bool,
     ) -> Result<Self, AutogradError> {
-        let inner = GroupNorm::new(session, num_features, num_features, eps, affine)?;
+        Self::new_with_dtype(session, num_features, eps, affine, DType::F64)
+    }
+
+    /// Create InstanceNorm2d with optional trainable F32 or F64 affine leaves.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        affine: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        let inner =
+            GroupNorm::new_with_dtype(session, num_features, num_features, eps, affine, dtype)?;
         Ok(Self {
             inner,
             num_features,
@@ -7434,6 +7530,7 @@ impl Module for InstanceNorm2d {
         // torch nn.InstanceNorm2d accepts an unbatched [C, H, W] input and returns
         // [C, H, W] — unsqueeze(0) -> norm -> squeeze(0).
         if input_shape.len() == 3 {
+            self.inner.validate_input(session, input, 0)?;
             let batched = session.tensor_unsqueeze(input, 0)?;
             let out = self.forward(session, batched)?;
             return session.tensor_squeeze(out, 0);
@@ -7490,7 +7587,19 @@ impl InstanceNorm3d {
         eps: f64,
         affine: bool,
     ) -> Result<Self, AutogradError> {
-        let inner = GroupNorm::new(session, num_features, num_features, eps, affine)?;
+        Self::new_with_dtype(session, num_features, eps, affine, DType::F64)
+    }
+
+    /// Create InstanceNorm3d with optional trainable F32 or F64 affine leaves.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        affine: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        let inner =
+            GroupNorm::new_with_dtype(session, num_features, num_features, eps, affine, dtype)?;
         Ok(Self {
             inner,
             num_features,
@@ -7513,6 +7622,7 @@ impl Module for InstanceNorm3d {
                         "input channel dimension does not match num_features",
                     ));
                 }
+                self.inner.validate_input(session, input, 0)?;
                 let batched = session.tensor_reshape(input, vec![1, *c, *d, *h, *w])?;
                 let normalized = self.inner.forward(session, batched)?;
                 session.tensor_reshape(normalized, input_shape)
@@ -21989,14 +22099,20 @@ mod tests {
             11 => construct!(TransformerDecoderLayer, 2, 1, 3, 0.2, activation, true),
             12 => construct!(TransformerEncoder, 2, 1, 2, 3, 0.2, activation, true, true),
             13 => construct!(TransformerDecoder, 2, 1, 2, 3, 0.2, activation, true, true),
-            _ => construct!(Transformer, 2, 1, 2, 2, 3, 0.2, activation, true),
+            14 => construct!(Transformer, 2, 1, 2, 2, 3, 0.2, activation, true),
+            15 => construct!(GroupNorm, 2, 4, 1e-5, true),
+            16 => construct!(RMSNorm, vec![2, 3], 1e-5),
+            17 => construct!(InstanceNorm1d, 4, 1e-5, true),
+            18 => construct!(InstanceNorm2d, 4, 1e-5, true),
+            19 => construct!(InstanceNorm3d, 4, 1e-5, true),
+            _ => unreachable!(),
         })
     }
 
     #[test]
     fn typed_model_constructors_preserve_seeded_values_and_trainable_leaves() {
         for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
-            for kind in 0..15 {
+            for kind in 0..20 {
                 let baseline = FrankenTorchSession::new(mode);
                 let mut original = baseline.clone();
                 let default = typed_constructor_parameters(&mut original, kind, None).unwrap();
@@ -22043,7 +22159,7 @@ mod tests {
 
     #[test]
     fn typed_model_constructors_reject_unsupported_dtype_without_nodes_or_rng() {
-        for kind in 0..15 {
+        for kind in 0..20 {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let mut untouched = session.clone();
             for dtype in [
@@ -28661,6 +28777,499 @@ mod tests {
     }
 
     // ── GroupNorm tests ────────────────────────────────────────────────
+
+    fn typed_normalization_test_module(
+        session: &mut FrankenTorchSession,
+        kind: usize,
+        dtype: DType,
+        affine: bool,
+    ) -> Result<Box<dyn Module>, AutogradError> {
+        let module: Box<dyn Module> = match kind {
+            0 => Box::new(GroupNorm::new_with_dtype(
+                session, 2, 4, 0.125, affine, dtype,
+            )?),
+            1 => Box::new(RMSNorm::new_with_dtype(session, vec![2, 3], 0.125, dtype)?),
+            2 => Box::new(InstanceNorm1d::new_with_dtype(
+                session, 4, 0.125, affine, dtype,
+            )?),
+            3 => Box::new(InstanceNorm2d::new_with_dtype(
+                session, 4, 0.125, affine, dtype,
+            )?),
+            4 => Box::new(InstanceNorm3d::new_with_dtype(
+                session, 4, 0.125, affine, dtype,
+            )?),
+            _ => unreachable!(),
+        };
+        Ok(module)
+    }
+
+    fn typed_normalization_test_shape(kind: usize, unbatched: bool) -> Vec<usize> {
+        let batch = if unbatched { None } else { Some(2) };
+        let suffix: &[usize] = match kind {
+            0 | 2 => &[4, 3],
+            1 => &[2, 3],
+            3 => &[4, 1, 3],
+            4 => &[4, 1, 1, 3],
+            _ => unreachable!(),
+        };
+        batch.into_iter().chain(suffix.iter().copied()).collect()
+    }
+
+    // Scalar formulas and their analytical weighted derivatives; this oracle
+    // uses neither a normalization module nor any tensor/autograd operations.
+    fn typed_normalization_reference(
+        kind: usize,
+        input: &[f64],
+        upstream: &[f64],
+        weight: &[f64],
+        bias: &[f64],
+    ) -> [Vec<f64>; 4] {
+        let mut output = vec![0.0; input.len()];
+        let mut dx = vec![0.0; input.len()];
+        let mut dw = vec![0.0; weight.len()];
+        let mut db = vec![0.0; bias.len()];
+        let group_size = if kind == 0 || kind == 1 { 6 } else { 3 };
+        for (group, values) in input.chunks_exact(group_size).enumerate() {
+            let offset = group * group_size;
+            let mean = if kind == 1 {
+                0.0
+            } else {
+                values.iter().sum::<f64>() / group_size as f64
+            };
+            let variance =
+                values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / group_size as f64;
+            let inverse_std = (variance + 0.125).sqrt().recip();
+            let parameter_index = |i: usize| {
+                if kind == 1 {
+                    i
+                } else {
+                    ((offset + i) / 3) % weight.len()
+                }
+            };
+            let mut sum_dy = 0.0;
+            let mut sum_dy_centered = 0.0;
+            for (i, &value) in values.iter().enumerate() {
+                let index = offset + i;
+                let parameter = parameter_index(i);
+                let centered = value - mean;
+                let normalized = centered * inverse_std;
+                output[index] = normalized * weight[parameter];
+                if kind != 1 {
+                    output[index] += bias[parameter];
+                    db[parameter] += upstream[index];
+                }
+                dw[parameter] += upstream[index] * normalized;
+                let dy = upstream[index] * weight[parameter];
+                sum_dy += dy;
+                sum_dy_centered += dy * centered;
+            }
+            for (i, &value) in values.iter().enumerate() {
+                let index = offset + i;
+                let dy = upstream[index] * weight[parameter_index(i)];
+                let mean_term = if kind == 1 {
+                    0.0
+                } else {
+                    sum_dy / group_size as f64
+                };
+                dx[index] = inverse_std
+                    * (dy
+                        - mean_term
+                        - (value - mean) * inverse_std.powi(2) * sum_dy_centered
+                            / group_size as f64);
+            }
+        }
+        [output, dx, dw, db]
+    }
+
+    fn assert_typed_normalization_close(actual: &[f64], expected: &[f64], dtype: DType) {
+        let tolerance = if dtype == DType::F32 { 3e-6 } else { 2e-12 };
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
+                "{dtype:?} element {index}: actual={actual}, expected={expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn typed_normalization_forward_and_weighted_gradients_match_scalar_reference() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for kind in 0..5 {
+                    for unbatched in [false, true] {
+                        if kind == 0 && unbatched {
+                            continue;
+                        }
+                        for affine in [false, true] {
+                            if kind == 1 && !affine {
+                                continue;
+                            }
+                            for input_grad in [false, true] {
+                                let mut session = FrankenTorchSession::new(mode);
+                                let model = session
+                                    .with_no_grad(|s| {
+                                        typed_normalization_test_module(s, kind, dtype, affine)
+                                    })
+                                    .unwrap();
+                                let parameters = model.parameters();
+                                for &parameter in &parameters {
+                                    assert_eq!(session.tensor_dtype(parameter).unwrap(), dtype);
+                                    assert!(session.tensor_requires_grad(parameter).unwrap());
+                                    assert!(session.tensor_is_leaf(parameter).unwrap());
+                                }
+                                let width = if kind == 1 { 6 } else { 4 };
+                                let weight: Vec<_> = (0..width)
+                                    .map(|i| if affine { (i as f64 - 2.0) * 0.5 } else { 1.0 })
+                                    .collect();
+                                let bias: Vec<_> = (0..width)
+                                    .map(|i| if affine { (i as f64 - 1.0) * 0.25 } else { 0.0 })
+                                    .collect();
+                                if affine {
+                                    session
+                                        .tensor_update_param_values(parameters[0], weight.clone())
+                                        .unwrap();
+                                    if kind != 1 {
+                                        session
+                                            .tensor_update_param_values(parameters[1], bias.clone())
+                                            .unwrap();
+                                    }
+                                }
+                                let shape = typed_normalization_test_shape(kind, unbatched);
+                                let numel: usize = shape.iter().product();
+                                let values: Vec<_> = (0..numel)
+                                    .map(|i| (i * 7 % 17) as f64 * 0.5 - 3.0)
+                                    .collect();
+                                let seed: Vec<_> = (0..numel)
+                                    .map(|i| (i * 3 % 11) as f64 * 0.25 - 1.0)
+                                    .collect();
+                                let expected = typed_normalization_reference(
+                                    kind, &values, &seed, &weight, &bias,
+                                );
+                                let input = packed_recurrent_test_leaf(
+                                    &mut session,
+                                    values,
+                                    shape.clone(),
+                                    dtype,
+                                    input_grad,
+                                );
+                                let output = model.forward(&mut session, input).unwrap();
+                                assert_eq!(session.tensor_shape(output).unwrap(), shape);
+                                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                                assert_typed_normalization_close(
+                                    &session.tensor_values_lossy_f64(output).unwrap(),
+                                    &expected[0],
+                                    dtype,
+                                );
+                                if input_grad || affine {
+                                    let upstream = packed_recurrent_test_leaf(
+                                        &mut session,
+                                        seed,
+                                        shape.clone(),
+                                        dtype,
+                                        false,
+                                    );
+                                    let weighted = session.tensor_mul(output, upstream).unwrap();
+                                    let loss = session.tensor_sum(weighted).unwrap();
+                                    let report = session.tensor_backward(loss).unwrap();
+                                    if input_grad {
+                                        assert_typed_normalization_close(
+                                            session.tensor_gradient(&report, input).unwrap(),
+                                            &expected[1],
+                                            dtype,
+                                        );
+                                    } else {
+                                        assert!(session.tensor_gradient(&report, input).is_none());
+                                    }
+                                    for (index, &parameter) in parameters.iter().enumerate() {
+                                        assert_typed_normalization_close(
+                                            session.tensor_gradient(&report, parameter).unwrap(),
+                                            &expected[index + 2],
+                                            dtype,
+                                        );
+                                    }
+                                } else {
+                                    assert!(!session.tensor_requires_grad(output).unwrap());
+                                }
+                                model.eval();
+                                let inference =
+                                    session.with_no_grad(|s| model.forward(s, input)).unwrap();
+                                assert!(!session.tensor_requires_grad(inference).unwrap());
+                                assert_eq!(session.tensor_dtype(inference).unwrap(), dtype);
+                                assert_typed_normalization_close(
+                                    &session.tensor_values_lossy_f64(inference).unwrap(),
+                                    &expected[0],
+                                    dtype,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_normalization_models_train_and_resume_serialized_checkpoints() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for kind in 0..5 {
+                    let make_model = |session: &mut FrankenTorchSession| {
+                        let mut model = Sequential::new();
+                        model.push(Box::new(
+                            Linear::new_with_dtype(session, 3, 3, true, dtype).unwrap(),
+                        ));
+                        model.push(
+                            typed_normalization_test_module(session, kind, dtype, true).unwrap(),
+                        );
+                        model.push(Box::new(Tanh));
+                        model.push(Box::new(
+                            Linear::new_with_dtype(session, 3, 2, true, dtype).unwrap(),
+                        ));
+                        model
+                    };
+                    // A real update through both neighboring layers also checks
+                    // that normalization does not sever the training graph.
+                    let train_step =
+                        |session: &mut FrankenTorchSession, model: &dyn Module, input| {
+                            session.tensor_zero_grads(&model.parameters()).unwrap();
+                            let output = model.forward(session, input).unwrap();
+                            assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                            let shape = session.tensor_shape(output).unwrap();
+                            let count: usize = shape.iter().product();
+                            let target = packed_recurrent_test_leaf(
+                                session,
+                                (0..count)
+                                    .map(|i| (i * 5 % 13) as f64 * 0.125 - 0.75)
+                                    .collect(),
+                                shape,
+                                dtype,
+                                false,
+                            );
+                            let difference = session.tensor_sub(output, target).unwrap();
+                            let squared = session.tensor_mul(difference, difference).unwrap();
+                            let loss = session.tensor_sum(squared).unwrap();
+                            let report = session.tensor_backward(loss).unwrap();
+                            let mut changed = 0;
+                            for parameter in model.parameters() {
+                                let gradient = session.tensor_gradient(&report, parameter).unwrap();
+                                assert!(gradient.iter().all(|value| value.is_finite()));
+                                changed +=
+                                    usize::from(gradient.iter().any(|value| value.abs() > 1e-10));
+                                let updated: Vec<_> = session
+                                    .tensor_values_lossy_f64(parameter)
+                                    .unwrap()
+                                    .iter()
+                                    .zip(gradient)
+                                    .map(|(&value, &gradient)| value - 0.01 * gradient)
+                                    .collect();
+                                session
+                                    .tensor_update_param_values(parameter, updated)
+                                    .unwrap();
+                            }
+                            assert_eq!(
+                                changed,
+                                model.parameters().len(),
+                                "kind {kind}, dtype {dtype:?}"
+                            );
+                            session.tensor_values_lossy_f64(output).unwrap()
+                        };
+                    let mut session = FrankenTorchSession::new(mode);
+                    let model = session.with_no_grad(make_model);
+                    let shape = typed_normalization_test_shape(kind, false);
+                    let values: Vec<_> = (0..shape.iter().product::<usize>())
+                        .map(|i| (i * 7 % 17) as f64 * 0.5 - 3.0)
+                        .collect();
+                    let input = packed_recurrent_test_leaf(
+                        &mut session,
+                        values.clone(),
+                        shape.clone(),
+                        dtype,
+                        false,
+                    );
+                    train_step(&mut session, &model, input);
+                    let checkpoint = module_state_dict(&model, &session).unwrap();
+                    let typed = checkpoint
+                        .iter()
+                        .map(|(name, tensor)| {
+                            (
+                                name.clone(),
+                                ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                            )
+                        })
+                        .collect();
+                    let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+                    let saved = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+
+                    let mut resumed = FrankenTorchSession::new(mode);
+                    resumed.tensor_variable(vec![9.0], vec![1], false).unwrap();
+                    let restored = resumed.with_no_grad(make_model);
+                    let restored_parameters = restored.parameters();
+                    assert_ne!(restored_parameters, model.parameters());
+                    module_load_state_dict(&restored, &mut resumed, &saved, true).unwrap();
+                    assert_eq!(restored.parameters(), restored_parameters);
+                    assert_batchnorm_test_state_equal(
+                        &module_state_dict(&restored, &resumed).unwrap(),
+                        &checkpoint,
+                    );
+                    let restored_input =
+                        packed_recurrent_test_leaf(&mut resumed, values, shape, dtype, false);
+                    for _ in 0..2 {
+                        let output = train_step(&mut session, &model, input);
+                        let restored_output = train_step(&mut resumed, &restored, restored_input);
+                        assert_eq!(output, restored_output);
+                        assert_batchnorm_test_state_equal(
+                            &module_state_dict(&restored, &resumed).unwrap(),
+                            &module_state_dict(&model, &session).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_normalization_preflight_rejects_invalid_shapes_and_operands_without_nodes() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mut untouched = session.clone();
+            let nodes = session.autograd_graph_node_count();
+            for (groups, channels) in [(0, 4), (2, 0), (3, 4)] {
+                assert!(
+                    GroupNorm::new_with_dtype(&mut session, groups, channels, 1e-5, true, dtype,)
+                        .is_err()
+                );
+            }
+            for shape in [vec![], vec![usize::MAX, 2]] {
+                assert!(RMSNorm::new_with_dtype(&mut session, shape, 1e-5, dtype).is_err());
+            }
+            assert!(InstanceNorm1d::new_with_dtype(&mut session, 0, 1e-5, true, dtype).is_err());
+            assert!(InstanceNorm2d::new_with_dtype(&mut session, 0, 1e-5, true, dtype).is_err());
+            assert!(InstanceNorm3d::new_with_dtype(&mut session, 0, 1e-5, true, dtype).is_err());
+            assert_eq!(session.autograd_graph_node_count(), nodes);
+            let next = session.rand(vec![4], false).unwrap();
+            let expected = untouched.rand(vec![4], false).unwrap();
+            assert_eq!(
+                session.tensor_values(next).unwrap(),
+                untouched.tensor_values(expected).unwrap()
+            );
+            for kind in 0..5 {
+                let model =
+                    typed_normalization_test_module(&mut session, kind, dtype, true).unwrap();
+                for unbatched in [false, true] {
+                    if kind == 0 && unbatched {
+                        continue;
+                    }
+                    let shape = typed_normalization_test_shape(kind, unbatched);
+                    let count = shape.iter().product();
+                    let other_dtype = if dtype == DType::F32 {
+                        DType::F64
+                    } else {
+                        DType::F32
+                    };
+                    let wrong_dtype = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; count],
+                        shape.clone(),
+                        other_dtype,
+                        true,
+                    );
+                    let storage = DenseTensor::from_contiguous_values(
+                        vec![1.0; count],
+                        shape.clone(),
+                        Device::Metal,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                    let wrong_device = session.tensor_variable_from_storage(storage, true);
+                    let mut wrong_shape = shape;
+                    if kind == 1 {
+                        *wrong_shape.last_mut().unwrap() += 1;
+                    } else {
+                        wrong_shape[usize::from(!unbatched)] += 1;
+                    }
+                    let wrong_shape = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; wrong_shape.iter().product()],
+                        wrong_shape,
+                        dtype,
+                        true,
+                    );
+                    let wrong_rank = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; 4],
+                        vec![4],
+                        dtype,
+                        true,
+                    );
+                    for input in [
+                        wrong_dtype,
+                        wrong_device,
+                        wrong_shape,
+                        wrong_rank,
+                        TensorNodeId(usize::MAX),
+                    ] {
+                        let nodes = session.autograd_graph_node_count();
+                        let before = module_state_dict(model.as_ref(), &session).unwrap();
+                        session.with_no_grad(|s| {
+                            assert!(model.forward(s, input).is_err(), "kind {kind}");
+                            assert!(!s.is_grad_enabled());
+                        });
+                        assert_eq!(session.autograd_graph_node_count(), nodes, "kind {kind}");
+                        assert_batchnorm_test_state_equal(
+                            &module_state_dict(model.as_ref(), &session).unwrap(),
+                            &before,
+                        );
+                    }
+                }
+            }
+            // This rank previously slipped through InstanceNorm1d to GroupNorm.
+            let model =
+                InstanceNorm1d::new_with_dtype(&mut session, 4, 1e-5, false, dtype).unwrap();
+            let rank_four = packed_recurrent_test_leaf(
+                &mut session,
+                vec![1.0; 12],
+                vec![1, 4, 1, 3],
+                dtype,
+                true,
+            );
+            let nodes = session.autograd_graph_node_count();
+            assert!(model.forward(&mut session, rank_four).is_err());
+            assert_eq!(session.autograd_graph_node_count(), nodes);
+        }
+    }
+
+    #[test]
+    fn typed_normalization_empty_batches_preserve_shape_dtype_and_gradients() {
+        for dtype in [DType::F32, DType::F64] {
+            for kind in 0..5 {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let model =
+                    typed_normalization_test_module(&mut session, kind, dtype, true).unwrap();
+                let mut shape = typed_normalization_test_shape(kind, false);
+                shape[0] = 0;
+                let input =
+                    packed_recurrent_test_leaf(&mut session, vec![], shape.clone(), dtype, true);
+                let output = model.forward(&mut session, input).unwrap();
+                assert_eq!(session.tensor_shape(output).unwrap(), shape);
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                assert!(session.tensor_values_lossy_f64(output).unwrap().is_empty());
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert!(session.tensor_gradient(&report, input).unwrap().is_empty());
+                for parameter in model.parameters() {
+                    assert!(
+                        session
+                            .tensor_gradient(&report, parameter)
+                            .unwrap()
+                            .iter()
+                            .all(|&value| value == 0.0)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn groupnorm_basic_output_shape() {
