@@ -17789,7 +17789,14 @@ impl TensorTape {
                             }
                         }
                     }
-                    let grad_in = self.leaf(contrib, original_shape.clone(), true)?;
+                    // Keep the zero-pad as a real linear map of the incoming
+                    // gradient; a fresh leaf would discard downstream curvature.
+                    let mut padding = vec![0usize; 2 * (original_shape.len() - dim)];
+                    let pair = 2 * (original_shape.len() - 1 - dim);
+                    padding[pair] = start;
+                    padding[pair + 1] = original_shape[dim] - start - length;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.pad_with_precomputed_f64(incoming, &padding, contrib)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -17882,37 +17889,42 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Softmax { input, dim } => {
-                    // grad_input_i = s_i * (grad_i - sum_dim_j(grad_j * s_j)), s = softmax output.
-                    // Compose from cg primitives so the gradient node depends on the output
-                    // `node_id` (hence the input); double-backward through softmax is then
-                    // correct instead of silently zero. (A detached leaf dropped the curvature.)
-                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let reduce_size = shape[dim];
-                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
-                        &shape,
-                        dim,
-                        "softmax cg backward shape volume overflow",
-                    )?;
-                    let mut reduced_shape = shape.clone();
-                    reduced_shape[dim] = 1;
-                    // dot = sum over `dim` of (grad ⊙ s), kept-dim, then broadcast back so the
-                    // elementwise cg_sub / cg_mul stay shape-aligned.
-                    let sg = self.cg_mul(node_id, incoming_id)?;
-                    let dot = self.cg_sum_to_shape(sg, &reduced_shape)?;
-                    let dot_vals = self.nodes[dot.0].tensor.contiguous_values_as_f64()?;
-                    let mut dot_full = vec![0.0; input_numel];
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let d = dot_vals[outer * inner_size + inner];
-                            for r in 0..reduce_size {
-                                dot_full
-                                    [outer * reduce_size * inner_size + r * inner_size + inner] = d;
-                            }
+                    // Work in the tape's f64 gradient space, retaining the edge to
+                    // the saved output even when the forward tensor is f32.
+                    let output = self.cg_to_f64(node_id)?;
+                    let sg = self.cg_mul(output, incoming_id)?;
+                    let dot = self.cg_sum_broadcast_along_dim(sg, dim)?;
+                    let diff = self.cg_sub(incoming_id, dot)?;
+                    let regular = self.cg_mul(output, diff)?;
+                    let s_dot = self.cg_mul(output, dot)?;
+                    let grad_in = if let Some((dominant, split_lane)) = self
+                        .cg_normalize_tail_masks(
+                            output,
+                            incoming_id,
+                            regular,
+                            (sg, s_dot),
+                            dim,
+                            NormalizeOp::Softmax,
+                        )? {
+                        // C replaces the dominant entry by minus the tail sum.
+                        // Its adjoint centers a second-pass direction BEFORE it
+                        // meets small probabilities, preserving tiny curvature.
+                        let factored = self.cg_conserve_along_dim(regular, dominant, dim)?;
+                        if let Some(split_lane) = split_lane {
+                            // Large signed tail gradients can swallow the small
+                            // dominant residual. Reduce the two terms separately
+                            // in those lanes; keep factor-before-multiply where
+                            // it better preserves small upstream residuals.
+                            let first = self.cg_conserve_along_dim(sg, dominant, dim)?;
+                            let second = self.cg_conserve_along_dim(s_dot, dominant, dim)?;
+                            let split = self.cg_sub(first, second)?;
+                            self.cg_where(split_lane, split, factored)?
+                        } else {
+                            factored
                         }
-                    }
-                    let dot_node = self.cg_expand(dot, dot_full, shape.clone())?;
-                    let diff = self.cg_sub(incoming_id, dot_node)?;
-                    let grad_in = self.cg_mul(node_id, diff)?;
+                    } else {
+                        regular
+                    };
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -17922,34 +17934,28 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::LogSoftmax { input, dim } => {
-                    // grad_input_i = grad_i - exp(out_i) * sum_dim_j(grad_j).
-                    // Compose from cg primitives: exp(out) = softmax depends on the input, so
-                    // double-backward is correct rather than silently zero.
-                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let reduce_size = shape[dim];
-                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
-                        &shape,
+                    let output = self.cg_to_f64(node_id)?;
+                    let gsum = self.cg_sum_broadcast_along_dim(incoming_id, dim)?;
+                    let exp_out = self.cg_exp(output)?;
+                    let term = self.cg_mul(exp_out, gsum)?;
+                    let regular = self.cg_sub(incoming_id, term)?;
+                    let grad_in = if let Some((dominant, _)) = self.cg_normalize_tail_masks(
+                        output,
+                        incoming_id,
+                        regular,
+                        (incoming_id, term),
                         dim,
-                        "log_softmax cg backward shape volume overflow",
-                    )?;
-                    let mut reduced_shape = shape.clone();
-                    reduced_shape[dim] = 1;
-                    let gsum = self.cg_sum_to_shape(incoming_id, &reduced_shape)?;
-                    let gsum_vals = self.nodes[gsum.0].tensor.contiguous_values_as_f64()?;
-                    let mut gsum_full = vec![0.0; input_numel];
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let v = gsum_vals[outer * inner_size + inner];
-                            for r in 0..reduce_size {
-                                gsum_full
-                                    [outer * reduce_size * inner_size + r * inner_size + inner] = v;
-                            }
-                        }
-                    }
-                    let gsum_node = self.cg_expand(gsum, gsum_full, shape.clone())?;
-                    let exp_out = self.cg_exp(node_id)?;
-                    let term = self.cg_mul(exp_out, gsum_node)?;
-                    let grad_in = self.cg_sub(incoming_id, term)?;
+                        NormalizeOp::LogSoftmax,
+                    )? {
+                        // C(g) - C(exp(out)*sum(g)), not C(g - exp(out)*sum(g)):
+                        // signed upstream tails such as [1, -1] must be reduced
+                        // separately from the tiny probability correction.
+                        let first = self.cg_conserve_along_dim(incoming_id, dominant, dim)?;
+                        let second = self.cg_conserve_along_dim(term, dominant, dim)?;
+                        self.cg_sub(first, second)?
+                    } else {
+                        regular
+                    };
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -17989,18 +17995,9 @@ impl TensorTape {
                             }
                         }
                     }
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
                     let zeros = self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
-                    let grad_in = self.scatter_add(
-                        zeros,
-                        incoming_id,
-                        dim,
-                        &index_full,
-                        output_shape,
-                        &incoming_vals,
-                    )?;
+                    let grad_in =
+                        self.cg_scatter_add(zeros, incoming_id, dim, &index_full, output_shape)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18024,20 +18021,9 @@ impl TensorTape {
                         input_shape,
                         "gather cg backward input shape overflow",
                     )?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let index_values = index.clone();
-                    let index_shape = index_shape.clone();
                     let zeros = self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
-                    let grad_in = self.scatter_add(
-                        zeros,
-                        incoming_id,
-                        dim,
-                        &index_values,
-                        index_shape,
-                        &incoming_vals,
-                    )?;
+                    let grad_in =
+                        self.cg_scatter_add(zeros, incoming_id, dim, index, index_shape.clone())?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18054,87 +18040,56 @@ impl TensorTape {
                     ref index_shape,
                     ref input_shape,
                 } => {
-                    // create_graph backward for scatter:
-                    //   grad_input: incoming with overwritten positions zeroed
-                    //   grad_src: gather(incoming, dim, index), mask non-last-writers to 0
+                    // Both adjoints must remain connected to the incoming gradient.
+                    // Scatter overwrites the base and keeps only the last source
+                    // writer at duplicate indices, matching ordinary backward.
                     let input_numel =
                         Self::checked_shape_numel(input_shape, "scatter cg backward overflow")?;
-                    let index_numel =
-                        Self::checked_shape_numel(index_shape, "scatter cg backward idx overflow")?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-
-                    let dim_size = input_shape[dim];
-                    let idx_dim_size = index_shape[dim];
-                    let (outer_size, inner_size, _) = Self::checked_dim_loop_sizes(
+                    let (outer_size, inner_size, index_numel) = Self::checked_dim_loop_sizes(
                         index_shape,
                         dim,
                         "scatter cg backward loop sizes overflow",
                     )?;
-
-                    // Track which output positions were overwritten and by which src slot last
+                    // Gather validates the saved indices before the indexing loop.
+                    let gathered = self.cg_gather(incoming_id, dim, index, index_shape.clone())?;
+                    let dim_size = input_shape[dim];
+                    let idx_dim_size = index_shape[dim];
                     let mut last_writer_for_output: Vec<Option<usize>> = vec![None; input_numel];
-                    let mut active_src_slots = vec![true; index_numel];
-
+                    let mut active_src_slots = vec![1.0; index_numel];
                     for outer in 0..outer_size {
                         for r in 0..idx_dim_size {
                             for inner in 0..inner_size {
                                 let idx_pos =
                                     outer * idx_dim_size * inner_size + r * inner_size + inner;
                                 let selected = index[idx_pos] as usize;
-                                if selected >= dim_size {
-                                    return Err(AutogradError::Dispatch(
-                                        DispatchKeyError::IncompatibleSet {
-                                            reason: "scatter cg backward: out-of-bounds index",
-                                        }
-                                        .into(),
-                                    ));
-                                }
                                 let orig_pos =
                                     outer * dim_size * inner_size + selected * inner_size + inner;
                                 if let Some(prev_slot) = last_writer_for_output[orig_pos] {
-                                    active_src_slots[prev_slot] = false;
+                                    active_src_slots[prev_slot] = 0.0;
                                 }
                                 last_writer_for_output[orig_pos] = Some(idx_pos);
                             }
                         }
                     }
 
-                    // grad_input: zero out overwritten positions
-                    let mut grad_input_vals = incoming_vals.clone();
-                    for (pos, last_writer) in last_writer_for_output.iter().enumerate() {
-                        if last_writer.is_some() {
-                            grad_input_vals[pos] = 0.0;
-                        }
-                    }
-                    let grad_input = self.leaf(grad_input_vals, input_shape.clone(), true)?;
+                    // Select rather than multiply by masks: an overwritten NaN/Inf
+                    // gradient is zero, not NaN from 0 * incoming.
+                    let overwritten: Vec<f64> = last_writer_for_output
+                        .iter()
+                        .map(|writer| if writer.is_some() { 1.0 } else { 0.0 })
+                        .collect();
+                    let overwritten = self.leaf(overwritten, input_shape.clone(), false)?;
+                    let input_zero =
+                        self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
+                    let grad_input = self.cg_where(overwritten, input_zero, incoming_id)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_input)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
-                    // grad_src: gather(incoming, dim, index), then mask non-last-writers
-                    let device = self.nodes[input.0].tensor.meta().device();
-                    let incoming_meta =
-                        ft_core::TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
-                    let idx_meta =
-                        ft_core::TensorMeta::from_shape(index_shape.clone(), DType::F64, device);
-                    let mut src_grad = gather_tensor_contiguous_f64(
-                        &incoming_vals,
-                        &incoming_meta,
-                        dim,
-                        index,
-                        &idx_meta,
-                    )
-                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
-                    for (slot, &active) in active_src_slots.iter().enumerate() {
-                        if !active {
-                            src_grad[slot] = 0.0;
-                        }
-                    }
-                    let grad_src = self.leaf(src_grad, index_shape.clone(), true)?;
+                    let active = self.leaf(active_src_slots, index_shape.clone(), false)?;
+                    let src_zero = self.leaf(vec![0.0; index_numel], index_shape.clone(), false)?;
+                    let grad_src = self.cg_where(active, gathered, src_zero)?;
                     self.cg_accumulate(src, &mut grad_nodes, grad_src)?;
                     Self::complete_dependency(&mut pending, src, &mut queue)?;
-
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
@@ -18147,45 +18102,17 @@ impl TensorTape {
                     dim,
                     ref index,
                     ref index_shape,
-                    ref input_shape,
+                    ..
                 } => {
-                    // create_graph backward for scatter_add:
-                    //   grad_input: passthrough (additions don't change input contribution)
-                    //   grad_src: gather(incoming, dim, index)
-                    let _ =
-                        Self::checked_shape_numel(input_shape, "scatter_add cg backward overflow")?;
-                    let index_numel = Self::checked_shape_numel(
-                        index_shape,
-                        "scatter_add cg backward idx overflow",
-                    )?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-
-                    // grad_input: passthrough
-                    let grad_input = self.leaf(incoming_vals.clone(), input_shape.clone(), true)?;
-                    self.cg_accumulate(input, &mut grad_nodes, grad_input)?;
+                    // The base adjoint is the incoming node itself. Gathering it
+                    // for the source records the exact transpose of scatter-add,
+                    // including repeated indices and nonlinear upstream gradients.
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    self.cg_accumulate(input, &mut grad_nodes, incoming)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
-
-                    // grad_src: gather(incoming, dim, index)
-                    let device = self.nodes[input.0].tensor.meta().device();
-                    let incoming_meta =
-                        ft_core::TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
-                    let idx_meta =
-                        ft_core::TensorMeta::from_shape(index_shape.clone(), DType::F64, device);
-                    let src_grad = gather_tensor_contiguous_f64(
-                        &incoming_vals,
-                        &incoming_meta,
-                        dim,
-                        index,
-                        &idx_meta,
-                    )
-                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
-                    let _ = index_numel; // silence unused warning
-                    let grad_src = self.leaf(src_grad, index_shape.clone(), true)?;
+                    let grad_src = self.cg_gather(incoming, dim, index, index_shape.clone())?;
                     self.cg_accumulate(src, &mut grad_nodes, grad_src)?;
                     Self::complete_dependency(&mut pending, src, &mut queue)?;
-
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
@@ -18198,15 +18125,15 @@ impl TensorTape {
                     // At x == 0 (or -0.0) and NaN, use the slope branch.
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
+                    // The slope is locally constant, but the incoming gradient
+                    // may depend on x through a nonlinear downstream loss.
+                    let slopes: Vec<f64> = input_vals
                         .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| g * if *x > 0.0 { 1.0 } else { 0.01 })
+                        .map(|x| if *x > 0.0 { 1.0 } else { 0.01 })
                         .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    let slopes = self.leaf(slopes, input_shape, false)?;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.cg_mul(incoming, slopes)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18305,21 +18232,19 @@ impl TensorTape {
                     // d(hardsigmoid(x))/dx = 0 if x <= -3 or x >= 3, else 1/6
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
+                    let slopes: Vec<f64> = input_vals
                         .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| {
-                            g * if *x <= -3.0 || *x >= 3.0 {
+                        .map(|x| {
+                            if *x <= -3.0 || *x >= 3.0 {
                                 0.0
                             } else {
                                 1.0 / 6.0
                             }
                         })
                         .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    let slopes = self.leaf(slopes, input_shape, false)?;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.cg_mul(incoming, slopes)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18332,15 +18257,13 @@ impl TensorTape {
                     // d(hardtanh(x))/dx = 0 if x <= -1 or x >= 1, else 1
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
+                    let slopes: Vec<f64> = input_vals
                         .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| g * if *x <= -1.0 || *x >= 1.0 { 0.0 } else { 1.0 })
+                        .map(|x| if *x <= -1.0 || *x >= 1.0 { 0.0 } else { 1.0 })
                         .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    let slopes = self.leaf(slopes, input_shape, false)?;
+                    let incoming = self.cg_to_f64(incoming_id)?;
+                    let grad_in = self.cg_mul(incoming, slopes)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18403,14 +18326,11 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Where { condition, x, y } => {
-                    // where(c, x, y) gates x where c != 0 and y otherwise. The
-                    // selection mask is a constant (condition carries no
-                    // gradient), so the gradient is a pure elementwise gate:
-                    // d/dx = grad * mask, d/dy = grad * (1 - mask). Building both
-                    // via cg_mul against constant mask leaves keeps the gradient
-                    // nodes dependent on `incoming_id`, so double-backward routes
-                    // back through the gate instead of collapsing to a detached
-                    // leaf (which would make second-order grads silently zero).
+                    // Capture the non-differentiable predicate, while retaining
+                    // both adjoints' dependence on the incoming gradient. Use
+                    // selection at every order: multiplication by a zero mask
+                    // would turn an unselected Inf/NaN into NaN, unlike ordinary
+                    // backward and the forward selection itself.
                     let cond_vals = self.nodes[condition.0]
                         .tensor
                         .contiguous_values_as_f64()
@@ -18420,11 +18340,18 @@ impl TensorTape {
                         .iter()
                         .map(|&c| if c != 0.0 { 1.0 } else { 0.0 })
                         .collect();
-                    let inv_mask: Vec<f64> = mask.iter().map(|&m| 1.0 - m).collect();
-                    let mask_leaf = self.leaf(mask, shape.clone(), false)?;
-                    let inv_mask_leaf = self.leaf(inv_mask, shape, false)?;
-                    let grad_x = self.cg_mul(incoming_id, mask_leaf)?;
-                    let grad_y = self.cg_mul(incoming_id, inv_mask_leaf)?;
+                    let zero_meta = TensorMeta::from_shape(
+                        shape.clone(),
+                        DType::F64,
+                        self.nodes[incoming_id.0].tensor.meta().device(),
+                    );
+                    let zeros = self.leaf_tensor(
+                        DenseTensor::from_storage(zero_meta, vec![0.0; mask.len()])?,
+                        false,
+                    );
+                    let mask_leaf = self.leaf(mask, shape, false)?;
+                    let grad_x = self.cg_where(mask_leaf, incoming_id, zeros)?;
+                    let grad_y = self.cg_where(mask_leaf, zeros, incoming_id)?;
                     self.cg_accumulate(x, &mut grad_nodes, grad_x)?;
                     self.cg_accumulate(y, &mut grad_nodes, grad_y)?;
                     Self::complete_dependency(&mut pending, x, &mut queue)?;
@@ -18531,18 +18458,13 @@ impl TensorTape {
                     let input_numel =
                         Self::checked_shape_numel(input_shape, "sort cg backward shape overflow")?;
                     let index_f64: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()
-                        .map_err(AutogradError::DenseTensor)?;
                     let zeros = self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
-                    let grad_in = self.scatter_add(
+                    let grad_in = self.cg_scatter_add(
                         zeros,
                         incoming_id,
                         dim,
                         &index_f64,
                         input_shape.clone(),
-                        &incoming_vals,
                     )?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -18568,19 +18490,9 @@ impl TensorTape {
                     let mut output_shape = input_shape.clone();
                     output_shape[dim] = k;
                     let index_f64: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()
-                        .map_err(AutogradError::DenseTensor)?;
                     let zeros = self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
-                    let grad_in = self.scatter_add(
-                        zeros,
-                        incoming_id,
-                        dim,
-                        &index_f64,
-                        output_shape,
-                        &incoming_vals,
-                    )?;
+                    let grad_in =
+                        self.cg_scatter_add(zeros, incoming_id, dim, &index_f64, output_shape)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -19097,6 +19009,316 @@ impl TensorTape {
         })
     }
 
+    /// Record the gather/scatter-add adjoint pair in f64 gradient space.
+    /// These helpers retain graph edges even when forward grad recording is off.
+    fn cg_gather(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: &[f64],
+        index_shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let node = self.node(input)?;
+        let input_shape = node.tensor.meta().shape().to_vec();
+        let device = node.tensor.meta().device();
+        let input_meta = TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
+        let index_meta = TensorMeta::from_shape(index_shape.clone(), DType::F64, device);
+        let values = gather_tensor_contiguous_f64(
+            &node.tensor.contiguous_values_as_f64()?,
+            &input_meta,
+            dim,
+            index,
+            &index_meta,
+        )
+        .map_err(|error| AutogradError::Dispatch(error.into()))?;
+        let requires_grad = node.requires_grad;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(index_meta, values)?,
+            requires_grad,
+            op: TensorNodeOp::Gather {
+                input,
+                dim,
+                index: index.to_vec(),
+                index_shape,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    fn cg_scatter_add(
+        &mut self,
+        input: TensorNodeId,
+        src: TensorNodeId,
+        dim: usize,
+        index: &[f64],
+        index_shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_node = self.node(input)?;
+        let src_node = self.node(src)?;
+        let input_shape = input_node.tensor.meta().shape().to_vec();
+        let device = input_node.tensor.meta().device();
+        let input_meta = TensorMeta::from_shape(input_shape.clone(), DType::F64, device);
+        let index_meta = TensorMeta::from_shape(index_shape.clone(), DType::F64, device);
+        let values = scatter_add_tensor_contiguous_f64(
+            &input_node.tensor.contiguous_values_as_f64()?,
+            &input_meta,
+            dim,
+            index,
+            &index_meta,
+            &src_node.tensor.contiguous_values_as_f64()?,
+        )
+        .map_err(|error| AutogradError::Dispatch(error.into()))?;
+        let requires_grad = input_node.requires_grad || src_node.requires_grad;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(input_meta, values)?,
+            requires_grad,
+            op: TensorNodeOp::ScatterAdd {
+                input,
+                src,
+                dim,
+                index: index.to_vec(),
+                index_shape,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Widen a saved forward tensor into the f64 gradient space without
+    /// detaching it. Unlike a public cast, a backward helper must record its
+    /// dependency even if forward grad recording is currently disabled.
+    fn cg_to_f64(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let node = self.node(input)?;
+        let meta = node.tensor.meta();
+        if meta.dtype() == DType::F64 {
+            return Ok(input);
+        }
+        if !matches!(meta.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()).into());
+        }
+        let tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+            node.tensor.contiguous_values_as_f64()?,
+        )?;
+        let requires_grad = node.requires_grad;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor,
+            requires_grad,
+            op: TensorNodeOp::CastF64 { input },
+        });
+        Ok(out)
+    }
+
+    /// A real selection node, rather than multiplication by a zero/one mask:
+    /// zero times an unselected infinity or NaN would change IEEE semantics.
+    fn cg_where(
+        &mut self,
+        condition: TensorNodeId,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let condition_node = self.node(condition)?;
+        let x_node = self.node(x)?;
+        let y_node = self.node(y)?;
+        let shape = x_node.tensor.meta().shape();
+        if condition_node.tensor.meta().shape() != shape || y_node.tensor.meta().shape() != shape {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "create_graph: shape mismatch in gradient selection",
+                }
+                .into(),
+            ));
+        }
+        let meta =
+            TensorMeta::from_shape(shape.to_vec(), DType::F64, x_node.tensor.meta().device());
+        let values = where_tensor_contiguous_f64(
+            &condition_node.tensor.contiguous_values_as_f64()?,
+            &x_node.tensor.contiguous_values_as_f64()?,
+            &y_node.tensor.contiguous_values_as_f64()?,
+            &meta,
+        )
+        .map_err(|error| AutogradError::Dispatch(error.into()))?;
+        let requires_grad = x_node.requires_grad || y_node.requires_grad;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, values)?,
+            requires_grad,
+            op: TensorNodeOp::Where { condition, x, y },
+        });
+        Ok(out)
+    }
+
+    /// Reduce one dimension and broadcast it back, recording both operations.
+    fn cg_sum_broadcast_along_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.node(input)?.tensor.meta().shape().to_vec();
+        let (outer_size, inner_size, numel) = Self::checked_dim_loop_sizes(
+            &shape,
+            dim,
+            "normalize cg backward shape volume overflow",
+        )?;
+        let reduce_size = shape[dim];
+        let mut reduced_shape = shape.clone();
+        reduced_shape[dim] = 1;
+        let sum = self.cg_sum_to_shape(input, &reduced_shape)?;
+        let values = self.nodes[sum.0].tensor.contiguous_values_as_f64()?;
+        let mut expanded = vec![0.0; numel];
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let value = values[outer * inner_size + inner];
+                for r in 0..reduce_size {
+                    expanded[outer * reduce_size * inner_size + r * inner_size + inner] = value;
+                }
+            }
+        }
+        self.cg_expand(sum, expanded, shape)
+    }
+
+    /// For a lane with dominant index r, C(z)_r = -sum_{j != r}(z_j),
+    /// C(z)_j = z_j otherwise. Normalization gradients sum to zero, so C
+    /// preserves their exact value. Crucially, C^T v = v - v_r: the graph
+    /// centers a second-backward direction before multiplying by tiny tails.
+    /// All numerical terms remain differentiable; only the selector is fixed.
+    fn cg_conserve_along_dim(
+        &mut self,
+        input: TensorNodeId,
+        dominant: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let meta = self.node(input)?.tensor.meta();
+        let zeros = DenseTensor::from_storage(
+            TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+            vec![0.0; meta.numel()],
+        )?;
+        let zero = self.leaf_tensor(zeros, false);
+        let tail = self.cg_where(dominant, zero, input)?;
+        let tail_sum = self.cg_sum_broadcast_along_dim(tail, dim)?;
+        let negative_tail = self.cg_neg(tail_sum)?;
+        self.cg_where(dominant, negative_tail, input)
+    }
+
+    /// Choose algebraically equivalent graphs per lane, never detached
+    /// numerical corrections. Leave nonfinite lanes on the original formula.
+    /// For softmax, compare cancellation in the factored tail gradients with
+    /// cancellation in separately reduced products. Select the WHOLE lane:
+    /// mixing only the dominant entry would lose C's centering adjoint.
+    fn cg_normalize_tail_masks(
+        &mut self,
+        output: TensorNodeId,
+        incoming: TensorNodeId,
+        regular: TensorNodeId,
+        terms: (TensorNodeId, TensorNodeId),
+        dim: usize,
+        op: NormalizeOp,
+    ) -> Result<Option<(TensorNodeId, Option<TensorNodeId>)>, AutogradError> {
+        let output_node = self.node(output)?;
+        let meta = output_node.tensor.meta();
+        let shape = meta.shape().to_vec();
+        let device = meta.device();
+        let (outer_size, inner_size, numel) =
+            Self::checked_dim_loop_sizes(&shape, dim, "normalize cg tail shape volume overflow")?;
+        let reduce_size = shape[dim];
+        if reduce_size <= 1 {
+            // No tail cancellation is possible; preserve legacy signed zeros.
+            return Ok(None);
+        }
+        let output_values = output_node.tensor.contiguous_values_as_f64()?;
+        let incoming_values = self.node(incoming)?.tensor.contiguous_values_as_f64()?;
+        let regular_values = self.node(regular)?.tensor.contiguous_values_as_f64()?;
+        let left_values = self.node(terms.0)?.tensor.contiguous_values_as_f64()?;
+        let right_values = self.node(terms.1)?.tensor.contiguous_values_as_f64()?;
+        for (id, values) in [
+            (output, &output_values),
+            (incoming, &incoming_values),
+            (regular, &regular_values),
+            (terms.0, &left_values),
+            (terms.1, &right_values),
+        ] {
+            Self::ensure_tensor_len(id, numel, values.len())?;
+        }
+        let log = matches!(op, NormalizeOp::LogSoftmax);
+        let threshold = if log { -std::f64::consts::LN_2 } else { 0.5 };
+        let mut dominant_mask = vec![0.0; numel];
+        let mut split_mask = vec![0.0; numel];
+        let mut any_dominant = false;
+        let mut any_split = false;
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let base = outer * reduce_size * inner_size + inner;
+                let mut dominant = None;
+                let mut finite = true;
+                for r in 0..reduce_size {
+                    let idx = base + r * inner_size;
+                    let value = output_values[idx];
+                    // A masked -inf logit has log probability -inf and p=0.
+                    // It is legitimate, unlike NaN/+inf normalization outputs.
+                    finite &= (value.is_finite() || (log && value == f64::NEG_INFINITY))
+                        && incoming_values[idx].is_finite()
+                        && regular_values[idx].is_finite()
+                        && left_values[idx].is_finite()
+                        && right_values[idx].is_finite();
+                    if value > threshold && dominant.replace(idx).is_some() {
+                        // Require a unique dominant even for rounded half
+                        // precision outputs or malformed saved tensors.
+                        finite = false;
+                    }
+                }
+                let Some(dominant) = dominant.filter(|_| finite) else {
+                    continue;
+                };
+                let (mut left_tail, mut right_tail, mut regular_tail, mut factored_cost) =
+                    (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                for r in 0..reduce_size {
+                    let idx = base + r * inner_size;
+                    if idx != dominant {
+                        left_tail += left_values[idx];
+                        right_tail += right_values[idx];
+                        regular_tail += regular_values[idx];
+                        factored_cost += regular_values[idx].abs();
+                    }
+                }
+                let separated_cost = left_tail.abs() + right_tail.abs();
+                if !left_tail.is_finite()
+                    || !right_tail.is_finite()
+                    || !regular_tail.is_finite()
+                    || !factored_cost.is_finite()
+                    || !separated_cost.is_finite()
+                    || !(right_tail - left_tail).is_finite()
+                {
+                    continue;
+                }
+                dominant_mask[dominant] = 1.0;
+                any_dominant = true;
+                if !log && separated_cost < factored_cost {
+                    for r in 0..reduce_size {
+                        split_mask[base + r * inner_size] = 1.0;
+                    }
+                    any_split = true;
+                }
+            }
+        }
+        if !any_dominant {
+            return Ok(None);
+        }
+        let meta = TensorMeta::from_shape(shape, DType::F64, device);
+        let dominant = self.leaf_tensor(
+            DenseTensor::from_storage(meta.clone(), dominant_mask)?,
+            false,
+        );
+        let split = if any_split {
+            Some(self.leaf_tensor(DenseTensor::from_storage(meta, split_mask)?, false))
+        } else {
+            None
+        };
+        Ok(Some((dominant, split)))
+    }
     /// Helper: accumulate a gradient node contribution for create_graph.
     fn cg_accumulate(
         &mut self,
@@ -32598,6 +32820,1215 @@ mod tests {
         assert!(gx[2] < 0.0);
     }
 
+    fn check_softmax_family_create_graph_collapse(f32_leaf: bool) {
+        // Decimal, 220 decimal digits, rounded once to f64. All input logits
+        // and weights are exactly representable in both tested dtypes.
+        let (margin, expected) = if f32_leaf {
+            (
+                9.0,
+                [
+                    [
+                        -3.045995763380708e-8,
+                        1.522997881690354e-8,
+                        1.522997881690354e-8,
+                    ],
+                    [
+                        -3.045995856161615e-8,
+                        1.5229979280808076e-8,
+                        1.5229979280808076e-8,
+                    ],
+                ],
+            )
+        } else {
+            (
+                20.0,
+                [[
+                    -8.496708510583178e-18,
+                    4.248354255291589e-18,
+                    4.248354255291589e-18,
+                ]; 2],
+            )
+        };
+        for (log, want) in [false, true].into_iter().zip(expected) {
+            for create_graph in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(
+                        vec![margin as f32, -margin as f32, -margin as f32],
+                        vec![3],
+                        true,
+                    )
+                } else {
+                    tape.leaf(vec![margin, -margin, -margin], vec![3], true)
+                }
+                .expect("logits");
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .expect("softmax family forward");
+                let weight = tape.leaf(vec![-1.0, 0.0, 0.0], vec![3], false).unwrap();
+                let (weighted, _) = tape.mul(y, weight, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let report = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .expect("backward must support both f32 and f64 logits");
+                let grad = report.gradient(x).unwrap();
+                let relative_tolerance = if f32_leaf { 2e-6 } else { 2e-14 };
+                for (i, (&got, reference)) in grad.iter().zip(want).enumerate() {
+                    assert!(
+                        (got - reference).abs() <= relative_tolerance * reference.abs(),
+                        "f32={f32_leaf}, log={log}, create_graph={create_graph}, gradient[{i}]={got:e}, reference={reference:e}"
+                    );
+                }
+                if create_graph {
+                    let grad_node = report.gradient_node(x).expect("differentiable gradient");
+                    assert_eq!(tape.tensor(grad_node).unwrap().meta().dtype(), DType::F64);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_collapse_f64() {
+        check_softmax_family_create_graph_collapse(false);
+    }
+
+    #[test]
+    fn create_graph_softmax_family_collapse_f32() {
+        check_softmax_family_create_graph_collapse(true);
+    }
+
+    struct SoftmaxCgReference {
+        logits: [f64; 3],
+        upstream: [f64; 3],
+        direction: [f64; 3],
+        // Index 0 is softmax, index 1 is log_softmax.
+        gradient: [[f64; 3]; 2],
+        hessian_vector: [[f64; 3]; 2],
+        upstream_derivative: [[f64; 3]; 2],
+    }
+
+    fn softmax_cg_references(f32_leaf: bool) -> [SoftmaxCgReference; 4] {
+        // Independent references generated using Python Decimal at precision 220:
+        // p_i = exp(x_i) / sum(exp(x)); A = sum(p*g); B = sum(p*v);
+        // q_i = p_i*(v_i-B), C = sum(g*q), G = sum(g).
+        // Softmax: grad_i=p_i*(g_i-A), Hv_i=q_i*(g_i-A)-p_i*C, d_g=q.
+        // Log-softmax: grad_i=g_i-p_i*G, Hv_i=-G*q_i, d_g_i=v_i-B.
+        // Only the final answers are rounded to f64, including the tiny dominant
+        // entries. Inputs/weights/directions are dyadic and exactly representable
+        // in both f32 and f64, so there is no hidden input-rounding discrepancy.
+        let collapse = if f32_leaf {
+            SoftmaxCgReference {
+                logits: [9.0, -9.0, -9.0],
+                upstream: [-1.0, 0.0, 0.0],
+                // This direction makes one tail curvature O(exp(-2*margin)).
+                // Keeping only the leading-order Hessian would silently zero it.
+                direction: [1.0, 1.0, 0.0],
+                gradient: [
+                    [
+                        -3.045995763380708e-8,
+                        1.522997881690354e-8,
+                        1.522997881690354e-8,
+                    ],
+                    [
+                        -3.045995856161615e-8,
+                        1.5229979280808076e-8,
+                        1.5229979280808076e-8,
+                    ],
+                ],
+                hessian_vector: [
+                    [
+                        1.522997788909449e-8,
+                        4.639045236571736e-16,
+                        -1.5229978352999016e-8,
+                    ],
+                    [
+                        1.522997881690354e-8,
+                        2.319522688938433e-16,
+                        -1.5229979048855806e-8,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        1.522997881690354e-8,
+                        2.319522688938433e-16,
+                        -1.5229979048855806e-8,
+                    ],
+                    [
+                        1.5229979280808076e-8,
+                        1.5229979280808076e-8,
+                        -0.9999999847700207,
+                    ],
+                ],
+            }
+        } else {
+            SoftmaxCgReference {
+                logits: [20.0, -20.0, -20.0],
+                upstream: [-1.0, 0.0, 0.0],
+                direction: [1.0, 1.0, 0.0],
+                gradient: [[
+                    -8.496708510583178e-18,
+                    4.248354255291589e-18,
+                    4.248354255291589e-18,
+                ]; 2],
+                hessian_vector: [
+                    [
+                        4.248354255291589e-18,
+                        3.60970277569083e-35,
+                        -4.248354255291589e-18,
+                    ],
+                    [
+                        4.248354255291589e-18,
+                        1.804851387845415e-35,
+                        -4.248354255291589e-18,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        4.248354255291589e-18,
+                        1.804851387845415e-35,
+                        -4.248354255291589e-18,
+                    ],
+                    [4.248354255291589e-18, 4.248354255291589e-18, -1.0],
+                ],
+            }
+        };
+        let large_margin = if f32_leaf {
+            SoftmaxCgReference {
+                logits: [-40.0, 40.0, -39.0],
+                upstream: [-1.0, 0.5, 1.25],
+                direction: [-1.5, 0.25, 2.0],
+                gradient: [
+                    [
+                        -2.7072770817681225e-35,
+                        -9.722939662188377e-36,
+                        3.6795710479869604e-35,
+                    ],
+                    [-1.0, -0.25, 1.25],
+                ],
+                hessian_vector: [
+                    [
+                        4.737734893094215e-35,
+                        -1.1176984227071396e-34,
+                        6.43924933397718e-35,
+                    ],
+                    [
+                        2.3688674465471074e-35,
+                        4.0703818874300733e-35,
+                        -6.43924933397718e-35,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        -3.1584899287294766e-35,
+                        -5.427175849906764e-35,
+                        8.585665778636241e-35,
+                    ],
+                    [-1.75, -5.427175849906764e-35, 1.75],
+                ],
+            }
+        } else {
+            SoftmaxCgReference {
+                logits: [-100.0, 100.0, -99.0],
+                upstream: [-1.0, 0.5, 1.25],
+                direction: [-1.5, 0.25, 2.0],
+                gradient: [
+                    [
+                        -2.075844790105106e-87,
+                        -7.455207957169393e-88,
+                        2.8213655858220456e-87,
+                    ],
+                    [-1.0, -0.25, 1.25],
+                ],
+                hessian_vector: [
+                    [
+                        3.632728382683936e-87,
+                        -8.570118157872516e-87,
+                        4.93738977518858e-87,
+                    ],
+                    [
+                        1.816364191341968e-87,
+                        3.121025583846612e-87,
+                        -4.93738977518858e-87,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        -2.421818921789291e-87,
+                        -4.161367445128816e-87,
+                        6.5831863669181065e-87,
+                    ],
+                    [-1.75, -4.161367445128816e-87, 1.75],
+                ],
+            }
+        };
+        [
+            collapse,
+            SoftmaxCgReference {
+                logits: [4.0, 4.0, -1.0],
+                upstream: [2.0, -3.0, 0.25],
+                direction: [1.25, 0.5, -1.0],
+                gradient: [
+                    [1.2445480275662826, -1.247057818367461, 0.002509790801178395],
+                    [2.3737408768900616, -2.6262591231099384, 0.25251824621987695],
+                ],
+                hessian_vector: [
+                    [
+                        0.011278257927308404,
+                        -0.0034667630296146665,
+                        -0.007811494897693737,
+                    ],
+                    [
+                        0.1425057577098778,
+                        -0.13779989995766834,
+                        -0.004705857752209491,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        0.19000767694650375,
+                        -0.18373319994355777,
+                        -0.006274477002945987,
+                    ],
+                    [0.3812956155496924, -0.3687043844503076, -1.8687043844503075],
+                ],
+            },
+            SoftmaxCgReference {
+                logits: [3.25, -1.5, 0.125],
+                upstream: [-0.75, 2.0, 0.5],
+                direction: [-0.25, 1.5, 0.75],
+                gradient: [
+                    [
+                        -0.07104457676687137,
+                        0.021988819975055276,
+                        0.0490557567918161,
+                    ],
+                    [-2.412567837115034, 1.9856159698187692, 0.4269518672962647],
+                ],
+                hessian_vector: [
+                    [
+                        -0.0791753402707056,
+                        0.03652679541269476,
+                        0.04264854485801084,
+                    ],
+                    [
+                        0.0933129836585726,
+                        -0.02436473732404613,
+                        -0.06894824633452648,
+                    ],
+                ],
+                upstream_derivative: [
+                    [
+                        -0.053321704947755774,
+                        0.013922707042312075,
+                        0.0393989979054437,
+                    ],
+                    [-0.056125820297650945, 1.693874179702349, 0.9438741797023491],
+                ],
+            },
+            large_margin,
+        ]
+    }
+
+    fn pack_softmax_reference_lanes(
+        references: &[SoftmaxCgReference],
+        shape: &[usize],
+        dim: usize,
+        select: impl Fn(&SoftmaxCgReference) -> [f64; 3],
+    ) -> Vec<f64> {
+        assert_eq!(shape[dim], 3);
+        let inner: usize = shape[dim + 1..].iter().product();
+        let numel: usize = shape.iter().product();
+        assert_eq!(numel, 3 * references.len());
+        let mut values = vec![0.0; numel];
+        for (lane, reference) in references.iter().enumerate() {
+            for (class, value) in select(reference).into_iter().enumerate() {
+                values[(lane / inner * 3 + class) * inner + lane % inner] = value;
+            }
+        }
+        values
+    }
+
+    fn assert_softmax_relative(label: &str, actual: &[f64], expected: &[f64], relative: f64) {
+        assert_eq!(actual.len(), expected.len(), "{label}: gradient length");
+        for (i, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+            // No absolute tolerance floor: a collapsed zero must fail even for
+            // the ~1e-87 f64 tails and the ~1e-35 f32 tails.
+            assert!(
+                (got - want).abs() <= relative * want.abs(),
+                "{label}[{i}]={got:e}, high-precision reference={want:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_high_precision_hvps_all_dimensions() {
+        for f32_leaf in [false, true] {
+            let references = softmax_cg_references(f32_leaf);
+            let relative = if f32_leaf { 1e-5 } else { 3e-13 };
+            for log in [false, true] {
+                let op_index = usize::from(log);
+                for (shape, dim) in [
+                    (vec![4, 3], 1),
+                    (vec![3, 4], 0),
+                    (vec![2, 3, 2], 1),
+                    (vec![2, 2, 3], 2),
+                ] {
+                    let pack = |select: fn(&SoftmaxCgReference) -> [f64; 3]| {
+                        pack_softmax_reference_lanes(&references, &shape, dim, select)
+                    };
+                    let logits = pack(|r| r.logits);
+                    let upstream = pack(|r| r.upstream);
+                    let direction = pack(|r| r.direction);
+                    let gradient = pack_softmax_reference_lanes(&references, &shape, dim, |r| {
+                        r.gradient[op_index]
+                    });
+                    let hvp = pack_softmax_reference_lanes(&references, &shape, dim, |r| {
+                        r.hessian_vector[op_index]
+                    });
+                    let upstream_derivative =
+                        pack_softmax_reference_lanes(&references, &shape, dim, |r| {
+                            r.upstream_derivative[op_index]
+                        });
+                    let mut tape = TensorTape::new();
+                    let (x, g) = if f32_leaf {
+                        (
+                            tape.leaf_f32(
+                                logits.iter().map(|&v| v as f32).collect(),
+                                shape.clone(),
+                                true,
+                            )
+                            .unwrap(),
+                            tape.leaf_f32(
+                                upstream.iter().map(|&v| v as f32).collect(),
+                                shape.clone(),
+                                true,
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        (
+                            tape.leaf(logits, shape.clone(), true).unwrap(),
+                            tape.leaf(upstream, shape.clone(), true).unwrap(),
+                        )
+                    };
+                    let (y, _) = if log {
+                        tape.log_softmax(x, dim, ExecutionMode::Strict)
+                    } else {
+                        tape.softmax(x, dim, ExecutionMode::Strict)
+                    }
+                    .unwrap();
+                    let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                    let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                    let ordinary = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions::strict_default().with_retain_graph(true),
+                        )
+                        .unwrap();
+                    let first = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions {
+                                create_graph: true,
+                                ..BackwardOptions::strict_default()
+                            },
+                        )
+                        .unwrap();
+                    let context = format!("f32={f32_leaf}, log={log}, shape={shape:?}, dim={dim}");
+                    assert_softmax_relative(
+                        &format!("ordinary {context}"),
+                        ordinary.gradient(x).unwrap(),
+                        &gradient,
+                        relative,
+                    );
+                    assert_softmax_relative(
+                        &format!("graph {context}"),
+                        first.gradient(x).unwrap(),
+                        &gradient,
+                        relative,
+                    );
+                    assert_softmax_relative(
+                        &format!("graph/ordinary {context}"),
+                        first.gradient(x).unwrap(),
+                        ordinary.gradient(x).unwrap(),
+                        relative,
+                    );
+                    let dx = first.gradient_node(x).expect("connected gradient node");
+                    assert_eq!(tape.tensor(dx).unwrap().meta().shape(), shape.as_slice());
+                    assert_eq!(tape.tensor(dx).unwrap().meta().dtype(), DType::F64);
+                    let v = tape.leaf(direction, shape, false).unwrap();
+                    let (dot_terms, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                    let (dot, _) = tape.sum(dot_terms, ExecutionMode::Strict).unwrap();
+                    for second_create_graph in [false, true] {
+                        let second = tape
+                            .backward_with_options(
+                                dot,
+                                BackwardOptions {
+                                    create_graph: second_create_graph,
+                                    retain_graph: true,
+                                    ..BackwardOptions::strict_default()
+                                },
+                            )
+                            .unwrap();
+                        assert_softmax_relative(
+                            &format!("HVP cg={second_create_graph} {context}"),
+                            second.gradient(x).expect("HVP reaches original logits"),
+                            &hvp,
+                            relative,
+                        );
+                        // The first backward must also retain the arbitrary upstream
+                        // graph. A detached numerical correction loses this derivative.
+                        assert_softmax_relative(
+                            &format!("upstream cg={second_create_graph} {context}"),
+                            second
+                                .gradient(g)
+                                .expect("mixed derivative reaches upstream"),
+                            &upstream_derivative,
+                            relative,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_nonlinear_upstream_high_precision() {
+        // L = op(x)[0]^2, so the upstream gradient itself depends on x.
+        // These 220-digit Decimal references include both Hessian terms;
+        // detaching the incoming derivative loses the J^T H_L J term.
+        for f32_leaf in [false, true] {
+            let (margin, gradients, hvps) = if f32_leaf {
+                (
+                    9.0,
+                    [
+                        [
+                            6.091991341199607e-8,
+                            -3.045995670599803e-8,
+                            -3.045995670599803e-8,
+                        ],
+                        [
+                            -1.8556181794117727e-15,
+                            9.278090897058864e-16,
+                            9.278090897058864e-16,
+                        ],
+                    ],
+                    [
+                        [
+                            -2.284496544192823e-8,
+                            6.091991236821092e-8,
+                            -3.8074946926282684e-8,
+                        ],
+                        [
+                            1.3917136027651748e-15,
+                            -2.2035465721546528e-15,
+                            8.11832969389478e-16,
+                        ],
+                    ],
+                )
+            } else {
+                (
+                    20.0,
+                    [
+                        [
+                            1.6993417021166355e-17,
+                            -8.496708510583178e-18,
+                            -8.496708510583178e-18,
+                        ],
+                        [
+                            -1.443881110276332e-34,
+                            7.21940555138166e-35,
+                            7.21940555138166e-35,
+                        ],
+                    ],
+                    [
+                        [
+                            -6.372531382937383e-18,
+                            1.6993417021166355e-17,
+                            -1.0620885638228972e-17,
+                        ],
+                        [
+                            1.082910832707249e-34,
+                            -1.7146088184531443e-34,
+                            6.316979857458953e-35,
+                        ],
+                    ],
+                )
+            };
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(
+                        vec![margin as f32, -margin as f32, -margin as f32],
+                        vec![3],
+                        true,
+                    )
+                } else {
+                    tape.leaf(vec![margin, -margin, -margin], vec![3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let (squared, _) = tape.square(y, ExecutionMode::Strict).unwrap();
+                let mask = tape.leaf(vec![1.0, 0.0, 0.0], vec![3], false).unwrap();
+                let (picked, _) = tape.mul(squared, mask, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(picked, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let relative = if f32_leaf { 3e-6 } else { 3e-13 };
+                let context = format!("nonlinear f32={f32_leaf}, log={log}");
+                assert_softmax_relative(
+                    &context,
+                    first.gradient(x).unwrap(),
+                    &gradients[usize::from(log)],
+                    relative,
+                );
+                let dx = first.gradient_node(x).unwrap();
+                let v = tape.leaf(vec![0.75, -1.25, 2.0], vec![3], false).unwrap();
+                let (weighted, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                let (dot, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let second = tape.backward(dot).unwrap();
+                assert_softmax_relative(
+                    &context,
+                    second.gradient(x).expect("nonlinear HVP"),
+                    &hvps[usize::from(log)],
+                    relative,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_log_softmax_cancelling_tail_upstream_high_precision() {
+        // g=[1,1,-1] makes the two tail gradients round to +1 and -1 in
+        // f64. Recovering the head by summing those already-subtracted tail
+        // gradients would lose its nonzero 2*exp(-40) derivative again.
+        for f32_leaf in [false, true] {
+            let reference = &softmax_cg_references(f32_leaf)[0];
+            let expected = if f32_leaf {
+                [
+                    3.045995856161615e-8,
+                    0.9999999847700207,
+                    -1.0000000152299793,
+                ]
+            } else {
+                [8.496708510583178e-18, 1.0, -1.0]
+            };
+            let mut tape = TensorTape::new();
+            let x = if f32_leaf {
+                tape.leaf_f32(
+                    reference.logits.iter().map(|&v| v as f32).collect(),
+                    vec![3],
+                    true,
+                )
+            } else {
+                tape.leaf(reference.logits.to_vec(), vec![3], true)
+            }
+            .unwrap();
+            let (y, _) = tape.log_softmax(x, 0, ExecutionMode::Strict).unwrap();
+            let g = tape.leaf(vec![1.0, 1.0, -1.0], vec![3], true).unwrap();
+            let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+            let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+            let ordinary = tape
+                .backward_with_options(
+                    loss,
+                    BackwardOptions::strict_default().with_retain_graph(true),
+                )
+                .unwrap();
+            let first = tape
+                .backward_with_options(
+                    loss,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .unwrap();
+            let relative = if f32_leaf { 3e-6 } else { 3e-13 };
+            assert_softmax_relative(
+                "signed-tail ordinary",
+                ordinary.gradient(x).unwrap(),
+                &expected,
+                relative,
+            );
+            assert_softmax_relative(
+                "signed-tail graph",
+                first.gradient(x).unwrap(),
+                &expected,
+                relative,
+            );
+            let dx = first.gradient_node(x).unwrap();
+            let v = tape
+                .leaf(reference.direction.to_vec(), vec![3], false)
+                .unwrap();
+            let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+            let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+            // G=+1 here, versus G=-1 in the independently computed collapse
+            // fixture; the log-softmax Hessian therefore has the opposite sign.
+            let expected_hvp = reference.hessian_vector[1].map(|value| -value);
+            for second_create_graph in [false, true] {
+                let second = tape
+                    .backward_with_options(
+                        dot,
+                        BackwardOptions {
+                            create_graph: second_create_graph,
+                            retain_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                assert_softmax_relative(
+                    "signed-tail HVP",
+                    second.gradient(x).unwrap(),
+                    &expected_hvp,
+                    relative,
+                );
+            }
+        }
+    }
+
+    fn check_softmax_conditioned_upstream(
+        f32_leaf: bool,
+        log: bool,
+        margin: f64,
+        upstream: [f64; 3],
+        gradient: [f64; 3],
+        hvp: [f64; 3],
+    ) {
+        let mut tape = TensorTape::new();
+        let x = if f32_leaf {
+            tape.leaf_f32(
+                vec![-margin as f32, -margin as f32, margin as f32],
+                vec![3],
+                true,
+            )
+        } else {
+            tape.leaf(vec![-margin, -margin, margin], vec![3], true)
+        }
+        .unwrap();
+        let (y, _) = if log {
+            tape.log_softmax(x, 0, ExecutionMode::Strict)
+        } else {
+            tape.softmax(x, 0, ExecutionMode::Strict)
+        }
+        .unwrap();
+        // Keep upstream contrasts in f64 even when the logits are f32.
+        let g = tape.leaf(upstream.to_vec(), vec![3], true).unwrap();
+        let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+        let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+        let ordinary = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions::strict_default().with_retain_graph(true),
+            )
+            .unwrap();
+        let first = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+        let relative = if f32_leaf { 5e-6 } else { 4e-13 };
+        let context = format!("conditioned f32={f32_leaf}, log={log}, g={upstream:?}");
+        assert_softmax_relative(
+            &format!("ordinary {context}"),
+            ordinary.gradient(x).unwrap(),
+            &gradient,
+            relative,
+        );
+        assert_softmax_relative(
+            &format!("graph {context}"),
+            first.gradient(x).unwrap(),
+            &gradient,
+            relative,
+        );
+        let dx = first.gradient_node(x).unwrap();
+        let v = tape.leaf(vec![0.75, -1.25, 2.0], vec![3], false).unwrap();
+        let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+        let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+        for second_create_graph in [false, true] {
+            let second = tape
+                .backward_with_options(
+                    dot,
+                    BackwardOptions {
+                        create_graph: second_create_graph,
+                        retain_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .unwrap();
+            assert_softmax_relative(
+                &format!("HVP cg={second_create_graph} {context}"),
+                second.gradient(x).unwrap(),
+                &hvp,
+                relative,
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_large_opposing_upstream_high_precision() {
+        // Decimal at precision 300, using the independent equations above.
+        // The weighted tails cancel before the dominant entry is added. The
+        // tiny dominant derivative must survive despite much larger tails.
+        let large = 18_014_398_509_481_984.0; // 2^54, exactly representable.
+        for f32_leaf in [false, true] {
+            let (margin, gradients, hvps) = if f32_leaf {
+                (
+                    9.0,
+                    [
+                        [-274358916.0556305, 274358916.0556305, 3.045995763380708e-8],
+                        [
+                            -18_014_398_509_481_984.0,
+                            18_014_398_509_481_984.0,
+                            3.045995856161615e-8,
+                        ],
+                    ],
+                    [
+                        [342948634.6233366, -891666450.0206752, 548717815.3973385],
+                        [
+                            1.9037473057224886e-8,
+                            4.949743161884104e-8,
+                            -6.853490467606592e-8,
+                        ],
+                    ],
+                )
+            } else {
+                (
+                    20.0,
+                    [
+                        [
+                            -0.07653154656427624,
+                            0.07653154656427624,
+                            8.496708510583178e-18,
+                        ],
+                        [
+                            -18_014_398_509_481_984.0,
+                            18_014_398_509_481_984.0,
+                            8.496708510583178e-18,
+                        ],
+                    ],
+                    [
+                        [
+                            0.0956644332053453,
+                            -0.24872752633389777,
+                            0.15306309312855246,
+                        ],
+                        [
+                            5.310442819114486e-18,
+                            1.3807151329697665e-17,
+                            -1.911759414881215e-17,
+                        ],
+                    ],
+                )
+            };
+            for log in [false, true] {
+                check_softmax_conditioned_upstream(
+                    f32_leaf,
+                    log,
+                    margin,
+                    [-large, large, 1.0],
+                    gradients[usize::from(log)],
+                    hvps[usize::from(log)],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_near_constant_upstream_preserves_factored_tails() {
+        // Subtracting p*g - p*dot loses the one-ulp contrast in g. The
+        // factored tails p*(g-dot) retain it. All weights are exact dyadics.
+        let delta = f64::EPSILON;
+        for f32_leaf in [false, true] {
+            let (margin, gradient, hvp) = if f32_leaf {
+                (
+                    40.0,
+                    [4.007575133625297e-51, -4.007575133625297e-51, 0.0],
+                    [
+                        -5.009468917031621e-51,
+                        1.3024619184282215e-50,
+                        -8.015150267250594e-51,
+                    ],
+                )
+            } else {
+                (
+                    20.0,
+                    [9.433241421977964e-34, -9.433241421977964e-34, 0.0],
+                    [
+                        -1.1791551777472456e-33,
+                        3.0658034621428386e-33,
+                        -1.886648284395593e-33,
+                    ],
+                )
+            };
+            check_softmax_conditioned_upstream(
+                f32_leaf,
+                false,
+                margin,
+                [1.0 + delta, 1.0 - delta, 1.0],
+                gradient,
+                hvp,
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_backward_ignores_forward_grad_recording_mode() {
+        for f32_leaf in [false, true] {
+            let reference = &softmax_cg_references(f32_leaf)[0];
+            let relative = if f32_leaf { 1e-5 } else { 3e-13 };
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(
+                        reference.logits.iter().map(|&v| v as f32).collect(),
+                        vec![3],
+                        true,
+                    )
+                } else {
+                    tape.leaf(reference.logits.to_vec(), vec![3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape
+                    .leaf(reference.upstream.to_vec(), vec![3], true)
+                    .unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                tape.set_grad_enabled(false);
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let dx = first
+                    .gradient_node(x)
+                    .expect("gradient graph survives no_grad");
+                assert!(tape.nodes[dx.0].requires_grad);
+                assert_softmax_relative(
+                    "no_grad first backward",
+                    first.gradient(x).unwrap(),
+                    &reference.gradient[usize::from(log)],
+                    relative,
+                );
+                tape.set_grad_enabled(true);
+                let v = tape
+                    .leaf(reference.direction.to_vec(), vec![3], false)
+                    .unwrap();
+                let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+                tape.set_grad_enabled(false);
+                let second = tape
+                    .backward_with_options(
+                        dot,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                assert_softmax_relative(
+                    "no_grad second backward",
+                    second.gradient(x).unwrap(),
+                    &reference.hessian_vector[usize::from(log)],
+                    relative,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_singleton_preserves_positive_zero() {
+        for f32_leaf in [false, true] {
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(vec![2.0, -3.0, 4.0, -5.0], vec![2, 1, 2], true)
+                } else {
+                    tape.leaf(vec![2.0, -3.0, 4.0, -5.0], vec![2, 1, 2], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 1, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 1, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape
+                    .leaf(vec![-2.0, 3.0, -4.0, 5.0], vec![2, 1, 2], false)
+                    .unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                for &value in first.gradient(x).unwrap() {
+                    assert_eq!(
+                        value.to_bits(),
+                        0.0_f64.to_bits(),
+                        "f32={f32_leaf}, log={log}: singleton graph gradient changed signed zero"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn create_graph_softmax_family_isolates_nonfinite_lanes_and_masked_logits() {
+        for f32_leaf in [false, true] {
+            let reference = &softmax_cg_references(f32_leaf)[0];
+            let [max, min, _] = reference.logits;
+            // Lane 0 is finite; lane 1 has a legitimate -inf masked logit;
+            // lane 2 is poisoned. A global nonfinite fallback collapses lane 0.
+            let logits = [
+                max,
+                min,
+                min,
+                max,
+                min,
+                f64::NEG_INFINITY,
+                f64::NAN,
+                0.0,
+                1.0,
+            ];
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(logits.iter().map(|&v| v as f32).collect(), vec![3, 3], true)
+                } else {
+                    tape.leaf(logits.to_vec(), vec![3, 3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 1, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 1, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape
+                    .leaf(
+                        vec![-1.0, 0.0, 0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+                        vec![3, 3],
+                        false,
+                    )
+                    .unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let got = first.gradient(x).unwrap();
+                let relative = if f32_leaf { 3e-6 } else { 3e-13 };
+                assert_softmax_relative(
+                    "finite lane",
+                    &got[..3],
+                    &reference.gradient[usize::from(log)],
+                    relative,
+                );
+                let masked_tail = if f32_leaf {
+                    if log {
+                        1.522997951276035e-8
+                    } else {
+                        1.5229979280808073e-8
+                    }
+                } else {
+                    4.248354255291589e-18
+                };
+                assert_softmax_relative(
+                    "masked lane",
+                    &got[3..6],
+                    &[-masked_tail, masked_tail, 0.0],
+                    relative,
+                );
+                assert!(
+                    got[6..].iter().all(|value| value.is_nan()),
+                    "poisoned lane must propagate NaNs: {got:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_preserves_nonfinite_formulas() {
+        // Preserve the pre-change graph path's IEEE classifications. Ordinary
+        // backward already uses another expression and is intentionally NOT an
+        // oracle for non-finite upstreams: for log_softmax([0,-inf,-inf]) with
+        // g=[1,+inf,0], the old graph gives [-inf,NaN,NaN], ordinary gives all NaN.
+        let cases = [
+            ([f64::NAN, 1.0, 0.0], [0.5, -2.0, 1.0]),
+            ([f64::INFINITY, 1.0, 0.0], [0.5, -2.0, 1.0]),
+            ([f64::NEG_INFINITY; 3], [0.5, -2.0, 1.0]),
+            (
+                [0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                [1.0, f64::INFINITY, 0.0],
+            ),
+            (
+                [0.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                [f64::INFINITY, 1.0, 0.0],
+            ),
+            ([1.0, 0.0, -1.0], [f64::NAN, 1.0, 0.0]),
+            ([1.0, 0.0, -1.0], [f64::INFINITY, f64::NEG_INFINITY, 0.0]),
+            ([0.0, 0.0, 0.0], [f64::MAX; 3]),
+        ];
+        for f32_leaf in [false, true] {
+            for log in [false, true] {
+                for (case, (logits, upstream)) in cases.into_iter().enumerate() {
+                    let mut tape = TensorTape::new();
+                    let x = if f32_leaf {
+                        tape.leaf_f32(logits.iter().map(|&v| v as f32).collect(), vec![3], true)
+                    } else {
+                        tape.leaf(logits.to_vec(), vec![3], true)
+                    }
+                    .unwrap();
+                    let (y, _) = if log {
+                        tape.log_softmax(x, 0, ExecutionMode::Strict)
+                    } else {
+                        tape.softmax(x, 0, ExecutionMode::Strict)
+                    }
+                    .unwrap();
+                    let values = tape.values_lossy_f64(y).unwrap();
+                    let expected: Vec<f64> = if log {
+                        let sum: f64 = upstream.iter().sum();
+                        values
+                            .iter()
+                            .zip(upstream)
+                            .map(|(&out, g)| g - out.exp() * sum)
+                            .collect()
+                    } else {
+                        let dot: f64 = values.iter().zip(upstream).map(|(&p, g)| p * g).sum();
+                        values
+                            .iter()
+                            .zip(upstream)
+                            .map(|(&p, g)| p * (g - dot))
+                            .collect()
+                    };
+                    let g = tape.leaf(upstream.to_vec(), vec![3], false).unwrap();
+                    let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                    let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                    let report = tape
+                        .backward_with_options(
+                            loss,
+                            BackwardOptions {
+                                create_graph: true,
+                                ..BackwardOptions::strict_default()
+                            },
+                        )
+                        .unwrap();
+                    for (&got, &want) in report.gradient(x).unwrap().iter().zip(&expected) {
+                        if want.is_nan() {
+                            assert!(
+                                got.is_nan(),
+                                "case={case}, f32={f32_leaf}, log={log}: {got} must be NaN"
+                            );
+                        } else {
+                            assert_eq!(got, want, "case={case}, f32={f32_leaf}, log={log}");
+                        }
+                    }
+                    if expected.iter().any(|value| !value.is_finite()) {
+                        tape.set_detect_anomaly(true);
+                        let error = tape
+                            .backward_with_options(
+                                loss,
+                                BackwardOptions {
+                                    create_graph: true,
+                                    ..BackwardOptions::strict_default()
+                                },
+                            )
+                            .unwrap_err();
+                        assert!(error.to_string().contains("detect_anomaly"), "{error:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_softmax_family_rejects_modified_upstream_on_double_backward() {
+        for f32_leaf in [false, true] {
+            for log in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = if f32_leaf {
+                    tape.leaf_f32(vec![9.0, -9.0, -9.0], vec![3], true)
+                } else {
+                    tape.leaf(vec![20.0, -20.0, -20.0], vec![3], true)
+                }
+                .unwrap();
+                let (y, _) = if log {
+                    tape.log_softmax(x, 0, ExecutionMode::Strict)
+                } else {
+                    tape.softmax(x, 0, ExecutionMode::Strict)
+                }
+                .unwrap();
+                let g = tape.leaf(vec![-1.0, 0.0, 0.0], vec![3], true).unwrap();
+                let (weighted, _) = tape.mul(y, g, ExecutionMode::Strict).unwrap();
+                let (loss, _) = tape.sum(weighted, ExecutionMode::Strict).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let dx = first.gradient_node(x).unwrap();
+                let v = tape.leaf(vec![1.0, 1.0, 0.0], vec![3], false).unwrap();
+                let (weighted_dx, _) = tape.mul(dx, v, ExecutionMode::Strict).unwrap();
+                let (dot, _) = tape.sum(weighted_dx, ExecutionMode::Strict).unwrap();
+                tape.update_tensor_values(g, vec![0.0, 1.0, 0.0]).unwrap();
+                let error = tape.backward(dot).unwrap_err();
+                assert!(
+                    matches!(error, AutogradError::BorrowedInputVersionMismatch { node, .. } if node == g),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
     // Hessian-vector cross-check for create_graph second-order through a reduction op.
     // Probes (H·w)_i = d/dx_i (w · ∇L) against a central finite difference. A non-uniform
     // `w` is required for softmax/log_softmax: both are shift-invariant, so the all-ones
@@ -34084,5 +35515,1259 @@ mod tests {
                 );
             }
         }
+    }
+    fn routing_options(mode: ExecutionMode, create_graph: bool) -> BackwardOptions {
+        BackwardOptions {
+            create_graph,
+            retain_graph: true,
+            ..match mode {
+                ExecutionMode::Strict => BackwardOptions::strict_default(),
+                ExecutionMode::Hardened => BackwardOptions::hardened_default(),
+            }
+        }
+    }
+
+    fn routing_leaf(
+        tape: &mut TensorTape,
+        values: &[f64],
+        shape: &[usize],
+        f32_leaf: bool,
+    ) -> TensorNodeId {
+        if f32_leaf {
+            tape.leaf_f32(
+                values.iter().map(|&x| x as f32).collect(),
+                shape.to_vec(),
+                true,
+            )
+            .expect("f32 routing leaf")
+        } else {
+            tape.leaf(values.to_vec(), shape.to_vec(), true)
+                .expect("f64 routing leaf")
+        }
+    }
+
+    fn routing_cubic_loss(
+        tape: &mut TensorTape,
+        output: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> TensorNodeId {
+        // Use multiplication to keep this regression independent of cg_pow's dtype handling.
+        let (square, _) = tape.mul(output, output, mode).expect("routing square");
+        let (cube, _) = tape.mul(square, output, mode).expect("routing cube");
+        tape.sum(cube, mode).expect("routing cubic sum").0
+    }
+
+    fn routing_contract(
+        tape: &mut TensorTape,
+        gradient: TensorNodeId,
+        direction: &[f64],
+        mode: ExecutionMode,
+    ) -> TensorNodeId {
+        let shape = tape
+            .tensor_meta(gradient)
+            .expect("gradient meta")
+            .shape()
+            .to_vec();
+        assert_eq!(
+            tape.tensor_meta(gradient).expect("gradient meta").dtype(),
+            DType::F64
+        );
+        let v = tape
+            .leaf(direction.to_vec(), shape, false)
+            .expect("direction");
+        let (product, _) = tape.mul(gradient, v, mode).expect("gradient contraction");
+        tape.sum(product, mode).expect("contracted gradient sum").0
+    }
+
+    #[test]
+    fn create_graph_narrow_cubic_hvp_preserves_upstream() {
+        for f32_leaf in [false, true] {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for case in 0..3 {
+                    let mut tape = TensorTape::new();
+                    let (x, y, expected_first, direction, expected_hvp, expected_third) = match case
+                    {
+                        0 => {
+                            let x = routing_leaf(
+                                &mut tape,
+                                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                                &[2, 3],
+                                f32_leaf,
+                            );
+                            let y = tape.narrow(x, 1, 1, 2).expect("last-dim narrow");
+                            (
+                                x,
+                                y,
+                                vec![0.0, 12.0, 27.0, 0.0, 75.0, 108.0],
+                                vec![0.5, -1.0, 2.0, -0.5, 0.25, -2.0],
+                                vec![0.0, -12.0, 36.0, 0.0, 7.5, -72.0],
+                                vec![0.0, -6.0, 12.0, 0.0, 1.5, -12.0],
+                            )
+                        }
+                        1 => {
+                            let x = routing_leaf(
+                                &mut tape,
+                                &[
+                                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                                ],
+                                &[2, 3, 2],
+                                f32_leaf,
+                            );
+                            let y = tape.narrow(x, 1, 1, 1).expect("middle-dim narrow");
+                            (
+                                x,
+                                y,
+                                vec![
+                                    0.0, 0.0, 27.0, 48.0, 0.0, 0.0, 0.0, 0.0, 243.0, 300.0, 0.0,
+                                    0.0,
+                                ],
+                                vec![
+                                    0.5, -1.0, 2.0, -0.5, 0.25, -2.0, 1.5, -0.25, 0.75, -1.5, 2.5,
+                                    -3.0,
+                                ],
+                                vec![
+                                    0.0, 0.0, 36.0, -12.0, 0.0, 0.0, 0.0, 0.0, 40.5, -90.0, 0.0,
+                                    0.0,
+                                ],
+                                vec![
+                                    0.0, 0.0, 12.0, -3.0, 0.0, 0.0, 0.0, 0.0, 4.5, -9.0, 0.0, 0.0,
+                                ],
+                            )
+                        }
+                        _ => {
+                            let x = routing_leaf(
+                                &mut tape,
+                                &[
+                                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                                ],
+                                &[4, 3],
+                                f32_leaf,
+                            );
+                            let offset = tape.narrow(x, 0, 1, 2).expect("offset view");
+                            assert_eq!(
+                                tape.tensor_meta(offset)
+                                    .expect("offset meta")
+                                    .storage_offset(),
+                                3
+                            );
+                            let y = tape.narrow(offset, 1, 1, 1).expect("narrow offset view");
+                            (
+                                x,
+                                y,
+                                vec![
+                                    0.0, 0.0, 0.0, 0.0, 75.0, 0.0, 0.0, 192.0, 0.0, 0.0, 0.0, 0.0,
+                                ],
+                                vec![
+                                    0.5, -1.0, 2.0, -0.5, 0.25, -2.0, 1.5, -0.25, 0.75, -1.5, 2.5,
+                                    -3.0,
+                                ],
+                                vec![0.0, 0.0, 0.0, 0.0, 7.5, 0.0, 0.0, -12.0, 0.0, 0.0, 0.0, 0.0],
+                                vec![0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, -1.5, 0.0, 0.0, 0.0, 0.0],
+                            )
+                        }
+                    };
+                    // L=sum(selected x^3): grad=3*x^2 on selected coordinates,
+                    // H*v=6*x*v and d(sum(H*v))/dx=6*v on those same coordinates.
+                    let loss = routing_cubic_loss(&mut tape, y, mode);
+                    let ordinary = tape
+                        .backward_with_options(loss, routing_options(mode, false))
+                        .expect("ordinary cubic gradient");
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, true))
+                        .expect("graph cubic gradient");
+                    assert_eq!(
+                        ordinary.gradient(x).expect("ordinary narrow gradient"),
+                        expected_first.as_slice()
+                    );
+                    assert_eq!(
+                        first.gradient(x).expect("graph narrow gradient"),
+                        expected_first.as_slice()
+                    );
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).expect("narrow gradient node"),
+                        &direction,
+                        mode,
+                    );
+                    for create_graph in [false, true] {
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, create_graph))
+                            .expect("narrow Hessian-vector product");
+                        assert_eq!(
+                            second.gradient(x).expect("narrow Hessian reaches x"),
+                            expected_hvp.as_slice()
+                        );
+                        if create_graph {
+                            let (third_loss, _) = tape
+                                .sum(second.gradient_node(x).expect("narrow Hessian node"), mode)
+                                .expect("sum Hessian-vector product");
+                            let third = tape
+                                .backward_with_options(third_loss, routing_options(mode, false))
+                                .expect("narrow third derivative");
+                            assert_eq!(
+                                third
+                                    .gradient(x)
+                                    .expect("narrow third derivative reaches x"),
+                                expected_third.as_slice()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_scatter_cubic_higher_derivatives(add: bool) {
+        for f32_leaf in [false, true] {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(&mut tape, &[1.0, 2.0, 3.0, 4.0], &[4], f32_leaf);
+                let src = routing_leaf(&mut tape, &[5.0, 6.0, 7.0], &[3], f32_leaf);
+                let index = [1.0, 1.0, 3.0];
+                let y = if add {
+                    tape.scatter_add(x, src, 0, &index, vec![3], &[5.0, 6.0, 7.0])
+                        .expect("scatter_add")
+                } else {
+                    tape.scatter(x, src, 0, &index, vec![3], &[5.0, 6.0, 7.0])
+                        .expect("scatter")
+                };
+                let (first_x, first_src, hvp_x, hvp_src, third_x, third_src) = if add {
+                    // y=[1,13,3,11]. The combined input/src direction maps to
+                    // w=[.5,.75,2,-2.5]; H*v=J^T(6*y*w).
+                    (
+                        [3.0, 507.0, 27.0, 363.0],
+                        [507.0, 507.0, 363.0],
+                        [3.0, 58.5, 36.0, -165.0],
+                        [58.5, 58.5, -165.0],
+                        [3.0, 13.5, 12.0, -30.0],
+                        [13.5, 13.5, -30.0],
+                    )
+                } else {
+                    // Last writer wins: y=[1,6,3,7], and src[0] has no influence.
+                    // The combined direction maps to w=[.5,1.5,2,-2].
+                    (
+                        [3.0, 0.0, 27.0, 0.0],
+                        [0.0, 108.0, 147.0],
+                        [3.0, 0.0, 36.0, 0.0],
+                        [0.0, 54.0, -84.0],
+                        [3.0, 0.0, 12.0, 0.0],
+                        [0.0, 9.0, -12.0],
+                    )
+                };
+                let loss = routing_cubic_loss(&mut tape, y, mode);
+                let ordinary = tape
+                    .backward_with_options(loss, routing_options(mode, false))
+                    .expect("ordinary scatter gradient");
+                let first = tape
+                    .backward_with_options(loss, routing_options(mode, true))
+                    .expect("graph scatter gradient");
+                for report in [&ordinary, &first] {
+                    assert_eq!(report.gradient(x).expect("input gradient"), &first_x);
+                    assert_eq!(report.gradient(src).expect("source gradient"), &first_src);
+                }
+                let px = routing_contract(
+                    &mut tape,
+                    first.gradient_node(x).expect("input gradient node"),
+                    &[0.5, -1.0, 2.0, -0.5],
+                    mode,
+                );
+                let ps = routing_contract(
+                    &mut tape,
+                    first.gradient_node(src).expect("source gradient node"),
+                    &[0.25, 1.5, -2.0],
+                    mode,
+                );
+                let (objective, _) = tape.add(px, ps, mode).expect("joint contraction");
+                for create_graph in [false, true] {
+                    let second = tape
+                        .backward_with_options(objective, routing_options(mode, create_graph))
+                        .expect("joint Hessian-vector product");
+                    assert_eq!(second.gradient(x).expect("Hessian reaches input"), &hvp_x);
+                    assert_eq!(
+                        second.gradient(src).expect("Hessian reaches source"),
+                        &hvp_src
+                    );
+                    if create_graph {
+                        let (hx, _) = tape
+                            .sum(second.gradient_node(x).expect("input Hessian node"), mode)
+                            .expect("input Hessian sum");
+                        let (hs, _) = tape
+                            .sum(
+                                second.gradient_node(src).expect("source Hessian node"),
+                                mode,
+                            )
+                            .expect("source Hessian sum");
+                        let (third_loss, _) = tape.add(hx, hs, mode).expect("joint Hessian sum");
+                        let third = tape
+                            .backward_with_options(third_loss, routing_options(mode, false))
+                            .expect("joint third derivative");
+                        assert_eq!(
+                            third.gradient(x).expect("third derivative reaches input"),
+                            &third_x
+                        );
+                        assert_eq!(
+                            third
+                                .gradient(src)
+                                .expect("third derivative reaches source"),
+                            &third_src
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_scatter_cubic_mixed_hvp_and_third_derivative() {
+        check_scatter_cubic_higher_derivatives(false);
+    }
+
+    #[test]
+    fn create_graph_scatter_add_cubic_mixed_hvp_and_third_derivative() {
+        check_scatter_cubic_higher_derivatives(true);
+    }
+
+    fn check_selection_gradient_penalty_third_derivative(gather: bool) {
+        for f32_leaf in [false, true] {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(
+                    &mut tape,
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[3, 2],
+                    f32_leaf,
+                );
+                let y = if gather {
+                    tape.gather(x, 0, &[0.0, 0.0, 0.0, 0.0, 2.0, 2.0], vec![3, 2])
+                        .expect("gather repeated rows")
+                } else {
+                    tape.index_select(x, 0, &[0.0, 0.0, 2.0])
+                        .expect("select repeated rows")
+                };
+                let loss = routing_cubic_loss(&mut tape, y, mode);
+                let first = tape
+                    .backward_with_options(loss, routing_options(mode, true))
+                    .expect("graph selected cubic gradient");
+                assert_eq!(
+                    first.gradient(x).expect("selected cubic gradient"),
+                    &[6.0, 24.0, 0.0, 0.0, 75.0, 108.0]
+                );
+                let dx = first.gradient_node(x).expect("selected gradient node");
+                let (dx_squared, _) = tape.mul(dx, dx, mode).expect("squared gradient");
+                let (penalty, _) = tape.sum(dx_squared, mode).expect("gradient penalty");
+                // With selection multiplicities m=[2,2,0,0,1,1],
+                // L=sum(m*x^3), P=sum((dL/dx)^2)=sum(9*m^2*x^4).
+                // dP/dx=36*m^2*x^3, d(sum(dP/dx))/dx=108*m^2*x^2.
+                // A fixed linear HVP seed cannot expose a detached scatter adjoint;
+                // this nonlinear penalty makes the incoming adjoint depend on x.
+                for create_graph in [false, true] {
+                    let second = tape
+                        .backward_with_options(penalty, routing_options(mode, create_graph))
+                        .expect("gradient penalty backward");
+                    assert_eq!(
+                        second.gradient(x).expect("penalty reaches x"),
+                        &[144.0, 1152.0, 0.0, 0.0, 4500.0, 7776.0]
+                    );
+                    if create_graph {
+                        let (third_loss, _) = tape
+                            .sum(
+                                second.gradient_node(x).expect("penalty gradient node"),
+                                mode,
+                            )
+                            .expect("penalty gradient sum");
+                        let third = tape
+                            .backward_with_options(third_loss, routing_options(mode, false))
+                            .expect("differentiate graph penalty gradient");
+                        assert_eq!(
+                            third
+                                .gradient(x)
+                                .expect("penalty third derivative reaches x"),
+                            &[432.0, 1728.0, 0.0, 0.0, 2700.0, 3888.0]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_gather_gradient_penalty_third_derivative() {
+        check_selection_gradient_penalty_third_derivative(true);
+    }
+
+    #[test]
+    fn create_graph_index_select_gradient_penalty_third_derivative() {
+        check_selection_gradient_penalty_third_derivative(false);
+    }
+
+    #[test]
+    fn create_graph_routing_independent_upstream_mixed_derivatives() {
+        for f32_leaf in [false, true] {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for disable_forward_recording in [false, true] {
+                    for kind in 0..5 {
+                        let mut tape = TensorTape::new();
+                        let x = routing_leaf(
+                            &mut tape,
+                            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                            &[2, 3],
+                            f32_leaf,
+                        );
+                        let (y, src, g_values, g_shape, expected_x, expected_src, expected_mixed) =
+                            match kind {
+                                0 => (
+                                    tape.narrow(x, 1, 1, 1).expect("narrow"),
+                                    None,
+                                    vec![-2.0, 3.0],
+                                    vec![2, 1],
+                                    vec![0.0, -2.0, 0.0, 0.0, 3.0, 0.0],
+                                    vec![],
+                                    vec![-1.0, -0.5],
+                                ),
+                                1 => (
+                                    tape.gather(x, 1, &[1.0, 1.0, 0.0, 2.0], vec![2, 2])
+                                        .expect("gather"),
+                                    None,
+                                    vec![0.5, -2.0, 3.0, -0.25],
+                                    vec![2, 2],
+                                    vec![0.0, -1.5, 0.0, 3.0, 0.0, -0.25],
+                                    vec![],
+                                    vec![-1.0, -1.0, 2.0, 3.0],
+                                ),
+                                2 => (
+                                    tape.index_select(x, 1, &[2.0, 0.0, 2.0])
+                                        .expect("index_select"),
+                                    None,
+                                    vec![0.5, -2.0, 3.0, 4.0, -0.25, 1.5],
+                                    vec![2, 3],
+                                    vec![-2.0, 0.0, 3.5, -0.25, 0.0, 5.5],
+                                    vec![],
+                                    vec![0.5, 1.0, 0.5, 3.0, 2.0, 3.0],
+                                ),
+                                _ => {
+                                    let src = routing_leaf(
+                                        &mut tape,
+                                        &[7.0, 8.0, 9.0, 10.0],
+                                        &[2, 2],
+                                        f32_leaf,
+                                    );
+                                    if kind == 3 {
+                                        (
+                                            tape.scatter(
+                                                x,
+                                                src,
+                                                1,
+                                                &[1.0, 1.0, 0.0, 2.0],
+                                                vec![2, 2],
+                                                &[7.0, 8.0, 9.0, 10.0],
+                                            )
+                                            .expect("scatter"),
+                                            Some(src),
+                                            vec![0.5, -2.0, 3.0, 4.0, -0.25, 1.5],
+                                            vec![2, 3],
+                                            vec![0.5, 0.0, 3.0, 0.0, -0.25, 0.0],
+                                            vec![0.0, -2.0, 4.0, 1.5],
+                                            vec![1.0, -0.75, 0.5, 1.5, -0.5, -2.0],
+                                        )
+                                    } else {
+                                        (
+                                            tape.scatter_add(
+                                                x,
+                                                src,
+                                                1,
+                                                &[1.0, 1.0, 0.0, 2.0],
+                                                vec![2, 2],
+                                                &[7.0, 8.0, 9.0, 10.0],
+                                            )
+                                            .expect("scatter_add"),
+                                            Some(src),
+                                            vec![0.5, -2.0, 3.0, 4.0, -0.25, 1.5],
+                                            vec![2, 3],
+                                            vec![0.5, -2.0, 3.0, 4.0, -0.25, 1.5],
+                                            vec![-2.0, -2.0, 4.0, 1.5],
+                                            vec![1.0, -1.5, 0.5, 3.5, -0.5, 1.0],
+                                        )
+                                    }
+                                }
+                            };
+                        let upstream = routing_leaf(&mut tape, &g_values, &g_shape, f32_leaf);
+                        let (weighted, _) =
+                            tape.mul(y, upstream, mode).expect("trainable upstream");
+                        let (loss, _) = tape.sum(weighted, mode).expect("weighted routing loss");
+                        let ordinary = tape
+                            .backward_with_options(loss, routing_options(mode, false))
+                            .expect("ordinary weighted gradient");
+                        tape.set_grad_enabled(!disable_forward_recording);
+                        let first = tape
+                            .backward_with_options(loss, routing_options(mode, true))
+                            .expect("graph weighted gradient");
+                        assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                        for report in [&ordinary, &first] {
+                            assert_eq!(
+                                report.gradient(x).expect("weighted input gradient"),
+                                expected_x.as_slice()
+                            );
+                            if let Some(src) = src {
+                                assert_eq!(
+                                    report.gradient(src).expect("weighted source gradient"),
+                                    expected_src.as_slice()
+                                );
+                            }
+                        }
+                        let dx = first
+                            .gradient_node(x)
+                            .expect("weighted input gradient node");
+                        assert!(
+                            tape.tensor_requires_grad(dx)
+                                .expect("weighted gradient dependency")
+                        );
+                        tape.set_grad_enabled(true);
+                        let mut objective = routing_contract(
+                            &mut tape,
+                            dx,
+                            &[1.0, -1.0, 0.5, 2.0, -0.5, 3.0],
+                            mode,
+                        );
+                        if let Some(src) = src {
+                            let ds = first
+                                .gradient_node(src)
+                                .expect("weighted source gradient node");
+                            let source_term =
+                                routing_contract(&mut tape, ds, &[0.25, -0.75, 1.5, -2.0], mode);
+                            objective = tape
+                                .add(objective, source_term, mode)
+                                .expect("joint upstream derivative")
+                                .0;
+                        }
+                        // L=<g, J*z>. Thus d/dg <dL/dz, v> = J*v, even though
+                        // the first gradient is independent of z. This catches a
+                        // detached incoming gradient without relying on a Hessian.
+                        for create_graph in [false, true] {
+                            tape.set_grad_enabled(!disable_forward_recording);
+                            let mixed = tape
+                                .backward_with_options(
+                                    objective,
+                                    routing_options(mode, create_graph),
+                                )
+                                .expect("differentiate incoming gradient");
+                            assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                            assert_eq!(
+                                mixed
+                                    .gradient(upstream)
+                                    .expect("mixed derivative reaches upstream"),
+                                expected_mixed.as_slice()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_scatter_preserves_nonfinite_masking_and_dependencies() {
+        for f32_leaf in [false, true] {
+            for add in [false, true] {
+                let mode = ExecutionMode::Strict;
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(&mut tape, &[1.0, 2.0, 3.0, 4.0], &[4], f32_leaf);
+                let src = routing_leaf(&mut tape, &[5.0, 6.0, 7.0], &[3], f32_leaf);
+                let y = if add {
+                    tape.scatter_add(x, src, 0, &[1.0, 1.0, 3.0], vec![3], &[5.0, 6.0, 7.0])
+                        .expect("nonfinite scatter_add")
+                } else {
+                    tape.scatter(x, src, 0, &[1.0, 1.0, 3.0], vec![3], &[5.0, 6.0, 7.0])
+                        .expect("nonfinite scatter")
+                };
+                let upstream = routing_leaf(
+                    &mut tape,
+                    &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::NAN],
+                    &[4],
+                    f32_leaf,
+                );
+                let (weighted, _) = tape
+                    .mul(y, upstream, mode)
+                    .expect("nonfinite weighted output");
+                let (loss, _) = tape.sum(weighted, mode).expect("nonfinite weighted loss");
+                let expected_x = if add {
+                    [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::NAN]
+                } else {
+                    [f64::NAN, 0.0, f64::NEG_INFINITY, 0.0]
+                };
+                let expected_src = if add {
+                    [f64::INFINITY, f64::INFINITY, f64::NAN]
+                } else {
+                    [0.0, f64::INFINITY, f64::NAN]
+                };
+                for create_graph in [false, true] {
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, create_graph))
+                        .expect("nonfinite routing gradient");
+                    for (actual, expected) in first
+                        .gradient(x)
+                        .expect("nonfinite input gradient")
+                        .iter()
+                        .zip(expected_x)
+                    {
+                        if expected.is_nan() {
+                            assert!(actual.is_nan());
+                        } else {
+                            assert_eq!(actual.to_bits(), expected.to_bits());
+                        }
+                    }
+                    for (actual, expected) in first
+                        .gradient(src)
+                        .expect("nonfinite source gradient")
+                        .iter()
+                        .zip(expected_src)
+                    {
+                        if expected.is_nan() {
+                            assert!(actual.is_nan());
+                        } else {
+                            assert_eq!(actual.to_bits(), expected.to_bits());
+                        }
+                    }
+                    if create_graph {
+                        let px = routing_contract(
+                            &mut tape,
+                            first
+                                .gradient_node(x)
+                                .expect("nonfinite input gradient node"),
+                            &[1.0; 4],
+                            mode,
+                        );
+                        let ps = routing_contract(
+                            &mut tape,
+                            first
+                                .gradient_node(src)
+                                .expect("nonfinite source gradient node"),
+                            &[1.0; 3],
+                            mode,
+                        );
+                        let (objective, _) = tape
+                            .add(px, ps, mode)
+                            .expect("nonfinite gradient contraction");
+                        let mixed = tape
+                            .backward_with_options(objective, routing_options(mode, false))
+                            .expect("nonfinite mixed derivative");
+                        let expected = if add { [1.0, 3.0, 1.0, 2.0] } else { [1.0; 4] };
+                        assert_eq!(
+                            mixed
+                                .gradient(upstream)
+                                .expect("nonfinite upstream dependency"),
+                            &expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_routing_empty_slices_and_indices() {
+        for f32_leaf in [false, true] {
+            for kind in 0..5 {
+                let mode = ExecutionMode::Strict;
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(
+                    &mut tape,
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    &[2, 3],
+                    f32_leaf,
+                );
+                let empty = routing_leaf(&mut tape, &[], &[2, 0], f32_leaf);
+                let y = match kind {
+                    0 => tape.narrow(x, 1, 2, 0).expect("empty narrow"),
+                    1 => tape.gather(x, 1, &[], vec![2, 0]).expect("empty gather"),
+                    2 => tape.index_select(x, 1, &[]).expect("empty index_select"),
+                    3 => tape
+                        .scatter(x, empty, 1, &[], vec![2, 0], &[])
+                        .expect("empty scatter"),
+                    _ => tape
+                        .scatter_add(x, empty, 1, &[], vec![2, 0], &[])
+                        .expect("empty scatter_add"),
+                };
+                let loss = routing_cubic_loss(&mut tape, y, mode);
+                for create_graph in [false, true] {
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, create_graph))
+                        .expect("empty routing backward");
+                    let expected = if kind < 3 {
+                        [0.0; 6]
+                    } else {
+                        [3.0, 12.0, 27.0, 48.0, 75.0, 108.0]
+                    };
+                    assert_eq!(
+                        first.gradient(x).expect("empty routing input gradient"),
+                        &expected
+                    );
+                    if kind >= 3 {
+                        assert!(
+                            first
+                                .gradient(empty)
+                                .expect("empty source gradient")
+                                .is_empty()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_routing_preserves_layout_and_index_errors() {
+        use crate::AutogradError;
+        use ft_core::{DenseTensor, DenseTensorError, Device, TensorMeta};
+
+        for f32_leaf in [false, true] {
+            let mut tape = TensorTape::new();
+            let dtype = if f32_leaf { DType::F32 } else { DType::F64 };
+            let meta =
+                TensorMeta::from_shape_and_strides(vec![2, 3], vec![1, 2], 0, dtype, Device::Cpu)
+                    .expect("strided meta");
+            let strided_tensor = if f32_leaf {
+                DenseTensor::from_storage_f32(meta, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+                    .expect("strided f32")
+            } else {
+                DenseTensor::from_storage(meta, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+                    .expect("strided f64")
+            };
+            let strided = tape.leaf_tensor(strided_tensor, true);
+            assert!(matches!(
+                tape.narrow(strided, 1, 0, 1),
+                Err(AutogradError::DenseTensor(
+                    DenseTensorError::UnsupportedLayout
+                ))
+            ));
+            assert!(matches!(
+                tape.gather(strided, 1, &[0.0, 1.0], vec![2, 1]),
+                Err(AutogradError::DenseTensor(
+                    DenseTensorError::UnsupportedLayout
+                ))
+            ));
+            let x = routing_leaf(
+                &mut tape,
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                &[2, 3],
+                f32_leaf,
+            );
+            let src = routing_leaf(&mut tape, &[7.0, 8.0], &[2, 1], f32_leaf);
+            assert!(matches!(
+                tape.narrow(x, 2, 0, 1),
+                Err(AutogradError::Dispatch(_))
+            ));
+            assert!(matches!(
+                tape.narrow(x, 1, 2, 2),
+                Err(AutogradError::Dispatch(_))
+            ));
+            assert!(matches!(
+                tape.gather(x, 1, &[3.0, 0.0], vec![2, 1]),
+                Err(AutogradError::Dispatch(_))
+            ));
+            assert!(matches!(
+                tape.index_select(x, 1, &[3.0]),
+                Err(AutogradError::Dispatch(_))
+            ));
+            assert!(matches!(
+                tape.scatter(x, src, 1, &[3.0, 0.0], vec![2, 1], &[7.0, 8.0]),
+                Err(AutogradError::Dispatch(_))
+            ));
+            assert!(matches!(
+                tape.scatter_add(x, src, 1, &[3.0, 0.0], vec![2, 1], &[7.0, 8.0]),
+                Err(AutogradError::Dispatch(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn create_graph_scatter_second_pass_selects_nonfinite_seeds() {
+        for f32_leaf in [false, true] {
+            for source_gradient in [false, true] {
+                let mode = ExecutionMode::Strict;
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(&mut tape, &[1.0, 2.0, 3.0, 4.0], &[4], f32_leaf);
+                let src = routing_leaf(&mut tape, &[5.0, 6.0, 7.0], &[3], f32_leaf);
+                let y = tape
+                    .scatter(x, src, 0, &[1.0, 1.0, 3.0], vec![3], &[5.0, 6.0, 7.0])
+                    .expect("scatter duplicate writers");
+                let upstream = routing_leaf(&mut tape, &[1.0, -2.0, 3.0, 0.5], &[4], f32_leaf);
+                let (weighted, _) = tape
+                    .mul(y, upstream, mode)
+                    .expect("trainable weighted scatter");
+                let (loss, _) = tape.sum(weighted, mode).expect("weighted scatter sum");
+                let first = tape
+                    .backward_with_options(loss, routing_options(mode, true))
+                    .expect("graph scatter gradient");
+                let (gradient, direction, expected): (TensorNodeId, Vec<f64>, [f64; 4]) =
+                    if source_gradient {
+                        // src[0] was overwritten by src[1]; a NaN second seed at that
+                        // inactive slot must be discarded by selection, not multiplied by 0.
+                        (
+                            first.gradient_node(src).expect("source gradient node"),
+                            vec![f64::NAN, 3.0, -2.0],
+                            [0.0, 3.0, 0.0, -2.0],
+                        )
+                    } else {
+                        // Input positions 1 and 3 were overwritten. Their infinite/NaN
+                        // second seeds must contribute exact positive zeros to d/dg.
+                        (
+                            first.gradient_node(x).expect("input gradient node"),
+                            vec![1.0, f64::INFINITY, 2.0, f64::NAN],
+                            [1.0, 0.0, 2.0, 0.0],
+                        )
+                    };
+                let objective = routing_contract(&mut tape, gradient, &direction, mode);
+                for create_graph in [false, true] {
+                    let second = tape
+                        .backward_with_options(objective, routing_options(mode, create_graph))
+                        .expect("nonfinite seeded second backward");
+                    let actual = second
+                        .gradient(upstream)
+                        .expect("nonfinite seed reaches upstream");
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        assert_eq!(actual.to_bits(), expected.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_routing_widens_custom_f32_upstream_without_detaching() {
+        for f32_leaf in [false, true] {
+            for add in [false, true] {
+                let mode = ExecutionMode::Strict;
+                let mut tape = TensorTape::new();
+                let x = routing_leaf(&mut tape, &[1.0, 2.0, 3.0, 4.0], &[4], f32_leaf);
+                let src = routing_leaf(&mut tape, &[5.0, 6.0, 7.0], &[3], f32_leaf);
+                let y = if add {
+                    tape.scatter_add(x, src, 0, &[1.0, 1.0, 3.0], vec![3], &[5.0, 6.0, 7.0])
+                        .expect("custom upstream scatter_add")
+                } else {
+                    tape.narrow(x, 0, 1, 2).expect("custom upstream narrow")
+                };
+                let custom_square = tape
+                    .apply_function_with_create_graph(
+                        &[y],
+                        |ctx, inputs| {
+                            let (values, shape) = inputs[0];
+                            ctx.save_for_backward(values.to_vec(), shape.to_vec());
+                            Ok((values.iter().map(|x| x * x).collect(), shape.to_vec()))
+                        },
+                        |ctx, grad_outputs| {
+                            Ok(vec![Some(
+                                ctx.saved_tensors()[0]
+                                    .iter()
+                                    .zip(grad_outputs[0])
+                                    .map(|(x, g)| 2.0 * x * g)
+                                    .collect(),
+                            )])
+                        },
+                        |_ctx, grad_outputs, inputs, tape| {
+                            // Public callbacks may return F32 nodes. The routing adjoint
+                            // must widen the result while retaining its links to y and g.
+                            let g = tape.to_f32(grad_outputs[0])?;
+                            let y = tape.to_f32(inputs[0])?;
+                            let (gy, _) = tape.mul(g, y, ExecutionMode::Strict)?;
+                            let (result, _) = tape.mul_scalar(gy, 2.0)?;
+                            assert_eq!(tape.tensor_meta(result)?.dtype(), DType::F32);
+                            Ok(vec![Some(result)])
+                        },
+                    )
+                    .expect("custom square with F32 graph backward");
+                let (loss, _) = tape.sum(custom_square, mode).expect("custom square sum");
+                let ordinary = tape
+                    .backward_with_options(loss, routing_options(mode, false))
+                    .expect("ordinary custom backward");
+                let first = tape
+                    .backward_with_options(loss, routing_options(mode, true))
+                    .expect("graph custom backward");
+                let expected_x = if add {
+                    [2.0, 26.0, 6.0, 22.0]
+                } else {
+                    [0.0, 4.0, 6.0, 0.0]
+                };
+                for report in [&ordinary, &first] {
+                    assert_eq!(
+                        report.gradient(x).expect("custom input gradient"),
+                        &expected_x
+                    );
+                    if add {
+                        assert_eq!(
+                            report.gradient(src).expect("custom source gradient"),
+                            &[26.0, 26.0, 22.0]
+                        );
+                    }
+                }
+                // routing_contract checks F64 gradient metadata as well as building
+                // the HVP; a plain Pad/pass-through would leak the callback's F32 dtype.
+                let mut objective = routing_contract(
+                    &mut tape,
+                    first.gradient_node(x).expect("custom input gradient node"),
+                    &[0.5, -1.0, 2.0, -0.5],
+                    mode,
+                );
+                if add {
+                    let source_term = routing_contract(
+                        &mut tape,
+                        first
+                            .gradient_node(src)
+                            .expect("custom source gradient node"),
+                        &[0.25, 1.5, -2.0],
+                        mode,
+                    );
+                    objective = tape
+                        .add(objective, source_term, mode)
+                        .expect("custom joint contraction")
+                        .0;
+                }
+                for create_graph in [false, true] {
+                    let second = tape
+                        .backward_with_options(objective, routing_options(mode, create_graph))
+                        .expect("differentiate F32 custom upstream");
+                    let expected = if add {
+                        [1.0, 1.5, 4.0, -5.0]
+                    } else {
+                        [0.0, -2.0, 4.0, 0.0]
+                    };
+                    assert_eq!(
+                        second
+                            .gradient(x)
+                            .expect("custom second derivative reaches input"),
+                        &expected
+                    );
+                    if add {
+                        assert_eq!(
+                            second
+                                .gradient(src)
+                                .expect("custom second derivative reaches source"),
+                            &[1.5, 1.5, -5.0]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    fn piecewise_activation(
+        tape: &mut TensorTape,
+        x: TensorNodeId,
+        kind: usize,
+        mode: ExecutionMode,
+    ) -> TensorNodeId {
+        match kind {
+            0 => tape.leaky_relu(x, mode).expect("leaky_relu").0,
+            1 => tape.hardsigmoid(x, mode).expect("hardsigmoid").0,
+            _ => tape.hardtanh(x, mode).expect("hardtanh").0,
+        }
+    }
+
+    fn assert_piecewise_relative(label: &str, actual: &[f64], expected: &[f64], relative: f64) {
+        assert_eq!(actual.len(), expected.len(), "{label}: gradient length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if expected == 0.0 {
+                assert_eq!(actual, 0.0, "{label}[{index}]");
+            } else {
+                assert!(
+                    (actual - expected).abs() <= relative * expected.abs(),
+                    "{label}[{index}]: actual={actual:.17e}, expected={expected:.17e}"
+                );
+            }
+        }
+    }
+
+    fn check_piecewise_cubic_higher_derivatives(kind: usize) {
+        // Each activation is affine on the chosen input regions. These are fixed
+        // mathematical outputs/slopes, independent of the implementation's predicates.
+        let (output, slope): ([f64; 6], [f64; 6]) = match kind {
+            0 => (
+                [-0.04, -0.02, -0.005, 0.5, 2.0, 4.0],
+                [0.01, 0.01, 0.01, 1.0, 1.0, 1.0],
+            ),
+            1 => (
+                [0.0, 1.0 / 6.0, 5.0 / 12.0, 7.0 / 12.0, 5.0 / 6.0, 1.0],
+                [0.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 0.0],
+            ),
+            _ => (
+                [-1.0, -1.0, -0.5, 0.5, 1.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+            ),
+        };
+        let weights = [0.5, -1.0, 2.0, -0.25, 1.5, -2.0];
+        let direction = [1.0, -0.5, 2.0, -1.0, 0.25, 1.5];
+        // L=sum(g*y^3), y=a*x+b locally:
+        // dL/dx=3*g*a*y^2; H*v=6*g*a^2*y*v; d/dg<dL/dx,v>=3*a*y^2*v.
+        // Differentiating sum(H*v) gives 6*g*a^3*v with respect to x and
+        // 6*a^2*y*v with respect to g. Nonzero small slopes use relative-only checks.
+        let expected_first: [f64; 6] =
+            std::array::from_fn(|i| 3.0 * weights[i] * slope[i] * output[i] * output[i]);
+        let expected_hvp: [f64; 6] = std::array::from_fn(|i| {
+            6.0 * weights[i] * slope[i] * slope[i] * output[i] * direction[i]
+        });
+        let expected_mixed: [f64; 6] =
+            std::array::from_fn(|i| 3.0 * slope[i] * output[i] * output[i] * direction[i]);
+        let expected_third: [f64; 6] = std::array::from_fn(|i| {
+            6.0 * weights[i] * slope[i] * slope[i] * slope[i] * direction[i]
+        });
+        let expected_third_upstream: [f64; 6] =
+            std::array::from_fn(|i| 6.0 * slope[i] * slope[i] * output[i] * direction[i]);
+        for f32_leaf in [false, true] {
+            let relative = if f32_leaf { 2.0e-6 } else { 3.0e-13 };
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for disable_forward_recording in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let x = routing_leaf(
+                        &mut tape,
+                        &[-4.0, -2.0, -0.5, 0.5, 2.0, 4.0],
+                        &[2, 3],
+                        f32_leaf,
+                    );
+                    let upstream = routing_leaf(&mut tape, &weights, &[2, 3], f32_leaf);
+                    let y = piecewise_activation(&mut tape, x, kind, mode);
+                    let (square, _) = tape.mul(y, y, mode).expect("activation square");
+                    let (cube, _) = tape.mul(square, y, mode).expect("activation cube");
+                    let (weighted, _) = tape
+                        .mul(cube, upstream, mode)
+                        .expect("weighted activation cube");
+                    let (loss, _) = tape.sum(weighted, mode).expect("activation loss");
+                    let ordinary = tape
+                        .backward_with_options(loss, routing_options(mode, false))
+                        .expect("ordinary activation gradient");
+                    tape.set_grad_enabled(!disable_forward_recording);
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, true))
+                        .expect("graph activation gradient");
+                    assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                    assert_piecewise_relative(
+                        "ordinary activation gradient",
+                        ordinary
+                            .gradient(x)
+                            .expect("ordinary activation gradient reaches x"),
+                        &expected_first,
+                        relative,
+                    );
+                    assert_piecewise_relative(
+                        "graph activation gradient",
+                        first
+                            .gradient(x)
+                            .expect("graph activation gradient reaches x"),
+                        &expected_first,
+                        relative,
+                    );
+                    tape.set_grad_enabled(true);
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).expect("activation gradient node"),
+                        &direction,
+                        mode,
+                    );
+                    for create_graph in [false, true] {
+                        tape.set_grad_enabled(!disable_forward_recording);
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, create_graph))
+                            .expect("activation Hessian-vector product");
+                        assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                        assert_piecewise_relative(
+                            "activation HVP",
+                            second.gradient(x).expect("activation Hessian reaches x"),
+                            &expected_hvp,
+                            relative,
+                        );
+                        assert_piecewise_relative(
+                            "activation upstream mixed derivative",
+                            second
+                                .gradient(upstream)
+                                .expect("activation mixed derivative reaches upstream"),
+                            &expected_mixed,
+                            relative,
+                        );
+                        if create_graph {
+                            tape.set_grad_enabled(true);
+                            let (third_loss, _) = tape
+                                .sum(
+                                    second.gradient_node(x).expect("activation Hessian node"),
+                                    mode,
+                                )
+                                .expect("activation Hessian sum");
+                            tape.set_grad_enabled(!disable_forward_recording);
+                            let third = tape
+                                .backward_with_options(third_loss, routing_options(mode, false))
+                                .expect("activation third derivative");
+                            assert_eq!(tape.is_grad_enabled(), !disable_forward_recording);
+                            assert_piecewise_relative(
+                                "activation third derivative",
+                                third
+                                    .gradient(x)
+                                    .expect("activation third derivative reaches x"),
+                                &expected_third,
+                                relative,
+                            );
+                            assert_piecewise_relative(
+                                "activation third upstream derivative",
+                                third
+                                    .gradient(upstream)
+                                    .expect("activation third derivative reaches upstream"),
+                                &expected_third_upstream,
+                                relative,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_piecewise_ieee(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "element {index} should remain NaN");
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "element {index}");
+            }
+        }
+    }
+
+    fn check_piecewise_boundary_nonfinite_upstreams(kind: usize) {
+        let inputs = [
+            f64::NEG_INFINITY,
+            -4.0,
+            -3.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            3.0,
+            4.0,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        // Preserve the existing native conventions: zero/NaN use the leaky slope;
+        // hardsigmoid and hardtanh exclude finite endpoints but pass NaN through
+        // their interior-slope branch. This change concerns graph dependencies.
+        let slopes: [f64; 11] = match kind {
+            0 => [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 1.0, 1.0, 1.0, 1.0, 0.01],
+            1 => [
+                0.0,
+                0.0,
+                0.0,
+                1.0 / 6.0,
+                1.0 / 6.0,
+                1.0 / 6.0,
+                1.0 / 6.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0 / 6.0,
+            ],
+            _ => [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        let second_seed = [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            3.0,
+            -0.0,
+            0.0,
+            1.0,
+            -2.0,
+            f64::INFINITY,
+            f64::NAN,
+            f64::NEG_INFINITY,
+        ];
+        let expected_mixed: [f64; 11] = std::array::from_fn(|i| second_seed[i] * slopes[i]);
+        for f32_leaf in [false, true] {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for upstream_values in [
+                    [1.0, -2.0, 0.5, 3.0, -1.0, 2.0, -3.0, 0.25, -0.5, 4.0, -4.0],
+                    [
+                        f64::INFINITY,
+                        f64::NAN,
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                        -0.0,
+                        0.0,
+                        f64::NEG_INFINITY,
+                        f64::NAN,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                    ],
+                ] {
+                    let mut tape = TensorTape::new();
+                    let x = routing_leaf(&mut tape, &inputs, &[11], f32_leaf);
+                    let upstream = routing_leaf(&mut tape, &upstream_values, &[11], f32_leaf);
+                    let y = piecewise_activation(&mut tape, x, kind, mode);
+                    let (weighted, _) = tape
+                        .mul(y, upstream, mode)
+                        .expect("boundary weighted activation");
+                    let (loss, _) = tape.sum(weighted, mode).expect("boundary activation sum");
+                    let ordinary = tape
+                        .backward_with_options(loss, routing_options(mode, false))
+                        .expect("ordinary boundary backward");
+                    let first = tape
+                        .backward_with_options(loss, routing_options(mode, true))
+                        .expect("graph boundary backward");
+                    let expected: [f64; 11] =
+                        std::array::from_fn(|i| upstream_values[i] * slopes[i]);
+                    // These activations multiply by a slope, unlike routing selection:
+                    // an infinite/NaN upstream times zero must continue to yield NaN.
+                    assert_piecewise_ieee(
+                        ordinary.gradient(x).expect("ordinary boundary gradient"),
+                        &expected,
+                    );
+                    assert_piecewise_ieee(
+                        first.gradient(x).expect("graph boundary gradient"),
+                        &expected,
+                    );
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).expect("boundary gradient node"),
+                        &second_seed,
+                        mode,
+                    );
+                    for create_graph in [false, true] {
+                        let second = tape
+                            .backward_with_options(objective, routing_options(mode, create_graph))
+                            .expect("boundary mixed backward");
+                        assert_piecewise_ieee(
+                            second
+                                .gradient(upstream)
+                                .expect("boundary mixed derivative reaches upstream"),
+                            &expected_mixed,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_leaky_relu_cubic_hvps_and_third_derivatives() {
+        check_piecewise_cubic_higher_derivatives(0);
+    }
+
+    #[test]
+    fn create_graph_hardsigmoid_cubic_hvps_and_third_derivatives() {
+        check_piecewise_cubic_higher_derivatives(1);
+    }
+
+    #[test]
+    fn create_graph_hardtanh_cubic_hvps_and_third_derivatives() {
+        check_piecewise_cubic_higher_derivatives(2);
+    }
+
+    #[test]
+    fn create_graph_leaky_relu_boundary_nonfinite_upstreams() {
+        check_piecewise_boundary_nonfinite_upstreams(0);
+    }
+
+    #[test]
+    fn create_graph_hardsigmoid_boundary_nonfinite_upstreams() {
+        check_piecewise_boundary_nonfinite_upstreams(1);
+    }
+
+    #[test]
+    fn create_graph_hardtanh_boundary_nonfinite_upstreams() {
+        check_piecewise_boundary_nonfinite_upstreams(2);
     }
 }
