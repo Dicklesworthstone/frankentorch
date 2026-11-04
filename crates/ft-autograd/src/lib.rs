@@ -17143,32 +17143,31 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::CumProd { input, dim } => {
-                    // grad_x = reverse_cumsum(grad_y * y) / x, where y is the cumprod
-                    // output (node_id). This division form is exact and differentiable
-                    // when no input element is zero (the common case). The zero case
-                    // needs a weighted reverse-scan primitive not yet available, so it
-                    // errors loudly (rather than producing NaN/inf — parity-safe).
+                    // The quotient rule is valid only when every input is nonzero.
+                    // At a zero, build the polynomial's omitted products instead:
+                    // masking a division by zero would lose mixed higher derivatives.
                     let x_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    if x_vals.contains(&0.0) {
-                        return Err(AutogradError::Dispatch(
-                            DispatchKeyError::IncompatibleSet {
-                                reason:
-                                    "create_graph for cumprod with zero inputs is not yet supported",
-                            }
-                            .into(),
-                        ));
-                    }
-                    let gy_y = self.cg_mul(incoming_id, node_id)?;
-                    let flipped = self.cg_flip(gy_y, vec![dim])?;
-                    let cs = self.cg_cumsum(flipped, dim)?;
-                    let rev_cumsum = self.cg_flip(cs, vec![dim])?;
-                    let grad_x = self.cg_div(rev_cumsum, input)?;
+                    let (grad_x, rule) = if x_vals.contains(&0.0) {
+                        (
+                            self.cg_cumprod_backward_with_zeros(input, incoming_id, dim)?,
+                            "d(cumprod(x))/dx=sum(grad*omitted_products) (cg, zeros)",
+                        )
+                    } else {
+                        let gy_y = self.cg_mul(incoming_id, node_id)?;
+                        let flipped = self.cg_flip(gy_y, vec![dim])?;
+                        let cs = self.cg_cumsum(flipped, dim)?;
+                        let rev_cumsum = self.cg_flip(cs, vec![dim])?;
+                        (
+                            self.cg_div(rev_cumsum, input)?,
+                            "d(cumprod(x))/dx=reverse_cumsum(grad*y)/x (cg, nonzero)",
+                        )
+                    };
                     self.cg_accumulate(input, &mut grad_nodes, grad_x)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                        rule: "d(cumprod(x))/dx=reverse_cumsum(grad*y)/x (cg, nonzero)",
+                        rule,
                     });
                 }
                 TensorNodeOp::Div { lhs, rhs } => {
@@ -20195,6 +20194,72 @@ impl TensorTape {
             op: TensorNodeOp::CumProd { input, dim },
         });
         Ok(out)
+    }
+
+    /// Differentiable cumprod adjoint for inputs containing zeros. For position
+    /// k, dy[j]/dx[k] is the product of x[..=j] with x[k] omitted (j >= k).
+    /// Prefix products and suffix cumprods keep this polynomial on the tape,
+    /// including mixed derivatives that are nonzero at multiple zero inputs.
+    ///
+    /// This follows PyTorch's higher-order omitted-products path. It deliberately
+    /// uses O(n^2) work along the scan axis: factoring into a weighted reverse
+    /// recurrence changes IEEE behavior for zeros mixed with infinity/overflow.
+    /// The existing O(n) quotient path remains in use for nonzero inputs.
+    fn cg_cumprod_backward_with_zeros(
+        &mut self,
+        input: TensorNodeId,
+        incoming: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let meta = self.node(input)?.tensor.meta();
+        let shape = meta.shape().to_vec();
+        let device = meta.device();
+        let n = shape[dim];
+        if n <= 1 || meta.numel() == 0 {
+            return Ok(incoming);
+        }
+        let input = self.cg_to_f64(input)?;
+        let mut slice_shape = shape.clone();
+        slice_shape[dim] = 1;
+        let slice_numel =
+            Self::checked_shape_numel(&slice_shape, "cumprod cg slice volume overflow")?;
+        let ones = self.leaf_tensor(
+            DenseTensor::from_storage(
+                TensorMeta::from_shape(slice_shape.clone(), DType::F64, device),
+                vec![1.0; slice_numel],
+            )?,
+            false,
+        );
+        let mut slices = Vec::with_capacity(n);
+        for k in 0..n {
+            let prefix = if k == 0 {
+                ones
+            } else {
+                let before = self.narrow(input, dim, 0, k)?;
+                let (product, _) = self.prod_dim(before, dim, ExecutionMode::Strict)?;
+                self.cg_reshape(product, slice_shape.clone())?
+            };
+            let omitted = if k == n - 1 {
+                prefix
+            } else {
+                let after = self.narrow(input, dim, k + 1, n - k - 1)?;
+                let suffix = self.cg_cumprod(after, dim)?;
+                let tail = if k == 0 {
+                    suffix
+                } else {
+                    let mut tail_shape = shape.clone();
+                    tail_shape[dim] = n - k - 1;
+                    let expanded = self.cg_broadcast_along_dim(prefix, dim, &tail_shape)?;
+                    self.cg_mul(expanded, suffix)?
+                };
+                self.cat(&[prefix, tail], dim, ExecutionMode::Strict)?.0
+            };
+            let grad_tail = self.narrow(incoming, dim, k, n - k)?;
+            let weighted = self.cg_mul(grad_tail, omitted)?;
+            let summed = self.cg_sum_dim(weighted, dim)?;
+            slices.push(self.cg_reshape(summed, slice_shape.clone())?);
+        }
+        Ok(self.cat(&slices, dim, ExecutionMode::Strict)?.0)
     }
 
     /// Helper: index_select along `dim` for create_graph backward in F64 gradient space.
@@ -30521,24 +30586,299 @@ mod tests {
     }
 
     #[test]
-    fn create_graph_cumprod_with_zero_errors_cleanly() {
-        // The division form is invalid with zeros; create_graph must error loudly
-        // (not produce NaN/inf). Parity-safe documented limitation.
-        let mut tape = TensorTape::new();
-        let x = tape.leaf(vec![2.0, 0.0, 4.0], vec![3], true).expect("x");
-        let (y, _) = tape.cumprod(x, 0, ExecutionMode::Strict).expect("cumprod");
-        let (loss, _) = tape.sum(y, ExecutionMode::Strict).expect("sum");
-        let result = tape.backward_with_options(
-            loss,
-            BackwardOptions {
-                create_graph: true,
-                ..BackwardOptions::strict_default()
-            },
-        );
-        assert!(
-            result.is_err(),
-            "create_graph cumprod with a zero input should error, not produce NaN"
-        );
+    fn create_graph_cumprod_zeros_have_polynomial_derivatives() {
+        // f(a,b,c)=a+ab+abc. A zero can occur anywhere, and two zeros may
+        // erase a first derivative while leaving mixed higher derivatives.
+        let cases = [
+            ([2.0, 0.0, 4.0], [1.0, 10.0, 0.0], [5.0, 7.0, 2.0]),
+            ([0.0, 3.0, 4.0], [16.0, 0.0, 0.0], [8.0, 5.0, 3.0]),
+            ([2.0, 3.0, 0.0], [4.0, 2.0, 6.0], [4.0, 3.0, 5.0]),
+            ([0.0, 0.0, 4.0], [1.0, 0.0, 0.0], [5.0, 5.0, 0.0]),
+            ([2.0, 0.0, 0.0], [1.0, 2.0, 0.0], [1.0, 3.0, 2.0]),
+            ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for (values, expected_first, expected_second) in cases {
+                    let mut tape = TensorTape::new();
+                    let tensor =
+                        DenseTensor::from_contiguous_values(values.to_vec(), vec![3], Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let x = tape.leaf_tensor(tensor, true);
+                    let (y, _) = tape.cumprod(x, 0, mode).unwrap();
+                    let (loss, _) = tape.sum(y, mode).unwrap();
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .expect("cumprod higher derivatives must support zero inputs");
+                    assert_eq!(first.gradient(x).unwrap(), expected_first);
+                    let first_node = first.gradient_node(x).unwrap();
+                    let second = tape
+                        .grad_with_options(first_node, routing_options(mode, true))
+                        .expect("cumprod Hessian at zero");
+                    assert_eq!(second.gradient(x).unwrap(), expected_second);
+                    let third = tape
+                        .grad_with_options(
+                            second.gradient_node(x).unwrap(),
+                            routing_options(mode, false),
+                        )
+                        .expect("cumprod third derivative at zero");
+                    assert_eq!(third.gradient(x).unwrap(), [2.0, 2.0, 2.0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_cumprod_zeros_preserve_nonlinear_upstream_gradients() {
+        // Independent polynomial oracle for
+        // f(a,b,c)=.5*(a^2+a) - ((ab)^2+ab) + 2*((abc)^2+abc).
+        // The direction is v=[.5,-1,2]; the third vector is d(sum(H*v))/dx.
+        // A detached incoming gradient would lose the squared terms' Hessian.
+        let cases = [
+            (
+                [2.0, 0.0, 4.0],
+                [2.5, 14.0, 0.0],
+                [-6.5, -236.5, -4.0],
+                [-246.0, 9.0, -129.0],
+            ),
+            (
+                [0.0, 3.0, 4.0],
+                [21.5, 0.0, 0.0],
+                [284.5, 3.5, 3.0],
+                [536.0, 191.0, 143.0],
+            ),
+            (
+                [2.0, 3.0, 0.0],
+                [-36.5, -26.0, 12.0],
+                [28.5, 3.5, 287.0],
+                [304.0, 195.0, 455.0],
+            ),
+            (
+                [0.0, 0.0, 4.0],
+                [0.5, 0.0, 0.0],
+                [-6.5, 3.5, 0.0],
+                [2.0, 5.0, -1.0],
+            ),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for (values, expected_first, expected_hvp, expected_third) in cases {
+                    let mut tape = TensorTape::new();
+                    let tensor =
+                        DenseTensor::from_contiguous_values(values.to_vec(), vec![3], Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let x = tape.leaf_tensor(tensor, true);
+                    let (y, _) = tape.cumprod(x, 0, mode).unwrap();
+                    let (square, _) = tape.mul(y, y, mode).unwrap();
+                    let (quadratic, _) = tape.add(square, y, mode).unwrap();
+                    let weights = DenseTensor::from_contiguous_values(
+                        vec![0.5, -1.0, 2.0],
+                        vec![3],
+                        Device::Cpu,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                    let weights = tape.leaf_tensor(weights, false);
+                    let (weighted, _) = tape.mul(quadratic, weights, mode).unwrap();
+                    let (loss, _) = tape.sum(weighted, mode).unwrap();
+
+                    // Differentiable backward must record its own graph even
+                    // when a caller disables forward recording, then restore it.
+                    tape.set_grad_enabled(false);
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .expect("nonlinear cumprod gradient at zero");
+                    assert!(!tape.is_grad_enabled());
+                    assert_eq!(first.gradient(x).unwrap(), expected_first);
+                    tape.set_grad_enabled(true);
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).unwrap(),
+                        &[0.5, -1.0, 2.0],
+                        mode,
+                    );
+                    for create_graph in [false, true] {
+                        let second = tape
+                            .grad_with_options(objective, routing_options(mode, create_graph))
+                            .expect("nonlinear cumprod Hessian-vector product at zero");
+                        assert_eq!(second.gradient(x).unwrap(), expected_hvp);
+                        if create_graph {
+                            let third = tape
+                                .grad_with_options(
+                                    second.gradient_node(x).unwrap(),
+                                    routing_options(mode, false),
+                                )
+                                .expect("nonlinear cumprod third derivative at zero");
+                            assert_eq!(third.gradient(x).unwrap(), expected_third);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_cumprod_zeros_keep_scan_axes_and_offset_views() {
+        // Four independent length-three scan lanes. The same values are
+        // exercised on dim 0, dim 1, and a middle axis with inner_size=2.
+        let lanes = [
+            [2.0, 0.0, 4.0],
+            [0.0, 3.0, 4.0],
+            [2.0, 3.0, 0.0],
+            [0.0, 0.0, 4.0],
+        ];
+        let first_lanes = [
+            [1.0, 10.0, 0.0],
+            [16.0, 0.0, 0.0],
+            [4.0, 2.0, 6.0],
+            [1.0, 0.0, 0.0],
+        ];
+        let second_lanes = [
+            [5.0, 7.0, 2.0],
+            [8.0, 5.0, 3.0],
+            [4.0, 3.0, 5.0],
+            [5.0, 5.0, 0.0],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for (shape, dim) in [(vec![3, 4], 0), (vec![4, 3], 1), (vec![2, 3, 2], 1)] {
+                    let inner: usize = shape[dim + 1..].iter().product();
+                    let outer: usize = shape[..dim].iter().product();
+                    let interleave = |rows: &[[f64; 3]; 4]| {
+                        let mut values = Vec::with_capacity(12);
+                        for o in 0..outer {
+                            for k in 0..3 {
+                                for i in 0..inner {
+                                    values.push(rows[o * inner + i][k]);
+                                }
+                            }
+                        }
+                        values
+                    };
+                    let values = interleave(&lanes);
+                    let expected_first = interleave(&first_lanes);
+                    let expected_second = interleave(&second_lanes);
+                    // A nonzero storage offset must not become a new base index
+                    // in any of the suffix/prefix views built by backward.
+                    let row_size: usize = shape[1..].iter().product();
+                    let mut storage = vec![9.0; row_size];
+                    storage.extend_from_slice(&values);
+                    storage.extend_from_slice(&vec![9.0; row_size]);
+                    let mut base_shape = shape.clone();
+                    base_shape[0] += 2;
+                    let tensor =
+                        DenseTensor::from_contiguous_values(storage, base_shape, Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let mut tape = TensorTape::new();
+                    let base = tape.leaf_tensor(tensor, true);
+                    let x = tape.narrow(base, 0, 1, shape[0]).unwrap();
+                    assert_eq!(tape.tensor_meta(x).unwrap().storage_offset(), row_size);
+                    let (y, _) = tape.cumprod(x, dim, mode).unwrap();
+                    let (loss, _) = tape.sum(y, mode).unwrap();
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .unwrap();
+                    assert_eq!(first.gradient(x).unwrap(), expected_first);
+                    let first_node = first.gradient_node(x).unwrap();
+                    assert_eq!(tape.tensor_meta(first_node).unwrap().shape(), shape);
+                    assert_eq!(tape.tensor_meta(first_node).unwrap().dtype(), DType::F64);
+                    let second = tape
+                        .grad_with_options(first_node, routing_options(mode, true))
+                        .unwrap();
+                    assert_eq!(second.gradient(x).unwrap(), expected_second);
+                    let third = tape
+                        .grad_with_options(
+                            second.gradient_node(x).unwrap(),
+                            routing_options(mode, false),
+                        )
+                        .unwrap();
+                    assert_eq!(third.gradient(x).unwrap(), vec![2.0; 12]);
+                    for report in [&first, &second, &third] {
+                        let base_grad = report.gradient(base).unwrap();
+                        assert_eq!(&base_grad[..row_size], vec![0.0; row_size]);
+                        assert_eq!(
+                            &base_grad[row_size..row_size + 12],
+                            report.gradient(x).unwrap()
+                        );
+                        assert_eq!(&base_grad[row_size + 12..], vec![0.0; row_size]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_cumprod_empty_and_zero_singleton_axes() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for (shape, dim) in [(vec![0, 3], 0), (vec![2, 0, 3], 1), (vec![0, 3], 1)] {
+                    let mut tape = TensorTape::new();
+                    let tensor =
+                        DenseTensor::from_contiguous_values(Vec::new(), shape.clone(), Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let x = tape.leaf_tensor(tensor, true);
+                    let (y, _) = tape.cumprod(x, dim, mode).unwrap();
+                    let (loss, _) = tape.sum(y, mode).unwrap();
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .unwrap();
+                    assert_eq!(first.gradient(x).unwrap(), &[]);
+                    assert_eq!(
+                        tape.tensor_meta(first.gradient_node(x).unwrap())
+                            .unwrap()
+                            .shape(),
+                        shape
+                    );
+                }
+                let mut tape = TensorTape::new();
+                let tensor =
+                    DenseTensor::from_contiguous_values(vec![0.0, 2.0], vec![2, 1], Device::Cpu)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                let x = tape.leaf_tensor(tensor, true);
+                let (y, _) = tape.cumprod(x, 1, mode).unwrap();
+                let (loss, _) = tape.mul(y, y, mode).unwrap();
+                let first = tape
+                    .grad_with_options(loss, routing_options(mode, true))
+                    .unwrap();
+                assert_eq!(first.gradient(x).unwrap(), &[0.0, 4.0]);
+                let second = tape
+                    .grad_with_options(
+                        first.gradient_node(x).unwrap(),
+                        routing_options(mode, false),
+                    )
+                    .unwrap();
+                assert_eq!(second.gradient(x).unwrap(), &[2.0, 2.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_cumprod_zeros_do_not_reassociate_nonfinite_products() {
+        // PyTorch's omitted products yield [NaN, 0, NaN] for [0, inf, 0].
+        // A factored reverse weighted scan incorrectly returns infinity at 0.
+        for middle in [f64::INFINITY, f64::NEG_INFINITY] {
+            let mut tape = TensorTape::new();
+            let x = tape.leaf(vec![0.0, middle, 0.0], vec![3], true).unwrap();
+            let (y, _) = tape.cumprod(x, 0, ExecutionMode::Strict).unwrap();
+            let first = tape
+                .grad_with_options(y, routing_options(ExecutionMode::Strict, true))
+                .unwrap();
+            let gradient = first.gradient(x).unwrap();
+            assert!(gradient[0].is_nan());
+            assert_eq!(gradient[1], 0.0);
+            assert!(gradient[2].is_nan());
+        }
     }
 
     #[test]
