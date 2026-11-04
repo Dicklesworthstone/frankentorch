@@ -246,6 +246,27 @@ mod gemm {
         m.div_ceil(threads).max(MIN_BLOCK_ROWS)
     }
 
+    fn should_use_2d_dgemm(m: usize, n: usize) -> bool {
+        if n < 2 * MIN_BLOCK_COLS {
+            return false;
+        }
+        if super::matrix_exp_fast_kernel() {
+            let threads = rayon::current_num_threads().max(1);
+            let (p, q) = tile_grid(threads);
+            let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
+            let nb = if crate::gemm_tile_col_floor_adaptive() {
+                n.div_ceil(q).max(MIN_BLOCK_COLS_ADAPTIVE)
+            } else {
+                n.div_ceil(q).max(MIN_BLOCK_COLS)
+            };
+            let tiles_2d = m.div_ceil(mb) * n.div_ceil(nb);
+            let tiles_1d = m.div_ceil(block_rows(m));
+            tiles_2d >= tiles_1d.min(threads)
+        } else {
+            true
+        }
+    }
+
     fn should_use_f32_reused_output_2d_tiling(m: usize, k: usize, n: usize) -> bool {
         n >= 2 * MIN_BLOCK_COLS
             && k > F32_2D_MAX_K
@@ -268,7 +289,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) || should_parallelize_householder_skinny(m, k, n) {
             dgemm_col_parallel(m, k, n, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS {
+            if should_use_2d_dgemm(m, n) {
                 // Square/wide-enough: 2-D tiling avoids the row-split's full-B
                 // re-streaming per thread (memory-bandwidth bound).
                 dgemm_2d_parallel(m, k, n, a, b, c);
@@ -305,7 +326,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) {
             dgemm_col_parallel_scaled(m, k, n, alpha, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS {
+            if should_use_2d_dgemm(m, n) {
                 dgemm_2d_parallel_scaled(m, k, n, alpha, a, b, c);
             } else {
                 let br = block_rows(m);
@@ -1478,25 +1499,57 @@ mod gemm {
             return;
         }
         DGEMM_SUB_COL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if crate::lu_fast_kernel() && col_blocks <= 1 {
-            unsafe {
-                dgemm_mm(
-                    m,
-                    k,
-                    n,
-                    -1.0,
-                    a.as_ptr(),
-                    k as isize,
-                    1,
-                    b.as_ptr(),
-                    n as isize,
-                    1,
-                    1.0,
-                    cp.0.add(c_off),
-                    ldc as isize,
-                    1,
-                );
+        if crate::lu_fast_kernel() {
+            let nb_fast = if n > 64 && m >= 128 && k >= 32 {
+                ((n.div_ceil(threads) + 15) & !15).max(32)
+            } else {
+                nb
+            };
+            let fast_col_blocks = n.div_ceil(nb_fast);
+            if fast_col_blocks <= 1 {
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        n,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr(),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off),
+                        ldc as isize,
+                        1,
+                    );
+                }
+                return;
             }
+            (0..fast_col_blocks).into_par_iter().for_each(|blk| {
+                let cp = &cp;
+                let n0 = blk * nb_fast;
+                let bw = (n0 + nb_fast).min(n) - n0;
+                unsafe {
+                    dgemm_mm(
+                        m,
+                        k,
+                        bw,
+                        -1.0,
+                        a.as_ptr(),
+                        k as isize,
+                        1,
+                        b.as_ptr().add(n0),
+                        n as isize,
+                        1,
+                        1.0,
+                        cp.0.add(c_off + n0),
+                        ldc as isize,
+                        1,
+                    );
+                }
+            });
             return;
         }
         (0..col_blocks).into_par_iter().for_each(|blk| {
@@ -2735,7 +2788,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) {
             sgemm_col_parallel(m, k, n, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS && k <= F32_2D_MAX_K {
+            if should_use_2d_dgemm(m, n) && k <= F32_2D_MAX_K {
                 // Bandwidth-bound regime: 2-D tiling cuts the row-split's full-B
                 // re-streaming per thread (direct-write, bit-exact). K-gated so the
                 // compute-bound large-K case keeps the row split.
@@ -2771,7 +2824,7 @@ mod gemm {
         if should_parallelize_cols(m, k, n) {
             sgemm_col_parallel_scaled(m, k, n, alpha, a, b, c);
         } else if should_parallelize(m, k, n) {
-            if n >= 2 * MIN_BLOCK_COLS && k <= F32_2D_MAX_K {
+            if should_use_2d_dgemm(m, n) && k <= F32_2D_MAX_K {
                 sgemm_2d_parallel_scaled(m, k, n, alpha, a, b, c);
             } else {
                 let br = block_rows(m);
@@ -6215,6 +6268,11 @@ pub fn sdpa_forward_masked_f64(
                     m = *s;
                 }
             }
+            // Fully masked rows contribute zero; genuine NaNs still propagate.
+            if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                row.fill(0.0);
+                continue;
+            }
             let mut sum = 0.0f64;
             for s in row.iter_mut() {
                 let e = (*s - m).exp();
@@ -6321,6 +6379,11 @@ pub fn sdpa_forward_masked_gqa_f64(
                 if *s > m {
                     m = *s;
                 }
+            }
+            // Fully masked rows contribute zero; genuine NaNs still propagate.
+            if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                row.fill(0.0);
+                continue;
             }
             let mut sum = 0.0f64;
             for s in row.iter_mut() {
@@ -7018,6 +7081,11 @@ pub fn sdpa_backward_masked_f64(
                     if *s > m {
                         m = *s;
                     }
+                }
+                // Fully masked rows contribute zero; genuine NaNs still propagate.
+                if m == f64::NEG_INFINITY && row.iter().all(|&s| s == f64::NEG_INFINITY) {
+                    row.fill(0.0);
+                    continue;
                 }
                 let mut sum = 0.0f64;
                 for s in row.iter_mut() {
@@ -11297,6 +11365,13 @@ pub fn conv2d_backward_masked_f32(
     };
 
     let dweight = output_mask[1].then(|| {
+        // Frozen inputs still train weights. Reuse the same size-gated streamed
+        // reduction as the both-gradient route before allocating an im2col panel.
+        if let Some(dweight) = conv2d_dweight_streamed_f32_if_enabled(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        ) {
+            return dweight;
+        }
         let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         build_uninit(out_ch * patch_width, |dw: &mut [f32]| {
             if out_ch == 0 || patch_width == 0 || flat == 0 {
@@ -12765,6 +12840,13 @@ pub fn conv2d_backward_masked_f64(
     };
 
     let dweight = output_mask[1].then(|| {
+        // Keep frozen-input training on the same bounded-panel reduction as the
+        // both-gradient route, including its size gate and legacy fallback.
+        if let Some(dweight) = conv2d_dweight_streamed_f64_if_enabled(
+            &dout_flat, padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
+        ) {
+            return dweight;
+        }
         let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
         build_uninit(out_ch * patch_width, |dw: &mut [f64]| {
             if out_ch == 0 || patch_width == 0 {
@@ -26693,8 +26775,13 @@ fn lu_factor_panel_recursive_f64(
             let __t_swap = std::time::Instant::now();
             if max_row != k {
                 pivots.swap(k, max_row);
-                for j in 0..n {
-                    lu.swap(k * n + j, max_row * n + j);
+                if fast {
+                    let (before, from_max) = lu.split_at_mut(max_row * n);
+                    before[k * n..(k + 1) * n].swap_with_slice(&mut from_max[..n]);
+                } else {
+                    for j in 0..n {
+                        lu.swap(k * n + j, max_row * n + j);
+                    }
                 }
             }
             stage_family_add(
@@ -26722,33 +26809,7 @@ fn lu_factor_panel_recursive_f64(
             } else if fast {
                 let (head, tail) = lu.split_at_mut((k + 1) * n);
                 let pivot_row = &head[k * n + (k + 1)..k * n + end];
-                let mut chunks = tail.chunks_exact_mut(4 * n);
-                for block in &mut chunks {
-                    let (r0, rest) = block.split_at_mut(n);
-                    let (r1, rest) = rest.split_at_mut(n);
-                    let (r2, r3) = rest.split_at_mut(n);
-                    let m0 = r0[k] / diag;
-                    let m1 = r1[k] / diag;
-                    let m2 = r2[k] / diag;
-                    let m3 = r3[k] / diag;
-                    r0[k] = m0;
-                    r1[k] = m1;
-                    r2[k] = m2;
-                    r3[k] = m3;
-                    for ((((d0, d1), d2), d3), &piv) in r0[(k + 1)..end]
-                        .iter_mut()
-                        .zip(&mut r1[(k + 1)..end])
-                        .zip(&mut r2[(k + 1)..end])
-                        .zip(&mut r3[(k + 1)..end])
-                        .zip(pivot_row)
-                    {
-                        *d0 -= m0 * piv;
-                        *d1 -= m1 * piv;
-                        *d2 -= m2 * piv;
-                        *d3 -= m3 * piv;
-                    }
-                }
-                for row in chunks.into_remainder().chunks_mut(n) {
+                for row in tail.chunks_exact_mut(n) {
                     let multiplier = row[k] / diag;
                     row[k] = multiplier;
                     for (dst, &piv) in row[(k + 1)..end].iter_mut().zip(pivot_row) {
@@ -30697,6 +30758,19 @@ pub fn matrix_exp_batched_contiguous_f32(
     Ok(out)
 }
 
+static MATRIX_EXP_FAST_KERNEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_matrix_exp_fast_kernel(on: bool) -> bool {
+    MATRIX_EXP_FAST_KERNEL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn matrix_exp_fast_kernel() -> bool {
+    MATRIX_EXP_FAST_KERNEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
@@ -30712,6 +30786,186 @@ pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
     }
 
     let offset = meta.storage_offset();
+    if matrix_exp_fast_kernel() {
+        let nn = n * n;
+        let src = &data[offset..offset + nn];
+        let mut col_sums = vec![0.0f64; n];
+        for row in src.chunks_exact(n) {
+            for (cs, &v) in col_sums.iter_mut().zip(row.iter()) {
+                *cs += v.abs();
+            }
+        }
+        let norm = col_sums.into_iter().fold(0.0f64, f64::max);
+        let s = if norm > 0.5 {
+            (norm / 0.5).log2().ceil() as u32
+        } else {
+            0
+        };
+        let scale = 0.5f64.powi(s as i32);
+        let b: Vec<f64> = if s == 0 {
+            src.to_vec()
+        } else {
+            src.iter().map(|&v| v * scale).collect()
+        };
+
+        // Paterson-Stockmeyer (q = 4) evaluation of the degree-12 Taylor polynomial
+        //   P_12(B) = sum_{k=0}^{12} B^k / k!
+        // using 5 n x n GEMMs (B^2, B^3, B^4, and two Horner steps in B^4) instead of
+        // 12 sequential Horner GEMMs, with adaptive lower degree (0..4 GEMMs) when s == 0
+        // and ||B||_1 is small enough that truncation error is strictly below 1e-17
+        // (Bader, Blanes & Casas 2019 Table 3 thresholds). frankentorch-q8y1p.
+        const C: [f64; 13] = [
+            1.0,
+            1.0,
+            1.0 / 2.0,
+            1.0 / 6.0,
+            1.0 / 24.0,
+            1.0 / 120.0,
+            1.0 / 720.0,
+            1.0 / 5040.0,
+            1.0 / 40_320.0,
+            1.0 / 362_880.0,
+            1.0 / 3_628_800.0,
+            1.0 / 39_916_800.0,
+            1.0 / 479_001_600.0,
+        ];
+        let scaled_norm = norm * scale;
+        let mut u = vec![0.0f64; nn];
+        let mut temp = vec![0.0f64; nn];
+        if s == 0 && scaled_norm == 0.0 && b.iter().all(|&v| v == 0.0) {
+            for i in 0..n {
+                u[i * n + i] = 1.0;
+            }
+            return Ok(u);
+        } else if s == 0 && scaled_norm <= 2.5e-8 {
+            gemm::dgemm(n, n, n, &b, &b, &mut temp);
+            for ((&v1, &v2), dst) in b.iter().zip(temp.iter()).zip(u.iter_mut()) {
+                *dst = C[2].mul_add(v2, v1);
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else if s == 0 && scaled_norm <= 3.4e-4 {
+            let mut b2 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            for ((&v1, &v2), dst) in b.iter().zip(b2.iter()).zip(u.iter_mut()) {
+                *dst = C[3].mul_add(v1, C[4] * v2);
+            }
+            for i in 0..n {
+                u[i * n + i] += C[2];
+            }
+            gemm::dgemm(n, n, n, &u, &b2, &mut temp);
+            for ((&v1, &t), dst) in b.iter().zip(temp.iter()).zip(u.iter_mut()) {
+                *dst = v1 + t;
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else if s == 0 && scaled_norm <= 9.0e-3 {
+            let mut b2 = vec![0.0f64; nn];
+            let mut b3 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            gemm::dgemm(n, n, n, &b2, &b, &mut b3);
+            for (((&v1, &v2), &v3), dst) in b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
+            {
+                *dst = C[4].mul_add(v1, C[5].mul_add(v2, C[6] * v3));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[3];
+            }
+            gemm::dgemm(n, n, n, &u, &b3, &mut temp);
+            for (((&v1, &v2), &t), dst) in
+                b.iter().zip(b2.iter()).zip(temp.iter()).zip(u.iter_mut())
+            {
+                *dst = v1 + C[2].mul_add(v2, t);
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else if s == 0 && scaled_norm <= 8.9e-2 {
+            let mut b2 = vec![0.0f64; nn];
+            let mut b3 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            gemm::dgemm(n, n, n, &b2, &b, &mut b3);
+            for (((&v1, &v2), &v3), dst) in b.iter().zip(b2.iter()).zip(b3.iter()).zip(u.iter_mut())
+            {
+                *dst = C[7].mul_add(v1, C[8].mul_add(v2, C[9] * v3));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[6];
+            }
+            gemm::dgemm(n, n, n, &u, &b3, &mut temp);
+            for (((&v1, &v2), &t), dst) in
+                b.iter().zip(b2.iter()).zip(temp.iter()).zip(u.iter_mut())
+            {
+                *dst = C[4].mul_add(v1, C[5].mul_add(v2, t));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[3];
+            }
+            gemm::dgemm(n, n, n, &u, &b3, &mut temp);
+            for (((&v1, &v2), &t), dst) in
+                b.iter().zip(b2.iter()).zip(temp.iter()).zip(u.iter_mut())
+            {
+                *dst = v1 + C[2].mul_add(v2, t);
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        } else {
+            let mut b2 = vec![0.0f64; nn];
+            let mut b3 = vec![0.0f64; nn];
+            let mut b4 = vec![0.0f64; nn];
+            gemm::dgemm(n, n, n, &b, &b, &mut b2);
+            gemm::dgemm(n, n, n, &b2, &b, &mut b3);
+            gemm::dgemm(n, n, n, &b2, &b2, &mut b4);
+            for ((((&v1, &v2), &v3), &v4), dst) in b
+                .iter()
+                .zip(b2.iter())
+                .zip(b3.iter())
+                .zip(b4.iter())
+                .zip(u.iter_mut())
+            {
+                *dst = C[9].mul_add(v1, C[10].mul_add(v2, C[11].mul_add(v3, C[12] * v4)));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[8];
+            }
+            gemm::dgemm(n, n, n, &u, &b4, &mut temp);
+            for ((((&v1, &v2), &v3), &t), dst) in b
+                .iter()
+                .zip(b2.iter())
+                .zip(b3.iter())
+                .zip(temp.iter())
+                .zip(u.iter_mut())
+            {
+                *dst = C[5].mul_add(v1, C[6].mul_add(v2, C[7].mul_add(v3, t)));
+            }
+            for i in 0..n {
+                u[i * n + i] += C[4];
+            }
+            gemm::dgemm(n, n, n, &u, &b4, &mut temp);
+            for ((((&v1, &v2), &v3), &t), dst) in b
+                .iter()
+                .zip(b2.iter())
+                .zip(b3.iter())
+                .zip(temp.iter())
+                .zip(u.iter_mut())
+            {
+                *dst = v1 + C[2].mul_add(v2, C[3].mul_add(v3, t));
+            }
+            for i in 0..n {
+                u[i * n + i] += 1.0;
+            }
+        }
+
+        for _ in 0..s {
+            gemm::dgemm(n, n, n, &u, &u, &mut temp);
+            std::mem::swap(&mut u, &mut temp);
+        }
+
+        return Ok(u);
+    }
     let mut a = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -30802,6 +31056,95 @@ pub fn matrix_exp_contiguous_f32(data: &[f32], meta: &TensorMeta) -> Result<Vec<
     }
 
     let offset = meta.storage_offset();
+    if matrix_exp_fast_kernel() {
+        let nn = n * n;
+        let src = &data[offset..offset + nn];
+        let mut col_sums = vec![0.0f32; n];
+        for row in src.chunks_exact(n) {
+            for (cs, &v) in col_sums.iter_mut().zip(row.iter()) {
+                *cs += v.abs();
+            }
+        }
+        let norm = col_sums.into_iter().fold(0.0f32, f32::max);
+        let s = if norm > 0.5 {
+            (norm / 0.5).log2().ceil() as u32
+        } else {
+            0
+        };
+        let scale = 0.5f32.powi(s as i32);
+        let b: Vec<f32> = if s == 0 {
+            src.to_vec()
+        } else {
+            src.iter().map(|&v| v * scale).collect()
+        };
+
+        const C: [f32; 13] = [
+            1.0,
+            1.0,
+            1.0 / 2.0,
+            1.0 / 6.0,
+            1.0 / 24.0,
+            1.0 / 120.0,
+            1.0 / 720.0,
+            1.0 / 5040.0,
+            1.0 / 40_320.0,
+            1.0 / 362_880.0,
+            1.0 / 3_628_800.0,
+            1.0 / 39_916_800.0,
+            1.0 / 479_001_600.0,
+        ];
+        let mut b2 = vec![0.0f32; nn];
+        let mut b3 = vec![0.0f32; nn];
+        let mut b4 = vec![0.0f32; nn];
+        let mut u = vec![0.0f32; nn];
+        let mut temp = vec![0.0f32; nn];
+        gemm::sgemm(n, n, n, &b, &b, &mut b2);
+        gemm::sgemm(n, n, n, &b2, &b, &mut b3);
+        gemm::sgemm(n, n, n, &b2, &b2, &mut b4);
+        for ((((&v1, &v2), &v3), &v4), dst) in b
+            .iter()
+            .zip(b2.iter())
+            .zip(b3.iter())
+            .zip(b4.iter())
+            .zip(u.iter_mut())
+        {
+            *dst = C[9].mul_add(v1, C[10].mul_add(v2, C[11].mul_add(v3, C[12] * v4)));
+        }
+        for i in 0..n {
+            u[i * n + i] += C[8];
+        }
+        gemm::sgemm(n, n, n, &u, &b4, &mut temp);
+        for ((((&v1, &v2), &v3), &t), dst) in b
+            .iter()
+            .zip(b2.iter())
+            .zip(b3.iter())
+            .zip(temp.iter())
+            .zip(u.iter_mut())
+        {
+            *dst = C[5].mul_add(v1, C[6].mul_add(v2, C[7].mul_add(v3, t)));
+        }
+        for i in 0..n {
+            u[i * n + i] += C[4];
+        }
+        gemm::sgemm(n, n, n, &u, &b4, &mut temp);
+        for ((((&v1, &v2), &v3), &t), dst) in b
+            .iter()
+            .zip(b2.iter())
+            .zip(b3.iter())
+            .zip(temp.iter())
+            .zip(u.iter_mut())
+        {
+            *dst = v1 + C[2].mul_add(v2, C[3].mul_add(v3, t));
+        }
+        for i in 0..n {
+            u[i * n + i] += 1.0;
+        }
+        for _ in 0..s {
+            gemm::sgemm(n, n, n, &u, &u, &mut temp);
+            std::mem::swap(&mut u, &mut temp);
+        }
+        return Ok(u);
+    }
     let mut a = vec![0.0f32; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -31570,6 +31913,212 @@ pub fn tred2_stage_take_ns() -> (u64, u64) {
     )
 }
 
+static EIGH_FAST_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[doc(hidden)]
+pub fn set_eigh_fast_kernel(on: bool) -> bool {
+    EIGH_FAST_KERNEL.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn eigh_fast_kernel() -> bool {
+    EIGH_FAST_KERNEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compute a contiguous chunk `out[0..len]` of the packed lower-triangular symmetric matvec
+/// `out[off] = sum_{k=0..=l} A(j_base + off, k) * row_i_ro[k]` using 16-wide (`4 x f64x4`)
+/// independent accumulators. Preserves each output element's strict ascending `k = 0..=l`
+/// accumulation order so it is 100% bit-for-bit identical to the scalar and 4-wide loops.
+fn packed_symmetric_ggs_chunk_f64(
+    j_base: usize,
+    out: &mut [f64],
+    prev_ro: &[f64],
+    row_i_ro: &[f64],
+) {
+    let l = row_i_ro.len().saturating_sub(1);
+    let len = out.len();
+    let mut off = 0usize;
+    while off + 16 <= len {
+        let j0 = j_base + off;
+        let j15 = j0 + 15;
+        let mut acc0 = wide::f64x4::ZERO;
+        let mut acc1 = wide::f64x4::ZERO;
+        let mut acc2 = wide::f64x4::ZERO;
+        let mut acc3 = wide::f64x4::ZERO;
+        let mut row_starts = [0usize; 16];
+        for (t, rs) in row_starts.iter_mut().enumerate() {
+            *rs = lower_packed_index(j0 + t, 0);
+        }
+        let mut row_k_start = 0usize;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(j15 + 1) {
+            let rk = wide::f64x4::splat(rik);
+            let mut lanes = [0.0f64; 16];
+            for t in 0..16 {
+                let j = j0 + t;
+                lanes[t] = if k <= j {
+                    prev_ro[row_starts[t] + k]
+                } else {
+                    prev_ro[row_k_start + j]
+                };
+            }
+            acc0 += wide::f64x4::from([lanes[0], lanes[1], lanes[2], lanes[3]]) * rk;
+            acc1 += wide::f64x4::from([lanes[4], lanes[5], lanes[6], lanes[7]]) * rk;
+            acc2 += wide::f64x4::from([lanes[8], lanes[9], lanes[10], lanes[11]]) * rk;
+            acc3 += wide::f64x4::from([lanes[12], lanes[13], lanes[14], lanes[15]]) * rk;
+            row_k_start += k + 1;
+        }
+        let mut row_k_j0 = row_k_start + j0;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(l + 1).skip(j15 + 1) {
+            let p = &prev_ro[row_k_j0..row_k_j0 + 16];
+            let rk = wide::f64x4::splat(rik);
+            acc0 += wide::f64x4::from([p[0], p[1], p[2], p[3]]) * rk;
+            acc1 += wide::f64x4::from([p[4], p[5], p[6], p[7]]) * rk;
+            acc2 += wide::f64x4::from([p[8], p[9], p[10], p[11]]) * rk;
+            acc3 += wide::f64x4::from([p[12], p[13], p[14], p[15]]) * rk;
+            row_k_j0 += k + 1;
+        }
+        out[off..off + 4].copy_from_slice(&acc0.to_array());
+        out[off + 4..off + 8].copy_from_slice(&acc1.to_array());
+        out[off + 8..off + 12].copy_from_slice(&acc2.to_array());
+        out[off + 12..off + 16].copy_from_slice(&acc3.to_array());
+        off += 16;
+    }
+    while off + 4 <= len {
+        let j0 = j_base + off;
+        let j3 = j0 + 3;
+        let mut acc = wide::f64x4::ZERO;
+        let mut row_k_start = 0usize;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(j3 + 1) {
+            let mut lane = [0.0f64; 4];
+            for (t, slot) in lane.iter_mut().enumerate() {
+                let j = j0 + t;
+                *slot = if k <= j {
+                    prev_ro[lower_packed_index(j, 0) + k]
+                } else {
+                    prev_ro[row_k_start + j]
+                };
+            }
+            acc += wide::f64x4::from(lane) * wide::f64x4::splat(rik);
+            row_k_start += k + 1;
+        }
+        let mut row_k_j0 = row_k_start + j0;
+        for (k, &rik) in row_i_ro.iter().enumerate().take(l + 1).skip(j3 + 1) {
+            let p = &prev_ro[row_k_j0..row_k_j0 + 4];
+            acc += wide::f64x4::from([p[0], p[1], p[2], p[3]]) * wide::f64x4::splat(rik);
+            row_k_j0 += k + 1;
+        }
+        out[off..off + 4].copy_from_slice(&acc.to_array());
+        off += 4;
+    }
+    while off < len {
+        let j = j_base + off;
+        let mut gg = 0.0;
+        let row_j_start = lower_packed_index(j, 0);
+        let row_j = &prev_ro[row_j_start..=row_j_start + j];
+        for (k, &rik) in row_i_ro.iter().enumerate().take(j + 1) {
+            gg += row_j[k] * rik;
+        }
+        let mut lower_col_offset = lower_packed_index(j + 1, j);
+        for (k, &rik) in row_i_ro.iter().enumerate().take(l + 1).skip(j + 1) {
+            gg += prev_ro[lower_col_offset] * rik;
+            lower_col_offset += k + 1;
+        }
+        out[off] = gg;
+        off += 1;
+    }
+}
+
+fn packed_symmetric_ggs_into_f64(
+    out: &mut [f64],
+    prev_ro: &[f64],
+    row_i_ro: &[f64],
+    par_min_l: usize,
+) {
+    let l = row_i_ro.len().saturating_sub(1);
+    let out = &mut out[..=l];
+    let threads = rayon::current_num_threads().max(1);
+    if l < par_min_l || threads <= 1 {
+        packed_symmetric_ggs_chunk_f64(0, out, prev_ro, row_i_ro);
+    } else {
+        let chunk_len = (((l + 1).div_ceil(threads * 2)).max(64) + 15) & !15;
+        out.par_chunks_mut(chunk_len)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                packed_symmetric_ggs_chunk_f64(ci * chunk_len, chunk, prev_ro, row_i_ro);
+            });
+    }
+}
+
+fn packed_symmetric_rank2_update_f64(
+    l: usize,
+    previous_rows: &mut [f64],
+    row_i_ro: &[f64],
+    e_ro: &[f64],
+    par_min_l: usize,
+) {
+    let threads = rayon::current_num_threads().max(1);
+    if l < par_min_l || threads <= 1 {
+        let mut offset = 0usize;
+        for j in 0..=l {
+            let row_len = j + 1;
+            let row_j = &mut previous_rows[offset..offset + row_len];
+            offset += row_len;
+            let fj = row_i_ro[j];
+            let ggj = e_ro[j];
+            for ((dst, &ek), &rik) in row_j
+                .iter_mut()
+                .zip(e_ro[..row_len].iter())
+                .zip(row_i_ro[..row_len].iter())
+            {
+                *dst -= fj * ek + ggj * rik;
+            }
+        }
+    } else {
+        let num_bands = (threads * 2).min(l + 1);
+        let total_elems = (l + 1) * (l + 2) / 2;
+        let mut bands: Vec<(usize, usize, &mut [f64])> = Vec::with_capacity(num_bands);
+        let mut rest = &mut previous_rows[..total_elems];
+        let mut j_start = 0usize;
+        for b in 0..num_bands {
+            if j_start > l {
+                break;
+            }
+            let j_end = if b + 1 == num_bands {
+                l + 1
+            } else {
+                let frac = ((b + 1) as f64 / num_bands as f64).sqrt();
+                let target = (frac * (l + 1) as f64).round() as usize;
+                target.clamp(j_start + 1, l + 1)
+            };
+            let elem_start = lower_packed_index(j_start, 0);
+            let elem_end = lower_packed_index(j_end, 0);
+            let (band_slice, tail) = rest.split_at_mut(elem_end - elem_start);
+            bands.push((j_start, j_end, band_slice));
+            rest = tail;
+            j_start = j_end;
+        }
+        bands
+            .into_par_iter()
+            .for_each(|(j_start, j_end, band_slice)| {
+                let mut offset = 0usize;
+                for j in j_start..j_end {
+                    let row_len = j + 1;
+                    let row_j = &mut band_slice[offset..offset + row_len];
+                    offset += row_len;
+                    let fj = row_i_ro[j];
+                    let ggj = e_ro[j];
+                    for ((dst, &ek), &rik) in row_j
+                        .iter_mut()
+                        .zip(e_ro[..row_len].iter())
+                        .zip(row_i_ro[..row_len].iter())
+                    {
+                        *dst -= fj * ek + ggj * rik;
+                    }
+                }
+            });
+    }
+}
+
 /// The reduction with its parallel gate exposed, so a same-process A/B can measure the
 /// serial and gated-parallel arms at one thread width instead of inferring across runs.
 fn eigh_tred2_reduce_packed_full_gated(
@@ -31625,6 +32174,34 @@ fn eigh_tred2_reduce_packed_full_gated(
                 // planes. Inner parallelism on planes that small would wreck it.
                 let row_i_ro: &[f64] = &row_i[..=l];
                 let prev_ro: &[f64] = &previous_rows[..];
+                if eigh_fast_kernel() {
+                    let __t_ggs = std::time::Instant::now();
+                    packed_symmetric_ggs_into_f64(e, prev_ro, row_i_ro, par_min_l);
+                    TRED2_GGS_NS
+                        .fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                    f = 0.0;
+                    for j in 0..=l {
+                        scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
+                        e[j] /= h;
+                        f += e[j] * row_i[j];
+                    }
+                    let hh = f / (h + h);
+                    for j in 0..=l {
+                        e[j] -= hh * row_i[j];
+                    }
+                    let __t_upd = std::time::Instant::now();
+                    packed_symmetric_rank2_update_f64(
+                        l,
+                        previous_rows,
+                        row_i_ro,
+                        &e[..=l],
+                        par_min_l,
+                    );
+                    TRED2_UPD_NS
+                        .fetch_add(__t_upd.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                    d[i] = h;
+                    continue;
+                }
                 let __t_ggs = std::time::Instant::now();
                 let grouped_ggs: Option<Vec<f64>> = if tred2_grouped_ggs() && l >= 8 {
                     // FOUR OUTPUTS IN FLIGHT — `frankentorch-wjrqt`, the item-254 lever applied
@@ -31991,6 +32568,36 @@ fn eigh_tred2_reduce_packed_blocked(
                         cswap[nb..].copy_from_slice(&c[..nb]);
                     }
                     let pm: &[f64] = &pmat;
+                    if eigh_fast_kernel() {
+                        packed_symmetric_ggs_into_f64(e, prev_ro, row_i_ro, par_min_l);
+                        if s > 0 {
+                            for (j, ej) in e.iter_mut().enumerate().take(l + 1) {
+                                *ej -= tred2_dot(&pm[j * m..(j + 1) * m], &cswap);
+                            }
+                        }
+                        TRED2_GGS_NS
+                            .fetch_add(__t_ggs.elapsed().as_nanos() as u64, LuOrdering::Relaxed);
+                        f = 0.0;
+                        for j in 0..=l {
+                            scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
+                            e[j] /= h;
+                            f += e[j] * row_i[j];
+                        }
+                        let hh = f / (h + h);
+                        for j in 0..=l {
+                            e[j] -= hh * row_i[j];
+                        }
+                        for j in 0..=l {
+                            let vj = row_i[j];
+                            let wj = e[j];
+                            pmat[j * m + s] = vj;
+                            pmat[j * m + nb + s] = wj;
+                            qmat[j * m + s] = wj;
+                            qmat[j * m + nb + s] = vj;
+                        }
+                        d[i] = h;
+                        continue;
+                    }
                     let ggs_at = |j: usize| -> f64 {
                         let mut gg = 0.0;
                         let row_j_start = lower_packed_index(j, 0);
@@ -32238,6 +32845,149 @@ pub fn set_eigh_bt_row_split(on: bool) -> bool {
     EIGH_BT_ROW_SPLIT.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn eigh_backtransform_project_chunk_f64(
+    out: &mut [f64],
+    j_base: usize,
+    prev: &[f64],
+    row_i: &[f64],
+    n: usize,
+    i: usize,
+) {
+    let len = out.len();
+    let mut off = 0usize;
+    while off + 16 <= len {
+        let j0 = j_base + off;
+        let mut acc0 = wide::f64x4::ZERO;
+        let mut acc1 = wide::f64x4::ZERO;
+        let mut acc2 = wide::f64x4::ZERO;
+        let mut acc3 = wide::f64x4::ZERO;
+        let mut k = 0usize;
+        while k + 4 <= i {
+            let f0 = wide::f64x4::splat(row_i[k]);
+            let f1 = wide::f64x4::splat(row_i[k + 1]);
+            let f2 = wide::f64x4::splat(row_i[k + 2]);
+            let f3 = wide::f64x4::splat(row_i[k + 3]);
+            let r0 = &prev[k * n + j0..k * n + j0 + 16];
+            let r1 = &prev[(k + 1) * n + j0..(k + 1) * n + j0 + 16];
+            let r2 = &prev[(k + 2) * n + j0..(k + 2) * n + j0 + 16];
+            let r3 = &prev[(k + 3) * n + j0..(k + 3) * n + j0 + 16];
+            acc0 += wide::f64x4::from([r0[0], r0[1], r0[2], r0[3]]) * f0;
+            acc1 += wide::f64x4::from([r0[4], r0[5], r0[6], r0[7]]) * f0;
+            acc2 += wide::f64x4::from([r0[8], r0[9], r0[10], r0[11]]) * f0;
+            acc3 += wide::f64x4::from([r0[12], r0[13], r0[14], r0[15]]) * f0;
+            acc0 += wide::f64x4::from([r1[0], r1[1], r1[2], r1[3]]) * f1;
+            acc1 += wide::f64x4::from([r1[4], r1[5], r1[6], r1[7]]) * f1;
+            acc2 += wide::f64x4::from([r1[8], r1[9], r1[10], r1[11]]) * f1;
+            acc3 += wide::f64x4::from([r1[12], r1[13], r1[14], r1[15]]) * f1;
+            acc0 += wide::f64x4::from([r2[0], r2[1], r2[2], r2[3]]) * f2;
+            acc1 += wide::f64x4::from([r2[4], r2[5], r2[6], r2[7]]) * f2;
+            acc2 += wide::f64x4::from([r2[8], r2[9], r2[10], r2[11]]) * f2;
+            acc3 += wide::f64x4::from([r2[12], r2[13], r2[14], r2[15]]) * f2;
+            acc0 += wide::f64x4::from([r3[0], r3[1], r3[2], r3[3]]) * f3;
+            acc1 += wide::f64x4::from([r3[4], r3[5], r3[6], r3[7]]) * f3;
+            acc2 += wide::f64x4::from([r3[8], r3[9], r3[10], r3[11]]) * f3;
+            acc3 += wide::f64x4::from([r3[12], r3[13], r3[14], r3[15]]) * f3;
+            k += 4;
+        }
+        while k < i {
+            let fk = wide::f64x4::splat(row_i[k]);
+            let rk = &prev[k * n + j0..k * n + j0 + 16];
+            acc0 += wide::f64x4::from([rk[0], rk[1], rk[2], rk[3]]) * fk;
+            acc1 += wide::f64x4::from([rk[4], rk[5], rk[6], rk[7]]) * fk;
+            acc2 += wide::f64x4::from([rk[8], rk[9], rk[10], rk[11]]) * fk;
+            acc3 += wide::f64x4::from([rk[12], rk[13], rk[14], rk[15]]) * fk;
+            k += 1;
+        }
+        out[off..off + 4].copy_from_slice(&acc0.to_array());
+        out[off + 4..off + 8].copy_from_slice(&acc1.to_array());
+        out[off + 8..off + 12].copy_from_slice(&acc2.to_array());
+        out[off + 12..off + 16].copy_from_slice(&acc3.to_array());
+        off += 16;
+    }
+    while off + 4 <= len {
+        let j0 = j_base + off;
+        let mut acc = wide::f64x4::ZERO;
+        for (k, &row_factor) in row_i.iter().enumerate().take(i) {
+            let rk = &prev[k * n + j0..k * n + j0 + 4];
+            acc += wide::f64x4::from([rk[0], rk[1], rk[2], rk[3]]) * wide::f64x4::splat(row_factor);
+        }
+        out[off..off + 4].copy_from_slice(&acc.to_array());
+        off += 4;
+    }
+    while off < len {
+        let j = j_base + off;
+        let mut acc = 0.0;
+        for (k, &row_factor) in row_i.iter().enumerate().take(i) {
+            acc += row_factor * prev[k * n + j];
+        }
+        out[off] = acc;
+        off += 1;
+    }
+}
+
+fn eigh_backtransform_apply_rows_f64(rows_buf: &mut [f64], proj: &[f64], n: usize, i: usize) {
+    let num_rows = rows_buf.len() / n;
+    let mut r = 0usize;
+    let mut rest = rows_buf;
+    while r + 4 <= num_rows {
+        let (r0_full, tail1) = rest.split_at_mut(n);
+        let (r1_full, tail2) = tail1.split_at_mut(n);
+        let (r2_full, tail3) = tail2.split_at_mut(n);
+        let (r3_full, next_rest) = tail3.split_at_mut(n);
+        rest = next_rest;
+        let ref0 = r0_full[i];
+        let ref1 = r1_full[i];
+        let ref2 = r2_full[i];
+        let ref3 = r3_full[i];
+        let ref0_v = wide::f64x4::splat(ref0);
+        let ref1_v = wide::f64x4::splat(ref1);
+        let ref2_v = wide::f64x4::splat(ref2);
+        let ref3_v = wide::f64x4::splat(ref3);
+        let r0 = &mut r0_full[..i];
+        let r1 = &mut r1_full[..i];
+        let r2 = &mut r2_full[..i];
+        let r3 = &mut r3_full[..i];
+        let mut j = 0usize;
+        while j + 4 <= i {
+            let pv = wide::f64x4::from([proj[j], proj[j + 1], proj[j + 2], proj[j + 3]]);
+            let v0 = wide::f64x4::from([r0[j], r0[j + 1], r0[j + 2], r0[j + 3]]) - pv * ref0_v;
+            let v1 = wide::f64x4::from([r1[j], r1[j + 1], r1[j + 2], r1[j + 3]]) - pv * ref1_v;
+            let v2 = wide::f64x4::from([r2[j], r2[j + 1], r2[j + 2], r2[j + 3]]) - pv * ref2_v;
+            let v3 = wide::f64x4::from([r3[j], r3[j + 1], r3[j + 2], r3[j + 3]]) - pv * ref3_v;
+            r0[j..j + 4].copy_from_slice(&v0.to_array());
+            r1[j..j + 4].copy_from_slice(&v1.to_array());
+            r2[j..j + 4].copy_from_slice(&v2.to_array());
+            r3[j..j + 4].copy_from_slice(&v3.to_array());
+            j += 4;
+        }
+        while j < i {
+            let pj = proj[j];
+            r0[j] -= pj * ref0;
+            r1[j] -= pj * ref1;
+            r2[j] -= pj * ref2;
+            r3[j] -= pj * ref3;
+            j += 1;
+        }
+        r += 4;
+    }
+    for row_full in rest.chunks_exact_mut(n) {
+        let reflector = row_full[i];
+        let ref_v = wide::f64x4::splat(reflector);
+        let row = &mut row_full[..i];
+        let mut j = 0usize;
+        while j + 4 <= i {
+            let pv = wide::f64x4::from([proj[j], proj[j + 1], proj[j + 2], proj[j + 3]]);
+            let v = wide::f64x4::from([row[j], row[j + 1], row[j + 2], row[j + 3]]) - pv * ref_v;
+            row[j..j + 4].copy_from_slice(&v.to_array());
+            j += 4;
+        }
+        while j < i {
+            row[j] -= proj[j] * reflector;
+            j += 1;
+        }
+    }
+}
+
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
     let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
     if nb > 0 {
@@ -32245,6 +32995,7 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
         return;
     }
     let par_min = EIGH_BT_PAR_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    let fast = eigh_fast_kernel();
     let threads = rayon::current_num_threads();
     let mut projections = Vec::with_capacity(n);
     for i in 0..n {
@@ -32254,6 +33005,52 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
             let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
             let row_i = &current_and_after[..i];
             projections.resize(i, 0.0);
+            if fast && par_min == usize::MAX {
+                let prev: &[f64] = previous_rows;
+                if i >= 512 && threads > 1 {
+                    let chunk = ((i.div_ceil(threads) + 15) & !15).max(128);
+                    projections[..i]
+                        .par_chunks_mut(chunk)
+                        .enumerate()
+                        .for_each(|(ci, out)| {
+                            eigh_backtransform_project_chunk_f64(
+                                out,
+                                ci * chunk,
+                                prev,
+                                row_i,
+                                n,
+                                i,
+                            );
+                        });
+                } else {
+                    eigh_backtransform_project_chunk_f64(
+                        &mut projections[..i],
+                        0,
+                        prev,
+                        row_i,
+                        n,
+                        i,
+                    );
+                }
+                let proj: &[f64] = &projections[..i];
+                if i >= 384 && threads > 1 {
+                    let rows_per_task = ((i.div_ceil(threads * 2) + 3) & !3).max(32);
+                    previous_rows
+                        .par_chunks_mut(rows_per_task * n)
+                        .for_each(|rows_buf| {
+                            eigh_backtransform_apply_rows_f64(rows_buf, proj, n, i);
+                        });
+                } else {
+                    eigh_backtransform_apply_rows_f64(previous_rows, proj, n, i);
+                }
+                d[i] = z[i * n + i];
+                z[i * n + i] = 1.0;
+                for j in 0..i {
+                    z[j * n + i] = 0.0;
+                    z[i * n + j] = 0.0;
+                }
+                continue;
+            }
             // BIT-EXACT EITHER WAY, and that is the whole point of splitting these two loops
             // the way they are split rather than the obvious way.
             //
@@ -32465,6 +33262,33 @@ fn eigh_tred2_values_only_with_observer<P: ValuesOnlyTred2Observer>(
                 row_i[l] = f - g;
                 f = 0.0;
                 observer.finished_reflector(reflector_started);
+                if eigh_fast_kernel() {
+                    let par_min_l = tred2_par_min_l();
+                    let row_i_ro: &[f64] = &row_i[..=l];
+                    let prev_ro: &[f64] = &previous_rows[..];
+                    let ggs_started = observer.started();
+                    packed_symmetric_ggs_into_f64(e, prev_ro, row_i_ro, par_min_l);
+                    for j in 0..=l {
+                        e[j] /= h;
+                        f += e[j] * row_i_ro[j];
+                    }
+                    observer.finished_ggs(ggs_started);
+                    let update_started = observer.started();
+                    let hh = f / (h + h);
+                    for j in 0..=l {
+                        e[j] -= hh * row_i_ro[j];
+                    }
+                    packed_symmetric_rank2_update_f64(
+                        l,
+                        previous_rows,
+                        row_i_ro,
+                        &e[..=l],
+                        par_min_l,
+                    );
+                    observer.finished_update(update_started);
+                    d[i] = h;
+                    continue;
+                }
                 let ggs_started = observer.started();
                 // `e` is overwritten for every j in 0..=l before the update.
                 // Reusing it for raw GGS results avoids one short-lived allocation and
@@ -32926,6 +33750,7 @@ fn eigh_tql2_replay_blocked(z: &mut [f64], n: usize, ops: &[(usize, f64, f64)], 
     }
     let br = block_rows.max(1);
     let transposed = svd_replay_transposed();
+    let fast = eigh_fast_kernel();
     z.par_chunks_mut(br * n).for_each(|block| {
         let nrows = block.len() / n;
         if !transposed {
@@ -32960,16 +33785,37 @@ fn eigh_tql2_replay_blocked(z: &mut [f64], n: usize, ops: &[(usize, f64, f64)], 
                 t[col * nrows + r] = block[base + col];
             }
         }
-        for &(i, c, s) in ops {
-            // i and i+1 are adjacent columns, so their runs are adjacent in `t`.
-            let (head, tail) = t.split_at_mut((i + 1) * nrows);
-            let xs = &mut head[i * nrows..];
-            let zs = &mut tail[..nrows];
-            for r in 0..nrows {
-                let a = xs[r];
-                let bb = zs[r];
-                zs[r] = s * a + c * bb;
-                xs[r] = c * a - s * bb;
+        if fast && nrows == 8 {
+            for &(i, c, s) in ops {
+                let off = i * 8;
+                let pair = &mut t[off..off + 16];
+                let a0 = wide::f64x4::from([pair[0], pair[1], pair[2], pair[3]]);
+                let a1 = wide::f64x4::from([pair[4], pair[5], pair[6], pair[7]]);
+                let b0 = wide::f64x4::from([pair[8], pair[9], pair[10], pair[11]]);
+                let b1 = wide::f64x4::from([pair[12], pair[13], pair[14], pair[15]]);
+                let sv = wide::f64x4::splat(s);
+                let cv = wide::f64x4::splat(c);
+                let z0 = sv * a0 + cv * b0;
+                let z1 = sv * a1 + cv * b1;
+                let x0 = cv * a0 - sv * b0;
+                let x1 = cv * a1 - sv * b1;
+                pair[0..4].copy_from_slice(&x0.to_array());
+                pair[4..8].copy_from_slice(&x1.to_array());
+                pair[8..12].copy_from_slice(&z0.to_array());
+                pair[12..16].copy_from_slice(&z1.to_array());
+            }
+        } else {
+            for &(i, c, s) in ops {
+                // i and i+1 are adjacent columns, so their runs are adjacent in `t`.
+                let (head, tail) = t.split_at_mut((i + 1) * nrows);
+                let xs = &mut head[i * nrows..];
+                let zs = &mut tail[..nrows];
+                for r in 0..nrows {
+                    let a = xs[r];
+                    let bb = zs[r];
+                    zs[r] = s * a + c * bb;
+                    xs[r] = c * a - s * bb;
+                }
             }
         }
         for r in 0..nrows {
@@ -54276,6 +55122,76 @@ mod tests {
                 );
             }
 
+            // Frozen inputs still train convolution weights (for example, the first layer).
+            // This output-mask entry does not delegate to the both-gradient route above.
+            for output_mask in [[false, true, false], [false, true, true]] {
+                super::set_conv2d_dweight_streamed(false);
+                super::reset_conv2d_backward_gemm_counts();
+                let (panel_dx, panel_dw, panel_db) = super::conv2d_backward_masked_f32(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (1, 0));
+                super::set_conv2d_dweight_streamed(true);
+                let _ = super::take_conv2d_dweight_streamed_calls();
+                super::reset_conv2d_backward_gemm_counts();
+                let (stream_dx, stream_dw, stream_db) = super::conv2d_backward_masked_f32(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(
+                    super::take_conv2d_dweight_streamed_calls(),
+                    1,
+                    "f32 frozen-input backward must reach streamed dweight: {output_mask:?}"
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (0, 0));
+                assert!(panel_dx.is_none() && stream_dx.is_none());
+                let panel_dw = panel_dw.expect("masked f32 panel dweight");
+                let stream_dw = stream_dw.expect("masked f32 streamed dweight");
+                assert_eq!(panel_dw.len(), stream_dw.len());
+                for (index, (&a, &b)) in panel_dw.iter().zip(&stream_dw).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "masked f32 dweight[{index}] differs at {batch}/{in_ch}/{out_ch}"
+                    );
+                }
+                assert_eq!(panel_db.is_some(), output_mask[2]);
+                assert_eq!(stream_db.is_some(), output_mask[2]);
+                if let (Some(panel_db), Some(stream_db)) = (panel_db, stream_db) {
+                    assert_eq!(panel_db.len(), stream_db.len());
+                    for (&a, &b) in panel_db.iter().zip(&stream_db) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+            }
+
             // THE FUSED MASKED f32 ENTRY, which keeps its own copy of the panel GEMM.
             super::set_conv2d_dweight_streamed(false);
             let _ = super::take_conv2d_dweight_streamed_calls();
@@ -54613,6 +55529,77 @@ mod tests {
                     "dpadded[{index}] moved at shape {batch}/{in_ch}/{out_ch}"
                 );
             }
+
+            // The weight-only output mask has its own dispatch, reached by frozen-input
+            // training. Exercise it separately from the unmasked and mask-fused entries.
+            for output_mask in [[false, true, false], [false, true, true]] {
+                super::set_conv2d_dweight_streamed(false);
+                super::reset_conv2d_backward_gemm_counts();
+                let (panel_dx, panel_dw, panel_db) = super::conv2d_backward_masked_f64(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (1, 0));
+                super::set_conv2d_dweight_streamed(true);
+                let _ = super::take_conv2d_dweight_streamed_calls();
+                super::reset_conv2d_backward_gemm_counts();
+                let (stream_dx, stream_dw, stream_db) = super::conv2d_backward_masked_f64(
+                    &dout,
+                    &padded,
+                    &weight_flat,
+                    batch,
+                    in_ch,
+                    ph,
+                    pw,
+                    kh,
+                    kw,
+                    oh,
+                    ow,
+                    sh,
+                    sw,
+                    out_ch,
+                    output_mask,
+                );
+                assert_eq!(
+                    super::take_conv2d_dweight_streamed_calls(),
+                    1,
+                    "f64 frozen-input backward must reach streamed dweight: {output_mask:?}"
+                );
+                assert_eq!(super::conv2d_backward_gemm_counts(), (0, 0));
+                assert!(panel_dx.is_none() && stream_dx.is_none());
+                let panel_dw = panel_dw.expect("masked f64 panel dweight");
+                let stream_dw = stream_dw.expect("masked f64 streamed dweight");
+                assert_eq!(panel_dw.len(), stream_dw.len());
+                for (index, (&a, &b)) in panel_dw.iter().zip(&stream_dw).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "masked f64 dweight[{index}] differs at {batch}/{in_ch}/{out_ch}"
+                    );
+                }
+                assert_eq!(panel_db.is_some(), output_mask[2]);
+                assert_eq!(stream_db.is_some(), output_mask[2]);
+                if let (Some(panel_db), Some(stream_db)) = (panel_db, stream_db) {
+                    assert_eq!(panel_db.len(), stream_db.len());
+                    for (&a, &b) in panel_db.iter().zip(&stream_db) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+            }
+            super::set_conv2d_dweight_streamed(previous);
 
             // THE FUSED MASKED ENTRY, which is the route the h2h training lane actually takes.
             // It does NOT delegate to `conv2d_backward_f64`; it keeps its own copy of the panel
@@ -71457,6 +72444,90 @@ mod tests {
                 }
                 let want = if i == j { 1.0 } else { 0.0 };
                 assert!((s - want).abs() < 1e-3, "expm(A)expm(-A)[{i},{j}]={s}");
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_exp_fast_kernel_matches_shipped_across_scales_and_sizes() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &n in &[4usize, 17, 64, 256] {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            for &scale in &[0.0f64, 1e-10, 1e-5, 3e-3, 4e-2, 0.25, 2.0] {
+                let a: Vec<f64> = (0..n * n)
+                    .map(|idx| {
+                        let r = idx / n;
+                        let c = idx % n;
+                        let base = ((((r + 2) * (c + 3)) % 17) as f64 - 8.0) * 0.05
+                            + if r == c { 3.0 } else { 0.0 };
+                        base * scale / (n as f64)
+                    })
+                    .collect();
+                let prev = super::set_matrix_exp_fast_kernel(false);
+                let slow = super::matrix_exp_contiguous_f64(&a, &meta).expect("slow matrix_exp");
+                super::set_matrix_exp_fast_kernel(true);
+                let fast = super::matrix_exp_contiguous_f64(&a, &meta).expect("fast matrix_exp");
+                super::set_matrix_exp_fast_kernel(prev);
+                assert_mat_approx_eq(&fast, &slow, 1e-12, "matrix_exp_fast_kernel vs slow");
+            }
+        }
+    }
+
+    #[test]
+    fn eigh_fast_kernel_matches_shipped_bitwise() {
+        let _guard = LU_CHOL_FAST_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &n in &[9usize, 37, 128, 400] {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let mut a = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..=r {
+                    let v = ((((r + 2) * (c + 3) + (r * c) % 29) % 41) as f64 - 20.0) * 0.05
+                        + if r == c { 5.0 } else { 0.0 };
+                    a[r * n + c] = v;
+                    a[c * n + r] = v;
+                }
+            }
+            let prev = super::set_eigh_fast_kernel(false);
+            let slow_val = super::eigvalsh_contiguous_f64(&a, &meta).expect("slow eigvalsh");
+            let slow_eigh = super::eigh_contiguous_f64(&a, &meta).expect("slow eigh");
+            super::set_eigh_fast_kernel(true);
+            let fast_val = super::eigvalsh_contiguous_f64(&a, &meta).expect("fast eigvalsh");
+            let fast_eigh = super::eigh_contiguous_f64(&a, &meta).expect("fast eigh");
+            super::set_eigh_fast_kernel(prev);
+            for (i, (&s, &f)) in slow_val.iter().zip(fast_val.iter()).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    f.to_bits(),
+                    "eigvalsh_fast_kernel diverged at n={n} idx={i}: {s} vs {f}"
+                );
+            }
+            for (i, (&s, &f)) in slow_eigh
+                .eigenvalues
+                .iter()
+                .zip(fast_eigh.eigenvalues.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    s.to_bits(),
+                    f.to_bits(),
+                    "eigh_fast_kernel eigenvalues diverged at n={n} idx={i}: {s} vs {f}"
+                );
+            }
+            for (i, (&s, &f)) in slow_eigh
+                .eigenvectors
+                .iter()
+                .zip(fast_eigh.eigenvectors.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    s.to_bits(),
+                    f.to_bits(),
+                    "eigh_fast_kernel eigenvectors diverged at n={n} idx={i}: {s} vs {f}"
+                );
             }
         }
     }
