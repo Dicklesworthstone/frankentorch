@@ -70,6 +70,9 @@ pub enum OptimizerState {
     SparseAdam(SparseAdamState),
     NAdam(NadamState),
     Asgd(AsgdState),
+    Adamax(AdamaxState),
+    Adadelta(AdadeltaState),
+    Rprop(RpropState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -231,6 +234,60 @@ pub struct AsgdParameterState {
     pub eta: f64,
     pub mu: f64,
     pub ax: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdamaxState {
+    pub lr: f64,
+    pub betas: [f64; 2],
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub maximize: bool,
+    pub parameters: Vec<Option<AdamaxParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdamaxParameterState {
+    pub step: u64,
+    pub exp_avg: Vec<f64>,
+    pub exp_inf: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdadeltaState {
+    pub lr: f64,
+    pub rho: f64,
+    pub eps: f64,
+    pub weight_decay: f64,
+    pub maximize: bool,
+    pub parameters: Vec<Option<AdadeltaParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdadeltaParameterState {
+    pub square_avg: Vec<f64>,
+    pub acc_delta: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RpropState {
+    pub lr: f64,
+    pub etas: [f64; 2],
+    pub step_sizes: [f64; 2],
+    pub maximize: bool,
+    pub parameters: Vec<Option<RpropParameterState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RpropParameterState {
+    pub step_size: Vec<f64>,
+    pub prev: Vec<f64>,
 }
 
 fn optimizer_parameter_metadata(
@@ -566,6 +623,74 @@ fn validate_asgd_state_buffers(state: &AsgdState, sizes: &[usize]) -> Result<(),
     Ok(())
 }
 
+fn validate_adamax_state_buffers(
+    state: &AdamaxState,
+    sizes: &[usize],
+) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "adamax state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        let Some(parameter) = parameter else {
+            continue;
+        };
+        if parameter.step == 0 {
+            return Err(optimizer_state_error(
+                "initialized adamax state requires a positive step",
+            ));
+        }
+        validate_optimizer_buffer(&parameter.exp_avg, numel)?;
+        validate_optimizer_buffer(&parameter.exp_inf, numel)?;
+        if parameter.exp_inf.iter().any(|&value| value < 0.0) {
+            return Err(optimizer_state_error(
+                "adamax state has negative infinity-norm accumulators",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_adadelta_state_buffers(
+    state: &AdadeltaState,
+    sizes: &[usize],
+) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "adadelta state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        if let Some(parameter) = parameter {
+            validate_nonnegative_optimizer_buffer(&parameter.square_avg, numel)?;
+            validate_nonnegative_optimizer_buffer(&parameter.acc_delta, numel)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_rprop_state_buffers(state: &RpropState, sizes: &[usize]) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.parameters.len(),
+        "rprop state parameter count mismatch",
+    )?;
+    for (parameter, &numel) in state.parameters.iter().zip(sizes) {
+        if let Some(parameter) = parameter {
+            validate_optimizer_buffer(&parameter.prev, numel)?;
+            validate_optimizer_buffer(&parameter.step_size, numel)?;
+            // A newly initialized step is the configured learning rate, even
+            // when it is zero or outside step_sizes. Bounds apply on subsequent
+            // sign changes, so they cannot be imposed on checkpoint buffers.
+            if parameter.step_size.iter().any(|&value| value < 0.0) {
+                return Err(optimizer_state_error("rprop state has negative step sizes"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_optimizer_state_dict(
     session: &FrankenTorchSession,
     params: &[TensorNodeId],
@@ -588,6 +713,9 @@ fn build_optimizer_state_dict(
         OptimizerState::SparseAdam(state) => validate_sparse_adam_state_buffers(state, &sizes)?,
         OptimizerState::NAdam(state) => validate_nadam_state_buffers(state, &sizes)?,
         OptimizerState::Asgd(state) => validate_asgd_state_buffers(state, &sizes)?,
+        OptimizerState::Adamax(state) => validate_adamax_state_buffers(state, &sizes)?,
+        OptimizerState::Adadelta(state) => validate_adadelta_state_buffers(state, &sizes)?,
+        OptimizerState::Rprop(state) => validate_rprop_state_buffers(state, &sizes)?,
     }
     Ok(result)
 }
@@ -5756,6 +5884,77 @@ impl Optimizer for Adamax {
         &self.params
     }
 
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [self.step_counts.len(), self.m.len(), self.u.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "adamax state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_counts
+            .iter()
+            .zip(&self.m)
+            .zip(&self.u)
+            .map(|((&step, first), infinity)| match (first, infinity) {
+                (None, None) if step == 0 => Ok(None),
+                (Some(first), Some(infinity)) => Ok(Some(AdamaxParameterState {
+                    step,
+                    exp_avg: first.clone(),
+                    exp_inf: infinity.clone(),
+                })),
+                _ => Err(optimizer_state_error(
+                    "adamax state has inconsistent moments",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Adamax(AdamaxState {
+                lr: self.lr,
+                betas: [self.beta1, self.beta2],
+                eps: self.eps,
+                weight_decay: self.weight_decay,
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Adamax(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_adamax_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .betas(saved.betas[0], saved.betas[1])
+            .eps(saved.eps)
+            .weight_decay(saved.weight_decay)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_counts[index] = parameter.step;
+                restored.m[index] = Some(parameter.exp_avg.clone());
+                restored.u[index] = Some(parameter.exp_inf.clone());
+            }
+        }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
+    }
+
     fn get_lr(&self) -> f64 {
         self.lr
     }
@@ -5770,31 +5969,58 @@ impl Optimizer for Adamax {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-
+        for count in [self.step_counts.len(), self.m.len(), self.u.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "adamax state parameter count mismatch",
+            )?;
+        }
+        // Check every active clock before updating any parameter. A restored
+        // counter can legitimately reach u64::MAX; only a subsequent gradient
+        // step overflows, and that error must not partially apply this batch.
+        let mut updates = Vec::with_capacity(self.params.len());
         for (i, &param) in self.params.iter().enumerate() {
-            let grad_len = match session.tensor_accumulated_gradient_len(param)? {
-                Some(len) => len,
-                None => continue,
+            let Some(grad_len) = session.tensor_accumulated_gradient_len(param)? else {
+                updates.push(None);
+                continue;
             };
-            let t =
-                advance_param_step_count(&mut self.step_counts, i, "adamax step counter overflow")?;
-            let param_len = session.tensor_values_len(param)?;
-            ensure_grad_len_matches_param(param, param_len, grad_len)?;
+            if !matches!(
+                session.tensor_dtype(param)?,
+                ft_core::DType::F32 | ft_core::DType::F64
+            ) {
+                return Err(optimizer_state_error(
+                    "adamax requires F32 or F64 parameters",
+                ));
+            }
+            ensure_grad_len_matches_param(param, session.tensor_values_len(param)?, grad_len)?;
+            if let Some(first) = &self.m[i] {
+                ensure_state_len(
+                    grad_len,
+                    first.len(),
+                    "adamax first-moment state length mismatch",
+                )?;
+            }
+            if let Some(infinity) = &self.u[i] {
+                ensure_state_len(
+                    grad_len,
+                    infinity.len(),
+                    "adamax infinity-norm state length mismatch",
+                )?;
+            }
+            let next_step =
+                checked_next_step_count(self.step_counts[i], "adamax step counter overflow")?;
+            updates.push(Some((grad_len, next_step)));
+        }
+        for (i, &param) in self.params.iter().enumerate() {
+            let Some((grad_len, t)) = updates[i] else {
+                continue;
+            };
 
             let bias_correction1 = adam_bias_correction(self.beta1, t);
 
             let m = self.m[i].get_or_insert_with(|| vec![0.0; grad_len]);
-            ensure_state_len(
-                grad_len,
-                m.len(),
-                "adamax first-moment state length mismatch",
-            )?;
             let u_state = self.u[i].get_or_insert_with(|| vec![0.0; grad_len]);
-            ensure_state_len(
-                grad_len,
-                u_state.len(),
-                "adamax infinity-norm state length mismatch",
-            )?;
 
             let (beta1, beta2, lr, eps) = (self.beta1, self.beta2, self.lr, self.eps);
             let weight_decay = self.weight_decay;
@@ -5838,6 +6064,7 @@ impl Optimizer for Adamax {
                     }
                 },
             )?;
+            self.step_counts[i] = t;
         }
         Ok(())
     }
@@ -5937,6 +6164,74 @@ impl Optimizer for Adadelta {
 
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
+    }
+
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [self.square_avg.len(), self.acc_delta.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "adadelta state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .square_avg
+            .iter()
+            .zip(&self.acc_delta)
+            .map(|(square_avg, acc_delta)| match (square_avg, acc_delta) {
+                (None, None) => Ok(None),
+                (Some(square_avg), Some(acc_delta)) => Ok(Some(AdadeltaParameterState {
+                    square_avg: square_avg.clone(),
+                    acc_delta: acc_delta.clone(),
+                })),
+                _ => Err(optimizer_state_error(
+                    "adadelta state has inconsistent accumulators",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Adadelta(AdadeltaState {
+                lr: self.lr,
+                rho: self.rho,
+                eps: self.eps,
+                weight_decay: self.weight_decay,
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Adadelta(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_adadelta_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .rho(saved.rho)
+            .eps(saved.eps)
+            .weight_decay(saved.weight_decay)
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.square_avg[index] = Some(parameter.square_avg.clone());
+                restored.acc_delta[index] = Some(parameter.acc_delta.clone());
+            }
+        }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
     }
 
     fn get_lr(&self) -> f64 {
@@ -6756,6 +7051,72 @@ impl Optimizer for Rprop {
 
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
+    }
+
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        for count in [self.step_sizes.len(), self.prev_grad.len()] {
+            ensure_state_len(
+                self.params.len(),
+                count,
+                "rprop state parameter count mismatch",
+            )?;
+        }
+        let parameters = self
+            .step_sizes
+            .iter()
+            .zip(&self.prev_grad)
+            .map(|(steps, previous)| match (steps, previous) {
+                (None, None) => Ok(None),
+                (Some(steps), Some(previous)) => Ok(Some(RpropParameterState {
+                    step_size: steps.clone(),
+                    prev: previous.clone(),
+                })),
+                _ => Err(optimizer_state_error(
+                    "rprop state has inconsistent step buffers",
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Rprop(RpropState {
+                lr: self.lr,
+                etas: [self.eta_minus, self.eta_plus],
+                step_sizes: [self.step_min, self.step_max],
+                maximize: self.maximize,
+                parameters,
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Rprop(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_rprop_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .etas(saved.etas[0], saved.etas[1])
+            .step_sizes(saved.step_sizes[0], saved.step_sizes[1])
+            .maximize(saved.maximize);
+        restored.validate_hyperparams()?;
+        for (index, parameter) in saved.parameters.iter().enumerate() {
+            if let Some(parameter) = parameter {
+                restored.step_sizes[index] = Some(parameter.step_size.clone());
+                restored.prev_grad[index] = Some(parameter.prev.clone());
+            }
+        }
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
     }
 
     fn get_lr(&self) -> f64 {
@@ -8048,6 +8409,9 @@ mod tests {
                 OptimizerState::SparseAdam(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::NAdam(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::Asgd(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::Adamax(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::Adadelta(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::Rprop(state) => assert!(state.parameters[1].is_none()),
             }
             let encoded = serde_json::to_vec(&saved).unwrap();
             let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
@@ -8216,6 +8580,609 @@ mod tests {
                 })
             });
         }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adamax_resume_preserves_infinity_norm_and_lazy_steps() {
+        for maximize in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    Adamax::new(params, 0.03)
+                        .betas(0.7, 0.8)
+                        .eps(0.125)
+                        .weight_decay(0.07)
+                        .maximize(maximize)
+                } else {
+                    Adamax::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adadelta_resume_preserves_both_accumulators() {
+        for maximize in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    Adadelta::new(params, 0.3)
+                        .rho(0.8)
+                        .eps(0.125)
+                        .weight_decay(0.07)
+                        .maximize(maximize)
+                } else {
+                    Adadelta::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_rprop_resume_preserves_step_sizes_and_previous_gradients() {
+        for maximize in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    Rprop::new(params, 0.03)
+                        .etas(0.4, 1.5)
+                        .step_sizes(0.01, 0.5)
+                        .maximize(maximize)
+                } else {
+                    Rprop::new(params, 0.9)
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adamax_adadelta_rprop_match_independent_trajectories() {
+        // Scalar recurrences independent of the checkpoint and optimizer code.
+        // Missing, zero, falling and sign-changing gradients distinguish lazy
+        // state, Adamax's decaying maximum and Rprop's sign-flip suppression.
+        let gradients = [
+            [Some([4.0, -2.0]), None],
+            [Some([0.0, 0.0]), None],
+            [None, Some([-1.0, 0.5])],
+            [Some([-0.25, 1.0]), Some([0.0, 0.0])],
+            [Some([-0.25, 1.0]), None],
+            [None, None],
+            [Some([0.75, -0.125]), Some([1.0, -1.0])],
+        ];
+        for algorithm in 0..3 {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                    for maximize in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let mut expected = [[1.5, -0.75], [2.25, 0.5]];
+                        let mut params: Vec<_> = expected
+                            .iter()
+                            .map(|values| {
+                                if dtype == ft_core::DType::F32 {
+                                    session.tensor_variable_f32(
+                                        values.iter().map(|&value| value as f32).collect(),
+                                        vec![2],
+                                        true,
+                                    )
+                                } else {
+                                    session.tensor_variable(values.to_vec(), vec![2], true)
+                                }
+                                .unwrap()
+                            })
+                            .collect();
+                        let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                            0 => Box::new(
+                                Adamax::new(params.clone(), 0.2)
+                                    .betas(0.5, 0.75)
+                                    .eps(0.125)
+                                    .weight_decay(0.1)
+                                    .maximize(maximize),
+                            ),
+                            1 => Box::new(
+                                Adadelta::new(params.clone(), 0.2)
+                                    .rho(0.75)
+                                    .eps(0.125)
+                                    .weight_decay(0.1)
+                                    .maximize(maximize),
+                            ),
+                            _ => Box::new(
+                                Rprop::new(params.clone(), 0.2)
+                                    .etas(0.5, 1.5)
+                                    .step_sizes(0.01, 0.8)
+                                    .maximize(maximize),
+                            ),
+                        };
+                        let mut first = [[0.0f64; 2]; 2];
+                        let mut second = [[0.0f64; 2]; 2];
+                        let mut counts = [0u64; 2];
+                        for (round, gradients) in gradients.iter().enumerate() {
+                            if round == 2 {
+                                // Move to a new session and intentionally construct with
+                                // different hyperparameters. Only the serialized state
+                                // may restore the algorithm's history and configuration.
+                                let saved = optimizer.state_dict(&session).unwrap();
+                                let bytes = serde_json::to_vec(&saved).unwrap();
+                                let decoded = serde_json::from_slice(&bytes).unwrap();
+                                let mut next = FrankenTorchSession::new(mode);
+                                next.tensor_variable(vec![99.0], vec![], false).unwrap();
+                                let remapped: Vec<_> = params
+                                    .iter()
+                                    .map(|&param| {
+                                        next.tensor_variable_from_storage(
+                                            session.tensor_snapshot(param).unwrap(),
+                                            true,
+                                        )
+                                    })
+                                    .collect();
+                                assert_ne!(remapped[0], params[0]);
+                                optimizer = match algorithm {
+                                    0 => Box::new(Adamax::new(remapped.clone(), 0.9)),
+                                    1 => Box::new(Adadelta::new(remapped.clone(), 0.9)),
+                                    _ => Box::new(Rprop::new(remapped.clone(), 0.9)),
+                                };
+                                optimizer.load_state_dict(&next, &decoded).unwrap();
+                                assert_eq!(optimizer.state_dict(&next).unwrap(), saved);
+                                session = next;
+                                params = remapped;
+                            }
+                            if round == 4 {
+                                optimizer.set_lr(0.05);
+                            }
+                            let lr = optimizer.get_lr();
+                            for (index, &param) in params.iter().enumerate() {
+                                session.tensor_requires_grad_(param, false).unwrap();
+                                session.tensor_requires_grad_(param, true).unwrap();
+                                let Some(gradient) = gradients[index] else {
+                                    continue;
+                                };
+                                session
+                                    .tensor_set_accumulated_gradient(param, gradient.to_vec())
+                                    .unwrap();
+                                if counts[index] == 0 && algorithm == 2 {
+                                    first[index] = [lr; 2];
+                                }
+                                counts[index] += 1;
+                                for (element, gradient) in gradient.iter().enumerate() {
+                                    let old = expected[index][element];
+                                    let direction = if maximize { -*gradient } else { *gradient };
+                                    let next = match algorithm {
+                                        0 => {
+                                            let effective = direction + 0.1 * old;
+                                            first[index][element] =
+                                                0.5 * first[index][element] + 0.5 * effective;
+                                            second[index][element] = (0.75
+                                                * second[index][element])
+                                                .max(effective.abs() + 0.125);
+                                            old - lr
+                                                * (first[index][element]
+                                                    / (1.0 - 0.5f64.powf(counts[index] as f64)))
+                                                / second[index][element]
+                                        }
+                                        1 => {
+                                            let effective = direction + 0.1 * old;
+                                            first[index][element] = 0.75 * first[index][element]
+                                                + 0.25 * effective * effective;
+                                            let delta = ((second[index][element] + 0.125)
+                                                / (first[index][element] + 0.125))
+                                                .sqrt()
+                                                * effective;
+                                            second[index][element] = 0.75 * second[index][element]
+                                                + 0.25 * delta * delta;
+                                            old - lr * delta
+                                        }
+                                        _ => {
+                                            let sign = direction * second[index][element];
+                                            if sign < 0.0 {
+                                                first[index][element] =
+                                                    (0.5 * first[index][element]).max(0.01);
+                                                second[index][element] = 0.0;
+                                                old
+                                            } else {
+                                                if sign > 0.0 {
+                                                    first[index][element] =
+                                                        (1.5 * first[index][element]).min(0.8);
+                                                }
+                                                second[index][element] = direction;
+                                                let sign = if direction > 0.0 {
+                                                    1.0
+                                                } else if direction < 0.0 {
+                                                    -1.0
+                                                } else {
+                                                    0.0
+                                                };
+                                                old - sign * first[index][element]
+                                            }
+                                        }
+                                    };
+                                    expected[index][element] = if dtype == ft_core::DType::F32 {
+                                        f64::from(next as f32)
+                                    } else {
+                                        next
+                                    };
+                                }
+                            }
+                            let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                            let report = session.tensor_backward(dummy).unwrap();
+                            optimizer.step(&mut session, &report).unwrap();
+                            for (index, &param) in params.iter().enumerate() {
+                                for (value, expected) in session
+                                    .tensor_values_lossy_f64(param)
+                                    .unwrap()
+                                    .iter()
+                                    .zip(expected[index])
+                                {
+                                    let tolerance = if dtype == ft_core::DType::F32 {
+                                        2e-6
+                                    } else {
+                                        2e-14
+                                    };
+                                    assert!(
+                                        (value - expected).abs() <= tolerance,
+                                        "algorithm={algorithm} {mode:?} {dtype:?} maximize={maximize} round={round}: {value} != {expected}"
+                                    );
+                                }
+                            }
+                        }
+                        let state = optimizer.state_dict(&session).unwrap();
+                        match state.state {
+                            OptimizerState::Adamax(saved) => {
+                                for (index, parameter) in saved.parameters.iter().enumerate() {
+                                    let parameter = parameter.as_ref().unwrap();
+                                    assert_eq!(parameter.step, counts[index]);
+                                    assert_eq!(parameter.exp_avg, first[index]);
+                                    assert_eq!(parameter.exp_inf, second[index]);
+                                }
+                            }
+                            OptimizerState::Adadelta(saved) => {
+                                for (index, parameter) in saved.parameters.iter().enumerate() {
+                                    let parameter = parameter.as_ref().unwrap();
+                                    for (actual, expected) in
+                                        parameter.square_avg.iter().zip(first[index])
+                                    {
+                                        assert!((actual - expected).abs() <= 2e-14);
+                                    }
+                                    for (actual, expected) in
+                                        parameter.acc_delta.iter().zip(second[index])
+                                    {
+                                        assert!((actual - expected).abs() <= 2e-14);
+                                    }
+                                }
+                            }
+                            OptimizerState::Rprop(saved) => {
+                                for (index, parameter) in saved.parameters.iter().enumerate() {
+                                    let parameter = parameter.as_ref().unwrap();
+                                    assert_eq!(parameter.step_size, first[index]);
+                                    assert_eq!(parameter.prev, second[index]);
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adamax_adadelta_rprop_reject_malformed_state_atomically() {
+        for algorithm in 0..3 {
+            for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+                for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let params: Vec<_> = [vec![1.5, -0.75], vec![2.25, 0.5]]
+                        .into_iter()
+                        .map(|values| {
+                            if dtype == ft_core::DType::F32 {
+                                session.tensor_variable_f32(
+                                    values.into_iter().map(|value| value as f32).collect(),
+                                    vec![2],
+                                    true,
+                                )
+                            } else {
+                                session.tensor_variable(values, vec![2], true)
+                            }
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                        0 => Box::new(Adamax::new(params.clone(), 0.03)),
+                        1 => Box::new(Adadelta::new(params.clone(), 0.03)),
+                        _ => Box::new(Rprop::new(params.clone(), 0.03)),
+                    };
+                    checkpoint_training_step(&mut session, optimizer.as_mut(), &params, 3);
+                    let before = optimizer.state_dict(&session).unwrap();
+                    let identity = Arc::clone(&optimizer.identity().0);
+                    let values: Vec<_> = params
+                        .iter()
+                        .map(|&param| session.tensor_values_lossy_f64(param).unwrap())
+                        .collect();
+                    let gradients: Vec<_> = params
+                        .iter()
+                        .map(|&param| session.tensor_grad(param).unwrap())
+                        .collect();
+                    for case in 0..21 {
+                        let mut invalid = before.clone();
+                        match case {
+                            0 => invalid.version += 1,
+                            1 => {
+                                invalid.parameters.pop();
+                            }
+                            2 => invalid.parameters[1].shape = vec![1, 2],
+                            3 => {
+                                invalid.parameters[1].dtype = if dtype == ft_core::DType::F32 {
+                                    ft_core::DType::F64
+                                } else {
+                                    ft_core::DType::F32
+                                }
+                            }
+                            4 => {
+                                invalid =
+                                    SGD::new(params.clone(), 0.1).state_dict(&session).unwrap()
+                            }
+                            _ => match &mut invalid.state {
+                                OptimizerState::Adamax(saved) => match case {
+                                    5 => {
+                                        saved.parameters.pop();
+                                    }
+                                    6 => saved.lr = f64::NAN,
+                                    7 => saved.betas[0] = -0.1,
+                                    8 => saved.betas[1] = 1.0,
+                                    9 => saved.eps = 0.0,
+                                    10 => saved.weight_decay = -0.1,
+                                    17 => saved.betas[0] = f64::NAN,
+                                    18 => saved.lr = -0.1,
+                                    19 => saved.weight_decay = f64::NAN,
+                                    20 => saved.eps = f64::INFINITY,
+                                    _ => {
+                                        let parameter = saved.parameters[1].as_mut().unwrap();
+                                        match case {
+                                            11 => parameter.exp_avg.clear(),
+                                            12 => parameter.exp_avg[0] = f64::INFINITY,
+                                            13 => parameter.exp_inf.clear(),
+                                            14 => parameter.exp_inf[0] = -1.0,
+                                            15 => parameter.exp_inf[0] = f64::NAN,
+                                            16 => parameter.step = 0,
+                                            _ => unreachable!(),
+                                        }
+                                    }
+                                },
+                                OptimizerState::Adadelta(saved) => match case {
+                                    5 => {
+                                        saved.parameters.pop();
+                                    }
+                                    6 => saved.lr = f64::NAN,
+                                    7 => saved.rho = -0.1,
+                                    8 => saved.rho = 1.0,
+                                    9 => saved.eps = 0.0,
+                                    10 => saved.weight_decay = -0.1,
+                                    17 => saved.rho = f64::NAN,
+                                    18 => saved.lr = -0.1,
+                                    19 => saved.weight_decay = f64::NAN,
+                                    20 => saved.eps = f64::INFINITY,
+                                    _ => {
+                                        let parameter = saved.parameters[1].as_mut().unwrap();
+                                        match case {
+                                            11 => parameter.square_avg.clear(),
+                                            12 => parameter.square_avg[0] = f64::INFINITY,
+                                            13 => parameter.acc_delta.clear(),
+                                            14 => parameter.acc_delta[0] = -1.0,
+                                            15 => parameter.acc_delta[0] = f64::NAN,
+                                            16 => parameter.square_avg[0] = -1.0,
+                                            _ => unreachable!(),
+                                        }
+                                    }
+                                },
+                                OptimizerState::Rprop(saved) => match case {
+                                    5 => {
+                                        saved.parameters.pop();
+                                    }
+                                    6 => saved.lr = f64::NAN,
+                                    7 => saved.etas[0] = 0.0,
+                                    8 => saved.etas[1] = 1.0,
+                                    9 => saved.step_sizes[0] = 0.0,
+                                    10 => saved.step_sizes[1] = -0.1,
+                                    16 => saved.step_sizes[0] = saved.step_sizes[1] + 1.0,
+                                    17 => saved.etas[0] = f64::NAN,
+                                    18 => saved.lr = -0.1,
+                                    19 => saved.step_sizes[1] = f64::NAN,
+                                    20 => saved.lr = f64::INFINITY,
+                                    _ => {
+                                        let parameter = saved.parameters[1].as_mut().unwrap();
+                                        match case {
+                                            11 => parameter.prev.clear(),
+                                            12 => parameter.prev[0] = f64::INFINITY,
+                                            13 => parameter.step_size.clear(),
+                                            14 => parameter.step_size[0] = -1.0,
+                                            15 => parameter.step_size[0] = f64::NAN,
+                                            _ => unreachable!(),
+                                        }
+                                    }
+                                },
+                                _ => unreachable!(),
+                            },
+                        }
+                        assert!(
+                            optimizer.load_state_dict(&session, &invalid).is_err(),
+                            "algorithm={algorithm} {mode:?} {dtype:?} case={case}"
+                        );
+                        assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+                        assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+                        assert_eq!(optimizer.parameters(), params);
+                        for (index, &param) in params.iter().enumerate() {
+                            assert_eq!(
+                                session.tensor_values_lossy_f64(param).unwrap(),
+                                values[index]
+                            );
+                            assert_eq!(session.tensor_grad(param).unwrap(), gradients[index]);
+                        }
+                    }
+                    let algorithm_key = ["Adamax", "Adadelta", "Rprop"][algorithm];
+                    let mut json = serde_json::to_value(&before).unwrap();
+                    json["state"][algorithm_key]["parameters"][1]["unexpected"] = true.into();
+                    assert!(serde_json::from_value::<OptimizerStateDict>(json).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adamax_counter_overflow_rejects_entire_step() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let params: Vec<_> = [1.5, -0.75]
+                    .into_iter()
+                    .map(|value| {
+                        if dtype == ft_core::DType::F32 {
+                            session.tensor_variable_f32(vec![value as f32], vec![1], true)
+                        } else {
+                            session.tensor_variable(vec![value], vec![1], true)
+                        }
+                        .unwrap()
+                    })
+                    .collect();
+                let mut optimizer = Adamax::new(params.clone(), 0.03);
+                checkpoint_training_step(&mut session, &mut optimizer, &params, 3);
+                let mut saved = optimizer.state_dict(&session).unwrap();
+                let OptimizerState::Adamax(state) = &mut saved.state else {
+                    unreachable!()
+                };
+                state.parameters[0].as_mut().unwrap().step = (1u64 << 53) + 7;
+                state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                let json = serde_json::to_vec(&saved).unwrap();
+                let restored = serde_json::from_slice(&json).unwrap();
+                assert_eq!(saved, restored);
+                optimizer.load_state_dict(&session, &restored).unwrap();
+                let values: Vec<_> = params
+                    .iter()
+                    .map(|&param| session.tensor_values_lossy_f64(param).unwrap())
+                    .collect();
+                let gradients: Vec<_> = params
+                    .iter()
+                    .map(|&param| session.tensor_grad(param).unwrap())
+                    .collect();
+                let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                let report = session.tensor_backward(dummy).unwrap();
+                assert!(optimizer.step(&mut session, &report).is_err());
+                assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+                for (index, &param) in params.iter().enumerate() {
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(param).unwrap(),
+                        values[index]
+                    );
+                    assert_eq!(session.tensor_grad(param).unwrap(), gradients[index]);
+                }
+                // An exhausted but inactive parameter must not block another
+                // parameter's legitimate step or lose its checkpointed clock.
+                session.tensor_requires_grad_(params[1], false).unwrap();
+                session.tensor_requires_grad_(params[1], true).unwrap();
+                optimizer.step(&mut session, &report).unwrap();
+                assert_eq!(optimizer.step_counts, vec![(1u64 << 53) + 8, u64::MAX]);
+                assert_eq!(
+                    session.tensor_values_lossy_f64(params[1]).unwrap(),
+                    values[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_rprop_accepts_unclamped_initial_steps() {
+        for lr in [0.0, 1e-8, 100.0] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let parameter = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let report = session.tensor_backward(parameter).unwrap();
+            let mut optimizer = Rprop::new(vec![parameter], lr);
+            optimizer.step(&mut session, &report).unwrap();
+            let saved = optimizer.state_dict(&session).unwrap();
+            let OptimizerState::Rprop(state) = &saved.state else {
+                unreachable!()
+            };
+            assert_eq!(state.parameters[0].as_ref().unwrap().step_size, vec![lr]);
+            let mut restored = Rprop::new(vec![parameter], 0.03);
+            restored.load_state_dict(&session, &saved).unwrap();
+            assert_eq!(restored.state_dict(&session).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adamax_adadelta_rprop_preserve_empty_and_untouched_states() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for algorithm in 0..3 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let params: Vec<_> = (0..2)
+                        .map(|_| {
+                            if dtype == ft_core::DType::F32 {
+                                session.tensor_variable_f32(vec![], vec![2, 0, 3], true)
+                            } else {
+                                session.tensor_variable(vec![], vec![2, 0, 3], true)
+                            }
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                        0 => Box::new(Adamax::new(params.clone(), 0.03)),
+                        1 => Box::new(Adadelta::new(params.clone(), 0.03)),
+                        _ => Box::new(Rprop::new(params.clone(), 0.03)),
+                    };
+                    session
+                        .tensor_set_accumulated_gradient(params[0], vec![])
+                        .unwrap();
+                    let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                    let report = session.tensor_backward(dummy).unwrap();
+                    optimizer.step(&mut session, &report).unwrap();
+                    let saved = optimizer.state_dict(&session).unwrap();
+                    match &saved.state {
+                        OptimizerState::Adamax(state) => {
+                            let initialized = state.parameters[0].as_ref().unwrap();
+                            assert_eq!(initialized.step, 1);
+                            assert!(initialized.exp_avg.is_empty());
+                            assert!(initialized.exp_inf.is_empty());
+                            assert!(state.parameters[1].is_none());
+                        }
+                        OptimizerState::Adadelta(state) => {
+                            let initialized = state.parameters[0].as_ref().unwrap();
+                            assert!(initialized.square_avg.is_empty());
+                            assert!(initialized.acc_delta.is_empty());
+                            assert!(state.parameters[1].is_none());
+                        }
+                        OptimizerState::Rprop(state) => {
+                            let initialized = state.parameters[0].as_ref().unwrap();
+                            assert!(initialized.step_size.is_empty());
+                            assert!(initialized.prev.is_empty());
+                            assert!(state.parameters[1].is_none());
+                        }
+                        _ => unreachable!(),
+                    }
+                    let decoded =
+                        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+                    optimizer.load_state_dict(&session, &decoded).unwrap();
+                    assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_adamax_adadelta_rprop_reject_inconsistent_live_buffers() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut adamax = Adamax::new(vec![param], 0.03);
+        adamax.m[0] = Some(vec![0.0]);
+        assert!(adamax.state_dict(&session).is_err());
+        adamax.u[0] = Some(vec![1.0]);
+        assert!(adamax.state_dict(&session).is_err());
+        adamax.step_counts[0] = 1;
+        adamax.u[0] = Some(vec![f64::INFINITY]);
+        assert!(adamax.state_dict(&session).is_err());
+        let mut adadelta = Adadelta::new(vec![param], 0.03);
+        adadelta.acc_delta[0] = Some(vec![0.0]);
+        assert!(adadelta.state_dict(&session).is_err());
+        adadelta.square_avg[0] = Some(vec![-1.0]);
+        assert!(adadelta.state_dict(&session).is_err());
+        let mut rprop = Rprop::new(vec![param], 0.03);
+        rprop.step_sizes[0] = Some(vec![0.03]);
+        assert!(rprop.state_dict(&session).is_err());
+        rprop.prev_grad[0] = Some(vec![f64::NAN]);
+        assert!(rprop.state_dict(&session).is_err());
     }
 
     #[test]
@@ -8591,7 +9558,7 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_checkpoint_distinguishes_sparse_nadam_and_dense_adam_algorithms() {
+    fn optimizer_checkpoint_distinguishes_algorithm_families() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let parameter = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
         let mut optimizers: Vec<Box<dyn Optimizer>> = vec![
@@ -8600,6 +9567,9 @@ mod tests {
             Box::new(Adam::new(vec![parameter], 0.03)),
             Box::new(AdamW::new(vec![parameter], 0.03)),
             Box::new(RAdam::new(vec![parameter], 0.03)),
+            Box::new(Adamax::new(vec![parameter], 0.03)),
+            Box::new(Adadelta::new(vec![parameter], 0.03)),
+            Box::new(Rprop::new(vec![parameter], 0.03)),
         ];
         let checkpoints: Vec<_> = optimizers
             .iter()
@@ -8934,6 +9904,9 @@ mod tests {
             Box::new(RAdam::new(vec![], 0.1)),
             Box::new(SparseAdam::new(vec![], 0.1)),
             Box::new(NAdam::new(vec![], 0.1)),
+            Box::new(Adamax::new(vec![], 0.1)),
+            Box::new(Adadelta::new(vec![], 0.1)),
+            Box::new(Rprop::new(vec![], 0.1)),
         ];
         for optimizer in &mut optimizers {
             let state = optimizer.state_dict(&session).unwrap();
@@ -8954,7 +9927,7 @@ mod tests {
         restored.load_state_dict(&session, &state).unwrap();
         assert_eq!(restored.state_dict(&session).unwrap(), state);
         assert_eq!(restored.params, vec![second]);
-        let mut unsupported = Adadelta::new(vec![param], 0.1);
+        let mut unsupported = Muon::new(vec![param], 0.1);
         assert!(unsupported.state_dict(&session).is_err());
         assert!(unsupported.load_state_dict(&session, &state).is_err());
     }
