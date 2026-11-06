@@ -73,6 +73,7 @@ pub enum OptimizerState {
     Adamax(AdamaxState),
     Adadelta(AdadeltaState),
     Rprop(RpropState),
+    Muon(MuonState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,6 +289,22 @@ pub struct RpropState {
 pub struct RpropParameterState {
     pub step_size: Vec<f64>,
     pub prev: Vec<f64>,
+}
+
+/// Portable Muon configuration and lazily initialized momentum buffers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MuonState {
+    pub lr: f64,
+    pub momentum: f64,
+    pub nesterov: bool,
+    pub ns_steps: usize,
+    pub ns_coefficients: [f64; 3],
+    pub eps: f64,
+    pub adjust_lr_fn: MuonLrAdjustment,
+    pub weight_decay: f64,
+    /// None means this parameter has never received a gradient.
+    pub momentum_buffers: Vec<Option<Vec<f64>>>,
 }
 
 fn optimizer_parameter_metadata(
@@ -691,6 +708,42 @@ fn validate_rprop_state_buffers(state: &RpropState, sizes: &[usize]) -> Result<(
     Ok(())
 }
 
+fn validate_muon_state_buffers(state: &MuonState, sizes: &[usize]) -> Result<(), AutogradError> {
+    ensure_state_len(
+        sizes.len(),
+        state.momentum_buffers.len(),
+        "muon state parameter count mismatch",
+    )?;
+    for (buffer, &numel) in state.momentum_buffers.iter().zip(sizes) {
+        if let Some(buffer) = buffer {
+            validate_optimizer_buffer(buffer, numel)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_muon_state_metadata(
+    parameters: &[OptimizerParameterMetadata],
+    adjustment: MuonLrAdjustment,
+) -> Result<(), AutogradError> {
+    for parameter in parameters {
+        if parameter.shape.len() != 2 {
+            return Err(optimizer_state_error(
+                "muon requires two-dimensional parameters",
+            ));
+        }
+        if parameter.shape[1] == 0 && adjustment != MuonLrAdjustment::MatchRmsAdamw {
+            return Err(optimizer_state_error(
+                "muon learning-rate adjustment requires nonzero columns",
+            ));
+        }
+        if !matches!(parameter.dtype, ft_core::DType::F32 | ft_core::DType::F64) {
+            return Err(optimizer_state_error("muon requires F32 or F64 parameters"));
+        }
+    }
+    Ok(())
+}
+
 fn build_optimizer_state_dict(
     session: &FrankenTorchSession,
     params: &[TensorNodeId],
@@ -716,6 +769,10 @@ fn build_optimizer_state_dict(
         OptimizerState::Adamax(state) => validate_adamax_state_buffers(state, &sizes)?,
         OptimizerState::Adadelta(state) => validate_adadelta_state_buffers(state, &sizes)?,
         OptimizerState::Rprop(state) => validate_rprop_state_buffers(state, &sizes)?,
+        OptimizerState::Muon(state) => {
+            validate_muon_state_metadata(&result.parameters, state.adjust_lr_fn)?;
+            validate_muon_state_buffers(state, &sizes)?;
+        }
     }
     Ok(result)
 }
@@ -7606,26 +7663,39 @@ impl SparseAdam {
 
 // ── frankentorch-ulg7: Muon optimizer ────────────────────────────────────
 
-/// Muon optimizer: Momentum with Orthogonalization of Updates.
+/// Shape-dependent scaling used by [`Muon`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MuonLrAdjustment {
+    /// Multiply the learning rate by `sqrt(max(1, rows / columns))`.
+    Original,
+    /// Match AdamW's update RMS using `0.2 * sqrt(max(rows, columns))`.
+    MatchRmsAdamw,
+    /// Use `sqrt(rows / columns)` without clamping the ratio to one.
+    SpectralUnclamped,
+}
+
+/// Muon optimizer for two-dimensional hidden-layer weight matrices.
 ///
-/// Muon orthogonalizes the momentum vector using Newton-Schulz iterations,
-/// which approximates Gram-Schmidt orthogonalization efficiently. This helps
-/// escape saddle points and improves convergence on certain problems.
+/// Matches the executable `torch.optim.Muon` update: exponential moving-average
+/// momentum, optional Nesterov interpolation, BF16 quintic Newton-Schulz
+/// orthogonalization using the actual matrix shape, shape-adjusted learning rate,
+/// and decoupled weight decay. Biases and other non-matrix parameters should use
+/// a separate optimizer such as [`AdamW`]. F32 and F64 parameter storage is supported.
 ///
-/// The update rule is:
-/// 1. m_t = beta * m_{t-1} + g_t
-/// 2. m_ortho = newton_schulz_ortho(m_t)
-/// 3. θ_{t+1} = θ_t - lr * m_ortho
-///
-/// Newton-Schulz iteration: X_{k+1} = X_k @ (1.5*I - 0.5*X_k^T @ X_k)
-///
-/// Equivalent to experimental `torch.optim.Muon`.
+/// Reference: `pytorch/torch/optim/_muon.py`, `_single_tensor_muon` and
+/// `_zeropower_via_newtonschulz`. In particular, the orthogonalized update is
+/// neither reshaped using a factorization of its length nor rescaled to its
+/// original gradient norm.
 pub struct Muon {
     identity: OptimizerIdentity,
     params: Vec<TensorNodeId>,
     lr: f64,
     momentum: f64,
+    nesterov: bool,
     ns_steps: usize,
+    ns_coefficients: [f64; 3],
+    eps: f64,
+    adjust_lr_fn: MuonLrAdjustment,
     weight_decay: f64,
     m: Vec<Option<Vec<f64>>>,
 }
@@ -7633,7 +7703,8 @@ pub struct Muon {
 impl Muon {
     /// Create a new Muon optimizer.
     ///
-    /// Defaults: lr, momentum=0.95, ns_steps=5, weight_decay=0.0
+    /// Defaults match PyTorch: momentum=0.95, nesterov=true, ns_steps=5,
+    /// ns_coefficients=[3.4445, -4.775, 2.0315], eps=1e-7, weight_decay=0.1.
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
@@ -7641,8 +7712,12 @@ impl Muon {
             params,
             lr,
             momentum: 0.95,
+            nesterov: true,
             ns_steps: 5,
-            weight_decay: 0.0,
+            ns_coefficients: [3.4445, -4.775, 2.0315],
+            eps: 1e-7,
+            adjust_lr_fn: MuonLrAdjustment::Original,
+            weight_decay: 0.1,
             m: vec![None; n],
         }
     }
@@ -7654,6 +7729,34 @@ impl Muon {
         self
     }
 
+    /// Enable or disable Nesterov interpolation (default: enabled).
+    #[must_use]
+    pub fn nesterov(mut self, nesterov: bool) -> Self {
+        self.nesterov = nesterov;
+        self
+    }
+
+    /// Set the three coefficients of the quintic Newton-Schulz polynomial.
+    #[must_use]
+    pub fn ns_coefficients(mut self, coefficients: [f64; 3]) -> Self {
+        self.ns_coefficients = coefficients;
+        self
+    }
+
+    /// Set the minimum Frobenius norm used when normalizing the update.
+    #[must_use]
+    pub fn eps(mut self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    /// Select the matrix-shape learning-rate adjustment.
+    #[must_use]
+    pub fn adjust_lr_fn(mut self, adjustment: MuonLrAdjustment) -> Self {
+        self.adjust_lr_fn = adjustment;
+        self
+    }
+
     /// Set number of Newton-Schulz iterations (default: 5).
     #[must_use]
     pub fn ns_steps(mut self, ns_steps: usize) -> Self {
@@ -7661,7 +7764,7 @@ impl Muon {
         self
     }
 
-    /// Set weight decay (default: 0.0).
+    /// Set decoupled weight decay (default: 0.1).
     #[must_use]
     pub fn weight_decay(mut self, weight_decay: f64) -> Self {
         self.weight_decay = weight_decay;
@@ -7674,11 +7777,27 @@ impl Muon {
                 "muon requires a finite non-negative learning rate",
             ));
         }
-        if !self.momentum.is_finite() || !(0.0..1.0).contains(&self.momentum) {
-            return Err(optimizer_hparam_error("muon momentum must be in [0, 1)"));
+        if !self.momentum.is_finite() || self.momentum < 0.0 {
+            return Err(optimizer_hparam_error(
+                "muon requires finite non-negative momentum",
+            ));
         }
-        if self.ns_steps == 0 {
-            return Err(optimizer_hparam_error("muon requires ns_steps >= 1"));
+        if self.ns_steps >= 100 {
+            return Err(optimizer_hparam_error("muon requires ns_steps < 100"));
+        }
+        if self
+            .ns_coefficients
+            .iter()
+            .any(|value| !(*value as f32).is_finite())
+        {
+            return Err(optimizer_hparam_error(
+                "muon requires finite NS coefficients",
+            ));
+        }
+        if !self.eps.is_finite() || self.eps <= 0.0 || self.eps > ft_core::BFloat16::MAX.to_f64() {
+            return Err(optimizer_hparam_error(
+                "muon requires positive eps within the BF16 finite range",
+            ));
         }
         if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
             return Err(optimizer_hparam_error(
@@ -7686,6 +7805,15 @@ impl Muon {
             ));
         }
         Ok(())
+    }
+
+    fn adjusted_lr(&self, rows: usize, cols: usize) -> f64 {
+        let ratio = match self.adjust_lr_fn {
+            MuonLrAdjustment::Original => ((rows as f64 / cols as f64).max(1.0)).sqrt(),
+            MuonLrAdjustment::MatchRmsAdamw => 0.2 * (rows.max(cols) as f64).sqrt(),
+            MuonLrAdjustment::SpectralUnclamped => (rows as f64 / cols as f64).sqrt(),
+        };
+        self.lr * ratio
     }
 }
 
@@ -7696,6 +7824,56 @@ impl Optimizer for Muon {
 
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
+    }
+
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Muon(MuonState {
+                lr: self.lr,
+                momentum: self.momentum,
+                nesterov: self.nesterov,
+                ns_steps: self.ns_steps,
+                ns_coefficients: self.ns_coefficients,
+                eps: self.eps,
+                adjust_lr_fn: self.adjust_lr_fn,
+                weight_decay: self.weight_decay,
+                momentum_buffers: self.m.clone(),
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Muon(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_muon_state_metadata(&state.parameters, saved.adjust_lr_fn)?;
+        validate_muon_state_buffers(saved, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .momentum(saved.momentum)
+            .nesterov(saved.nesterov)
+            .ns_steps(saved.ns_steps)
+            .ns_coefficients(saved.ns_coefficients)
+            .eps(saved.eps)
+            .adjust_lr_fn(saved.adjust_lr_fn)
+            .weight_decay(saved.weight_decay);
+        restored.validate_hyperparams()?;
+        restored.m.clone_from(&saved.momentum_buffers);
+        // Validate and allocate first; loading state must retain the runtime
+        // identity used by GradScaler and keep this optimizer's parameter IDs.
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
     }
 
     fn get_lr(&self) -> f64 {
@@ -7712,39 +7890,98 @@ impl Optimizer for Muon {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-
+        ensure_state_len(
+            self.params.len(),
+            self.m.len(),
+            "muon state parameter count mismatch",
+        )?;
+        // Preflight the complete parameter set before changing any momentum or
+        // weight. A malformed later parameter must not leave a partial step.
+        let mut active = Vec::with_capacity(self.params.len());
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_grad(param)? {
-                Some(g) => g,
-                None => continue,
-            };
-            let param_vals = session.tensor_values(param)?;
-            let numel = param_vals.len();
-
-            // Apply weight decay to gradient
-            let grad = if self.weight_decay > 0.0 {
-                grad.iter()
-                    .zip(param_vals.iter())
-                    .map(|(&g, &p)| g + self.weight_decay * p)
-                    .collect::<Vec<_>>()
-            } else {
-                grad
-            };
-
-            // Update momentum: m = beta * m + g
-            let m = self.m[i].get_or_insert_with(|| vec![0.0; numel]);
-            for (j, &g) in grad.iter().enumerate() {
-                m[j] = self.momentum * m[j] + g;
+            let shape = session.tensor_shape(param)?;
+            if shape.len() != 2 {
+                return Err(optimizer_hparam_error(
+                    "muon requires two-dimensional parameters",
+                ));
             }
+            if shape[1] == 0 && self.adjust_lr_fn != MuonLrAdjustment::MatchRmsAdamw {
+                return Err(optimizer_hparam_error(
+                    "muon learning-rate adjustment requires nonzero columns",
+                ));
+            }
+            let dtype = session.tensor_dtype(param)?;
+            if !matches!(dtype, ft_core::DType::F32 | ft_core::DType::F64) {
+                return Err(optimizer_hparam_error(
+                    "muon requires F32 or F64 parameters",
+                ));
+            }
+            let numel = checked_shape_numel(&shape, "muon parameter shape overflow")?;
+            if let Some(buffer) = &self.m[i] {
+                ensure_state_len(numel, buffer.len(), "muon momentum shape mismatch")?;
+            }
+            if session.tensor_accumulated_sparse_gradient(param)?.is_some() {
+                return Err(optimizer_hparam_error(
+                    "muon does not support sparse gradients",
+                ));
+            }
+            let gradient = session.tensor_grad(param)?;
+            if let Some(gradient) = &gradient {
+                ensure_grad_len_matches_param(param, numel, gradient.len())?;
+                // Validate storage access before the first parameter is changed.
+                let tensor = session.tensor_snapshot(param)?;
+                if dtype == ft_core::DType::F32 {
+                    tensor
+                        .contiguous_values_f32()
+                        .map_err(AutogradError::DenseTensor)?;
+                } else {
+                    tensor
+                        .contiguous_values()
+                        .map_err(AutogradError::DenseTensor)?;
+                }
+            }
+            active.push((shape, dtype, gradient));
+        }
 
-            // Newton-Schulz orthogonalization
-            // For vectors, we approximate orthogonalization by normalizing
-            // For matrices (2D params), we use Newton-Schulz
-            let m_ortho = newton_schulz_ortho(m, self.ns_steps);
-
-            // Update parameters
-            let update: Vec<f64> = m_ortho.iter().map(|&v| self.lr * v).collect();
-            apply_param_update(session, param, &update)?;
+        for (i, (shape, dtype, gradient)) in active.into_iter().enumerate() {
+            let Some(grad) = gradient else {
+                continue;
+            };
+            let param = self.params[i];
+            let numel = grad.len();
+            let adjusted_lr = self.adjusted_lr(shape[0], shape[1]);
+            let m = self.m[i].get_or_insert_with(|| vec![0.0; numel]);
+            let mut update = Vec::with_capacity(numel);
+            for (buffer, &gradient) in m.iter_mut().zip(&grad) {
+                // torch's buffers and lerps use the parameter's dtype. Stored
+                // F32 moments are widened losslessly for the portable state.
+                *buffer = muon_lerp(*buffer, gradient, 1.0 - self.momentum, dtype);
+                update.push(if self.nesterov {
+                    muon_lerp(gradient, *buffer, self.momentum, dtype)
+                } else {
+                    *buffer
+                });
+            }
+            let orthogonal = newton_schulz_ortho(
+                &update,
+                shape[0],
+                shape[1],
+                self.ns_steps,
+                self.ns_coefficients,
+                self.eps,
+            );
+            let decay = 1.0 - self.lr * self.weight_decay;
+            session.tensor_update_param_values_f64_with(param, |values| {
+                for (value, &direction) in values.iter_mut().zip(&orthogonal) {
+                    *value = if dtype == ft_core::DType::F32 {
+                        // Decay and add are separate in-place operations upstream.
+                        let decayed = (*value as f32) * (decay as f32);
+                        f64::from(decayed + (-adjusted_lr as f32) * direction as f32)
+                    } else {
+                        *value * decay - adjusted_lr * direction
+                    };
+                }
+            })?;
         }
         Ok(())
     }
@@ -7754,110 +7991,144 @@ impl Optimizer for Muon {
     }
 }
 
-/// Newton-Schulz orthogonalization: X' = X @ (1.5*I - 0.5*X^T @ X)
-/// For a 1D vector, this just normalizes. For matrices, it orthogonalizes rows.
-fn newton_schulz_ortho(m: &[f64], ns_steps: usize) -> Vec<f64> {
-    let numel = m.len();
-    if numel == 0 {
-        return Vec::new();
-    }
-
-    // Compute norm for scaling
-    let norm: f64 = m.iter().map(|&x| x * x).sum::<f64>().sqrt();
-    if norm < 1e-12 {
-        return vec![0.0; numel];
-    }
-
-    // For 1D vectors or small tensors, just normalize
-    // Newton-Schulz is primarily for weight matrices
-    if numel < 16 {
-        return m.iter().map(|&x| x / norm).collect();
-    }
-
-    // Reshape to approximate 2D (rows x cols) for Newton-Schulz
-    let (rows, cols) = factorize_approx_square(numel);
-
-    // Scale input to have reasonable spectral norm
-    let scale = 1.0 / norm.max(1.0);
-    let mut x: Vec<f64> = m.iter().map(|&v| v * scale).collect();
-
-    // Newton-Schulz iterations. The two matmuls (X^T@X, then X@(1.5I-0.5X^T@X))
-    // are the cost — O(rows*cols^2) each, expensive for the large weight matrices
-    // Muon targets. Each output element is an INDEPENDENT dot product, so fan the
-    // output rows over rayon above the threshold; the inner k-accumulation order is
-    // unchanged → bit-for-bit identical to the serial loop. frankentorch-optpar.
-    const NS_PAR_MIN: usize = 1 << 12; // 4096 output elems (~64x64)
-    for _ in 0..ns_steps {
-        // Compute X^T @ X (cols x cols)
-        let mut xtx = vec![0.0; cols * cols];
-        let xtx_body = |i: usize, row: &mut [f64]| {
-            for (j, slot) in row.iter_mut().enumerate() {
-                let mut sum = 0.0;
-                for k in 0..rows {
-                    let xi = x.get(k * cols + i).copied().unwrap_or(0.0);
-                    let xj = x.get(k * cols + j).copied().unwrap_or(0.0);
-                    sum += xi * xj;
-                }
-                *slot = sum;
-            }
-        };
-        if cols * cols >= NS_PAR_MIN {
-            use rayon::prelude::*;
-            xtx.par_chunks_mut(cols)
-                .enumerate()
-                .for_each(|(i, row)| xtx_body(i, row));
+fn muon_lerp(start: f64, end: f64, weight: f64, dtype: ft_core::DType) -> f64 {
+    if dtype == ft_core::DType::F32 {
+        let (start, end, weight) = (start as f32, end as f32, weight as f32);
+        f64::from(if weight.abs() < 0.5 {
+            start + weight * (end - start)
         } else {
-            for (i, row) in xtx.chunks_mut(cols).enumerate() {
-                xtx_body(i, row);
-            }
-        }
-
-        // Compute X @ (1.5*I - 0.5*X^T @ X)
-        let mut x_new = vec![0.0; numel];
-        let xnew_body = |r: usize, row: &mut [f64]| {
-            for (c, slot) in row.iter_mut().enumerate() {
-                let mut sum = 0.0;
-                for k in 0..cols {
-                    let xrk = x.get(r * cols + k).copied().unwrap_or(0.0);
-                    // (1.5*I - 0.5*X^T @ X)[k,c]
-                    let ident = if k == c { 1.5 } else { 0.0 };
-                    let xtx_kc = xtx[k * cols + c];
-                    sum += xrk * (ident - 0.5 * xtx_kc);
-                }
-                *slot = sum;
-            }
-        };
-        if numel >= NS_PAR_MIN {
-            use rayon::prelude::*;
-            x_new
-                .par_chunks_mut(cols)
-                .enumerate()
-                .for_each(|(r, row)| xnew_body(r, row));
-        } else {
-            for (r, row) in x_new.chunks_mut(cols).enumerate() {
-                xnew_body(r, row);
-            }
-        }
-        x = x_new;
+            end - (end - start) * (1.0 - weight)
+        })
+    } else if weight.abs() < 0.5 {
+        start + weight * (end - start)
+    } else {
+        end - (end - start) * (1.0 - weight)
     }
-
-    // Scale back to original magnitude
-    let x_norm: f64 = x.iter().map(|&v| v * v).sum::<f64>().sqrt();
-    if x_norm < 1e-12 {
-        return m.iter().map(|&v| v / norm).collect();
-    }
-    x.iter().map(|&v| v * (norm / x_norm)).collect()
 }
 
-/// Factorize numel into approximate (rows, cols) for matrix operations.
-fn factorize_approx_square(numel: usize) -> (usize, usize) {
-    let sqrt_n = (numel as f64).sqrt() as usize;
-    for cols in (1..=sqrt_n).rev() {
-        if numel.is_multiple_of(cols) {
-            return (numel / cols, cols);
+fn muon_bf16(value: f32) -> f32 {
+    ft_core::BFloat16::from_f32(value).to_f32()
+}
+
+/// BF16 quintic Newton-Schulz, with F32 accumulation and BF16 output at each
+/// matmul/addmm boundary. Orient the real matrix so the Gram matrix uses its
+/// smaller dimension; independent rows may run in parallel without changing
+/// the accumulation order within any dot product.
+fn newton_schulz_ortho(
+    m: &[f64],
+    rows: usize,
+    cols: usize,
+    ns_steps: usize,
+    coefficients: [f64; 3],
+    eps: f64,
+) -> Vec<f64> {
+    if m.is_empty() {
+        return Vec::new();
+    }
+    let transposed = rows > cols;
+    let (height, width) = if transposed {
+        (cols, rows)
+    } else {
+        (rows, cols)
+    };
+    let mut x = vec![0.0f32; m.len()];
+    for r in 0..height {
+        for c in 0..width {
+            let source = if transposed {
+                c * cols + r
+            } else {
+                r * cols + c
+            };
+            // ATen converts through float, including double-rounding at BF16
+            // ties. half::bf16::from_f64 rounds differently at those boundaries.
+            x[r * width + c] = muon_bf16(m[source] as f32);
         }
     }
-    (numel, 1)
+    let norm = muon_bf16(x.iter().map(|&v| v * v).sum::<f32>().sqrt());
+    let eps = muon_bf16(eps as f32);
+    // Preserve NaN, as torch.clamp does.
+    let divisor = if norm < eps { eps } else { norm };
+    for value in &mut x {
+        *value = muon_bf16(*value / divisor);
+    }
+    let [a, b, c] = coefficients.map(|value| value as f32);
+    const NS_PAR_MIN: usize = 1 << 12;
+    for _ in 0..ns_steps {
+        let mut gram = vec![0.0f32; height * height];
+        let gram_row = |r: usize, row: &mut [f32]| {
+            for (column, value) in row.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                for k in 0..width {
+                    sum += x[r * width + k] * x[column * width + k];
+                }
+                *value = muon_bf16(sum);
+            }
+        };
+        if gram.len() >= NS_PAR_MIN {
+            use rayon::prelude::*;
+            gram.par_chunks_mut(height)
+                .enumerate()
+                .for_each(|(r, row)| gram_row(r, row));
+        } else {
+            for (r, row) in gram.chunks_mut(height).enumerate() {
+                gram_row(r, row);
+            }
+        }
+        let mut polynomial = vec![0.0f32; height * height];
+        let polynomial_row = |r: usize, row: &mut [f32]| {
+            for (column, value) in row.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                for k in 0..height {
+                    sum += gram[r * height + k] * gram[k * height + column];
+                }
+                *value = muon_bf16(b * gram[r * height + column] + c * sum);
+            }
+        };
+        if polynomial.len() >= NS_PAR_MIN {
+            use rayon::prelude::*;
+            polynomial
+                .par_chunks_mut(height)
+                .enumerate()
+                .for_each(|(r, row)| polynomial_row(r, row));
+        } else {
+            for (r, row) in polynomial.chunks_mut(height).enumerate() {
+                polynomial_row(r, row);
+            }
+        }
+        let mut next = vec![0.0f32; m.len()];
+        let next_row = |r: usize, row: &mut [f32]| {
+            for (column, value) in row.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                for k in 0..height {
+                    sum += polynomial[r * height + k] * x[k * width + column];
+                }
+                *value = muon_bf16(a * x[r * width + column] + sum);
+            }
+        };
+        if next.len() >= NS_PAR_MIN {
+            use rayon::prelude::*;
+            next.par_chunks_mut(width)
+                .enumerate()
+                .for_each(|(r, row)| next_row(r, row));
+        } else {
+            for (r, row) in next.chunks_mut(width).enumerate() {
+                next_row(r, row);
+            }
+        }
+        x = next;
+    }
+    let mut result = vec![0.0; m.len()];
+    for r in 0..height {
+        for c in 0..width {
+            let target = if transposed {
+                c * cols + r
+            } else {
+                r * cols + c
+            };
+            result[target] = f64::from(x[r * width + c]);
+        }
+    }
+    result
 }
 
 // ── frankentorch-iha: Mixed precision GradScaler ────────────────────────
@@ -8370,6 +8641,13 @@ mod tests {
     fn assert_optimizer_checkpoint_resume(
         make_optimizer: impl Fn(Vec<TensorNodeId>, bool) -> Box<dyn Optimizer>,
     ) {
+        assert_optimizer_checkpoint_resume_with_shapes(make_optimizer, [vec![2], vec![1, 2]]);
+    }
+
+    fn assert_optimizer_checkpoint_resume_with_shapes(
+        make_optimizer: impl Fn(Vec<TensorNodeId>, bool) -> Box<dyn Optimizer>,
+        shapes: [Vec<usize>; 2],
+    ) {
         for (mode, dtype) in [
             (ExecutionMode::Strict, ft_core::DType::F64),
             (ExecutionMode::Hardened, ft_core::DType::F64),
@@ -8377,22 +8655,25 @@ mod tests {
             (ExecutionMode::Hardened, ft_core::DType::F32),
         ] {
             let mut uninterrupted = FrankenTorchSession::new(mode);
-            let params: Vec<_> = [(vec![2.0, -3.0], vec![2]), (vec![0.75, -1.25], vec![1, 2])]
-                .into_iter()
-                .map(|(values, shape)| {
-                    if dtype == ft_core::DType::F32 {
-                        uninterrupted
-                            .tensor_variable_f32(
-                                values.into_iter().map(|value| value as f32).collect(),
-                                shape,
-                                true,
-                            )
-                            .unwrap()
-                    } else {
-                        uninterrupted.tensor_variable(values, shape, true).unwrap()
-                    }
-                })
-                .collect();
+            let params: Vec<_> = [
+                (vec![2.0, -3.0], shapes[0].clone()),
+                (vec![0.75, -1.25], shapes[1].clone()),
+            ]
+            .into_iter()
+            .map(|(values, shape)| {
+                if dtype == ft_core::DType::F32 {
+                    uninterrupted
+                        .tensor_variable_f32(
+                            values.into_iter().map(|value| value as f32).collect(),
+                            shape,
+                            true,
+                        )
+                        .unwrap()
+                } else {
+                    uninterrupted.tensor_variable(values, shape, true).unwrap()
+                }
+            })
+            .collect();
             let mut optimizer = make_optimizer(params.clone(), true);
             for round in 0..2 {
                 checkpoint_training_step(&mut uninterrupted, optimizer.as_mut(), &params, round);
@@ -8412,6 +8693,7 @@ mod tests {
                 OptimizerState::Adamax(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::Adadelta(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::Rprop(state) => assert!(state.parameters[1].is_none()),
+                OptimizerState::Muon(state) => assert!(state.momentum_buffers[1].is_none()),
             }
             let encoded = serde_json::to_vec(&saved).unwrap();
             let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
@@ -9927,7 +10209,7 @@ mod tests {
         restored.load_state_dict(&session, &state).unwrap();
         assert_eq!(restored.state_dict(&session).unwrap(), state);
         assert_eq!(restored.params, vec![second]);
-        let mut unsupported = Muon::new(vec![param], 0.1);
+        let mut unsupported = LBFGS::new(vec![param], 0.1);
         assert!(unsupported.state_dict(&session).is_err());
         assert!(unsupported.load_state_dict(&session, &state).is_err());
     }
@@ -18989,63 +19271,97 @@ mod tests {
     }
 
     #[test]
-    fn factorize_approx_square_returns_balanced_divisor_pair() {
-        // Exact (rows, cols) with rows*cols == numel, cols the largest divisor <= sqrt(numel).
-        assert_eq!(super::factorize_approx_square(16), (4, 4));
-        assert_eq!(super::factorize_approx_square(12), (4, 3));
-        assert_eq!(super::factorize_approx_square(20), (5, 4));
-        assert_eq!(super::factorize_approx_square(7), (7, 1)); // prime -> column vector
-        assert_eq!(super::factorize_approx_square(1), (1, 1));
-        assert_eq!(super::factorize_approx_square(8192), (128, 64));
+    fn muon_orthogonalization_uses_the_actual_matrix_shape() {
+        let values = [1.0, -2.0, 3.0, 4.0, 0.5, -1.5];
+        let wide = super::newton_schulz_ortho(&values, 2, 3, 5, [3.4445, -4.775, 2.0315], 1e-7);
+        let tall = super::newton_schulz_ortho(&values, 3, 2, 5, [3.4445, -4.775, 2.0315], 1e-7);
+        assert_ne!(
+            wide, tall,
+            "equal element counts do not imply equal matrices"
+        );
     }
 
     #[test]
-    fn factorize_approx_square_invariants_hold() {
-        for numel in [1usize, 2, 3, 9, 15, 16, 17, 100, 256, 999, 1024] {
-            let (rows, cols) = super::factorize_approx_square(numel);
-            assert_eq!(rows * cols, numel, "product must reconstruct numel={numel}");
-            assert!(cols <= rows, "cols<=rows expected for numel={numel}");
-            assert!(
-                cols >= 1 && rows >= 1,
-                "dims must be positive for numel={numel}"
-            );
+    fn muon_zero_iterations_still_normalizes_in_bfloat16() {
+        let out = super::newton_schulz_ortho(
+            &[3.0, 4.0, 0.0, 0.0],
+            2,
+            2,
+            0,
+            [3.4445, -4.775, 2.0315],
+            1e-7,
+        );
+        assert_eq!(out, vec![0.6015625, 0.80078125, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn muon_f64_bfloat16_ties_match_pytorch_float_intermediate() {
+        // torch 2.15 CPU casts F64 through F32 before BF16. Direct F64-to-BF16
+        // rounding chooses the opposite neighbor for this exact boundary input.
+        let out = super::newton_schulz_ortho(
+            &[1.0117187499990905, 1.0],
+            1,
+            2,
+            0,
+            [3.4445, -4.775, 2.0315],
+            1e-7,
+        );
+        assert_eq!(out, vec![0.71484375, 0.703125]);
+    }
+
+    #[test]
+    fn muon_rejects_scalar_conversion_overflow_before_mutating() {
+        let (mut session, param) = muon_matrix_session();
+        let report = backward_sum_sq(&mut session, param);
+        let before = session.tensor_values(param).unwrap();
+        for mut optimizer in [
+            Muon::new(vec![param], 0.1).eps(1e39),
+            Muon::new(vec![param], 0.1).ns_coefficients([1e39, -0.5, 0.0]),
+        ] {
+            assert!(optimizer.step(&mut session, &report).is_err());
+            assert_eq!(session.tensor_values(param).unwrap(), before);
+            assert_eq!(optimizer.m, vec![None]);
         }
     }
 
     #[test]
     fn newton_schulz_ortho_empty_and_zero_inputs() {
-        assert!(super::newton_schulz_ortho(&[], 5).is_empty());
-        // All-zero input is below the degeneracy threshold -> all-zero output.
-        let zeros = super::newton_schulz_ortho(&[0.0; 20], 5);
+        assert!(
+            super::newton_schulz_ortho(&[], 0, 5, 5, [3.4445, -4.775, 2.0315], 1e-7).is_empty()
+        );
+        let zeros = super::newton_schulz_ortho(&[0.0; 20], 4, 5, 5, [3.4445, -4.775, 2.0315], 1e-7);
         assert_eq!(zeros.len(), 20);
         assert!(zeros.iter().all(|&v| v == 0.0));
     }
 
     #[test]
-    fn newton_schulz_ortho_small_input_normalizes_to_unit_norm() {
-        // numel < 16 falls back to plain normalization (direction preserved, unit norm).
-        let out = super::newton_schulz_ortho(&[3.0, 4.0, 0.0, 0.0], 5);
-        assert!((frob_norm(&out) - 1.0).abs() < 1e-12, "expected unit norm");
-        assert!((out[0] - 0.6).abs() < 1e-12 && (out[1] - 0.8).abs() < 1e-12);
+    fn muon_small_matrices_use_newton_schulz_too() {
+        let values = [3.0, 4.0, 0.0, 0.0];
+        let normalized =
+            super::newton_schulz_ortho(&values, 2, 2, 0, [3.4445, -4.775, 2.0315], 1e-7);
+        let iterated = super::newton_schulz_ortho(&values, 2, 2, 5, [3.4445, -4.775, 2.0315], 1e-7);
+        assert_ne!(normalized, iterated);
     }
 
     #[test]
-    fn newton_schulz_ortho_preserves_frobenius_norm_for_matrices() {
-        // For numel >= 16 the result is scaled back to the input Frobenius norm.
+    fn muon_orthogonalization_is_invariant_to_power_of_two_gradient_scaling() {
         let m: Vec<f64> = (1..=16).map(|x| x as f64).collect();
-        let input_norm = frob_norm(&m);
-        let out = super::newton_schulz_ortho(&m, 5);
-        assert_eq!(out.len(), 16);
-        assert!(out.iter().all(|v| v.is_finite()), "output must be finite");
-        let rel = (frob_norm(&out) - input_norm).abs() / input_norm;
-        assert!(rel < 1e-9, "Frobenius norm not preserved: rel error {rel}");
+        let scaled: Vec<_> = m.iter().map(|v| v * 8.0).collect();
+        let out = super::newton_schulz_ortho(&m, 4, 4, 5, [3.4445, -4.775, 2.0315], 1e-7);
+        let out_scaled =
+            super::newton_schulz_ortho(&scaled, 4, 4, 5, [3.4445, -4.775, 2.0315], 1e-7);
+        assert_eq!(out, out_scaled);
+        assert!(
+            frob_norm(&out) < 4.0,
+            "update must not regain the raw gradient norm"
+        );
     }
 
     #[test]
     fn newton_schulz_ortho_is_deterministic() {
         let m: Vec<f64> = (1..=24).map(|x| (x as f64) * 0.5 - 3.0).collect();
-        let a = super::newton_schulz_ortho(&m, 5);
-        let b = super::newton_schulz_ortho(&m, 5);
+        let a = super::newton_schulz_ortho(&m, 4, 6, 5, [3.4445, -4.775, 2.0315], 1e-7);
+        let b = super::newton_schulz_ortho(&m, 4, 6, 5, [3.4445, -4.775, 2.0315], 1e-7);
         assert_eq!(a, b, "Newton-Schulz must be a pure deterministic function");
     }
 
@@ -19068,28 +19384,354 @@ mod tests {
     }
 
     #[test]
-    fn muon_first_step_delta_norm_equals_lr_times_grad_norm() {
-        // On the first step the momentum buffer equals the gradient, and the
-        // orthogonalized update preserves the gradient's Frobenius norm, so
-        // ||x_after - x_before||_F == lr * ||grad||_F exactly (grad = 2x).
-        let (mut session, x) = muon_matrix_session();
-        let lr = 0.01;
-        let before = session.tensor_values(x).expect("values");
-        let grad_norm = 2.0 * frob_norm(&before); // d/dx sum(x^2) = 2x
-        let report = backward_sum_sq(&mut session, x);
-        let mut opt = Muon::new(vec![x], lr);
-        opt.step(&mut session, &report)
-            .expect("step should succeed");
-        let after = session.tensor_values(x).expect("values");
-        let delta: Vec<f64> = before.iter().zip(&after).map(|(b, a)| a - b).collect();
-        assert!(after.iter().all(|v| v.is_finite()));
-        let expected = lr * grad_norm;
+    fn muon_zero_gradient_applies_only_decoupled_decay() {
+        for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let param = if dtype == ft_core::DType::F32 {
+                session
+                    .tensor_variable_f32(vec![1.0, -2.0, 3.0, -4.0], vec![2, 2], true)
+                    .unwrap()
+            } else {
+                session
+                    .tensor_variable(vec![1.0, -2.0, 3.0, -4.0], vec![2, 2], true)
+                    .unwrap()
+            };
+            let report = backward_sum_sq(&mut session, param);
+            session.tensor_zero_grad(param).unwrap();
+            let mut optimizer = Muon::new(vec![param], 0.25).weight_decay(0.5);
+            optimizer.step(&mut session, &report).unwrap();
+            assert_eq!(
+                session.tensor_values_lossy_f64(param).unwrap(),
+                vec![0.875, -1.75, 2.625, -3.5]
+            );
+            assert_eq!(optimizer.m, vec![Some(vec![0.0; 4])]);
+        }
+    }
+
+    #[test]
+    fn muon_rectangular_training_matches_pytorch_cpu_oracle() {
+        // Captured from torch 2.15.0+cpu, git d0f2af8b66b20da4baa50644c0cd3f887a2eae2e,
+        // using actual torch.optim.Muon.step(), lr=.05, momentum=.8, wd=.1.
+        // These fixed trajectories cover both matrix orientations, storage dtypes,
+        // Nesterov modes, every LR adjustment, zero NS steps and custom coefficients.
+        let initial = [0.5, -1.0, 2.0, -0.25, 0.75, -1.5];
+        let gradients = [
+            [1.0, -2.0, 0.5, 3.0, -0.25, -1.0],
+            [0.25, 1.0, -1.5, -2.0, 0.75, 2.5],
+            [-1.25, 0.5, 2.0, -0.75, -3.0, 1.25],
+        ];
+        let cases = [
+            (
+                vec![2, 3],
+                ft_core::DType::F64,
+                true,
+                MuonLrAdjustment::Original,
+                5,
+                [3.4445, -4.775, 2.0315],
+                vec![
+                    vec![
+                        0.48734375,
+                        -0.9608203125,
+                        1.97876953125,
+                        -0.2878125,
+                        0.744638671875,
+                        -1.47736328125,
+                    ],
+                    vec![
+                        0.474897265625,
+                        -0.9823833984375,
+                        1.98899287109375,
+                        -0.275289453125,
+                        0.718845166015625,
+                        -1.49673427734375,
+                    ],
+                    vec![
+                        0.496839185546875,
+                        -1.0061824189453126,
+                        1.9399854067382811,
+                        -0.2729181328125,
+                        0.7500165651855468,
+                        -1.4998951372070313,
+                    ],
+                ],
+            ),
+            (
+                vec![3, 2],
+                ft_core::DType::F32,
+                true,
+                MuonLrAdjustment::Original,
+                5,
+                [3.4445, -4.775, 2.0315],
+                vec![
+                    vec![
+                        0.4446350336074829,
+                        -0.9719164371490479,
+                        1.9600989818572998,
+                        -0.2848704159259796,
+                        0.7607819437980652,
+                        -1.4803602695465088,
+                    ],
+                    vec![
+                        0.41334810853004456,
+                        -0.9608075618743896,
+                        2.0055556297302246,
+                        -0.2872734069824219,
+                        0.7725265622138977,
+                        -1.5248665809631348,
+                    ],
+                    vec![
+                        0.4311356246471405,
+                        -0.9421892762184143,
+                        1.9627563953399658,
+                        -0.30389726161956787,
+                        0.7903122901916504,
+                        -1.5550371408462524,
+                    ],
+                ],
+            ),
+            (
+                vec![1, 4],
+                ft_core::DType::F64,
+                false,
+                MuonLrAdjustment::SpectralUnclamped,
+                0,
+                [3.4445, -4.775, 2.0315],
+                vec![
+                    vec![
+                        0.490908203125,
+                        -0.98181640625,
+                        1.9867041015625,
+                        -0.26857421875,
+                    ],
+                    vec![
+                        0.472828662109375,
+                        -0.9679717773437501,
+                        1.9930791748046874,
+                        -0.27318837890625003,
+                    ],
+                    vec![
+                        0.47852115942382817,
+                        -0.9635255952148438,
+                        1.961141122680664,
+                        -0.2633751713867188,
+                    ],
+                ],
+            ),
+            (
+                vec![4, 1],
+                ft_core::DType::F32,
+                false,
+                MuonLrAdjustment::MatchRmsAdamw,
+                1,
+                [1.5, -0.5, 0.0],
+                vec![
+                    vec![
+                        0.4921875,
+                        -0.984375,
+                        1.9873437881469727,
+                        -0.26468750834465027,
+                    ],
+                    vec![
+                        0.477226585149765,
+                        -0.9723047018051147,
+                        1.9904539585113525,
+                        -0.26812970638275146,
+                    ],
+                    vec![
+                        0.48132485151290894,
+                        -0.9677605628967285,
+                        1.9628454446792603,
+                        -0.25999218225479126,
+                    ],
+                ],
+            ),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (shape, dtype, nesterov, adjustment, steps, coefficients, expected) in &cases {
+                let mut session = FrankenTorchSession::new(mode);
+                let count = shape.iter().product::<usize>();
+                let param = if *dtype == ft_core::DType::F32 {
+                    session
+                        .tensor_variable_f32(
+                            initial[..count].iter().map(|&v| v as f32).collect(),
+                            shape.clone(),
+                            true,
+                        )
+                        .unwrap()
+                } else {
+                    session
+                        .tensor_variable(initial[..count].to_vec(), shape.clone(), true)
+                        .unwrap()
+                };
+                let mut optimizer = Muon::new(vec![param], 0.05)
+                    .momentum(0.8)
+                    .nesterov(*nesterov)
+                    .adjust_lr_fn(*adjustment)
+                    .ns_steps(*steps)
+                    .ns_coefficients(*coefficients);
+                let report = backward_sum_sq(&mut session, param);
+                for (round, (gradient, expected)) in gradients.iter().zip(expected).enumerate() {
+                    session
+                        .tensor_set_accumulated_gradient(param, gradient[..count].to_vec())
+                        .unwrap();
+                    optimizer.step(&mut session, &report).unwrap();
+                    let actual = session.tensor_values_lossy_f64(param).unwrap();
+                    let tolerance = if *dtype == ft_core::DType::F32 {
+                        3e-7
+                    } else {
+                        3e-14
+                    };
+                    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= tolerance,
+                            "torch Muon mismatch {shape:?} {dtype:?} {adjustment:?} round={round} index={index}: {actual} != {expected}"
+                        );
+                    }
+                }
+                let expected_momentum = [-0.082, 0.004, 0.224, -0.086, -0.512, 0.522];
+                for (&actual, &expected) in optimizer.m[0]
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .zip(&expected_momentum[..count])
+                {
+                    assert!((actual - expected).abs() < 2e-7);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn muon_invalid_later_parameter_does_not_partially_update() {
+        for bad_shape in [vec![4], vec![1, 2, 2], vec![4, 0]] {
+            let (mut session, valid) = muon_matrix_session();
+            let invalid = session
+                .tensor_variable(vec![1.0; bad_shape.iter().product()], bad_shape, true)
+                .unwrap();
+            let report = backward_sum_sq(&mut session, valid);
+            let before = session.tensor_values(valid).unwrap();
+            let mut optimizer = Muon::new(vec![valid, invalid], 0.1);
+            assert!(optimizer.step(&mut session, &report).is_err());
+            assert_eq!(session.tensor_values(valid).unwrap(), before);
+            assert_eq!(optimizer.m, vec![None, None]);
+        }
+    }
+
+    #[test]
+    fn muon_checkpoint_resumes_typed_rectangular_training() {
+        for nesterov in [false, true] {
+            for adjustment in [
+                MuonLrAdjustment::Original,
+                MuonLrAdjustment::MatchRmsAdamw,
+                MuonLrAdjustment::SpectralUnclamped,
+            ] {
+                assert_optimizer_checkpoint_resume_with_shapes(
+                    |params, original| {
+                        if original {
+                            Box::new(
+                                Muon::new(params, 0.05)
+                                    .momentum(0.8)
+                                    .nesterov(nesterov)
+                                    .weight_decay(0.125)
+                                    .ns_steps(3)
+                                    .ns_coefficients([1.5, -0.5, 0.0])
+                                    .eps(2e-6)
+                                    .adjust_lr_fn(adjustment),
+                            )
+                        } else {
+                            Box::new(Muon::new(params, 0.9))
+                        }
+                    },
+                    [vec![1, 2], vec![2, 1]],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn muon_checkpoint_rejects_corruption_without_changing_state_or_identity() {
+        let (mut session, param) = muon_matrix_session();
+        let report = backward_sum_sq(&mut session, param);
+        let mut optimizer = Muon::new(vec![param], 0.05);
+        optimizer.step(&mut session, &report).unwrap();
+        let saved = optimizer.state_dict(&session).unwrap();
+        let before = session.tensor_values(param).unwrap();
+        let identity = Arc::clone(&optimizer.identity().0);
+        for case in 0..13 {
+            let mut invalid = saved.clone();
+            match case {
+                0 => invalid.version += 1,
+                1 => invalid.parameters.clear(),
+                2 => invalid.parameters[0].shape = vec![2, 8],
+                3 => invalid.parameters[0].dtype = ft_core::DType::F32,
+                _ => {
+                    let OptimizerState::Muon(state) = &mut invalid.state else {
+                        unreachable!()
+                    };
+                    match case {
+                        4 => state.momentum_buffers.clear(),
+                        5 => {
+                            state.momentum_buffers[0].as_mut().unwrap().pop();
+                        }
+                        6 => state.momentum_buffers[0].as_mut().unwrap()[0] = f64::NAN,
+                        7 => state.lr = -0.1,
+                        8 => state.momentum = f64::INFINITY,
+                        9 => state.ns_steps = 100,
+                        10 => state.ns_coefficients[1] = f64::NAN,
+                        11 => state.eps = 0.0,
+                        12 => state.weight_decay = -0.1,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(
+                optimizer.load_state_dict(&session, &invalid).is_err(),
+                "case {case}"
+            );
+            assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+            assert_eq!(session.tensor_values(param).unwrap(), before);
+            assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+        }
+        let wrong_algorithm = SGD::new(vec![param], 0.1).state_dict(&session).unwrap();
         assert!(
-            (frob_norm(&delta) - expected).abs() < 1e-9,
-            "delta norm {} differs from lr*||grad|| {}",
-            frob_norm(&delta),
-            expected
+            optimizer
+                .load_state_dict(&session, &wrong_algorithm)
+                .is_err()
         );
+        assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+        let mut corrupt = serde_json::to_value(&saved).unwrap();
+        corrupt["state"]["Muon"]["unrecognized"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<OptimizerStateDict>(corrupt).is_err());
+    }
+
+    #[test]
+    fn muon_checkpoint_preserves_empty_and_absent_momentum() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let empty = session
+            .tensor_variable(Vec::new(), vec![0, 3], true)
+            .unwrap();
+        let empty_loss = session.tensor_sum(empty).unwrap();
+        let report = session.tensor_backward(empty_loss).unwrap();
+        let mut optimizer = Muon::new(vec![empty], 0.1);
+        let untouched = optimizer.state_dict(&session).unwrap();
+        let OptimizerState::Muon(state) = &untouched.state else {
+            unreachable!()
+        };
+        assert_eq!(state.momentum_buffers, vec![None]);
+        optimizer.step(&mut session, &report).unwrap();
+        let initialized = optimizer.state_dict(&session).unwrap();
+        let OptimizerState::Muon(state) = &initialized.state else {
+            unreachable!()
+        };
+        assert_eq!(state.momentum_buffers, vec![Some(Vec::new())]);
+        optimizer.load_state_dict(&session, &untouched).unwrap();
+        assert_eq!(optimizer.state_dict(&session).unwrap(), untouched);
+        optimizer.load_state_dict(&session, &initialized).unwrap();
+        assert_eq!(optimizer.state_dict(&session).unwrap(), initialized);
+        let mut no_parameters = Muon::new(Vec::new(), 0.1);
+        let state = no_parameters.state_dict(&session).unwrap();
+        no_parameters.load_state_dict(&session, &state).unwrap();
+        assert!(state.parameters.is_empty());
     }
 
     #[test]
@@ -19163,24 +19805,24 @@ mod tests {
                     .is_err()
             );
         }
-        // momentum >= 1
+        // negative momentum
         {
             let (mut session, x) = make();
             let report = backward_sum_sq(&mut session, x);
             assert!(
                 Muon::new(vec![x], 0.1)
-                    .momentum(1.0)
+                    .momentum(-0.1)
                     .step(&mut session, &report)
                     .is_err()
             );
         }
-        // ns_steps == 0
+        // ns_steps reaches upstream's bound
         {
             let (mut session, x) = make();
             let report = backward_sum_sq(&mut session, x);
             assert!(
                 Muon::new(vec![x], 0.1)
-                    .ns_steps(0)
+                    .ns_steps(100)
                     .step(&mut session, &report)
                     .is_err()
             );
