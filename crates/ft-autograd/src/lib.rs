@@ -7036,6 +7036,340 @@ impl TensorTape {
         ))
     }
 
+    /// Validate probability-space BCE before recording its forward or AMP casts.
+    /// Targets have exactly the input shape; BCE does not broadcast targets.
+    pub fn validate_binary_cross_entropy_inputs(
+        &self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        autocast_fp32: bool,
+    ) -> Result<(), AutogradError> {
+        let input = &self.node(input)?.tensor;
+        let target = &self.node(target)?.tensor;
+        let effective_dtype = |dtype| {
+            if autocast_fp32 && matches!(dtype, DType::F16 | DType::BF16) {
+                DType::F32
+            } else {
+                dtype
+            }
+        };
+        if input.meta().shape() != target.meta().shape()
+            || input.meta().device() != target.meta().device()
+            || effective_dtype(input.meta().dtype()) != effective_dtype(target.meta().dtype())
+        {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason:
+                        "binary_cross_entropy requires matching shapes, floating dtypes and devices",
+                }
+                .into(),
+            ));
+        }
+        if !matches!(
+            input.meta().dtype(),
+            DType::F64 | DType::F32 | DType::F16 | DType::BF16
+        ) {
+            return Err(DenseTensorError::UnsupportedDType(input.meta().dtype()).into());
+        }
+        for tensor in [input, target] {
+            let values = if tensor.meta().dtype() == DType::F64 && tensor.meta().is_contiguous() {
+                std::borrow::Cow::Borrowed(tensor.contiguous_values()?)
+            } else {
+                std::borrow::Cow::Owned(tensor.contiguous_values_as_f64()?)
+            };
+            if values.iter().any(|value| !(0.0..=1.0).contains(value)) {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason:
+                            "binary_cross_entropy input and target values must be between 0 and 1",
+                    }
+                    .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Unreduced probability-space BCE, including PyTorch's endpoint derivatives.
+    ///
+    /// ATen/native/Loss.cpp clamps each logarithm to -100, not the input
+    /// probability. Its input derivative independently clamps x*(1-x) to a
+    /// float-valued 1e-12. FunctionsManual.cpp gives explicit double-backward
+    /// rules using a double-valued epsilon; differentiating the forward clamps
+    /// (or the first backward clamp) would therefore be incorrect.
+    pub fn binary_cross_entropy(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.validate_binary_cross_entropy_inputs(input, target, false)?;
+        let dtype = self.node(input)?.tensor.meta().dtype();
+        let out = self.apply_function_with_create_graph(
+            &[input, target],
+            move |ctx, inputs| {
+                use rayon::prelude::*;
+
+                let (x, shape) = inputs[0];
+                let (t, _) = inputs[1];
+                if ctx.needs_input_grad().iter().any(|&needed| needed) {
+                    ctx.save_for_backward(x.to_vec(), shape.to_vec());
+                    ctx.save_for_backward(t.to_vec(), shape.to_vec());
+                }
+                let values = x
+                    .par_iter()
+                    .zip(t.par_iter())
+                    .map(|(&x, &t)| {
+                        if dtype == DType::F64 {
+                            (t - 1.0) * (-x).ln_1p().max(-100.0) - t * x.ln().max(-100.0)
+                        } else {
+                            let (x, t) = (x as f32, t as f32);
+                            f64::from((t - 1.0) * (-x).ln_1p().max(-100.0) - t * x.ln().max(-100.0))
+                        }
+                    })
+                    .collect();
+                Ok((values, shape.to_vec()))
+            },
+            |ctx, incoming| {
+                let x = &ctx.saved_tensors()[0];
+                let target = &ctx.saved_tensors()[1];
+                let input_grad = ctx.needs_input_grad()[0].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(x.iter().zip(target))
+                        .map(|(&g, (&x, &t))| {
+                            g * (x - t) / ((1.0 - x) * x).max(f64::from(1e-12_f32))
+                        })
+                        .collect()
+                });
+                let target_grad = ctx.needs_input_grad()[1].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(x)
+                        .map(|(&g, &x)| -((x / (1.0 - x)).ln()) * g)
+                        .collect()
+                });
+                Ok(vec![input_grad, target_grad])
+            },
+            |ctx, incoming, inputs, tape| {
+                let grad = tape.cg_to_f64(incoming[0])?;
+                let input_grad = if ctx.needs_input_grad()[0] {
+                    Some(tape.cg_binary_cross_entropy_input_backward(grad, inputs[0], inputs[1])?)
+                } else {
+                    None
+                };
+                let target_grad = if ctx.needs_input_grad()[1] {
+                    Some(tape.cg_binary_cross_entropy_target_backward(grad, inputs[0])?)
+                } else {
+                    None
+                };
+                Ok(vec![input_grad, target_grad])
+            },
+        )?;
+        if self.node(out)?.requires_grad {
+            self.save_custom_function_input_versions(out, &[input, target])?;
+        }
+        Ok(out)
+    }
+
+    /// Record BCE's first input derivative as an operation with ATen's explicit
+    /// double-backward formulas, which deliberately differ from a clamp's
+    /// derivative near 0 and 1. Keep the original typed operands as dependencies
+    /// for version checking; placing the F64 incoming gradient last selects an
+    /// F64 output without detaching or prematurely copying those operands.
+    fn cg_binary_cross_entropy_input_backward(
+        &mut self,
+        grad: TensorNodeId,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let out = self.apply_function_with_create_graph(
+            &[input, target, grad],
+            |ctx, inputs| {
+                let (x, _) = inputs[0];
+                let (target, _) = inputs[1];
+                let (grad, shape) = inputs[2];
+                if ctx.needs_input_grad().iter().any(|&needed| needed) {
+                    for &(values, shape) in inputs {
+                        ctx.save_for_backward(values.to_vec(), shape.to_vec());
+                    }
+                }
+                let values = grad
+                    .iter()
+                    .zip(x.iter().zip(target))
+                    .map(|(&g, (&x, &t))| g * (x - t) / ((1.0 - x) * x).max(f64::from(1e-12_f32)))
+                    .collect();
+                Ok((values, shape.to_vec()))
+            },
+            |ctx, incoming| {
+                let saved = ctx.saved_tensors();
+                let (x, target, grad) = (&saved[0], &saved[1], &saved[2]);
+                let needs = ctx.needs_input_grad();
+                let grad_grad = needs[2].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(x.iter().zip(target))
+                        .map(|(&h, (&x, &t))| (x - t) / ((x + 1e-12) * (1.0 - x + 1e-12)) * h)
+                        .collect()
+                });
+                let grad_input = needs[0].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(grad.iter().zip(x.iter().zip(target)))
+                        .map(|(&h, (&g, (&x, &t)))| {
+                            (x * x - 2.0 * x * t + t)
+                                / ((x + 1e-12).powi(2) * (1.0 - x + 1e-12).powi(2))
+                                * (h * g)
+                        })
+                        .collect()
+                });
+                let grad_target = needs[1].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(grad.iter().zip(x))
+                        .map(|(&h, (&g, &x))| -h * g / ((1.0 - x) * x).max(1e-12))
+                        .collect()
+                });
+                Ok(vec![grad_input, grad_target, grad_grad])
+            },
+            |ctx, incoming, inputs, tape| {
+                let x = tape.cg_to_f64(inputs[0])?;
+                let target = tape.cg_to_f64(inputs[1])?;
+                let grad = tape.cg_to_f64(inputs[2])?;
+                let h = tape.cg_to_f64(incoming[0])?;
+                let shape = tape.node(x)?.tensor.meta().shape().to_vec();
+                let numel = tape.node(x)?.tensor.meta().numel();
+                let one = tape.leaf(vec![1.0; numel], shape.clone(), false)?;
+                let eps = tape.leaf(vec![1e-12; numel], shape.clone(), false)?;
+                let complement = tape.cg_sub(one, x)?;
+                let x_eps = tape.cg_add(x, eps)?;
+                let complement_eps = tape.cg_add(complement, eps)?;
+                let needs = ctx.needs_input_grad();
+                let grad_grad = if needs[2] {
+                    let numerator = tape.cg_sub(x, target)?;
+                    let denom = tape.cg_mul(x_eps, complement_eps)?;
+                    let local = tape.cg_div(numerator, denom)?;
+                    Some(tape.cg_mul(local, h)?)
+                } else {
+                    None
+                };
+                let grad_input = if needs[0] {
+                    let x_square = tape.cg_mul(x, x)?;
+                    let twice_x = tape.cg_mul_scalar(x, 2.0)?;
+                    let twice_x_target = tape.cg_mul(twice_x, target)?;
+                    let numerator = tape.cg_sub(x_square, twice_x_target)?;
+                    let numerator = tape.cg_add(numerator, target)?;
+                    let x_eps_square = tape.cg_mul(x_eps, x_eps)?;
+                    let complement_eps_square = tape.cg_mul(complement_eps, complement_eps)?;
+                    let denom = tape.cg_mul(x_eps_square, complement_eps_square)?;
+                    let local = tape.cg_div(numerator, denom)?;
+                    let incoming = tape.cg_mul(h, grad)?;
+                    Some(tape.cg_mul(local, incoming)?)
+                } else {
+                    None
+                };
+                let grad_target = if needs[1] {
+                    let denom = tape.cg_mul(complement, x)?;
+                    // Upstream clamps this denominator under NoGradGuard. The
+                    // value correction is constant, while derivatives still
+                    // pass through x*(1-x), including on clamped entries.
+                    let correction = tape
+                        .node(denom)?
+                        .tensor
+                        .contiguous_values_as_f64()?
+                        .into_iter()
+                        .map(|value| value.max(1e-12) - value)
+                        .collect();
+                    let correction = tape.leaf(correction, shape, false)?;
+                    let denom = tape.cg_add(denom, correction)?;
+                    let negative_h = tape.cg_neg(h)?;
+                    let numerator = tape.cg_mul(negative_h, grad)?;
+                    Some(tape.cg_div(numerator, denom)?)
+                } else {
+                    None
+                };
+                Ok(vec![grad_input, grad_target, grad_grad])
+            },
+        )?;
+        if self.node(out)?.requires_grad {
+            self.save_custom_function_input_versions(out, &[grad, input, target])?;
+        }
+        Ok(out)
+    }
+
+    /// BCE differentiates trainable targets as -grad*logit(input), without
+    /// the forward log clamp. Keep the logit's endpoint derivatives explicit:
+    /// differentiating log(x/(1-x)) as a quotient gives spurious 0*infinity.
+    fn cg_binary_cross_entropy_target_backward(
+        &mut self,
+        grad: TensorNodeId,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let out = self.apply_function_with_create_graph(
+            &[input, grad],
+            |ctx, inputs| {
+                let (x, _) = inputs[0];
+                let (grad, shape) = inputs[1];
+                if ctx.needs_input_grad().iter().any(|&needed| needed) {
+                    for &(values, shape) in inputs {
+                        ctx.save_for_backward(values.to_vec(), shape.to_vec());
+                    }
+                }
+                let values = grad
+                    .iter()
+                    .zip(x)
+                    .map(|(&g, &x)| -((x / (1.0 - x)).ln()) * g)
+                    .collect();
+                Ok((values, shape.to_vec()))
+            },
+            |ctx, incoming| {
+                let saved = ctx.saved_tensors();
+                let (x, grad) = (&saved[0], &saved[1]);
+                let grad_grad = ctx.needs_input_grad()[1].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(x)
+                        .map(|(&h, &x)| -((x / (1.0 - x)).ln()) * h)
+                        .collect()
+                });
+                let grad_input = ctx.needs_input_grad()[0].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(grad.iter().zip(x))
+                        .map(|(&h, (&g, &x))| -h * g / (x * (1.0 - x)))
+                        .collect()
+                });
+                Ok(vec![grad_input, grad_grad])
+            },
+            |ctx, incoming, inputs, tape| {
+                let x = tape.cg_to_f64(inputs[0])?;
+                let grad = tape.cg_to_f64(inputs[1])?;
+                let h = tape.cg_to_f64(incoming[0])?;
+                let grad_grad = if ctx.needs_input_grad()[1] {
+                    Some(tape.cg_binary_cross_entropy_target_backward(h, inputs[0])?)
+                } else {
+                    None
+                };
+                let grad_input = if ctx.needs_input_grad()[0] {
+                    let shape = tape.node(x)?.tensor.meta().shape().to_vec();
+                    let numel = tape.node(x)?.tensor.meta().numel();
+                    let one = tape.leaf(vec![1.0; numel], shape, false)?;
+                    let complement = tape.cg_sub(one, x)?;
+                    let denom = tape.cg_mul(x, complement)?;
+                    let negative_h = tape.cg_neg(h)?;
+                    let numerator = tape.cg_mul(negative_h, grad)?;
+                    Some(tape.cg_div(numerator, denom)?)
+                } else {
+                    None
+                };
+                Ok(vec![grad_input, grad_grad])
+            },
+        )?;
+        if self.node(out)?.requires_grad {
+            self.save_custom_function_input_versions(out, &[grad, input])?;
+        }
+        Ok(out)
+    }
+
     /// `base ^ exponent` with a TENSOR exponent, matching `torch.pow`.
     ///
     /// frankentorch-v8f5k. ft-api's `tensor_pow_tensor` computed `x^e` as `exp(e * ln x)` on BOTH
@@ -19106,6 +19440,10 @@ impl TensorTape {
                     // user-provided tape-building backward (registered via
                     // apply_function_with_create_graph). If present, call it to build
                     // the input-gradient nodes; otherwise error (can't auto-derive).
+                    Self::assert_borrowed_versions(
+                        &self.nodes,
+                        self.custom_function_input_versions.get(&function_id),
+                    )?;
                     let (cg_backward, ctx) = {
                         let record = self
                             .custom_functions
@@ -30878,6 +31216,253 @@ mod tests {
             assert!(gradient[0].is_nan());
             assert_eq!(gradient[1], 0.0);
             assert!(gradient[2].is_nan());
+        }
+    }
+
+    fn probability_bce_test_leaf(
+        tape: &mut TensorTape,
+        values: &[f64],
+        dtype: DType,
+        requires_grad: bool,
+    ) -> TensorNodeId {
+        let tensor =
+            DenseTensor::from_contiguous_values(values.to_vec(), vec![values.len()], Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+        tape.leaf_tensor(tensor, requires_grad)
+    }
+
+    fn assert_probability_bce_close(actual: &[f64], expected: &[f64], tolerance: f64) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if expected.is_infinite() || expected.is_nan() {
+                assert!(
+                    actual == expected || (actual.is_nan() && expected.is_nan()),
+                    "BCE[{index}]: {actual} != {expected}"
+                );
+            } else {
+                assert!(
+                    (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
+                    "BCE[{index}]: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probability_bce_double_backward_matches_torch_endpoints_and_cross_derivatives() {
+        // Live PyTorch 2.15 CPU oracle, F64: F.binary_cross_entropy(x, t,
+        // reduction="none"); differentiate sum(loss*w), then sum(dx*h).
+        // The unequal mixed derivatives at clamped entries are intentional:
+        // input backward uses EPSILON, target backward uses unclamped logit.
+        let x_values = [0.0, 1.0, 0.0, 1.0, 1e-15, 1.0 - 1e-15, 0.125, 0.875, 0.5];
+        let targets = [0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.75, 0.25, 0.5];
+        let weights = [1.0, 2.0, -0.5, 0.25, 3.0, -2.0, 0.75, 1.25, -1.0];
+        let direction = [0.2, -0.3, 1.5, -2.0, 0.7, 0.6, 1.0, -1.0, 2.0];
+        let expected_xx = [
+            0.0,
+            0.0,
+            -7.499_999_999_984_998e23,
+            -4.999_999_999_989_999_4e23,
+            2.095_806_291_606_299_4e-6,
+            0.0,
+            36.244_897_958_520_91,
+            -60.408_163_264_201_52,
+            -7.999_999_999_936_001,
+        ];
+        let expected_xt = [
+            -2e11,
+            6e11,
+            7.5e11,
+            5e11,
+            -2.1e12,
+            1.2e12,
+            -6.857_142_857_142_857,
+            11.428_571_428_571_429,
+            8.0,
+        ];
+        let expected_tx = [
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            -2.100_000_000_000_001_5e15,
+            1.200_959_900_632_133_5e15,
+            -6.857_142_857_142_857,
+            11.428_571_428_571_429,
+            8.0,
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for record_second in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = probability_bce_test_leaf(&mut tape, &x_values, DType::F64, true);
+                let target = probability_bce_test_leaf(&mut tape, &targets, DType::F64, true);
+                let weights = probability_bce_test_leaf(&mut tape, &weights, DType::F64, false);
+                let h = probability_bce_test_leaf(&mut tape, &direction, DType::F64, false);
+                let loss = tape.binary_cross_entropy(x, target).unwrap();
+                let weighted = tape.mul(loss, weights, mode).unwrap().0;
+                let total = tape.sum(weighted, mode).unwrap().0;
+                // Backward graph recording must not depend on forward grad mode.
+                tape.set_grad_enabled(false);
+                let first = tape
+                    .backward_with_options(
+                        total,
+                        BackwardOptions::for_mode(mode)
+                            .with_create_graph(true)
+                            .with_retain_graph(true),
+                    )
+                    .unwrap();
+                tape.set_grad_enabled(true);
+                let dx = first.gradient_node(x).unwrap();
+                let weighted_dx = tape.mul(dx, h, mode).unwrap().0;
+                let dx_total = tape.sum(weighted_dx, mode).unwrap().0;
+                let second = tape
+                    .backward_with_options(
+                        dx_total,
+                        BackwardOptions::for_mode(mode)
+                            .with_create_graph(record_second)
+                            .with_retain_graph(true),
+                    )
+                    .unwrap();
+                assert_probability_bce_close(second.gradient(x).unwrap(), &expected_xx, 2e-14);
+                assert_probability_bce_close(second.gradient(target).unwrap(), &expected_xt, 2e-14);
+
+                let dt = first.gradient_node(target).unwrap();
+                let weighted_dt = tape.mul(dt, h, mode).unwrap().0;
+                let dt_total = tape.sum(weighted_dt, mode).unwrap().0;
+                let mixed = tape
+                    .backward_with_options(
+                        dt_total,
+                        BackwardOptions::for_mode(mode).with_create_graph(record_second),
+                    )
+                    .unwrap();
+                assert_probability_bce_close(mixed.gradient(x).unwrap(), &expected_tx, 2e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn probability_bce_nonlinear_upstream_has_torch_second_and_third_derivatives() {
+        // PyTorch 2.15: f=sum(w * BCE(x,t)^2), h=[1.5,-.5,.25];
+        // d2 = grad(sum(grad(f,x)*h), (x,t)), d3=grad(sum(d2[0]),x).
+        // This exercises both derivatives of the incoming gradient, not just
+        // the local diagonal Hessian of an unreduced BCE.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                let mut tape = TensorTape::new();
+                let x = probability_bce_test_leaf(&mut tape, &[0.125, 0.4, 0.8], dtype, true);
+                let target = probability_bce_test_leaf(&mut tape, &[0.8, 0.25, 0.6], dtype, true);
+                let weights =
+                    probability_bce_test_leaf(&mut tape, &[0.5, 1.5, -0.75], dtype, false);
+                let loss = tape.binary_cross_entropy(x, target).unwrap();
+                let square = tape.mul(loss, loss, mode).unwrap().0;
+                let weighted = tape.mul(square, weights, mode).unwrap().0;
+                let total = tape.sum(weighted, mode).unwrap().0;
+                let options = BackwardOptions::for_mode(mode)
+                    .with_create_graph(true)
+                    .with_retain_graph(true);
+                let first = tape.backward_with_options(total, options).unwrap();
+                let tolerance = if dtype == DType::F64 { 2e-12 } else { 3e-6 };
+                assert_probability_bce_close(
+                    first.gradient(x).unwrap(),
+                    &[
+                        -10.431_315_844_675_86,
+                        1.147_859_813_986_934_7,
+                        -1.458_114_929_554_062_3,
+                    ],
+                    tolerance,
+                );
+                assert_probability_bce_close(
+                    first.gradient(target).unwrap(),
+                    &[
+                        3.289_093_138_682_726,
+                        0.744_667_365_713_967_5,
+                        1.617_101_203_764_418,
+                    ],
+                    tolerance,
+                );
+                let dx = first.gradient_node(x).unwrap();
+                let direction =
+                    probability_bce_test_leaf(&mut tape, &[1.5, -0.5, 0.25], DType::F64, false);
+                let weighted_dx = tape.mul(dx, direction, mode).unwrap().0;
+                let dx_total = tape.sum(weighted_dx, mode).unwrap().0;
+                let second = tape.backward_with_options(dx_total, options).unwrap();
+                assert_probability_bce_close(
+                    second.gradient(x).unwrap(),
+                    &[
+                        187.604_032_194_896_94,
+                        -3.933_861_957_431_552,
+                        -3.775_563_908_355_979_8,
+                    ],
+                    tolerance,
+                );
+                assert_probability_bce_close(
+                    second.gradient(target).unwrap(),
+                    &[
+                        -41.194_270_113_861_954,
+                        3.446_075_841_106_628_3,
+                        2.472_469_143_713_465,
+                    ],
+                    tolerance,
+                );
+                let dxx = second.gradient_node(x).unwrap();
+                let dxx_total = tape.sum(dxx, mode).unwrap().0;
+                let third = tape.backward_with_options(dxx_total, options).unwrap();
+                assert_probability_bce_close(
+                    third.gradient(x).unwrap(),
+                    &[
+                        -3504.628_766_457_348,
+                        -9.456_781_379_107_98,
+                        -43.859_666_592_109_26,
+                    ],
+                    tolerance,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probability_bce_saved_inputs_reject_mutation_before_each_backward() {
+        for dtype in [DType::F64, DType::F32] {
+            for mutate_target in [false, true] {
+                for create_graph in [false, true] {
+                    for after_first_backward in [false, true] {
+                        let mut tape = TensorTape::new();
+                        let x = probability_bce_test_leaf(&mut tape, &[0.2, 0.8], dtype, true);
+                        let target =
+                            probability_bce_test_leaf(&mut tape, &[1.0, 0.0], dtype, false);
+                        let loss = tape.binary_cross_entropy(x, target).unwrap();
+                        let root = if after_first_backward {
+                            tape.backward_with_options(
+                                loss,
+                                BackwardOptions::strict_default()
+                                    .with_create_graph(true)
+                                    .with_retain_graph(true),
+                            )
+                            .unwrap()
+                            .gradient_node(x)
+                            .unwrap()
+                        } else {
+                            loss
+                        };
+                        let modified = if mutate_target { target } else { x };
+                        if dtype == DType::F64 {
+                            tape.update_tensor_values(modified, vec![0.4, 0.6]).unwrap();
+                        } else {
+                            tape.update_tensor_values_f32(modified, vec![0.4, 0.6])
+                                .unwrap();
+                        }
+                        assert!(matches!(
+                            tape.backward_with_options(
+                                root,
+                                BackwardOptions::strict_default().with_create_graph(create_graph),
+                            ),
+                            Err(AutogradError::BorrowedInputVersionMismatch { node, .. }) if node == modified
+                        ));
+                    }
+                }
+            }
         }
     }
 
