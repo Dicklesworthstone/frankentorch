@@ -8219,6 +8219,14 @@ impl TensorTape {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
+            if meta.numel() == 0 && (p < 0.0 || p == f64::INFINITY) {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "norm: this order has no identity for an empty reduction",
+                    }
+                    .into(),
+                ));
+            }
             let outcome = dispatch_tensor_norm_contiguous_typed(
                 mode,
                 input_node.tensor.typed_storage(),
@@ -8267,6 +8275,14 @@ impl TensorTape {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
+            if meta.shape().get(dim) == Some(&0) && (p < 0.0 || p == f64::INFINITY) {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "norm_dim: this order has no identity for an empty reduction",
+                    }
+                    .into(),
+                ));
+            }
             let outcome = dispatch_tensor_norm_dim_contiguous_typed(
                 mode,
                 input_node.tensor.typed_storage(),
@@ -8572,18 +8588,48 @@ impl TensorTape {
     }
 
     /// PyTorch's three-way `sign`: 0 at ±0 (NOT Rust's `f64::signum`, which
-    /// returns ±1 at ±0), ±1 for nonzero, NaN propagates. Used by the norm
+    /// returns ±1 at ±0), ±1 for nonzero, and 0 at NaN. Used by the norm
     /// backward so `d|x|/dx` at x==0 is 0 (matching torch's subgradient choice),
     /// not ±1. frankentorch parity (see Abs backward for the same convention).
     fn torch_sign(v: f64) -> f64 {
-        if v.is_nan() {
-            f64::NAN
-        } else if v > 0.0 {
+        if v > 0.0 {
             1.0
         } else if v < 0.0 {
             -1.0
         } else {
             0.0
+        }
+    }
+
+    /// The input-dependent factor in PyTorch's general p-norm derivative.
+    /// For p < 1, the negative power is masked at zero before multiplying by
+    /// sign(x). For p > 2, using x * |x|^(p-2) also preserves the derivative
+    /// of this factor at zero when it is recorded for higher-order backward.
+    fn norm_backward_scaled_input(value: f64, p: f64) -> f64 {
+        if p < 1.0 {
+            Self::torch_sign(value)
+                * if value == 0.0 {
+                    0.0
+                } else {
+                    value.abs().powf(p - 1.0)
+                }
+        } else if p < 2.0 {
+            Self::torch_sign(value) * value.abs().powf(p - 1.0)
+        } else {
+            value * value.abs().powf(p - 2.0)
+        }
+    }
+
+    /// Reduction-dependent factor, shared by full and per-dimension norms.
+    fn norm_backward_scale(grad: f64, norm: f64, p: f64) -> f64 {
+        if p < 1.0 {
+            // Multiply by grad only after the input-dependent factor. The
+            // alternative association can overflow an otherwise finite VJP.
+            norm.powf(1.0 - p)
+        } else if norm == 0.0 {
+            0.0
+        } else {
+            grad / norm.powf(p - 1.0)
         }
     }
 
@@ -14607,6 +14653,16 @@ impl TensorTape {
                         rule: "d(std_dim(x))/dx_i=(x_i-mean)/((n-1)*std)",
                     });
                 }
+                TensorNodeOp::Norm { p, .. } | TensorNodeOp::NormDim { p, .. } if p == 0.0 => {
+                    // PyTorch returns an undefined input gradient for the
+                    // nonzero count, not a dense zero that would advance an
+                    // optimizer's state. The scheduler excludes this edge.
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(norm0(x))/dx=undefined",
+                    });
+                }
                 TensorNodeOp::Norm {
                     input,
                     p,
@@ -14615,14 +14671,8 @@ impl TensorTape {
                     let grad_scalar = incoming[0];
                     let norm_val = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?[0];
 
-                    // Backward of a full-tensor p-norm: each dx_i depends only on x_i,
-                    // grad_scalar and the scalar norm_val (no cross-element coupling), so the
-                    // whole contribution fuses into the gradient slot in ONE Rayon pass — no
-                    // 128MB input clone (borrow via operand_values_cow), no zero-init scratch
-                    // `Vec`, no separate serial accumulate loop. Bit-for-bit identical to the
-                    // prior clone+scratch+serial-accumulate path: same per-element formula,
-                    // ascending index order, and IEEE-commutative `0.0 + c` / `+= c` writes.
-                    // frankentorch-normp-bwd-fused.
+                    // Write each contribution directly into its gradient slot;
+                    // borrow inputs and share the reduction-dependent factors.
                     let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     let iv = input_values.as_ref();
                     if p == 2.0 {
@@ -14632,14 +14682,14 @@ impl TensorTape {
                                 input,
                                 &mut grads[input.0],
                                 input_numel,
-                                |i| grad_scalar * iv[i] / norm_val,
+                                |i| grad_scalar * (iv[i] / norm_val),
                             )?;
                         } else {
                             Self::accumulate_tensor_gradient_par_with(
                                 input,
                                 &mut grads[input.0],
                                 input_numel,
-                                |_| 0.0,
+                                |_| grad_scalar * 0.0,
                             )?;
                         }
                     } else if p == 1.0 {
@@ -14651,39 +14701,35 @@ impl TensorTape {
                             |i| grad_scalar * Self::torch_sign(iv[i]),
                         )?;
                     } else if p.is_infinite() {
-                        // Gradient flows to the element(s) achieving the extremum:
-                        // inf-norm -> max |x_i|, -inf-norm -> min |x_i|.
-                        if norm_val != 0.0 {
-                            Self::accumulate_tensor_gradient_par_with(
-                                input,
-                                &mut grads[input.0],
-                                input_numel,
-                                |i| {
-                                    if iv[i].abs() == norm_val {
-                                        grad_scalar * Self::torch_sign(iv[i])
-                                    } else {
-                                        0.0
-                                    }
-                                },
-                            )?;
-                        } else {
-                            Self::accumulate_tensor_gradient_par_with(
-                                input,
-                                &mut grads[input.0],
-                                input_numel,
-                                |_| 0.0,
-                            )?;
-                        }
-                    } else if p != 0.0 && norm_val != 0.0 {
-                        // General p-norm: d/dx_i = sign(x_i) * |x_i|^(p-1) / norm^(p-1)
-                        let norm_pow = norm_val.powf(p - 1.0);
+                        // PyTorch splits the subgradient equally between tied
+                        // extrema, including NaNs in its selection mask.
+                        let count = iv
+                            .iter()
+                            .filter(|&&value| value.abs() == norm_val || value.is_nan())
+                            .count() as f64;
                         Self::accumulate_tensor_gradient_par_with(
                             input,
                             &mut grads[input.0],
                             input_numel,
                             |i| {
-                                grad_scalar * Self::torch_sign(iv[i]) * iv[i].abs().powf(p - 1.0)
-                                    / norm_pow
+                                let selected = iv[i].abs() == norm_val || iv[i].is_nan();
+                                Self::torch_sign(iv[i])
+                                    * ((grad_scalar / count) * if selected { 1.0 } else { 0.0 })
+                            },
+                        )?;
+                    } else if p != 0.0 {
+                        let scale = Self::norm_backward_scale(grad_scalar, norm_val, p);
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |i| {
+                                let scaled = Self::norm_backward_scaled_input(iv[i], p);
+                                if p < 1.0 {
+                                    (scaled * grad_scalar) * scale
+                                } else {
+                                    scaled * scale
+                                }
                             },
                         )?;
                     } else {
@@ -14726,14 +14772,8 @@ impl TensorTape {
                     let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
 
-                    // Fused single Rayon pass: each input index `idx` maps to its reduction
-                    // lane `oi = outer*inner_size + inner` (inner = idx % inner_size,
-                    // outer = idx / inner_size / reduce_size). The per-element gradient is a
-                    // pure fn of iv[idx] and the lane's norm_val/grad_val — no cross-element
-                    // coupling — so it writes straight into the grad slot with no scratch
-                    // `Vec` and no separate serial accumulate. Bit-for-bit identical to the
-                    // prior nested-serial-fill + accumulate path (same per-lane norm^(p-1),
-                    // same formula, ascending index order). frankentorch-normp-bwd-fused.
+                    // Each index maps to one reduction lane. Share lane scales
+                    // and tie counts while accumulating directly into gradients.
                     if p == 2.0 {
                         Self::accumulate_tensor_gradient_par_with(
                             input,
@@ -14744,9 +14784,9 @@ impl TensorTape {
                                 let oi = (idx / inner_size / reduce_size) * inner_size + inner;
                                 let norm_val = output_values[oi];
                                 if norm_val != 0.0 {
-                                    incoming[oi] * iv[idx] / norm_val
+                                    incoming[oi] * (iv[idx] / norm_val)
                                 } else {
-                                    0.0
+                                    incoming[oi] * 0.0
                                 }
                             },
                         )?;
@@ -14762,6 +14802,14 @@ impl TensorTape {
                             },
                         )?;
                     } else if p.is_infinite() {
+                        let mut counts = vec![0usize; expected_incoming];
+                        for (idx, &value) in iv.iter().enumerate() {
+                            let oi =
+                                (idx / inner_size / reduce_size) * inner_size + idx % inner_size;
+                            if value.abs() == output_values[oi] || value.is_nan() {
+                                counts[oi] += 1;
+                            }
+                        }
                         Self::accumulate_tensor_gradient_par_with(
                             input,
                             &mut grads[input.0],
@@ -14770,20 +14818,20 @@ impl TensorTape {
                                 let inner = idx % inner_size;
                                 let oi = (idx / inner_size / reduce_size) * inner_size + inner;
                                 let norm_val = output_values[oi];
-                                if norm_val != 0.0 && iv[idx].abs() == norm_val {
-                                    incoming[oi] * Self::torch_sign(iv[idx])
-                                } else {
-                                    0.0
-                                }
+                                let selected = iv[idx].abs() == norm_val || iv[idx].is_nan();
+                                Self::torch_sign(iv[idx])
+                                    * ((incoming[oi] / counts[oi] as f64)
+                                        * if selected { 1.0 } else { 0.0 })
                             },
                         )?;
                     } else if p != 0.0 {
-                        // General p: precompute per-lane norm^(p-1) exactly once (matches the
-                        // serial `norm_pow` bit-for-bit); the 0.0 placeholder for zero lanes is
-                        // never divided by (guarded on norm_val != 0.0 in the closure).
-                        let norm_pow: Vec<f64> = output_values
+                        // Keep the reduction-dependent scale outside the element
+                        // loop. Negative powers at x == 0 must be masked before
+                        // multiplying by sign(x), or fractional norms produce NaN.
+                        let scales: Vec<f64> = output_values
                             .iter()
-                            .map(|&nv| if nv != 0.0 { nv.powf(p - 1.0) } else { 0.0 })
+                            .zip(incoming.iter())
+                            .map(|(&norm, &grad)| Self::norm_backward_scale(grad, norm, p))
                             .collect();
                         Self::accumulate_tensor_gradient_par_with(
                             input,
@@ -14792,14 +14840,11 @@ impl TensorTape {
                             |idx| {
                                 let inner = idx % inner_size;
                                 let oi = (idx / inner_size / reduce_size) * inner_size + inner;
-                                let norm_val = output_values[oi];
-                                if norm_val != 0.0 {
-                                    incoming[oi]
-                                        * Self::torch_sign(iv[idx])
-                                        * iv[idx].abs().powf(p - 1.0)
-                                        / norm_pow[oi]
+                                let scaled = Self::norm_backward_scaled_input(iv[idx], p);
+                                if p < 1.0 {
+                                    (scaled * incoming[oi]) * scales[oi]
                                 } else {
-                                    0.0
+                                    scaled * scales[oi]
                                 }
                             },
                         )?;
@@ -19164,6 +19209,13 @@ impl TensorTape {
                         rule: "d(cumsum(x))/dx=reverse_cumsum(grad) (cg)",
                     });
                 }
+                TensorNodeOp::Norm { p, .. } | TensorNodeOp::NormDim { p, .. } if p == 0.0 => {
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(norm0(x))/dx=undefined (cg)",
+                    });
+                }
                 TensorNodeOp::Norm {
                     input,
                     p,
@@ -21201,6 +21253,7 @@ impl TensorTape {
 
             match self.nodes[node.0].op {
                 TensorNodeOp::Leaf => {}
+                TensorNodeOp::Norm { p, .. } | TensorNodeOp::NormDim { p, .. } if p == 0.0 => {}
                 TensorNodeOp::Add { lhs, rhs }
                 | TensorNodeOp::Sub { lhs, rhs }
                 | TensorNodeOp::Div { lhs, rhs }
@@ -21372,6 +21425,7 @@ impl TensorTape {
 
             match node.op {
                 TensorNodeOp::Leaf => {}
+                TensorNodeOp::Norm { p, .. } | TensorNodeOp::NormDim { p, .. } if p == 0.0 => {}
                 TensorNodeOp::Add { lhs, rhs }
                 | TensorNodeOp::Sub { lhs, rhs }
                 | TensorNodeOp::Div { lhs, rhs }
@@ -31090,7 +31144,7 @@ mod tests {
                     let interleave = |rows: &[[f64; 3]; 4]| {
                         let mut values = Vec::with_capacity(12);
                         for o in 0..outer {
-                            for k in 0..3 {
+                            for (k, _) in rows[0].iter().enumerate() {
                                 for i in 0..inner {
                                     values.push(rows[o * inner + i][k]);
                                 }
@@ -31412,7 +31466,7 @@ mod tests {
                 assert_probability_bce_close(
                     third.gradient(x).unwrap(),
                     &[
-                        -3504.628_766_457_348,
+                        -3_504.628_766_457_348,
                         -9.456_781_379_107_98,
                         -43.859_666_592_109_26,
                     ],
@@ -37113,6 +37167,156 @@ mod tests {
             "d2[2] expected 6.0, got {}",
             g2[2]
         );
+    }
+
+    #[test]
+    fn norm_backward_matches_pytorch_ties_and_zero_subgradients() {
+        // Independent PyTorch norm_backward cases: tied extrema split their
+        // upstream gradient; negative powers at zero use the zero subgradient.
+        let cases = [
+            (f64::INFINITY, [2.0, -2.0, 1.0], [0.5, -0.5, 0.0]),
+            (f64::NEG_INFINITY, [2.0, -2.0, 4.0], [0.5, -0.5, 0.0]),
+            (f64::INFINITY, [f64::NAN, 1.0, -1.0], [0.0, 0.0, 0.0]),
+            (0.5, [0.0, 1.0, 4.0], [0.0, 3.0, 1.5]),
+            (-1.0, [0.0, 1.0, 4.0], [0.0, 0.0, 0.0]),
+            (
+                -1.0,
+                [1.0, -2.0, 4.0],
+                [16.0 / 49.0, -4.0 / 49.0, 1.0 / 49.0],
+            ),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for (p, values, expected) in cases {
+                    let mut tape = TensorTape::new();
+                    let tensor = DenseTensor::from_typed_storage(
+                        TensorMeta::from_shape(vec![3], dtype, Device::Cpu),
+                        TensorTape::reduction_values_storage(dtype, values.to_vec()),
+                    )
+                    .expect("typed input");
+                    let x = tape.leaf_tensor(tensor, true);
+                    let (n, _) = tape.norm(x, p, mode).expect("norm");
+                    assert_eq!(tape.tensor_meta(n).expect("meta").dtype(), dtype);
+                    let report = tape
+                        .backward_with_options(n, BackwardOptions::for_mode(mode))
+                        .expect("backward");
+                    for (&actual, expected) in
+                        report.gradient(x).expect("gradient").iter().zip(expected)
+                    {
+                        let tolerance = match dtype {
+                            DType::F64 => 1e-12,
+                            DType::F32 => 1e-6,
+                            _ => 0.01,
+                        };
+                        assert!(
+                            (actual - expected).abs() <= tolerance,
+                            "p={p}, dtype={dtype:?}, mode={mode:?}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn norm_dim_backward_splits_each_lane_and_preserves_weighted_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut tape = TensorTape::new();
+            let x = tape
+                .leaf(vec![2.0, 4.0, -2.0, -4.0, 1.0, 0.0], vec![3, 2], true)
+                .expect("x");
+            let (n, _) = tape.norm_dim(x, f64::INFINITY, 0, mode).expect("norm");
+            let weights = tape.leaf(vec![2.0, -3.0], vec![2], false).expect("weights");
+            let (loss, _) = tape.mul(n, weights, mode).expect("weighted loss");
+            let report = tape
+                .backward_with_options(loss, BackwardOptions::for_mode(mode))
+                .expect("backward");
+            assert_eq!(
+                report.gradient(x).expect("gradient"),
+                &[1.0, -1.5, -1.0, 1.5, 0.0, 0.0]
+            );
+
+            let mut tape = TensorTape::new();
+            let x = tape
+                .leaf(vec![0.0, 0.0, 1.0, 0.0, 4.0, 0.0], vec![3, 2], true)
+                .expect("x");
+            let (n, _) = tape.norm_dim(x, 0.5, 0, mode).expect("norm");
+            let report = tape
+                .backward_with_options(n, BackwardOptions::for_mode(mode))
+                .expect("backward");
+            assert_eq!(
+                report.gradient(x).expect("gradient"),
+                &[0.0, 0.0, 3.0, 0.0, 1.5, 0.0]
+            );
+        }
+    }
+
+    #[test]
+    fn norm_backward_preserves_finite_large_vjps_and_nonfinite_upstream() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (p, value) in [(0.5, 1e200), (2.0, 1e100)] {
+                for by_dim in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let x = tape.leaf(vec![value], vec![1], true).unwrap();
+                    let norm = if by_dim {
+                        tape.norm_dim(x, p, 0, mode).unwrap().0
+                    } else {
+                        tape.norm(x, p, mode).unwrap().0
+                    };
+                    let weight = tape.leaf(vec![1e250], vec![1], false).unwrap();
+                    let loss = tape.mul(norm, weight, mode).unwrap().0;
+                    let report = tape
+                        .backward_with_options(loss, BackwardOptions::for_mode(mode))
+                        .unwrap();
+                    let gradient = report.gradient(x).unwrap()[0];
+                    assert!(gradient.is_finite(), "p={p}, by_dim={by_dim}: {gradient}");
+                    assert!((gradient / 1e250 - 1.0).abs() < 1e-14);
+                }
+            }
+            let mut tape = TensorTape::new();
+            let x = tape.leaf(vec![0.0; 2], vec![2], true).unwrap();
+            let norm = tape.norm(x, 2.0, mode).unwrap().0;
+            let weight = tape.leaf(vec![f64::INFINITY], vec![1], false).unwrap();
+            let loss = tape.mul(norm, weight, mode).unwrap().0;
+            let report = tape
+                .backward_with_options(loss, BackwardOptions::for_mode(mode))
+                .unwrap();
+            assert!(
+                report
+                    .gradient(x)
+                    .unwrap()
+                    .iter()
+                    .all(|value| value.is_nan())
+            );
+        }
+    }
+
+    #[test]
+    fn norm_zero_order_excludes_only_its_own_gradient_edge() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for create_graph in [false, true] {
+                for by_dim in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let x = tape.leaf(vec![0.0, 1.0, 4.0], vec![3], true).unwrap();
+                    let norm = if by_dim {
+                        tape.norm_dim(x, 0.0, 0, mode).unwrap().0
+                    } else {
+                        tape.norm(x, 0.0, mode).unwrap().0
+                    };
+                    let options = BackwardOptions {
+                        create_graph,
+                        retain_graph: true,
+                        ..BackwardOptions::for_mode(mode)
+                    };
+                    let report = tape.backward_with_options(norm, options).unwrap();
+                    assert!(report.gradient(x).is_none());
+                    let sum = tape.sum(x, mode).unwrap().0;
+                    let combined = tape.add(norm, sum, mode).unwrap().0;
+                    let report = tape.backward_with_options(combined, options).unwrap();
+                    assert_eq!(report.gradient(x).unwrap(), &[1.0; 3]);
+                }
+            }
+        }
     }
 
     #[test]
