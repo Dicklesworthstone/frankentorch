@@ -3137,6 +3137,43 @@ struct LBFGSSearchContext<'a> {
     eval_budget: usize,
 }
 
+#[derive(Clone, Copy)]
+struct LBFGSLineSearchPoint {
+    step: f64,
+    loss: f64,
+    derivative: f64,
+}
+
+impl LBFGSLineSearchPoint {
+    /// Minimize the cubic matching two losses and directional derivatives.
+    /// Invalid interpolation (including a non-finite trial loss) falls back
+    /// to bisection. Bounds keep extrapolation and zoom making progress.
+    fn interpolate(self, other: Self, lower: f64, upper: f64) -> f64 {
+        let midpoint = lower + (upper - lower) * 0.5;
+        let d1 = self.derivative + other.derivative
+            - 3.0 * (self.loss - other.loss) / (self.step - other.step);
+        let discriminant = d1 * d1 - self.derivative * other.derivative;
+        if !discriminant.is_finite() || discriminant < 0.0 {
+            return midpoint;
+        }
+        let d2 = discriminant.sqrt();
+        let candidate = if self.step < other.step {
+            other.step
+                - (other.step - self.step) * (other.derivative + d2 - d1)
+                    / (other.derivative - self.derivative + 2.0 * d2)
+        } else {
+            self.step
+                - (self.step - other.step) * (self.derivative + d2 - d1)
+                    / (self.derivative - other.derivative + 2.0 * d2)
+        };
+        if candidate.is_finite() {
+            candidate.clamp(lower, upper)
+        } else {
+            midpoint
+        }
+    }
+}
+
 impl LBFGS {
     /// Create a new LBFGS optimizer.
     ///
@@ -3239,7 +3276,13 @@ impl LBFGS {
     fn flatten_params(&self, session: &FrankenTorchSession) -> Result<Vec<f64>, AutogradError> {
         let mut flat = Vec::new();
         for &param in &self.params {
-            let values = session.tensor_values(param)?;
+            if !matches!(
+                session.tensor_dtype(param)?,
+                ft_core::DType::F64 | ft_core::DType::F32
+            ) {
+                return Err(optimizer_state_error("lbfgs parameters must be F32 or F64"));
+            }
+            let values = session.tensor_values_lossy_f64(param)?;
             flat.extend(values);
         }
         Ok(flat)
@@ -3274,10 +3317,17 @@ impl LBFGS {
         session: &mut FrankenTorchSession,
         flat_params: &[f64],
     ) -> Result<(), AutogradError> {
+        // Validate every target and slice before the first write. In
+        // particular, a bad later ID, non-contiguous tensor, or F32 overflow
+        // must not leave earlier parameters at a rejected trial point.
+        let mut sizes = Vec::with_capacity(self.params.len());
         let mut offset = 0usize;
         for &param in &self.params {
-            let numel = session.tensor_numel(param)?;
-            let _shape = session.tensor_shape(param)?;
+            let dtype = session.tensor_dtype(param)?;
+            if !matches!(dtype, ft_core::DType::F64 | ft_core::DType::F32) {
+                return Err(optimizer_state_error("lbfgs parameters must be F32 or F64"));
+            }
+            let numel = session.tensor_values_len(param)?;
             let end = offset
                 .checked_add(numel)
                 .ok_or_else(|| optimizer_state_error("lbfgs parameter offset overflow"))?;
@@ -3286,13 +3336,26 @@ impl LBFGS {
                     "lbfgs flat parameter vector is shorter than parameter footprint",
                 ));
             }
-            session.tensor_update_param_values(param, flat_params[offset..end].to_vec())?;
+            if flat_params[offset..end].iter().any(|&value| {
+                !value.is_finite() || (dtype == ft_core::DType::F32 && !(value as f32).is_finite())
+            }) {
+                return Err(optimizer_state_error(
+                    "lbfgs parameter update must remain finite in its dtype",
+                ));
+            }
+            sizes.push(numel);
             offset = end;
         }
         if offset != flat_params.len() {
             return Err(optimizer_state_error(
                 "lbfgs flat parameter vector has trailing unused values",
             ));
+        }
+        offset = 0;
+        for (&param, numel) in self.params.iter().zip(sizes) {
+            let end = offset + numel;
+            session.tensor_update_param_values(param, flat_params[offset..end].to_vec())?;
+            offset = end;
         }
         Ok(())
     }
@@ -3390,10 +3453,26 @@ impl LBFGS {
     }
 
     fn search_step(
-        &mut self,
+        &self,
         session: &mut FrankenTorchSession,
         closure: &mut dyn FnMut(&mut FrankenTorchSession) -> Result<f64, AutogradError>,
         context: LBFGSSearchContext<'_>,
+    ) -> Result<(Vec<f64>, Vec<f64>, f64, usize), AutogradError> {
+        let result = self.search_step_inner(session, closure, &context);
+        if result.is_err() {
+            // A closure error, invalid gradient, or exhausted search must not
+            // strand the model at the last rejected trial. Closure-created
+            // graphs and other side effects are not transactional.
+            self.set_flat_params(session, context.current_params)?;
+        }
+        result
+    }
+
+    fn search_step_inner(
+        &self,
+        session: &mut FrankenTorchSession,
+        closure: &mut dyn FnMut(&mut FrankenTorchSession) -> Result<f64, AutogradError>,
+        context: &LBFGSSearchContext<'_>,
     ) -> Result<(Vec<f64>, Vec<f64>, f64, usize), AutogradError> {
         if context.eval_budget == 0 {
             return Err(optimizer_state_error(
@@ -3408,50 +3487,110 @@ impl LBFGS {
             ));
         }
 
-        if self.line_search_fn == LBFGSLineSearch::None {
-            let next_params = vector_add_scaled(context.current_params, context.direction, self.lr);
-            self.set_flat_params(session, &next_params)?;
-            let next_loss = closure(session)?;
-            let next_grad = self
-                .flatten_gradients(session)?
-                .unwrap_or_else(|| vec![0.0; next_params.len()]);
-            return Ok((next_params, next_grad, next_loss, 1));
-        }
-
         let armijo_c1 = 1e-4;
         let wolfe_c2 = 0.9;
-        let min_step = 1e-12;
         let mut step_size = self.lr;
+        let mut previous = LBFGSLineSearchPoint {
+            step: 0.0,
+            loss: context.current_loss,
+            derivative: directional_derivative,
+        };
+        let mut bracket: Option<(LBFGSLineSearchPoint, LBFGSLineSearchPoint)> = None;
 
         for attempt in 0..context.eval_budget {
-            let trial_params =
+            let proposed_params =
                 vector_add_scaled(context.current_params, context.direction, step_size);
-            self.set_flat_params(session, &trial_params)?;
+            self.set_flat_params(session, &proposed_params)?;
             let trial_loss = closure(session)?;
+            // F32 writes round. Curvature pairs, subsequent trial origins and
+            // convergence tests must use the values the closure actually saw.
+            let trial_params = self.flatten_params(session)?;
             let trial_grad = self
                 .flatten_gradients(session)?
                 .unwrap_or_else(|| vec![0.0; trial_params.len()]);
-            let armijo_ok =
-                trial_loss <= context.current_loss + armijo_c1 * step_size * directional_derivative;
-            let accept = match self.line_search_fn {
-                LBFGSLineSearch::BacktrackingArmijo => armijo_ok,
-                LBFGSLineSearch::StrongWolfe => {
-                    let directional_grad = vector_dot(&trial_grad, context.direction);
-                    armijo_ok && directional_grad.abs() <= wolfe_c2 * directional_derivative.abs()
-                }
-                LBFGSLineSearch::None => true,
+            let point = LBFGSLineSearchPoint {
+                step: step_size,
+                loss: trial_loss,
+                derivative: vector_dot(&trial_grad, context.direction),
             };
-            if accept {
+            let finite = trial_loss.is_finite()
+                && point.derivative.is_finite()
+                && trial_params.iter().all(|value| value.is_finite())
+                && trial_grad.iter().all(|value| value.is_finite());
+            if self.line_search_fn == LBFGSLineSearch::None {
+                if !finite {
+                    return Err(optimizer_state_error(
+                        "lbfgs closure must return a finite loss and gradients",
+                    ));
+                }
                 return Ok((trial_params, trial_grad, trial_loss, attempt + 1));
             }
 
-            step_size *= 0.5;
-            if step_size < min_step {
-                break;
+            let armijo_ok = finite
+                && trial_loss
+                    <= context.current_loss + armijo_c1 * step_size * directional_derivative;
+            if self.line_search_fn == LBFGSLineSearch::BacktrackingArmijo {
+                if armijo_ok {
+                    return Ok((trial_params, trial_grad, trial_loss, attempt + 1));
+                }
+                step_size *= 0.5;
+                if step_size == 0.0 {
+                    break;
+                }
+                continue;
+            }
+
+            // Strong Wolfe needs both expansion and zoom. If Armijo holds but
+            // the slope remains too negative, shortening the step can never
+            // satisfy the curvature condition on a convex quadratic.
+            let curvature_ok =
+                finite && point.derivative.abs() <= wolfe_c2 * directional_derivative.abs();
+            if let Some((mut low, mut high)) = bracket {
+                if !armijo_ok || trial_loss >= low.loss {
+                    high = point;
+                } else {
+                    if curvature_ok {
+                        return Ok((trial_params, trial_grad, trial_loss, attempt + 1));
+                    }
+                    if point.derivative * (high.step - low.step) >= 0.0 {
+                        high = low;
+                    }
+                    low = point;
+                }
+                bracket = Some((low, high));
+            } else if !armijo_ok || (previous.step > 0.0 && trial_loss >= previous.loss) {
+                bracket = Some((previous, point));
+            } else if curvature_ok {
+                return Ok((trial_params, trial_grad, trial_loss, attempt + 1));
+            } else if point.derivative >= 0.0 {
+                bracket = Some((point, previous));
+            } else {
+                let lower = step_size + 0.01 * (step_size - previous.step);
+                let upper = (step_size * 10.0).min(f64::MAX);
+                if !lower.is_finite() || lower >= upper {
+                    break;
+                }
+                step_size = previous.interpolate(point, lower, upper);
+                previous = point;
+                continue;
+            }
+
+            if let Some((low, high)) = bracket {
+                let lower = low.step.min(high.step);
+                let upper = low.step.max(high.step);
+                let width = upper - lower;
+                if width * vector_max_abs(context.direction) <= self.tolerance_change {
+                    break;
+                }
+                // A ten-percent safeguard prevents cubic interpolation from
+                // repeatedly selecting a bracket endpoint without progress.
+                step_size = low.interpolate(high, lower + 0.1 * width, upper - 0.1 * width);
+                if step_size <= lower || step_size >= upper {
+                    break;
+                }
             }
         }
 
-        self.set_flat_params(session, context.current_params)?;
         Err(optimizer_state_error(
             "lbfgs line search failed to satisfy acceptance criteria",
         ))
@@ -3459,7 +3598,10 @@ impl LBFGS {
 
     /// Perform one LBFGS step using a closure that recomputes loss and gradients.
     ///
-    /// The closure is expected to run forward + backward and return a scalar loss.
+    /// The closure must clear old gradients, run forward + backward, and return
+    /// a scalar loss. `max_eval` includes the initial closure call. An error
+    /// restores parameter values to the last accepted iterate; gradients,
+    /// graph allocations and arbitrary closure side effects are not rolled back.
     pub fn step_with_closure(
         &mut self,
         session: &mut FrankenTorchSession,
@@ -3467,9 +3609,27 @@ impl LBFGS {
     ) -> Result<f64, AutogradError> {
         self.validate_hyperparams()?;
 
+        let initial_params = self.flatten_params(session)?;
+        if initial_params.iter().any(|value| !value.is_finite()) {
+            return Err(optimizer_state_error("lbfgs parameters must be finite"));
+        }
         let mut eval_count = 1usize;
-        let mut loss = closure(session)?;
+        let mut loss = match closure(session) {
+            Ok(loss) if loss.is_finite() => loss,
+            result => {
+                self.set_flat_params(session, &initial_params)?;
+                return Err(result.err().unwrap_or_else(|| {
+                    optimizer_state_error("lbfgs closure must return a finite loss and gradients")
+                }));
+            }
+        };
         let mut params = self.flatten_params(session)?;
+        if params.iter().any(|value| !value.is_finite()) {
+            self.set_flat_params(session, &initial_params)?;
+            return Err(optimizer_state_error(
+                "lbfgs closure must preserve finite parameters",
+            ));
+        }
         let mut grad = match self.flatten_gradients(session)? {
             Some(grad) => grad,
             None => {
@@ -3478,15 +3638,22 @@ impl LBFGS {
                 return Ok(loss);
             }
         };
+        if grad.iter().any(|value| !value.is_finite()) {
+            self.set_flat_params(session, &initial_params)?;
+            return Err(optimizer_state_error(
+                "lbfgs closure must return finite parameters and gradients",
+            ));
+        }
         self.record_history_from_previous(&params, &grad);
 
         for _ in 0..self.max_iter {
-            if vector_max_abs(&grad) <= self.tolerance_grad {
+            if self.lr == 0.0 || vector_max_abs(&grad) <= self.tolerance_grad {
                 break;
             }
 
             let mut direction = self.two_loop_direction(&grad);
-            if vector_dot(&direction, &grad) >= 0.0 {
+            let derivative = vector_dot(&direction, &grad);
+            if !derivative.is_finite() || derivative >= 0.0 {
                 direction = grad.iter().map(|value| -value).collect();
                 self.clear_history();
             }
@@ -3499,7 +3666,7 @@ impl LBFGS {
             let old_params = params;
             let old_grad = grad;
 
-            let (next_params, next_grad, next_loss, evals_used) = self.search_step(
+            let search = self.search_step(
                 session,
                 closure,
                 LBFGSSearchContext {
@@ -3509,7 +3676,17 @@ impl LBFGS {
                     current_loss: loss,
                     eval_budget,
                 },
-            )?;
+            );
+            let (next_params, next_grad, next_loss, evals_used) = match search {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // Retain any earlier accepted steps, without replaying a
+                    // previous curvature pair when the caller retries.
+                    self.previous_params = Some(old_params);
+                    self.previous_grad = Some(old_grad);
+                    return Err(error);
+                }
+            };
 
             let max_change = vector_max_abs_delta(&old_params, &next_params);
             self.push_history_pair(&old_params, &old_grad, &next_params, &next_grad);
@@ -3551,6 +3728,11 @@ impl Optimizer for LBFGS {
             Some(grad) => grad,
             None => return Ok(()),
         };
+        if params.iter().chain(&grad).any(|value| !value.is_finite()) {
+            return Err(optimizer_state_error(
+                "lbfgs parameters and gradients must be finite",
+            ));
+        }
         self.record_history_from_previous(&params, &grad);
 
         if vector_max_abs(&grad) <= self.tolerance_grad {
@@ -3560,7 +3742,8 @@ impl Optimizer for LBFGS {
         }
 
         let mut direction = self.two_loop_direction(&grad);
-        if vector_dot(&direction, &grad) >= 0.0 {
+        let derivative = vector_dot(&direction, &grad);
+        if !derivative.is_finite() || derivative >= 0.0 {
             direction = grad.iter().map(|value| -value).collect();
             self.clear_history();
         }
@@ -13660,6 +13843,365 @@ mod tests {
     }
 
     // ── LBFGS tests ────────────────────────────────────────────────────
+
+    fn lbfgs_quadratic_loss(
+        session: &mut FrankenTorchSession,
+        params: &[TensorNodeId],
+    ) -> Result<f64, AutogradError> {
+        session.tensor_zero_grads(params)?;
+        let mut value = 0.0;
+        for &param in params {
+            let square = session.tensor_mul(param, param)?;
+            let loss = session.tensor_sum(square)?;
+            value += session.tensor_item(loss)?;
+            session.tensor_backward(loss)?;
+        }
+        Ok(value)
+    }
+
+    #[test]
+    fn lbfgs_strong_wolfe_expands_and_zooms_within_evaluation_budget() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            // The first two guesses require expansion; the last overshoots
+            // and must be bracketed and zoomed. Pure backtracking cannot solve
+            // either small-step case, even on this exact quadratic.
+            for lr in [1e-6, 0.01, 3.0] {
+                let mut session = FrankenTorchSession::new(mode);
+                let initial = [4.0, -1.5];
+                let x = session
+                    .tensor_variable(initial.to_vec(), vec![2], true)
+                    .unwrap();
+                let mut optimizer = LBFGS::new(vec![x], lr).max_iter(1).max_eval(25);
+                let mut calls = 0;
+                let loss = optimizer
+                    .step_with_closure(&mut session, &mut |session| {
+                        calls += 1;
+                        lbfgs_quadratic_loss(session, &[x])
+                    })
+                    .unwrap();
+                let actual = session.tensor_values(x).unwrap();
+                let initial_loss = initial.iter().map(|x| x * x).sum::<f64>();
+                let direction = initial.map(|x| -2.0 * x);
+                let slope0 = -direction.iter().map(|d| d * d).sum::<f64>();
+                let step = (actual[0] - initial[0]) / direction[0];
+                let slope = actual
+                    .iter()
+                    .zip(direction)
+                    .map(|(x, d)| 2.0 * x * d)
+                    .sum::<f64>();
+                assert!(calls > 2 && calls <= 25, "lr={lr}, calls={calls}");
+                assert!(loss <= initial_loss + 1e-4 * step * slope0);
+                assert!(slope.abs() <= 0.9 * slope0.abs());
+                assert!(step > 0.0);
+                assert_eq!(optimizer.previous_params.as_ref().unwrap(), &actual);
+                assert_eq!(optimizer.s_history.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_f32_history_tracks_stored_parameters_across_steps() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let x = session
+                .tensor_variable_f32(vec![1.234_567, -2.345_678], vec![2], true)
+                .unwrap();
+            let y = session
+                .tensor_variable_f32(vec![0.876_543], vec![1], true)
+                .unwrap();
+            let mut optimizer = LBFGS::new(vec![x, y], 0.123_456_789)
+                .max_iter(1)
+                .history_size(2)
+                .line_search_fn(LBFGSLineSearch::None);
+            let mut old = optimizer.flatten_params(&session).unwrap();
+            for round in 0..3 {
+                // On the first update H=I. Later, the secant pairs of this
+                // quadratic give H=I/2, independently of the rounded step.
+                let hessian_inverse = if round == 0 { 1.0 } else { 0.5 };
+                let expected = old
+                    .iter()
+                    .map(|x| f64::from((x - 0.123_456_789 * hessian_inverse * 2.0 * x) as f32))
+                    .collect::<Vec<_>>();
+                optimizer
+                    .step_with_closure(&mut session, &mut |session| {
+                        lbfgs_quadratic_loss(session, &[x, y])
+                    })
+                    .unwrap();
+                let actual = optimizer.flatten_params(&session).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(optimizer.previous_params.as_ref().unwrap(), &actual);
+                let displacement = actual
+                    .iter()
+                    .zip(&old)
+                    .map(|(new, old)| new - old)
+                    .collect::<Vec<_>>();
+                assert_eq!(optimizer.s_history.last().unwrap(), &displacement);
+                assert_eq!(
+                    optimizer.y_history.last().unwrap(),
+                    &displacement.iter().map(|s| 2.0 * s).collect::<Vec<_>>()
+                );
+                assert_eq!(optimizer.s_history.len(), (round + 1).min(2));
+                assert_eq!(session.tensor_dtype(x).unwrap(), ft_core::DType::F32);
+                old = actual;
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_f32_strong_wolfe_trains_with_expansion_and_zoom() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for lr in [0.001, 3.0] {
+                let mut session = FrankenTorchSession::new(mode);
+                let x = session
+                    .tensor_variable_f32(vec![1.234_567, -2.345_678], vec![2], true)
+                    .unwrap();
+                let mut optimizer = LBFGS::new(vec![x], lr).max_iter(2).max_eval(25);
+                let initial_loss = lbfgs_quadratic_loss(&mut session, &[x]).unwrap();
+                let mut calls = 0;
+                let loss = optimizer
+                    .step_with_closure(&mut session, &mut |session| {
+                        calls += 1;
+                        lbfgs_quadratic_loss(session, &[x])
+                    })
+                    .unwrap();
+                assert!(loss < initial_loss);
+                assert!(calls <= 25);
+                let actual = session.tensor_values_lossy_f64(x).unwrap();
+                assert_eq!(optimizer.previous_params.as_ref().unwrap(), &actual);
+                assert_eq!(session.tensor_dtype(x).unwrap(), ft_core::DType::F32);
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_f32_regular_step_matches_quadratic_update() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(vec![1.25, -3.5], vec![2], true)
+            .unwrap();
+        let mut optimizer = LBFGS::new(vec![x], 0.2);
+        let square = session.tensor_mul(x, x).unwrap();
+        let loss = session.tensor_sum(square).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        optimizer.step(&mut session, &report).unwrap();
+        assert_eq!(session.tensor_values_f32(x).unwrap(), vec![0.75, -2.1]);
+    }
+
+    #[test]
+    fn lbfgs_failed_trial_restores_all_parameters_for_each_search_mode() {
+        for line_search in [
+            LBFGSLineSearch::None,
+            LBFGSLineSearch::BacktrackingArmijo,
+            LBFGSLineSearch::StrongWolfe,
+        ] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(vec![3.0, -4.0], vec![2], true)
+                .unwrap();
+            let y = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+            let mut optimizer = LBFGS::new(vec![x, y], 0.1).line_search_fn(line_search);
+            let initial = optimizer.flatten_params(&session).unwrap();
+            let mut calls = 0;
+            let error = optimizer
+                .step_with_closure(&mut session, &mut |session| {
+                    calls += 1;
+                    if calls == 2 {
+                        // Even an error after a closure touched both parameter
+                        // buffers must restore the last accepted iterate.
+                        session.tensor_update_param_values(x, vec![100.0, 200.0])?;
+                        session.tensor_update_param_values(y, vec![300.0])?;
+                        return Err(optimizer_state_error("deliberate closure failure"));
+                    }
+                    lbfgs_quadratic_loss(session, &[x, y])
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("deliberate closure failure"));
+            assert_eq!(calls, 2);
+            assert_eq!(optimizer.flatten_params(&session).unwrap(), initial);
+            assert!(optimizer.s_history.is_empty());
+        }
+    }
+
+    #[test]
+    fn lbfgs_later_failure_preserves_accepted_history_and_retry() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut optimizer = LBFGS::new(vec![x], 0.1)
+            .max_iter(3)
+            .line_search_fn(LBFGSLineSearch::None);
+        let mut calls = 0;
+        assert!(
+            optimizer
+                .step_with_closure(&mut session, &mut |session| {
+                    calls += 1;
+                    if calls == 3 {
+                        return Err(optimizer_state_error("second trial failure"));
+                    }
+                    lbfgs_quadratic_loss(session, &[x])
+                })
+                .is_err()
+        );
+        assert_eq!(session.tensor_values(x).unwrap(), vec![1.6]);
+        assert_eq!(optimizer.previous_params, Some(vec![1.6]));
+        assert_eq!(optimizer.s_history.len(), 1);
+        optimizer.max_iter = 1;
+        optimizer
+            .step_with_closure(&mut session, &mut |session| {
+                lbfgs_quadratic_loss(session, &[x])
+            })
+            .unwrap();
+        assert_eq!(optimizer.s_history.len(), 2);
+        assert!((session.tensor_values(x).unwrap()[0] - 1.44).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lbfgs_exhausted_wolfe_budget_restores_parameters() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let x = session.tensor_variable(vec![4.0], vec![1], true).unwrap();
+            let mut optimizer = LBFGS::new(vec![x], 0.001).max_eval(2);
+            let mut calls = 0;
+            assert!(
+                optimizer
+                    .step_with_closure(&mut session, &mut |session| {
+                        calls += 1;
+                        lbfgs_quadratic_loss(session, &[x])
+                    })
+                    .is_err()
+            );
+            assert_eq!(calls, 2);
+            assert_eq!(session.tensor_values(x).unwrap(), vec![4.0]);
+            assert!(optimizer.s_history.is_empty());
+        }
+    }
+
+    #[test]
+    fn lbfgs_backtracks_nonfinite_losses_and_gradients() {
+        for line_search in [
+            LBFGSLineSearch::BacktrackingArmijo,
+            LBFGSLineSearch::StrongWolfe,
+        ] {
+            for invalid in 0..4 {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
+                let mut optimizer = LBFGS::new(vec![x], 0.4)
+                    .max_iter(1)
+                    .line_search_fn(line_search);
+                let mut rejected = 0;
+                let loss = optimizer
+                    .step_with_closure(&mut session, &mut |session| {
+                        let value = session.tensor_values(x)?[0];
+                        let mut loss = value * value;
+                        let mut grad = 2.0 * value;
+                        if value < 0.5 {
+                            rejected += 1;
+                            match invalid {
+                                0 => loss = f64::NAN,
+                                1 => loss = f64::INFINITY,
+                                2 => grad = f64::NAN,
+                                _ => grad = f64::INFINITY,
+                            }
+                        }
+                        session.tensor_set_accumulated_gradient(x, vec![grad])?;
+                        Ok(loss)
+                    })
+                    .unwrap();
+                let actual = session.tensor_values(x).unwrap()[0];
+                assert!(rejected > 0);
+                assert!((0.5..1.0).contains(&actual));
+                assert_eq!(loss, actual * actual);
+                assert!(
+                    optimizer
+                        .y_history
+                        .iter()
+                        .flatten()
+                        .all(|value| value.is_finite())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_initial_and_fixed_step_nonfinite_evaluations_fail_closed() {
+        for invalid_on in [1, 2] {
+            for invalid_loss in [true, false] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
+                let mut optimizer = LBFGS::new(vec![x], 0.1).line_search_fn(LBFGSLineSearch::None);
+                let mut calls = 0;
+                assert!(
+                    optimizer
+                        .step_with_closure(&mut session, &mut |session| {
+                            calls += 1;
+                            let value = session.tensor_values(x)?[0];
+                            let bad = calls == invalid_on;
+                            session.tensor_set_accumulated_gradient(
+                                x,
+                                vec![if bad && !invalid_loss {
+                                    f64::NAN
+                                } else {
+                                    2.0 * value
+                                }],
+                            )?;
+                            Ok(if bad && invalid_loss {
+                                f64::NAN
+                            } else {
+                                value * value
+                            })
+                        })
+                        .is_err()
+                );
+                assert_eq!(calls, invalid_on);
+                assert_eq!(session.tensor_values(x).unwrap(), vec![1.0]);
+                assert!(optimizer.s_history.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_zero_lr_and_initial_only_budget_do_not_evaluate_trials() {
+        for (lr, max_eval) in [(0.0, 25), (0.1, 1)] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(vec![2.0], vec![1], true)
+                .unwrap();
+            let mut optimizer = LBFGS::new(vec![x], lr).max_eval(max_eval);
+            let mut calls = 0;
+            let loss = optimizer
+                .step_with_closure(&mut session, &mut |session| {
+                    calls += 1;
+                    lbfgs_quadratic_loss(session, &[x])
+                })
+                .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(loss, 4.0);
+            assert_eq!(session.tensor_values_f32(x).unwrap(), vec![2.0]);
+            assert!(optimizer.s_history.is_empty());
+        }
+    }
+
+    #[test]
+    fn lbfgs_flat_update_preflights_every_parameter() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let y = session
+            .tensor_variable_f32(vec![2.0], vec![1], true)
+            .unwrap();
+        let optimizer = LBFGS::new(vec![x, y], 0.1);
+        for values in [
+            vec![5.0],
+            vec![5.0, 6.0, 7.0],
+            vec![5.0, f64::NAN],
+            vec![5.0, f64::MAX],
+        ] {
+            assert!(optimizer.set_flat_params(&mut session, &values).is_err());
+            assert_eq!(session.tensor_values(x).unwrap(), vec![1.0]);
+            assert_eq!(session.tensor_values_f32(y).unwrap(), vec![2.0]);
+        }
+        let invalid = LBFGS::new(vec![x, TensorNodeId(usize::MAX)], 0.1);
+        assert!(invalid.set_flat_params(&mut session, &[5.0, 6.0]).is_err());
+        assert_eq!(session.tensor_values(x).unwrap(), vec![1.0]);
+    }
 
     #[test]
     fn lbfgs_basic_step_reduces_loss() {
