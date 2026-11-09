@@ -95,10 +95,13 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Command buffers this process committed that ended in a state other than
-/// [`CommandBufferState::Completed`], counted by [`sgemm`] and
-/// `fused::Batch::finish`. A failed command buffer's output buffers hold
-/// whatever the GPU wrote before it stopped (often nothing), so these calls
-/// never return them; see [`COMMAND_BUFFER_ATTEMPTS`].
+/// [`CommandBufferState::Completed`], counted by [`sgemm`],
+/// `fused::Batch::finish` and [`compute::Batch::submit`]. A failed command
+/// buffer's output buffers hold whatever the GPU wrote before it stopped
+/// (often nothing). `sgemm` and the fused encoder never return them, and
+/// re-run instead (see [`COMMAND_BUFFER_ATTEMPTS`]); a compute batch reports
+/// the failure to its caller, since its kernels may have written what they
+/// read.
 static COMMAND_BUFFER_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many failed command buffers this process has seen (see
@@ -260,7 +263,8 @@ pub(crate) mod fault {
 }
 
 /// Test seam (not for production use): the next `n` command buffers that
-/// [`sgemm`] or the fused encoder submit from the calling thread end without
+/// [`sgemm`], the fused encoder or the compute gateway ([`compute::Gateway::dispatch`],
+/// [`compute::Batch::submit`]) submit from the calling thread end without
 /// running and report `NotEnqueued`, leaving their outputs unwritten, as a GPU
 /// restart leaves aborted work. `0` disarms.
 ///

@@ -40,10 +40,18 @@
 //!    makes [`SharedBuffer::read_f32`] and friends safe to call immediately
 //!    afterwards with no fences in the public API.
 //!
-//! Anything richer — multiple encoders per command buffer, async completion
-//! handlers, resource heaps — is deliberately absent until a consumer proves it
-//! needs it. [`fused::Batch`](crate::fused::Batch) already demonstrates the
-//! batched-encoder shape for the ops that ship here.
+//! 6. [`Gateway::batch`](crate::compute::Gateway::batch) — several ordered
+//!    kernels in one command buffer, with each buffer registered once as an
+//!    [`Input`](crate::compute::Input) (shared borrow, read only) or an
+//!    [`Output`](crate::compute::Output) (exclusive borrow, may be written),
+//!    each kernel's arguments declared read or written and checked for
+//!    aliases, and a [`Receipt`](crate::compute::Receipt) once the command
+//!    buffer completed. A consumer whose tick is
+//!    a chain of kernels pays one commit and one wait for the chain, and the
+//!    borrows keep the host away from every buffer until the GPU is done.
+//!
+//! Anything richer — asynchronous completion handlers, resource heaps — is
+//! deliberately absent until a consumer proves it needs it.
 //!
 //! Off macOS the whole module is a stub whose [`Gateway::open`] returns
 //! [`Error::Unavailable`], so consumers compile everywhere and fall back to
@@ -182,15 +190,340 @@ fn ensure_command_completed(state: CommandBufferState) -> Result<(), Error> {
     }
 }
 
+/// The most buffer arguments one kernel of a [`Batch`] takes: the 31
+/// entries of a Metal compute function's buffer argument table.
+pub const MAX_ARGUMENTS: usize = 31;
+
+/// Batch identities, so an argument of one batch is refused by another.
+static NEXT_BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A buffer a [`Batch`] only reads, registered by [`Batch::input`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Input {
+    batch: u64,
+    slot: usize,
+}
+
+/// A buffer a [`Batch`] may write, registered by [`Batch::output`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Output {
+    batch: u64,
+    slot: usize,
+}
+
+/// One buffer argument of a kernel in a [`Batch`]: a registered buffer and
+/// whether the kernel writes it.
+///
+/// The declaration is the caller's statement of what the kernel does. The
+/// gateway cannot see inside a kernel, so it checks declarations against each
+/// other (no buffer written while it is also bound elsewhere in the same
+/// kernel) and against the borrows ([`Input`]s cannot be declared written),
+/// not against the shader source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Argument {
+    batch: u64,
+    slot: usize,
+    writes: bool,
+}
+
+impl Input {
+    /// The buffer as an argument the kernel reads.
+    #[must_use]
+    pub fn read(self) -> Argument {
+        Argument {
+            batch: self.batch,
+            slot: self.slot,
+            writes: false,
+        }
+    }
+}
+
+impl Output {
+    /// The buffer as an argument the kernel only reads.
+    #[must_use]
+    pub fn read(self) -> Argument {
+        Argument {
+            batch: self.batch,
+            slot: self.slot,
+            writes: false,
+        }
+    }
+
+    /// The buffer as an argument the kernel writes (and may also read).
+    #[must_use]
+    pub fn write(self) -> Argument {
+        Argument {
+            batch: self.batch,
+            slot: self.slot,
+            writes: true,
+        }
+    }
+}
+
+impl Argument {
+    /// Whether the kernel writes this argument.
+    #[must_use]
+    pub fn writes(&self) -> bool {
+        self.writes
+    }
+}
+
+/// What a completed [`Batch`] ran.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Receipt {
+    /// Kernels the command buffer ran, in order.
+    pub kernels: usize,
+    /// The device's time for the command buffer, in seconds: from when the
+    /// GPU started executing it to when it finished (Metal's `GPUStartTime`
+    /// and `GPUEndTime`). Excludes encoding, queueing and the host's wait.
+    pub device_seconds: f64,
+}
+
+/// One kernel of a [`Batch`]: its pipeline, its arguments' slots in
+/// argument-index order, and its grid. Only the macOS encoder reads it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Step<'a> {
+    pipeline: &'a Pipeline,
+    slots: Vec<usize>,
+    grid: Grid,
+}
+
+/// A **command batch**: several kernels encoded, in order, into one command
+/// buffer, committed once, and waited for once.
+///
+/// - **Ordered.** The kernels run in the order they were added, each one
+///   after the previous one finished, so a kernel reads what earlier kernels
+///   of the batch wrote. They are encoded into one serial compute encoder.
+/// - **Declared bindings.** Buffers are registered once:
+///   [`input`](Batch::input) borrows a buffer shared, for kernels that only
+///   read it; [`output`](Batch::output) borrows it exclusively, for kernels
+///   that may write it. Each kernel then names its arguments as
+///   [`Input::read`], [`Output::read`] or [`Output::write`].
+/// - **Retained resources.** The batch holds every registered buffer and
+///   pipeline until [`submit`](Batch::submit) returns, so no host code can
+///   read an output, write anything the batch uses, or free it while the
+///   GPU runs. The borrow checker enforces it; Metal's command buffer also
+///   retains each bound buffer.
+/// - **Checked before encoding.** [`dispatch`](Batch::dispatch) refuses a
+///   kernel whose grid is empty or too large for its pipeline, an argument
+///   of another batch, more than [`MAX_ARGUMENTS`] arguments, or an alias:
+///   one buffer bound twice in a kernel when either binding writes it (two
+///   reads are compatible). A refused kernel adds nothing to the batch.
+/// - **Completion receipts.** [`submit`](Batch::submit) returns a
+///   [`Receipt`] only after the command buffer completed; any other terminal
+///   state is [`Error::CommandBuffer`]. A failed batch is not re-run: its
+///   kernels may have written buffers they read, so the caller decides.
+///
+/// Dropping a batch without submitting it encodes and runs nothing.
+///
+/// ```no_run
+/// use ft_kernel_metal::compute::{Gateway, Grid};
+/// # fn main() -> Result<(), ft_kernel_metal::Error> {
+/// let gateway = Gateway::open()?;
+/// let library = gateway.library(
+///     "kernel void twice(device const float* x [[buffer(0)]],
+///                        device float* y [[buffer(1)]],
+///                        uint i [[thread_position_in_grid]]) { y[i] = 2.0f * x[i]; }",
+/// )?;
+/// let twice = library.pipeline("twice")?;
+/// let x = gateway.buffer_f32(&[1.0; 64])?;
+/// let mut y = gateway.buffer_zeroed(64 * 4)?;
+/// let mut z = gateway.buffer_zeroed(64 * 4)?;
+///
+/// let mut batch = gateway.batch();
+/// let (x_in, y_out, z_out) = (batch.input(&x), batch.output(&mut y), batch.output(&mut z));
+/// batch.dispatch(&twice, &[x_in.read(), y_out.write()], Grid::linear(1, 64))?;
+/// batch.dispatch(&twice, &[y_out.read(), z_out.write()], Grid::linear(1, 64))?;
+/// let receipt = batch.submit()?;
+/// assert_eq!(receipt.kernels, 2);
+///
+/// let mut out = [0.0f32; 64];
+/// z.read_f32(&mut out)?;
+/// assert_eq!(out, [4.0; 64]);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A host read of an output while the batch holds it does not compile:
+///
+/// ```compile_fail,E0502
+/// # use ft_kernel_metal::compute::{Gateway, SharedBuffer};
+/// # fn race(gateway: Gateway, mut y: SharedBuffer) {
+/// let mut batch = gateway.batch();
+/// let y_out = batch.output(&mut y);
+/// let mut seen = [0.0f32; 4];
+/// let _ = y.read_f32(&mut seen); // the batch holds `y` until it is submitted
+/// let _ = (y_out, batch.submit());
+/// # }
+/// ```
+///
+/// Nor does registering an output through a shared reference, which would
+/// leave the host free to read it while a kernel writes it:
+///
+/// ```compile_fail,E0308
+/// # use ft_kernel_metal::compute::{Gateway, SharedBuffer};
+/// # fn race(gateway: Gateway, y: SharedBuffer) {
+/// let mut batch = gateway.batch();
+/// let y_out = batch.output(&y);
+/// let _ = (y_out, batch.submit());
+/// # }
+/// ```
+///
+/// Nor does a host write of an input:
+///
+/// ```compile_fail,E0502
+/// # use ft_kernel_metal::compute::{Gateway, SharedBuffer};
+/// # fn race(gateway: Gateway, mut x: SharedBuffer) {
+/// let mut batch = gateway.batch();
+/// let x_in = batch.input(&x);
+/// let _ = x.write_f32(0, &[1.0]); // the batch reads `x` until it is submitted
+/// let _ = (x_in, batch.submit());
+/// # }
+/// ```
+pub struct Batch<'a> {
+    gateway: Gateway,
+    id: u64,
+    buffers: Vec<&'a SharedBuffer>,
+    steps: Vec<Step<'a>>,
+}
+
+impl Gateway {
+    /// An empty [`Batch`] on this gateway's queue.
+    #[must_use]
+    pub fn batch<'a>(&self) -> Batch<'a> {
+        Batch {
+            gateway: *self,
+            id: NEXT_BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            buffers: Vec::new(),
+            steps: Vec::new(),
+        }
+    }
+}
+
+impl<'a> Batch<'a> {
+    /// Register `buffer` for kernels that only read it, holding it shared
+    /// until the batch is submitted or dropped.
+    pub fn input(&mut self, buffer: &'a SharedBuffer) -> Input {
+        self.buffers.push(buffer);
+        Input {
+            batch: self.id,
+            slot: self.buffers.len() - 1,
+        }
+    }
+
+    /// Register `buffer` for kernels that may write it, holding it
+    /// exclusively until the batch is submitted or dropped.
+    pub fn output(&mut self, buffer: &'a mut SharedBuffer) -> Output {
+        self.buffers.push(buffer);
+        Output {
+            batch: self.id,
+            slot: self.buffers.len() - 1,
+        }
+    }
+
+    /// Add a kernel: `pipeline` over `grid`, with `arguments` bound to buffer
+    /// indices `0..arguments.len()`. It runs after every kernel added before
+    /// it.
+    ///
+    /// # Errors
+    /// [`Error::Kernel`] or [`Error::SizeOverflow`] for an empty or
+    /// overflowing grid, a threadgroup larger than the pipeline's maximum, an
+    /// argument of another batch, more than [`MAX_ARGUMENTS`] arguments, or an
+    /// alias. The batch is unchanged.
+    pub fn dispatch(
+        &mut self,
+        pipeline: &'a Pipeline,
+        arguments: &[Argument],
+        grid: Grid,
+    ) -> Result<(), Error> {
+        grid.validate()?;
+        let max = pipeline.max_threads_per_threadgroup();
+        let want = grid.threads_per_threadgroup_count()?;
+        if want > max {
+            return Err(Error::Kernel(format!(
+                "kernel {}: {want} threads/threadgroup exceeds the pipeline maximum {max}",
+                self.steps.len()
+            )));
+        }
+        let slots = check_arguments(self.id, self.buffers.len(), arguments)?;
+        self.steps.push(Step {
+            pipeline,
+            slots,
+            grid,
+        });
+        Ok(())
+    }
+
+    /// Kernels added so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Whether no kernel has been added.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Encode every kernel in order into one command buffer, commit it, and
+    /// **block until the GPU finishes**, releasing the batch's buffers.
+    ///
+    /// # Errors
+    /// [`Error::Kernel`] for a batch of no kernels, with nothing submitted;
+    /// [`Error::CommandBuffer`] when the command buffer ends in any state but
+    /// completed. Its outputs then hold whatever the GPU wrote before it
+    /// stopped, possibly nothing.
+    pub fn submit(self) -> Result<Receipt, Error> {
+        if self.steps.is_empty() {
+            return Err(Error::Kernel("a batch of no kernels".into()));
+        }
+        imp::submit_batch(self.gateway, &self.buffers, &self.steps)
+    }
+}
+
+/// Check one kernel's arguments against the batch `batch` of `registered`
+/// buffers, returning their slots in argument order.
+fn check_arguments(
+    batch: u64,
+    registered: usize,
+    arguments: &[Argument],
+) -> Result<Vec<usize>, Error> {
+    if arguments.len() > MAX_ARGUMENTS {
+        return Err(Error::Kernel(format!(
+            "{} buffer arguments: a kernel takes at most {MAX_ARGUMENTS}",
+            arguments.len()
+        )));
+    }
+    for (at, argument) in arguments.iter().enumerate() {
+        if argument.batch != batch || argument.slot >= registered {
+            return Err(Error::Kernel(format!(
+                "argument {at} names a buffer of another batch"
+            )));
+        }
+        let alias = arguments[..at].iter().position(|earlier| {
+            earlier.slot == argument.slot && (earlier.writes || argument.writes)
+        });
+        if let Some(earlier) = alias {
+            return Err(Error::Kernel(format!(
+                "arguments {earlier} and {at} bind one buffer and one of them writes it: an alias"
+            )));
+        }
+    }
+    Ok(arguments.iter().map(|argument| argument.slot).collect())
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        Error, Grid, MathMode, checked_byte_len, ensure_command_completed, validate_buffer_size,
+        Error, Grid, MathMode, Receipt, Step, checked_byte_len, ensure_command_completed,
+        validate_buffer_size,
     };
     use metal::{
-        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
+        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, MTLDispatchType,
         MTLResourceOptions, MTLSize,
     };
+    use objc::{msg_send, sel, sel_impl};
     use std::sync::OnceLock;
 
     const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
@@ -246,9 +579,11 @@ mod imp {
     /// Host data is copied in at construction or by the `write_*` methods and
     /// copied out by the `read_*` methods; the buffer never aliases host
     /// memory, which is what keeps this API safe without lifetime plumbing.
-    /// Every GPU use of a buffer (a [`Gateway::dispatch`], a presentation
-    /// blit) borrows it shared and waits for its command buffer to complete,
-    /// so a `write_*` through `&mut self` can never race the GPU.
+    /// Every GPU use of a buffer (a [`Gateway::dispatch`], a [`Batch`](super::Batch), a
+    /// presentation blit) borrows it and waits for its command buffer to
+    /// complete, so a `write_*` through `&mut self` can never race the GPU.
+    /// A [`Batch`](super::Batch) borrows the buffers it may write exclusively, so no host
+    /// read races its kernels either.
     pub struct SharedBuffer {
         buf: metal::Buffer,
         bytes: usize,
@@ -391,20 +726,34 @@ mod imp {
                 grid.threads_per_threadgroup,
                 "threads-per-threadgroup extent",
             )?;
-
-            let cmd = self.ctx.queue.new_command_buffer();
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline.pso);
+            let mut bound = Vec::with_capacity(buffers.len());
             for (i, b) in buffers.iter().enumerate() {
                 let index =
                     u64::try_from(i).map_err(|_| Error::SizeOverflow("buffer argument index"))?;
-                enc.set_buffer(index, Some(&b.buf), 0);
+                bound.push((index, b.metal_buffer()));
             }
-            enc.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-            ensure_command_completed(cmd.status().into())
+
+            // The command buffer and its encoder are autoreleased. Without a
+            // pool, a thread that never exits keeps every one it dispatched:
+            // about 1.8 KiB each, measured over 200,000 dispatches on an M5
+            // Ultra (+368 MB). Draining a pool per dispatch releases them.
+            objc::rc::autoreleasepool(|| {
+                let cmd = self.ctx.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline.pso);
+                for (index, buffer) in &bound {
+                    enc.set_buffer(*index, Some(*buffer), 0);
+                }
+                enc.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+                enc.end_encoding();
+                // An injected fault (tests only) leaves the buffer uncommitted,
+                // as `crate::submit_and_wait` does.
+                if !crate::fault::take() {
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                }
+                ensure_command_completed(cmd.status().into())
+            })
         }
     }
 
@@ -547,6 +896,67 @@ mod imp {
         }
     }
 
+    /// Encode `steps` in order into one serial compute encoder of one command
+    /// buffer, submit it, and wait. Everything fallible is resolved before the
+    /// command buffer exists, so a refusal encodes nothing.
+    #[allow(
+        unexpected_cfgs,
+        reason = "objc 0.2's msg_send! expands a cfg(feature = \"cargo-clippy\") check"
+    )]
+    pub(super) fn submit_batch(
+        gateway: Gateway,
+        buffers: &[&SharedBuffer],
+        steps: &[Step<'_>],
+    ) -> Result<Receipt, Error> {
+        let mut plan = Vec::with_capacity(steps.len());
+        for step in steps {
+            let mut bound = Vec::with_capacity(step.slots.len());
+            for (index, &slot) in step.slots.iter().enumerate() {
+                let index = u64::try_from(index)
+                    .map_err(|_| Error::SizeOverflow("buffer argument index"))?;
+                let buffer = buffers
+                    .get(slot)
+                    .ok_or_else(|| Error::Kernel(format!("slot {slot} is not registered")))?;
+                bound.push((index, buffer.metal_buffer()));
+            }
+            plan.push((
+                &step.pipeline.pso,
+                bound,
+                msize(step.grid.threadgroups, "threadgroup extent")?,
+                msize(
+                    step.grid.threads_per_threadgroup,
+                    "threads-per-threadgroup extent",
+                )?,
+            ));
+        }
+        // The command buffer and its encoder are autoreleased. Draining a
+        // pool here releases them when the submission ends rather than when
+        // the calling thread exits; an uncommitted buffer (an injected fault)
+        // would otherwise hold one of the queue's 64 slots for good.
+        objc::rc::autoreleasepool(|| {
+            let cmd = gateway.metal_queue().new_command_buffer();
+            let enc = cmd.compute_command_encoder_with_dispatch_type(MTLDispatchType::Serial);
+            for (pso, bound, threadgroups, threads_per_threadgroup) in &plan {
+                enc.set_compute_pipeline_state(pso);
+                for (index, buffer) in bound {
+                    enc.set_buffer(*index, Some(*buffer), 0);
+                }
+                enc.dispatch_thread_groups(*threadgroups, *threads_per_threadgroup);
+            }
+            enc.end_encoding();
+            crate::submit_and_wait(cmd)?;
+            // SAFETY: `GPUStartTime` and `GPUEndTime` are read-only
+            // `CFTimeInterval` (f64) properties of a command buffer, valid
+            // once it has completed, which `submit_and_wait` just verified.
+            let (start, end): (f64, f64) =
+                unsafe { (msg_send![cmd, GPUStartTime], msg_send![cmd, GPUEndTime]) };
+            Ok(Receipt {
+                kernels: plan.len(),
+                device_seconds: (end - start).max(0.0),
+            })
+        })
+    }
+
     fn msize(v: [usize; 3], what: &'static str) -> Result<MTLSize, Error> {
         let [x, y, z] = v.map(u64::try_from);
         Ok(MTLSize::new(
@@ -567,7 +977,16 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::{Error, Grid, MathMode};
+    use super::{Error, Grid, MathMode, Receipt, Step};
+
+    /// Unreachable off macOS: no `Gateway`, so no `Batch`, can exist.
+    pub(super) fn submit_batch(
+        _gateway: Gateway,
+        _buffers: &[&SharedBuffer],
+        _steps: &[Step<'_>],
+    ) -> Result<Receipt, Error> {
+        Err(Error::Unavailable)
+    }
 
     /// Stub: no Metal device exists off macOS, so no value of this type can be
     /// constructed — [`Gateway::open`] always fails.
@@ -796,6 +1215,325 @@ kernel void scale_add(
         let mut back = vec![0.0f32; n];
         bx.read_f32(&mut back).expect("readback x");
         assert_eq!(back[n - 1], (n - 1) as f32);
+        Ok(())
+    }
+
+    /// Kernels for the batch tests. `reverse_add_one` makes thread `i` read
+    /// element `n - 1 - i`, which a far threadgroup of the previous kernel
+    /// wrote, so a kernel that started before its predecessor finished would
+    /// read stale values somewhere in a large grid.
+    const BATCH_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void reverse_add_one(
+    device const float* x [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    constant uint* n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    uint count = n[0];
+    if (i >= count) return;
+    y[i] = x[count - 1 - i] + 1.0f;
+}
+kernel void accumulate(
+    device float* y [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    constant uint* n [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n[0]) return;
+    y[i] += x[i];
+}
+kernel void add_pair(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant uint* n [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n[0]) return;
+    y[i] = a[i] + b[i];
+}
+"#;
+
+    /// Sixteen reversing kernels alternating between two buffers and a
+    /// read-write accumulation, in one command buffer: the result equals the
+    /// same sequence on the CPU, exactly, and the receipt counts every
+    /// kernel with a device time no longer than the host's wait.
+    #[test]
+    fn a_batch_runs_its_kernels_in_order_in_one_command_buffer() -> Result<(), Error> {
+        let gw = match Gateway::open() {
+            Ok(gw) => gw,
+            Err(Error::Unavailable) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let n = 1usize << 20;
+        let lib = gw.library(BATCH_SRC)?;
+        let reverse = lib.pipeline("reverse_add_one")?;
+        let accumulate = lib.pipeline("accumulate")?;
+        let start: Vec<f32> = (0..n).map(|i| (i % 4093) as f32).collect();
+        let mut a = gw.buffer_f32(&start)?;
+        let mut b = gw.buffer_zeroed(n * 4)?;
+        let count = gw.buffer_u32(&[n as u32])?;
+        let grid = Grid::linear(n / 256, 256);
+
+        let mut batch = gw.batch();
+        let (a_out, b_out, count_in) = (
+            batch.output(&mut a),
+            batch.output(&mut b),
+            batch.input(&count),
+        );
+        for step in 0..16 {
+            let (from, to) = if step % 2 == 0 {
+                (a_out, b_out)
+            } else {
+                (b_out, a_out)
+            };
+            batch.dispatch(&reverse, &[from.read(), to.write(), count_in.read()], grid)?;
+        }
+        batch.dispatch(
+            &accumulate,
+            &[a_out.write(), b_out.read(), count_in.read()],
+            grid,
+        )?;
+        assert_eq!(batch.len(), 17);
+        let began = std::time::Instant::now();
+        let receipt = batch.submit()?;
+        let waited = began.elapsed().as_secs_f64();
+        assert_eq!(receipt.kernels, 17);
+        assert!(
+            receipt.device_seconds > 0.0 && receipt.device_seconds <= waited,
+            "device {} s against a {waited} s wait",
+            receipt.device_seconds
+        );
+
+        let (mut want_a, mut want_b) = (start, vec![0.0f32; n]);
+        for step in 0..16 {
+            let (from, to) = if step % 2 == 0 {
+                (&want_a, &mut want_b)
+            } else {
+                (&want_b, &mut want_a)
+            };
+            let next: Vec<f32> = (0..n).map(|i| from[n - 1 - i] + 1.0).collect();
+            *to = next;
+        }
+        for (y, x) in want_a.iter_mut().zip(&want_b) {
+            *y += x;
+        }
+        let (mut got_a, mut got_b) = (vec![0.0f32; n], vec![0.0f32; n]);
+        a.read_f32(&mut got_a)?;
+        b.read_f32(&mut got_b)?;
+        let wrong = got_a.iter().zip(&want_a).filter(|(g, w)| g != w).count()
+            + got_b.iter().zip(&want_b).filter(|(g, w)| g != w).count();
+        assert_eq!(wrong, 0, "{wrong} elements differ from the CPU sequence");
+        Ok(())
+    }
+
+    /// Every refusal leaves the batch as it was; one buffer read twice by a
+    /// kernel is compatible; an empty batch is refused; the batch then runs.
+    #[test]
+    fn a_batch_refuses_what_it_cannot_run_and_adds_nothing() -> Result<(), Error> {
+        let gw = match Gateway::open() {
+            Ok(gw) => gw,
+            Err(Error::Unavailable) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let n = 1024usize;
+        let lib = gw.library(BATCH_SRC)?;
+        let add_pair = lib.pipeline("add_pair")?;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let a = gw.buffer_f32(&x)?;
+        let mut y = gw.buffer_zeroed(n * 4)?;
+        let count = gw.buffer_u32(&[n as u32])?;
+        let other_count = gw.buffer_u32(&[n as u32])?;
+        let grid = Grid::linear(n / 128, 128);
+
+        assert!(matches!(
+            gw.batch().submit(),
+            Err(Error::Kernel(message)) if message == "a batch of no kernels"
+        ));
+
+        let mut other = gw.batch();
+        let foreign = other.input(&other_count);
+        let mut batch = gw.batch();
+        let (a_in, y_out, count_in) = (batch.input(&a), batch.output(&mut y), batch.input(&count));
+        let refusals = [
+            batch.dispatch(
+                &add_pair,
+                &[a_in.read(), a_in.read(), y_out.write(), count_in.read()],
+                Grid::linear(0, 128),
+            ),
+            batch.dispatch(
+                &add_pair,
+                &[a_in.read(), a_in.read(), y_out.write(), count_in.read()],
+                Grid::linear(1, add_pair.max_threads_per_threadgroup() + 1),
+            ),
+            batch.dispatch(
+                &add_pair,
+                &[a_in.read(), a_in.read(), y_out.write(), foreign.read()],
+                grid,
+            ),
+            batch.dispatch(
+                &add_pair,
+                &[a_in.read(), y_out.read(), y_out.write(), count_in.read()],
+                grid,
+            ),
+            batch.dispatch(
+                &add_pair,
+                &[y_out.write(), a_in.read(), y_out.write(), count_in.read()],
+                grid,
+            ),
+            batch.dispatch(&add_pair, &[a_in.read(); MAX_ARGUMENTS + 1], grid),
+        ];
+        for (at, refusal) in refusals.into_iter().enumerate() {
+            assert!(refusal.is_err(), "refusal {at} was admitted");
+        }
+        assert!(batch.is_empty(), "a refused kernel was added");
+        drop(other);
+
+        batch.dispatch(
+            &add_pair,
+            &[a_in.read(), a_in.read(), y_out.write(), count_in.read()],
+            grid,
+        )?;
+        assert_eq!(batch.submit()?.kernels, 1);
+        let mut got = vec![0.0f32; n];
+        y.read_f32(&mut got)?;
+        assert!(got.iter().enumerate().all(|(i, &g)| g == 2.0 * i as f32));
+        Ok(())
+    }
+
+    #[test]
+    fn argument_checks_name_the_alias_and_the_foreign_batch() {
+        let read = |slot| Argument {
+            batch: 7,
+            slot,
+            writes: false,
+        };
+        let write = |slot| Argument {
+            batch: 7,
+            slot,
+            writes: true,
+        };
+        assert_eq!(
+            check_arguments(7, 3, &[read(0), read(0), write(1), read(2)]),
+            Ok(vec![0, 0, 1, 2])
+        );
+        assert_eq!(
+            check_arguments(7, 3, &[read(1), read(0), write(1)]),
+            Err(Error::Kernel(
+                "arguments 0 and 2 bind one buffer and one of them writes it: an alias".into()
+            ))
+        );
+        assert_eq!(
+            check_arguments(7, 3, &[write(2), write(2)]),
+            Err(Error::Kernel(
+                "arguments 0 and 1 bind one buffer and one of them writes it: an alias".into()
+            ))
+        );
+        let foreign = Argument {
+            batch: 8,
+            slot: 0,
+            writes: false,
+        };
+        assert_eq!(
+            check_arguments(7, 3, &[read(0), foreign]),
+            Err(Error::Kernel(
+                "argument 1 names a buffer of another batch".into()
+            ))
+        );
+        assert!(check_arguments(7, 3, &[read(0); MAX_ARGUMENTS]).is_ok());
+        assert!(check_arguments(7, 3, &[read(0); MAX_ARGUMENTS + 1]).is_err());
+    }
+
+    /// A batch whose command buffer fails reports its state, counts the
+    /// failure, and is not re-run: its output keeps what it held. Seventy
+    /// failed batches in a row (more than the queue's 64 command buffers)
+    /// release their buffers, so the next batch still runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_batch_reports_its_state_and_releases_its_command_buffer() -> Result<(), Error> {
+        let gw = match Gateway::open() {
+            Ok(gw) => gw,
+            Err(Error::Unavailable) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let n = 256usize;
+        let lib = gw.library(BATCH_SRC)?;
+        let add_pair = lib.pipeline("add_pair")?;
+        let a = gw.buffer_f32(&vec![1.0; n])?;
+        let mut y = gw.buffer_f32(&vec![-5.0; n])?;
+        let count = gw.buffer_u32(&[n as u32])?;
+        let grid = Grid::linear(n / 64, 64);
+        let run = |y: &mut SharedBuffer| {
+            let mut batch = gw.batch();
+            let (a_in, y_out, count_in) = (batch.input(&a), batch.output(y), batch.input(&count));
+            batch.dispatch(
+                &add_pair,
+                &[a_in.read(), a_in.read(), y_out.write(), count_in.read()],
+                grid,
+            )?;
+            batch.submit()
+        };
+
+        let before = crate::command_buffer_failures();
+        crate::fault::arm(70);
+        for attempt in 0..70 {
+            assert_eq!(
+                run(&mut y),
+                Err(Error::CommandBuffer(crate::CommandBufferState::NotEnqueued)),
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(crate::fault::pending(), 0);
+        // The counter is process-wide, and other tests' injected faults
+        // land in it concurrently.
+        assert!(crate::command_buffer_failures() >= before + 70);
+        let mut got = vec![0.0f32; n];
+        y.read_f32(&mut got)?;
+        assert!(got.iter().all(|&g| g == -5.0), "a failed batch wrote");
+
+        assert_eq!(run(&mut y)?.kernels, 1);
+        y.read_f32(&mut got)?;
+        assert!(got.iter().all(|&g| g == 2.0));
+        Ok(())
+    }
+
+    /// Seventy dispatches whose command buffers fail (more than the queue's
+    /// 64) each report their state and leave their output unwritten, and the
+    /// next dispatch still runs: each dispatch releases its command buffer
+    /// when it returns rather than when its thread exits.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dispatch_releases_its_command_buffer_when_it_returns() -> Result<(), Error> {
+        let gw = match Gateway::open() {
+            Ok(gw) => gw,
+            Err(Error::Unavailable) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let n = 256usize;
+        let pso = gw.library(SRC)?.pipeline("scale_add")?;
+        let x = gw.buffer_f32(&vec![3.0; n])?;
+        let y = gw.buffer_f32(&vec![-5.0; n])?;
+        let count = gw.buffer_u32(&[n as u32])?;
+        let grid = Grid::linear(n / 64, 64);
+
+        crate::fault::arm(70);
+        for attempt in 0..70 {
+            assert_eq!(
+                gw.dispatch(&pso, &[&x, &y, &count], grid),
+                Err(Error::CommandBuffer(crate::CommandBufferState::NotEnqueued)),
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(crate::fault::pending(), 0);
+        let mut got = vec![0.0f32; n];
+        y.read_f32(&mut got)?;
+        assert!(got.iter().all(|&g| g == -5.0), "a failed dispatch wrote");
+
+        gw.dispatch(&pso, &[&x, &y, &count], grid)?;
+        y.read_f32(&mut got)?;
+        assert!(got.iter().all(|&g| g == 7.0));
         Ok(())
     }
 
