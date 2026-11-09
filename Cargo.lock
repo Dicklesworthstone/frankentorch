@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "ft-kernel-metal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "core-graphics-types",
  "foreign-types",

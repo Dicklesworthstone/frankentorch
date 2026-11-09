@@ -1,7 +1,9 @@
 [package]
 name = "ft-kernel-metal"
-# Includes the October 10 command-buffer failure/retry correction.
-version = "0.1.1"
+# 0.1.1: the October 10 command-buffer failure/retry correction.
+# 0.1.2: typed native input from the presenter (pointer, buttons, scroll, keys,
+# modifiers, focus, capture loss, resize) and the `synthetic-input` test seam.
+version = "0.1.2"
 edition = "2024"
 license-file = "../../LICENSE"
 description = "Metal GPU compute kernels for FrankenTorch (macOS / Apple Silicon). Safe API; all unsafe Metal FFI is contained here. No-op stub on non-macOS targets."
@@ -25,3 +27,15 @@ half = { version = "2.7", default-features = false, features = ["std"] }
 # next `n` command buffers submitted from the calling thread end without running,
 # the way a GPU restart aborts in-flight work. Never enable it in a shipped build.
 fault-injection = []
+# Test seam for dependents' tests: `NativePresenter::post_synthetic` posts real
+# AppKit events for the presenter's window into the application queue, so they
+# take the same dispatch and translation path as user input. Never enable it in
+# a shipped build.
+synthetic-input = []
+
+# Opens a real window on the main thread, so it runs without the libtest
+# harness: `cargo test -p ft-kernel-metal --features synthetic-input --test native_input`.
+[[test]]
+name = "native_input"
+harness = false
+required-features = ["synthetic-input"]
