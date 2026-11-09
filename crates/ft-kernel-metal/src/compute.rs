@@ -243,9 +243,12 @@ mod imp {
 
     /// A unified-memory (`StorageModeShared`) GPU buffer.
     ///
-    /// Host data is copied in at construction and copied out by the `read_*`
-    /// methods; the buffer never aliases host memory, which is what keeps this
-    /// API safe without lifetime plumbing.
+    /// Host data is copied in at construction or by the `write_*` methods and
+    /// copied out by the `read_*` methods; the buffer never aliases host
+    /// memory, which is what keeps this API safe without lifetime plumbing.
+    /// Every GPU use of a buffer (a [`Gateway::dispatch`], a presentation
+    /// blit) borrows it shared and waits for its command buffer to complete,
+    /// so a `write_*` through `&mut self` can never race the GPU.
     pub struct SharedBuffer {
         buf: metal::Buffer,
         bytes: usize,
@@ -492,6 +495,47 @@ mod imp {
             Ok(())
         }
 
+        /// Overwrite `data.len()` `f32`s in place, starting at element
+        /// `offset`: a resident buffer updated without reallocating it. The
+        /// range must lie inside the buffer; nothing is written otherwise.
+        pub fn write_f32(&mut self, offset: usize, data: &[f32]) -> Result<(), Error> {
+            self.write_bytes(offset, std::mem::size_of::<f32>(), bytes_of_f32(data))
+        }
+
+        /// Overwrite `data.len()` `u32`s in place, starting at element
+        /// `offset`, as [`SharedBuffer::write_f32`].
+        pub fn write_u32(&mut self, offset: usize, data: &[u32]) -> Result<(), Error> {
+            self.write_bytes(offset, std::mem::size_of::<u32>(), bytes_of_u32(data))
+        }
+
+        fn write_bytes(&mut self, offset: usize, width: usize, data: &[u8]) -> Result<(), Error> {
+            let start = offset
+                .checked_mul(width)
+                .ok_or(Error::SizeOverflow("buffer write offset"))?;
+            let end = start
+                .checked_add(data.len())
+                .ok_or(Error::SizeOverflow("buffer write end"))?;
+            if end > self.bytes {
+                return Err(Error::Kernel(format!(
+                    "write of bytes {start}..{end} into a {}-byte buffer",
+                    self.bytes
+                )));
+            }
+            // SAFETY: `start..end` lies inside the buffer's `self.bytes`
+            // bytes of shared storage, and `data` is host memory that the
+            // buffer never aliases. `&mut self` excludes every other borrow,
+            // and no GPU work on this buffer outlives the call that borrowed
+            // it, so nothing reads the range while it is written.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (self.buf.contents() as *mut u8).add(start),
+                    data.len(),
+                );
+            }
+            Ok(())
+        }
+
         fn check(&self, want: usize) -> Result<(), Error> {
             if want > self.bytes {
                 return Err(Error::Kernel(format!(
@@ -635,6 +679,14 @@ mod imp {
         pub fn read_u8(&self, _out: &mut [u8]) -> Result<(), Error> {
             Err(Error::Unavailable)
         }
+        /// Unreachable off macOS: no `SharedBuffer` can exist.
+        pub fn write_f32(&mut self, _offset: usize, _data: &[f32]) -> Result<(), Error> {
+            Err(Error::Unavailable)
+        }
+        /// Unreachable off macOS: no `SharedBuffer` can exist.
+        pub fn write_u32(&mut self, _offset: usize, _data: &[u32]) -> Result<(), Error> {
+            Err(Error::Unavailable)
+        }
     }
 }
 
@@ -689,6 +741,61 @@ kernel void scale_add(
             let want = xi * 2.0 + 1.0;
             assert!((g - want).abs() <= 1e-6, "idx {i}: {g} vs {want}");
         }
+        Ok(())
+    }
+
+    /// A resident buffer rewritten in place between dispatches: each
+    /// dispatch sees exactly the latest writes, a partial write leaves the
+    /// rest as it was, and an out-of-range write is refused unchanged.
+    #[test]
+    fn in_place_writes_reach_the_next_dispatch() -> Result<(), Error> {
+        let gw = match Gateway::open() {
+            Ok(gw) => gw,
+            Err(Error::Unavailable) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let n = 512usize;
+        let lib = gw.library(SRC).expect("compile");
+        let pso = lib.pipeline("scale_add").expect("pipeline");
+        let mut bx = gw.buffer_zeroed(n * 4).expect("buffer x");
+        let by = gw.buffer_zeroed(n * 4).expect("buffer y");
+        let mut bn = gw.buffer_u32(&[0]).expect("buffer n");
+        let grid = Grid::linear(n / 128, 128);
+        let mut got = vec![0.0f32; n];
+
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        bx.write_f32(0, &x).expect("write x");
+        bn.write_u32(0, &[n as u32]).expect("write n");
+        gw.dispatch(&pso, &[&bx, &by, &bn], grid).expect("dispatch");
+        by.read_f32(&mut got).expect("readback");
+        assert!(
+            got.iter()
+                .enumerate()
+                .all(|(i, &g)| g == i as f32 * 2.0 + 1.0)
+        );
+
+        // Rewrite elements 100..110 only.
+        bx.write_f32(100, &[-1.0; 10]).expect("partial write");
+        gw.dispatch(&pso, &[&bx, &by, &bn], grid).expect("dispatch");
+        by.read_f32(&mut got).expect("readback");
+        for (i, &g) in got.iter().enumerate() {
+            let want = if (100..110).contains(&i) {
+                -1.0
+            } else {
+                i as f32 * 2.0 + 1.0
+            };
+            assert_eq!(g, want, "element {i}");
+        }
+
+        // Past the end: refused, and the buffer keeps its contents.
+        assert!(bx.write_f32(n - 1, &[0.0, 0.0]).is_err());
+        assert!(matches!(
+            bx.write_f32(usize::MAX, &[0.0]),
+            Err(Error::SizeOverflow(_))
+        ));
+        let mut back = vec![0.0f32; n];
+        bx.read_f32(&mut back).expect("readback x");
+        assert_eq!(back[n - 1], (n - 1) as f32);
         Ok(())
     }
 
