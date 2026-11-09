@@ -74,6 +74,7 @@ pub enum OptimizerState {
     Adadelta(AdadeltaState),
     Rprop(RpropState),
     Muon(MuonState),
+    Lbfgs(LbfgsState),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,6 +306,32 @@ pub struct MuonState {
     pub weight_decay: f64,
     /// None means this parameter has never received a gradient.
     pub momentum_buffers: Vec<Option<Vec<f64>>>,
+}
+
+/// Portable limited-memory BFGS configuration and inverse-Hessian history.
+///
+/// Vectors use the flattened optimizer parameter order. The previous iterate
+/// and gradient are separate from the model checkpoint: the regular `step`
+/// interface retains the pre-update iterate until the next gradient is known.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LbfgsState {
+    pub lr: f64,
+    pub max_iter: usize,
+    pub max_eval: usize,
+    pub tolerance_grad: f64,
+    pub tolerance_change: f64,
+    pub history_size: usize,
+    pub line_search_fn: LBFGSLineSearch,
+    /// Accepted parameter displacements, from oldest to newest.
+    pub s_history: Vec<Vec<f64>>,
+    /// Gradient displacements corresponding to `s_history`.
+    pub y_history: Vec<Vec<f64>>,
+    /// Reciprocal curvature `1 / dot(y, s)` for each stored pair.
+    pub rho_history: Vec<f64>,
+    pub previous_params: Option<Vec<f64>>,
+    /// `None` preserves a closure evaluation which produced no gradients.
+    pub previous_grad: Option<Vec<f64>>,
 }
 
 fn optimizer_parameter_metadata(
@@ -744,6 +771,78 @@ fn validate_muon_state_metadata(
     Ok(())
 }
 
+fn validate_lbfgs_state_buffers(
+    state: &LbfgsState,
+    parameters: &[OptimizerParameterMetadata],
+    sizes: &[usize],
+) -> Result<(), AutogradError> {
+    if parameters
+        .iter()
+        .any(|parameter| !matches!(parameter.dtype, ft_core::DType::F32 | ft_core::DType::F64))
+    {
+        return Err(optimizer_state_error("lbfgs parameters must be F32 or F64"));
+    }
+    let numel = sizes.iter().try_fold(0usize, |total, &size| {
+        total
+            .checked_add(size)
+            .ok_or_else(|| optimizer_state_error("lbfgs state parameter footprint overflow"))
+    })?;
+    ensure_state_len(
+        state.s_history.len(),
+        state.y_history.len(),
+        "lbfgs state curvature history count mismatch",
+    )?;
+    ensure_state_len(
+        state.s_history.len(),
+        state.rho_history.len(),
+        "lbfgs state reciprocal curvature count mismatch",
+    )?;
+    if state.s_history.len() > state.history_size {
+        return Err(optimizer_state_error(
+            "lbfgs state exceeds configured history size",
+        ));
+    }
+    if state.previous_params.is_none()
+        && (state.previous_grad.is_some() || !state.s_history.is_empty())
+    {
+        return Err(optimizer_state_error(
+            "lbfgs state is missing its previous parameter vector",
+        ));
+    }
+    if let Some(values) = &state.previous_params {
+        validate_optimizer_buffer(values, numel)?;
+    }
+    if let Some(values) = &state.previous_grad {
+        validate_optimizer_buffer(values, numel)?;
+    }
+    for ((s, y), &rho) in state
+        .s_history
+        .iter()
+        .zip(&state.y_history)
+        .zip(&state.rho_history)
+    {
+        validate_optimizer_buffer(s, numel)?;
+        validate_optimizer_buffer(y, numel)?;
+        let curvature = vector_dot(y, s);
+        // Match the acceptance threshold in push_history_pair. A finite but
+        // inconsistent reciprocal silently changes the next search direction,
+        // so validate the relation as well as the individual buffer values.
+        let reciprocal_error = (rho * curvature - 1.0).abs();
+        if !curvature.is_finite()
+            || curvature <= 1e-10
+            || !rho.is_finite()
+            || rho <= 0.0
+            || !reciprocal_error.is_finite()
+            || reciprocal_error > 16.0 * f64::EPSILON
+        {
+            return Err(optimizer_state_error(
+                "lbfgs state has invalid or inconsistent positive curvature",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn build_optimizer_state_dict(
     session: &FrankenTorchSession,
     params: &[TensorNodeId],
@@ -772,6 +871,9 @@ fn build_optimizer_state_dict(
         OptimizerState::Muon(state) => {
             validate_muon_state_metadata(&result.parameters, state.adjust_lr_fn)?;
             validate_muon_state_buffers(state, &sizes)?;
+        }
+        OptimizerState::Lbfgs(state) => {
+            validate_lbfgs_state_buffers(state, &result.parameters, &sizes)?;
         }
     }
     Ok(result)
@@ -3100,7 +3202,7 @@ fn vector_add_scaled(base: &[f64], direction: &[f64], scale: f64) -> Vec<f64> {
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LBFGSLineSearch {
     None,
     BacktrackingArmijo,
@@ -3714,6 +3816,62 @@ impl Optimizer for LBFGS {
 
     fn parameters(&self) -> &[TensorNodeId] {
         &self.params
+    }
+
+    fn state_dict(
+        &self,
+        session: &FrankenTorchSession,
+    ) -> Result<OptimizerStateDict, AutogradError> {
+        self.validate_hyperparams()?;
+        build_optimizer_state_dict(
+            session,
+            &self.params,
+            OptimizerState::Lbfgs(LbfgsState {
+                lr: self.lr,
+                max_iter: self.max_iter,
+                max_eval: self.max_eval,
+                tolerance_grad: self.tolerance_grad,
+                tolerance_change: self.tolerance_change,
+                history_size: self.history_size,
+                line_search_fn: self.line_search_fn,
+                s_history: self.s_history.clone(),
+                y_history: self.y_history.clone(),
+                rho_history: self.rho_history.clone(),
+                previous_params: self.previous_params.clone(),
+                previous_grad: self.previous_grad.clone(),
+            }),
+        )
+    }
+
+    fn load_state_dict(
+        &mut self,
+        session: &FrankenTorchSession,
+        state: &OptimizerStateDict,
+    ) -> Result<(), AutogradError> {
+        let sizes = validate_optimizer_state_targets(session, &self.params, state)?;
+        let OptimizerState::Lbfgs(saved) = &state.state else {
+            return Err(optimizer_state_error("optimizer state algorithm mismatch"));
+        };
+        validate_lbfgs_state_buffers(saved, &state.parameters, &sizes)?;
+        let mut restored = Self::new(self.params.clone(), saved.lr)
+            .max_iter(saved.max_iter)
+            .max_eval(saved.max_eval)
+            .tolerance_grad(saved.tolerance_grad)
+            .tolerance_change(saved.tolerance_change)
+            .history_size(saved.history_size)
+            .line_search_fn(saved.line_search_fn);
+        restored.validate_hyperparams()?;
+        restored.s_history.clone_from(&saved.s_history);
+        restored.y_history.clone_from(&saved.y_history);
+        restored.rho_history.clone_from(&saved.rho_history);
+        restored.previous_params.clone_from(&saved.previous_params);
+        restored.previous_grad.clone_from(&saved.previous_grad);
+        // Preserve the identity shared with GradScaler. Validation and all
+        // allocations precede the swap, leaving the live optimizer untouched
+        // when a malformed checkpoint is rejected.
+        std::mem::swap(&mut restored.identity, &mut self.identity);
+        *self = restored;
+        Ok(())
     }
 
     fn step(
@@ -8877,6 +9035,14 @@ mod tests {
                 OptimizerState::Adadelta(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::Rprop(state) => assert!(state.parameters[1].is_none()),
                 OptimizerState::Muon(state) => assert!(state.momentum_buffers[1].is_none()),
+                OptimizerState::Lbfgs(state) => {
+                    let first_numel = uninterrupted.tensor_numel(params[0]).unwrap();
+                    assert!(
+                        state.previous_grad.as_ref().unwrap()[first_numel..]
+                            .iter()
+                            .all(|&value| value == 0.0)
+                    );
+                }
             }
             let encoded = serde_json::to_vec(&saved).unwrap();
             let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
@@ -10372,6 +10538,7 @@ mod tests {
             Box::new(Adamax::new(vec![], 0.1)),
             Box::new(Adadelta::new(vec![], 0.1)),
             Box::new(Rprop::new(vec![], 0.1)),
+            Box::new(LBFGS::new(vec![], 0.1)),
         ];
         for optimizer in &mut optimizers {
             let state = optimizer.state_dict(&session).unwrap();
@@ -10392,9 +10559,8 @@ mod tests {
         restored.load_state_dict(&session, &state).unwrap();
         assert_eq!(restored.state_dict(&session).unwrap(), state);
         assert_eq!(restored.params, vec![second]);
-        let mut unsupported = LBFGS::new(vec![param], 0.1);
-        assert!(unsupported.state_dict(&session).is_err());
-        assert!(unsupported.load_state_dict(&session, &state).is_err());
+        let mut wrong_algorithm = LBFGS::new(vec![param], 0.1);
+        assert!(wrong_algorithm.load_state_dict(&session, &state).is_err());
     }
 
     #[test]
@@ -13859,6 +14025,291 @@ mod tests {
         Ok(value)
     }
 
+    fn lbfgs_weighted_quadratic_loss(
+        session: &mut FrankenTorchSession,
+        params: &[TensorNodeId],
+    ) -> Result<f64, AutogradError> {
+        session.tensor_zero_grads(params)?;
+        let mut value = 0.0;
+        let mut offset = 0usize;
+        for &param in params {
+            let shape = session.tensor_shape(param)?;
+            let weights: Vec<_> = (0..session.tensor_numel(param)?)
+                .map(|index| (offset + index + 1) as f64)
+                .collect();
+            offset += weights.len();
+            let weights = if session.tensor_dtype(param)? == ft_core::DType::F32 {
+                session.tensor_variable_f32(
+                    weights.into_iter().map(|value| value as f32).collect(),
+                    shape,
+                    false,
+                )?
+            } else {
+                session.tensor_variable(weights, shape, false)?
+            };
+            let square = session.tensor_mul(param, param)?;
+            let weighted = session.tensor_mul(square, weights)?;
+            let loss = session.tensor_sum(weighted)?;
+            value += session.tensor_item(loss)?;
+            session.tensor_backward(loss)?;
+        }
+        Ok(value)
+    }
+
+    #[test]
+    fn lbfgs_checkpoint_resumes_regular_steps_and_skipped_gradients_exactly() {
+        assert_optimizer_checkpoint_resume(|params, original| {
+            if original {
+                Box::new(
+                    LBFGS::new(params, 0.125)
+                        .max_iter(3)
+                        .max_eval(7)
+                        .history_size(2)
+                        .tolerance_grad(1e-9)
+                        .tolerance_change(1e-11)
+                        .line_search_fn(LBFGSLineSearch::BacktrackingArmijo),
+                )
+            } else {
+                Box::new(LBFGS::new(params, 0.9))
+            }
+        });
+    }
+
+    #[test]
+    fn lbfgs_checkpoint_resumes_closure_training_with_remapped_parameters() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for search in [
+                    LBFGSLineSearch::None,
+                    LBFGSLineSearch::BacktrackingArmijo,
+                    LBFGSLineSearch::StrongWolfe,
+                ] {
+                    let mut original = FrankenTorchSession::new(mode);
+                    let params: Vec<_> = [vec![1.25, -2.0], vec![0.75]]
+                        .into_iter()
+                        .map(|values| {
+                            let shape = vec![values.len()];
+                            if dtype == ft_core::DType::F32 {
+                                original
+                                    .tensor_variable_f32(
+                                        values.into_iter().map(|value| value as f32).collect(),
+                                        shape,
+                                        true,
+                                    )
+                                    .unwrap()
+                            } else {
+                                original.tensor_variable(values, shape, true).unwrap()
+                            }
+                        })
+                        .collect();
+                    let mut optimizer = LBFGS::new(params.clone(), 0.15)
+                        .max_iter(1)
+                        .max_eval(13)
+                        .history_size(3)
+                        .tolerance_grad(0.0)
+                        .tolerance_change(0.0)
+                        .line_search_fn(search);
+                    for _ in 0..3 {
+                        optimizer
+                            .step_with_closure(&mut original, &mut |session| {
+                                lbfgs_weighted_quadratic_loss(session, &params)
+                            })
+                            .unwrap();
+                    }
+                    assert_eq!(optimizer.s_history.len(), 3);
+                    let saved = optimizer.state_dict(&original).unwrap();
+                    let encoded = serde_json::to_vec(&saved).unwrap();
+                    let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(decoded, saved);
+
+                    let mut resumed = FrankenTorchSession::new(mode);
+                    resumed.tensor_variable(vec![99.0], vec![], false).unwrap();
+                    let remapped: Vec<_> = params
+                        .iter()
+                        .map(|&param| {
+                            resumed.tensor_variable_from_storage(
+                                original.tensor_snapshot(param).unwrap(),
+                                true,
+                            )
+                        })
+                        .collect();
+                    assert_ne!(params, remapped);
+                    let mut restored = LBFGS::new(remapped.clone(), 0.9);
+                    let identity = Arc::clone(&restored.identity().0);
+                    restored.load_state_dict(&resumed, &decoded).unwrap();
+                    assert!(Arc::ptr_eq(&identity, &restored.identity().0));
+                    assert_eq!(restored.parameters(), remapped);
+                    assert_eq!(restored.state_dict(&resumed).unwrap(), saved);
+                    let mut previous_loss =
+                        lbfgs_weighted_quadratic_loss(&mut original, &params).unwrap();
+                    for _ in 0..5 {
+                        let expected_loss = optimizer
+                            .step_with_closure(&mut original, &mut |session| {
+                                lbfgs_weighted_quadratic_loss(session, &params)
+                            })
+                            .unwrap();
+                        let actual_loss = restored
+                            .step_with_closure(&mut resumed, &mut |session| {
+                                lbfgs_weighted_quadratic_loss(session, &remapped)
+                            })
+                            .unwrap();
+                        assert_eq!(expected_loss.to_bits(), actual_loss.to_bits());
+                        assert!(actual_loss < previous_loss);
+                        previous_loss = actual_loss;
+                        let expected = optimizer.flatten_params(&original).unwrap();
+                        let actual = restored.flatten_params(&resumed).unwrap();
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            expected
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                        // An independent objective evaluation checks that both
+                        // continuations still solve the intended quadratic.
+                        let reference: f64 = actual
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| (index + 1) as f64 * value * value)
+                            .sum();
+                        let tolerance = if dtype == ft_core::DType::F32 {
+                            2e-6
+                        } else {
+                            1e-13
+                        };
+                        assert!((actual_loss - reference).abs() <= tolerance * reference.max(1.0));
+                        assert_eq!(
+                            restored.state_dict(&resumed).unwrap(),
+                            optimizer.state_dict(&original).unwrap()
+                        );
+                        assert_eq!(restored.s_history.len(), 3);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lbfgs_checkpoint_rejects_malformed_history_atomically() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session
+            .tensor_variable(vec![2.0, -1.0], vec![2], true)
+            .unwrap();
+        let mut optimizer = LBFGS::new(vec![param], 0.15)
+            .max_iter(1)
+            .history_size(2)
+            .line_search_fn(LBFGSLineSearch::None);
+        for _ in 0..2 {
+            optimizer
+                .step_with_closure(&mut session, &mut |session| {
+                    lbfgs_quadratic_loss(session, &[param])
+                })
+                .unwrap();
+        }
+        let before = optimizer.state_dict(&session).unwrap();
+        let values = session.tensor_values(param).unwrap();
+        let gradient = session.tensor_grad(param).unwrap();
+        let identity = Arc::clone(&optimizer.identity().0);
+        for case in 0..30 {
+            let mut invalid = before.clone();
+            match case {
+                0 => invalid.version += 1,
+                1 => invalid.parameters.clear(),
+                2 => invalid.parameters[0].shape = vec![1, 2],
+                3 => invalid.parameters[0].dtype = ft_core::DType::F32,
+                4 => invalid = SGD::new(vec![param], 0.1).state_dict(&session).unwrap(),
+                _ => {
+                    let OptimizerState::Lbfgs(saved) = &mut invalid.state else {
+                        unreachable!()
+                    };
+                    match case {
+                        5 => saved.lr = f64::NAN,
+                        6 => saved.max_iter = 0,
+                        7 => saved.max_eval = 0,
+                        8 => saved.tolerance_grad = -1.0,
+                        9 => saved.tolerance_change = f64::INFINITY,
+                        10 => saved.history_size = 0,
+                        11 => saved.history_size = 1,
+                        12 => saved.s_history.clear(),
+                        13 => saved.y_history.clear(),
+                        14 => saved.rho_history.clear(),
+                        15 => saved.s_history[0].clear(),
+                        16 => saved.y_history[0].push(0.0),
+                        17 => saved.s_history[0][0] = f64::NAN,
+                        18 => saved.y_history[0][0] = f64::INFINITY,
+                        19 => saved.rho_history[0] = f64::INFINITY,
+                        20 => saved.rho_history[0] = -saved.rho_history[0],
+                        21 => saved.rho_history[0] *= 2.0,
+                        22 => saved.y_history[0]
+                            .iter_mut()
+                            .for_each(|value| *value = -*value),
+                        23 => saved.s_history[0].fill(0.0),
+                        24 => saved.previous_params = None,
+                        25 => saved.previous_params.as_mut().unwrap().clear(),
+                        26 => saved.previous_grad.as_mut().unwrap().clear(),
+                        27 => saved.previous_params.as_mut().unwrap()[0] = f64::INFINITY,
+                        28 => saved.previous_grad.as_mut().unwrap()[0] = f64::NAN,
+                        29 => saved.lr = -1.0,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(
+                optimizer.load_state_dict(&session, &invalid).is_err(),
+                "malformed LBFGS state case {case}"
+            );
+            assert_eq!(optimizer.state_dict(&session).unwrap(), before);
+            assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+            assert_eq!(session.tensor_values(param).unwrap(), values);
+            assert_eq!(session.tensor_grad(param).unwrap(), gradient);
+        }
+        let mut json = serde_json::to_value(&before).unwrap();
+        json["state"]["Lbfgs"]["unexpected"] = true.into();
+        assert!(serde_json::from_value::<OptimizerStateDict>(json).is_err());
+        let mut json = serde_json::to_value(&before).unwrap();
+        json["state"]["Lbfgs"]["line_search_fn"] = "Unknown".into();
+        assert!(serde_json::from_value::<OptimizerStateDict>(json).is_err());
+    }
+
+    #[test]
+    fn lbfgs_checkpoint_preserves_no_gradient_and_empty_parameter_states() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Hardened);
+        let empty = session
+            .tensor_variable_f32(vec![], vec![0, 2], true)
+            .unwrap();
+        let param = session
+            .tensor_variable_f32(vec![2.0], vec![1], true)
+            .unwrap();
+        let mut optimizer = LBFGS::new(vec![param, empty], 0.15)
+            .max_iter(1)
+            .line_search_fn(LBFGSLineSearch::None);
+        let initial = optimizer.state_dict(&session).unwrap();
+        optimizer.load_state_dict(&session, &initial).unwrap();
+        optimizer
+            .step_with_closure(&mut session, &mut |session| {
+                lbfgs_quadratic_loss(session, &[param])
+            })
+            .unwrap();
+        session.tensor_requires_grad_(param, false).unwrap();
+        session.tensor_requires_grad_(param, true).unwrap();
+        optimizer
+            .step_with_closure(&mut session, &mut |_| Ok(0.0))
+            .unwrap();
+        assert_eq!(optimizer.s_history.len(), 1);
+        assert!(optimizer.previous_grad.is_none());
+        let saved = optimizer.state_dict(&session).unwrap();
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+        let mut restored = LBFGS::new(vec![param, empty], 0.7);
+        restored.load_state_dict(&session, &decoded).unwrap();
+        assert_eq!(restored.state_dict(&session).unwrap(), saved);
+        let half = session.tensor_to_dtype(param, ft_core::DType::F16).unwrap();
+        assert!(LBFGS::new(vec![half], 0.1).state_dict(&session).is_err());
+    }
+
     #[test]
     fn lbfgs_strong_wolfe_expands_and_zooms_within_evaluation_budget() {
         for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
@@ -14044,6 +14495,15 @@ mod tests {
         assert_eq!(session.tensor_values(x).unwrap(), vec![1.6]);
         assert_eq!(optimizer.previous_params, Some(vec![1.6]));
         assert_eq!(optimizer.s_history.len(), 1);
+        // A rejected trial is still a resumable step boundary: preserve the
+        // earlier accepted pair and do not replay it after restoration.
+        let saved = optimizer.state_dict(&session).unwrap();
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
+        let mut restored = LBFGS::new(vec![x], 0.9);
+        restored.load_state_dict(&session, &decoded).unwrap();
+        assert_eq!(restored.state_dict(&session).unwrap(), saved);
+        optimizer = restored;
         optimizer.max_iter = 1;
         optimizer
             .step_with_closure(&mut session, &mut |session| {
