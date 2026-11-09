@@ -536,9 +536,18 @@ pub enum SyntheticInput {
         /// Modifiers now held.
         modifiers: Modifiers,
     },
-    /// Activate the application and make the window key (true), or
-    /// deactivate the application (false).
+    /// Make the presenter's window key again (true), or make a second
+    /// window of this application key (false).
     Focus(bool),
+    /// Resize the window's content area to this many logical points, as a
+    /// user's resize ends: through `-[NSWindow setContentSize:]`, leaving the
+    /// drawable at its size until the next frame is presented.
+    Resize {
+        /// Content width in points, at least 1.
+        width: f64,
+        /// Content height in points, at least 1.
+        height: f64,
+    },
 }
 
 /// Failure to create, update, or present a native preview surface.
@@ -1564,6 +1573,20 @@ kernel void present_rgba8(
                     if let Some(decoy) = self.focus_decoy {
                         let _: () = msg_send![decoy.as_ptr(), orderOut:nil];
                     }
+                    return Ok(());
+                }
+                SyntheticInput::Resize { width, height } => {
+                    if !(width.is_finite() && height.is_finite() && *width >= 1.0 && *height >= 1.0)
+                    {
+                        return Err(PresentationError::Window(
+                            "a synthetic resize needs a finite size of at least one point",
+                        ));
+                    }
+                    let size = NativeSize {
+                        width: *width,
+                        height: *height,
+                    };
+                    let _: () = msg_send![window.as_ptr(), setContentSize:size];
                     return Ok(());
                 }
                 SyntheticInput::Focus(false) => {

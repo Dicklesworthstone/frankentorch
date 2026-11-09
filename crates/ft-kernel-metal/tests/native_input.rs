@@ -66,7 +66,7 @@ mod macos {
                 std::process::exit(1);
             }
         };
-        let cases: [Case; 10] = [
+        let cases: [Case; 11] = [
             ("initial_focus_and_geometry", initial_focus_and_geometry),
             (
                 "pointer_motion_is_logical_top_left",
@@ -91,6 +91,10 @@ mod macos {
                 poll_events_keeps_input_queued,
             ),
             ("resize_reports_new_geometry", resize_reports_new_geometry),
+            (
+                "a_user_resize_leaves_the_drawable",
+                a_user_resize_leaves_the_drawable,
+            ),
             (
                 "focus_loss_releases_held_buttons",
                 focus_loss_releases_held_buttons,
@@ -529,6 +533,44 @@ mod macos {
             Ok(())
         } else {
             Err(format!("resized geometry {metrics:?}"))
+        }
+    }
+
+    fn a_user_resize_leaves_the_drawable(presenter: &mut NativePresenter) -> Check {
+        post(
+            presenter,
+            SyntheticInput::Resize {
+                width: 360.0,
+                height: 225.0,
+            },
+        )?;
+        let events = until(
+            presenter,
+            Duration::from_secs(2),
+            |event| matches!(event, InputEvent::Resized(metrics) if close(metrics.logical_width, 360.0)),
+        )?;
+        let metrics = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                InputEvent::Resized(metrics) => Some(*metrics),
+                _ => None,
+            })
+            .ok_or("no Resized")?;
+        // The drawable is still the 400 x 250 of the last presenter resize.
+        if !(close(metrics.logical_height, 225.0)
+            && metrics.drawable_width == 400
+            && metrics.drawable_height == 250
+            && metrics.to_drawable(point(180.0, 90.0)) == Some([200.0, 100.0]))
+        {
+            return Err(format!("user-resized geometry {metrics:?}"));
+        }
+        match presenter.post_synthetic(&SyntheticInput::Resize {
+            width: 0.0,
+            height: 10.0,
+        }) {
+            Err(PresentationError::Window(_)) => Ok(()),
+            other => Err(format!("a zero-width resize gave {other:?}")),
         }
     }
 
