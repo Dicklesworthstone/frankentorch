@@ -48831,6 +48831,85 @@ pub fn bmm_tensor_contiguous_f32_into(
     Ok(())
 }
 
+/// One dense layer for each member of a population, every member with its own weights:
+/// `[B, 1, I] × [B, I, O] + [B, 1, O]`, serial, in a declared order of operations.
+///
+/// For each batch element `b` and output `o`,
+/// `out[b, o] = ((bias[b, o] + inputs[b, 0]·weights[b, 0, o]) + inputs[b, 1]·weights[b, 1, o]) + …`
+/// in f32: the bias first, then each input's product in ascending `i`, every product and every
+/// sum rounded once to f32. There is no fused multiply-add and no reassociation, so the result is
+/// that of the plain scalar loop, bit for bit, on every host. (The GEMM-backed
+/// [`bmm_tensor_contiguous_f32`] fuses multiply-adds and blocks over `k`, and adds no bias, so it
+/// is not this.)
+///
+/// Layouts are contiguous and row-major: `inputs` is `[B, I]`, `weights` is `[B, I, O]` (the
+/// right operand of the batched product, so the output loop walks contiguous memory), `bias` and
+/// `out` are `[B, O]`.
+///
+/// It runs on the calling thread only. It never touches a rayon pool, spawns no thread and
+/// allocates nothing. Batch elements are independent, so a caller that wants parallelism splits
+/// the batch across workers it owns and budgets itself, and the result does not depend on the
+/// split.
+///
+/// # Errors
+/// [`KernelError::ShapeOverflow`] if `batch · in_features · out_features` overflows `usize`;
+/// [`KernelError::ShapeMismatch`] if a slice is not exactly its operand's length, with `lhs` the
+/// expected shape and `rhs` the slice's length.
+pub fn population_affine_f32_into(
+    inputs: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    batch: usize,
+    in_features: usize,
+    out_features: usize,
+    out: &mut [f32],
+) -> Result<(), KernelError> {
+    let overflow = KernelError::ShapeOverflow {
+        context: "population_affine_f32_into",
+    };
+    let input_len = batch.checked_mul(in_features).ok_or(overflow.clone())?;
+    let weight_len = input_len
+        .checked_mul(out_features)
+        .ok_or(overflow.clone())?;
+    let output_len = batch.checked_mul(out_features).ok_or(overflow)?;
+    for (shape, expected, len) in [
+        (&[batch, in_features][..], input_len, inputs.len()),
+        (
+            &[batch, in_features, out_features][..],
+            weight_len,
+            weights.len(),
+        ),
+        (&[batch, out_features][..], output_len, bias.len()),
+        (&[batch, out_features][..], output_len, out.len()),
+    ] {
+        if len != expected {
+            return Err(KernelError::ShapeMismatch {
+                lhs: shape.to_vec(),
+                rhs: vec![len],
+            });
+        }
+    }
+    out.copy_from_slice(bias);
+    if in_features == 0 || out_features == 0 {
+        return Ok(());
+    }
+    for ((member_inputs, member_weights), member_out) in inputs
+        .chunks_exact(in_features)
+        .zip(weights.chunks_exact(in_features * out_features))
+        .zip(out.chunks_exact_mut(out_features))
+    {
+        for (&input, weight_row) in member_inputs
+            .iter()
+            .zip(member_weights.chunks_exact(out_features))
+        {
+            for (sum, &weight) in member_out.iter_mut().zip(weight_row) {
+                *sum += input * weight;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn trace_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f32, KernelError> {
     ensure_unary_layout_and_storage_f32(input, meta)?;
     if meta.shape().len() != 2 {
