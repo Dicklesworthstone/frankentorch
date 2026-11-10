@@ -29,10 +29,11 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use ft_kernel_metal::compute::Gateway;
+    use ft_kernel_metal::compute::{Gateway, SharedBuffer};
     use ft_kernel_metal::presentation::{
-        ButtonSet, InputEvent, LogicalPoint, Modifiers, NativePresenter, PointerButton,
-        PresentationConfig, PresentationError, PresentationState, ScrollUnit, SyntheticInput,
+        ButtonSet, InputEvent, LogicalPoint, Modifiers, NativePresenter, PixelDensity,
+        PointerButton, PresentationConfig, PresentationError, PresentationState, ScrollUnit,
+        SurfaceMetrics, SyntheticInput,
     };
     use std::time::{Duration, Instant};
 
@@ -110,6 +111,15 @@ mod macos {
                 }
             }
         }
+        match backing_density_keeps_the_window_and_fills_its_pixels(&mut presenter, &gateway) {
+            Ok(()) => println!("test backing_density_keeps_the_window_and_fills_its_pixels ... ok"),
+            Err(reason) => {
+                failed += 1;
+                println!(
+                    "test backing_density_keeps_the_window_and_fills_its_pixels ... FAILED: {reason}"
+                );
+            }
+        }
         let closing = closed_presenter_reports_closed(&mut presenter);
         match closing {
             Ok(()) => println!("test closed_presenter_reports_closed ... ok"),
@@ -118,7 +128,7 @@ mod macos {
                 println!("test closed_presenter_reports_closed ... FAILED: {reason}");
             }
         }
-        let total = cases.len() + 1;
+        let total = cases.len() + 2;
         println!(
             "test result: {}. {} passed; {failed} failed",
             if failed == 0 { "ok" } else { "FAILED" },
@@ -619,6 +629,128 @@ mod macos {
         until(presenter, Duration::from_secs(5), |event| {
             matches!(event, InputEvent::FocusGained)
         })?;
+        Ok(())
+    }
+
+    /// Pump every event posted so far, then read the geometry.
+    fn settled(presenter: &mut NativePresenter) -> Result<SurfaceMetrics, String> {
+        until_marker(presenter, KEY_SPACE)?;
+        presenter
+            .surface_metrics()
+            .map_err(|error| format!("surface metrics: {error}"))
+    }
+
+    fn present(
+        presenter: &mut NativePresenter,
+        frame: &SharedBuffer,
+        width: u32,
+        height: u32,
+    ) -> Check {
+        presenter
+            .present_rgba8(frame, width, height, width as usize * 4)
+            .map(|_| ())
+            .map_err(|error| format!("present {width} x {height}: {error}"))
+    }
+
+    fn contents_scale(presenter: &NativePresenter) -> Result<f64, String> {
+        presenter
+            .contents_scale()
+            .map_err(|error| format!("contents scale: {error}"))
+    }
+
+    /// The content area, in points, and the drawable, in pixels.
+    fn sizes(metrics: &SurfaceMetrics) -> ([f64; 2], [u32; 2]) {
+        (
+            [metrics.logical_width, metrics.logical_height],
+            [metrics.drawable_width, metrics.drawable_height],
+        )
+    }
+
+    fn backing_density_keeps_the_window_and_fills_its_pixels(
+        presenter: &mut NativePresenter,
+        gateway: &Gateway,
+    ) -> Check {
+        let before = settled(presenter)?;
+        let scale = before.backing_scale;
+        println!("native_input: backing scale {scale}");
+        if presenter.pixel_density() != PixelDensity::OnePerPoint
+            || contents_scale(presenter)? != 1.0
+        {
+            return Err(format!(
+                "the default density is {:?} at contentsScale {}",
+                presenter.pixel_density(),
+                contents_scale(presenter)?
+            ));
+        }
+        presenter
+            .set_pixel_density(PixelDensity::Backing)
+            .map_err(|error| format!("set_pixel_density: {error}"))?;
+        if presenter.pixel_density() != PixelDensity::Backing || contents_scale(presenter)? != scale
+        {
+            return Err(format!(
+                "backing density gave contentsScale {} on a {scale}x screen",
+                contents_scale(presenter)?
+            ));
+        }
+        let [width, height] = before
+            .backing_size()
+            .ok_or_else(|| format!("no backing size for {before:?}"))?;
+        let frame = gateway
+            .buffer_zeroed(width as usize * height as usize * 4)
+            .map_err(|error| format!("frame buffer: {error}"))?;
+
+        // A frame at the backing size fills the window without moving it.
+        present(presenter, &frame, width, height)?;
+        let shown = settled(presenter)?;
+        let points = [before.logical_width, before.logical_height];
+        if sizes(&shown) != (points, [width, height])
+            || shown.to_drawable(point(180.0, 90.0)) != Some([180.0 * scale, 90.0 * scale])
+            || contents_scale(presenter)? != scale
+        {
+            return Err(format!(
+                "a {width} x {height} frame at backing density moved the window: {before:?} -> {shown:?}"
+            ));
+        }
+
+        // A host resize moves the content area; the drawable waits for the
+        // next frame.
+        presenter
+            .resize(300, 200)
+            .map_err(|error| format!("resize: {error}"))?;
+        let resized = settled(presenter)?;
+        if sizes(&resized) != ([300.0, 200.0], [width, height]) {
+            return Err(format!("a resize at backing density gave {resized:?}"));
+        }
+        let [width, height] = resized
+            .backing_size()
+            .ok_or_else(|| format!("no backing size for {resized:?}"))?;
+        present(presenter, &frame, width, height)?;
+        let followed = settled(presenter)?;
+        if sizes(&followed) != ([300.0, 200.0], [width, height]) {
+            return Err(format!("the next frame after the resize gave {followed:?}"));
+        }
+
+        // Back to one pixel per point: the window takes the drawable's size
+        // in points, and each frame sizes it again.
+        presenter
+            .set_pixel_density(PixelDensity::OnePerPoint)
+            .map_err(|error| format!("set_pixel_density: {error}"))?;
+        let back = settled(presenter)?;
+        if sizes(&back) != ([f64::from(width), f64::from(height)], [width, height])
+            || contents_scale(presenter)? != 1.0
+        {
+            return Err(format!(
+                "returning to one pixel per point gave {back:?} at contentsScale {}",
+                contents_scale(presenter)?
+            ));
+        }
+        present(presenter, &frame, 320, 200)?;
+        let again = settled(presenter)?;
+        if sizes(&again) != ([320.0, 200.0], [320, 200]) {
+            return Err(format!(
+                "a 320 x 200 frame at one pixel per point gave {again:?}"
+            ));
+        }
         Ok(())
     }
 

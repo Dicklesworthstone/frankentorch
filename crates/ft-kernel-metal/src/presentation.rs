@@ -22,6 +22,15 @@
 //! `NativePresenter::post_synthetic` posts real AppKit events into the
 //! application queue, so a dependent's test exercises the same dispatch and
 //! translation path as a user.
+//!
+//! # Pixel density
+//!
+//! By default a presented frame has one pixel per point, and the window
+//! takes the frame's size. With
+//! [`PixelDensity::Backing`](crate::presentation::PixelDensity::Backing) the
+//! window keeps its size in points and a host renders
+//! [`SurfaceMetrics::backing_size`](crate::presentation::SurfaceMetrics::backing_size)
+//! pixels, one per device pixel on a high-DPI screen.
 
 pub use crate::CommandBufferState;
 use crate::compute::{Gateway, SharedBuffer};
@@ -31,9 +40,9 @@ use std::fmt;
 /// Native preview-window configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresentationConfig {
-    /// Initial drawable width in pixels.
+    /// Initial drawable width in pixels, and content-area width in points.
     pub width: u32,
-    /// Initial drawable height in pixels.
+    /// Initial drawable height in pixels, and content-area height in points.
     pub height: u32,
     /// Window title.
     pub title: String,
@@ -258,13 +267,31 @@ pub enum ScrollUnit {
     Lines,
 }
 
+/// How a presented frame's pixels relate to the window's points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PixelDensity {
+    /// One drawable pixel per point, the default. Presenting a `W × H`
+    /// frame sizes the content area to `W × H` points and the layer's
+    /// `contentsScale` is 1, so on a 2× screen the compositor stretches each
+    /// drawable pixel over four device pixels.
+    #[default]
+    OnePerPoint,
+    /// The screen's own density. Presenting never resizes the window: the
+    /// content area keeps its size in points (the user can still resize
+    /// it), the drawable takes each frame's pixel size, and the layer's
+    /// `contentsScale` follows the window's backing scale. A frame of
+    /// [`SurfaceMetrics::backing_size`] pixels then puts one drawable pixel
+    /// on each device pixel.
+    Backing,
+}
+
 /// Geometry of the presentation surface.
 ///
 /// A [`LogicalPoint`] maps to the drawable by the ratio of drawable pixels
-/// to logical points on each axis. The presenter keeps its layer's
-/// `contentsScale` at 1, so that ratio is 1 until the window is resized and
-/// the next frame is presented at the new size; `backing_scale` is the
-/// screen's own pixel density, for a host that wants to render denser.
+/// to logical points on each axis. At [`PixelDensity::OnePerPoint`] that
+/// ratio is 1 until the window is resized and the next frame is presented
+/// at the new size. At [`PixelDensity::Backing`] it is `backing_scale` once
+/// a frame of [`Self::backing_size`] is presented.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceMetrics {
     /// Content-area width in logical points.
@@ -292,6 +319,22 @@ impl SurfaceMetrics {
             point.x * f64::from(self.drawable_width) / self.logical_width,
             point.y * f64::from(self.drawable_height) / self.logical_height,
         ])
+    }
+
+    /// The frame size, in pixels, that covers the content area at the
+    /// screen's density: each logical length times `backing_scale`, rounded
+    /// to the nearest pixel. `None` while the content area or the scale is
+    /// empty or not finite, or when a length would round below one pixel or
+    /// past `u32::MAX`.
+    #[must_use]
+    pub fn backing_size(&self) -> Option<[u32; 2]> {
+        // A zero, negative or non-finite length or scale fails here too.
+        let pixels = |points: f64| {
+            let pixels = (points * self.backing_scale).round();
+            (pixels.is_finite() && pixels >= 1.0 && pixels <= f64::from(u32::MAX))
+                .then_some(pixels as u32)
+        };
+        Some([pixels(self.logical_width)?, pixels(self.logical_height)?])
     }
 }
 
@@ -669,7 +712,7 @@ mod imp {
     use super::SyntheticInput;
     use super::{
         ButtonSet, CommandBufferState, Gateway, INPUT_QUEUE_CAPACITY, InputEvent, InputQueue,
-        LogicalPoint, Modifiers, PointerButton, PresentOutcome, PresentationConfig,
+        LogicalPoint, Modifiers, PixelDensity, PointerButton, PresentOutcome, PresentationConfig,
         PresentationError, PresentationPipelineInfo, PresentationState, ScrollUnit, SharedBuffer,
         SurfaceMetrics, required_source_bytes, validate_dimensions,
     };
@@ -824,8 +867,10 @@ kernel void present_rgba8(
         gateway: Gateway,
         pipeline: ComputePipelineState,
         pipeline_info: PresentationPipelineInfo,
+        /// The drawable's size in pixels.
         width: u32,
         height: u32,
+        density: PixelDensity,
         closed: bool,
         input: InputQueue,
         buttons: ButtonSet,
@@ -922,6 +967,7 @@ kernel void present_rgba8(
                     pipeline_info,
                     width: config.width,
                     height: config.height,
+                    density: PixelDensity::OnePerPoint,
                     closed: false,
                     input: InputQueue::new(INPUT_QUEUE_CAPACITY),
                     buttons: ButtonSet::EMPTY,
@@ -1007,6 +1053,60 @@ kernel void present_rgba8(
             })
         }
 
+        /// Choose how presented frames map to the window (see
+        /// [`PixelDensity`]). Moving to [`PixelDensity::Backing`] sets the
+        /// layer's `contentsScale` to the window's backing scale at once.
+        /// Moving back to [`PixelDensity::OnePerPoint`] sets it to 1 and
+        /// sizes the content area to the drawable, one point per pixel.
+        /// Repeating the current density is a no-op.
+        pub fn set_pixel_density(
+            &mut self,
+            density: PixelDensity,
+        ) -> Result<(), PresentationError> {
+            require_main_thread()?;
+            if self.closed {
+                return Err(PresentationError::Closed);
+            }
+            if self.density == density {
+                return Ok(());
+            }
+            autoreleasepool(|| unsafe {
+                let window = self.window.ok_or(PresentationError::Closed)?;
+                match density {
+                    PixelDensity::Backing => {
+                        let scale: f64 = msg_send![window.as_ptr(), backingScaleFactor];
+                        self.layer.set_contents_scale(scale);
+                    }
+                    PixelDensity::OnePerPoint => {
+                        self.layer.set_contents_scale(1.0);
+                        let size = NativeSize {
+                            width: f64::from(self.width),
+                            height: f64::from(self.height),
+                        };
+                        let _: () = msg_send![window.as_ptr(), setContentSize:size];
+                    }
+                }
+                self.density = density;
+                Ok(())
+            })
+        }
+
+        /// How presented frames map to the window.
+        pub fn pixel_density(&self) -> PixelDensity {
+            self.density
+        }
+
+        /// The layer's `contentsScale`: 1 at [`PixelDensity::OnePerPoint`],
+        /// and at [`PixelDensity::Backing`] the window's backing scale as of
+        /// the last event pump.
+        pub fn contents_scale(&self) -> Result<f64, PresentationError> {
+            require_main_thread()?;
+            if self.closed {
+                return Err(PresentationError::Closed);
+            }
+            Ok(self.layer.contents_scale())
+        }
+
         /// Post one real AppKit event for this window into the application
         /// queue (test seam; see [`SyntheticInput`]). It is translated by the
         /// next poll, exactly like user input.
@@ -1019,7 +1119,10 @@ kernel void present_rgba8(
             autoreleasepool(|| unsafe { self.post_synthetic_inner(input) })
         }
 
-        /// Resize the window content and drawable. Repeating the same size is a
+        /// Resize the window's content area to `width × height` points. At
+        /// [`PixelDensity::OnePerPoint`] the drawable takes the same size in
+        /// pixels at once; at [`PixelDensity::Backing`] it keeps its size
+        /// until the next frame is presented. Repeating the same size is a
         /// no-op.
         pub fn resize(&mut self, width: u32, height: u32) -> Result<(), PresentationError> {
             require_main_thread()?;
@@ -1027,7 +1130,10 @@ kernel void present_rgba8(
             if self.closed {
                 return Err(PresentationError::Closed);
             }
-            if self.width == width && self.height == height {
+            if self.density == PixelDensity::OnePerPoint
+                && self.width == width
+                && self.height == height
+            {
                 return Ok(());
             }
             autoreleasepool(|| unsafe {
@@ -1036,20 +1142,46 @@ kernel void present_rgba8(
                     width: f64::from(width),
                     height: f64::from(height),
                 };
-                let _: () = msg_send![window.as_ptr(), setContentSize:size];
-                self.layer
-                    .set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
-                self.width = width;
-                self.height = height;
+                match self.density {
+                    PixelDensity::OnePerPoint => {
+                        let _: () = msg_send![window.as_ptr(), setContentSize:size];
+                        self.set_drawable(width, height);
+                    }
+                    PixelDensity::Backing => {
+                        let view: *mut Object = msg_send![window.as_ptr(), contentView];
+                        let unchanged = !view.is_null() && {
+                            let bounds: NativeRect = msg_send![view, bounds];
+                            bounds.size.width == size.width && bounds.size.height == size.height
+                        };
+                        if !unchanged {
+                            let _: () = msg_send![window.as_ptr(), setContentSize:size];
+                        }
+                    }
+                }
                 Ok(())
             })
+        }
+
+        /// Give the layer's drawable `width × height` pixels, if it has
+        /// another size.
+        fn set_drawable(&mut self, width: u32, height: u32) {
+            if self.width == width && self.height == height {
+                return;
+            }
+            self.layer
+                .set_drawable_size(CGSize::new(f64::from(width), f64::from(height)));
+            self.width = width;
+            self.height = height;
         }
 
         /// Present packed RGBA8 pixels directly from a Metal shared buffer.
         ///
         /// `stride` is measured in bytes. Padding after each row is permitted.
         /// The source remains GPU-visible throughout; the only per-frame CPU
-        /// values are the three integer layout parameters.
+        /// values are the three integer layout parameters. The drawable takes
+        /// the frame's size; at [`PixelDensity::OnePerPoint`] the content
+        /// area does too, in points, and at [`PixelDensity::Backing`] it keeps
+        /// its size.
         pub fn present_rgba8(
             &mut self,
             source: &SharedBuffer,
@@ -1062,7 +1194,10 @@ kernel void present_rgba8(
             if self.closed {
                 return Err(PresentationError::Closed);
             }
-            self.resize(width, height)?;
+            match self.density {
+                PixelDensity::OnePerPoint => self.resize(width, height)?,
+                PixelDensity::Backing => autoreleasepool(|| self.set_drawable(width, height)),
+            }
 
             autoreleasepool(|| unsafe {
                 self.pump_events();
@@ -1318,6 +1453,12 @@ kernel void present_rgba8(
             if let Some(metrics) = unsafe { self.read_metrics() }
                 && self.metrics != Some(metrics)
             {
+                // The window may have moved to a screen of another density.
+                if self.density == PixelDensity::Backing
+                    && self.layer.contents_scale() != metrics.backing_scale
+                {
+                    self.layer.set_contents_scale(metrics.backing_scale);
+                }
                 self.input.push(InputEvent::Resized(metrics));
                 self.metrics = Some(metrics);
             }
@@ -1787,7 +1928,7 @@ mod imp {
     #[cfg(feature = "synthetic-input")]
     use super::SyntheticInput;
     use super::{
-        Gateway, InputEvent, PresentOutcome, PresentationConfig, PresentationError,
+        Gateway, InputEvent, PixelDensity, PresentOutcome, PresentationConfig, PresentationError,
         PresentationPipelineInfo, PresentationState, SharedBuffer, SurfaceMetrics,
     };
 
@@ -1844,6 +1985,24 @@ mod imp {
 
         /// Unreachable off macOS.
         pub fn set_resizable(&mut self, _resizable: bool) -> Result<(), PresentationError> {
+            Err(PresentationError::Unavailable)
+        }
+
+        /// Unreachable off macOS.
+        pub fn set_pixel_density(
+            &mut self,
+            _density: PixelDensity,
+        ) -> Result<(), PresentationError> {
+            Err(PresentationError::Unavailable)
+        }
+
+        /// Unreachable off macOS.
+        pub fn pixel_density(&self) -> PixelDensity {
+            PixelDensity::OnePerPoint
+        }
+
+        /// Unreachable off macOS.
+        pub fn contents_scale(&self) -> Result<f64, PresentationError> {
             Err(PresentationError::Unavailable)
         }
 
@@ -2068,6 +2227,86 @@ mod tests {
             ..metrics
         };
         assert_eq!(empty.to_drawable(LogicalPoint { x: 1.0, y: 1.0 }), None);
+    }
+
+    #[test]
+    fn the_backing_size_covers_the_content_area_at_the_screen_density() {
+        let metrics = SurfaceMetrics {
+            logical_width: 400.0,
+            logical_height: 250.0,
+            backing_scale: 2.0,
+            drawable_width: 400,
+            drawable_height: 250,
+        };
+        assert_eq!(metrics.backing_size(), Some([800, 500]));
+        // Presented at that size, a logical point lands on its device pixel.
+        let presented = SurfaceMetrics {
+            drawable_width: 800,
+            drawable_height: 500,
+            ..metrics
+        };
+        assert_eq!(
+            presented.to_drawable(LogicalPoint { x: 100.25, y: 30.5 }),
+            Some([200.5, 61.0])
+        );
+        // Fractional lengths round to the nearest pixel: 150.75 up, 150.3
+        // down.
+        let fractional = SurfaceMetrics {
+            logical_width: 100.5,
+            logical_height: 100.2,
+            backing_scale: 1.5,
+            ..metrics
+        };
+        assert_eq!(fractional.backing_size(), Some([151, 150]));
+        assert_eq!(
+            SurfaceMetrics {
+                backing_scale: 1.0,
+                ..metrics
+            }
+            .backing_size(),
+            Some([400, 250])
+        );
+        for broken in [
+            SurfaceMetrics {
+                logical_width: 0.0,
+                ..metrics
+            },
+            SurfaceMetrics {
+                logical_height: 0.2,
+                ..metrics
+            },
+            SurfaceMetrics {
+                logical_width: f64::NAN,
+                ..metrics
+            },
+            SurfaceMetrics {
+                backing_scale: 0.0,
+                ..metrics
+            },
+            SurfaceMetrics {
+                backing_scale: f64::INFINITY,
+                ..metrics
+            },
+            SurfaceMetrics {
+                backing_scale: -2.0,
+                ..metrics
+            },
+            SurfaceMetrics {
+                backing_scale: f64::NAN,
+                ..metrics
+            },
+            SurfaceMetrics {
+                logical_width: 3.0e9,
+                ..metrics
+            },
+        ] {
+            assert_eq!(broken.backing_size(), None, "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn one_pixel_per_point_is_the_default_density() {
+        assert_eq!(PixelDensity::default(), PixelDensity::OnePerPoint);
     }
 
     #[cfg(not(target_os = "macos"))]
