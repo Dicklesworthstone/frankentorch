@@ -108631,13 +108631,8 @@ mod tests {
                 for route in 0..4 {
                     for create_graph in [false, true] {
                         let mut session = FrankenTorchSession::new(mode);
-                        let input = probability_bce_tensor(
-                            &mut session,
-                            &[0.0; 4],
-                            vec![4],
-                            dtype,
-                            true,
-                        );
+                        let input =
+                            probability_bce_tensor(&mut session, &[0.0; 4], vec![4], dtype, true);
                         let target = probability_bce_tensor(
                             &mut session,
                             &[0.0, 0.25, 0.75, 1.0],
