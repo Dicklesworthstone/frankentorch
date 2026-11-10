@@ -61870,32 +61870,7 @@ impl FrankenTorchSession {
         logits: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // max(x, 0) = relu(x)
-        let relu_x = self.tensor_relu(logits)?;
-
-        // x * y
-        let x_times_y = self.tensor_mul(logits, target)?;
-
-        // |x|
-        let abs_x = self.tensor_abs(logits)?;
-
-        // -|x|
-        let neg_abs_x = self.tensor_neg(abs_x)?;
-
-        // exp(-|x|)
-        let exp_neg_abs = self.tensor_exp(neg_abs_x)?;
-
-        // log1p(exp(-|x|)) = log(1 + exp(-|x|))
-        let log_term = self.tensor_log1p(exp_neg_abs)?;
-
-        // relu(x) - x * y
-        let diff = self.tensor_sub(relu_x, x_times_y)?;
-
-        // relu(x) - x * y + log1p(exp(-|x|))
-        let elementwise = self.tensor_add(diff, log_term)?;
-
-        // mean reduction
-        self.tensor_mean(elementwise)
+        self.tensor_bce_with_logits_loss(logits, target, "mean")
     }
 
     /// Smooth L1 (Huber) loss:
@@ -108645,6 +108620,58 @@ mod tests {
             vals[0]
         );
         assert_eq!(vals[0], 0.0);
+    }
+
+    #[test]
+    fn bce_logits_shortcuts_use_logistic_gradient_at_zero() {
+        // d BCE(x, y)/dx = sigmoid(x) - y. ReLU's derivative at zero
+        // cannot replace the half-gradient of max(x, 0) in this identity.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for route in 0..4 {
+                    for create_graph in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let input = probability_bce_tensor(
+                            &mut session,
+                            &[0.0; 4],
+                            vec![4],
+                            dtype,
+                            true,
+                        );
+                        let target = probability_bce_tensor(
+                            &mut session,
+                            &[0.0, 0.25, 0.75, 1.0],
+                            vec![4],
+                            dtype,
+                            false,
+                        );
+                        let loss = match route {
+                            0 => session.bce_with_logits_loss(input, target),
+                            1 => session.bce_with_logits_simple(input, target),
+                            2 => session.bce_logits_loss(input, target),
+                            _ => session.functional_bce_with_logits_loss(input, target, "mean"),
+                        }
+                        .unwrap();
+                        assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                        assert_probability_bce_close(
+                            &session.tensor_values_lossy_f64(loss).unwrap(),
+                            &[std::f64::consts::LN_2],
+                            1e-7,
+                        );
+                        let report = session
+                            .tensor_backward_with_options(
+                                loss,
+                                BackwardOptions::for_mode(mode).with_create_graph(create_graph),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            report.gradient(input).unwrap(),
+                            &[0.125, 0.0625, -0.0625, -0.125],
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
