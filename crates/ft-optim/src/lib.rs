@@ -966,68 +966,6 @@ fn ensure_state_len(
     Ok(())
 }
 
-/// Decode a state-dict field that must survive the f64 round trip exactly.
-///
-/// Deliberately strict: `usize::MAX` (2^64-1) is not representable in f64 and
-/// rounds up to 2^64, so `(usize::MAX as f64) + 1.0` is that same f64 and acts
-/// as an inclusive rejection of the saturating-cast boundary. Decoding 2^64
-/// with an `as` cast would silently yield `usize::MAX`, losing a unit, so it is
-/// refused here. Counters that should clamp rather than be refused use
-/// [`decode_saturating_usize_field`].
-fn decode_exact_usize_field(value: f64, min: usize) -> Option<usize> {
-    let upper_exclusive = (usize::MAX as f64) + 1.0;
-    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value >= upper_exclusive {
-        return None;
-    }
-    let decoded = value as usize;
-    if decoded < min || decoded as f64 != value {
-        return None;
-    }
-    Some(decoded)
-}
-
-/// Decode a monotonic counter field, clamping instead of refusing.
-///
-/// `state_dict` encodes counters as `usize as f64`, which is lossy above 2^53
-/// and rounds `usize::MAX` up to 2^64. Round-tripping such a state dict through
-/// [`decode_exact_usize_field`] would refuse the value and silently leave the
-/// counter at its default, so a saved run near the counter ceiling would resume
-/// from zero. For a counter that is only ever advanced with `saturating_add`,
-/// clamping a too-large encoding to `usize::MAX` preserves the intended
-/// saturation semantics. Non-integral, negative, or non-finite values are still
-/// refused.
-fn decode_saturating_usize_field(value: f64, min: usize) -> Option<usize> {
-    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 {
-        return None;
-    }
-    let decoded = if value >= usize::MAX as f64 {
-        usize::MAX
-    } else {
-        value as usize
-    };
-    if decoded < min {
-        return None;
-    }
-    Some(decoded)
-}
-
-fn decode_exact_i64_field(value: f64, min: i64) -> Option<i64> {
-    let lower_inclusive = i64::MIN as f64;
-    let upper_exclusive = (i64::MAX as f64) + 1.0;
-    if !value.is_finite()
-        || value.fract() != 0.0
-        || value < lower_inclusive
-        || value >= upper_exclusive
-    {
-        return None;
-    }
-    let decoded = value as i64;
-    if decoded < min || decoded as f64 != value {
-        return None;
-    }
-    Some(decoded)
-}
-
 fn powi_exponent_saturating(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
@@ -3933,15 +3871,386 @@ impl Optimizer for LBFGS {
 // Learning Rate Schedulers
 // ---------------------------------------------------------------------------
 
-/// Serializable scheduler state for save/restore.
-#[derive(Debug, Clone, PartialEq)]
+/// Version of the portable learning-rate scheduler checkpoint format.
+pub const SCHEDULER_STATE_VERSION: u32 = 1;
+
+/// Portable scheduler state, including the complete child tree of a composite.
+///
+/// Save this alongside the optimizer state at a step boundary. Restore the
+/// optimizer first and then load this state into the same scheduler kinds and
+/// child ordering. Loading does not advance the schedule or change the optimizer:
+/// its checkpoint already contains the learning rate and momentum for that step.
+/// Integer clocks and periods are serialized as integers, never through f64.
+/// Enable serde_json's `float_roundtrip` feature for bit-exact floating-point
+/// continuation when storing these checkpoints as JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerState {
+    pub version: u32,
     /// Current epoch (0-based after first step()).
     pub last_epoch: i64,
     /// Per-param-group learning rates after the last step().
     pub last_lrs: Vec<f64>,
-    /// Scheduler-specific extra state.
-    pub extra: Vec<(String, f64)>,
+    pub config: SchedulerConfig,
+}
+
+/// Algorithm-specific scheduler configuration and progress.
+///
+/// Rust functions are not serializable. LambdaLR and MultiplicativeLR retain
+/// the callable supplied to the destination constructor; supply the same
+/// function when resuming, including any external state it depends on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SchedulerConfig {
+    StepLR {
+        initial_lr: f64,
+        step_size: usize,
+        gamma: f64,
+        verbose: bool,
+    },
+    MultiStepLR {
+        initial_lr: f64,
+        milestones: Vec<usize>,
+        gamma: f64,
+        verbose: bool,
+    },
+    CosineAnnealingLR {
+        initial_lr: f64,
+        t_max: usize,
+        eta_min: f64,
+        verbose: bool,
+    },
+    CosineAnnealingWarmRestarts {
+        initial_lr: f64,
+        t_0: usize,
+        t_mult: usize,
+        eta_min: f64,
+        t_cur: i64,
+        t_i: usize,
+        verbose: bool,
+    },
+    ExponentialLR {
+        initial_lr: f64,
+        gamma: f64,
+        verbose: bool,
+    },
+    LinearLR {
+        initial_lr: f64,
+        start_factor: f64,
+        end_factor: f64,
+        total_iters: usize,
+        verbose: bool,
+    },
+    ReduceLROnPlateau {
+        mode: PlateauMode,
+        factor: f64,
+        patience: usize,
+        threshold: f64,
+        threshold_mode: ThresholdMode,
+        cooldown: usize,
+        min_lr: f64,
+        eps: f64,
+        best: SchedulerMetric,
+        num_bad_epochs: usize,
+        cooldown_counter: usize,
+        initialized: bool,
+        verbose: bool,
+    },
+    LambdaLR {
+        initial_lr: f64,
+        verbose: bool,
+    },
+    SequentialLR {
+        milestones: Vec<usize>,
+        schedulers: Vec<SchedulerState>,
+    },
+    ChainedScheduler {
+        base_lr: f64,
+        schedulers: Vec<SchedulerState>,
+    },
+    OneCycleLR {
+        max_lr: f64,
+        total_steps: usize,
+        pct_start: f64,
+        anneal_strategy: OneCycleAnnealStrategy,
+        cycle_momentum: bool,
+        base_momentum: f64,
+        max_momentum: f64,
+        div_factor: f64,
+        final_div_factor: f64,
+        three_phase: bool,
+        last_momentum: Option<f64>,
+        verbose: bool,
+    },
+    PolynomialLR {
+        initial_lr: f64,
+        total_iters: usize,
+        power: f64,
+    },
+    ConstantLR {
+        initial_lr: f64,
+        factor: f64,
+        total_iters: usize,
+    },
+    MultiplicativeLR {
+        initial_lr: f64,
+    },
+    CyclicLR {
+        base_lr: f64,
+        max_lr: f64,
+        step_size_up: usize,
+        step_size_down: usize,
+        mode: CyclicLRMode,
+        iteration: usize,
+    },
+}
+
+/// Metric values can legitimately be nonfinite; encode them explicitly so a
+/// JSON round-trip never silently turns NaN or infinity into null.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SchedulerMetric {
+    Finite(f64),
+    PositiveInfinity,
+    NegativeInfinity,
+    NotANumber,
+}
+
+impl SchedulerMetric {
+    fn from_value(value: f64) -> Self {
+        if value.is_nan() {
+            Self::NotANumber
+        } else if value == f64::INFINITY {
+            Self::PositiveInfinity
+        } else if value == f64::NEG_INFINITY {
+            Self::NegativeInfinity
+        } else {
+            Self::Finite(value)
+        }
+    }
+
+    fn value(self) -> f64 {
+        match self {
+            Self::Finite(value) => value,
+            Self::PositiveInfinity => f64::INFINITY,
+            Self::NegativeInfinity => f64::NEG_INFINITY,
+            Self::NotANumber => f64::NAN,
+        }
+    }
+}
+
+impl SchedulerState {
+    fn validate_for(&self, target: &Self) -> Result<(), AutogradError> {
+        self.validate_for_at_depth(target, 0)
+    }
+
+    fn validate_for_at_depth(&self, target: &Self, depth: usize) -> Result<(), AutogradError> {
+        let invalid = || optimizer_state_error("invalid scheduler checkpoint");
+        if depth > 64
+            || self.version != SCHEDULER_STATE_VERSION
+            || self.last_epoch < -1
+            || self.last_lrs.len() != 1
+            || self.last_lrs.iter().any(|lr| !lr.is_finite() || *lr < 0.0)
+            || std::mem::discriminant(&self.config) != std::mem::discriminant(&target.config)
+        {
+            return Err(invalid());
+        }
+        let nonnegative = |values: &[f64]| {
+            if values
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        };
+        let children = |states: &[Self], targets: &[Self]| {
+            if states.is_empty() || states.len() != targets.len() {
+                return Err(invalid());
+            }
+            for (state, target) in states.iter().zip(targets) {
+                state.validate_for_at_depth(target, depth + 1)?;
+            }
+            Ok(())
+        };
+        match &self.config {
+            SchedulerConfig::StepLR {
+                initial_lr,
+                step_size,
+                gamma,
+                ..
+            } => {
+                nonnegative(&[*initial_lr, *gamma])?;
+                if *step_size == 0 {
+                    return Err(invalid());
+                }
+            }
+            SchedulerConfig::MultiStepLR {
+                initial_lr,
+                milestones,
+                gamma,
+                ..
+            } => {
+                nonnegative(&[*initial_lr, *gamma])?;
+                if !milestones.is_sorted() {
+                    return Err(invalid());
+                }
+            }
+            SchedulerConfig::CosineAnnealingLR {
+                initial_lr,
+                t_max,
+                eta_min,
+                ..
+            } => {
+                nonnegative(&[*initial_lr, *eta_min])?;
+                if *t_max == 0 {
+                    return Err(invalid());
+                }
+            }
+            SchedulerConfig::CosineAnnealingWarmRestarts {
+                initial_lr,
+                t_0,
+                t_mult,
+                eta_min,
+                t_cur,
+                t_i,
+                ..
+            } => {
+                nonnegative(&[*initial_lr, *eta_min])?;
+                if *t_0 == 0
+                    || *t_mult == 0
+                    || *t_i == 0
+                    || *t_cur < -1
+                    || (*t_cur >= 0 && *t_cur as usize >= *t_i)
+                {
+                    return Err(invalid());
+                }
+            }
+            SchedulerConfig::ExponentialLR {
+                initial_lr, gamma, ..
+            } => {
+                nonnegative(&[*initial_lr, *gamma])?;
+            }
+            SchedulerConfig::LinearLR {
+                initial_lr,
+                start_factor,
+                end_factor,
+                ..
+            } => {
+                nonnegative(&[*initial_lr, *start_factor, *end_factor])?;
+            }
+            SchedulerConfig::ReduceLROnPlateau {
+                factor,
+                threshold,
+                min_lr,
+                eps,
+                best,
+                cooldown,
+                cooldown_counter,
+                ..
+            } => {
+                nonnegative(&[*factor, *threshold, *min_lr, *eps])?;
+                if *cooldown_counter > *cooldown
+                    || matches!(best, SchedulerMetric::Finite(value) if !value.is_finite())
+                {
+                    return Err(invalid());
+                }
+            }
+            SchedulerConfig::LambdaLR { initial_lr, .. }
+            | SchedulerConfig::MultiplicativeLR { initial_lr } => {
+                nonnegative(&[*initial_lr])?;
+            }
+            SchedulerConfig::SequentialLR {
+                milestones,
+                schedulers,
+            } => {
+                let SchedulerConfig::SequentialLR {
+                    schedulers: targets,
+                    ..
+                } = &target.config
+                else {
+                    return Err(invalid());
+                };
+                if milestones.len().checked_add(1) != Some(schedulers.len())
+                    || !milestones.is_sorted()
+                    || milestones.iter().any(|&epoch| epoch > i64::MAX as usize)
+                {
+                    return Err(invalid());
+                }
+                children(schedulers, targets)?;
+            }
+            SchedulerConfig::ChainedScheduler {
+                base_lr,
+                schedulers,
+            } => {
+                nonnegative(&[*base_lr])?;
+                let SchedulerConfig::ChainedScheduler {
+                    schedulers: targets,
+                    ..
+                } = &target.config
+                else {
+                    return Err(invalid());
+                };
+                children(schedulers, targets)?;
+            }
+            SchedulerConfig::OneCycleLR {
+                max_lr,
+                total_steps,
+                pct_start,
+                base_momentum,
+                max_momentum,
+                div_factor,
+                final_div_factor,
+                last_momentum,
+                ..
+            } => {
+                nonnegative(&[
+                    *max_lr,
+                    *pct_start,
+                    *base_momentum,
+                    *max_momentum,
+                    *div_factor,
+                    *final_div_factor,
+                ])?;
+                if *total_steps == 0
+                    || *pct_start > 1.0
+                    || *div_factor == 0.0
+                    || *final_div_factor == 0.0
+                    || last_momentum.is_some_and(|value| !value.is_finite() || value < 0.0)
+                {
+                    return Err(invalid());
+                }
+            }
+            SchedulerConfig::PolynomialLR {
+                initial_lr, power, ..
+            } => {
+                nonnegative(&[*initial_lr, *power])?;
+            }
+            SchedulerConfig::ConstantLR {
+                initial_lr, factor, ..
+            } => {
+                nonnegative(&[*initial_lr, *factor])?;
+            }
+            SchedulerConfig::CyclicLR {
+                base_lr,
+                max_lr,
+                step_size_up,
+                step_size_down,
+                mode,
+                ..
+            } => {
+                nonnegative(&[*base_lr, *max_lr])?;
+                if *step_size_up == 0 || *step_size_down == 0 {
+                    return Err(invalid());
+                }
+                if let CyclicLRMode::ExpRange { gamma } = mode {
+                    nonnegative(&[*gamma])?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Trait for learning rate schedulers.
@@ -3974,8 +4283,37 @@ pub trait LRScheduler {
     /// Serialize the scheduler state.
     fn state_dict(&self) -> SchedulerState;
 
-    /// Restore scheduler state from a previously serialized snapshot.
-    fn load_state_dict(&mut self, state: SchedulerState);
+    /// Restore scheduler state atomically. Invalid configuration, a different
+    /// scheduler kind, or a mismatched child tree leaves every scheduler
+    /// unchanged. Restore the optimizer separately before resuming training.
+    fn load_state_dict(&mut self, state: SchedulerState) -> Result<(), AutogradError>;
+}
+
+// Field lists keep the snapshot and restore paths symmetric. Validation walks
+// the entire composite tree before the first field or child can be changed.
+macro_rules! scheduler_state_methods {
+    ($variant:ident { $($field:ident),* $(,)? }) => {
+        #[allow(clippy::clone_on_copy)]
+        fn state_dict(&self) -> SchedulerState {
+            SchedulerState {
+                version: SCHEDULER_STATE_VERSION,
+                last_epoch: self.last_epoch,
+                last_lrs: vec![self.last_lr],
+                config: SchedulerConfig::$variant { $($field: self.$field.clone()),* },
+            }
+        }
+
+        fn load_state_dict(&mut self, state: SchedulerState) -> Result<(), AutogradError> {
+            state.validate_for(&self.state_dict())?;
+            let SchedulerConfig::$variant { $($field),* } = state.config else {
+                return Err(optimizer_state_error("scheduler kind mismatch"));
+            };
+            self.last_epoch = state.last_epoch;
+            self.last_lr = state.last_lrs[0];
+            $(self.$field = $field;)*
+            Ok(())
+        }
+    };
 }
 
 /// StepLR: decays the learning rate by `gamma` every `step_size` epochs.
@@ -4085,36 +4423,12 @@ impl LRScheduler for StepLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("step_size".to_owned(), self.step_size as f64),
-                ("gamma".to_owned(), self.gamma),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "step_size" => {
-                    if let Some(step_size) = decode_exact_usize_field(*val, 1) {
-                        self.step_size = step_size;
-                    }
-                }
-                "gamma" => self.gamma = finite_non_negative_factor(*val),
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(StepLR {
+        initial_lr,
+        step_size,
+        gamma,
+        verbose
+    });
 }
 
 /// MultiStepLR: decays lr by `gamma` at each milestone epoch.
@@ -4219,58 +4533,12 @@ impl LRScheduler for MultiStepLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        let mut extra = vec![
-            ("initial_lr".to_owned(), self.initial_lr),
-            ("gamma".to_owned(), self.gamma),
-            ("milestones_len".to_owned(), self.milestones.len() as f64),
-        ];
-        extra.extend(
-            self.milestones
-                .iter()
-                .enumerate()
-                .map(|(idx, milestone)| (format!("milestone_{idx}"), *milestone as f64)),
-        );
-
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra,
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-
-        let mut indexed_milestones = Vec::new();
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "gamma" => self.gamma = finite_non_negative_factor(*val),
-                _ => {
-                    if let Some(index) = key
-                        .strip_prefix("milestone_")
-                        .and_then(|suffix| suffix.parse::<usize>().ok())
-                        && let Some(milestone) = decode_exact_usize_field(*val, 0)
-                    {
-                        indexed_milestones.push((index, milestone));
-                    }
-                }
-            }
-        }
-
-        if !indexed_milestones.is_empty() {
-            indexed_milestones.sort_by_key(|(index, _)| *index);
-            self.milestones = indexed_milestones
-                .into_iter()
-                .map(|(_, milestone)| milestone)
-                .collect();
-        }
-        self.milestones.sort_unstable();
-    }
+    scheduler_state_methods!(MultiStepLR {
+        initial_lr,
+        milestones,
+        gamma,
+        verbose
+    });
 }
 
 /// CosineAnnealingLR: anneals lr using a cosine schedule from `initial_lr`
@@ -4369,36 +4637,12 @@ impl LRScheduler for CosineAnnealingLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("t_max".to_owned(), self.t_max as f64),
-                ("eta_min".to_owned(), self.eta_min),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "t_max" => {
-                    if let Some(t_max) = decode_exact_usize_field(*val, 1) {
-                        self.t_max = t_max;
-                    }
-                }
-                "eta_min" => self.eta_min = finite_non_negative_factor(*val),
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(CosineAnnealingLR {
+        initial_lr,
+        t_max,
+        eta_min,
+        verbose
+    });
 }
 
 /// CosineAnnealingWarmRestarts: cosine annealing with periodic warm restarts.
@@ -4522,54 +4766,15 @@ impl LRScheduler for CosineAnnealingWarmRestarts {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("t_0".to_owned(), self.t_0 as f64),
-                ("t_mult".to_owned(), self.t_mult as f64),
-                ("eta_min".to_owned(), self.eta_min),
-                ("t_cur".to_owned(), self.t_cur as f64),
-                ("t_i".to_owned(), self.t_i as f64),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "t_0" => {
-                    if let Some(t_0) = decode_exact_usize_field(*val, 1) {
-                        self.t_0 = t_0;
-                    }
-                }
-                "t_mult" => {
-                    if let Some(t_mult) = decode_exact_usize_field(*val, 1) {
-                        self.t_mult = t_mult;
-                    }
-                }
-                "eta_min" => self.eta_min = finite_non_negative_factor(*val),
-                "t_cur" => {
-                    if let Some(t_cur) = decode_exact_i64_field(*val, -1) {
-                        self.t_cur = t_cur;
-                    }
-                }
-                "t_i" => {
-                    if let Some(t_i) = decode_exact_usize_field(*val, 1) {
-                        self.t_i = t_i;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(CosineAnnealingWarmRestarts {
+        initial_lr,
+        t_0,
+        t_mult,
+        eta_min,
+        t_cur,
+        t_i,
+        verbose
+    });
 }
 
 /// ExponentialLR: decays lr by a multiplicative `gamma` each epoch.
@@ -4650,30 +4855,11 @@ impl LRScheduler for ExponentialLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("gamma".to_owned(), self.gamma),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "gamma" => self.gamma = finite_non_negative_factor(*val),
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(ExponentialLR {
+        initial_lr,
+        gamma,
+        verbose
+    });
 }
 
 /// LinearLR: linearly interpolates an lr multiplier from `start_factor` to
@@ -4786,48 +4972,23 @@ impl LRScheduler for LinearLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("start_factor".to_owned(), self.start_factor),
-                ("end_factor".to_owned(), self.end_factor),
-                ("total_iters".to_owned(), self.total_iters as f64),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "start_factor" => self.start_factor = finite_non_negative_factor(*val),
-                "end_factor" => self.end_factor = finite_non_negative_factor(*val),
-                "total_iters" => {
-                    if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
-                        self.total_iters = total_iters;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(LinearLR {
+        initial_lr,
+        start_factor,
+        end_factor,
+        total_iters,
+        verbose
+    });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlateauMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlateauMode {
     Min,
     Max,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThresholdMode {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThresholdMode {
     Rel,
     Abs,
 }
@@ -5028,93 +5189,63 @@ impl LRScheduler for ReduceLROnPlateau {
 
     fn state_dict(&self) -> SchedulerState {
         SchedulerState {
+            version: SCHEDULER_STATE_VERSION,
             last_epoch: self.last_epoch,
             last_lrs: vec![self.last_lr],
-            extra: vec![
-                (
-                    "mode".to_owned(),
-                    if self.mode == PlateauMode::Min {
-                        0.0
-                    } else {
-                        1.0
-                    },
-                ),
-                ("factor".to_owned(), self.factor),
-                ("patience".to_owned(), self.patience as f64),
-                ("threshold".to_owned(), self.threshold),
-                (
-                    "threshold_mode".to_owned(),
-                    if self.threshold_mode == ThresholdMode::Rel {
-                        0.0
-                    } else {
-                        1.0
-                    },
-                ),
-                ("cooldown".to_owned(), self.cooldown as f64),
-                ("min_lr".to_owned(), self.min_lr),
-                ("eps".to_owned(), self.eps),
-                ("best".to_owned(), self.best),
-                ("num_bad_epochs".to_owned(), self.num_bad_epochs as f64),
-                ("cooldown_counter".to_owned(), self.cooldown_counter as f64),
-                (
-                    "initialized".to_owned(),
-                    if self.initialized { 1.0 } else { 0.0 },
-                ),
-            ],
+            config: SchedulerConfig::ReduceLROnPlateau {
+                mode: self.mode,
+                factor: self.factor,
+                patience: self.patience,
+                threshold: self.threshold,
+                threshold_mode: self.threshold_mode,
+                cooldown: self.cooldown,
+                min_lr: self.min_lr,
+                eps: self.eps,
+                best: SchedulerMetric::from_value(self.best),
+                num_bad_epochs: self.num_bad_epochs,
+                cooldown_counter: self.cooldown_counter,
+                initialized: self.initialized,
+                verbose: self.verbose,
+            },
         }
     }
 
-    fn load_state_dict(&mut self, state: SchedulerState) {
+    fn load_state_dict(&mut self, state: SchedulerState) -> Result<(), AutogradError> {
+        state.validate_for(&self.state_dict())?;
+        let SchedulerConfig::ReduceLROnPlateau {
+            mode,
+            factor,
+            patience,
+            threshold,
+            threshold_mode,
+            cooldown,
+            min_lr,
+            eps,
+            best,
+            num_bad_epochs,
+            cooldown_counter,
+            initialized,
+            verbose,
+        } = state.config
+        else {
+            return Err(optimizer_state_error("scheduler kind mismatch"));
+        };
         self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "mode" => {
-                    self.mode = if *val >= 0.5 {
-                        PlateauMode::Max
-                    } else {
-                        PlateauMode::Min
-                    };
-                }
-                "factor" => self.factor = finite_non_negative_factor(*val),
-                "patience" => {
-                    if let Some(patience) = decode_exact_usize_field(*val, 0) {
-                        self.patience = patience;
-                    }
-                }
-                "threshold" => self.threshold = finite_non_negative_factor(*val),
-                "threshold_mode" => {
-                    self.threshold_mode = if *val >= 0.5 {
-                        ThresholdMode::Abs
-                    } else {
-                        ThresholdMode::Rel
-                    };
-                }
-                "cooldown" => {
-                    if let Some(cooldown) = decode_exact_usize_field(*val, 0) {
-                        self.cooldown = cooldown;
-                    }
-                }
-                "min_lr" => self.min_lr = finite_non_negative_factor(*val),
-                "eps" => self.eps = finite_non_negative_factor(*val),
-                "best" => self.best = *val,
-                "num_bad_epochs" => {
-                    if let Some(num_bad_epochs) = decode_exact_usize_field(*val, 0) {
-                        self.num_bad_epochs = num_bad_epochs;
-                    }
-                }
-                "cooldown_counter" => {
-                    if let Some(cooldown_counter) = decode_exact_usize_field(*val, 0) {
-                        self.cooldown_counter = cooldown_counter;
-                    }
-                }
-                "initialized" => self.initialized = *val >= 0.5,
-                _ => {}
-            }
-        }
+        self.last_lr = state.last_lrs[0];
+        self.mode = mode;
+        self.factor = factor;
+        self.patience = patience;
+        self.threshold = threshold;
+        self.threshold_mode = threshold_mode;
+        self.cooldown = cooldown;
+        self.min_lr = min_lr;
+        self.eps = eps;
+        self.best = best.value();
+        self.num_bad_epochs = num_bad_epochs;
+        self.cooldown_counter = cooldown_counter;
+        self.initialized = initialized;
+        self.verbose = verbose;
+        Ok(())
     }
 }
 
@@ -5234,25 +5365,10 @@ impl LRScheduler for LambdaLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![("initial_lr".to_owned(), self.initial_lr)],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = finite_non_negative_factor(lr);
-        }
-        for (key, val) in &state.extra {
-            if key == "initial_lr" {
-                self.initial_lr = finite_non_negative_factor(*val);
-            }
-        }
-    }
+    scheduler_state_methods!(LambdaLR {
+        initial_lr,
+        verbose
+    });
 }
 
 /// SequentialLR: switch between schedulers at milestone epochs.
@@ -5272,6 +5388,15 @@ impl SequentialLR {
         assert!(
             !schedulers.is_empty(),
             "SequentialLR requires at least one scheduler"
+        );
+        assert_eq!(
+            milestones.len().checked_add(1),
+            Some(schedulers.len()),
+            "SequentialLR requires one milestone between each pair of schedulers"
+        );
+        assert!(
+            milestones.iter().all(|&epoch| epoch <= i64::MAX as usize),
+            "SequentialLR milestones must fit in an epoch counter"
         );
         milestones.sort_unstable();
         Self {
@@ -5320,40 +5445,36 @@ impl LRScheduler for SequentialLR {
 
     fn state_dict(&self) -> SchedulerState {
         SchedulerState {
+            version: SCHEDULER_STATE_VERSION,
             last_epoch: self.last_epoch,
             last_lrs: vec![self.last_lr],
-            extra: self
-                .milestones
-                .iter()
-                .enumerate()
-                .map(|(idx, milestone)| (format!("milestone_{idx}"), *milestone as f64))
-                .collect(),
+            config: SchedulerConfig::SequentialLR {
+                milestones: self.milestones.clone(),
+                schedulers: self
+                    .schedulers
+                    .iter()
+                    .map(|scheduler| scheduler.state_dict())
+                    .collect(),
+            },
         }
     }
 
-    fn load_state_dict(&mut self, state: SchedulerState) {
+    fn load_state_dict(&mut self, state: SchedulerState) -> Result<(), AutogradError> {
+        state.validate_for(&self.state_dict())?;
+        let SchedulerConfig::SequentialLR {
+            milestones,
+            schedulers,
+        } = state.config
+        else {
+            return Err(optimizer_state_error("scheduler kind mismatch"));
+        };
+        for (scheduler, child) in self.schedulers.iter_mut().zip(schedulers) {
+            scheduler.load_state_dict(child)?;
+        }
         self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        let mut indexed_milestones = Vec::new();
-        for (key, val) in &state.extra {
-            if let Some(index) = key
-                .strip_prefix("milestone_")
-                .and_then(|suffix| suffix.parse::<usize>().ok())
-                && let Some(milestone) = decode_exact_usize_field(*val, 0)
-            {
-                indexed_milestones.push((index, milestone));
-            }
-        }
-        if !indexed_milestones.is_empty() {
-            indexed_milestones.sort_by_key(|(index, _)| *index);
-            self.milestones = indexed_milestones
-                .into_iter()
-                .map(|(_, milestone)| milestone)
-                .collect();
-            self.milestones.sort_unstable();
-        }
+        self.last_lr = state.last_lrs[0];
+        self.milestones = milestones;
+        Ok(())
     }
 }
 
@@ -5411,27 +5532,41 @@ impl LRScheduler for ChainedScheduler {
 
     fn state_dict(&self) -> SchedulerState {
         SchedulerState {
+            version: SCHEDULER_STATE_VERSION,
             last_epoch: self.last_epoch,
             last_lrs: vec![self.last_lr],
-            extra: vec![("base_lr".to_owned(), self.base_lr)],
+            config: SchedulerConfig::ChainedScheduler {
+                base_lr: self.base_lr,
+                schedulers: self
+                    .schedulers
+                    .iter()
+                    .map(|scheduler| scheduler.state_dict())
+                    .collect(),
+            },
         }
     }
 
-    fn load_state_dict(&mut self, state: SchedulerState) {
+    fn load_state_dict(&mut self, state: SchedulerState) -> Result<(), AutogradError> {
+        state.validate_for(&self.state_dict())?;
+        let SchedulerConfig::ChainedScheduler {
+            base_lr,
+            schedulers,
+        } = state.config
+        else {
+            return Err(optimizer_state_error("scheduler kind mismatch"));
+        };
+        for (scheduler, child) in self.schedulers.iter_mut().zip(schedulers) {
+            scheduler.load_state_dict(child)?;
+        }
         self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            if key == "base_lr" {
-                self.base_lr = finite_non_negative_factor(*val);
-            }
-        }
+        self.last_lr = state.last_lrs[0];
+        self.base_lr = base_lr;
+        Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OneCycleAnnealStrategy {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OneCycleAnnealStrategy {
     Cos,
     Linear,
 }
@@ -5704,77 +5839,20 @@ impl LRScheduler for OneCycleLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        let momentum = self.last_momentum.unwrap_or(f64::NAN);
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("max_lr".to_owned(), self.max_lr),
-                ("total_steps".to_owned(), self.total_steps as f64),
-                ("pct_start".to_owned(), self.pct_start),
-                (
-                    "anneal_strategy".to_owned(),
-                    if self.anneal_strategy == OneCycleAnnealStrategy::Cos {
-                        0.0
-                    } else {
-                        1.0
-                    },
-                ),
-                (
-                    "cycle_momentum".to_owned(),
-                    if self.cycle_momentum { 1.0 } else { 0.0 },
-                ),
-                ("base_momentum".to_owned(), self.base_momentum),
-                ("max_momentum".to_owned(), self.max_momentum),
-                ("div_factor".to_owned(), self.div_factor),
-                ("final_div_factor".to_owned(), self.final_div_factor),
-                (
-                    "three_phase".to_owned(),
-                    if self.three_phase { 1.0 } else { 0.0 },
-                ),
-                ("last_momentum".to_owned(), momentum),
-                ("verbose".to_owned(), if self.verbose { 1.0 } else { 0.0 }),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "max_lr" => self.max_lr = finite_non_negative_factor(*val),
-                "total_steps" => {
-                    if let Some(total_steps) = decode_exact_usize_field(*val, 1) {
-                        self.total_steps = total_steps;
-                    }
-                }
-                "pct_start" => self.pct_start = finite_unit_interval(*val),
-                "anneal_strategy" => {
-                    self.anneal_strategy = if *val >= 0.5 {
-                        OneCycleAnnealStrategy::Linear
-                    } else {
-                        OneCycleAnnealStrategy::Cos
-                    };
-                }
-                "cycle_momentum" => self.cycle_momentum = *val >= 0.5,
-                "base_momentum" => self.base_momentum = *val,
-                "max_momentum" => self.max_momentum = *val,
-                "div_factor" => self.div_factor = val.max(f64::EPSILON),
-                "final_div_factor" => self.final_div_factor = val.max(f64::EPSILON),
-                "three_phase" => self.three_phase = *val >= 0.5,
-                "last_momentum" => {
-                    self.last_momentum = if val.is_nan() { None } else { Some(*val) };
-                }
-                "verbose" => self.verbose = *val >= 0.5,
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(OneCycleLR {
+        max_lr,
+        total_steps,
+        pct_start,
+        anneal_strategy,
+        cycle_momentum,
+        base_momentum,
+        max_momentum,
+        div_factor,
+        final_div_factor,
+        three_phase,
+        last_momentum,
+        verbose
+    });
 }
 
 /// Polynomial learning rate decay scheduler.
@@ -5830,36 +5908,11 @@ impl LRScheduler for PolynomialLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("total_iters".to_owned(), self.total_iters as f64),
-                ("power".to_owned(), self.power),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "total_iters" => {
-                    if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
-                        self.total_iters = total_iters;
-                    }
-                }
-                "power" => self.power = finite_non_negative_factor(*val),
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(PolynomialLR {
+        initial_lr,
+        total_iters,
+        power
+    });
 }
 
 /// Constant factor learning rate scheduler.
@@ -5913,36 +5966,11 @@ impl LRScheduler for ConstantLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("initial_lr".to_owned(), self.initial_lr),
-                ("factor".to_owned(), self.factor),
-                ("total_iters".to_owned(), self.total_iters as f64),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "initial_lr" => self.initial_lr = finite_non_negative_factor(*val),
-                "factor" => self.factor = finite_non_negative_factor(*val),
-                "total_iters" => {
-                    if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
-                        self.total_iters = total_iters;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(ConstantLR {
+        initial_lr,
+        factor,
+        total_iters
+    });
 }
 
 // ── MultiplicativeLR Scheduler ─────────────────────────────────────────
@@ -5995,25 +6023,7 @@ impl LRScheduler for MultiplicativeLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![("initial_lr".to_owned(), self.initial_lr)],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = finite_non_negative_factor(lr);
-        }
-        for (key, val) in &state.extra {
-            if key == "initial_lr" {
-                self.initial_lr = finite_non_negative_factor(*val);
-            }
-        }
-    }
+    scheduler_state_methods!(MultiplicativeLR { initial_lr });
 }
 
 // ── CyclicLR Scheduler ─────────────────────────────────────────────────
@@ -6026,7 +6036,8 @@ impl LRScheduler for MultiplicativeLR {
 /// - `triangular`: linear scaling
 /// - `triangular2`: halve the range each cycle
 /// - `exp_range`: scale by `gamma^iterations`
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CyclicLRMode {
     Triangular,
     Triangular2,
@@ -6141,80 +6152,14 @@ impl LRScheduler for CyclicLR {
         vec![self.last_lr]
     }
 
-    fn state_dict(&self) -> SchedulerState {
-        SchedulerState {
-            last_epoch: self.last_epoch,
-            last_lrs: vec![self.last_lr],
-            extra: vec![
-                ("base_lr".to_owned(), self.base_lr),
-                ("max_lr".to_owned(), self.max_lr),
-                ("step_size_up".to_owned(), self.step_size_up as f64),
-                ("step_size_down".to_owned(), self.step_size_down as f64),
-                ("iteration".to_owned(), self.iteration as f64),
-                (
-                    "mode".to_owned(),
-                    match self.mode {
-                        CyclicLRMode::Triangular => 0.0,
-                        CyclicLRMode::Triangular2 => 1.0,
-                        CyclicLRMode::ExpRange { .. } => 2.0,
-                    },
-                ),
-                (
-                    "gamma".to_owned(),
-                    match self.mode {
-                        CyclicLRMode::ExpRange { gamma } => gamma,
-                        _ => 1.0,
-                    },
-                ),
-            ],
-        }
-    }
-
-    fn load_state_dict(&mut self, state: SchedulerState) {
-        self.last_epoch = state.last_epoch;
-        if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
-        }
-        if let Some((_, mode)) = state.extra.iter().find(|(key, _)| key == "mode") {
-            self.mode = if *mode == 1.0 {
-                CyclicLRMode::Triangular2
-            } else if *mode == 2.0 {
-                let gamma = state
-                    .extra
-                    .iter()
-                    .find(|(key, _)| key == "gamma")
-                    .map_or(1.0, |(_, gamma)| finite_non_negative_factor(*gamma));
-                CyclicLRMode::ExpRange { gamma }
-            } else {
-                CyclicLRMode::Triangular
-            };
-        }
-        for (key, val) in &state.extra {
-            match key.as_str() {
-                "base_lr" => self.base_lr = finite_non_negative_factor(*val),
-                "max_lr" => self.max_lr = finite_non_negative_factor(*val),
-                "step_size_up" => {
-                    if let Some(step_size_up) = decode_exact_usize_field(*val, 1) {
-                        self.step_size_up = step_size_up;
-                    }
-                }
-                "step_size_down" => {
-                    if let Some(step_size_down) = decode_exact_usize_field(*val, 1) {
-                        self.step_size_down = step_size_down;
-                    }
-                }
-                "iteration" => {
-                    // Counter, not a sizing parameter: clamp a too-large
-                    // encoding to usize::MAX rather than refusing it and
-                    // silently resuming from zero.
-                    if let Some(iteration) = decode_saturating_usize_field(*val, 0) {
-                        self.iteration = iteration;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    scheduler_state_methods!(CyclicLR {
+        base_lr,
+        max_lr,
+        step_size_up,
+        step_size_down,
+        mode,
+        iteration
+    });
 }
 
 /// Adamax optimizer — variant of Adam using the infinity norm (Kingma & Ba, 2014).
@@ -10739,23 +10684,29 @@ mod tests {
     }
 
     #[test]
-    fn exact_usize_state_field_rejects_saturating_cast_boundary() {
-        let upper_exclusive = (usize::MAX as f64) + 1.0;
-        assert_eq!(decode_exact_usize_field(42.0, 1), Some(42));
-        assert_eq!(decode_exact_usize_field(0.5, 0), None);
-        assert_eq!(decode_exact_usize_field(upper_exclusive, 0), None);
+    fn scheduler_integer_fields_preserve_usize_max_without_float_conversion() {
+        let opt = SGD::new(Vec::new(), 0.1);
+        let state = StepLR::new(&opt, usize::MAX).state_dict();
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: SchedulerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, state);
+        let mut malformed = serde_json::to_value(&state).unwrap();
+        malformed["config"]["StepLR"]["step_size"] = serde_json::json!(0.5);
+        assert!(serde_json::from_value::<SchedulerState>(malformed).is_err());
     }
 
     #[test]
-    fn exact_i64_state_field_rejects_saturating_cast_boundary() {
-        let upper_exclusive = (i64::MAX as f64) + 1.0;
-        assert_eq!(decode_exact_i64_field(-1.0, -1), Some(-1));
+    fn scheduler_epoch_fields_preserve_i64_max_and_reject_overflow() {
+        let opt = SGD::new(Vec::new(), 0.1);
+        let state = StepLR::new(&opt, 1).last_epoch(i64::MAX).state_dict();
+        let json = serde_json::to_string(&state).unwrap();
         assert_eq!(
-            decode_exact_i64_field(i64::MIN as f64, i64::MIN),
-            Some(i64::MIN)
+            serde_json::from_str::<SchedulerState>(&json).unwrap(),
+            state
         );
-        assert_eq!(decode_exact_i64_field(-2.0, -1), None);
-        assert_eq!(decode_exact_i64_field(upper_exclusive, i64::MIN), None);
+        let mut malformed = serde_json::to_value(&state).unwrap();
+        malformed["last_epoch"] = serde_json::json!(u64::MAX);
+        assert!(serde_json::from_value::<SchedulerState>(malformed).is_err());
     }
 
     #[test]
@@ -14790,6 +14741,322 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // LRScheduler / StepLR tests
+    fn scheduler_checkpoint_matrix(optimizer: &dyn Optimizer) -> Vec<Box<dyn LRScheduler>> {
+        vec![
+            Box::new(StepLR::new(optimizer, 3).gamma(0.4)),
+            Box::new(MultiStepLR::new(optimizer, vec![2, 5, 5, 11]).gamma(0.6)),
+            Box::new(CosineAnnealingLR::new(optimizer, 7).eta_min(0.02)),
+            Box::new(
+                CosineAnnealingWarmRestarts::new(optimizer, 3)
+                    .t_mult(2)
+                    .eta_min(0.03),
+            ),
+            Box::new(ExponentialLR::new(optimizer, 0.91)),
+            Box::new(
+                LinearLR::new(optimizer)
+                    .start_factor(0.2)
+                    .end_factor(0.8)
+                    .total_iters(12),
+            ),
+            Box::new(
+                ReduceLROnPlateau::new(optimizer)
+                    .factor(0.3)
+                    .patience(1)
+                    .cooldown(2),
+            ),
+            Box::new(LambdaLR::new(optimizer, |epoch| {
+                1.0 / (epoch + 1).max(1) as f64
+            })),
+            Box::new(SequentialLR::new(
+                optimizer,
+                vec![
+                    Box::new(ConstantLR::new(optimizer, 0.4, 3)),
+                    Box::new(MultiplicativeLR::new(optimizer, |_| 0.7)),
+                ],
+                vec![4],
+            )),
+            Box::new(ChainedScheduler::new(
+                optimizer,
+                vec![
+                    Box::new(StepLR::new(optimizer, 3).gamma(0.8)),
+                    Box::new(MultiplicativeLR::new(optimizer, |_| 0.95)),
+                ],
+            )),
+            Box::new(
+                OneCycleLR::new(optimizer, 0.8, 30)
+                    .three_phase(true)
+                    .anneal_strategy_linear()
+                    .div_factor(8.0)
+                    .final_div_factor(30.0),
+            ),
+            Box::new(PolynomialLR::new(optimizer, 30, 1.5)),
+            Box::new(ConstantLR::new(optimizer, 0.4, 10)),
+            Box::new(MultiplicativeLR::new(optimizer, |epoch| {
+                if epoch % 2 == 0 { 0.8 } else { 0.9 }
+            })),
+            Box::new(
+                CyclicLR::new(optimizer, 0.02, 0.3, 2)
+                    .step_size_down(4)
+                    .mode(CyclicLRMode::ExpRange { gamma: 0.93 }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn scheduler_checkpoint_all_families_resume_serialized_training_schedule() {
+        let session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let initial_optimizer = SGD::new(Vec::new(), 0.7).momentum(0.9);
+        for (index, mut scheduler) in scheduler_checkpoint_matrix(&initial_optimizer)
+            .into_iter()
+            .enumerate()
+        {
+            let mut optimizer = SGD::new(Vec::new(), 0.7).momentum(0.9);
+            for epoch in 0..8 {
+                scheduler.step_with_metric(&mut optimizer, 1.0 + epoch as f64 * 0.01);
+            }
+            let saved = scheduler.state_dict();
+            let encoded = serde_json::to_string(&saved).unwrap();
+            let decoded: SchedulerState = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, saved, "family {index}");
+
+            // Construct before restoring the optimizer, with a deliberately
+            // different base rate. Every scheduler must restore its own base.
+            let mut restored_optimizer = SGD::new(Vec::new(), 0.123).momentum(0.2);
+            let mut restored = scheduler_checkpoint_matrix(&restored_optimizer).swap_remove(index);
+            restored_optimizer
+                .load_state_dict(&session, &optimizer.state_dict(&session).unwrap())
+                .unwrap();
+            restored.load_state_dict(decoded).unwrap();
+            for epoch in 8..20 {
+                let metric = 1.0 + epoch as f64 * 0.01;
+                scheduler.step_with_metric(&mut optimizer, metric);
+                restored.step_with_metric(&mut restored_optimizer, metric);
+                assert_eq!(
+                    restored_optimizer.get_lr(),
+                    optimizer.get_lr(),
+                    "family {index}, epoch {epoch}"
+                );
+                assert_eq!(restored_optimizer.get_momentum(), optimizer.get_momentum());
+                assert_eq!(
+                    restored.state_dict(),
+                    scheduler.state_dict(),
+                    "family {index}, epoch {epoch}"
+                );
+            }
+        }
+    }
+
+    fn nested_checkpoint_scheduler(optimizer: &dyn Optimizer, alternative: bool) -> SequentialLR {
+        SequentialLR::new(
+            optimizer,
+            vec![
+                Box::new(
+                    LinearLR::new(optimizer)
+                        .start_factor(if alternative { 0.7 } else { 0.25 })
+                        .total_iters(if alternative { 8 } else { 3 }),
+                ),
+                Box::new(ChainedScheduler::new(
+                    optimizer,
+                    vec![
+                        Box::new(
+                            StepLR::new(optimizer, if alternative { 5 } else { 2 }).gamma(0.5),
+                        ),
+                        Box::new(MultiplicativeLR::new(optimizer, |_| 0.5)),
+                    ],
+                )),
+            ],
+            vec![if alternative { 12 } else { 4 }],
+        )
+    }
+
+    #[test]
+    fn scheduler_checkpoint_nested_stateful_schedule_matches_independent_trajectory() {
+        let mut optimizer = SGD::new(Vec::new(), 1.0);
+        let mut scheduler = nested_checkpoint_scheduler(&optimizer, false);
+        // Linear warmup, followed by gamma^(local_epoch / 2) * 0.5^local_epoch.
+        let expected = [
+            0.25,
+            0.5,
+            0.75,
+            1.0,
+            1.0,
+            0.5,
+            0.125,
+            0.0625,
+            0.015625,
+            0.0078125,
+            0.001953125,
+        ];
+        for &lr in &expected[..8] {
+            scheduler.step(&mut optimizer, None);
+            assert_eq!(optimizer.get_lr(), lr);
+        }
+        let encoded = serde_json::to_vec(&scheduler.state_dict()).unwrap();
+        let mut restored_optimizer = SGD::new(Vec::new(), optimizer.get_lr());
+        let mut restored = nested_checkpoint_scheduler(&restored_optimizer, true);
+        restored
+            .load_state_dict(serde_json::from_slice(&encoded).unwrap())
+            .unwrap();
+        for &lr in &expected[8..] {
+            scheduler.step(&mut optimizer, None);
+            restored.step(&mut restored_optimizer, None);
+            assert_eq!(optimizer.get_lr(), lr);
+            assert_eq!(restored_optimizer.get_lr(), lr);
+            assert_eq!(restored.state_dict(), scheduler.state_dict());
+        }
+    }
+
+    #[test]
+    fn scheduler_checkpoint_invalid_nested_state_is_atomic() {
+        let mut optimizer = SGD::new(Vec::new(), 1.0);
+        let mut scheduler = nested_checkpoint_scheduler(&optimizer, false);
+        for _ in 0..8 {
+            scheduler.step(&mut optimizer, None);
+        }
+        let before = scheduler.state_dict();
+        for defect in 0..10 {
+            let mut invalid = before.clone();
+            invalid.last_epoch = 99;
+            match defect {
+                0 => invalid.version += 1,
+                1 => invalid.last_epoch = -2,
+                2 => invalid.last_lrs.clear(),
+                3 => invalid.last_lrs = vec![0.1, 0.2],
+                4 => invalid.last_lrs[0] = f64::NAN,
+                5 => invalid.last_lrs[0] = -0.5,
+                _ => {
+                    let SchedulerConfig::SequentialLR {
+                        milestones,
+                        schedulers,
+                    } = &mut invalid.config
+                    else {
+                        unreachable!()
+                    };
+                    if defect == 6 {
+                        milestones.push(10);
+                    } else if defect == 7 {
+                        schedulers.pop();
+                    } else {
+                        // Change a valid early child, then corrupt a later one:
+                        // catching the latter must not partially restore the former.
+                        schedulers[0].last_epoch = 123;
+                        let SchedulerConfig::ChainedScheduler { schedulers, .. } =
+                            &mut schedulers[1].config
+                        else {
+                            unreachable!()
+                        };
+                        if defect == 8 {
+                            schedulers[1] = StepLR::new(&optimizer, 1).state_dict();
+                        } else {
+                            let SchedulerConfig::MultiplicativeLR { initial_lr } =
+                                &mut schedulers[1].config
+                            else {
+                                unreachable!()
+                            };
+                            *initial_lr = f64::INFINITY;
+                        }
+                    }
+                }
+            }
+            assert!(
+                scheduler.load_state_dict(invalid).is_err(),
+                "defect {defect}"
+            );
+            assert_eq!(scheduler.state_dict(), before, "defect {defect}");
+        }
+    }
+
+    #[test]
+    fn scheduler_checkpoint_rejects_unknown_missing_and_wrong_typed_fields() {
+        let optimizer = SGD::new(Vec::new(), 0.1);
+        let state = StepLR::new(&optimizer, 3).state_dict();
+        let json = serde_json::to_value(&state).unwrap();
+        for defect in 0..5 {
+            let mut invalid = json.clone();
+            match defect {
+                0 => invalid["unknown"] = serde_json::json!(true),
+                1 => invalid["config"]["StepLR"]["unknown"] = serde_json::json!(true),
+                2 => {
+                    invalid["config"]["StepLR"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("gamma");
+                }
+                3 => invalid["config"]["StepLR"]["step_size"] = serde_json::json!(-1),
+                _ => invalid["config"]["StepLR"]["step_size"] = serde_json::json!(1.5),
+            }
+            assert!(
+                serde_json::from_value::<SchedulerState>(invalid).is_err(),
+                "defect {defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_checkpoint_preserves_empty_milestones_optional_momentum_and_metrics() {
+        let optimizer = SGD::new(Vec::new(), 0.1);
+        let source = MultiStepLR::new(&optimizer, Vec::new());
+        let mut target = MultiStepLR::new(&optimizer, vec![1, 2]);
+        target.load_state_dict(source.state_dict()).unwrap();
+        assert_eq!(target.state_dict(), source.state_dict());
+
+        let optimizer_without_momentum = Adagrad::new(Vec::new(), 0.1);
+        let source = OneCycleLR::new(&optimizer_without_momentum, 1.0, 10).cycle_momentum(false);
+        let json = serde_json::to_string(&source.state_dict()).unwrap();
+        let restored: SchedulerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, source.state_dict());
+        assert!(matches!(
+            restored.config,
+            SchedulerConfig::OneCycleLR {
+                last_momentum: None,
+                ..
+            }
+        ));
+
+        for metric in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
+            let mut optimizer = SGD::new(Vec::new(), 0.5);
+            let mut scheduler = ReduceLROnPlateau::new(&optimizer).patience(0);
+            scheduler.step_with_metric(&mut optimizer, metric);
+            let json = serde_json::to_string(&scheduler.state_dict()).unwrap();
+            let mut restored_optimizer = SGD::new(Vec::new(), optimizer.get_lr());
+            let mut restored = ReduceLROnPlateau::new(&restored_optimizer);
+            restored
+                .load_state_dict(serde_json::from_str(&json).unwrap())
+                .unwrap();
+            assert_eq!(restored.state_dict(), scheduler.state_dict());
+            for metric in [1.0, 2.0, 0.5] {
+                scheduler.step_with_metric(&mut optimizer, metric);
+                restored.step_with_metric(&mut restored_optimizer, metric);
+                assert_eq!(restored_optimizer.get_lr(), optimizer.get_lr());
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_checkpoint_resumes_sgd_momentum_above_one() {
+        // SGD accepts any finite nonnegative momentum. Scheduler persistence
+        // must not impose Adam's beta range on the SGD momentum schedule.
+        let mut optimizer = SGD::new(Vec::new(), 0.1).momentum(1.2);
+        let mut scheduler = OneCycleLR::new(&optimizer, 0.4, 20)
+            .base_momentum(1.1)
+            .max_momentum(1.2);
+        for _ in 0..7 {
+            scheduler.step(&mut optimizer, None);
+        }
+        let json = serde_json::to_string(&scheduler.state_dict()).unwrap();
+        let mut restored_optimizer =
+            SGD::new(Vec::new(), optimizer.get_lr()).momentum(optimizer.get_momentum().unwrap());
+        let mut restored = OneCycleLR::new(&restored_optimizer, 1.0, 3);
+        restored
+            .load_state_dict(serde_json::from_str(&json).unwrap())
+            .unwrap();
+        for _ in 0..8 {
+            scheduler.step(&mut optimizer, None);
+            restored.step(&mut restored_optimizer, None);
+            assert_eq!(restored_optimizer.get_lr(), optimizer.get_lr());
+            assert_eq!(restored_optimizer.get_momentum(), optimizer.get_momentum());
+        }
+    }
     // -----------------------------------------------------------------------
 
     #[test]
@@ -14975,160 +15242,54 @@ mod tests {
     }
 
     #[test]
-    fn decay_lr_schedulers_clamp_loaded_invalid_gamma_to_zero() {
-        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = session
-            .tensor_variable(vec![1.0], vec![1], true)
-            .expect("var");
-        let mut opt = SGD::new(vec![x], 1.0);
-        let mut scheduler = StepLR::new(&opt, 1).gamma(0.5);
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: -1,
-            last_lrs: vec![1.0],
-            extra: vec![
-                ("initial_lr".to_owned(), 1.0),
-                ("step_size".to_owned(), 1.0),
-                ("gamma".to_owned(), f64::NAN),
-            ],
-        });
-        scheduler.step(&mut opt, Some(1));
-        assert_eq!(opt.get_lr(), 0.0);
-
-        let x = session
-            .tensor_variable(vec![1.0], vec![1], true)
-            .expect("var");
-        let mut opt = SGD::new(vec![x], 1.0);
-        let mut scheduler = MultiStepLR::new(&opt, vec![1]).gamma(0.5);
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: -1,
-            last_lrs: vec![1.0],
-            extra: vec![
-                ("initial_lr".to_owned(), 1.0),
-                ("gamma".to_owned(), f64::INFINITY),
-                ("milestone_0".to_owned(), 1.0),
-            ],
-        });
-        scheduler.step(&mut opt, Some(1));
-        assert_eq!(opt.get_lr(), 0.0);
-
-        let x = session
-            .tensor_variable(vec![1.0], vec![1], true)
-            .expect("var");
-        let mut opt = SGD::new(vec![x], 1.0);
-        let mut scheduler = ExponentialLR::new(&opt, 0.5);
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: -1,
-            last_lrs: vec![1.0],
-            extra: vec![("initial_lr".to_owned(), 1.0), ("gamma".to_owned(), -0.5)],
-        });
-        scheduler.step(&mut opt, Some(1));
-        assert_eq!(opt.get_lr(), 0.0);
+    fn decay_lr_schedulers_reject_loaded_invalid_gamma_atomically() {
+        let opt = SGD::new(Vec::new(), 1.0);
+        let mut schedulers: Vec<Box<dyn LRScheduler>> = vec![
+            Box::new(StepLR::new(&opt, 1).gamma(0.5)),
+            Box::new(MultiStepLR::new(&opt, vec![1]).gamma(0.5)),
+            Box::new(ExponentialLR::new(&opt, 0.5)),
+        ];
+        for scheduler in &mut schedulers {
+            let before = scheduler.state_dict();
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5] {
+                let mut state = before.clone();
+                match &mut state.config {
+                    SchedulerConfig::StepLR { gamma, .. }
+                    | SchedulerConfig::MultiStepLR { gamma, .. }
+                    | SchedulerConfig::ExponentialLR { gamma, .. } => *gamma = invalid,
+                    _ => unreachable!(),
+                }
+                assert!(scheduler.load_state_dict(state).is_err());
+                assert_eq!(scheduler.state_dict(), before);
+            }
+        }
     }
 
     #[test]
-    fn cosine_and_decay_schedulers_clamp_loaded_invalid_initial_lr() {
-        for initial_lr in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
-            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-
-            let x = session
-                .tensor_variable(vec![1.0], vec![1], true)
-                .expect("var");
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut scheduler = StepLR::new(&opt, 1).gamma(0.5);
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("step_size".to_owned(), 1.0),
-                    ("gamma".to_owned(), 0.5),
-                ],
-            });
-            scheduler.step(&mut opt, Some(1));
-            assert_eq!(opt.get_lr(), 0.0, "StepLR initial_lr {initial_lr:?}");
-            assert!(opt.get_lr().is_finite());
-
-            let x = session
-                .tensor_variable(vec![1.0], vec![1], true)
-                .expect("var");
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut scheduler = MultiStepLR::new(&opt, vec![1]).gamma(0.5);
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("gamma".to_owned(), 0.5),
-                    ("milestone_0".to_owned(), 1.0),
-                ],
-            });
-            scheduler.step(&mut opt, Some(1));
-            assert_eq!(opt.get_lr(), 0.0, "MultiStepLR initial_lr {initial_lr:?}");
-            assert!(opt.get_lr().is_finite());
-
-            let x = session
-                .tensor_variable(vec![1.0], vec![1], true)
-                .expect("var");
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut scheduler = CosineAnnealingLR::new(&opt, 2);
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("t_max".to_owned(), 2.0),
-                    ("eta_min".to_owned(), 0.0),
-                ],
-            });
-            scheduler.step(&mut opt, Some(1));
-            assert_eq!(
-                opt.get_lr(),
-                0.0,
-                "CosineAnnealingLR initial_lr {initial_lr:?}"
-            );
-            assert!(opt.get_lr().is_finite());
-
-            let x = session
-                .tensor_variable(vec![1.0], vec![1], true)
-                .expect("var");
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut scheduler = CosineAnnealingWarmRestarts::new(&opt, 2);
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("t_0".to_owned(), 2.0),
-                    ("t_mult".to_owned(), 1.0),
-                    ("eta_min".to_owned(), 0.0),
-                    ("t_cur".to_owned(), -1.0),
-                    ("t_i".to_owned(), 2.0),
-                ],
-            });
-            scheduler.step(&mut opt, Some(1));
-            assert_eq!(
-                opt.get_lr(),
-                0.0,
-                "CosineAnnealingWarmRestarts initial_lr {initial_lr:?}"
-            );
-            assert!(opt.get_lr().is_finite());
-
-            let x = session
-                .tensor_variable(vec![1.0], vec![1], true)
-                .expect("var");
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut scheduler = ExponentialLR::new(&opt, 0.5);
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("gamma".to_owned(), 0.5),
-                ],
-            });
-            scheduler.step(&mut opt, Some(1));
-            assert_eq!(opt.get_lr(), 0.0, "ExponentialLR initial_lr {initial_lr:?}");
-            assert!(opt.get_lr().is_finite());
+    fn cosine_and_decay_schedulers_reject_loaded_invalid_initial_lr() {
+        let opt = SGD::new(Vec::new(), 1.0);
+        let mut schedulers: Vec<Box<dyn LRScheduler>> = vec![
+            Box::new(StepLR::new(&opt, 1).gamma(0.5)),
+            Box::new(MultiStepLR::new(&opt, vec![1]).gamma(0.5)),
+            Box::new(CosineAnnealingLR::new(&opt, 2)),
+            Box::new(CosineAnnealingWarmRestarts::new(&opt, 2)),
+            Box::new(ExponentialLR::new(&opt, 0.5)),
+        ];
+        for scheduler in &mut schedulers {
+            let before = scheduler.state_dict();
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+                let mut state = before.clone();
+                match &mut state.config {
+                    SchedulerConfig::StepLR { initial_lr, .. }
+                    | SchedulerConfig::MultiStepLR { initial_lr, .. }
+                    | SchedulerConfig::CosineAnnealingLR { initial_lr, .. }
+                    | SchedulerConfig::CosineAnnealingWarmRestarts { initial_lr, .. }
+                    | SchedulerConfig::ExponentialLR { initial_lr, .. } => *initial_lr = invalid,
+                    _ => unreachable!(),
+                }
+                assert!(scheduler.load_state_dict(state).is_err());
+                assert_eq!(scheduler.state_dict(), before);
+            }
         }
     }
 
@@ -15195,7 +15356,7 @@ mod tests {
 
         // Create a fresh scheduler and load state
         let mut scheduler2 = StepLR::new(&opt, 10).gamma(0.1);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_lr(), scheduler.get_lr());
@@ -15203,7 +15364,7 @@ mod tests {
     }
 
     #[test]
-    fn step_lr_load_state_dict_ignores_invalid_step_size() {
+    fn step_lr_load_state_dict_rejects_invalid_step_size() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
@@ -15212,31 +15373,13 @@ mod tests {
         let mut scheduler = StepLR::new(&opt, 7).gamma(0.3);
         let original = scheduler.state_dict();
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: 5,
-            last_lrs: vec![0.03],
-            extra: vec![
-                ("initial_lr".to_owned(), 0.1),
-                ("step_size".to_owned(), 0.0),
-                ("gamma".to_owned(), 0.3),
-            ],
-        });
-
-        let restored = scheduler.state_dict();
-        assert_eq!(restored.last_epoch, 5);
-        assert_eq!(restored.last_lrs, vec![0.03]);
-        assert_eq!(
-            restored
-                .extra
-                .iter()
-                .find(|(key, _)| key.as_str().cmp("step_size").is_eq())
-                .map(|(_, value)| *value),
-            original
-                .extra
-                .iter()
-                .find(|(key, _)| key.as_str().cmp("step_size").is_eq())
-                .map(|(_, value)| *value)
-        );
+        let mut invalid = original.clone();
+        invalid.last_epoch = 5;
+        if let SchedulerConfig::StepLR { step_size, .. } = &mut invalid.config {
+            *step_size = 0;
+        }
+        assert!(scheduler.load_state_dict(invalid).is_err());
+        assert_eq!(scheduler.state_dict(), original);
     }
 
     #[test]
@@ -15461,7 +15604,7 @@ mod tests {
         let state = scheduler.state_dict();
 
         let mut scheduler2 = MultiStepLR::new(&opt, vec![1]).gamma(0.9);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -15469,7 +15612,7 @@ mod tests {
     }
 
     #[test]
-    fn multistep_lr_load_state_dict_ignores_invalid_milestones() {
+    fn multistep_lr_load_state_dict_rejects_unsorted_milestones() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
@@ -15478,34 +15621,13 @@ mod tests {
         let mut scheduler = MultiStepLR::new(&opt, vec![4, 8]).gamma(0.2);
         let original = scheduler.state_dict();
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: 9,
-            last_lrs: vec![0.032],
-            extra: vec![
-                ("initial_lr".to_owned(), 0.8),
-                ("gamma".to_owned(), 0.2),
-                ("milestone_0".to_owned(), -1.0),
-                ("milestone_1".to_owned(), 3.5),
-            ],
-        });
-
-        let restored = scheduler.state_dict();
-        assert_eq!(restored.last_epoch, 9);
-        assert_eq!(restored.last_lrs, vec![0.032]);
-        assert_eq!(
-            restored
-                .extra
-                .iter()
-                .filter(|(key, _)| key.starts_with("milestone_"))
-                .cloned()
-                .collect::<Vec<_>>(),
-            original
-                .extra
-                .iter()
-                .filter(|(key, _)| key.starts_with("milestone_"))
-                .cloned()
-                .collect::<Vec<_>>()
-        );
+        let mut invalid = original.clone();
+        invalid.last_epoch = 9;
+        if let SchedulerConfig::MultiStepLR { milestones, .. } = &mut invalid.config {
+            *milestones = vec![8, 4];
+        }
+        assert!(scheduler.load_state_dict(invalid).is_err());
+        assert_eq!(scheduler.state_dict(), original);
     }
 
     #[test]
@@ -15585,15 +15707,13 @@ mod tests {
             assert!(opt.get_lr().is_finite(), "lr must remain finite");
             assert!(opt.get_lr() >= 0.0, "lr must remain non-negative");
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.5],
-                extra: vec![
-                    ("initial_lr".to_owned(), 0.5),
-                    ("t_max".to_owned(), 10.0),
-                    ("eta_min".to_owned(), eta_min),
-                ],
-            });
+            let before = scheduler.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::CosineAnnealingLR { eta_min: value, .. } = &mut invalid.config {
+                *value = eta_min;
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
             scheduler.step(&mut opt, Some(10));
             assert_eq!(opt.get_lr(), 0.0, "loaded invalid eta_min {eta_min:?}");
             assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
@@ -15614,7 +15734,7 @@ mod tests {
         let state = scheduler.state_dict();
 
         let mut scheduler2 = CosineAnnealingLR::new(&opt, 3).eta_min(0.0);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -15705,18 +15825,13 @@ mod tests {
             assert!(lr.is_finite(), "lr must remain finite");
             assert!(lr >= 0.0, "lr must remain non-negative");
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.5],
-                extra: vec![
-                    ("initial_lr".to_owned(), 0.5),
-                    ("t_0".to_owned(), 4.0),
-                    ("t_mult".to_owned(), 1.0),
-                    ("eta_min".to_owned(), eta_min),
-                    ("t_cur".to_owned(), -1.0),
-                    ("t_i".to_owned(), 4.0),
-                ],
-            });
+            let before = scheduler.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::CosineAnnealingWarmRestarts { eta_min: value, .. } = &mut invalid.config {
+                *value = eta_min;
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
             scheduler.step(&mut opt, Some(2));
             let loaded_lr = opt.get_lr();
             assert!(
@@ -15745,7 +15860,7 @@ mod tests {
         let mut scheduler2 = CosineAnnealingWarmRestarts::new(&opt, 1)
             .t_mult(1)
             .eta_min(0.0);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -15753,7 +15868,7 @@ mod tests {
     }
 
     #[test]
-    fn cosine_warm_restarts_load_state_dict_ignores_invalid_cycle_fields() {
+    fn cosine_warm_restarts_load_state_dict_rejects_invalid_cycle_fields() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
@@ -15764,33 +15879,26 @@ mod tests {
             .eta_min(0.05);
         let original = scheduler.state_dict();
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: 4,
-            last_lrs: vec![0.42],
-            extra: vec![
-                ("initial_lr".to_owned(), 0.5),
-                ("t_0".to_owned(), -3.0),
-                ("t_mult".to_owned(), 1.5),
-                ("eta_min".to_owned(), 0.05),
-                ("t_cur".to_owned(), f64::NAN),
-                ("t_i".to_owned(), 0.0),
-            ],
-        });
-
-        let restored = scheduler.state_dict();
-        assert_eq!(restored.last_epoch, 4);
-        assert_eq!(restored.last_lrs, vec![0.42]);
-        for key in ["t_0", "t_mult", "t_cur", "t_i"] {
-            assert_eq!(
-                restored
-                    .extra
-                    .iter()
-                    .find(|(name, _)| name.as_str().cmp(key).is_eq()),
-                original
-                    .extra
-                    .iter()
-                    .find(|(name, _)| name.as_str().cmp(key).is_eq())
-            );
+        for field in 0..4 {
+            let mut invalid = original.clone();
+            invalid.last_epoch = 4;
+            if let SchedulerConfig::CosineAnnealingWarmRestarts {
+                t_0,
+                t_mult,
+                t_cur,
+                t_i,
+                ..
+            } = &mut invalid.config
+            {
+                match field {
+                    0 => *t_0 = 0,
+                    1 => *t_mult = 0,
+                    2 => *t_cur = -2,
+                    _ => *t_i = 0,
+                }
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), original);
         }
     }
 
@@ -15854,7 +15962,7 @@ mod tests {
         let state = scheduler.state_dict();
 
         let mut scheduler2 = ExponentialLR::new(&opt, 0.5);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -15952,16 +16060,15 @@ mod tests {
             assert_eq!(opt.get_lr(), 0.0, "end factor {factor:?}");
             assert!(opt.get_lr().is_finite(), "end lr must remain finite");
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![2.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), 2.0),
-                    ("start_factor".to_owned(), factor),
-                    ("end_factor".to_owned(), factor),
-                    ("total_iters".to_owned(), 0.0),
-                ],
-            });
+            let before = scheduler.state_dict();
+            for change_start in [false, true] {
+                let mut invalid = before.clone();
+                if let SchedulerConfig::LinearLR { start_factor, end_factor, .. } = &mut invalid.config {
+                    if change_start { *start_factor = factor; } else { *end_factor = factor; }
+                }
+                assert!(scheduler.load_state_dict(invalid).is_err());
+                assert_eq!(scheduler.state_dict(), before);
+            }
             scheduler.step(&mut opt, Some(0));
             assert_eq!(opt.get_lr(), 0.0, "loaded factor {factor:?}");
             assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
@@ -15987,7 +16094,7 @@ mod tests {
             .start_factor(1.0)
             .end_factor(1.0)
             .total_iters(1);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -16152,29 +16259,40 @@ mod tests {
     }
 
     #[test]
-    fn reduce_on_plateau_loaded_invalid_scalars_are_clamped() {
+    fn reduce_on_plateau_loaded_invalid_scalars_are_rejected() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
             .expect("var");
         let mut opt = SGD::new(vec![x], 1.0);
         let mut scheduler = ReduceLROnPlateau::new(&opt).patience(0);
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: -1,
-            last_lrs: vec![1.0],
-            extra: vec![
-                ("factor".to_owned(), f64::INFINITY),
-                ("threshold".to_owned(), f64::NAN),
-                ("min_lr".to_owned(), -0.5),
-                ("eps".to_owned(), f64::NEG_INFINITY),
-            ],
-        });
+        let before = scheduler.state_dict();
+        for field in 0..4 {
+            let mut invalid = before.clone();
+            if let SchedulerConfig::ReduceLROnPlateau {
+                factor,
+                threshold,
+                min_lr,
+                eps,
+                ..
+            } = &mut invalid.config
+            {
+                match field {
+                    0 => *factor = f64::INFINITY,
+                    1 => *threshold = f64::NAN,
+                    2 => *min_lr = -0.5,
+                    _ => *eps = f64::NEG_INFINITY,
+                }
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
+        }
 
         scheduler.step_with_metric(&mut opt, 1.0);
         scheduler.step_with_metric(&mut opt, 1.1);
 
         let lr = opt.get_lr();
-        assert_eq!(lr, 0.0);
+        assert_eq!(lr, 0.1);
         assert!(lr.is_finite(), "loaded invalid scalars must keep lr finite");
         assert!(
             lr >= 0.0,
@@ -16205,11 +16323,9 @@ mod tests {
         let mut opt = SGD::new(vec![x], 1.0);
         let mut scheduler = ReduceLROnPlateau::new(&opt).factor(0.5).patience(0);
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: i64::MAX,
-            last_lrs: vec![1.0],
-            extra: Vec::new(),
-        });
+        let mut state = scheduler.state_dict();
+        state.last_epoch = i64::MAX;
+        scheduler.load_state_dict(state).unwrap();
 
         scheduler.step_with_metric(&mut opt, 1.0);
 
@@ -16239,7 +16355,7 @@ mod tests {
         let state = scheduler.state_dict();
 
         let mut scheduler2 = ReduceLROnPlateau::new(&opt);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -16301,7 +16417,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_lr_loaded_invalid_scalars_are_clamped() {
+    fn lambda_lr_loaded_invalid_scalars_are_rejected() {
         for scalar in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = session
@@ -16310,15 +16426,17 @@ mod tests {
             let mut opt = SGD::new(vec![x], 1.0);
             let mut scheduler = LambdaLR::new(&opt, |_epoch| 0.5);
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![scalar],
-                extra: vec![("initial_lr".to_owned(), scalar)],
-            });
+            let before = scheduler.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::LambdaLR { initial_lr, .. } = &mut invalid.config {
+                *initial_lr = scalar;
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
             scheduler.step(&mut opt, Some(0));
 
             let lr = opt.get_lr();
-            assert_eq!(lr, 0.0, "invalid loaded scalar {scalar:?}");
+            assert_eq!(lr, 0.5, "invalid loaded scalar {scalar:?}");
             assert!(lr.is_finite(), "loaded lr must stay finite");
             assert!(lr >= 0.0, "loaded lr must stay non-negative");
         }
@@ -16336,7 +16454,7 @@ mod tests {
         let state = scheduler.state_dict();
 
         let mut scheduler2 = LambdaLR::new(&opt, |_epoch| 1.0);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
     }
@@ -16409,8 +16527,15 @@ mod tests {
         scheduler.step(&mut opt, Some(4));
         let state = scheduler.state_dict();
 
-        let mut scheduler2 = SequentialLR::new(&opt, vec![Box::new(StepLR::new(&opt, 1))], vec![]);
-        scheduler2.load_state_dict(state.clone());
+        let mut scheduler2 = SequentialLR::new(
+            &opt,
+            vec![
+                Box::new(LinearLR::new(&opt)),
+                Box::new(ExponentialLR::new(&opt, 0.1)),
+            ],
+            vec![1],
+        );
+        scheduler2.load_state_dict(state.clone()).unwrap();
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
         assert_eq!(scheduler2.get_lr(), scheduler.get_lr());
@@ -16469,16 +16594,21 @@ mod tests {
         chained.step(&mut opt, Some(5));
         let state = chained.state_dict();
 
-        let mut chained2 =
-            ChainedScheduler::new(&opt, vec![Box::new(ExponentialLR::new(&opt, 1.0))]);
-        chained2.load_state_dict(state.clone());
+        let mut chained2 = ChainedScheduler::new(
+            &opt,
+            vec![
+                Box::new(ExponentialLR::new(&opt, 1.0)),
+                Box::new(StepLR::new(&opt, 1)),
+            ],
+        );
+        chained2.load_state_dict(state.clone()).unwrap();
         assert_eq!(chained2.state_dict(), state);
         assert_eq!(chained2.get_last_lr(), chained.get_last_lr());
         assert_eq!(chained2.get_lr(), chained.get_lr());
     }
 
     #[test]
-    fn chained_scheduler_loaded_invalid_base_lr_is_clamped() {
+    fn chained_scheduler_loaded_invalid_base_lr_is_rejected() {
         for base_lr in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = session
@@ -16493,15 +16623,17 @@ mod tests {
                 ],
             );
 
-            chained.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![("base_lr".to_owned(), base_lr)],
-            });
+            let before = chained.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::ChainedScheduler { base_lr: value, .. } = &mut invalid.config {
+                *value = base_lr;
+            }
+            assert!(chained.load_state_dict(invalid).is_err());
+            assert_eq!(chained.state_dict(), before);
             chained.step(&mut opt, Some(1));
 
             let lr = opt.get_lr();
-            assert_eq!(lr, 0.0, "invalid base_lr {base_lr:?}");
+            assert_eq!(lr, 0.25, "invalid base_lr {base_lr:?}");
             assert!(lr.is_finite(), "loaded base_lr must keep lr finite");
             assert!(lr >= 0.0, "loaded base_lr must keep lr non-negative");
         }
@@ -16636,7 +16768,7 @@ mod tests {
         let state = scheduler.state_dict();
 
         let mut scheduler2 = OneCycleLR::new(&opt, 1.0, 5);
-        scheduler2.load_state_dict(state.clone());
+        scheduler2.load_state_dict(state.clone()).unwrap();
 
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
@@ -16668,24 +16800,13 @@ mod tests {
             assert!(opt.get_lr().is_finite(), "peak lr must remain finite");
             assert!(opt.get_lr() >= 0.0, "peak lr must remain non-negative");
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.0],
-                extra: vec![
-                    ("max_lr".to_owned(), max_lr),
-                    ("total_steps".to_owned(), 10.0),
-                    ("pct_start".to_owned(), 0.3),
-                    ("anneal_strategy".to_owned(), 1.0),
-                    ("cycle_momentum".to_owned(), 0.0),
-                    ("base_momentum".to_owned(), 0.85),
-                    ("max_momentum".to_owned(), 0.95),
-                    ("div_factor".to_owned(), 25.0),
-                    ("final_div_factor".to_owned(), 1e4),
-                    ("three_phase".to_owned(), 0.0),
-                    ("last_momentum".to_owned(), f64::NAN),
-                    ("verbose".to_owned(), 0.0),
-                ],
-            });
+            let before = scheduler.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::OneCycleLR { max_lr: value, .. } = &mut invalid.config {
+                *value = max_lr;
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
             scheduler.step(&mut opt, Some(2));
             assert_eq!(opt.get_lr(), 0.0, "loaded invalid max_lr {max_lr:?}");
             assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
@@ -16714,24 +16835,13 @@ mod tests {
             assert!(opt.get_lr().is_finite(), "lr must remain finite");
             assert!(opt.get_lr() >= 0.0, "lr must remain non-negative");
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.0],
-                extra: vec![
-                    ("max_lr".to_owned(), 1.0),
-                    ("total_steps".to_owned(), 1.0),
-                    ("pct_start".to_owned(), pct_start),
-                    ("anneal_strategy".to_owned(), 0.0),
-                    ("cycle_momentum".to_owned(), 0.0),
-                    ("base_momentum".to_owned(), 0.85),
-                    ("max_momentum".to_owned(), 0.95),
-                    ("div_factor".to_owned(), 25.0),
-                    ("final_div_factor".to_owned(), 1e4),
-                    ("three_phase".to_owned(), 0.0),
-                    ("last_momentum".to_owned(), f64::NAN),
-                    ("verbose".to_owned(), 0.0),
-                ],
-            });
+            let before = scheduler.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::OneCycleLR { pct_start: value, .. } = &mut invalid.config {
+                *value = pct_start;
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
             scheduler.step(&mut opt, Some(0));
             assert!(
                 (opt.get_lr() - 4.0e-6).abs() < 1e-12,
@@ -17885,15 +17995,13 @@ mod tests {
             assert!(opt.get_lr().is_finite(), "lr must remain finite");
             assert!(opt.get_lr() >= 0.0, "lr must remain non-negative");
 
-            sched.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.5],
-                extra: vec![
-                    ("initial_lr".to_owned(), 0.5),
-                    ("total_iters".to_owned(), 10.0),
-                    ("power".to_owned(), power),
-                ],
-            });
+            let before = sched.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::PolynomialLR { power: value, .. } = &mut invalid.config {
+                *value = power;
+            }
+            assert!(sched.load_state_dict(invalid).is_err());
+            assert_eq!(sched.state_dict(), before);
             sched.step(&mut opt, Some(5));
             assert_eq!(opt.get_lr(), 0.5, "loaded invalid power {power:?}");
             assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
@@ -17910,7 +18018,7 @@ mod tests {
         sched.step(&mut opt, Some(7));
         let state = sched.state_dict();
         let mut sched2 = PolynomialLR::new(&opt, 20, 1.5);
-        sched2.load_state_dict(state);
+        sched2.load_state_dict(state).unwrap();
         assert_eq!(sched.get_last_lr(), sched2.get_last_lr());
     }
 
@@ -17950,15 +18058,13 @@ mod tests {
             assert_eq!(opt.get_lr(), 0.0, "invalid factor {factor:?}");
             assert!(opt.get_lr().is_finite(), "lr must remain finite");
 
-            sched.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.5],
-                extra: vec![
-                    ("initial_lr".to_owned(), 0.5),
-                    ("factor".to_owned(), factor),
-                    ("total_iters".to_owned(), 3.0),
-                ],
-            });
+            let before = sched.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::ConstantLR { factor: value, .. } = &mut invalid.config {
+                *value = factor;
+            }
+            assert!(sched.load_state_dict(invalid).is_err());
+            assert_eq!(sched.state_dict(), before);
             sched.step(&mut opt, Some(0));
             assert_eq!(opt.get_lr(), 0.0, "loaded invalid factor {factor:?}");
             assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
@@ -17966,58 +18072,26 @@ mod tests {
     }
 
     #[test]
-    fn warmup_schedulers_clamp_loaded_invalid_initial_lr() {
-        for initial_lr in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
-            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-
-            let x = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut sched = LinearLR::new(&opt).start_factor(1.0).end_factor(1.0);
-            sched.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("start_factor".to_owned(), 1.0),
-                    ("end_factor".to_owned(), 1.0),
-                    ("total_iters".to_owned(), 5.0),
-                ],
-            });
-            sched.step(&mut opt, Some(0));
-            assert_eq!(opt.get_lr(), 0.0, "LinearLR initial_lr {initial_lr:?}");
-            assert!(opt.get_lr().is_finite());
-
-            let x = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut sched = PolynomialLR::new(&opt, 10, 1.0);
-            sched.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("total_iters".to_owned(), 10.0),
-                    ("power".to_owned(), 1.0),
-                ],
-            });
-            sched.step(&mut opt, Some(5));
-            assert_eq!(opt.get_lr(), 0.0, "PolynomialLR initial_lr {initial_lr:?}");
-            assert!(opt.get_lr().is_finite());
-
-            let x = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
-            let mut opt = SGD::new(vec![x], 1.0);
-            let mut sched = ConstantLR::new(&opt, 0.5, 3);
-            sched.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![1.0],
-                extra: vec![
-                    ("initial_lr".to_owned(), initial_lr),
-                    ("factor".to_owned(), 0.5),
-                    ("total_iters".to_owned(), 3.0),
-                ],
-            });
-            sched.step(&mut opt, Some(0));
-            assert_eq!(opt.get_lr(), 0.0, "ConstantLR initial_lr {initial_lr:?}");
-            assert!(opt.get_lr().is_finite());
+    fn warmup_schedulers_reject_loaded_invalid_initial_lr() {
+        let opt = SGD::new(Vec::new(), 1.0);
+        let mut schedulers: Vec<Box<dyn LRScheduler>> = vec![
+            Box::new(LinearLR::new(&opt)),
+            Box::new(PolynomialLR::new(&opt, 10, 1.0)),
+            Box::new(ConstantLR::new(&opt, 0.5, 3)),
+        ];
+        for scheduler in &mut schedulers {
+            let before = scheduler.state_dict();
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+                let mut state = before.clone();
+                match &mut state.config {
+                    SchedulerConfig::LinearLR { initial_lr, .. }
+                    | SchedulerConfig::PolynomialLR { initial_lr, .. }
+                    | SchedulerConfig::ConstantLR { initial_lr, .. } => *initial_lr = invalid,
+                    _ => unreachable!(),
+                }
+                assert!(scheduler.load_state_dict(state).is_err());
+                assert_eq!(scheduler.state_dict(), before);
+            }
         }
     }
 
@@ -18030,7 +18104,7 @@ mod tests {
         sched.step(&mut opt, Some(3));
         let state = sched.state_dict();
         let mut sched2 = ConstantLR::new(&opt, 0.2, 10);
-        sched2.load_state_dict(state);
+        sched2.load_state_dict(state).unwrap();
         assert_eq!(sched.get_last_lr(), sched2.get_last_lr());
     }
 
@@ -18665,7 +18739,7 @@ mod tests {
             }
             let mut restored_optimizer = SGD::new(Vec::new(), optimizer.get_lr());
             let mut restored = CyclicLR::new(&restored_optimizer, 0.0, 1.0, 7);
-            restored.load_state_dict(scheduler.state_dict());
+            restored.load_state_dict(scheduler.state_dict()).unwrap();
             for _ in 0..20 {
                 scheduler.step(&mut optimizer, None);
                 restored.step(&mut restored_optimizer, None);
@@ -18810,18 +18884,16 @@ mod tests {
             assert!(opt_max.get_lr().is_finite(), "max lr must remain finite");
             assert!(opt_max.get_lr() >= 0.0, "max lr must remain non-negative");
 
-            max_scheduler.load_state_dict(SchedulerState {
-                last_epoch: -1,
-                last_lrs: vec![0.0],
-                extra: vec![
-                    ("base_lr".to_owned(), bound),
-                    ("max_lr".to_owned(), bound),
-                    ("step_size_up".to_owned(), 1.0),
-                    ("step_size_down".to_owned(), 1.0),
-                    ("iteration".to_owned(), 1.0),
-                ],
-            });
-            max_scheduler.step(&mut opt_max, None);
+            let before = max_scheduler.state_dict();
+            for change_base in [false, true] {
+                let mut invalid = before.clone();
+                if let SchedulerConfig::CyclicLR { base_lr, max_lr, .. } = &mut invalid.config {
+                    if change_base { *base_lr = bound; } else { *max_lr = bound; }
+                }
+                assert!(max_scheduler.load_state_dict(invalid).is_err());
+                assert_eq!(max_scheduler.state_dict(), before);
+            }
+            max_scheduler.step(&mut opt_max, Some(1));
             assert_eq!(opt_max.get_lr(), 0.0, "loaded invalid bound {bound:?}");
             assert!(opt_max.get_lr().is_finite(), "loaded lr must remain finite");
             assert!(
@@ -18846,13 +18918,13 @@ mod tests {
 
         let state = scheduler.state_dict();
         let mut scheduler2 = CyclicLR::new(&opt, 0.001, 0.01, 5);
-        scheduler2.load_state_dict(state);
+        scheduler2.load_state_dict(state).unwrap();
 
         assert_eq!(scheduler.get_last_lr(), scheduler2.get_last_lr());
     }
 
     #[test]
-    fn cyclic_lr_load_state_dict_ignores_invalid_step_sizes() {
+    fn cyclic_lr_load_state_dict_rejects_invalid_step_sizes() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
@@ -18861,32 +18933,23 @@ mod tests {
         let mut scheduler = CyclicLR::new(&opt, 0.001, 0.01, 5).step_size_down(4);
         let original = scheduler.state_dict();
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: 3,
-            last_lrs: vec![0.006],
-            extra: vec![
-                ("base_lr".to_owned(), 0.001),
-                ("max_lr".to_owned(), 0.01),
-                ("step_size_up".to_owned(), 0.0),
-                ("step_size_down".to_owned(), -2.0),
-                ("iteration".to_owned(), 2.25),
-            ],
-        });
-
-        let restored = scheduler.state_dict();
-        assert_eq!(restored.last_epoch, 3);
-        assert_eq!(restored.last_lrs, vec![0.006]);
-        for key in ["step_size_up", "step_size_down", "iteration"] {
-            assert_eq!(
-                restored
-                    .extra
-                    .iter()
-                    .find(|(name, _)| name.as_str().cmp(key).is_eq()),
-                original
-                    .extra
-                    .iter()
-                    .find(|(name, _)| name.as_str().cmp(key).is_eq())
-            );
+        for change_up in [false, true] {
+            let mut invalid = original.clone();
+            invalid.last_epoch = 3;
+            if let SchedulerConfig::CyclicLR {
+                step_size_up,
+                step_size_down,
+                ..
+            } = &mut invalid.config
+            {
+                if change_up {
+                    *step_size_up = 0;
+                } else {
+                    *step_size_down = 0;
+                }
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), original);
         }
     }
 
@@ -18915,31 +18978,27 @@ mod tests {
         let mut opt = SGD::new(vec![x], 0.1);
         let mut scheduler = CyclicLR::new(&opt, 0.001, 0.01, 1);
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: 7,
-            last_lrs: vec![0.001],
-            extra: vec![
-                ("base_lr".to_owned(), 0.001),
-                ("max_lr".to_owned(), 0.01),
-                ("step_size_up".to_owned(), 1.0),
-                ("step_size_down".to_owned(), 1.0),
-                ("iteration".to_owned(), usize::MAX as f64),
-            ],
-        });
+        let mut state = scheduler.state_dict();
+        state.last_epoch = 7;
+        if let SchedulerConfig::CyclicLR { iteration, .. } = &mut state.config {
+            *iteration = usize::MAX;
+        }
+        let json = serde_json::to_string(&state).unwrap();
+        scheduler
+            .load_state_dict(serde_json::from_str(&json).unwrap())
+            .unwrap();
 
         scheduler.step(&mut opt, None);
 
         let lr = opt.get_lr();
         assert!(lr.is_finite(), "lr should remain finite, got {lr}");
-        assert_eq!(
-            scheduler
-                .state_dict()
-                .extra
-                .iter()
-                .find(|(name, _)| name.as_str().cmp("iteration").is_eq())
-                .map(|(_, value)| *value),
-            Some(usize::MAX as f64)
-        );
+        assert!(matches!(
+            scheduler.state_dict().config,
+            SchedulerConfig::CyclicLR {
+                iteration: usize::MAX,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -18951,17 +19010,9 @@ mod tests {
         let mut opt = SGD::new(vec![x], 0.1);
         let mut scheduler = CyclicLR::new(&opt, 0.001, 0.01, 1);
 
-        scheduler.load_state_dict(SchedulerState {
-            last_epoch: i64::MAX,
-            last_lrs: vec![0.001],
-            extra: vec![
-                ("base_lr".to_owned(), 0.001),
-                ("max_lr".to_owned(), 0.01),
-                ("step_size_up".to_owned(), 1.0),
-                ("step_size_down".to_owned(), 1.0),
-                ("iteration".to_owned(), 0.0),
-            ],
-        });
+        let mut state = scheduler.state_dict();
+        state.last_epoch = i64::MAX;
+        scheduler.load_state_dict(state).unwrap();
 
         scheduler.step(&mut opt, None);
 
@@ -19035,7 +19086,7 @@ mod tests {
     }
 
     #[test]
-    fn multiplicative_lr_loaded_invalid_scalars_are_clamped() {
+    fn multiplicative_lr_loaded_invalid_scalars_are_rejected() {
         for scalar in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = session
@@ -19044,15 +19095,17 @@ mod tests {
             let mut opt = SGD::new(vec![x], 1.0);
             let mut scheduler = MultiplicativeLR::new(&opt, |_epoch| 0.5);
 
-            scheduler.load_state_dict(SchedulerState {
-                last_epoch: 0,
-                last_lrs: vec![scalar],
-                extra: vec![("initial_lr".to_owned(), scalar)],
-            });
+            let before = scheduler.state_dict();
+            let mut invalid = before.clone();
+            if let SchedulerConfig::MultiplicativeLR { initial_lr } = &mut invalid.config {
+                *initial_lr = scalar;
+            }
+            assert!(scheduler.load_state_dict(invalid).is_err());
+            assert_eq!(scheduler.state_dict(), before);
             scheduler.step(&mut opt, None);
 
             let lr = opt.get_lr();
-            assert_eq!(lr, 0.0, "invalid loaded scalar {scalar:?}");
+            assert_eq!(lr, 1.0, "invalid loaded scalar {scalar:?}");
             assert!(lr.is_finite(), "loaded lr must stay finite");
             assert!(lr >= 0.0, "loaded lr must stay non-negative");
         }
