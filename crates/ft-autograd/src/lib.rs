@@ -7090,6 +7090,255 @@ impl TensorTape {
         Ok(())
     }
 
+    /// Validate logits-space BCE without constraining the target's values.
+    /// Unlike probability BCE, this operation permits nonfinite logits and
+    /// targets outside [0, 1]; their ordinary IEEE results remain observable.
+    pub fn validate_binary_cross_entropy_with_logits_inputs(
+        &self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        let input = &self.node(input)?.tensor;
+        let target = &self.node(target)?.tensor;
+        if input.meta().shape() != target.meta().shape()
+            || input.meta().device() != target.meta().device()
+        {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "binary_cross_entropy_with_logits requires matching shapes and devices",
+                }
+                .into(),
+            ));
+        }
+        for tensor in [input, target] {
+            if !matches!(
+                tensor.meta().dtype(),
+                DType::F64 | DType::F32 | DType::F16 | DType::BF16
+            ) {
+                return Err(DenseTensorError::UnsupportedDType(tensor.meta().dtype()).into());
+            }
+        }
+        Ok(())
+    }
+
+    fn logits_bce_round(value: f64, dtype: DType) -> f64 {
+        match dtype {
+            DType::F64 => value,
+            DType::F16 => f64::from(ft_core::Float16::from_f32(value as f32).to_f32()),
+            DType::BF16 => f64::from(ft_core::BFloat16::from_f32(value as f32).to_f32()),
+            _ => f64::from(value as f32),
+        }
+    }
+
+    /// Unreduced BCE with logits and optional scalar positive-class weight.
+    ///
+    /// Follow ATen/native/Loss.cpp's `(1-target)*input - log_sigmoid(input)`
+    /// evaluation order, including its nonfinite behavior. Differentiating a
+    /// max/abs decomposition would lose the logistic curvature at zero. The
+    /// explicit adjoint instead uses both sigmoid tails, so confident correct
+    /// predictions also retain their small gradients without cancellation.
+    pub fn binary_cross_entropy_with_logits(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        pos_weight: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.validate_binary_cross_entropy_with_logits_inputs(input, target)?;
+        let dtype = self.node(input)?.tensor.meta().dtype();
+        let target_dtype = self.node(target)?.tensor.meta().dtype();
+        let pos_weight = pos_weight.map(|weight| Self::logits_bce_round(weight, target_dtype));
+        // Keep inference on native F32 storage. The custom-function interface
+        // widens its inputs to F64; no backward needs that copy in this case.
+        if dtype == DType::F32
+            && target_dtype == DType::F32
+            && (!self.grad_enabled
+                || (!self.node(input)?.requires_grad && !self.node(target)?.requires_grad))
+            && self.node(input)?.tensor.meta().is_contiguous()
+            && self.node(target)?.tensor.meta().is_contiguous()
+        {
+            use rayon::prelude::*;
+
+            let input = &self.node(input)?.tensor;
+            let target = &self.node(target)?.tensor;
+            let values = input
+                .contiguous_values_f32()?
+                .par_iter()
+                .zip(target.contiguous_values_f32()?.par_iter())
+                .map(|(&x, &target)| {
+                    let mut log_sigmoid = x.min(0.0) - (-x.abs()).exp().ln_1p();
+                    if let Some(weight) = pos_weight {
+                        log_sigmoid *= 1.0 + (weight as f32 - 1.0) * target;
+                    }
+                    (1.0 - target) * x - log_sigmoid
+                })
+                .collect();
+            let meta =
+                TensorMeta::from_shape(input.meta().shape().to_vec(), dtype, input.meta().device());
+            let output = DenseTensor::from_storage_f32(meta, values)?;
+            return Ok(self.leaf_tensor(output, false));
+        }
+        let out = self.apply_function_with_create_graph(
+            &[input, target],
+            move |ctx, inputs| {
+                use rayon::prelude::*;
+
+                let (x, shape) = inputs[0];
+                let (target, _) = inputs[1];
+                if ctx.needs_input_grad().iter().any(|&needed| needed) {
+                    ctx.save_for_backward(x.to_vec(), shape.to_vec());
+                    ctx.save_for_backward(target.to_vec(), shape.to_vec());
+                }
+                let values = x
+                    .par_iter()
+                    .zip(target.par_iter())
+                    .map(|(&x, &target)| {
+                        let log_sigmoid = if dtype == DType::F64 {
+                            x.min(0.0) - (-x.abs()).exp().ln_1p()
+                        } else {
+                            let x = x as f32;
+                            f64::from(x.min(0.0) - (-x.abs()).exp().ln_1p())
+                        };
+                        let mut log_sigmoid = Self::logits_bce_round(log_sigmoid, dtype);
+                        if let Some(weight) = pos_weight {
+                            let difference = Self::logits_bce_round(weight - 1.0, target_dtype);
+                            let scaled = Self::logits_bce_round(difference * target, target_dtype);
+                            let log_weight = Self::logits_bce_round(1.0 + scaled, target_dtype);
+                            log_sigmoid = Self::logits_bce_round(log_sigmoid * log_weight, dtype);
+                        }
+                        // ATen mutates the target-dtype temporary at each
+                        // stage; mixed input/target dtypes must retain those
+                        // rounding points, not promote the whole loss to F64.
+                        let complement = Self::logits_bce_round(1.0 - target, target_dtype);
+                        let product = Self::logits_bce_round(complement * x, target_dtype);
+                        Self::logits_bce_round(product - log_sigmoid, target_dtype)
+                    })
+                    .collect();
+                Ok((values, shape.to_vec()))
+            },
+            move |ctx, incoming| {
+                let x = &ctx.saved_tensors()[0];
+                let target = &ctx.saved_tensors()[1];
+                let input_grad = ctx.needs_input_grad()[0].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(x.iter().zip(target))
+                        .map(|(&grad, (&x, &target))| {
+                            let positive = (1.0 - target) / (1.0 + (-x).exp());
+                            let mut negative = target / (1.0 + x.exp());
+                            if let Some(weight) = pos_weight {
+                                negative *= weight;
+                            }
+                            (positive - negative) * grad
+                        })
+                        .collect()
+                });
+                let target_grad = ctx.needs_input_grad()[1].then(|| {
+                    incoming[0]
+                        .iter()
+                        .zip(x)
+                        .map(|(&grad, &x)| {
+                            let local = if let Some(weight) = pos_weight {
+                                let correction = (-x.abs()).exp().ln_1p();
+                                let log_positive = x.min(0.0) - correction;
+                                let log_negative = (-x).min(0.0) - correction;
+                                log_negative - weight * log_positive
+                            } else {
+                                -x
+                            };
+                            local * grad
+                        })
+                        .collect()
+                });
+                Ok(vec![input_grad, target_grad])
+            },
+            move |ctx, incoming, inputs, tape| {
+                let x = tape.cg_to_f64(inputs[0])?;
+                let target = tape.cg_to_f64(inputs[1])?;
+                let grad = tape.cg_to_f64(incoming[0])?;
+                let negative_x = tape.cg_neg(x)?;
+                let input_grad = if ctx.needs_input_grad()[0] {
+                    let shape = tape.node(x)?.tensor.meta().shape().to_vec();
+                    let numel = tape.node(x)?.tensor.meta().numel();
+                    let device = tape.node(x)?.tensor.meta().device();
+                    let one = tape.leaf_tensor(
+                        DenseTensor::from_storage(
+                            TensorMeta::from_shape(shape, DType::F64, device),
+                            vec![1.0; numel],
+                        )?,
+                        false,
+                    );
+                    let complement = tape.cg_sub(one, target)?;
+                    let positive_sigmoid = tape.sigmoid(x, ExecutionMode::Strict)?.0;
+                    let negative_sigmoid = tape.sigmoid(negative_x, ExecutionMode::Strict)?.0;
+                    let positive = tape.cg_mul(positive_sigmoid, complement)?;
+                    let mut negative = tape.cg_mul(negative_sigmoid, target)?;
+                    if let Some(weight) = pos_weight {
+                        negative = tape.cg_mul_scalar(negative, weight)?;
+                    }
+                    let local = tape.cg_sub(positive, negative)?;
+                    Some(tape.cg_mul(local, grad)?)
+                } else {
+                    None
+                };
+                let target_grad = if ctx.needs_input_grad()[1] {
+                    let local = if let Some(weight) = pos_weight {
+                        let log_positive = tape.cg_log_sigmoid(x)?;
+                        let log_negative = tape.cg_log_sigmoid(negative_x)?;
+                        let weighted = tape.cg_mul_scalar(log_positive, weight)?;
+                        tape.cg_sub(log_negative, weighted)?
+                    } else {
+                        negative_x
+                    };
+                    Some(tape.cg_mul(local, grad)?)
+                } else {
+                    None
+                };
+                Ok(vec![input_grad, target_grad])
+            },
+        )?;
+        if self.node(out)?.requires_grad {
+            self.save_custom_function_input_versions(out, &[input, target])?;
+        }
+        Ok(out)
+    }
+
+    /// Exact log-sigmoid for the logits loss's differentiable target adjoint.
+    /// The public softplus operation has a linear threshold and cannot supply
+    /// the unthresholded derivative required by this loss.
+    fn cg_log_sigmoid(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let out = self.apply_function_with_create_graph(
+            &[input],
+            |ctx, inputs| {
+                let (values, shape) = inputs[0];
+                if ctx.needs_input_grad()[0] {
+                    ctx.save_for_backward(values.to_vec(), shape.to_vec());
+                }
+                let output = values
+                    .iter()
+                    .map(|&x| x.min(0.0) - (-x.abs()).exp().ln_1p())
+                    .collect();
+                Ok((output, shape.to_vec()))
+            },
+            |ctx, incoming| {
+                let gradient = incoming[0]
+                    .iter()
+                    .zip(&ctx.saved_tensors()[0])
+                    .map(|(&grad, &x)| grad / (1.0 + x.exp()))
+                    .collect();
+                Ok(vec![Some(gradient)])
+            },
+            |_ctx, incoming, inputs, tape| {
+                let negative = tape.cg_neg(inputs[0])?;
+                let sigmoid = tape.sigmoid(negative, ExecutionMode::Strict)?.0;
+                Ok(vec![Some(tape.cg_mul(incoming[0], sigmoid)?)])
+            },
+        )?;
+        if self.node(out)?.requires_grad {
+            self.save_custom_function_input_versions(out, &[input])?;
+        }
+        Ok(out)
+    }
+
     /// Unreduced probability-space BCE, including PyTorch's endpoint derivatives.
     ///
     /// ATen/native/Loss.cpp clamps each logarithm to -100, not the input

@@ -16649,108 +16649,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input = self.maybe_autocast_fp32(input)?;
-        let target = self.maybe_autocast_fp32(target)?;
-        // BCE_logits = max(input, 0) - input * target + log(1 + exp(-|input|))
-        let shape = self.tensor_shape(input)?;
-        // No-grad fused fast path: the compose below is 11 elementwise tape ops + 2 full() allocs
-        // (~13 full-size materialisations; measured 5.4x SLOWER than torch). Compute the stable
-        // per-element loss in ONE parallel pass over the borrowed contiguous storage, then reduce
-        // via the existing tensor_mean/tensor_sum (so the reduction output is identical). It's a
-        // transcendental (exp/log) tolerance loss; f64-accumulated per-element value is at-or-more
-        // accurate than the f32 compose. Grad / shape-mismatch / non-contiguous / non-float fall
-        // through. frankentorch-specf32.
-        if !self.tensor_requires_grad(input)?
-            && !self.tensor_requires_grad(target)?
-            && self.tensor_shape(target)? == shape
-            && reduction != "none"
-        {
-            let dt = self.tensor_dtype(input)?;
-            let loss_built: Option<(Option<Vec<f64>>, Option<Vec<f32>>)> = {
-                let xt = self.tensor_tape.tensor(input)?;
-                let tt = self.tensor_tape.tensor(target)?;
-                if xt.meta().is_contiguous()
-                    && tt.meta().is_contiguous()
-                    && matches!(dt, DType::F32 | DType::F64)
-                    && self.tensor_dtype(target)? == dt
-                {
-                    use rayon::prelude::*;
-                    match dt {
-                        // f32: compute NATIVELY in f32 (f32 expf/lnf is ~2x faster than f64 exp/ln
-                        // AND matches the f32 compose's per-op rounding).
-                        DType::F32 => {
-                            let xv = xt.contiguous_values_f32()?;
-                            let zv = tt.contiguous_values_f32()?;
-                            if xv.len() == zv.len() {
-                                let l: Vec<f32> = xv
-                                    .par_iter()
-                                    .zip(zv.par_iter())
-                                    .map(|(&x, &z)| {
-                                        x.max(0.0) - x * z + (1.0_f32 + (-x.abs()).exp()).ln()
-                                    })
-                                    .collect();
-                                Some((None, Some(l)))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => {
-                            let xv = xt.contiguous_values()?;
-                            let zv = tt.contiguous_values()?;
-                            if xv.len() == zv.len() {
-                                let l: Vec<f64> = xv
-                                    .par_iter()
-                                    .zip(zv.par_iter())
-                                    .map(|(&x, &z)| {
-                                        x.max(0.0) - x * z + (1.0 + (-x.abs()).exp()).ln()
-                                    })
-                                    .collect();
-                                Some((Some(l), None))
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
-            let loss = match loss_built {
-                Some((Some(l64), None)) => Some(self.tensor_variable(l64, shape.clone(), false)?),
-                Some((None, Some(l32))) => {
-                    Some(self.tensor_variable_f32(l32, shape.clone(), false)?)
-                }
-                _ => None,
-            };
-            if let Some(loss) = loss {
-                return match reduction {
-                    "mean" => self.tensor_mean(loss),
-                    "sum" => self.tensor_sum(loss),
-                    _ => unreachable!("reduction != none guarded above"),
-                };
-            }
-        }
-        let zeros = self.const_tensor_like(input, shape.clone(), 0.0)?;
-        let relu_input = self.tensor_maximum(input, zeros)?;
-        let input_target = self.tensor_mul(input, target)?;
-        let term1 = self.tensor_sub(relu_input, input_target)?;
-        let abs_input = self.tensor_abs(input)?;
-        let neg_abs_input = self.tensor_neg(abs_input)?;
-        let exp_term = self.tensor_exp(neg_abs_input)?;
-        let ones = self.const_tensor_like(input, shape, 1.0)?;
-        let one_plus_exp = self.tensor_add(ones, exp_term)?;
-        let log_term = self.tensor_log(one_plus_exp)?;
-        let loss = self.tensor_add(term1, log_term)?;
-        match reduction {
-            "none" => Ok(loss),
-            "mean" => self.tensor_mean(loss),
-            "sum" => self.tensor_sum(loss),
-            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "bce_with_logits_loss: reduction must be 'none', 'mean', or 'sum'",
-                },
-            ))),
-        }
+        self.bce_with_logits_impl(input, target, None, reduction)
     }
 
     /// Alias for tensor_bce_with_logits_loss.
@@ -16770,11 +16669,8 @@ impl FrankenTorchSession {
     /// target, pos_weight=pos_weight, reduction=reduction)` for a scalar
     /// `pos_weight` (the common per-binary-task imbalance weight).
     ///
-    /// Derived from `l = pos_weight·t·softplus(-x) + (1-t)·softplus(x)` and
-    /// `softplus(x) = softplus(-x) + x`:
-    ///   l = (1-t)·x + log_weight·(max(-x, 0) + log(1 + e^{-|x|}))
-    /// with `log_weight = 1 + (pos_weight-1)·t`. pos_weight=1 reduces to the
-    /// plain stable BCE-with-logits. Composed from autograd-aware ops.
+    /// Uses the stable log-sigmoid forward and explicit logistic derivatives,
+    /// including higher derivatives at zero and gradients of trainable targets.
     pub fn tensor_bce_with_logits_pos_weight(
         &mut self,
         input: TensorNodeId,
@@ -16782,125 +16678,35 @@ impl FrankenTorchSession {
         pos_weight: f64,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        self.bce_with_logits_impl(input, target, Some(pos_weight), reduction)
+    }
+
+    fn bce_with_logits_impl(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        pos_weight: Option<f64>,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !matches!(reduction, "none" | "mean" | "sum") {
+            return Err(Self::incompatible_tensor_args(
+                "bce_with_logits_loss: reduction must be 'none', 'mean', or 'sum'",
+            ));
+        }
+        // Validate before AMP can record casts, and before any forward nodes
+        // are created. In particular, logits BCE does not broadcast targets.
+        self.tensor_tape
+            .validate_binary_cross_entropy_with_logits_inputs(input, target)?;
         let input = self.maybe_autocast_fp32(input)?;
         let target = self.maybe_autocast_fp32(target)?;
-        if (pos_weight - 1.0).abs() < f64::EPSILON {
-            return self.tensor_bce_with_logits_loss(input, target, reduction);
-        }
-        let shape = self.tensor_shape(input)?;
-        // No-grad fused fast path: the compose below is 13 elementwise ops + 2 full() allocs.
-        // loss = (1-z)·x + (1+(pw-1)·z)·(max(-x,0) + log(1+exp(-|x|))) in ONE parallel pass
-        // (f32-native expf/lnf for f32), then reduce via tensor_mean/tensor_sum. Grad / "none" /
-        // shape-mismatch / non-contiguous / non-float fall through. frankentorch-specf32.
-        if reduction != "none"
-            && !self.tensor_requires_grad(input)?
-            && !self.tensor_requires_grad(target)?
-            && self.tensor_shape(target)? == shape
-        {
-            let dt = self.tensor_dtype(input)?;
-            let loss_built: Option<(Option<Vec<f64>>, Option<Vec<f32>>)> = {
-                let xt = self.tensor_tape.tensor(input)?;
-                let tt = self.tensor_tape.tensor(target)?;
-                if xt.meta().is_contiguous()
-                    && tt.meta().is_contiguous()
-                    && matches!(dt, DType::F32 | DType::F64)
-                    && self.tensor_dtype(target)? == dt
-                {
-                    use rayon::prelude::*;
-                    match dt {
-                        DType::F32 => {
-                            let xv = xt.contiguous_values_f32()?;
-                            let zv = tt.contiguous_values_f32()?;
-                            if xv.len() == zv.len() {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let pw_m1 = (pos_weight - 1.0) as f32;
-                                let l: Vec<f32> = xv
-                                    .par_iter()
-                                    .zip(zv.par_iter())
-                                    .map(|(&x, &z)| {
-                                        let log_weight = 1.0 + pw_m1 * z;
-                                        let softplus_neg =
-                                            (-x).max(0.0) + (1.0_f32 + (-x.abs()).exp()).ln();
-                                        (1.0 - z) * x + log_weight * softplus_neg
-                                    })
-                                    .collect();
-                                Some((None, Some(l)))
-                            } else {
-                                None
-                            }
-                        }
-                        _ => {
-                            let xv = xt.contiguous_values()?;
-                            let zv = tt.contiguous_values()?;
-                            if xv.len() == zv.len() {
-                                let pw_m1 = pos_weight - 1.0;
-                                let l: Vec<f64> = xv
-                                    .par_iter()
-                                    .zip(zv.par_iter())
-                                    .map(|(&x, &z)| {
-                                        let log_weight = 1.0 + pw_m1 * z;
-                                        let softplus_neg =
-                                            (-x).max(0.0) + (1.0 + (-x.abs()).exp()).ln();
-                                        (1.0 - z) * x + log_weight * softplus_neg
-                                    })
-                                    .collect();
-                                Some((Some(l), None))
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
-            let loss = match loss_built {
-                Some((Some(l64), None)) => Some(self.tensor_variable(l64, shape.clone(), false)?),
-                Some((None, Some(l32))) => {
-                    Some(self.tensor_variable_f32(l32, shape.clone(), false)?)
-                }
-                _ => None,
-            };
-            if let Some(loss) = loss {
-                return match reduction {
-                    "mean" => self.tensor_mean(loss),
-                    "sum" => self.tensor_sum(loss),
-                    _ => unreachable!("reduction != none guarded above"),
-                };
-            }
-        }
-        let ones = self.const_tensor_like(input, shape.clone(), 1.0)?;
-        let zeros = self.const_tensor_like(input, shape, 0.0)?;
-
-        // log_weight = 1 + (pos_weight - 1) * target
-        let lw_scaled = self.tensor_mul_scalar(target, pos_weight - 1.0)?;
-        let log_weight = self.tensor_add(ones, lw_scaled)?;
-
-        // softplus(-x) = max(-x, 0) + log(1 + e^{-|x|})
-        let neg_x = self.tensor_neg(input)?;
-        let max_neg = self.tensor_maximum(neg_x, zeros)?;
-        let abs_x = self.tensor_abs(input)?;
-        let neg_abs = self.tensor_neg(abs_x)?;
-        let exp_term = self.tensor_exp(neg_abs)?;
-        let one_plus_exp = self.tensor_add(ones, exp_term)?;
-        let log_term = self.tensor_log(one_plus_exp)?;
-        let softplus_neg = self.tensor_add(max_neg, log_term)?;
-
-        // term1 = (1 - t) * x ; term2 = log_weight * softplus(-x)
-        let one_minus_t = self.tensor_sub(ones, target)?;
-        let term1 = self.tensor_mul(one_minus_t, input)?;
-        let term2 = self.tensor_mul(log_weight, softplus_neg)?;
-        let loss = self.tensor_add(term1, term2)?;
-
+        let loss = self
+            .tensor_tape
+            .binary_cross_entropy_with_logits(input, target, pos_weight)?;
         match reduction {
             "none" => Ok(loss),
             "mean" => self.tensor_mean(loss),
             "sum" => self.tensor_sum(loss),
-            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "bce_with_logits: reduction must be 'none', 'mean', or 'sum'",
-                },
-            ))),
+            _ => unreachable!("reduction validated before recording logits BCE"),
         }
     }
 
@@ -108666,6 +108472,402 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bce_logits_has_logistic_curvature_through_fourth_order() {
+        // At x=0 and x=ln(3), sigmoid is exactly 1/2 and 3/4. These
+        // independent polynomial derivatives detect the zero curvature caused
+        // by differentiating max/abs, including weighted positive classes.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for positive_weight in [None, Some(3.0)] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = probability_bce_tensor(
+                        &mut session,
+                        &[0.0, 3.0_f64.ln()],
+                        vec![2],
+                        dtype,
+                        true,
+                    );
+                    let target =
+                        probability_bce_tensor(&mut session, &[0.25, 0.25], vec![2], dtype, false);
+                    let weight =
+                        probability_bce_tensor(&mut session, &[2.0, -0.5], vec![2], dtype, false);
+                    let loss = match positive_weight {
+                        Some(p) => session.tensor_bce_with_logits_pos_weight(x, target, p, "none"),
+                        None => session.tensor_bce_with_logits_loss(x, target, "none"),
+                    }
+                    .unwrap();
+                    assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                    let mut root = session.tensor_mul(loss, weight).unwrap();
+                    let expected = if positive_weight.is_some() {
+                        [
+                            [0.0, -0.1875],
+                            [0.75, -0.140625],
+                            [0.0, 0.0703125],
+                            [-0.375, 0.017578125],
+                        ]
+                    } else {
+                        [
+                            [0.5, -0.25],
+                            [0.5, -0.09375],
+                            [0.0, 0.046875],
+                            [-0.25, 0.01171875],
+                        ]
+                    };
+                    let tolerance = if dtype == DType::F64 { 1e-13 } else { 2e-7 };
+                    for (order, expected) in expected.iter().enumerate() {
+                        let report = session
+                            .tensor_backward_with_options(
+                                root,
+                                BackwardOptions::for_mode(mode)
+                                    .with_create_graph(order < 3)
+                                    .with_retain_graph(true),
+                            )
+                            .unwrap();
+                        assert_probability_bce_close(
+                            report.gradient(x).unwrap(),
+                            expected,
+                            tolerance,
+                        );
+                        if order < 3 {
+                            root = report.gradient_node(x).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bce_logits_trainable_targets_keep_mixed_derivatives() {
+        for dtype in [DType::F64, DType::F32] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x =
+                probability_bce_tensor(&mut session, &[0.0, 3.0_f64.ln()], vec![2], dtype, true);
+            let target = probability_bce_tensor(&mut session, &[0.25, 0.75], vec![2], dtype, true);
+            let weights = probability_bce_tensor(&mut session, &[2.0, -0.5], vec![2], dtype, false);
+            let loss = session
+                .tensor_bce_with_logits_pos_weight(x, target, 3.0, "none")
+                .unwrap();
+            let loss = session.tensor_mul(loss, weights).unwrap();
+            let options = BackwardOptions::strict_default()
+                .with_create_graph(true)
+                .with_retain_graph(true);
+            let report = session.tensor_backward_with_options(loss, options).unwrap();
+            let tolerance = if dtype == DType::F64 { 1e-13 } else { 2e-7 };
+            assert_probability_bce_close(
+                report.gradient(target).unwrap(),
+                &[
+                    4.0 * std::f64::consts::LN_2,
+                    -0.5 * (2.0 * 4.0_f64.ln() - 3.0 * 3.0_f64.ln()),
+                ],
+                tolerance,
+            );
+            let target_grad = report.gradient_node(target).unwrap();
+            let mixed = session
+                .tensor_backward_with_options(target_grad, options)
+                .unwrap();
+            assert_probability_bce_close(mixed.gradient(x).unwrap(), &[-4.0, 0.75], tolerance);
+            let mixed_node = mixed.gradient_node(x).unwrap();
+            let third = session.tensor_backward(mixed_node).unwrap();
+            assert_probability_bce_close(third.gradient(x).unwrap(), &[1.0, -0.1875], tolerance);
+        }
+    }
+
+    #[test]
+    fn bce_logits_weighted_strided_inputs_preserve_gradient_layout() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for create_graph in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = probability_bce_tensor(
+                        &mut session,
+                        &[0.0, 3.0_f64.ln(), -3.0_f64.ln(), 0.0],
+                        vec![2, 2],
+                        dtype,
+                        true,
+                    );
+                    let target = probability_bce_tensor(
+                        &mut session,
+                        &[0.0, 0.25, 0.75, 1.0],
+                        vec![2, 2],
+                        dtype,
+                        false,
+                    );
+                    let weight = probability_bce_tensor(
+                        &mut session,
+                        &[1.0, -2.0, 0.5, 3.0],
+                        vec![2, 2],
+                        dtype,
+                        false,
+                    );
+                    let x_view = session.tensor_transpose(x, 0, 1).unwrap();
+                    let target_view = session.tensor_transpose(target, 0, 1).unwrap();
+                    let weight_view = session.tensor_transpose(weight, 0, 1).unwrap();
+                    let loss = session
+                        .tensor_bce_with_logits_pos_weight(x_view, target_view, 3.0, "none")
+                        .unwrap();
+                    let weighted = session.tensor_mul(loss, weight_view).unwrap();
+                    let report = session
+                        .tensor_backward_with_options(
+                            weighted,
+                            BackwardOptions::for_mode(mode).with_create_graph(create_graph),
+                        )
+                        .unwrap();
+                    assert_probability_bce_close(
+                        report.gradient(x).unwrap(),
+                        &[0.5, -0.75, -0.8125, -4.5],
+                        2e-7,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bce_logits_saved_inputs_reject_mutation_before_backward() {
+        for dtype in [DType::F64, DType::F32] {
+            for mutate_target in [false, true] {
+                for create_graph in [false, true] {
+                    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let x = probability_bce_tensor(&mut session, &[0.0, 1.0], vec![2], dtype, true);
+                    let target =
+                        probability_bce_tensor(&mut session, &[1.0, 0.0], vec![2], dtype, false);
+                    let loss = session
+                        .tensor_bce_with_logits_loss(x, target, "sum")
+                        .unwrap();
+                    let modified = if mutate_target { target } else { x };
+                    if dtype == DType::F64 {
+                        session
+                            .tensor_tape
+                            .update_tensor_values(modified, vec![0.5, 0.5])
+                            .unwrap();
+                    } else {
+                        session
+                            .tensor_tape
+                            .update_tensor_values_f32(modified, vec![0.5, 0.5])
+                            .unwrap();
+                    }
+                    assert!(matches!(
+                        session.tensor_backward_with_options(
+                            loss,
+                            BackwardOptions::strict_default().with_create_graph(create_graph),
+                        ),
+                        Err(AutogradError::BorrowedInputVersionMismatch { node, .. }) if node == modified
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bce_logits_nonlinear_upstream_keeps_zero_logit_hessian() {
+        // For L(x)=BCE(x,0)^2: L''(0)=2*(1/2)^2+2*ln(2)*(1/4).
+        for dtype in [DType::F64, DType::F32] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = probability_bce_tensor(&mut session, &[0.0], vec![1], dtype, true);
+            let target = probability_bce_tensor(&mut session, &[0.0], vec![1], dtype, false);
+            let loss = session
+                .tensor_bce_with_logits_loss(x, target, "sum")
+                .unwrap();
+            let square = session.tensor_mul(loss, loss).unwrap();
+            let first = session
+                .tensor_backward_with_options(
+                    square,
+                    BackwardOptions::strict_default().with_create_graph(true),
+                )
+                .unwrap();
+            let gradient = first.gradient_node(x).unwrap();
+            let second = session.tensor_backward(gradient).unwrap();
+            assert_probability_bce_close(
+                second.gradient(x).unwrap(),
+                &[0.5 + 0.5 * std::f64::consts::LN_2],
+                1e-7,
+            );
+        }
+    }
+
+    #[test]
+    fn bce_logits_mixed_floating_dtypes_follow_target_storage() {
+        // ATen builds (1-target) then mutates that temporary, so the
+        // result retains target.dtype even when logits have a different dtype.
+        for (input_dtype, target_dtype) in [(DType::F32, DType::F64), (DType::F64, DType::F32)] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = probability_bce_tensor(
+                &mut session,
+                &[0.0, 100_000_001.0],
+                vec![2],
+                input_dtype,
+                true,
+            );
+            let target =
+                probability_bce_tensor(&mut session, &[0.25, 0.0], vec![2], target_dtype, true);
+            let loss = session
+                .tensor_bce_with_logits_loss(x, target, "none")
+                .unwrap();
+            assert_eq!(session.tensor_dtype(loss).unwrap(), target_dtype);
+            assert_eq!(
+                session.tensor_values_lossy_f64(loss).unwrap(),
+                vec![f64::from(std::f32::consts::LN_2), 100_000_000.0],
+            );
+            let first = session
+                .tensor_backward_with_options(
+                    loss,
+                    BackwardOptions::strict_default().with_create_graph(true),
+                )
+                .unwrap();
+            assert_probability_bce_close(first.gradient(x).unwrap(), &[0.25, 1.0], 1e-12);
+            let gradient = first.gradient_node(x).unwrap();
+            let second = session.tensor_backward(gradient).unwrap();
+            assert_probability_bce_close(second.gradient(x).unwrap(), &[0.25, 0.0], 1e-12);
+        }
+    }
+
+    #[test]
+    fn bce_logits_extremes_follow_log_sigmoid_evaluation_and_retain_tails() {
+        for dtype in [DType::F64, DType::F32] {
+            for tracked in [false, true] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = probability_bce_tensor(
+                    &mut session,
+                    &[
+                        40.0,
+                        -40.0,
+                        1000.0,
+                        -1000.0,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                    ],
+                    vec![6],
+                    dtype,
+                    tracked,
+                );
+                let target = probability_bce_tensor(
+                    &mut session,
+                    &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    vec![6],
+                    dtype,
+                    false,
+                );
+                let loss = session
+                    .tensor_bce_with_logits_loss(x, target, "none")
+                    .unwrap();
+                assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                let values = session.tensor_values_lossy_f64(loss).unwrap();
+                // Loss.cpp evaluates (1-t)*x - log_sigmoid(x). The negative
+                // correct tail rounds to zero, and -infinity minus -infinity
+                // is NaN; replacing that expression with softplus changes it.
+                assert!(
+                    values[0] > 0.0 && (values[0] / 4.248_354_255_291_589e-18 - 1.0).abs() < 1e-6
+                );
+                assert_eq!(&values[1..4], &[0.0, 1000.0, 1000.0]);
+                assert_eq!(values[4], f64::INFINITY);
+                assert!(values[5].is_nan());
+                if tracked {
+                    for create_graph in [false, true] {
+                        let report = session
+                            .tensor_backward_with_options(
+                                loss,
+                                BackwardOptions::strict_default()
+                                    .with_create_graph(create_graph)
+                                    .with_retain_graph(true),
+                            )
+                            .unwrap();
+                        let grad = report.gradient(x).unwrap();
+                        for (actual, expected) in grad[..2]
+                            .iter()
+                            .zip([-4.248_354_255_291_589e-18, 4.248_354_255_291_589e-18])
+                        {
+                            assert!((*actual / expected - 1.0).abs() < 1e-6);
+                        }
+                        assert_eq!(&grad[2..], &[1.0, -1.0, 1.0, 0.0]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bce_logits_rejects_invalid_inputs_before_recording_or_autocast() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for tracked in [false, true] {
+                for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x =
+                        probability_bce_tensor(&mut session, &[0.0; 2], vec![2], dtype, tracked);
+                    let target =
+                        probability_bce_tensor(&mut session, &[0.5; 2], vec![2], dtype, false);
+                    let wrong_shape =
+                        probability_bce_tensor(&mut session, &[0.5], vec![1], dtype, false);
+                    session.autocast_enter(DType::BF16);
+                    for (input, target, reduction) in [
+                        (x, target, "invalid"),
+                        (x, wrong_shape, "mean"),
+                        (TensorNodeId(usize::MAX), target, "none"),
+                    ] {
+                        for positive_weight in [None, Some(3.0)] {
+                            let before = session.autograd_graph_node_count();
+                            let result = match positive_weight {
+                                Some(p) => session
+                                    .tensor_bce_with_logits_pos_weight(input, target, p, reduction),
+                                None => {
+                                    session.tensor_bce_with_logits_loss(input, target, reduction)
+                                }
+                            };
+                            assert!(result.is_err());
+                            assert_eq!(session.autograd_graph_node_count(), before);
+                        }
+                    }
+                    session.autocast_exit();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bce_logits_empty_batches_and_amp_preserve_training_contracts() {
+        for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+            for reduction in ["none", "sum", "mean"] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = probability_bce_tensor(&mut session, &[], vec![0, 2], dtype, true);
+                let target = probability_bce_tensor(&mut session, &[], vec![0, 2], dtype, false);
+                let loss = session
+                    .tensor_bce_with_logits_loss(x, target, reduction)
+                    .unwrap();
+                assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                let values = session.tensor_values_lossy_f64(loss).unwrap();
+                match reduction {
+                    "none" => assert!(values.is_empty()),
+                    "sum" => assert_eq!(values, vec![0.0]),
+                    _ => assert!(values[0].is_nan()),
+                }
+                let report = session.tensor_backward(loss).unwrap();
+                assert_eq!(report.gradient(x).unwrap(), &[]);
+            }
+        }
+        for dtype in [DType::F16, DType::BF16] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = probability_bce_tensor(&mut session, &[0.0], vec![1], dtype, true);
+            let target = probability_bce_tensor(&mut session, &[1.0], vec![1], dtype, false);
+            session.autocast_enter(dtype);
+            let loss = session
+                .tensor_bce_with_logits_pos_weight(x, target, 3.0, "mean")
+                .unwrap();
+            session.autocast_exit();
+            assert_eq!(session.tensor_dtype(loss).unwrap(), DType::F32);
+            let first = session
+                .tensor_backward_with_options(
+                    loss,
+                    BackwardOptions::strict_default().with_create_graph(true),
+                )
+                .unwrap();
+            assert_eq!(first.gradient(x).unwrap(), &[-1.5]);
+            let gradient = first.gradient_node(x).unwrap();
+            let second = session.tensor_backward(gradient).unwrap();
+            assert_eq!(second.gradient(x).unwrap(), &[0.75]);
         }
     }
 
