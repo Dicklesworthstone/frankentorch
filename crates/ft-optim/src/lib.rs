@@ -6096,19 +6096,23 @@ impl CyclicLR {
     }
 
     fn compute_lr(&self, iteration: usize) -> f64 {
-        // PyTorch-compatible CyclicLR formula:
-        // cycle = floor(1 + iteration / (step_size_up + step_size_down))
-        // x = 1 - abs(iteration / step_size_up - 2 * cycle + 1)
-        // x is clamped to [0, 1]
-        let total_size = self.step_size_up.saturating_add(self.step_size_down).max(1);
-        let cycle = 1usize.saturating_add(iteration / total_size);
-        let x = (iteration as f64 / self.step_size_up as f64) - 2.0 * cycle as f64 + 1.0;
-        let scale_x = (1.0 - x.abs()).max(0.0);
+        // Each half-cycle has its own duration. Compute the phase with integer
+        // arithmetic before conversion so large clocks do not lose their
+        // position within a short cycle. A wider sum also handles periods whose
+        // combined length exceeds usize::MAX.
+        let total_size = self.step_size_up as u128 + self.step_size_down as u128;
+        let completed_cycles = (iteration as u128 / total_size) as usize;
+        let phase = iteration as u128 % total_size;
+        let scale_x = if phase <= self.step_size_up as u128 {
+            phase as f64 / self.step_size_up as f64
+        } else {
+            (total_size - phase) as f64 / self.step_size_down as f64
+        };
 
         let scale_fn = match &self.mode {
             CyclicLRMode::Triangular => 1.0,
             CyclicLRMode::Triangular2 => {
-                1.0 / (2.0_f64.powi(powi_exponent_saturating(cycle.saturating_sub(1))))
+                1.0 / (2.0_f64.powi(powi_exponent_saturating(completed_cycles)))
             }
             CyclicLRMode::ExpRange { gamma } => gamma.powi(powi_exponent_saturating(iteration)),
         };
@@ -6120,6 +6124,9 @@ impl CyclicLR {
 impl LRScheduler for CyclicLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         self.last_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
+        if let Some(epoch) = epoch {
+            self.iteration = epoch.max(0) as usize;
+        }
         let lr = self.compute_lr(self.iteration);
         optimizer.set_lr(lr);
         self.last_lr = lr;
@@ -6144,6 +6151,21 @@ impl LRScheduler for CyclicLR {
                 ("step_size_up".to_owned(), self.step_size_up as f64),
                 ("step_size_down".to_owned(), self.step_size_down as f64),
                 ("iteration".to_owned(), self.iteration as f64),
+                (
+                    "mode".to_owned(),
+                    match self.mode {
+                        CyclicLRMode::Triangular => 0.0,
+                        CyclicLRMode::Triangular2 => 1.0,
+                        CyclicLRMode::ExpRange { .. } => 2.0,
+                    },
+                ),
+                (
+                    "gamma".to_owned(),
+                    match self.mode {
+                        CyclicLRMode::ExpRange { gamma } => gamma,
+                        _ => 1.0,
+                    },
+                ),
             ],
         }
     }
@@ -6152,6 +6174,20 @@ impl LRScheduler for CyclicLR {
         self.last_epoch = state.last_epoch;
         if let Some(&lr) = state.last_lrs.first() {
             self.last_lr = lr;
+        }
+        if let Some((_, mode)) = state.extra.iter().find(|(key, _)| key == "mode") {
+            self.mode = if *mode == 1.0 {
+                CyclicLRMode::Triangular2
+            } else if *mode == 2.0 {
+                let gamma = state
+                    .extra
+                    .iter()
+                    .find(|(key, _)| key == "gamma")
+                    .map_or(1.0, |(_, gamma)| finite_non_negative_factor(*gamma));
+                CyclicLRMode::ExpRange { gamma }
+            } else {
+                CyclicLRMode::Triangular
+            };
         }
         for (key, val) in &state.extra {
             match key.as_str() {
@@ -18581,6 +18617,62 @@ mod tests {
     }
 
     // ── CyclicLR Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn cyclic_lr_asymmetric_cycles_match_piecewise_linear_schedule() {
+        for (up, down, expected) in [
+            (2, 4, vec![0.0, 0.5, 1.0, 0.75, 0.5, 0.25]),
+            (4, 2, vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.5]),
+        ] {
+            let mut optimizer = SGD::new(Vec::new(), 1.0);
+            let mut scheduler = CyclicLR::new(&optimizer, 0.0, 1.0, up).step_size_down(down);
+            for epoch in 0..18 {
+                scheduler.step(&mut optimizer, None);
+                assert_eq!(optimizer.get_lr(), expected[epoch % expected.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn cyclic_lr_explicit_epoch_controls_phase_and_subsequent_steps() {
+        let mut optimizer = SGD::new(Vec::new(), 1.0);
+        let mut scheduler = CyclicLR::new(&optimizer, 0.0, 1.0, 2)
+            .step_size_down(4)
+            .mode(CyclicLRMode::Triangular2);
+        scheduler.step(&mut optimizer, Some(9));
+        assert_eq!(optimizer.get_lr(), 0.375);
+        scheduler.step(&mut optimizer, None);
+        assert_eq!(optimizer.get_lr(), 0.25);
+        scheduler.step(&mut optimizer, Some(2));
+        assert_eq!(optimizer.get_lr(), 1.0);
+        scheduler.step(&mut optimizer, None);
+        assert_eq!(optimizer.get_lr(), 0.75);
+    }
+
+    #[test]
+    fn cyclic_lr_resume_restores_scaling_mode_and_gamma() {
+        for mode in [
+            CyclicLRMode::Triangular,
+            CyclicLRMode::Triangular2,
+            CyclicLRMode::ExpRange { gamma: 0.9 },
+        ] {
+            let mut optimizer = SGD::new(Vec::new(), 1.0);
+            let mut scheduler = CyclicLR::new(&optimizer, 0.01, 0.5, 2)
+                .step_size_down(4)
+                .mode(mode);
+            for _ in 0..8 {
+                scheduler.step(&mut optimizer, None);
+            }
+            let mut restored_optimizer = SGD::new(Vec::new(), optimizer.get_lr());
+            let mut restored = CyclicLR::new(&restored_optimizer, 0.0, 1.0, 7);
+            restored.load_state_dict(scheduler.state_dict());
+            for _ in 0..20 {
+                scheduler.step(&mut optimizer, None);
+                restored.step(&mut restored_optimizer, None);
+                assert_eq!(optimizer.get_lr(), restored_optimizer.get_lr());
+            }
+        }
+    }
 
     #[test]
     fn cyclic_lr_triangular_monotonic_increase() {
