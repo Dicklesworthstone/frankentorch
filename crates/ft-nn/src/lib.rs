@@ -11525,6 +11525,183 @@ impl Module for Upsample3d {
 
 // ── Transposed Convolution ─────────────────────────────────────────────
 
+/// Validate all operands and geometry before recording reshapes or dilated weights.
+struct TransposedConvolutionGeometry<const D: usize> {
+    in_channels: usize,
+    out_channels: usize,
+    groups: usize,
+    kernel: [usize; D],
+    stride: [usize; D],
+    padding: [usize; D],
+    output_padding: [usize; D],
+    dilation: [usize; D],
+}
+
+impl<const D: usize> TransposedConvolutionGeometry<D> {
+    fn validate(
+        &self,
+        session: &FrankenTorchSession,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+    ) -> Result<Vec<usize>, AutogradError> {
+        let shape = session.tensor_shape(input)?;
+        if shape.len() != D + 1 && shape.len() != D + 2 {
+            return Err(incompatible_error(
+                "transposed convolution requires channel and spatial dimensions, with an optional batch",
+            ));
+        }
+        let channel_dim = usize::from(shape.len() == D + 2);
+        if self.in_channels == 0 || self.out_channels == 0 || shape[channel_dim] != self.in_channels
+        {
+            return Err(incompatible_error(
+                "transposed convolution input channels must match positive in_channels",
+            ));
+        }
+        if self.groups == 0
+            || !self.in_channels.is_multiple_of(self.groups)
+            || !self.out_channels.is_multiple_of(self.groups)
+        {
+            return Err(incompatible_error(
+                "transposed convolution groups must be positive and divide both channel counts",
+            ));
+        }
+        let dtype = session.tensor_dtype(input)?;
+        let device = session.tensor_device(input)?;
+        if !dtype.is_floating_point() {
+            return Err(incompatible_error(
+                "transposed convolution input must have a real floating dtype",
+            ));
+        }
+        let mut weight_shape = vec![self.in_channels, self.out_channels / self.groups];
+        weight_shape.extend_from_slice(&self.kernel);
+        if session.tensor_shape(weight)? != weight_shape
+            || session.tensor_dtype(weight)? != dtype
+            || session.tensor_device(weight)? != device
+        {
+            return Err(incompatible_error(
+                "transposed convolution weight must match input dtype, device and configured kernel shape",
+            ));
+        }
+        if let Some(bias) = bias
+            && (session.tensor_shape(bias)? != [self.out_channels]
+                || session.tensor_dtype(bias)? != dtype
+                || session.tensor_device(bias)? != device)
+        {
+            return Err(incompatible_error(
+                "transposed convolution bias must match input dtype, device and output channels",
+            ));
+        }
+
+        let mut input_volume = 1usize;
+        let mut output_volume = 1usize;
+        let mut effective_volume = 1usize;
+        for axis in 0..D {
+            let spatial = shape[channel_dim + 1 + axis];
+            let kernel = self.kernel[axis];
+            let stride = self.stride[axis];
+            let dilation = self.dilation[axis];
+            if spatial == 0 || kernel == 0 || stride == 0 || dilation == 0 {
+                return Err(incompatible_error(
+                    "transposed convolution spatial dimensions, kernel, stride and dilation must be positive",
+                ));
+            }
+            if self.output_padding[axis] >= stride {
+                return Err(incompatible_error(
+                    "transposed convolution output_padding must be less than stride",
+                ));
+            }
+            let effective = checked_add(
+                checked_mul(
+                    kernel - 1,
+                    dilation,
+                    "transposed convolution dilated kernel overflow",
+                )?,
+                1,
+                "transposed convolution dilated kernel overflow",
+            )?;
+            let output = checked_conv_transpose_output_dim(
+                spatial,
+                stride,
+                effective,
+                self.padding[axis],
+                self.output_padding[axis],
+                ConvTransposeOutputDimReasons {
+                    overflow_reason: "transposed convolution output dimension overflow",
+                    padding_overflow_reason: "transposed convolution padding overflow",
+                    underflow_reason: "transposed convolution output size underflow from padding",
+                    empty_reason: "transposed convolution requires non-empty spatial dimensions",
+                },
+            )?;
+            input_volume = checked_mul(
+                input_volume,
+                spatial,
+                "transposed convolution input size overflow",
+            )?;
+            output_volume = checked_mul(
+                output_volume,
+                output,
+                "transposed convolution output size overflow",
+            )?;
+            effective_volume = checked_mul(
+                effective_volume,
+                effective,
+                "transposed convolution dilated kernel size overflow",
+            )?;
+        }
+        let batch = if channel_dim == 1 { shape[0] } else { 1 };
+        let output_plane = checked_mul(
+            self.out_channels,
+            output_volume,
+            "transposed convolution output size overflow",
+        )?;
+        checked_mul(
+            batch,
+            output_plane,
+            "transposed convolution output size overflow",
+        )?;
+        let kernel_plane = checked_mul(
+            self.out_channels / self.groups,
+            effective_volume,
+            "transposed convolution dilated kernel size overflow",
+        )?;
+        checked_mul(
+            self.in_channels,
+            kernel_plane,
+            "transposed convolution dilated kernel size overflow",
+        )?;
+        if D == 2 {
+            let column_plane = checked_mul(
+                input_volume,
+                kernel_plane,
+                "transposed convolution column size overflow",
+            )?;
+            checked_mul(
+                batch,
+                column_plane,
+                "transposed convolution column size overflow",
+            )?;
+        }
+        Ok(shape)
+    }
+}
+
+/// Keep zero derivatives connected when padding excludes every input/kernel tap.
+/// Empty reductions avoid multiplying unused NaN/Inf values by zero.
+fn transposed_convolution_zero(
+    session: &mut FrankenTorchSession,
+    input: TensorNodeId,
+    weight: TensorNodeId,
+    output: TensorNodeId,
+) -> Result<TensorNodeId, AutogradError> {
+    let empty_input = session.tensor_narrow(input, 0, 0, 0)?;
+    let empty_weight = session.tensor_narrow(weight, 0, 0, 0)?;
+    let input_zero = session.tensor_sum(empty_input)?;
+    let weight_zero = session.tensor_sum(empty_weight)?;
+    let zero = session.tensor_add(input_zero, weight_zero)?;
+    session.tensor_add(output, zero)
+}
+
 /// 1D transposed convolution (sometimes called "deconvolution").
 ///
 /// Applies a transposed convolution over an input signal of shape `[N, C_in, L]`.
@@ -11557,6 +11734,34 @@ impl ConvTranspose1d {
         output_padding: usize,
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            use_bias,
+            DType::F64,
+        )
+    }
+
+    /// Create a transposed convolution with trainable F32 or F64 leaf parameters.
+    /// Initialization retains the default random stream, including under `with_no_grad`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        use_bias: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if in_channels == 0 || out_channels == 0 || kernel_size == 0 || stride == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -11589,10 +11794,11 @@ impl ConvTranspose1d {
         let w_shift = session.full(vec![numel], bound, false)?;
         let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
         let w_values = session.tensor_values(w_shifted)?;
-        let weight = session.tensor_variable(
+        let weight = initialized_parameter(
+            session,
             w_values,
             vec![in_channels, out_channels, kernel_size],
-            true,
+            dtype,
         )?;
 
         let bias = if use_bias {
@@ -11602,7 +11808,12 @@ impl ConvTranspose1d {
             let b_shift = session.full(vec![out_channels], bound, false)?;
             let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
             let b_values = session.tensor_values(b_shifted)?;
-            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+            Some(initialized_parameter(
+                session,
+                b_values,
+                vec![out_channels],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -11637,6 +11848,35 @@ impl ConvTranspose1d {
         use_bias: bool,
         groups: usize,
     ) -> Result<Self, AutogradError> {
+        Self::new_grouped_with_dtype(
+            session,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            use_bias,
+            groups,
+            DType::F64,
+        )
+    }
+
+    /// Create a grouped transposed convolution with trainable F32 or F64 parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_grouped_with_dtype(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        use_bias: bool,
+        groups: usize,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if in_channels == 0 || out_channels == 0 || kernel_size == 0 || stride == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -11682,10 +11922,11 @@ impl ConvTranspose1d {
         let w_shift = session.full(vec![numel], bound, false)?;
         let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
         let w_values = session.tensor_values(w_shifted)?;
-        let weight = session.tensor_variable(
+        let weight = initialized_parameter(
+            session,
             w_values,
             vec![in_channels, out_per_group, kernel_size],
-            true,
+            dtype,
         )?;
 
         let bias = if use_bias {
@@ -11695,7 +11936,12 @@ impl ConvTranspose1d {
             let b_shift = session.full(vec![out_channels], bound, false)?;
             let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
             let b_values = session.tensor_values(b_shifted)?;
-            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+            Some(initialized_parameter(
+                session,
+                b_values,
+                vec![out_channels],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -11742,7 +11988,17 @@ impl Module for ConvTranspose1d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_shape = { session.tensor_shape(input)? };
+        let input_shape = TransposedConvolutionGeometry {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            groups: self.groups,
+            kernel: [self.kernel_size],
+            stride: [self.stride],
+            padding: [self.padding],
+            output_padding: [self.output_padding],
+            dilation: [self.dilation],
+        }
+        .validate(session, input, self.weight, self.bias)?;
 
         // torch nn.ConvTranspose1d accepts an unbatched [C_in, L] input and
         // returns [C_out, L_out] — equivalent to unsqueeze(0) -> conv -> squeeze(0).
@@ -11805,13 +12061,15 @@ impl Module for ConvTranspose1d {
         // Transposed convolution via scatter-and-accumulate:
         // For each input position, scatter kernel-weighted values to output positions.
         // Initialize output to zeros
-        let output = session.zeros(vec![batch_size, self.out_channels, l_out], false)?;
+        let output =
+            session.tensor_new_zeros(input, vec![batch_size, self.out_channels, l_out], false)?;
 
         // For each input channel c_in and each output channel c_out:
         // For each input position i: output[:, c_out, i*stride + k - padding] += input[:, c_in, i] * weight[c_in, c_out, k]
         //
         // We implement this by iterating over kernel positions and accumulating.
         let mut result = output;
+        let mut contributed = false;
         for k in 0..self.kernel_size {
             // Extract weight slice for this kernel position: weight[:, :, k]
             // weight shape: [in_channels, out_channels, kernel_size]
@@ -11843,7 +12101,12 @@ impl Module for ConvTranspose1d {
                 let contrib_padded = session.tensor_pad(contrib, &[pad_left, pad_right], 0.0)?;
 
                 result = session.tensor_add(result, contrib_padded)?;
+                contributed = true;
             }
+        }
+
+        if !contributed {
+            result = transposed_convolution_zero(session, input, self.weight, result)?;
         }
 
         // Add bias if present. bias shape is [out_channels];
@@ -12458,6 +12721,34 @@ impl ConvTranspose2d {
         output_padding: (usize, usize),
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            use_bias,
+            DType::F64,
+        )
+    }
+
+    /// Create a transposed convolution with trainable F32 or F64 leaf parameters.
+    /// Initialization retains the default random stream, including under `with_no_grad`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        output_padding: (usize, usize),
+        use_bias: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let (kh, kw) = kernel_size;
         let (sh, sw) = stride;
         let (ph, pw) = padding;
@@ -12504,8 +12795,12 @@ impl ConvTranspose2d {
         let w_shift = session.full(vec![numel], bound, false)?;
         let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
         let w_values = session.tensor_values(w_shifted)?;
-        let weight =
-            session.tensor_variable(w_values, vec![in_channels, out_channels, kh, kw], true)?;
+        let weight = initialized_parameter(
+            session,
+            w_values,
+            vec![in_channels, out_channels, kh, kw],
+            dtype,
+        )?;
 
         let bias = if use_bias {
             let b_rand = session.rand(vec![out_channels], false)?;
@@ -12514,7 +12809,12 @@ impl ConvTranspose2d {
             let b_shift = session.full(vec![out_channels], bound, false)?;
             let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
             let b_values = session.tensor_values(b_shifted)?;
-            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+            Some(initialized_parameter(
+                session,
+                b_values,
+                vec![out_channels],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -12554,6 +12854,35 @@ impl ConvTranspose2d {
         use_bias: bool,
         groups: usize,
     ) -> Result<Self, AutogradError> {
+        Self::new_grouped_with_dtype(
+            session,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            use_bias,
+            groups,
+            DType::F64,
+        )
+    }
+
+    /// Create a grouped transposed convolution with trainable F32 or F64 parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_grouped_with_dtype(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        output_padding: (usize, usize),
+        use_bias: bool,
+        groups: usize,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let (kh, kw) = kernel_size;
         let (sh, sw) = stride;
         let (ph, pw) = padding;
@@ -12610,8 +12939,12 @@ impl ConvTranspose2d {
         let w_shift = session.full(vec![numel], bound, false)?;
         let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
         let w_values = session.tensor_values(w_shifted)?;
-        let weight =
-            session.tensor_variable(w_values, vec![in_channels, out_per_group, kh, kw], true)?;
+        let weight = initialized_parameter(
+            session,
+            w_values,
+            vec![in_channels, out_per_group, kh, kw],
+            dtype,
+        )?;
 
         let bias = if use_bias {
             let b_rand = session.rand(vec![out_channels], false)?;
@@ -12620,7 +12953,12 @@ impl ConvTranspose2d {
             let b_shift = session.full(vec![out_channels], bound, false)?;
             let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
             let b_values = session.tensor_values(b_shifted)?;
-            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+            Some(initialized_parameter(
+                session,
+                b_values,
+                vec![out_channels],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -12673,11 +13011,17 @@ impl Module for ConvTranspose2d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // Use tensor_shape rather than tensor_values_meta — the
-        // latter calls tensor_values which only supports F64 and
-        // errors with UnsupportedDType(F32) on F32 input. We only
-        // need the shape here. frankentorch-l68y.
-        let input_shape = session.tensor_shape(input)?;
+        let input_shape = TransposedConvolutionGeometry {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            groups: self.groups,
+            kernel: [self.kernel_h, self.kernel_w],
+            stride: [self.stride_h, self.stride_w],
+            padding: [self.padding_h, self.padding_w],
+            output_padding: [self.output_padding_h, self.output_padding_w],
+            dilation: [self.dilation_h, self.dilation_w],
+        }
+        .validate(session, input, self.weight, self.bias)?;
 
         // torch nn.ConvTranspose2d accepts an unbatched [C_in, H, W] input and
         // returns [C_out, H_out, W_out] — unsqueeze(0) -> conv -> squeeze(0).
@@ -12839,7 +13183,12 @@ impl Module for ConvTranspose2d {
 
         // Actually the most practical approach: for each (kh, kw), compute a shifted
         // grid and use it to build partial outputs that we sum together.
-        let mut result = session.zeros(vec![batch_size, self.out_channels, h_out, w_out], false)?;
+        let mut result = session.tensor_new_zeros(
+            columns,
+            vec![batch_size, self.out_channels, h_out, w_out],
+            false,
+        )?;
+        let mut contributed = false;
 
         for kh in 0..self.kernel_h {
             for kw in 0..self.kernel_w {
@@ -12867,8 +13216,11 @@ impl Module for ConvTranspose2d {
                         let row = session.tensor_narrow(upsampled, 2, hi, 1)?;
                         rows.push(row);
                     }
-                    let zero_row =
-                        session.zeros(vec![batch_size, self.out_channels, 1, w_in], false)?;
+                    let zero_row = session.tensor_new_zeros(
+                        c,
+                        vec![batch_size, self.out_channels, 1, w_in],
+                        false,
+                    )?;
                     let interleaved_len = if h_in == 0 {
                         0
                     } else {
@@ -12908,8 +13260,11 @@ impl Module for ConvTranspose2d {
                         let col = session.tensor_narrow(upsampled, 3, wi, 1)?;
                         cols.push(col);
                     }
-                    let zero_col =
-                        session.zeros(vec![batch_size, self.out_channels, up_h, 1], false)?;
+                    let zero_col = session.tensor_new_zeros(
+                        c,
+                        vec![batch_size, self.out_channels, up_h, 1],
+                        false,
+                    )?;
                     let interleaved_len = if w_in == 0 {
                         0
                     } else {
@@ -12987,7 +13342,8 @@ impl Module for ConvTranspose2d {
 
                 // Pad height: add zero rows top and bottom
                 if dst_h_start > 0 {
-                    let top_zeros = session.zeros(
+                    let top_zeros = session.tensor_new_zeros(
+                        valid,
                         vec![batch_size, self.out_channels, dst_h_start, valid_w],
                         false,
                     )?;
@@ -12995,15 +13351,19 @@ impl Module for ConvTranspose2d {
                 }
                 let bottom = h_out - dst_h_start - valid_h;
                 if bottom > 0 {
-                    let bot_zeros = session
-                        .zeros(vec![batch_size, self.out_channels, bottom, valid_w], false)?;
+                    let bot_zeros = session.tensor_new_zeros(
+                        valid,
+                        vec![batch_size, self.out_channels, bottom, valid_w],
+                        false,
+                    )?;
                     padded = session.tensor_cat(&[padded, bot_zeros], 2)?;
                 }
                 // padded is now [N, out_ch, h_out, valid_w]
 
                 // Pad width: add zero cols left and right
                 if dst_w_start > 0 {
-                    let left_zeros = session.zeros(
+                    let left_zeros = session.tensor_new_zeros(
+                        valid,
                         vec![batch_size, self.out_channels, h_out, dst_w_start],
                         false,
                     )?;
@@ -13011,14 +13371,22 @@ impl Module for ConvTranspose2d {
                 }
                 let right = w_out - dst_w_start - valid_w;
                 if right > 0 {
-                    let right_zeros =
-                        session.zeros(vec![batch_size, self.out_channels, h_out, right], false)?;
+                    let right_zeros = session.tensor_new_zeros(
+                        valid,
+                        vec![batch_size, self.out_channels, h_out, right],
+                        false,
+                    )?;
                     padded = session.tensor_cat(&[padded, right_zeros], 3)?;
                 }
                 // padded is now [N, out_ch, h_out, w_out]
 
                 result = session.tensor_add(result, padded)?;
+                contributed = true;
             }
+        }
+
+        if !contributed {
+            result = transposed_convolution_zero(session, input, self.weight, result)?;
         }
 
         // Add bias
@@ -13091,6 +13459,34 @@ impl ConvTranspose3d {
         output_padding: (usize, usize, usize),
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            use_bias,
+            DType::F64,
+        )
+    }
+
+    /// Create a transposed convolution with trainable F32 or F64 leaf parameters.
+    /// Initialization retains the default random stream, including under `with_no_grad`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        output_padding: (usize, usize, usize),
+        use_bias: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         let (kd, kh, kw) = kernel_size;
         let (sd, sh, sw) = stride;
         let (pd, ph, pw) = padding;
@@ -13139,8 +13535,12 @@ impl ConvTranspose3d {
         let w_shift = session.full(vec![numel], bound, false)?;
         let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
         let w_values = session.tensor_values(w_shifted)?;
-        let weight =
-            session.tensor_variable(w_values, vec![in_channels, out_channels, kd, kh, kw], true)?;
+        let weight = initialized_parameter(
+            session,
+            w_values,
+            vec![in_channels, out_channels, kd, kh, kw],
+            dtype,
+        )?;
 
         let bias = if use_bias {
             let b_rand = session.rand(vec![out_channels], false)?;
@@ -13149,7 +13549,12 @@ impl ConvTranspose3d {
             let b_shift = session.full(vec![out_channels], bound, false)?;
             let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
             let b_values = session.tensor_values(b_shifted)?;
-            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+            Some(initialized_parameter(
+                session,
+                b_values,
+                vec![out_channels],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -13193,7 +13598,21 @@ impl Module for ConvTranspose3d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_shape = { session.tensor_shape(input)? };
+        let input_shape = TransposedConvolutionGeometry {
+            in_channels: self.in_channels,
+            out_channels: self.out_channels,
+            groups: 1,
+            kernel: [self.kernel_d, self.kernel_h, self.kernel_w],
+            stride: [self.stride_d, self.stride_h, self.stride_w],
+            padding: [self.padding_d, self.padding_h, self.padding_w],
+            output_padding: [
+                self.output_padding_d,
+                self.output_padding_h,
+                self.output_padding_w,
+            ],
+            dilation: [1; 3],
+        }
+        .validate(session, input, self.weight, self.bias)?;
 
         // torch nn.ConvTranspose3d accepts an unbatched [C_in, D, H, W] input and
         // returns [C_out, ...] — unsqueeze(0) -> conv -> squeeze(0).
@@ -13264,10 +13683,12 @@ impl Module for ConvTranspose3d {
             },
         )?;
 
-        let mut result = session.zeros(
+        let mut result = session.tensor_new_zeros(
+            input,
             vec![batch_size, self.out_channels, d_out, h_out, w_out],
             false,
         )?;
+        let mut contributed = false;
 
         for kd in 0..self.kernel_d {
             for kh in 0..self.kernel_h {
@@ -13331,11 +13752,16 @@ impl Module for ConvTranspose3d {
                                 )?;
 
                                 result = session.tensor_add(result, contrib_padded)?;
+                                contributed = true;
                             }
                         }
                     }
                 }
             }
+        }
+
+        if !contributed {
+            result = transposed_convolution_zero(session, input, self.weight, result)?;
         }
 
         if let Some(bias) = self.bias {
@@ -27390,13 +27816,24 @@ mod tests {
         macro_rules! build {
             ($module:ident, $kernel:expr, $stride:expr, $padding:expr, $dilation:expr) => {{
                 let module = if case.groups == 1 {
-                    $module::new_with_dtype(session, 4, 4, $kernel, $stride, $padding, case.bias, dtype)?
+                    $module::new_with_dtype(
+                        session, 4, 4, $kernel, $stride, $padding, case.bias, dtype,
+                    )?
                 } else {
                     $module::new_grouped_with_dtype(
-                        session, 4, 4, $kernel, $stride, $padding, case.bias, case.groups, dtype,
+                        session,
+                        4,
+                        4,
+                        $kernel,
+                        $stride,
+                        $padding,
+                        case.bias,
+                        case.groups,
+                        dtype,
                     )?
                 };
-                Box::new(module.dilation($dilation).padding_mode(case.padding_mode)) as Box<dyn Module>
+                Box::new(module.dilation($dilation).padding_mode(case.padding_mode))
+                    as Box<dyn Module>
             }};
         }
         Ok(match case.dimensions {
@@ -33615,6 +34052,488 @@ mod tests {
             base_values.as_slice()
         );
         assert_eq!(extended_values[base_values.len()], 0.0);
+    }
+
+    #[derive(Clone, Copy)]
+    struct TypedTransposedConvolutionCase {
+        dimensions: usize,
+        groups: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        dilation: usize,
+        bias: bool,
+    }
+
+    fn typed_transposed_convolution_test_module(
+        session: &mut FrankenTorchSession,
+        case: TypedTransposedConvolutionCase,
+        dtype: DType,
+    ) -> Result<Box<dyn Module>, AutogradError> {
+        macro_rules! build {
+            ($module:ident, $kernel:expr, $stride:expr, $padding:expr, $output_padding:expr, $dilation:expr) => {{
+                let module = if case.groups == 1 {
+                    $module::new_with_dtype(
+                        session,
+                        2,
+                        4,
+                        $kernel,
+                        $stride,
+                        $padding,
+                        $output_padding,
+                        case.bias,
+                        dtype,
+                    )?
+                } else {
+                    $module::new_grouped_with_dtype(
+                        session,
+                        2,
+                        4,
+                        $kernel,
+                        $stride,
+                        $padding,
+                        $output_padding,
+                        case.bias,
+                        case.groups,
+                        dtype,
+                    )?
+                };
+                Box::new(module.dilation($dilation)) as Box<dyn Module>
+            }};
+        }
+        Ok(match case.dimensions {
+            1 => build!(
+                ConvTranspose1d,
+                2,
+                case.stride,
+                case.padding,
+                case.output_padding,
+                case.dilation
+            ),
+            2 => build!(
+                ConvTranspose2d,
+                (2, 2),
+                (case.stride, case.stride),
+                (case.padding, case.padding),
+                (case.output_padding, case.output_padding),
+                (case.dilation, case.dilation)
+            ),
+            3 => Box::new(ConvTranspose3d::new_with_dtype(
+                session,
+                2,
+                4,
+                (2, 2, 2),
+                (case.stride, case.stride, case.stride),
+                (case.padding, case.padding, case.padding),
+                (
+                    case.output_padding,
+                    case.output_padding,
+                    case.output_padding,
+                ),
+                case.bias,
+                dtype,
+            )?),
+            _ => unreachable!(),
+        })
+    }
+
+    /// Direct scalar gather at each output coordinate, independent of the
+    /// production scatter/col2im and fused paths. Also differentiates the
+    /// resulting weighted sum with respect to each input and parameter.
+    fn typed_transposed_convolution_reference(
+        case: TypedTransposedConvolutionCase,
+        input: &[f64],
+        weight: &[f64],
+        bias: &[f64],
+        seed: &[f64],
+    ) -> [Vec<f64>; 4] {
+        let spatial_volume = 2usize.pow(case.dimensions as u32);
+        let output_extent =
+            case.stride + case.dilation + 1 - 2 * case.padding + case.output_padding;
+        let output_volume = output_extent.pow(case.dimensions as u32);
+        let in_per_group = 2 / case.groups;
+        let out_per_group = 4 / case.groups;
+        let mut output = vec![0.0; seed.len()];
+        let mut input_grad = vec![0.0; input.len()];
+        let mut weight_grad = vec![0.0; weight.len()];
+        let mut bias_grad = vec![0.0; bias.len()];
+        for (index, &upstream) in seed.iter().enumerate() {
+            let batch = index / (4 * output_volume);
+            let out_channel = (index / output_volume) % 4;
+            let group = out_channel / out_per_group;
+            let output_coordinates =
+                convolution_test_coordinates(index % output_volume, output_extent, case.dimensions);
+            if case.bias {
+                output[index] = bias[out_channel];
+                bias_grad[out_channel] += upstream;
+            }
+            for in_channel in group * in_per_group..(group + 1) * in_per_group {
+                for kernel in 0..spatial_volume {
+                    let kernel_coordinates =
+                        convolution_test_coordinates(kernel, 2, case.dimensions);
+                    let mut input_spatial = 0usize;
+                    let mut valid = true;
+                    for axis in 0..case.dimensions {
+                        let position = output_coordinates[axis] as isize + case.padding as isize
+                            - (kernel_coordinates[axis] * case.dilation) as isize;
+                        if position < 0
+                            || !(position as usize).is_multiple_of(case.stride)
+                            || position as usize / case.stride >= 2
+                        {
+                            valid = false;
+                            break;
+                        }
+                        input_spatial = input_spatial * 2 + position as usize / case.stride;
+                    }
+                    if valid {
+                        let input_index = (batch * 2 + in_channel) * spatial_volume + input_spatial;
+                        let weight_index = (in_channel * out_per_group
+                            + out_channel % out_per_group)
+                            * spatial_volume
+                            + kernel;
+                        output[index] += input[input_index] * weight[weight_index];
+                        input_grad[input_index] += upstream * weight[weight_index];
+                        weight_grad[weight_index] += upstream * input[input_index];
+                    }
+                }
+            }
+        }
+        [output, input_grad, weight_grad, bias_grad]
+    }
+
+    #[test]
+    fn typed_transposed_convolution_forward_and_weighted_gradients_match_scalar_reference() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for dimensions in 1..=3 {
+                    for (
+                        groups,
+                        dilation,
+                        stride,
+                        padding,
+                        output_padding,
+                        unbatched,
+                        input_grad,
+                        bias,
+                    ) in [
+                        (1, 1, 1, 0, 0, false, true, true),
+                        (1, 1, 2, 1, 1, true, false, false),
+                        (2, 2, 2, 1, 1, false, true, true),
+                        (2, 1, 2, 0, 1, true, false, true),
+                        (1, 2, 1, 1, 0, true, true, false),
+                    ] {
+                        if dimensions == 3 && (groups != 1 || dilation != 1) {
+                            continue;
+                        }
+                        let case = TypedTransposedConvolutionCase {
+                            dimensions,
+                            groups,
+                            stride,
+                            padding,
+                            output_padding,
+                            dilation,
+                            bias,
+                        };
+                        let mut session = FrankenTorchSession::new(mode);
+                        let model = session
+                            .with_no_grad(|session| {
+                                typed_transposed_convolution_test_module(session, case, dtype)
+                            })
+                            .unwrap();
+                        let parameters = model.parameters();
+                        for &parameter in &parameters {
+                            assert_eq!(session.tensor_dtype(parameter).unwrap(), dtype);
+                            assert!(session.tensor_is_leaf(parameter).unwrap());
+                            assert!(session.tensor_requires_grad(parameter).unwrap());
+                        }
+                        let weight_len: usize = session
+                            .tensor_shape(parameters[0])
+                            .unwrap()
+                            .iter()
+                            .product();
+                        let weight: Vec<_> = (0..weight_len)
+                            .map(|i| (i * 3 % 13) as f64 * 0.125 - 0.75)
+                            .collect();
+                        let bias_values = if bias {
+                            vec![-0.25, 0.125, 0.5, -0.375]
+                        } else {
+                            vec![]
+                        };
+                        session
+                            .tensor_update_param_values(parameters[0], weight.clone())
+                            .unwrap();
+                        if bias {
+                            session
+                                .tensor_update_param_values(parameters[1], bias_values.clone())
+                                .unwrap();
+                        }
+                        let batch = if unbatched { 1 } else { 2 };
+                        let mut input_shape = if unbatched { vec![2] } else { vec![batch, 2] };
+                        input_shape.extend(vec![2; dimensions]);
+                        let input_len: usize = input_shape.iter().product();
+                        let values: Vec<_> = (0..input_len)
+                            .map(|i| (i * 7 % 19) as f64 * 0.25 - 2.0)
+                            .collect();
+                        let extent = stride + dilation + 1 - 2 * padding + output_padding;
+                        let mut output_shape = if unbatched { vec![4] } else { vec![batch, 4] };
+                        output_shape.extend(vec![extent; dimensions]);
+                        let output_len: usize = output_shape.iter().product();
+                        let seed: Vec<_> = (0..output_len)
+                            .map(|i| (i * 5 % 17) as f64 * 0.125 - 1.0)
+                            .collect();
+                        let expected = typed_transposed_convolution_reference(
+                            case,
+                            &values,
+                            &weight,
+                            &bias_values,
+                            &seed,
+                        );
+                        let input = packed_recurrent_test_leaf(
+                            &mut session,
+                            values,
+                            input_shape,
+                            dtype,
+                            input_grad,
+                        );
+                        let output = model.forward(&mut session, input).unwrap();
+                        assert_eq!(session.tensor_shape(output).unwrap(), output_shape);
+                        assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                        assert_typed_convolution_close(
+                            &session.tensor_values_lossy_f64(output).unwrap(),
+                            &expected[0],
+                            dtype,
+                        );
+                        let upstream = packed_recurrent_test_leaf(
+                            &mut session,
+                            seed,
+                            output_shape,
+                            dtype,
+                            false,
+                        );
+                        let weighted = session.tensor_mul(output, upstream).unwrap();
+                        let loss = session.tensor_sum(weighted).unwrap();
+                        let report = session.tensor_backward(loss).unwrap();
+                        if input_grad {
+                            assert_typed_convolution_close(
+                                session.tensor_gradient(&report, input).unwrap(),
+                                &expected[1],
+                                dtype,
+                            );
+                        } else {
+                            assert!(session.tensor_gradient(&report, input).is_none());
+                        }
+                        for (index, &parameter) in parameters.iter().enumerate() {
+                            assert_typed_convolution_close(
+                                session.tensor_gradient(&report, parameter).unwrap(),
+                                &expected[index + 2],
+                                dtype,
+                            );
+                        }
+                        let inference = session.with_no_grad(|s| model.forward(s, input)).unwrap();
+                        assert_eq!(session.tensor_dtype(inference).unwrap(), dtype);
+                        assert!(!session.tensor_requires_grad(inference).unwrap());
+                        assert_typed_convolution_close(
+                            &session.tensor_values_lossy_f64(inference).unwrap(),
+                            &expected[0],
+                            dtype,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_transposed_convolution_preflight_rejects_invalid_inputs_without_nodes() {
+        for dtype in [DType::F32, DType::F64] {
+            for dimensions in 1..=3 {
+                let case = TypedTransposedConvolutionCase {
+                    dimensions,
+                    groups: 1,
+                    stride: 2,
+                    padding: 1,
+                    output_padding: 1,
+                    dilation: 1,
+                    bias: true,
+                };
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let mut untouched = session.clone();
+                for bad_dtype in [DType::F16, DType::BF16, DType::Complex64, DType::QInt8] {
+                    assert!(
+                        typed_transposed_convolution_test_module(&mut session, case, bad_dtype)
+                            .is_err()
+                    );
+                    assert_eq!(session.autograd_graph_node_count(), 0);
+                }
+                for bad_case in [
+                    TypedTransposedConvolutionCase { stride: 0, ..case },
+                    TypedTransposedConvolutionCase {
+                        output_padding: 2,
+                        ..case
+                    },
+                ] {
+                    assert!(
+                        typed_transposed_convolution_test_module(&mut session, bad_case, dtype)
+                            .is_err()
+                    );
+                    assert_eq!(session.autograd_graph_node_count(), 0);
+                }
+                let next = session.rand(vec![4], false).unwrap();
+                let expected = untouched.rand(vec![4], false).unwrap();
+                assert_eq!(
+                    session.tensor_values(next).unwrap(),
+                    untouched.tensor_values(expected).unwrap()
+                );
+                let model =
+                    typed_transposed_convolution_test_module(&mut session, case, dtype).unwrap();
+                for unbatched in [false, true] {
+                    let mut shape = if unbatched { vec![2] } else { vec![2, 2] };
+                    shape.extend(vec![2; dimensions]);
+                    let count: usize = shape.iter().product();
+                    let other_dtype = if dtype == DType::F32 {
+                        DType::F64
+                    } else {
+                        DType::F32
+                    };
+                    let wrong_dtype = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; count],
+                        shape.clone(),
+                        other_dtype,
+                        true,
+                    );
+                    let storage = DenseTensor::from_contiguous_values(
+                        vec![1.0; count],
+                        shape.clone(),
+                        Device::Metal,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                    let wrong_device = session.tensor_variable_from_storage(storage, true);
+                    let mut bad_shape = shape.clone();
+                    bad_shape[usize::from(!unbatched)] = 3;
+                    let wrong_channels = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; bad_shape.iter().product()],
+                        bad_shape,
+                        dtype,
+                        true,
+                    );
+                    let mut empty_shape = shape.clone();
+                    *empty_shape.last_mut().unwrap() = 0;
+                    let empty_spatial =
+                        packed_recurrent_test_leaf(&mut session, vec![], empty_shape, dtype, true);
+                    let wrong_rank = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; 2],
+                        vec![2],
+                        dtype,
+                        true,
+                    );
+                    for input in [
+                        wrong_dtype,
+                        wrong_device,
+                        wrong_channels,
+                        empty_spatial,
+                        wrong_rank,
+                        TensorNodeId(usize::MAX),
+                    ] {
+                        let nodes = session.autograd_graph_node_count();
+                        session.with_no_grad(|session| {
+                            assert!(model.forward(session, input).is_err());
+                            assert!(!session.is_grad_enabled());
+                        });
+                        assert_eq!(session.autograd_graph_node_count(), nodes);
+                    }
+                    let input = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; count],
+                        shape,
+                        dtype,
+                        true,
+                    );
+                    for (padding, stride, dilation) in [
+                        (usize::MAX, 2, 1),
+                        (1, usize::MAX, 1),
+                        (1, 2, 0),
+                        (1, 2, usize::MAX),
+                    ] {
+                        if dimensions == 3 && dilation != 1 {
+                            continue;
+                        }
+                        let bad_case = TypedTransposedConvolutionCase {
+                            padding,
+                            stride,
+                            dilation,
+                            ..case
+                        };
+                        let invalid =
+                            typed_transposed_convolution_test_module(&mut session, bad_case, dtype)
+                                .unwrap();
+                        let nodes = session.autograd_graph_node_count();
+                        assert!(invalid.forward(&mut session, input).is_err());
+                        assert_eq!(session.autograd_graph_node_count(), nodes);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_transposed_convolution_empty_and_padding_only_outputs_keep_zero_gradients() {
+        for dtype in [DType::F32, DType::F64] {
+            for dimensions in 1..=3 {
+                for padding_only in [false, true] {
+                    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let case = TypedTransposedConvolutionCase {
+                        dimensions,
+                        groups: 1,
+                        stride: if padding_only { 4 } else { 1 },
+                        padding: if padding_only { 2 } else { 0 },
+                        output_padding: 0,
+                        dilation: 1,
+                        bias: false,
+                    };
+                    let model = typed_transposed_convolution_test_module(&mut session, case, dtype)
+                        .unwrap();
+                    let batch = usize::from(padding_only);
+                    let mut input_shape = vec![batch, 2];
+                    input_shape.extend(vec![2; dimensions]);
+                    let input_len = input_shape.iter().product();
+                    let input = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![1.0; input_len],
+                        input_shape,
+                        dtype,
+                        true,
+                    );
+                    let output = model.forward(&mut session, input).unwrap();
+                    let mut output_shape = vec![batch, 4];
+                    output_shape.extend(vec![if padding_only { 2 } else { 3 }; dimensions]);
+                    assert_eq!(session.tensor_shape(output).unwrap(), output_shape);
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert!(
+                        session
+                            .tensor_values_lossy_f64(output)
+                            .unwrap()
+                            .iter()
+                            .all(|&v| v == 0.0)
+                    );
+                    let loss = session.tensor_sum(output).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    for node in std::iter::once(input).chain(model.parameters()) {
+                        assert!(
+                            session
+                                .tensor_gradient(&report, node)
+                                .unwrap()
+                                .iter()
+                                .all(|&g| g == 0.0)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

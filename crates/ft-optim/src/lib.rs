@@ -15827,7 +15827,9 @@ mod tests {
 
             let before = scheduler.state_dict();
             let mut invalid = before.clone();
-            if let SchedulerConfig::CosineAnnealingWarmRestarts { eta_min: value, .. } = &mut invalid.config {
+            if let SchedulerConfig::CosineAnnealingWarmRestarts { eta_min: value, .. } =
+                &mut invalid.config
+            {
                 *value = eta_min;
             }
             assert!(scheduler.load_state_dict(invalid).is_err());
@@ -16063,8 +16065,17 @@ mod tests {
             let before = scheduler.state_dict();
             for change_start in [false, true] {
                 let mut invalid = before.clone();
-                if let SchedulerConfig::LinearLR { start_factor, end_factor, .. } = &mut invalid.config {
-                    if change_start { *start_factor = factor; } else { *end_factor = factor; }
+                if let SchedulerConfig::LinearLR {
+                    start_factor,
+                    end_factor,
+                    ..
+                } = &mut invalid.config
+                {
+                    if change_start {
+                        *start_factor = factor;
+                    } else {
+                        *end_factor = factor;
+                    }
                 }
                 assert!(scheduler.load_state_dict(invalid).is_err());
                 assert_eq!(scheduler.state_dict(), before);
@@ -16837,7 +16848,10 @@ mod tests {
 
             let before = scheduler.state_dict();
             let mut invalid = before.clone();
-            if let SchedulerConfig::OneCycleLR { pct_start: value, .. } = &mut invalid.config {
+            if let SchedulerConfig::OneCycleLR {
+                pct_start: value, ..
+            } = &mut invalid.config
+            {
                 *value = pct_start;
             }
             assert!(scheduler.load_state_dict(invalid).is_err());
@@ -18887,8 +18901,15 @@ mod tests {
             let before = max_scheduler.state_dict();
             for change_base in [false, true] {
                 let mut invalid = before.clone();
-                if let SchedulerConfig::CyclicLR { base_lr, max_lr, .. } = &mut invalid.config {
-                    if change_base { *base_lr = bound; } else { *max_lr = bound; }
+                if let SchedulerConfig::CyclicLR {
+                    base_lr, max_lr, ..
+                } = &mut invalid.config
+                {
+                    if change_base {
+                        *base_lr = bound;
+                    } else {
+                        *max_lr = bound;
+                    }
                 }
                 assert!(max_scheduler.load_state_dict(invalid).is_err());
                 assert_eq!(max_scheduler.state_dict(), before);
