@@ -86147,70 +86147,17 @@ impl FrankenTorchSession {
         n: Option<usize>,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled() {
-            // Autograd (frankentorch-ng1hw): hfft(x,n) = irfft(conj(x), n)·n for the
-            // "backward" norm; other norms just rescale by factor_h. conj is
-            // expressed as complex(real(x), -imag(x)), so the whole path composes
-            // through differentiable ops (real/imag/mul_scalar/complex/irfft).
-            let dtype = self.tensor_dtype(input)?;
-            if dtype != DType::Complex128 && dtype != DType::Complex64 {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "hfft: input must be complex",
-                    },
-                )));
-            }
-            let shape = self.tensor_shape(input)?;
-            let freq_len = *shape.last().unwrap();
-            let out_len = n.unwrap_or((freq_len - 1) * 2);
-            let factor_h = Self::fft_norm_factor(norm, out_len, false)?;
-            let re = self.tensor_real(input)?;
-            let im = self.tensor_imag(input)?;
-            let neg_im = self.tensor_mul_scalar(im, -1.0)?;
-            let conj_x = self.tensor_complex(re, neg_im)?;
-            let ir = self.tensor_irfft_norm(conj_x, Some(out_len), "backward")?;
-            return self.tensor_mul_scalar(ir, out_len as f64 * factor_h);
-        }
-        let dtype = self.tensor_dtype(input)?;
-        if dtype != DType::Complex128 && dtype != DType::Complex64 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfft: input must be complex",
-                },
-            )));
-        }
-
-        let real_view = self.tensor_view_as_real(input)?;
-        let vals = self.tensor_values(real_view)?;
-        let freq_len = vals.len() / 2;
-        let out_len = n.unwrap_or((freq_len - 1) * 2);
-        let factor = Self::fft_norm_factor(norm, out_len, false)?;
-
-        // Reconstruct full spectrum using conjugate symmetry, then FFT
-        let mut re_full = vec![0.0; out_len];
-        let mut im_full = vec![0.0; out_len];
-
-        for k in 0..freq_len.min(out_len) {
-            re_full[k] = vals[k * 2];
-            im_full[k] = vals[k * 2 + 1];
-        }
-        for k in 1..freq_len.min(out_len) {
-            let mirror = out_len - k;
-            if mirror < out_len {
-                re_full[mirror] = vals[k * 2];
-                im_full[mirror] = -vals[k * 2 + 1];
-            }
-        }
-
-        // Forward FFT (not inverse) to get real output
-        Self::dft_inplace_1d(&mut re_full, &mut im_full, false);
-
-        if factor != 1.0 {
-            for v in re_full.iter_mut() {
-                *v *= factor;
-            }
-        }
-        self.tensor_variable(re_full, vec![out_len], false)
+        let rank = self.tensor_shape(input)?.len();
+        let dim = rank.checked_sub(1).ok_or_else(|| {
+            Self::incompatible_tensor_args("hfft: input must have at least one dimension")
+        })?;
+        let sizes = n.map(|size| [size]);
+        self.tensor_hfftn_norm(
+            input,
+            sizes.as_ref().map(|sizes| &sizes[..]),
+            Some(&[dim]),
+            norm,
+        )
     }
 
     /// Compute the inverse Hermitian FFT (real input -> complex Hermitian output).
@@ -86230,45 +86177,11 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled() {
-            // Autograd (frankentorch-ng1hw): ihfft(r) = conj(rfft(r))/N for the
-            // "backward" norm; other norms rescale by factor_i. conj+scale is folded
-            // into the real/imag parts: complex(real(c)·s, imag(c)·(-s)), s=factor_i/N,
-            // c=rfft(r) — all differentiable real ops, no complex-scalar path.
-            let shape = self.tensor_shape(input)?;
-            let nn = *shape.last().unwrap();
-            let factor_i = Self::fft_norm_factor(norm, nn, true)?;
-            let s = factor_i / nn as f64;
-            let c = self.tensor_rfft_norm(input, None, "backward")?;
-            let re = self.tensor_real(c)?;
-            let im = self.tensor_imag(c)?;
-            let re_s = self.tensor_mul_scalar(re, s)?;
-            let im_s = self.tensor_mul_scalar(im, -s)?;
-            return self.tensor_complex(re_s, im_s);
-        }
-
-        let vals = self.tensor_values(input)?;
-        let n = vals.len();
-        let out_len = n / 2 + 1;
-        let factor = Self::fft_norm_factor(norm, n, true)?;
-
-        // Inverse FFT of real input
-        let mut re_buf = vals;
-        let mut im_buf = vec![0.0_f64; n];
-        Self::dft_inplace_1d(&mut re_buf, &mut im_buf, true);
-
-        // Keep only the first n/2+1 bins (Hermitian-symmetric)
-        let mut re_out: Vec<f64> = re_buf[..out_len].to_vec();
-        let mut im_out: Vec<f64> = im_buf[..out_len].to_vec();
-        if factor != 1.0 {
-            for v in re_out.iter_mut().chain(im_out.iter_mut()) {
-                *v *= factor;
-            }
-        }
-
-        let re_node = self.tensor_variable(re_out, vec![out_len], false)?;
-        let im_node = self.tensor_variable(im_out, vec![out_len], false)?;
-        self.tensor_complex(re_node, im_node)
+        let rank = self.tensor_shape(input)?.len();
+        let dim = rank.checked_sub(1).ok_or_else(|| {
+            Self::incompatible_tensor_args("ihfft: input must have at least one dimension")
+        })?;
+        self.tensor_ihfftn_norm(input, None, Some(&[dim]), norm)
     }
 
     /// Compute the 2-D Hermitian FFT.
@@ -86282,95 +86195,30 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         s: Option<(usize, usize)>,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfft2: autograd not supported",
-                },
-            )));
-        }
-        let dtype = self.tensor_dtype(input)?;
-        if dtype != DType::Complex128 && dtype != DType::Complex64 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfft2: input must be complex",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        if shape.len() < 2 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfft2: input must be at least 2-D",
-                },
-            )));
-        }
+        self.tensor_hfft2_norm(input, s, "backward")
+    }
 
-        let real_view = self.tensor_view_as_real(input)?;
-        let vals = self.tensor_values(real_view)?;
-        let ndim = shape.len();
-        let rows = shape[ndim - 2];
-        let in_cols = shape[ndim - 1];
-        let (out_rows, out_cols) = s.unwrap_or((rows, (in_cols - 1) * 2));
-        let batch_size: usize = shape[..ndim - 2].iter().product();
-
-        let mut re_tmp = vec![0.0_f64; batch_size * out_rows * out_cols];
-        let mut im_tmp = vec![0.0_f64; batch_size * out_rows * out_cols];
-
-        // Reconstruct full spectrum with conjugate symmetry, then 2D FFT
-        for b in 0..batch_size {
-            for r in 0..rows.min(out_rows) {
-                for c in 0..in_cols.min(out_cols) {
-                    let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
-                    let out_idx = b * out_rows * out_cols + r * out_cols + c;
-                    re_tmp[out_idx] = vals[in_idx];
-                    im_tmp[out_idx] = vals[in_idx + 1];
-                }
-                // Mirror for conjugate symmetry along last dimension
-                for c in 1..in_cols.min(out_cols) {
-                    let mirror = out_cols - c;
-                    if mirror < out_cols && mirror >= in_cols {
-                        let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
-                        let out_idx = b * out_rows * out_cols + r * out_cols + mirror;
-                        re_tmp[out_idx] = vals[in_idx];
-                        im_tmp[out_idx] = -vals[in_idx + 1];
-                    }
-                }
-            }
+    /// Hermitian FFT over the final two dimensions, with explicit signal sizes
+    /// and the same normalization modes as `torch.fft.hfft2`.
+    pub fn tensor_hfft2_norm(
+        &mut self,
+        input: TensorNodeId,
+        s: Option<(usize, usize)>,
+        norm: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let rank = self.tensor_shape(input)?.len();
+        if rank < 2 {
+            return Err(Self::incompatible_tensor_args(
+                "hfft2: input must be at least 2-D",
+            ));
         }
-
-        // FFT along columns (last dim)
-        for b in 0..batch_size {
-            for r in 0..out_rows {
-                let start = b * out_rows * out_cols + r * out_cols;
-                let mut re_row = re_tmp[start..start + out_cols].to_vec();
-                let mut im_row = im_tmp[start..start + out_cols].to_vec();
-                Self::dft_inplace_1d(&mut re_row, &mut im_row, false);
-                re_tmp[start..start + out_cols].copy_from_slice(&re_row);
-                im_tmp[start..start + out_cols].copy_from_slice(&im_row);
-            }
-        }
-
-        // FFT along rows (second-to-last dim)
-        for b in 0..batch_size {
-            for c in 0..out_cols {
-                let mut re_col = vec![0.0_f64; out_rows];
-                let mut im_col = vec![0.0_f64; out_rows];
-                for r in 0..out_rows {
-                    re_col[r] = re_tmp[b * out_rows * out_cols + r * out_cols + c];
-                    im_col[r] = im_tmp[b * out_rows * out_cols + r * out_cols + c];
-                }
-                Self::dft_inplace_1d(&mut re_col, &mut im_col, false);
-                for r in 0..out_rows {
-                    re_tmp[b * out_rows * out_cols + r * out_cols + c] = re_col[r];
-                }
-            }
-        }
-
-        let mut out_shape = shape[..ndim - 2].to_vec();
-        out_shape.push(out_rows);
-        out_shape.push(out_cols);
-        self.tensor_variable(re_tmp, out_shape, false)
+        let sizes = s.map(|(rows, cols)| [rows, cols]);
+        self.tensor_hfftn_norm(
+            input,
+            sizes.as_ref().map(|sizes| &sizes[..]),
+            Some(&[rank - 2, rank - 1]),
+            norm,
+        )
     }
 
     /// Compute the inverse 2-D Hermitian FFT.
@@ -86379,80 +86227,30 @@ impl FrankenTorchSession {
     /// Input is real; output is complex with Hermitian symmetry along last dim.
     /// For real input of shape [..., H, W], outputs complex [..., H, W/2+1].
     pub fn tensor_ihfft2(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "ihfft2: autograd not supported",
-                },
-            )));
+        self.tensor_ihfft2_norm(input, None, "backward")
+    }
+
+    /// Inverse Hermitian FFT over the final two dimensions. Explicit sizes
+    /// crop or zero-pad each signal axis before transformation.
+    pub fn tensor_ihfft2_norm(
+        &mut self,
+        input: TensorNodeId,
+        s: Option<(usize, usize)>,
+        norm: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let rank = self.tensor_shape(input)?.len();
+        if rank < 2 {
+            return Err(Self::incompatible_tensor_args(
+                "ihfft2: input must be at least 2-D",
+            ));
         }
-        let shape = self.tensor_shape(input)?;
-        if shape.len() < 2 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "ihfft2: input must be at least 2-D",
-                },
-            )));
-        }
-
-        let vals = self.tensor_values(input)?;
-        let ndim = shape.len();
-        let rows = shape[ndim - 2];
-        let cols = shape[ndim - 1];
-        let out_cols = cols / 2 + 1;
-        let batch_size: usize = shape[..ndim - 2].iter().product();
-
-        let mut re_tmp = vec![0.0_f64; batch_size * rows * cols];
-        let mut im_tmp = vec![0.0_f64; batch_size * rows * cols];
-
-        // Copy real input
-        re_tmp.copy_from_slice(&vals);
-
-        // Inverse FFT along rows (second-to-last dim)
-        for b in 0..batch_size {
-            for c in 0..cols {
-                let mut re_col = vec![0.0_f64; rows];
-                let mut im_col = vec![0.0_f64; rows];
-                for r in 0..rows {
-                    re_col[r] = re_tmp[b * rows * cols + r * cols + c];
-                }
-                Self::dft_inplace_1d(&mut re_col, &mut im_col, true);
-                for r in 0..rows {
-                    re_tmp[b * rows * cols + r * cols + c] = re_col[r];
-                    im_tmp[b * rows * cols + r * cols + c] = im_col[r];
-                }
-            }
-        }
-
-        // Inverse FFT along columns (last dim)
-        for b in 0..batch_size {
-            for r in 0..rows {
-                let start = b * rows * cols + r * cols;
-                let mut re_row = re_tmp[start..start + cols].to_vec();
-                let mut im_row = im_tmp[start..start + cols].to_vec();
-                Self::dft_inplace_1d(&mut re_row, &mut im_row, true);
-                re_tmp[start..start + cols].copy_from_slice(&re_row);
-                im_tmp[start..start + cols].copy_from_slice(&im_row);
-            }
-        }
-
-        // Keep only the first out_cols columns (Hermitian-symmetric)
-        let mut re_out = Vec::with_capacity(batch_size * rows * out_cols);
-        let mut im_out = Vec::with_capacity(batch_size * rows * out_cols);
-        for b in 0..batch_size {
-            for r in 0..rows {
-                for c in 0..out_cols {
-                    re_out.push(re_tmp[b * rows * cols + r * cols + c]);
-                    im_out.push(im_tmp[b * rows * cols + r * cols + c]);
-                }
-            }
-        }
-
-        let mut out_shape = shape[..ndim - 1].to_vec();
-        out_shape.push(out_cols);
-        let re_node = self.tensor_variable(re_out, out_shape.clone(), false)?;
-        let im_node = self.tensor_variable(im_out, out_shape, false)?;
-        self.tensor_complex(re_node, im_node)
+        let sizes = s.map(|(rows, cols)| [rows, cols]);
+        self.tensor_ihfftn_norm(
+            input,
+            sizes.as_ref().map(|sizes| &sizes[..]),
+            Some(&[rank - 2, rank - 1]),
+            norm,
+        )
     }
 
     /// Compute the N-D Hermitian FFT.
@@ -86467,61 +86265,49 @@ impl FrankenTorchSession {
         s: Option<Vec<usize>>,
         dim: Option<Vec<usize>>,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfftn: autograd not supported",
-                },
-            )));
-        }
+        self.tensor_hfftn_norm(input, s.as_deref(), dim.as_deref(), "backward")
+    }
+
+    /// N-D Hermitian FFT with explicit axes, signal sizes and normalization.
+    ///
+    /// `hfftn(x)` is `irfftn(conj(x))` with the forward/inverse normalization
+    /// modes exchanged. This uses the same N-D Hermitian reconstruction as
+    /// `irfftn`, including the conjugation across every transformed axis.
+    /// F32/Complex64 inputs produce F32; F64/Complex128 inputs produce F64.
+    pub fn tensor_hfftn_norm(
+        &mut self,
+        input: TensorNodeId,
+        s: Option<&[usize]>,
+        dims: Option<&[usize]>,
+        norm: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
         let dtype = self.tensor_dtype(input)?;
-        if dtype != DType::Complex128 && dtype != DType::Complex64 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfftn: input must be complex",
-                },
-            )));
-        }
-        let shape = self.tensor_shape(input)?;
-        let ndim = shape.len();
-
-        let transform_dims: Vec<usize> = dim.unwrap_or_else(|| (0..ndim).collect());
-        if transform_dims.is_empty() {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "hfftn: must transform at least one dimension",
-                },
-            )));
-        }
-
-        // For 2D case, delegate to hfft2
-        if transform_dims.len() == 2 && ndim >= 2 {
-            let s_2d = s.map(|sizes| (sizes[0], sizes[1]));
-            return self.tensor_hfft2(input, s_2d);
-        }
-
-        // For 1D case, delegate to hfft
-        if transform_dims.len() == 1 {
-            let n = s.and_then(|sizes| sizes.first().copied());
-            return self.tensor_hfft(input, n);
-        }
-
-        // For >2D: apply hfft2 on last 2 dims, then fft on remaining
-        let s_2d = s.as_ref().map(|sizes| {
-            let len = sizes.len();
-            (sizes[len.saturating_sub(2)], sizes[len - 1])
-        });
-        let intermediate = self.tensor_hfft2(input, s_2d)?;
-
-        if transform_dims.len() > 2 {
-            let mut result = intermediate;
-            for _ in 0..transform_dims.len() - 2 {
-                result = self.tensor_fft(result, None)?;
+        let output_dtype = match dtype {
+            DType::F32 | DType::Complex64 => DType::F32,
+            DType::F64 | DType::Complex128 => DType::F64,
+            _ => {
+                return Err(Self::incompatible_tensor_args(
+                    "hfftn: input must be f32, f64, complex64 or complex128",
+                ));
             }
-            Ok(result)
-        } else {
-            Ok(intermediate)
+        };
+        let shape = self.tensor_shape(input)?;
+        let (transform_dims, _, _) = Self::fft_nd_shape_and_dims(&shape, s, dims, true)?;
+        if transform_dims.is_empty() {
+            return Err(Self::incompatible_tensor_args(
+                "hfftn: must transform at least one dimension",
+            ));
         }
+        let dual_norm = Self::hermitian_fft_dual_norm(norm)?;
+        // Validate the whole request before recording any cast/conjugate nodes.
+        let complex = match dtype {
+            DType::F32 => self.tensor_cfloat(input)?,
+            DType::F64 => self.tensor_cdouble(input)?,
+            _ => input,
+        };
+        let conjugate = self.tensor_conj(complex)?;
+        let output = self.tensor_irfftn_norm(conjugate, s, Some(&transform_dims), dual_norm)?;
+        self.tensor_to_dtype(output, output_dtype)
     }
 
     /// Compute the inverse N-D Hermitian FFT.
@@ -86534,44 +86320,51 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         dim: Option<Vec<usize>>,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "ihfftn: autograd not supported",
-                },
-            )));
+        self.tensor_ihfftn_norm(input, None, dim.as_deref(), "backward")
+    }
+
+    /// N-D inverse Hermitian FFT with explicit axes, signal sizes and
+    /// normalization, equivalent to `torch.fft.ihfftn(input, s, dim, norm)`.
+    /// The final transformed dimension is compressed to `s[-1] / 2 + 1`.
+    /// F32 input produces Complex64 and F64 input produces Complex128.
+    pub fn tensor_ihfftn_norm(
+        &mut self,
+        input: TensorNodeId,
+        s: Option<&[usize]>,
+        dims: Option<&[usize]>,
+        norm: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let dtype = self.tensor_dtype(input)?;
+        if !matches!(dtype, DType::F32 | DType::F64) {
+            return Err(Self::incompatible_tensor_args(
+                "ihfftn: input must be real f32 or f64",
+            ));
         }
         let shape = self.tensor_shape(input)?;
-        let ndim = shape.len();
-
-        let transform_dims: Vec<usize> = dim.unwrap_or_else(|| (0..ndim).collect());
+        let (transform_dims, _, _) = Self::fft_nd_shape_and_dims(&shape, s, dims, false)?;
         if transform_dims.is_empty() {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "ihfftn: must transform at least one dimension",
-                },
-            )));
+            return Err(Self::incompatible_tensor_args(
+                "ihfftn: must transform at least one dimension",
+            ));
         }
-
-        // For 2D case, delegate to ihfft2
-        if transform_dims.len() == 2 && ndim >= 2 {
-            return self.tensor_ihfft2(input);
-        }
-
-        // For 1D case, delegate to ihfft
-        if transform_dims.len() == 1 {
-            return self.tensor_ihfft(input);
-        }
-
-        // For >2D: apply ifft on leading dims, then ihfft2
-        if transform_dims.len() > 2 {
-            let mut result = input;
-            for _ in 0..transform_dims.len() - 2 {
-                result = self.tensor_ifft(result, None)?;
-            }
-            self.tensor_ihfft2(result)
+        let dual_norm = Self::hermitian_fft_dual_norm(norm)?;
+        let spectrum = self.tensor_rfftn_norm(input, s, Some(&transform_dims), dual_norm)?;
+        let output = self.tensor_conj(spectrum)?;
+        if dtype == DType::F32 {
+            self.tensor_cfloat(output)
         } else {
-            self.tensor_ihfft2(input)
+            Ok(output)
+        }
+    }
+
+    fn hermitian_fft_dual_norm(norm: &str) -> Result<&'static str, AutogradError> {
+        match norm {
+            "backward" => Ok("forward"),
+            "forward" => Ok("backward"),
+            "ortho" => Ok("ortho"),
+            _ => Err(Self::incompatible_tensor_args(
+                "fft: norm must be \"backward\", \"forward\", or \"ortho\"",
+            )),
         }
     }
 

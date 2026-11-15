@@ -16,9 +16,16 @@ use ft_autograd::{AutogradError, BackwardOptions, TensorNodeId};
 use ft_core::{DType, ExecutionMode};
 
 fn assert_close(label: &str, got: &[f64], want: &[f64]) {
+    assert_fft_close(label, got, want, 1e-9);
+}
+
+fn assert_fft_close(label: &str, got: &[f64], want: &[f64], tolerance: f64) {
     assert_eq!(got.len(), want.len(), "{label}: length mismatch");
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-        assert!((g - w).abs() <= 1e-9, "{label}[{i}]: got {g}, want {w}");
+        assert!(
+            (g - w).abs() <= tolerance,
+            "{label}[{i}]: got {g}, want {w}"
+        );
     }
 }
 
@@ -231,14 +238,24 @@ enum NdFft {
     Inverse,
     RealForward,
     RealInverse,
+    HermitianForward,
+    HermitianInverse,
 }
 
 impl NdFft {
     fn complex_input(self) -> bool {
         matches!(
             self,
-            Self::ComplexForward | Self::Inverse | Self::RealInverse
+            Self::ComplexForward | Self::Inverse | Self::RealInverse | Self::HermitianForward
         )
+    }
+
+    fn real_output(self) -> bool {
+        matches!(self, Self::RealInverse | Self::HermitianForward)
+    }
+
+    fn half_output(self) -> bool {
+        matches!(self, Self::RealForward | Self::HermitianInverse)
     }
 
     fn run(
@@ -256,16 +273,20 @@ impl NdFft {
             Self::Inverse => session.tensor_ifftn_norm(input, sizes, dims, norm),
             Self::RealForward => session.tensor_rfftn_norm(input, sizes, dims, norm),
             Self::RealInverse => session.tensor_irfftn_norm(input, sizes, dims, norm),
+            Self::HermitianForward => session.tensor_hfftn_norm(input, sizes, dims, norm),
+            Self::HermitianInverse => session.tensor_ihfftn_norm(input, sizes, dims, norm),
         }
     }
 }
 
-const ND_FFTS: [NdFft; 5] = [
+const ND_FFTS: [NdFft; 7] = [
     NdFft::Forward,
     NdFft::ComplexForward,
     NdFft::Inverse,
     NdFft::RealForward,
     NdFft::RealInverse,
+    NdFft::HermitianForward,
+    NdFft::HermitianInverse,
 ];
 
 fn coordinates(mut flat: usize, shape: &[usize]) -> Vec<usize> {
@@ -279,8 +300,8 @@ fn coordinates(mut flat: usize, shape: &[usize]) -> Vec<usize> {
 
 /// Independent O(input_len * output_len) Fourier definition. This deliberately
 /// does not call an FFT, resize helper, or separable per-axis transform. For
-/// irfftn, each non-boundary half-spectrum bin contributes its conjugate pair;
-/// the phase includes EVERY transformed axis, not just the compressed axis.
+/// irfftn/hfftn, each non-boundary half-spectrum bin contributes its conjugate
+/// pair; the phase includes EVERY transformed axis, not just the compressed axis.
 fn direct_nd_dft(
     kind: NdFft,
     real: &[f64],
@@ -290,7 +311,10 @@ fn direct_nd_dft(
     dims: &[usize],
     norm: &str,
 ) -> (Vec<usize>, Vec<f64>, Vec<f64>) {
-    let inverse = matches!(kind, NdFft::Inverse | NdFft::RealInverse);
+    let inverse = matches!(
+        kind,
+        NdFft::Inverse | NdFft::RealInverse | NdFft::HermitianInverse
+    );
     let n = dims
         .iter()
         .map(|&dim| logical_shape[dim])
@@ -302,7 +326,7 @@ fn direct_nd_dft(
     };
     let last_dim = *dims.last().unwrap();
     let mut output_shape = logical_shape.to_vec();
-    if kind == NdFft::RealForward {
+    if kind.half_output() {
         output_shape[last_dim] = logical_shape[last_dim] / 2 + 1;
     }
     let output_len: usize = output_shape.iter().product();
@@ -315,7 +339,7 @@ fn direct_nd_dft(
             if (0..input_shape.len()).any(|dim| {
                 if !dims.contains(&dim) {
                     in_coord[dim] != out_coord[dim]
-                } else if kind == NdFft::RealInverse && dim == last_dim {
+                } else if kind.real_output() && dim == last_dim {
                     in_coord[dim] > logical_shape[dim] / 2
                 } else {
                     in_coord[dim] >= logical_shape[dim]
@@ -332,12 +356,12 @@ fn direct_nd_dft(
             let (sin, cos) = phase.sin_cos();
             let k = in_coord[last_dim];
             let final_len = logical_shape[last_dim];
-            let paired = kind == NdFft::RealInverse
+            let paired = kind.real_output()
                 && k != 0
                 && !(final_len.is_multiple_of(2) && k == final_len / 2);
             let factor = scale * if paired { 2.0 } else { 1.0 };
             output_real[output] += factor * (real[source] * cos - imag[source] * sin);
-            if kind != NdFft::RealInverse {
+            if !kind.real_output() {
                 output_imag[output] += factor * (real[source] * sin + imag[source] * cos);
             }
         }
@@ -410,7 +434,7 @@ fn nd_fft_explicit_sizes_and_default_axes_match_direct_dft() {
                         let label = format!(
                             "{mode:?} {kind:?} {norm} grad={requires_grad} dims={explicit_dims}"
                         );
-                        if kind == NdFft::RealInverse {
+                        if kind.real_output() {
                             assert_close(
                                 &label,
                                 &session.tensor_values(output).unwrap(),
@@ -445,6 +469,7 @@ fn nd_fft_resized_backward_matches_independent_dft_adjoint() {
                 for (shape, sizes, dims, logical_shape) in [
                     (vec![3, 2, 4], vec![3, 5], vec![2, 0], vec![5, 2, 3]),
                     (vec![2, 3], vec![3, 8], vec![0, 1], vec![3, 8]),
+                    (vec![2, 3, 4], vec![3, 5, 2], vec![2, 0, 1], vec![5, 2, 3]),
                 ] {
                     let input_len: usize = shape.iter().product();
                     let real: Vec<_> = (0..input_len).map(|i| i as f64 / 8.0 - 1.0).collect();
@@ -472,7 +497,7 @@ fn nd_fft_resized_backward_matches_independent_dft_adjoint() {
                     let output = kind
                         .run(&mut session, input, Some(&sizes), Some(&dims), norm)
                         .unwrap();
-                    let out_real = if kind == NdFft::RealInverse {
+                    let out_real = if kind.real_output() {
                         output
                     } else {
                         session.tensor_real(output).unwrap()
@@ -481,7 +506,7 @@ fn nd_fft_resized_backward_matches_independent_dft_adjoint() {
                         .tensor_variable(wr.clone(), output_shape.clone(), false)
                         .unwrap();
                     let mut weighted = session.tensor_mul(out_real, wr_node).unwrap();
-                    if kind != NdFft::RealInverse {
+                    if !kind.real_output() {
                         let out_imag = session.tensor_imag(output).unwrap();
                         let wi_node = session
                             .tensor_variable(wi.clone(), output_shape, false)
@@ -607,7 +632,7 @@ fn nd_fft_validates_sizes_and_dimensions_before_execution() {
                 kind.run(&mut session, input, None, None, "invalid")
                     .is_err()
             );
-            if matches!(kind, NdFft::RealForward | NdFft::RealInverse) {
+            if kind.half_output() || kind.real_output() {
                 assert!(
                     kind.run(&mut session, input, None, Some(&[]), "backward")
                         .is_err()
@@ -627,9 +652,9 @@ fn nd_fft_resizing_preserves_empty_batches() {
             let output = kind
                 .run(&mut session, input, Some(&[5]), None, "backward")
                 .unwrap();
-            let columns = if kind == NdFft::RealForward { 3 } else { 5 };
+            let columns = if kind.half_output() { 3 } else { 5 };
             assert_eq!(session.tensor_shape(output).unwrap(), vec![0, columns]);
-            let real = if kind == NdFft::RealInverse {
+            let real = if kind.real_output() {
                 output
             } else {
                 session.tensor_real(output).unwrap()
@@ -649,6 +674,7 @@ fn nd_fft_resizing_keeps_f32_and_complex64_inputs_trainable() {
     // The existing FFT kernels compute Complex128 (and irfftn computes F64),
     // including for single-precision input. Resizing must retain that behavior
     // while routing derivatives back to the original F32 parameter tensors.
+    // The Hermitian APIs additionally restore the original single precision.
     for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
         for kind in ND_FFTS {
             let mut session = FrankenTorchSession::new(mode);
@@ -684,30 +710,38 @@ fn nd_fft_resizing_keeps_f32_and_complex64_inputs_trainable() {
             );
             assert_eq!(
                 session.tensor_dtype(output).unwrap(),
-                if kind == NdFft::RealInverse {
-                    DType::F64
-                } else {
-                    DType::Complex128
+                match kind {
+                    NdFft::HermitianForward => DType::F32,
+                    NdFft::HermitianInverse => DType::Complex64,
+                    NdFft::RealInverse => DType::F64,
+                    _ => DType::Complex128,
                 }
             );
             let (shape, expected_real, expected_imag) =
                 direct_nd_dft(kind, &real, &imag, &[3, 2], &[2, 5], &[0, 1], "ortho");
-            let yr = if kind == NdFft::RealInverse {
+            let yr = if kind.real_output() {
                 output
             } else {
                 session.tensor_real(output).unwrap()
             };
-            assert_close(
+            let tolerance = if matches!(kind, NdFft::HermitianForward | NdFft::HermitianInverse) {
+                2e-6
+            } else {
+                1e-9
+            };
+            assert_fft_close(
                 "F32 FFT real",
-                &session.tensor_values(yr).unwrap(),
+                &session.tensor_values_lossy_f64(yr).unwrap(),
                 &expected_real,
+                tolerance,
             );
-            if kind != NdFft::RealInverse {
+            if !kind.real_output() {
                 let yi = session.tensor_imag(output).unwrap();
-                assert_close(
+                assert_fft_close(
                     "F32 FFT imaginary",
-                    &session.tensor_values(yi).unwrap(),
+                    &session.tensor_values_lossy_f64(yi).unwrap(),
                     &expected_imag,
+                    tolerance,
                 );
             }
             let weights: Vec<_> = (0..expected_real.len())
@@ -716,6 +750,8 @@ fn nd_fft_resizing_keeps_f32_and_complex64_inputs_trainable() {
             let weight_node = session
                 .tensor_variable(weights.clone(), shape, false)
                 .unwrap();
+            let weight_dtype = session.tensor_dtype(yr).unwrap();
+            let weight_node = session.tensor_to_dtype(weight_node, weight_dtype).unwrap();
             let weighted = session.tensor_mul(yr, weight_node).unwrap();
             let loss = session.tensor_sum(weighted).unwrap();
             let report = session.tensor_backward(loss).unwrap();
@@ -742,10 +778,11 @@ fn nd_fft_resizing_keeps_f32_and_complex64_inputs_trainable() {
                             .sum::<f64>()
                     })
                     .collect();
-                assert_close(
+                assert_fft_close(
                     "F32 FFT gradient",
                     session.tensor_gradient(&report, node).unwrap(),
                     &expected,
+                    tolerance,
                 );
             }
         }
@@ -775,7 +812,7 @@ fn nd_fft_higher_order_bridge_backwards_remain_explicitly_unsupported() {
             let output = kind
                 .run(&mut session, input, Some(&[3, 5]), None, "backward")
                 .unwrap();
-            let real = if kind == NdFft::RealInverse {
+            let real = if kind.real_output() {
                 output
             } else {
                 session.tensor_real(output).unwrap()
@@ -791,5 +828,206 @@ fn nd_fft_higher_order_bridge_backwards_remain_explicitly_unsupported() {
                 "{kind:?}: {error}"
             );
         }
+    }
+}
+
+#[test]
+fn hermitian_fft_wrappers_preserve_batches_precision_and_training() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for norm in ["backward", "forward", "ortho"] {
+                for axes in [1, 2, 3] {
+                    let shape = [2, 3, 5];
+                    let dims: Vec<_> = (3 - axes..3).collect();
+                    let values: Vec<_> =
+                        (0..30).map(|i| ((i * 5 % 17) as f64 - 8.0) / 4.0).collect();
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = session
+                        .tensor_variable(values.clone(), shape.to_vec(), true)
+                        .unwrap();
+                    let x = session.tensor_to_dtype(x, dtype).unwrap();
+                    let spectrum = match (axes, norm) {
+                        (1, "backward") => session.tensor_ihfft(x),
+                        (2, "backward") => session.tensor_ihfft2(x),
+                        (3, "backward") => session.tensor_ihfftn(x, None),
+                        (1, _) => session.tensor_ihfft_norm(x, norm),
+                        (2, _) => session.tensor_ihfft2_norm(x, None, norm),
+                        _ => session.tensor_ihfftn_norm(x, None, None, norm),
+                    }
+                    .unwrap();
+                    assert_eq!(
+                        session.tensor_dtype(spectrum).unwrap(),
+                        if dtype == DType::F32 {
+                            DType::Complex64
+                        } else {
+                            DType::Complex128
+                        }
+                    );
+                    let (expected_shape, expected_real, expected_imag) = direct_nd_dft(
+                        NdFft::HermitianInverse,
+                        &values,
+                        &[0.0; 30],
+                        &shape,
+                        &shape,
+                        &dims,
+                        norm,
+                    );
+                    assert_eq!(session.tensor_shape(spectrum).unwrap(), expected_shape);
+                    let tolerance = if dtype == DType::F32 { 4e-6 } else { 1e-9 };
+                    let real = session.tensor_real(spectrum).unwrap();
+                    let imag = session.tensor_imag(spectrum).unwrap();
+                    assert_fft_close(
+                        "Hermitian wrapper real",
+                        &session.tensor_values_lossy_f64(real).unwrap(),
+                        &expected_real,
+                        tolerance,
+                    );
+                    assert_fft_close(
+                        "Hermitian wrapper imaginary",
+                        &session.tensor_values_lossy_f64(imag).unwrap(),
+                        &expected_imag,
+                        tolerance,
+                    );
+                    let restored = match (axes, norm) {
+                        (1, "backward") => session.tensor_hfft(spectrum, Some(5)),
+                        (2, "backward") => session.tensor_hfft2(spectrum, Some((3, 5))),
+                        (3, "backward") => {
+                            session.tensor_hfftn(spectrum, Some(shape.to_vec()), None)
+                        }
+                        (1, _) => session.tensor_hfft_norm(spectrum, Some(5), norm),
+                        (2, _) => session.tensor_hfft2_norm(spectrum, Some((3, 5)), norm),
+                        _ => session.tensor_hfftn_norm(spectrum, Some(&shape), None, norm),
+                    }
+                    .unwrap();
+                    assert_eq!(session.tensor_shape(restored).unwrap(), shape);
+                    assert_eq!(session.tensor_dtype(restored).unwrap(), dtype);
+                    assert_fft_close(
+                        "Hermitian wrapper round trip",
+                        &session.tensor_values_lossy_f64(restored).unwrap(),
+                        &values,
+                        tolerance,
+                    );
+                    let squared = session.tensor_mul(restored, restored).unwrap();
+                    let loss = session.tensor_sum(squared).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert_fft_close(
+                        "Hermitian wrapper round trip gradient",
+                        session.tensor_gradient(&report, x).unwrap(),
+                        &values.iter().map(|value| 2.0 * value).collect::<Vec<_>>(),
+                        tolerance,
+                    );
+                    let inferred_even = session
+                        .tensor_hfftn(spectrum, None, Some(dims))
+                        .unwrap();
+                    assert_eq!(
+                        session.tensor_shape(inferred_even).unwrap(),
+                        vec![2, 3, 4]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hermitian_fft_real_input_and_no_grad_match_direct_dft() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for norm in ["backward", "forward", "ortho"] {
+                let shape = [2, 3];
+                let values = [0.5, -1.0, 0.25, 2.0, 0.75, -0.5];
+                let mut session = FrankenTorchSession::new(mode);
+                let x = session
+                    .tensor_variable(values.to_vec(), shape.to_vec(), true)
+                    .unwrap();
+                let x = session.tensor_to_dtype(x, dtype).unwrap();
+                let output = session
+                    .with_no_grad(|session| session.tensor_hfft_norm(x, Some(5), norm))
+                    .unwrap();
+                assert!(!session.tensor_requires_grad(output).unwrap());
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                let (expected_shape, expected_real, _) = direct_nd_dft(
+                    NdFft::HermitianForward,
+                    &values,
+                    &[0.0; 6],
+                    &shape,
+                    &[2, 5],
+                    &[1],
+                    norm,
+                );
+                assert_eq!(session.tensor_shape(output).unwrap(), expected_shape);
+                assert_fft_close(
+                    "real Hermitian input",
+                    &session.tensor_values_lossy_f64(output).unwrap(),
+                    &expected_real,
+                    if dtype == DType::F32 { 1e-6 } else { 1e-9 },
+                );
+                let inverse = session
+                    .with_no_grad(|session| {
+                        session.tensor_ihfftn_norm(x, Some(&[4]), None, norm)
+                    })
+                    .unwrap();
+                assert!(!session.tensor_requires_grad(inverse).unwrap());
+                assert_eq!(session.tensor_shape(inverse).unwrap(), vec![2, 3]);
+                assert_eq!(
+                    session.tensor_dtype(inverse).unwrap(),
+                    if dtype == DType::F32 {
+                        DType::Complex64
+                    } else {
+                        DType::Complex128
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hermitian_fft_preflights_shapes_dtypes_and_scalar_inputs() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        let mut session = FrankenTorchSession::new(mode);
+        let scalar = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+        let empty = session.tensor_variable(vec![], vec![0], true).unwrap();
+        let singleton = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let half = session.tensor_to_dtype(singleton, DType::F16).unwrap();
+        let complex = session.tensor_cdouble(singleton).unwrap();
+        let initial_nodes = session.autograd_graph_node_count();
+        assert!(session.tensor_hfft(scalar, None).is_err());
+        assert!(session.tensor_ihfft(scalar).is_err());
+        assert!(session.tensor_hfft2(singleton, None).is_err());
+        assert!(session.tensor_ihfft2(singleton).is_err());
+        assert!(session.tensor_hfft(empty, None).is_err());
+        assert!(session.tensor_ihfft(empty).is_err());
+        assert!(session.tensor_hfft(singleton, None).is_err());
+        assert!(session.tensor_hfft(singleton, Some(0)).is_err());
+        assert!(session.tensor_hfft(half, Some(1)).is_err());
+        assert!(session.tensor_ihfft(half).is_err());
+        assert!(session.tensor_ihfft(complex).is_err());
+        assert!(
+            session
+                .tensor_hfft_norm(complex, Some(1), "invalid")
+                .is_err()
+        );
+        assert!(session.tensor_ihfft_norm(singleton, "invalid").is_err());
+        assert_eq!(session.autograd_graph_node_count(), initial_nodes);
+        let forward = session.tensor_hfft(singleton, Some(1)).unwrap();
+        assert_close(
+            "length-one Hermitian forward",
+            &session.tensor_values(forward).unwrap(),
+            &[2.0],
+        );
+        let inverse = session.tensor_ihfft(singleton).unwrap();
+        let real = session.tensor_real(inverse).unwrap();
+        let imag = session.tensor_imag(inverse).unwrap();
+        assert_close(
+            "length-one Hermitian inverse real",
+            &session.tensor_values(real).unwrap(),
+            &[2.0],
+        );
+        assert_close(
+            "length-one Hermitian inverse imaginary",
+            &session.tensor_values(imag).unwrap(),
+            &[0.0],
+        );
     }
 }
