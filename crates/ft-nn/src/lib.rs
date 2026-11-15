@@ -5177,10 +5177,7 @@ impl Module for AvgPool1d {
 
         // Verify shape
         debug_assert_eq!(
-            {
-                let (_, m) = session.tensor_values_meta(output).unwrap();
-                m.shape().to_vec()
-            },
+            session.tensor_shape(output)?,
             vec![batch_size, channels, l_out]
         );
 
@@ -6544,12 +6541,34 @@ impl PReLU {
         num_parameters: usize,
         init: f64,
     ) -> Result<Self, AutogradError> {
-        let weight =
-            session.tensor_variable(vec![init; num_parameters], vec![num_parameters], true)?;
+        Self::new_with_dtype(session, num_parameters, init, DType::F64)
+    }
+
+    /// Create PReLU with F32 or F64 learnable slopes.
+    /// The slopes are fresh trainable leaves even inside `with_no_grad`.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_parameters: usize,
+        init: f64,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
+        let weight = initialized_parameter(
+            session,
+            vec![init; num_parameters],
+            vec![num_parameters],
+            dtype,
+        )?;
         Ok(Self {
             weight,
             num_parameters,
         })
+    }
+
+    /// Access the learnable slope parameter.
+    #[must_use]
+    pub fn weight(&self) -> TensorNodeId {
+        self.weight
     }
 }
 
@@ -6582,13 +6601,24 @@ impl Module for PReLU {
         // The previous severed-autograd path dropped both the input
         // and the weight gradient.
         let input_shape = session.tensor_shape(input)?;
+        let dtype = session.tensor_dtype(input)?;
+        validate_parameter_dtype(dtype)?;
+        if session.tensor_shape(self.weight)? != [self.num_parameters]
+            || session.tensor_dtype(self.weight)? != dtype
+            || session.tensor_device(self.weight)? != session.tensor_device(input)?
+        {
+            return Err(incompatible_error(
+                "PReLU weight must match num_parameters and the input dtype and device",
+            ));
+        }
 
         // Determine the pre-expand shape for the weight tensor.
         // tensor_expand requires every original dim to be 1 or to
         // already match the target dim. So we lay out
         //   num_parameters == 1                 → [1, 1, ..., 1]
-        //   1-D input, num_parameters == len    → [num_parameters]
         //   N-D input, num_parameters == channels → [1, C, 1, ..., 1]
+        // As in PyTorch, scalar and 1-D inputs have one channel; their
+        // leading dimension is not a per-channel slope dimension.
         let weight_pre_expand: Vec<usize> = if self.num_parameters == 1 {
             if input_shape.is_empty() {
                 vec![]
@@ -6596,16 +6626,9 @@ impl Module for PReLU {
                 vec![1; input_shape.len()]
             }
         } else if input_shape.len() <= 1 {
-            // 1-D input with per-element slope; weight shape must be
-            // [num_parameters] and match the input length.
-            if input_shape.first().copied().unwrap_or(0) != self.num_parameters {
-                return Err(AutogradError::Dispatch(DispatchError::Key(
-                    DispatchKeyError::IncompatibleSet {
-                        reason: "PReLU num_parameters must match input length for 1-D input",
-                    },
-                )));
-            }
-            vec![self.num_parameters]
+            return Err(incompatible_error(
+                "PReLU scalar and 1-D inputs require a single parameter",
+            ));
         } else {
             // 2+D input: per-channel slope along dim 1.
             if input_shape[1] != self.num_parameters {
@@ -6630,18 +6653,26 @@ impl Module for PReLU {
         } else {
             session.tensor_expand(weight_reshaped, input_shape.clone())?
         };
-        let neg_branch = session.tensor_mul(weight_broadcast, input)?;
-        let zeros = session.full(input_shape, 0.0, false)?;
+        let zeros = session.zeros_like(input, false)?;
         // STRICTLY greater, matching torch's `where(input > 0, input, weight*input)`.
         // This used to be `tensor_ge`, which routes an `x == 0` element down the
         // identity branch and hands it a gradient of 1.0 where torch hands it
         // `w[c]`. frankentorch-x4cx3.
         let mask = session.tensor_gt(input, zeros)?;
+        // Do not expose positive inputs to the slope multiplication. Otherwise
+        // an unselected +Inf produces 0 * Inf in the weight adjoint, and a NaN
+        // slope can contaminate the derivative of the positive identity branch.
+        let negative_input = session.tensor_where(mask, zeros, input)?;
+        let neg_branch = session.tensor_mul(weight_broadcast, negative_input)?;
         session.tensor_where(mask, input, neg_branch)
     }
 
     fn parameters(&self) -> Vec<TensorNodeId> {
         vec![self.weight]
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        vec![("weight", self.weight)]
     }
 }
 
@@ -7966,10 +7997,7 @@ impl Module for MaxPool1d {
         let output = session.tensor_cat(&slices, 2)?;
 
         debug_assert_eq!(
-            {
-                let (_, m) = session.tensor_values_meta(output).unwrap();
-                m.shape().to_vec()
-            },
+            session.tensor_shape(output)?,
             vec![batch_size, channels, l_out]
         );
 
@@ -30997,6 +31025,171 @@ mod tests {
         assert!(pool.forward(&mut session, x).is_err());
     }
 
+    #[test]
+    fn pool1d_typed_training_matches_pytorch_composed_cnn() {
+        // PyTorch 2.15.0+cpu oracle, identical results in float32 and float64:
+        // Conv1d(1,2,1,bias=False) -> PReLU(2) -> pool(2,2) -> Flatten ->
+        // Linear(6,1,bias=False), with the explicit weights below. The loss is
+        // the output sum, so every expected adjoint is independently fixed.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for maximum in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let conv =
+                        Conv1d::new_with_dtype(&mut session, 1, 2, 1, 1, 0, false, dtype).unwrap();
+                    let activation = PReLU::new_with_dtype(&mut session, 2, 0.25, dtype).unwrap();
+                    let linear = Linear::new_with_dtype(&mut session, 6, 1, false, dtype).unwrap();
+                    session
+                        .tensor_update_param_values(conv.weight(), vec![0.5, -1.0])
+                        .unwrap();
+                    session
+                        .tensor_update_param_values(activation.weight(), vec![0.25, 0.5])
+                        .unwrap();
+                    session
+                        .tensor_update_param_values(
+                            linear.weight(),
+                            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        )
+                        .unwrap();
+                    let parameters = [conv.weight(), activation.weight(), linear.weight()];
+                    let mut model = Sequential::new();
+                    model.push(Box::new(conv));
+                    model.push(Box::new(activation));
+                    let pool: Box<dyn Module> = if maximum {
+                        Box::new(MaxPool1d::new(2, 2))
+                    } else {
+                        Box::new(AvgPool1d::new(2, 2))
+                    };
+                    model.push(pool);
+                    model.push(Box::new(Flatten::new(1, 2)));
+                    model.push(Box::new(linear));
+                    let input = packed_recurrent_test_leaf(
+                        &mut session,
+                        vec![-4.0, -2.0, 0.0, 2.0, 4.0, 6.0],
+                        vec![1, 1, 6],
+                        dtype,
+                        true,
+                    );
+                    let output = model.forward(&mut session, input).unwrap();
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert_eq!(session.tensor_shape(output).unwrap(), [1, 1]);
+                    let (
+                        expected_output,
+                        expected_input,
+                        expected_conv,
+                        expected_slope,
+                        expected_linear,
+                    ) = if maximum {
+                        (
+                            14.75,
+                            [-4.0, 0.125, -2.5, 1.0, -3.0, 1.5],
+                            [21.5, -4.0],
+                            [-1.0, -24.0],
+                            [-0.25, 1.0, 3.0, 4.0, 0.0, -2.0],
+                        )
+                    } else {
+                        (
+                            2.625,
+                            [-1.9375, -1.9375, -1.125, -0.75, -0.75, -0.75],
+                            [16.25, 5.5],
+                            [-1.5, -35.0],
+                            [-0.375, 0.5, 2.5, 3.0, -0.5, -2.5],
+                        )
+                    };
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(output).unwrap(),
+                        [expected_output]
+                    );
+                    let loss = session.tensor_sum(output).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert_eq!(
+                        session.tensor_gradient(&report, input).unwrap(),
+                        expected_input
+                    );
+                    assert_eq!(
+                        session.tensor_gradient(&report, parameters[0]).unwrap(),
+                        expected_conv
+                    );
+                    assert_eq!(
+                        session.tensor_gradient(&report, parameters[1]).unwrap(),
+                        expected_slope
+                    );
+                    assert_eq!(
+                        session.tensor_gradient(&report, parameters[2]).unwrap(),
+                        expected_linear
+                    );
+                    let inference = session.with_no_grad(|s| model.forward(s, input)).unwrap();
+                    assert!(!session.tensor_requires_grad(inference).unwrap());
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(inference).unwrap(),
+                        [expected_output]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pool1d_typed_unbatched_overlap_and_empty_batches_keep_gradients() {
+        for dtype in [DType::F32, DType::F64] {
+            for maximum in [false, true] {
+                let pool: Box<dyn Module> = if maximum {
+                    Box::new(MaxPool1d::new(3, 1))
+                } else {
+                    Box::new(AvgPool1d::new(3, 1))
+                };
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let input = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![1.0, 3.0, 3.0, -2.0, 4.0],
+                    vec![1, 5],
+                    dtype,
+                    true,
+                );
+                let output = pool.forward(&mut session, input).unwrap();
+                assert_eq!(session.tensor_shape(output).unwrap(), [1, 3]);
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                let (expected_output, expected_input) = if maximum {
+                    ([3.0, 3.0, 4.0], [0.0, -1.0, 0.0, 0.0, 3.0])
+                } else {
+                    (
+                        [7.0 / 3.0, 4.0 / 3.0, 5.0 / 3.0],
+                        [1.0 / 3.0, -1.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 1.0],
+                    )
+                };
+                assert_typed_normalization_close(
+                    &session.tensor_values_lossy_f64(output).unwrap(),
+                    &expected_output,
+                    dtype,
+                );
+                let upstream = packed_recurrent_test_leaf(
+                    &mut session,
+                    vec![1.0, -2.0, 3.0],
+                    vec![1, 3],
+                    dtype,
+                    false,
+                );
+                let weighted = session.tensor_mul(output, upstream).unwrap();
+                let loss = session.tensor_sum(weighted).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert_typed_normalization_close(
+                    session.tensor_gradient(&report, input).unwrap(),
+                    &expected_input,
+                    dtype,
+                );
+
+                let empty =
+                    packed_recurrent_test_leaf(&mut session, vec![], vec![0, 2, 5], dtype, true);
+                let output = pool.forward(&mut session, empty).unwrap();
+                assert_eq!(session.tensor_shape(output).unwrap(), [0, 2, 3]);
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert!(session.tensor_gradient(&report, empty).unwrap().is_empty());
+            }
+        }
+    }
+
     // ── Conv2d tests ─────────────────────────────────────────────────────
 
     #[test]
@@ -40891,6 +41084,296 @@ mod tests {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let prelu = PReLU::new(&mut session, 3, 0.25).unwrap();
         assert_eq!(prelu.parameters().len(), 1);
+    }
+
+    #[test]
+    fn prelu_typed_outputs_and_weighted_gradients_match_scalar_reference() {
+        let values = vec![
+            -2.0, 0.0, 1.0, -4.0, 2.0, -0.0, -0.5, 3.0, -1.0, 0.0, 4.0, -2.0,
+        ];
+        let incoming = vec![
+            0.5, -1.0, 2.0, 0.25, -0.75, 1.5, -2.0, 1.0, 0.125, -0.5, 2.5, -1.25,
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for slopes in [vec![0.25], vec![0.25, -0.5, 1.5]] {
+                    for input_grad in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let model = session
+                            .with_no_grad(|s| PReLU::new_with_dtype(s, slopes.len(), 0.25, dtype))
+                            .unwrap();
+                        assert!(session.tensor_is_leaf(model.weight()).unwrap());
+                        assert!(session.tensor_requires_grad(model.weight()).unwrap());
+                        assert_eq!(session.tensor_dtype(model.weight()).unwrap(), dtype);
+                        session
+                            .tensor_update_param_values(model.weight(), slopes.clone())
+                            .unwrap();
+                        let input = packed_recurrent_test_leaf(
+                            &mut session,
+                            values.clone(),
+                            vec![2, 3, 2],
+                            dtype,
+                            input_grad,
+                        );
+                        let output = model.forward(&mut session, input).unwrap();
+                        assert_eq!(session.tensor_shape(output).unwrap(), [2, 3, 2]);
+                        assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                        let mut expected_output = Vec::new();
+                        let mut expected_input = Vec::new();
+                        let mut expected_weight = vec![0.0; slopes.len()];
+                        for (i, (&x, &gradient)) in values.iter().zip(&incoming).enumerate() {
+                            let channel = if slopes.len() == 1 { 0 } else { i / 2 % 3 };
+                            expected_output.push(if x > 0.0 { x } else { slopes[channel] * x });
+                            expected_input
+                                .push(gradient * if x > 0.0 { 1.0 } else { slopes[channel] });
+                            if x <= 0.0 {
+                                expected_weight[channel] += gradient * x;
+                            }
+                        }
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(output).unwrap(),
+                            expected_output
+                        );
+                        let upstream = packed_recurrent_test_leaf(
+                            &mut session,
+                            incoming.clone(),
+                            vec![2, 3, 2],
+                            dtype,
+                            false,
+                        );
+                        let weighted = session.tensor_mul(output, upstream).unwrap();
+                        let loss = session.tensor_sum(weighted).unwrap();
+                        let report = session.tensor_backward(loss).unwrap();
+                        assert_eq!(
+                            session.tensor_gradient(&report, model.weight()).unwrap(),
+                            expected_weight
+                        );
+                        if input_grad {
+                            assert_eq!(
+                                session.tensor_gradient(&report, input).unwrap(),
+                                expected_input
+                            );
+                        } else {
+                            assert!(session.tensor_gradient(&report, input).is_none());
+                        }
+                        let evaluated = session.with_no_grad(|s| model.forward(s, input)).unwrap();
+                        assert_eq!(session.tensor_dtype(evaluated).unwrap(), dtype);
+                        assert!(!session.tensor_requires_grad(evaluated).unwrap());
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(evaluated).unwrap(),
+                            expected_output
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prelu_typed_scalar_empty_and_nonfinite_cases_match_pytorch() {
+        // Verified against torch 2.15.0+cpu: 0-D/1-D inputs have one channel,
+        // zero-channel tensors permit an empty weight, and unselected +Inf/NaN
+        // operands do not corrupt gradients in the other branch.
+        for dtype in [DType::F32, DType::F64] {
+            for (shape, count) in [(vec![0], 1), (vec![0, 3, 2], 3), (vec![2, 0, 3], 0)] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let model = PReLU::new_with_dtype(&mut session, count, 0.25, dtype).unwrap();
+                let input =
+                    packed_recurrent_test_leaf(&mut session, vec![], shape.clone(), dtype, true);
+                let output = model.forward(&mut session, input).unwrap();
+                assert_eq!(session.tensor_shape(output).unwrap(), shape);
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert!(session.tensor_gradient(&report, input).unwrap().is_empty());
+                assert_eq!(
+                    session.tensor_gradient(&report, model.weight()).unwrap(),
+                    vec![0.0; count]
+                );
+            }
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let model = PReLU::new_with_dtype(&mut session, 1, 0.25, dtype).unwrap();
+            let scalar = packed_recurrent_test_leaf(&mut session, vec![-2.0], vec![], dtype, true);
+            let output = model.forward(&mut session, scalar).unwrap();
+            assert_eq!(session.tensor_shape(output).unwrap(), Vec::<usize>::new());
+            assert_eq!(session.tensor_values_lossy_f64(output).unwrap(), [-0.5]);
+            let report = session.tensor_backward(output).unwrap();
+            assert_eq!(session.tensor_gradient(&report, scalar).unwrap(), [0.25]);
+            assert_eq!(
+                session.tensor_gradient(&report, model.weight()).unwrap(),
+                [-2.0]
+            );
+
+            for (values, slope, expected_output, expected_input, expected_weight) in [
+                (
+                    vec![f64::INFINITY, -1.0],
+                    0.25,
+                    vec![f64::INFINITY, -0.25],
+                    vec![1.0, 0.25],
+                    -1.0,
+                ),
+                (vec![2.0], f64::NAN, vec![2.0], vec![1.0], 0.0),
+            ] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let model = PReLU::new_with_dtype(&mut session, 1, slope, dtype).unwrap();
+                let shape = vec![values.len()];
+                let input = packed_recurrent_test_leaf(&mut session, values, shape, dtype, true);
+                let output = model.forward(&mut session, input).unwrap();
+                assert_eq!(
+                    session.tensor_values_lossy_f64(output).unwrap(),
+                    expected_output
+                );
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert_eq!(
+                    session.tensor_gradient(&report, input).unwrap(),
+                    expected_input
+                );
+                assert_eq!(
+                    session.tensor_gradient(&report, model.weight()).unwrap(),
+                    [expected_weight]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prelu_typed_preflight_preserves_graph_and_random_stream() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut untouched = FrankenTorchSession::new(ExecutionMode::Strict);
+        session.manual_seed(111);
+        untouched.manual_seed(111);
+        for dtype in [DType::F16, DType::BF16, DType::I64, DType::Complex64] {
+            assert!(PReLU::new_with_dtype(&mut session, 3, 0.25, dtype).is_err());
+        }
+        assert_eq!(session.autograd_graph_node_count(), 0);
+        let model = PReLU::new_with_dtype(&mut session, 3, 0.25, DType::F32).unwrap();
+        let rank_one = session
+            .tensor_variable_f32(vec![1.0; 3], vec![3], true)
+            .unwrap();
+        let scalar = session
+            .tensor_variable_f32(vec![1.0], vec![], true)
+            .unwrap();
+        let wrong_channels = session
+            .tensor_variable_f32(vec![1.0; 4], vec![1, 4], true)
+            .unwrap();
+        let wrong_dtype = session
+            .tensor_variable(vec![1.0; 3], vec![1, 3], true)
+            .unwrap();
+        let storage =
+            DenseTensor::from_contiguous_values_f32(vec![1.0; 3], vec![1, 3], Device::Metal)
+                .unwrap();
+        let wrong_device = session.tensor_variable_from_storage(storage, true);
+        for input in [
+            rank_one,
+            scalar,
+            wrong_channels,
+            wrong_dtype,
+            wrong_device,
+            TensorNodeId(usize::MAX),
+        ] {
+            let nodes = session.autograd_graph_node_count();
+            assert!(model.forward(&mut session, input).is_err());
+            assert_eq!(session.autograd_graph_node_count(), nodes);
+        }
+        let next = session.rand(vec![4], false).unwrap();
+        let expected = untouched.rand(vec![4], false).unwrap();
+        assert_eq!(
+            session.tensor_values(next).unwrap(),
+            untouched.tensor_values(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn prelu_typed_model_checkpoint_restores_learned_slopes_and_training() {
+        for dtype in [DType::F32, DType::F64] {
+            let make_model = |session: &mut FrankenTorchSession| {
+                let mut model = Sequential::new();
+                model.push(Box::new(
+                    Linear::new_with_dtype(session, 2, 3, true, dtype).unwrap(),
+                ));
+                model.push(Box::new(
+                    PReLU::new_with_dtype(session, 3, 0.25, dtype).unwrap(),
+                ));
+                model.push(Box::new(
+                    Linear::new_with_dtype(session, 3, 2, true, dtype).unwrap(),
+                ));
+                model
+            };
+            let train_step = |session: &mut FrankenTorchSession, model: &Sequential, input| {
+                session.tensor_zero_grads(&model.parameters()).unwrap();
+                let output = model.forward(session, input).unwrap();
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                let square = session.tensor_mul(output, output).unwrap();
+                let loss = session.tensor_sum(square).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                let gradients: Vec<Vec<f64>> = model
+                    .parameters()
+                    .iter()
+                    .map(|&parameter| {
+                        session
+                            .tensor_gradient(&report, parameter)
+                            .unwrap()
+                            .to_vec()
+                    })
+                    .collect();
+                for (parameter, gradient) in model.parameters().into_iter().zip(&gradients) {
+                    let values = session.tensor_values_lossy_f64(parameter).unwrap();
+                    let updated = values
+                        .iter()
+                        .zip(gradient)
+                        .map(|(&v, &g)| v - 0.01 * g)
+                        .collect();
+                    session
+                        .tensor_update_param_values(parameter, updated)
+                        .unwrap();
+                }
+                (session.tensor_values_lossy_f64(output).unwrap(), gradients)
+            };
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            session.manual_seed(111);
+            let model = session.with_no_grad(make_model);
+            let values = vec![-2.0, 1.0, 0.5, -3.0, -1.0, -2.0];
+            let input =
+                packed_recurrent_test_leaf(&mut session, values.clone(), vec![3, 2], dtype, false);
+            let (_, gradients) = train_step(&mut session, &model, input);
+            assert!(gradients[2].iter().any(|&gradient| gradient != 0.0));
+            let saved = module_state_dict(&model, &session).unwrap();
+            assert_eq!(
+                saved.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["0.bias", "0.weight", "1.weight", "2.bias", "2.weight",]
+            );
+            let typed = saved
+                .iter()
+                .map(|(name, tensor)| {
+                    (
+                        name.clone(),
+                        ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                    )
+                })
+                .collect();
+            let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+            let decoded = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+            let mut resumed = FrankenTorchSession::new(ExecutionMode::Strict);
+            resumed.manual_seed(222);
+            resumed.tensor_variable(vec![9.0], vec![1], false).unwrap();
+            let restored = resumed.with_no_grad(make_model);
+            let restored_ids = restored.parameters();
+            module_load_state_dict(&restored, &mut resumed, &decoded, true).unwrap();
+            assert_eq!(restored.parameters(), restored_ids);
+            let restored_input =
+                packed_recurrent_test_leaf(&mut resumed, values, vec![3, 2], dtype, false);
+            for _ in 0..2 {
+                assert_eq!(
+                    train_step(&mut session, &model, input),
+                    train_step(&mut resumed, &restored, restored_input)
+                );
+                assert_batchnorm_test_state_equal(
+                    &module_state_dict(&model, &session).unwrap(),
+                    &module_state_dict(&restored, &resumed).unwrap(),
+                );
+            }
+        }
     }
 
     #[test]
