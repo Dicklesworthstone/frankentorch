@@ -84086,8 +84086,14 @@ impl FrankenTorchSession {
                 _ => unreachable!("is_complex implies complex storage"),
             }
         } else {
-            let vals = self.tensor_values(input)?;
-            re_data = vals;
+            // The transform computes in F64, but its real input may be F32.
+            // Keep the adjoint attached to the original typed input while
+            // widening its values for this kernel.
+            re_data = if dtype == DType::F32 {
+                self.tensor_values_lossy_f64(input)?
+            } else {
+                self.tensor_values(input)?
+            };
             im_data = vec![0.0_f64; total_elements];
         }
         // Each (outer, inner) lane is an independent 1-D DFT (O(N log N) trig
@@ -84296,7 +84302,87 @@ impl FrankenTorchSession {
         }
     }
 
-    /// Resize tensor by padding with zeros or cropping.
+    /// Resolve the logical N-D transform shape before allocating or transforming.
+    /// With explicit sizes and no dimensions, PyTorch transforms the last
+    /// `s.len()` axes. The inverse real transform infers an even final length
+    /// only when no explicit sizes were supplied.
+    fn fft_nd_shape_and_dims(
+        shape: &[usize],
+        s: Option<&[usize]>,
+        dims: Option<&[usize]>,
+        inverse_real: bool,
+    ) -> Result<(Vec<usize>, Vec<usize>, usize), AutogradError> {
+        let ndim = shape.len();
+        let transform_dims = match dims {
+            Some(dims) => dims.to_vec(),
+            None => {
+                let count = s.map_or(ndim, <[usize]>::len);
+                if count > ndim {
+                    return Err(Self::incompatible_tensor_args(
+                        "fft: more transform sizes than input dimensions",
+                    ));
+                }
+                (ndim - count..ndim).collect()
+            }
+        };
+        if s.is_some_and(|sizes| sizes.len() != transform_dims.len()) {
+            return Err(Self::incompatible_tensor_args(
+                "fft: sizes and dimensions must have the same length",
+            ));
+        }
+        let mut seen = vec![false; ndim];
+        let mut transform_shape = shape.to_vec();
+        let mut n_total = 1usize;
+        for (index, &dim) in transform_dims.iter().enumerate() {
+            if dim >= ndim {
+                return Err(Self::incompatible_tensor_args(
+                    "fft: dimension out of range",
+                ));
+            }
+            if seen[dim] {
+                return Err(Self::incompatible_tensor_args(
+                    "fft: transform dimensions must be unique",
+                ));
+            }
+            seen[dim] = true;
+            let size = if let Some(sizes) = s {
+                sizes[index]
+            } else if inverse_real && index + 1 == transform_dims.len() {
+                shape[dim]
+                    .checked_sub(1)
+                    .and_then(|half| half.checked_mul(2))
+                    .ok_or_else(|| {
+                        Self::incompatible_tensor_args("fft: inferred real output size overflow")
+                    })?
+            } else {
+                shape[dim]
+            };
+            if size == 0 {
+                return Err(Self::incompatible_tensor_args(
+                    "fft: transform sizes must be greater than zero",
+                ));
+            }
+            transform_shape[dim] = size;
+            n_total = n_total.checked_mul(size).ok_or_else(|| {
+                Self::incompatible_tensor_args("fft: transform size product overflow")
+            })?;
+        }
+        let output_numel = transform_shape
+            .iter()
+            .try_fold(1usize, |volume, &size| volume.checked_mul(size))
+            .ok_or_else(|| Self::incompatible_tensor_args("fft: output shape volume overflow"))?;
+        output_numel
+            .checked_mul(std::mem::size_of::<Complex128>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(|| {
+                Self::incompatible_tensor_args("fft: output allocation size overflow")
+            })?;
+        Ok((transform_dims, transform_shape, n_total))
+    }
+
+    /// Resize a signal before its transform, keeping cropping and padding on
+    /// the tape. Complex data moves through its real components so their
+    /// existing real-valued view adjoints also preserve complex gradients.
     fn tensor_resize_with_pad_or_crop(
         &mut self,
         input: TensorNodeId,
@@ -84306,70 +84392,34 @@ impl FrankenTorchSession {
         if current_shape == target_shape {
             return Ok(input);
         }
-        let vals = self.tensor_values(input)?;
-        let mut result = vec![0.0_f64; target_shape.iter().product()];
-        fn copy_recursive(
-            src: &[f64],
-            dst: &mut [f64],
-            src_shape: &[usize],
-            dst_shape: &[usize],
-            src_idx: usize,
-            dst_idx: usize,
-            dim: usize,
-            _src_stride: usize,
-            _dst_stride: usize,
+        if current_shape.len() != target_shape.len() {
+            return Err(Self::incompatible_tensor_args(
+                "fft resize: input and output ranks must match",
+            ));
+        }
+        if matches!(
+            self.tensor_dtype(input)?,
+            DType::Complex64 | DType::Complex128
         ) {
-            if dim == src_shape.len() {
-                dst[dst_idx] = src[src_idx];
-                return;
-            }
-            let copy_len = src_shape[dim].min(dst_shape[dim]);
-            let new_src_stride = if dim + 1 < src_shape.len() {
-                src_shape[dim + 1..].iter().product()
+            let real = self.tensor_real(input)?;
+            let imag = self.tensor_imag(input)?;
+            let real = self.tensor_resize_with_pad_or_crop(real, target_shape)?;
+            let imag = self.tensor_resize_with_pad_or_crop(imag, target_shape)?;
+            return self.tensor_complex(real, imag);
+        }
+        let mut resized = input;
+        let mut padding = vec![0usize; current_shape.len() * 2];
+        for (dim, (&current, &target)) in current_shape.iter().zip(target_shape).enumerate() {
+            if target < current {
+                resized = self.tensor_narrow(resized, dim, 0, target)?;
             } else {
-                1
-            };
-            let new_dst_stride = if dim + 1 < dst_shape.len() {
-                dst_shape[dim + 1..].iter().product()
-            } else {
-                1
-            };
-            for i in 0..copy_len {
-                copy_recursive(
-                    src,
-                    dst,
-                    src_shape,
-                    dst_shape,
-                    src_idx + i * new_src_stride,
-                    dst_idx + i * new_dst_stride,
-                    dim + 1,
-                    new_src_stride,
-                    new_dst_stride,
-                );
+                padding[2 * (current_shape.len() - 1 - dim) + 1] = target - current;
             }
         }
-        let src_stride: usize = if current_shape.is_empty() {
-            1
-        } else {
-            current_shape.iter().product()
-        };
-        let dst_stride: usize = if target_shape.is_empty() {
-            1
-        } else {
-            target_shape.iter().product()
-        };
-        copy_recursive(
-            &vals,
-            &mut result,
-            &current_shape,
-            target_shape,
-            0,
-            0,
-            0,
-            src_stride,
-            dst_stride,
-        );
-        self.tensor_variable(result, target_shape.to_vec(), false)
+        // Also materialize a crop-only result: dim-0 Narrow may retain a
+        // larger backing allocation, while complex assembly consumes compact
+        // component storage. Pad with zero widths preserves the Narrow edge.
+        self.tensor_pad(resized, &padding, 0.0)
     }
 
     /// Extend a half-spectrum complex tensor to full length using Hermitian symmetry.
@@ -85793,7 +85843,9 @@ impl FrankenTorchSession {
     /// Compute the N-dimensional Discrete Fourier Transform.
     ///
     /// Equivalent to `torch.fft.fftn(input, s, dim)`.
-    /// If `dims` is None, transforms all dimensions. `s` can specify output sizes.
+    /// If `dims` is None, transforms all dimensions, or the last `s.len()`
+    /// dimensions when sizes are supplied. Signals are padded or cropped before
+    /// the transform, including when gradients are enabled.
     pub fn tensor_fftn(
         &mut self,
         input: TensorNodeId,
@@ -85804,9 +85856,8 @@ impl FrankenTorchSession {
     }
 
     /// `torch.fft.fftn(input, s, dim, norm=norm)`. The N-D norm rescales by the
-    /// product of the TRANSFORMED dim sizes N = prod(shape[d] for d in dims):
-    /// backward x1, forward x(1/N), ortho x(1/√N). Verified vs torch 2.12 for
-    /// the default `s=None` (the per-dim DFT lengths equal the input sizes).
+    /// product of the logical transform sizes: backward x1, forward x(1/N),
+    /// ortho x(1/√N). Explicit sizes determine both the signal and this factor.
     pub fn tensor_fftn_norm(
         &mut self,
         input: TensorNodeId,
@@ -85814,61 +85865,24 @@ impl FrankenTorchSession {
         dims: Option<&[usize]>,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && s.is_some() {
-            // fftn is differentiable via composition over tensor_fft_along_dim
-            // (frankentorch-ng1hw), but the explicit-output-size (s=) resize path
-            // goes through tensor_resize_with_pad_or_crop, which is not yet
-            // autograd-aware — fail loud rather than silently drop the gradient.
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "fftn: autograd with explicit output size (s=) not yet supported",
-                },
-            )));
-        }
         let shape = self.tensor_shape(input)?;
-        let ndim = shape.len();
-        let transform_dims: Vec<usize> = match dims {
-            Some(d) => d.iter().copied().collect(),
-            None => (0..ndim).collect(),
-        };
+        let (transform_dims, transform_shape, n_total) =
+            Self::fft_nd_shape_and_dims(&shape, s, dims, false)?;
+        let factor = Self::fft_norm_factor(norm, n_total, false)?;
         if transform_dims.is_empty() {
-            let vals = self.tensor_values(input)?;
-            let re_node = self.tensor_variable(vals.clone(), shape.clone(), false)?;
+            if matches!(
+                self.tensor_dtype(input)?,
+                DType::Complex64 | DType::Complex128
+            ) {
+                return Ok(input);
+            }
+            let re_node = self.tensor_to_f64(input)?;
             let im_node = self.tensor_zeros(shape, false)?;
             return self.tensor_complex(re_node, im_node);
         }
-        // N = product of the transformed dim sizes (validates dims in range too).
-        let mut n_total: usize = 1;
-        for &dim in &transform_dims {
-            if dim >= ndim {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "fftn: dimension out of range",
-                    },
-                )));
-            }
-            n_total *= shape[dim];
-        }
-        let factor = Self::fft_norm_factor(norm, n_total, false)?;
-        let mut current = input;
+        let mut current = self.tensor_resize_with_pad_or_crop(input, &transform_shape)?;
         for &dim in &transform_dims {
             current = self.tensor_fft_along_dim(current, dim, false)?;
-        }
-        if let Some(target_sizes) = s {
-            let current_shape = self.tensor_shape(current)?;
-            let mut new_shape = current_shape.clone();
-            for (i, &target_sz) in target_sizes.iter().enumerate() {
-                if i < transform_dims.len() {
-                    new_shape[transform_dims[i]] = target_sz;
-                }
-            }
-            if new_shape != current_shape {
-                let re_view = self.tensor_real(current)?;
-                let im_view = self.tensor_imag(current)?;
-                let re_resized = self.tensor_resize_with_pad_or_crop(re_view, &new_shape)?;
-                let im_resized = self.tensor_resize_with_pad_or_crop(im_view, &new_shape)?;
-                current = self.tensor_complex(re_resized, im_resized)?;
-            }
         }
         if factor != 1.0 {
             let re = self.tensor_real(current)?;
@@ -85883,7 +85897,8 @@ impl FrankenTorchSession {
     /// Compute the N-dimensional Inverse Discrete Fourier Transform.
     ///
     /// Equivalent to `torch.fft.ifftn(input, s, dim)`.
-    /// If `dims` is None, transforms all dimensions.
+    /// If `dims` is None, transforms all dimensions, or the last `s.len()`
+    /// dimensions when sizes are supplied.
     pub fn tensor_ifftn(
         &mut self,
         input: TensorNodeId,
@@ -85894,7 +85909,7 @@ impl FrankenTorchSession {
     }
 
     /// `torch.fft.ifftn(input, s, dim, norm=norm)`. Inverse N-D DFT; the rescale
-    /// uses the product of the transformed dim sizes N = prod(shape[d]):
+    /// uses the product of the logical transform sizes:
     /// backward x1 (the inverse already carries 1/N), forward xN, ortho x√N.
     pub fn tensor_ifftn_norm(
         &mut self,
@@ -85903,15 +85918,6 @@ impl FrankenTorchSession {
         dims: Option<&[usize]>,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && s.is_some() {
-            // Differentiable via composition over tensor_fft_along_dim
-            // (frankentorch-ng1hw); the s= resize path is not yet autograd-aware.
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "ifftn: autograd with explicit output size (s=) not yet supported",
-                },
-            )));
-        }
         let dtype = self.tensor_dtype(input)?;
         if dtype != DType::Complex128 && dtype != DType::Complex64 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -85921,45 +85927,15 @@ impl FrankenTorchSession {
             )));
         }
         let shape = self.tensor_shape(input)?;
-        let ndim = shape.len();
-        let transform_dims: Vec<usize> = match dims {
-            Some(d) => d.iter().copied().collect(),
-            None => (0..ndim).collect(),
-        };
+        let (transform_dims, transform_shape, n_total) =
+            Self::fft_nd_shape_and_dims(&shape, s, dims, false)?;
+        let factor = Self::fft_norm_factor(norm, n_total, true)?;
         if transform_dims.is_empty() {
             return Ok(input);
         }
-        let mut n_total: usize = 1;
-        for &dim in &transform_dims {
-            if dim >= ndim {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "ifftn: dimension out of range",
-                    },
-                )));
-            }
-            n_total *= shape[dim];
-        }
-        let factor = Self::fft_norm_factor(norm, n_total, true)?;
-        let mut current = input;
+        let mut current = self.tensor_resize_with_pad_or_crop(input, &transform_shape)?;
         for &dim in &transform_dims {
             current = self.tensor_fft_along_dim(current, dim, true)?;
-        }
-        if let Some(target_sizes) = s {
-            let current_shape = self.tensor_shape(current)?;
-            let mut new_shape = current_shape.clone();
-            for (i, &target_sz) in target_sizes.iter().enumerate() {
-                if i < transform_dims.len() {
-                    new_shape[transform_dims[i]] = target_sz;
-                }
-            }
-            if new_shape != current_shape {
-                let re_view = self.tensor_real(current)?;
-                let im_view = self.tensor_imag(current)?;
-                let re_resized = self.tensor_resize_with_pad_or_crop(re_view, &new_shape)?;
-                let im_resized = self.tensor_resize_with_pad_or_crop(im_view, &new_shape)?;
-                current = self.tensor_complex(re_resized, im_resized)?;
-            }
         }
         if factor != 1.0 {
             let re = self.tensor_real(current)?;
@@ -85996,45 +85972,21 @@ impl FrankenTorchSession {
         dims: Option<&[usize]>,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled() {
-            // Autograd (frankentorch-ng1hw): rfftn(x) is the non-redundant half of
-            // fftn(x) — the last transform dim truncated to L/2+1. fftn + real/imag/
-            // narrow/complex are all differentiable, so compose the grad path through
-            // them (same norm factor as fftn: product of the full transform-dim sizes).
-            let shape = self.tensor_shape(input)?;
-            let ndim = shape.len();
-            let tdims: Vec<usize> = match dims {
-                Some(d) => d.to_vec(),
-                None => (0..ndim).collect(),
-            };
-            if s.is_some() || tdims.is_empty() || tdims.iter().any(|&d| d >= ndim) {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "rfftn: autograd with explicit output size (s=) / empty or out-of-range dims not yet supported",
-                    },
-                )));
-            }
-            let last_td = *tdims.last().unwrap();
-            let half = shape[last_td] / 2 + 1;
-            let f = self.tensor_fftn_norm(input, None, dims, norm)?;
-            let re = self.tensor_real(f)?;
-            let im = self.tensor_imag(f)?;
-            let re_h = self.tensor_narrow(re, last_td, 0, half)?;
-            let im_h = self.tensor_narrow(im, last_td, 0, half)?;
-            return self.tensor_complex(re_h, im_h);
+        let dtype = self.tensor_dtype(input)?;
+        if matches!(dtype, DType::Complex64 | DType::Complex128) {
+            return Err(Self::incompatible_tensor_args("rfftn: input must be real"));
         }
         let shape = self.tensor_shape(input)?;
         let ndim = shape.len();
-        let transform_dims: Vec<usize> = match dims {
-            Some(d) => d.iter().copied().collect(),
-            None => (0..ndim).collect(),
+        let (transform_dims, transform_shape, n_total) =
+            Self::fft_nd_shape_and_dims(&shape, s, dims, false)?;
+        let Some(&last_dim) = transform_dims.last() else {
+            return Err(Self::incompatible_tensor_args(
+                "rfftn: at least one transform dimension is required",
+            ));
         };
-        if transform_dims.is_empty() {
-            let vals = self.tensor_values(input)?;
-            let re_node = self.tensor_variable(vals, shape.clone(), false)?;
-            let im_node = self.tensor_zeros(shape, false)?;
-            return self.tensor_complex(re_node, im_node);
-        }
+        let factor = Self::fft_norm_factor(norm, n_total, false)?;
+        let requires_grad = self.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
         // Real-input fast path (mirrors rfft2's forward real-FFT). When the last
         // transformed dim is the contiguous last axis with an even length and no
         // resizing is requested, transform that dim with the real-input FFT (an
@@ -86044,10 +85996,10 @@ impl FrankenTorchSession {
         // win torch's rfftn gets from its real-FFT core. Equals the full-complex
         // path up to FFT round-off (validated by `rfftn_real_fast_path_matches_*`).
         // frankentorch-l9xod/no-gaps FFT vein.
-        let last_dim = *transform_dims.last().unwrap();
-        if s.is_none()
+        if !requires_grad
+            && s.is_none()
             && last_dim == ndim - 1
-            && self.tensor_dtype(input)? == DType::F64
+            && dtype == DType::F64
             && shape[ndim - 1] >= 2
             && shape[ndim - 1].is_multiple_of(2)
         {
@@ -86090,11 +86042,6 @@ impl FrankenTorchSession {
             }
             // Normalization uses N = product of the FULL transformed dim sizes
             // (the last dim's FULL length L, not the halved spectrum), matching fftn.
-            let mut n_total: usize = 1;
-            for &dim in &transform_dims {
-                n_total *= shape[dim];
-            }
-            let factor = Self::fft_norm_factor(norm, n_total, false)?;
             if factor != 1.0 {
                 let re = self.tensor_real(current)?;
                 let im = self.tensor_imag(current)?;
@@ -86105,14 +86052,16 @@ impl FrankenTorchSession {
             return Ok(current);
         }
         let full_fft = self.tensor_fftn_norm(input, s, dims, norm)?;
-        if let Some(&last_dim) = transform_dims.last() {
-            let current_shape = self.tensor_shape(full_fft)?;
-            let full_len = current_shape[last_dim];
-            let half_len = full_len / 2 + 1;
-            self.tensor_narrow(full_fft, last_dim, 0, half_len)
-        } else {
-            Ok(full_fft)
-        }
+        let half_len = transform_shape[last_dim] / 2 + 1;
+        // Narrow the real components: the tape's real-valued Narrow adjoint
+        // preserves both complex cotangents, including after signal resizing.
+        let real = self.tensor_real(full_fft)?;
+        let imag = self.tensor_imag(full_fft)?;
+        let mut half_shape = transform_shape;
+        half_shape[last_dim] = half_len;
+        let real = self.tensor_resize_with_pad_or_crop(real, &half_shape)?;
+        let imag = self.tensor_resize_with_pad_or_crop(imag, &half_shape)?;
+        self.tensor_complex(real, imag)
     }
 
     /// Compute the N-dimensional inverse real FFT.
@@ -86129,10 +86078,11 @@ impl FrankenTorchSession {
         self.tensor_irfftn_norm(input, s, dims, "backward")
     }
 
-    /// `torch.fft.irfftn(input, s, dim, norm=norm)`. The rescale uses the FULL
-    /// (Hermitian-extended) transformed dim sizes — the inverse N-D DFT is run
-    /// on the reconstructed full spectrum, so delegating to
-    /// [`Self::tensor_ifftn_norm`] applies the correct N = prod(full sizes).
+    /// `torch.fft.irfftn(input, s, dim, norm=norm)`. The rescale uses the full
+    /// logical transform sizes. The other axes are inverse-transformed before
+    /// reconstructing the final axis's Hermitian symmetry, which is essential
+    /// for N-D spectra: conjugating only the final frequency coordinate would
+    /// otherwise miss the sign reversal of the other transformed coordinates.
     pub fn tensor_irfftn_norm(
         &mut self,
         input: TensorNodeId,
@@ -86140,16 +86090,6 @@ impl FrankenTorchSession {
         dims: Option<&[usize]>,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && s.is_some() {
-            // Differentiable via composition (hermitian_extend + ifftn + real),
-            // frankentorch-ng1hw; the explicit-output-size (s=) resize path is not
-            // yet autograd-aware (fail loud rather than silently drop the gradient).
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "irfftn: autograd with explicit output size (s=) not yet supported",
-                },
-            )));
-        }
         let dtype = self.tensor_dtype(input)?;
         if dtype != DType::Complex128 && dtype != DType::Complex64 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -86159,23 +86099,29 @@ impl FrankenTorchSession {
             )));
         }
         let shape = self.tensor_shape(input)?;
-        let ndim = shape.len();
-        let transform_dims: Vec<usize> = match dims {
-            Some(d) => d.iter().copied().collect(),
-            None => (0..ndim).collect(),
+        let (transform_dims, transform_shape, n_total) =
+            Self::fft_nd_shape_and_dims(&shape, s, dims, true)?;
+        let Some(&last_dim) = transform_dims.last() else {
+            return Err(Self::incompatible_tensor_args(
+                "irfftn: at least one transform dimension is required",
+            ));
         };
-        if transform_dims.is_empty() {
-            return self.tensor_real(input);
+        let factor = Self::fft_norm_factor(norm, n_total, true)?;
+        let full_len = transform_shape[last_dim];
+        let mut spectrum_shape = transform_shape;
+        spectrum_shape[last_dim] = full_len / 2 + 1;
+        let mut current = self.tensor_resize_with_pad_or_crop(input, &spectrum_shape)?;
+        for &dim in &transform_dims[..transform_dims.len() - 1] {
+            current = self.tensor_fft_along_dim(current, dim, true)?;
         }
-        let last_dim = *transform_dims.last().unwrap();
-        let half_len = shape[last_dim];
-        let full_len = match s {
-            Some(sizes) if !sizes.is_empty() => sizes[sizes.len() - 1],
-            _ => (half_len - 1) * 2,
-        };
-        let full_complex = self.tensor_hermitian_extend(input, last_dim, full_len)?;
-        let ifft_result = self.tensor_ifftn_norm(full_complex, s, dims, norm)?;
-        self.tensor_real(ifft_result)
+        let full_complex = self.tensor_hermitian_extend(current, last_dim, full_len)?;
+        let ifft_result = self.tensor_fft_along_dim(full_complex, last_dim, true)?;
+        let real = self.tensor_real(ifft_result)?;
+        if factor == 1.0 {
+            Ok(real)
+        } else {
+            self.tensor_mul_scalar(real, factor)
+        }
     }
 
     /// Compute the Hermitian FFT (complex Hermitian input -> real output).
