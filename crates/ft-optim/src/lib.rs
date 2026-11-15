@@ -896,6 +896,25 @@ fn optimizer_hparam_error(reason: &'static str) -> AutogradError {
     }))
 }
 
+fn set_beta1_momentum(beta1: &mut f64, momentum: f64) -> Result<(), AutogradError> {
+    if !(0.0..1.0).contains(&momentum) {
+        return Err(optimizer_hparam_error(
+            "optimizer beta1 momentum must be finite and in [0, 1)",
+        ));
+    }
+    *beta1 = momentum;
+    Ok(())
+}
+
+fn validate_momentum(momentum: f64) -> Result<(), AutogradError> {
+    if !momentum.is_finite() || momentum < 0.0 {
+        return Err(optimizer_hparam_error(
+            "optimizer momentum must be finite and non-negative",
+        ));
+    }
+    Ok(())
+}
+
 fn optimizer_state_error(reason: &'static str) -> AutogradError {
     AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
         reason,
@@ -1120,19 +1139,27 @@ pub trait Optimizer {
 
     /// Return the optimizer's momentum hyperparameter when the algorithm exposes one.
     ///
+    /// For Adam-family optimizers this is `beta1`, the first-moment coefficient.
+    /// For SGD, RMSprop and Muon it is their explicit momentum coefficient.
+    /// Schedulers can therefore cycle the coefficient actually used by the
+    /// optimizer without resetting moments or changing Adam's `beta2`.
+    ///
     /// # Default behavior
     /// Returns `None`. This is correct for optimizers whose update rule has no momentum
     /// term because the base trait cannot invent a meaningful synthetic value.
     ///
     /// # When to override
     /// Override this method when your optimizer has a momentum-like hyperparameter that
-    /// should participate in scheduler coordination or diagnostics. For example, `SGD`
-    /// overrides this to return its configured momentum so `OneCycleLR` can inspect it.
+    /// should participate in scheduler coordination or diagnostics.
     fn get_momentum(&self) -> Option<f64> {
         None
     }
 
     /// Update the optimizer's momentum hyperparameter when supported.
+    ///
+    /// Adam-family implementations update only `beta1` and require `[0, 1)`.
+    /// Explicit momentum coefficients must be finite and non-negative. Invalid
+    /// coefficients are rejected before any optimizer state changes.
     ///
     /// # Default behavior
     /// Returns an `AutogradError` indicating that momentum is unsupported. This is
@@ -1326,6 +1353,12 @@ impl Optimizer for SGD {
     }
 
     fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        validate_momentum(momentum)?;
+        if self.nesterov && momentum == 0.0 {
+            return Err(optimizer_hparam_error(
+                "nesterov requires positive momentum",
+            ));
+        }
         self.momentum = momentum;
         Ok(())
     }
@@ -1620,6 +1653,14 @@ impl Optimizer for Adam {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.beta1)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        set_beta1_momentum(&mut self.beta1, momentum)
     }
 
     fn step(
@@ -1967,6 +2008,14 @@ impl Optimizer for AdamW {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.beta1)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        set_beta1_momentum(&mut self.beta1, momentum)
     }
 
     fn step(
@@ -2366,6 +2415,27 @@ impl Optimizer for RMSprop {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.momentum)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        validate_momentum(momentum)?;
+        // A scheduler can enable momentum after momentum-free updates. Give
+        // initialized parameters the zero buffer their next update would use,
+        // so the new configuration is checkpointable immediately. Never reset
+        // existing buffers when momentum is disabled or re-enabled.
+        if momentum > 0.0 {
+            for (square_avg, buffer) in self.square_avg.iter().zip(&mut self.momentum_buffer) {
+                if let Some(square_avg) = square_avg {
+                    buffer.get_or_insert_with(|| vec![0.0; square_avg.len()]);
+                }
+            }
+        }
+        self.momentum = momentum;
+        Ok(())
     }
 
     fn step(
@@ -3000,6 +3070,14 @@ impl Optimizer for RAdam {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.beta1)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        set_beta1_momentum(&mut self.beta1, momentum)
     }
 
     fn step(
@@ -6342,6 +6420,14 @@ impl Optimizer for Adamax {
         self.lr = lr;
     }
 
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.beta1)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        set_beta1_momentum(&mut self.beta1, momentum)
+    }
+
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
@@ -6926,6 +7012,14 @@ impl Optimizer for NAdam {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.beta1)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        set_beta1_momentum(&mut self.beta1, momentum)
     }
 
     fn step(
@@ -7791,6 +7885,14 @@ impl Optimizer for SparseAdam {
         self.lr = lr;
     }
 
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.beta1)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        set_beta1_momentum(&mut self.beta1, momentum)
+    }
+
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
@@ -8204,6 +8306,16 @@ impl Optimizer for Muon {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.momentum)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        validate_momentum(momentum)?;
+        self.momentum = momentum;
+        Ok(())
     }
 
     fn step(
@@ -16993,6 +17105,307 @@ mod tests {
                 "onecycle linear lr step {i}: got {}, want {want}",
                 opt2.get_lr(),
             );
+        }
+    }
+
+    #[test]
+    fn one_cycle_lr_adam_and_adamw_updates_match_torch() {
+        // torch 2.15.0 CPU oracle: float64 [1.5, -0.75], betas=(0.8, 0.92),
+        // eps=0.01, weight_decay=0.025, amsgrad=True. OneCycleLR(max_lr=0.1,
+        // total_steps=10, pct_start=0.3, anneal_strategy="linear") sets beta1
+        // while retaining beta2. Each row is read after optimizer.step(), then
+        // scheduler.step() advances to the next batch's coefficients.
+        let gradients = [
+            [2.0, -1.0],
+            [-0.5, 0.75],
+            [0.0, 0.25],
+            [1.25, -0.5],
+            [-2.0, 1.0],
+            [0.0, 0.0],
+            [0.5, 2.0],
+            [-0.75, -0.25],
+            [1.0, -1.5],
+            [0.25, 0.5],
+        ];
+        let expected_adam = [
+            [1.4960195360195361, -0.7460388821385177],
+            [1.4876214844153199, -0.7544232613377236],
+            [1.4783483614210755, -0.7745848765977524],
+            [1.4441234334667237, -0.7687260578637967],
+            [1.4495401518528628, -0.7885930793270531],
+            [1.4532146266117263, -0.8029629005123479],
+            [1.4524087649319621, -0.8247637149522983],
+            [1.454668883332535, -0.8379569508181723],
+            [1.4539992661549965, -0.8412106015083384],
+            [1.4539992325977416, -0.8412107250295168],
+        ];
+        let expected_adamw = [
+            [1.4958699004975125, -0.745964603960396],
+            [1.4863928961155828, -0.7542335268056704],
+            [1.4754097826765853, -0.7743499149845368],
+            [1.4396594151958106, -0.7688322483551464],
+            [1.4442553798940401, -0.7889080887723688],
+            [1.447502490652065, -0.8036667252309935],
+            [1.4465510099960091, -0.8253077325245813],
+            [1.4488563093025506, -0.838482329055318],
+            [1.4482919461673749, -0.8417922434504431],
+            [1.4482919189731676, -0.8417923705337271],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for f32_storage in [false, true] {
+                for (decoupled, expected) in [(false, expected_adam), (true, expected_adamw)] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let param = if f32_storage {
+                        session.tensor_variable_f32(vec![1.5, -0.75], vec![2], true)
+                    } else {
+                        session.tensor_variable(vec![1.5, -0.75], vec![2], true)
+                    }
+                    .unwrap();
+                    let mut optimizer: Box<dyn Optimizer> = if decoupled {
+                        Box::new(
+                            AdamW::new(vec![param], 0.03)
+                                .betas(0.8, 0.92)
+                                .eps(0.01)
+                                .weight_decay(0.025)
+                                .amsgrad(true),
+                        )
+                    } else {
+                        Box::new(
+                            Adam::new(vec![param], 0.03)
+                                .betas(0.8, 0.92)
+                                .eps(0.01)
+                                .weight_decay(0.025)
+                                .amsgrad(true),
+                        )
+                    };
+                    let mut scheduler =
+                        OneCycleLR::new(optimizer.as_ref(), 0.1, 10).anneal_strategy_linear();
+                    // FT constructors borrow immutably, so apply step zero
+                    // explicitly before the first batch (torch does it in new).
+                    scheduler.step(optimizer.as_mut(), Some(0));
+                    let report = backward_sum_sq(&mut session, param);
+                    for (round, (gradient, expected)) in gradients.iter().zip(expected).enumerate()
+                    {
+                        let expected_beta1 = if round <= 2 {
+                            0.95 - 0.1 * round as f64 / 2.0
+                        } else {
+                            0.85 + 0.1 * (round - 2) as f64 / 7.0
+                        };
+                        assert!((optimizer.get_momentum().unwrap() - expected_beta1).abs() < 1e-14);
+                        session
+                            .tensor_set_accumulated_gradient(param, gradient.to_vec())
+                            .unwrap();
+                        optimizer.step(&mut session, &report).unwrap();
+                        let tolerance = if f32_storage { 3e-7 } else { 3e-14 };
+                        for (actual, expected) in session
+                            .tensor_values_lossy_f64(param)
+                            .unwrap()
+                            .iter()
+                            .zip(expected)
+                        {
+                            assert!(
+                                (actual - expected).abs() < tolerance,
+                                "one-cycle update drift: decoupled={decoupled}, f32={f32_storage}, round={round}, {actual} != {expected}"
+                            );
+                        }
+                        scheduler.step(optimizer.as_mut(), None);
+                    }
+                }
+            }
+        }
+    }
+
+    fn momentum_test_optimizer(index: usize, params: Vec<TensorNodeId>) -> Box<dyn Optimizer> {
+        match index {
+            0 => Box::new(Adam::new(params, 0.03).betas(0.8, 0.92).amsgrad(true)),
+            1 => Box::new(AdamW::new(params, 0.03).betas(0.8, 0.92).amsgrad(true)),
+            2 => Box::new(RAdam::new(params, 0.03).betas(0.8, 0.92)),
+            3 => Box::new(Adamax::new(params, 0.03).betas(0.8, 0.92)),
+            4 => Box::new(NAdam::new(params, 0.03).betas(0.8, 0.92)),
+            5 => Box::new(SparseAdam::new(params, 0.03).betas(0.8, 0.92)),
+            6 => Box::new(SGD::new(params, 0.03).momentum(0.8)),
+            7 => Box::new(RMSprop::new(params, 0.03).momentum(0.8)),
+            8 => Box::new(Muon::new(params, 0.03).momentum(0.8)),
+            _ => unreachable!("unknown test optimizer"),
+        }
+    }
+
+    #[test]
+    fn optimizer_momentum_changes_only_its_coefficient_and_rejects_invalid_values() {
+        for index in 0..9 {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let param = session
+                .tensor_variable(vec![1.5, -0.75], vec![1, 2], true)
+                .unwrap();
+            let mut optimizer = momentum_test_optimizer(index, vec![param]);
+            let report = backward_sum_sq(&mut session, param);
+            optimizer.step(&mut session, &report).unwrap();
+            let mut expected = optimizer.state_dict(&session).unwrap();
+            let identity = Arc::clone(&optimizer.identity().0);
+            let parameter = session.tensor_values(param).unwrap();
+            match &mut expected.state {
+                OptimizerState::Adam(state) | OptimizerState::AdamW(state) => state.betas[0] = 0.45,
+                OptimizerState::RAdam(state) => state.betas[0] = 0.45,
+                OptimizerState::Adamax(state) => state.betas[0] = 0.45,
+                OptimizerState::NAdam(state) => state.betas[0] = 0.45,
+                OptimizerState::SparseAdam(state) => state.betas[0] = 0.45,
+                OptimizerState::Sgd(state) => state.momentum = 0.45,
+                OptimizerState::Rmsprop(state) => state.momentum = 0.45,
+                OptimizerState::Muon(state) => state.momentum = 0.45,
+                _ => unreachable!("test optimizer has no momentum"),
+            }
+            optimizer.set_momentum(0.45).unwrap();
+            assert_eq!(optimizer.get_momentum(), Some(0.45));
+            // Equality checks every moment, clock, lazy flag and beta2, not
+            // only the public getter which the scheduler also reads.
+            assert_eq!(optimizer.state_dict(&session).unwrap(), expected);
+            for invalid in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(optimizer.set_momentum(invalid).is_err());
+                assert_eq!(optimizer.state_dict(&session).unwrap(), expected);
+            }
+            if index < 6 {
+                for invalid in [1.0, 1.25] {
+                    assert!(optimizer.set_momentum(invalid).is_err());
+                    assert_eq!(optimizer.state_dict(&session).unwrap(), expected);
+                }
+            } else {
+                optimizer.set_momentum(1.25).unwrap();
+                assert_eq!(optimizer.get_momentum(), Some(1.25));
+            }
+            optimizer.set_momentum(0.0).unwrap();
+            assert_eq!(optimizer.get_momentum(), Some(0.0));
+            assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+            assert_eq!(session.tensor_values(param).unwrap(), parameter);
+        }
+        let mut nesterov = SGD::new(Vec::new(), 0.1).momentum(0.9).nesterov(true);
+        assert!(nesterov.set_momentum(0.0).is_err());
+        assert_eq!(nesterov.get_momentum(), Some(0.9));
+    }
+
+    #[test]
+    fn one_cycle_lr_checkpoint_resumes_momentum_training_for_every_supported_optimizer() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for f32_storage in [false, true] {
+                for index in 0..9 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let param = if f32_storage {
+                        session.tensor_variable_f32(vec![1.5, -0.75], vec![1, 2], true)
+                    } else {
+                        session.tensor_variable(vec![1.5, -0.75], vec![1, 2], true)
+                    }
+                    .unwrap();
+                    let mut optimizer = momentum_test_optimizer(index, vec![param]);
+                    let mut scheduler = OneCycleLR::new(optimizer.as_ref(), 0.1, 10);
+                    scheduler.step(optimizer.as_mut(), Some(0));
+                    let report = backward_sum_sq(&mut session, param);
+                    for round in 0..4 {
+                        session
+                            .tensor_set_accumulated_gradient(param, vec![0.25 * round as f64, -0.5])
+                            .unwrap();
+                        optimizer.step(&mut session, &report).unwrap();
+                        scheduler.step(optimizer.as_mut(), None);
+                    }
+                    let state = optimizer.state_dict(&session).unwrap();
+                    let optimizer_json = serde_json::to_vec(&state).unwrap();
+                    let scheduler_json = serde_json::to_vec(&scheduler.state_dict()).unwrap();
+                    let mut resumed = FrankenTorchSession::new(mode);
+                    resumed.tensor_variable(vec![99.0], vec![1], false).unwrap();
+                    let restored_param = resumed.tensor_variable_from_storage(
+                        session.tensor_snapshot(param).unwrap(),
+                        true,
+                    );
+                    assert_ne!(param, restored_param);
+                    let restored_report = backward_sum_sq(&mut resumed, restored_param);
+                    let mut restored = momentum_test_optimizer(index, vec![restored_param]);
+                    restored.set_momentum(0.123).unwrap();
+                    restored
+                        .load_state_dict(
+                            &resumed,
+                            &serde_json::from_slice(&optimizer_json).unwrap(),
+                        )
+                        .unwrap();
+                    let mut restored_scheduler = OneCycleLR::new(restored.as_ref(), 0.9, 3);
+                    restored_scheduler
+                        .load_state_dict(serde_json::from_slice(&scheduler_json).unwrap())
+                        .unwrap();
+                    assert_eq!(restored.state_dict(&resumed).unwrap(), state);
+                    for round in 4..10 {
+                        let gradient = vec![0.25 * round as f64, -0.5];
+                        session
+                            .tensor_set_accumulated_gradient(param, gradient.clone())
+                            .unwrap();
+                        resumed
+                            .tensor_set_accumulated_gradient(restored_param, gradient)
+                            .unwrap();
+                        optimizer.step(&mut session, &report).unwrap();
+                        restored.step(&mut resumed, &restored_report).unwrap();
+                        scheduler.step(optimizer.as_mut(), None);
+                        restored_scheduler.step(restored.as_mut(), None);
+                        assert_eq!(
+                            resumed.tensor_values_lossy_f64(restored_param).unwrap(),
+                            session.tensor_values_lossy_f64(param).unwrap(),
+                            "scheduled resume drift: optimizer={index}, f32={f32_storage}, round={round}"
+                        );
+                        assert_eq!(
+                            restored.state_dict(&resumed).unwrap(),
+                            optimizer.state_dict(&session).unwrap()
+                        );
+                        assert_eq!(restored_scheduler.state_dict(), scheduler.state_dict());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rmsprop_scheduled_momentum_can_start_after_momentum_free_training() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let param = session.tensor_variable(vec![1.5], vec![1], true).unwrap();
+        let untouched = session.tensor_variable(Vec::new(), vec![0], true).unwrap();
+        let mut optimizer = RMSprop::new(vec![param, untouched], 0.1)
+            .alpha(0.9)
+            .eps(0.01);
+        let report = backward_sum_sq(&mut session, param);
+        session
+            .tensor_set_accumulated_gradient(param, vec![2.0])
+            .unwrap();
+        optimizer.step(&mut session, &report).unwrap();
+        let mut expected = 1.5 - 0.1 * 2.0 / (0.4_f64.sqrt() + 0.01);
+        let mut square_avg = 0.4;
+        let mut buffer = 0.0;
+        let mut scheduler = OneCycleLR::new(&optimizer, 0.2, 10);
+        scheduler.step(&mut optimizer, Some(0));
+        let state = optimizer.state_dict(&session).unwrap();
+        let OptimizerState::Rmsprop(saved) = &state.state else {
+            unreachable!()
+        };
+        assert_eq!(
+            saved.parameters[0].as_ref().unwrap().momentum_buffer,
+            Some(vec![0.0])
+        );
+        assert!(saved.parameters[1].is_none());
+        let json = serde_json::to_vec(&state).unwrap();
+        let mut restored = RMSprop::new(vec![param, untouched], 0.5);
+        restored
+            .load_state_dict(&session, &serde_json::from_slice(&json).unwrap())
+            .unwrap();
+        assert_eq!(restored.state_dict(&session).unwrap(), state);
+        for (momentum, gradient) in [(0.95, 0.5), (0.0, -1.0), (0.8, 0.25)] {
+            restored.set_momentum(momentum).unwrap();
+            session
+                .tensor_set_accumulated_gradient(param, vec![gradient])
+                .unwrap();
+            restored.step(&mut session, &report).unwrap();
+            square_avg = 0.9 * square_avg + 0.1 * gradient * gradient;
+            let scaled_gradient = gradient / (square_avg.sqrt() + 0.01);
+            if momentum == 0.0 {
+                expected -= 0.008 * scaled_gradient;
+            } else {
+                buffer = momentum * buffer + scaled_gradient;
+                expected -= 0.008 * buffer;
+            }
+            assert!((session.tensor_values(param).unwrap()[0] - expected).abs() < 1e-14);
+            assert!((restored.momentum_buffer[0].as_ref().unwrap()[0] - buffer).abs() < 1e-14);
         }
     }
 
