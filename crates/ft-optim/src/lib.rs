@@ -1186,7 +1186,10 @@ pub trait Optimizer {
         ))
     }
 
-    /// Return the optimizer's momentum hyperparameter when the algorithm exposes one.
+    /// Return the optimizer's momentum, or beta1 for adaptive moment methods.
+    ///
+    /// OneCycleLR and CyclicLR schedule beta1 without changing beta2 or resetting
+    /// accumulated moments, matching PyTorch's momentum/beta1 selection.
     ///
     /// For Adam-family optimizers this is `beta1`, the first-moment coefficient.
     /// For SGD, RMSprop and Muon it is their explicit momentum coefficient.
@@ -4129,7 +4132,25 @@ pub enum SchedulerConfig {
         step_size_down: usize,
         mode: CyclicLRMode,
         iteration: usize,
+        // Schema-one checkpoints predating momentum cycling must retain their
+        // original learning-rate-only behavior when resumed.
+        #[serde(default)]
+        cycle_momentum: bool,
+        #[serde(default = "default_cyclic_base_momentum")]
+        base_momentum: f64,
+        #[serde(default = "default_cyclic_max_momentum")]
+        max_momentum: f64,
+        #[serde(default)]
+        last_momentum: Option<f64>,
     },
+}
+
+fn default_cyclic_base_momentum() -> f64 {
+    0.8
+}
+
+fn default_cyclic_max_momentum() -> f64 {
+    0.9
 }
 
 /// Metric values can legitimately be nonfinite; encode them explicitly so a
@@ -4365,10 +4386,16 @@ impl SchedulerState {
                 step_size_up,
                 step_size_down,
                 mode,
+                base_momentum,
+                max_momentum,
+                last_momentum,
                 ..
             } => {
-                nonnegative(&[*base_lr, *max_lr])?;
-                if *step_size_up == 0 || *step_size_down == 0 {
+                nonnegative(&[*base_lr, *max_lr, *base_momentum, *max_momentum])?;
+                if *step_size_up == 0
+                    || *step_size_down == 0
+                    || last_momentum.is_some_and(|value| !value.is_finite() || value < 0.0)
+                {
                     return Err(invalid());
                 }
                 if let CyclicLRMode::ExpRange { gamma } = mode {
@@ -5376,21 +5403,23 @@ impl LRScheduler for ReduceLROnPlateau {
     }
 }
 
-struct ShadowOptimizer {
+struct ShadowOptimizer<'a> {
     identity: OptimizerIdentity,
     lr: f64,
+    optimizer: &'a mut dyn Optimizer,
 }
 
-impl ShadowOptimizer {
-    fn new(lr: f64) -> Self {
+impl<'a> ShadowOptimizer<'a> {
+    fn new(lr: f64, optimizer: &'a mut dyn Optimizer) -> Self {
         Self {
             identity: OptimizerIdentity::new(),
             lr,
+            optimizer,
         }
     }
 }
 
-impl Optimizer for ShadowOptimizer {
+impl Optimizer for ShadowOptimizer<'_> {
     fn identity(&self) -> &OptimizerIdentity {
         &self.identity
     }
@@ -5417,6 +5446,16 @@ impl Optimizer for ShadowOptimizer {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    // Chained schedules isolate LR factors, but momentum must still reach the
+    // actual optimizer. Forwarding also retains its beta1 validation rules.
+    fn get_momentum(&self) -> Option<f64> {
+        self.optimizer.get_momentum()
+    }
+
+    fn set_momentum(&mut self, momentum: f64) -> Result<(), AutogradError> {
+        self.optimizer.set_momentum(momentum)
     }
 }
 
@@ -5636,7 +5675,7 @@ impl LRScheduler for ChainedScheduler {
 
         let mut factor = 1.0;
         for scheduler in &mut self.schedulers {
-            let mut shadow = ShadowOptimizer::new(self.base_lr);
+            let mut shadow = ShadowOptimizer::new(self.base_lr, optimizer);
             scheduler.step(&mut shadow, Some(new_epoch));
             let sched_lr = scheduler.get_last_lr()[0];
             if self.base_lr.abs() > f64::EPSILON {
@@ -6180,6 +6219,10 @@ pub struct CyclicLR {
     last_epoch: i64,
     last_lr: f64,
     iteration: usize,
+    cycle_momentum: bool,
+    base_momentum: f64,
+    max_momentum: f64,
+    last_momentum: Option<f64>,
 }
 
 impl CyclicLR {
@@ -6188,8 +6231,10 @@ impl CyclicLR {
     /// * `base_lr` - Lower learning rate boundary.
     /// * `max_lr` - Upper learning rate boundary.
     /// * `step_size_up` - Number of iterations in the increasing half of a cycle.
+    ///
+    /// Momentum (or adaptive beta1) cycles inversely between 0.8 and 0.9 by
+    /// default. Use `cycle_momentum(false)` for optimizers without momentum.
     pub fn new(optimizer: &dyn Optimizer, base_lr: f64, max_lr: f64, step_size_up: usize) -> Self {
-        let _ = optimizer;
         let base_lr = finite_non_negative_factor(base_lr);
         let max_lr = finite_non_negative_factor(max_lr);
         // step_size_up=0 (and the default step_size_down=step_size_up=0)
@@ -6209,7 +6254,34 @@ impl CyclicLR {
             last_epoch: -1,
             last_lr: base_lr,
             iteration: 0,
+            cycle_momentum: true,
+            base_momentum: 0.8,
+            max_momentum: 0.9,
+            last_momentum: optimizer.get_momentum(),
         }
+    }
+
+    #[must_use]
+    pub fn cycle_momentum(mut self, cycle_momentum: bool) -> Self {
+        self.cycle_momentum = cycle_momentum;
+        self
+    }
+
+    #[must_use]
+    pub fn base_momentum(mut self, base_momentum: f64) -> Self {
+        self.base_momentum = base_momentum;
+        self
+    }
+
+    #[must_use]
+    pub fn max_momentum(mut self, max_momentum: f64) -> Self {
+        self.max_momentum = max_momentum;
+        self
+    }
+
+    #[must_use]
+    pub fn get_last_momentum(&self) -> Option<f64> {
+        self.last_momentum
     }
 
     #[must_use]
@@ -6233,7 +6305,7 @@ impl CyclicLR {
         self
     }
 
-    fn compute_lr(&self, iteration: usize) -> f64 {
+    fn compute_values(&self, iteration: usize) -> (f64, Option<f64>) {
         // Each half-cycle has its own duration. Compute the phase with integer
         // arithmetic before conversion so large clocks do not lose their
         // position within a short cycle. A wider sum also handles periods whose
@@ -6255,7 +6327,13 @@ impl CyclicLR {
             CyclicLRMode::ExpRange { gamma } => gamma.powi(powi_exponent_saturating(iteration)),
         };
 
-        self.base_lr + (self.max_lr - self.base_lr) * scale_x * scale_fn
+        let lr = self.base_lr + (self.max_lr - self.base_lr) * scale_x * scale_fn;
+        let momentum = if self.cycle_momentum {
+            Some(self.max_momentum - (self.max_momentum - self.base_momentum) * scale_x * scale_fn)
+        } else {
+            None
+        };
+        (lr, momentum)
     }
 }
 
@@ -6265,14 +6343,28 @@ impl LRScheduler for CyclicLR {
         if let Some(epoch) = epoch {
             self.iteration = epoch.max(0) as usize;
         }
-        let lr = self.compute_lr(self.iteration);
+        let (lr, momentum) = self.compute_values(self.iteration);
         optimizer.set_lr(lr);
         self.last_lr = lr;
+        if let Some(momentum) = momentum {
+            match optimizer.set_momentum(momentum) {
+                Ok(()) => self.last_momentum = Some(momentum),
+                Err(error) => {
+                    eprintln!(
+                        "CyclicLR: failed to set momentum to {momentum:.6e} at step {}: {error}",
+                        self.last_epoch
+                    );
+                    self.last_momentum = optimizer.get_momentum();
+                }
+            }
+        } else {
+            self.last_momentum = optimizer.get_momentum();
+        }
         self.iteration = self.iteration.saturating_add(1);
     }
 
     fn get_lr(&self) -> Vec<f64> {
-        vec![self.compute_lr(self.iteration)]
+        vec![self.compute_values(self.iteration).0]
     }
 
     fn get_last_lr(&self) -> Vec<f64> {
@@ -6285,7 +6377,11 @@ impl LRScheduler for CyclicLR {
         step_size_up,
         step_size_down,
         mode,
-        iteration
+        iteration,
+        cycle_momentum,
+        base_momentum,
+        max_momentum,
+        last_momentum
     });
 }
 
@@ -11876,6 +11972,62 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_optimizer_momentum_updates_only_beta1_and_rejects_invalid_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let parameter = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let report = session.tensor_backward(parameter).unwrap();
+        let optimizers: Vec<Box<dyn Optimizer>> = vec![
+            Box::new(Adam::new(vec![parameter], 0.1).betas(0.75, 0.875)),
+            Box::new(AdamW::new(vec![parameter], 0.1).betas(0.75, 0.875)),
+            Box::new(RAdam::new(vec![parameter], 0.1).betas(0.75, 0.875)),
+            Box::new(NAdam::new(vec![parameter], 0.1).betas(0.75, 0.875)),
+            Box::new(Adamax::new(vec![parameter], 0.1).betas(0.75, 0.875)),
+            Box::new(SparseAdam::new(vec![parameter], 0.1).betas(0.75, 0.875)),
+        ];
+        for mut optimizer in optimizers {
+            optimizer.step(&mut session, &report).unwrap();
+            assert_eq!(optimizer.get_momentum(), Some(0.75));
+            let mut expected = optimizer.state_dict(&session).unwrap();
+            let betas = match &mut expected.state {
+                OptimizerState::Adam(state) | OptimizerState::AdamW(state) => &mut state.betas,
+                OptimizerState::RAdam(state) => &mut state.betas,
+                OptimizerState::NAdam(state) => &mut state.betas,
+                OptimizerState::Adamax(state) => &mut state.betas,
+                OptimizerState::SparseAdam(state) => &mut state.betas,
+                _ => unreachable!(),
+            };
+            betas[0] = 0.5;
+            optimizer.set_momentum(0.5).unwrap();
+            assert_eq!(optimizer.get_momentum(), Some(0.5));
+            // Includes beta2, lazy clocks, all moments, and NAdam's product.
+            assert_eq!(optimizer.state_dict(&session).unwrap(), expected);
+            for invalid in [-0.1, 1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(optimizer.set_momentum(invalid).is_err());
+                assert_eq!(optimizer.state_dict(&session).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn momentum_optimizers_keep_nonnegative_range_distinct_from_adaptive_beta1() {
+        let session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let optimizers: Vec<Box<dyn Optimizer>> = vec![
+            Box::new(SGD::new(Vec::new(), 0.1)),
+            Box::new(RMSprop::new(Vec::new(), 0.1)),
+            Box::new(Muon::new(Vec::new(), 0.1)),
+        ];
+        for mut optimizer in optimizers {
+            optimizer.set_momentum(1.25).unwrap();
+            assert_eq!(optimizer.get_momentum(), Some(1.25));
+            let saved = optimizer.state_dict(&session).unwrap();
+            for invalid in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(optimizer.set_momentum(invalid).is_err());
+                assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_optimizer_set_momentum_returns_error() {
         let mut optimizer = Adagrad::new(vec![], 0.1);
 
@@ -15368,6 +15520,191 @@ mod tests {
             assert_eq!(restored_optimizer.get_momentum(), optimizer.get_momentum());
         }
     }
+
+    fn momentum_training_schedule(optimizer: &dyn Optimizer, cyclic: bool) -> Box<dyn LRScheduler> {
+        if cyclic {
+            Box::new(
+                CyclicLR::new(optimizer, 0.125, 0.375, 2)
+                    .base_momentum(0.5)
+                    .max_momentum(0.75),
+            )
+        } else {
+            Box::new(
+                OneCycleLR::new(optimizer, 0.375, 5)
+                    .pct_start(0.6)
+                    .anneal_strategy_linear()
+                    .div_factor(3.0)
+                    .final_div_factor(1.0)
+                    .base_momentum(0.5)
+                    .max_momentum(0.75),
+            )
+        }
+    }
+
+    fn scheduled_sum_training_step(
+        session: &mut FrankenTorchSession,
+        optimizer: &mut dyn Optimizer,
+        scheduler: &mut dyn LRScheduler,
+        parameter: TensorNodeId,
+        round: usize,
+    ) {
+        // Both configured schedules have these exact linear phase values.
+        const LR: [f64; 5] = [0.125, 0.25, 0.375, 0.25, 0.125];
+        const BETA1: [f64; 5] = [0.75, 0.625, 0.5, 0.625, 0.75];
+        const FIRST: [f64; 5] = [0.25, 0.53125, 0.765625, 0.853515625, 0.89013671875];
+        const SECOND: [f64; 5] = [0.5, 0.75, 0.875, 0.9375, 0.96875];
+        scheduler.step(optimizer, None);
+        assert_eq!(optimizer.get_lr(), LR[round]);
+        assert_eq!(optimizer.get_momentum(), Some(BETA1[round]));
+        optimizer.zero_grad(session).unwrap();
+        let loss = session.tensor_sum(parameter).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        optimizer.step(session, &report).unwrap();
+        let saved = optimizer.state_dict(session).unwrap();
+        let (OptimizerState::Adam(state) | OptimizerState::AdamW(state)) = saved.state else {
+            unreachable!()
+        };
+        assert_eq!(state.betas, [BETA1[round], 0.5]);
+        let state = state.parameters[0].as_ref().unwrap();
+        assert_eq!(state.step, round as u64 + 1);
+        assert_eq!(state.exp_avg, vec![FIRST[round]; 2]);
+        assert_eq!(state.exp_avg_sq, vec![SECOND[round]; 2]);
+    }
+
+    #[test]
+    fn scheduler_beta1_training_matches_fixed_moments_and_resumes_in_fresh_sessions() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for adamw in [false, true] {
+                    for cyclic in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let parameter = if dtype == ft_core::DType::F32 {
+                            session.tensor_variable_f32(vec![1.5, -0.75], vec![2], true)
+                        } else {
+                            session.tensor_variable(vec![1.5, -0.75], vec![2], true)
+                        }
+                        .unwrap();
+                        let make_optimizer = |parameter| -> Box<dyn Optimizer> {
+                            if adamw {
+                                Box::new(
+                                    AdamW::new(vec![parameter], 0.9)
+                                        .betas(0.9, 0.5)
+                                        .weight_decay(0.0),
+                                )
+                            } else {
+                                Box::new(Adam::new(vec![parameter], 0.9).betas(0.9, 0.5))
+                            }
+                        };
+                        let mut optimizer = make_optimizer(parameter);
+                        let mut scheduler = momentum_training_schedule(optimizer.as_ref(), cyclic);
+                        for round in 0..2 {
+                            scheduled_sum_training_step(
+                                &mut session,
+                                optimizer.as_mut(),
+                                scheduler.as_mut(),
+                                parameter,
+                                round,
+                            );
+                        }
+                        let optimizer_bytes =
+                            serde_json::to_vec(&optimizer.state_dict(&session).unwrap()).unwrap();
+                        let scheduler_bytes = serde_json::to_vec(&scheduler.state_dict()).unwrap();
+                        let mut resumed = FrankenTorchSession::new(mode);
+                        resumed.tensor_variable(vec![99.0], vec![], false).unwrap();
+                        let remapped = resumed.tensor_variable_from_storage(
+                            session.tensor_snapshot(parameter).unwrap(),
+                            true,
+                        );
+                        assert_ne!(remapped, parameter);
+                        let mut restored_optimizer = make_optimizer(remapped);
+                        let mut restored_scheduler: Box<dyn LRScheduler> = if cyclic {
+                            Box::new(
+                                CyclicLR::new(restored_optimizer.as_ref(), 0.01, 0.02, 7)
+                                    .cycle_momentum(false),
+                            )
+                        } else {
+                            Box::new(
+                                OneCycleLR::new(restored_optimizer.as_ref(), 0.02, 15)
+                                    .cycle_momentum(false),
+                            )
+                        };
+                        restored_optimizer
+                            .load_state_dict(
+                                &resumed,
+                                &serde_json::from_slice(&optimizer_bytes).unwrap(),
+                            )
+                            .unwrap();
+                        restored_scheduler
+                            .load_state_dict(serde_json::from_slice(&scheduler_bytes).unwrap())
+                            .unwrap();
+                        assert_eq!(restored_scheduler.state_dict(), scheduler.state_dict());
+                        for round in 2..5 {
+                            scheduled_sum_training_step(
+                                &mut session,
+                                optimizer.as_mut(),
+                                scheduler.as_mut(),
+                                parameter,
+                                round,
+                            );
+                            scheduled_sum_training_step(
+                                &mut resumed,
+                                restored_optimizer.as_mut(),
+                                restored_scheduler.as_mut(),
+                                remapped,
+                                round,
+                            );
+                            assert_eq!(
+                                resumed.tensor_values_lossy_f64(remapped).unwrap(),
+                                session.tensor_values_lossy_f64(parameter).unwrap()
+                            );
+                            assert_eq!(
+                                restored_optimizer.state_dict(&resumed).unwrap(),
+                                optimizer.state_dict(&session).unwrap()
+                            );
+                            assert_eq!(restored_scheduler.state_dict(), scheduler.state_dict());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composed_schedulers_forward_momentum_to_the_training_optimizer() {
+        for cyclic in [false, true] {
+            let mut optimizer = AdamW::new(Vec::new(), 0.125).betas(0.9, 0.5);
+            let cycle = momentum_training_schedule(&optimizer, cyclic);
+            let scale = Box::new(ConstantLR::new(&optimizer, 0.5, 10));
+            let chained = ChainedScheduler::new(&optimizer, vec![cycle, scale]);
+            // A sequential wrapper must preserve the chained child's effects.
+            let mut scheduler = SequentialLR::new(&optimizer, vec![Box::new(chained)], Vec::new());
+            let expected_lr = [0.0625, 0.125, 0.1875, 0.125, 0.0625];
+            let expected_beta1 = [0.75, 0.625, 0.5, 0.625, 0.75];
+            for round in 0..5 {
+                scheduler.step(&mut optimizer, None);
+                assert_eq!(optimizer.get_lr(), expected_lr[round]);
+                assert_eq!(optimizer.get_momentum(), Some(expected_beta1[round]));
+                assert_eq!(optimizer.beta2, 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_disabled_momentum_cycling_preserves_beta1() {
+        let mut optimizer = AdamW::new(Vec::new(), 0.1).betas(0.625, 0.875);
+        let schedules: Vec<Box<dyn LRScheduler>> = vec![
+            Box::new(OneCycleLR::new(&optimizer, 0.5, 10).cycle_momentum(false)),
+            Box::new(CyclicLR::new(&optimizer, 0.1, 0.5, 2).cycle_momentum(false)),
+        ];
+        for mut scheduler in schedules {
+            for _ in 0..5 {
+                scheduler.step(&mut optimizer, None);
+                assert_eq!(optimizer.get_momentum(), Some(0.625));
+                assert_eq!(optimizer.beta2, 0.875);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
 
     #[test]
@@ -19434,6 +19771,138 @@ mod tests {
                 assert_eq!(optimizer.get_lr(), expected[epoch % expected.len()]);
             }
         }
+    }
+
+    #[test]
+    fn cyclic_lr_momentum_uses_the_same_asymmetric_and_scaled_cycle() {
+        let cases = [
+            (CyclicLRMode::Triangular, 1, 0.25, 0.625),
+            (CyclicLRMode::Triangular, 2, 0.375, 0.5),
+            (CyclicLRMode::Triangular, 3, 0.3125, 0.5625),
+            (CyclicLRMode::Triangular, 5, 0.1875, 0.6875),
+            (CyclicLRMode::Triangular, 6, 0.125, 0.75),
+            (CyclicLRMode::Triangular2, 8, 0.25, 0.625),
+            (CyclicLRMode::Triangular2, 9, 0.21875, 0.65625),
+            (CyclicLRMode::ExpRange { gamma: 0.5 }, 2, 0.1875, 0.6875),
+            (
+                CyclicLRMode::ExpRange { gamma: 0.5 },
+                3,
+                0.1484375,
+                0.7265625,
+            ),
+        ];
+        for (mode, epoch, lr, beta1) in cases {
+            let mut optimizer = AdamW::new(Vec::new(), 0.1).betas(0.9, 0.875);
+            let mut scheduler = CyclicLR::new(&optimizer, 0.125, 0.375, 2)
+                .step_size_down(4)
+                .base_momentum(0.5)
+                .max_momentum(0.75)
+                .mode(mode);
+            scheduler.step(&mut optimizer, Some(epoch));
+            assert_eq!(optimizer.get_lr(), lr);
+            assert_eq!(optimizer.get_momentum(), Some(beta1));
+            assert_eq!(scheduler.get_last_momentum(), Some(beta1));
+            assert_eq!(optimizer.beta2, 0.875);
+        }
+    }
+
+    #[test]
+    fn cyclic_lr_checkpoint_rejects_invalid_momentum_without_mutation() {
+        let mut optimizer = SGD::new(Vec::new(), 0.1).momentum(1.25);
+        let mut scheduler = CyclicLR::new(&optimizer, 0.125, 0.375, 2)
+            .base_momentum(1.0)
+            .max_momentum(1.25);
+        scheduler.step(&mut optimizer, Some(1));
+        let before = scheduler.state_dict();
+        let encoded = serde_json::to_vec(&before).unwrap();
+        scheduler
+            .load_state_dict(serde_json::from_slice(&encoded).unwrap())
+            .unwrap();
+        assert_eq!(scheduler.state_dict(), before);
+        for field in 0..3 {
+            for value in [-0.1, f64::NAN, f64::INFINITY] {
+                let mut invalid = before.clone();
+                let SchedulerConfig::CyclicLR {
+                    base_momentum,
+                    max_momentum,
+                    last_momentum,
+                    ..
+                } = &mut invalid.config
+                else {
+                    unreachable!()
+                };
+                match field {
+                    0 => *base_momentum = value,
+                    1 => *max_momentum = value,
+                    _ => *last_momentum = Some(value),
+                }
+                assert!(scheduler.load_state_dict(invalid).is_err());
+                assert_eq!(scheduler.state_dict(), before);
+            }
+        }
+        let mut without_momentum = Adagrad::new(Vec::new(), 0.1);
+        let mut disabled = CyclicLR::new(&without_momentum, 0.125, 0.375, 2).cycle_momentum(false);
+        disabled.step(&mut without_momentum, None);
+        assert_eq!(disabled.get_last_momentum(), None);
+        let bytes = serde_json::to_vec(&disabled.state_dict()).unwrap();
+        let mut restored = CyclicLR::new(&without_momentum, 0.01, 0.02, 7);
+        restored
+            .load_state_dict(serde_json::from_slice(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(restored.state_dict(), disabled.state_dict());
+    }
+
+    #[test]
+    fn cyclic_lr_loads_legacy_schema_one_without_enabling_momentum() {
+        // This is the complete JSON shape emitted before CyclicLR supported
+        // momentum. Loading it must not silently change an existing recipe.
+        let legacy = r#"{
+            "version": 1,
+            "last_epoch": 1,
+            "last_lrs": [0.25],
+            "config": {
+                "CyclicLR": {
+                    "base_lr": 0.125,
+                    "max_lr": 0.375,
+                    "step_size_up": 2,
+                    "step_size_down": 2,
+                    "mode": "Triangular",
+                    "iteration": 2
+                }
+            }
+        }"#;
+        let mut optimizer = AdamW::new(Vec::new(), 0.25).betas(0.625, 0.875);
+        let mut scheduler = CyclicLR::new(&optimizer, 0.01, 0.02, 7);
+        scheduler
+            .load_state_dict(serde_json::from_str(legacy).unwrap())
+            .unwrap();
+        assert_eq!(optimizer.get_lr(), 0.25);
+        assert_eq!(optimizer.get_momentum(), Some(0.625));
+        assert_eq!(scheduler.get_last_lr(), [0.25]);
+        assert_eq!(scheduler.get_last_momentum(), None);
+        assert!(matches!(
+            scheduler.state_dict().config,
+            SchedulerConfig::CyclicLR {
+                cycle_momentum: false,
+                base_momentum,
+                max_momentum,
+                last_momentum: None,
+                ..
+            } if base_momentum == 0.8 && max_momentum == 0.9
+        ));
+        for expected_lr in [0.375, 0.25, 0.125, 0.25, 0.375] {
+            scheduler.step(&mut optimizer, None);
+            assert_eq!(optimizer.get_lr(), expected_lr);
+            assert_eq!(optimizer.get_momentum(), Some(0.625));
+            assert_eq!(optimizer.beta2, 0.875);
+            assert_eq!(scheduler.get_last_momentum(), Some(0.625));
+        }
+        let bytes = serde_json::to_vec(&scheduler.state_dict()).unwrap();
+        let mut resumed = CyclicLR::new(&optimizer, 0.01, 0.02, 7);
+        resumed
+            .load_state_dict(serde_json::from_slice(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(resumed.state_dict(), scheduler.state_dict());
     }
 
     #[test]
