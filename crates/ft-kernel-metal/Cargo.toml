@@ -3,7 +3,9 @@ name = "ft-kernel-metal"
 # 0.1.1: the October 10 command-buffer failure/retry correction.
 # 0.1.2: typed native input from the presenter (pointer, buttons, scroll, keys,
 # modifiers, focus, capture loss, resize) and the `synthetic-input` test seam.
-version = "0.1.2"
+# 0.1.3: the device's recommended working set and allocated bytes
+# (`Gateway::recommended_working_set_bytes`, `Gateway::allocated_bytes`).
+version = "0.1.3"
 edition = "2024"
 license-file = "../../LICENSE"
 description = "Metal GPU compute kernels for FrankenTorch (macOS / Apple Silicon). Safe API; all unsafe Metal FFI is contained here. No-op stub on non-macOS targets."

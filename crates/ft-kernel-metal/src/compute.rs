@@ -623,6 +623,22 @@ mod imp {
             usize::try_from(self.ctx.device.max_buffer_length()).unwrap_or(usize::MAX)
         }
 
+        /// The most bytes the device should hold at once without hurting its
+        /// performance (`MTLDevice.recommendedMaxWorkingSetSize`). On unified
+        /// memory it is a share of the machine's memory, which the host's own
+        /// allocations compete for too.
+        pub fn recommended_working_set_bytes(&self) -> u64 {
+            self.ctx.device.recommended_max_working_set_size()
+        }
+
+        /// The bytes this process's resources on the device hold now
+        /// (`MTLDevice.currentAllocatedSize`): every buffer, texture, heap and
+        /// pipeline it has made there through any gateway (they share one
+        /// device), as the driver rounds them.
+        pub fn allocated_bytes(&self) -> u64 {
+            self.ctx.device.current_allocated_size()
+        }
+
         pub(crate) fn metal_device(&self) -> &metal::DeviceRef {
             &self.ctx.device
         }
@@ -1030,6 +1046,14 @@ mod imp {
         }
         /// Unreachable off macOS: no `Gateway` can exist.
         pub fn max_buffer_length(&self) -> usize {
+            0
+        }
+        /// Unreachable off macOS: no `Gateway` can exist.
+        pub fn recommended_working_set_bytes(&self) -> u64 {
+            0
+        }
+        /// Unreachable off macOS: no `Gateway` can exist.
+        pub fn allocated_bytes(&self) -> u64 {
             0
         }
         /// Unreachable off macOS: no `Gateway` can exist.
