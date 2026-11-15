@@ -724,9 +724,9 @@ fn validate_rprop_state_buffers(state: &RpropState, sizes: &[usize]) -> Result<(
         if let Some(parameter) = parameter {
             validate_optimizer_buffer(&parameter.prev, numel)?;
             validate_optimizer_buffer(&parameter.step_size, numel)?;
-            // A newly initialized step is the configured learning rate, even
-            // when it is zero or outside step_sizes. Bounds apply on subsequent
-            // sign changes, so they cannot be imposed on checkpoint buffers.
+            // Checkpoints may contain a newly initialized step or have their
+            // configured bounds changed. Accept finite non-negative buffers;
+            // every applied Rprop step clamps them before updating parameters.
             if parameter.step_size.iter().any(|&value| value < 0.0) {
                 return Err(optimizer_state_error("rprop state has negative step sizes"));
             }
@@ -941,6 +941,55 @@ fn advance_param_step_count(
     let next = checked_next_step_count(*counter, overflow_reason)?;
     *counter = next;
     Ok(next)
+}
+
+/// Validate all active adaptive-optimizer parameters before any update. A
+/// restored late parameter can exhaust its clock even while earlier ones are
+/// valid; checking during the update loop would partially apply that step.
+fn preflight_adaptive_updates(
+    session: &FrankenTorchSession,
+    params: &[TensorNodeId],
+    step_counts: &[u64],
+    first: &[Option<Vec<f64>>],
+    second: &[Option<Vec<f64>>],
+    overflow_reason: &'static str,
+) -> Result<Vec<Option<(usize, u64)>>, AutogradError> {
+    for count in [step_counts.len(), first.len(), second.len()] {
+        ensure_state_len(
+            params.len(),
+            count,
+            "adaptive optimizer state parameter count mismatch",
+        )?;
+    }
+    params
+        .iter()
+        .enumerate()
+        .map(|(index, &param)| {
+            let Some(grad_len) = session.tensor_accumulated_gradient_len(param)? else {
+                return Ok(None);
+            };
+            if !matches!(
+                session.tensor_dtype(param)?,
+                ft_core::DType::F32 | ft_core::DType::F64
+            ) {
+                return Err(optimizer_state_error(
+                    "adaptive optimizer requires F32 or F64 parameters",
+                ));
+            }
+            ensure_grad_len_matches_param(param, session.tensor_values_len(param)?, grad_len)?;
+            for moment in [&first[index], &second[index]].into_iter().flatten() {
+                ensure_state_len(
+                    grad_len,
+                    moment.len(),
+                    "adaptive optimizer moment state length mismatch",
+                )?;
+            }
+            Ok(Some((
+                grad_len,
+                checked_next_step_count(step_counts[index], overflow_reason)?,
+            )))
+        })
+        .collect()
 }
 
 fn checked_shape_numel(
@@ -7028,16 +7077,23 @@ impl Optimizer for NAdam {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-
+        ensure_state_len(
+            self.params.len(),
+            self.mu_products.len(),
+            "nadam momentum product state length mismatch",
+        )?;
+        let updates = preflight_adaptive_updates(
+            session,
+            &self.params,
+            &self.step_counts,
+            &self.m,
+            &self.v,
+            "nadam step counter overflow",
+        )?;
         for (i, &param) in self.params.iter().enumerate() {
-            let grad_len = match session.tensor_accumulated_gradient_len(param)? {
-                Some(len) => len,
-                None => continue,
+            let Some((grad_len, t)) = updates[i] else {
+                continue;
             };
-            let t =
-                advance_param_step_count(&mut self.step_counts, i, "nadam step counter overflow")?;
-            let param_len = session.tensor_values_len(param)?;
-            ensure_grad_len_matches_param(param, param_len, grad_len)?;
 
             // Per-param SCALARS (computed once, not per element).
             // Momentum schedule: mu_t = beta1 * (1 - 0.5 * 0.96^(t * momentum_decay))
@@ -7046,22 +7102,11 @@ impl Optimizer for NAdam {
                 self.beta1 * (1.0 - 0.5 * 0.96f64.powf((t as f64 + 1.0) * self.momentum_decay));
             // Cumulative product of mu values (state); the bias-correction
             // denominators need the full running product, not just mu_t.
-            self.mu_products[i] *= mu_t;
-            let mu_product = self.mu_products[i];
+            let mu_product = self.mu_products[i] * mu_t;
             let bias_correction2 = adam_bias_correction(self.beta2, t);
 
             let m = self.m[i].get_or_insert_with(|| vec![0.0; grad_len]);
-            ensure_state_len(
-                grad_len,
-                m.len(),
-                "nadam first-moment state length mismatch",
-            )?;
             let v_state = self.v[i].get_or_insert_with(|| vec![0.0; grad_len]);
-            ensure_state_len(
-                grad_len,
-                v_state.len(),
-                "nadam second-moment state length mismatch",
-            )?;
 
             let (beta1, beta2, lr, eps) = (self.beta1, self.beta2, self.lr, self.eps);
             let weight_decay = self.weight_decay;
@@ -7112,6 +7157,8 @@ impl Optimizer for NAdam {
                     }
                 },
             )?;
+            self.step_counts[i] = t;
+            self.mu_products[i] = mu_product;
         }
         Ok(())
     }
@@ -7645,12 +7692,17 @@ impl Optimizer for Rprop {
                     let body = |p: &mut f64, g_in: f64, step: &mut f64, prv: &mut f64| {
                         let g = if maximize { -g_in } else { g_in };
                         let sign_product = g * *prv;
-                        if sign_product > 0.0 {
-                            *step = (*step * eta_plus).min(step_max);
-                            *p -= if g > 0.0 { *step } else { -*step };
-                            *prv = g;
+                        let factor = if sign_product > 0.0 {
+                            eta_plus
                         } else if sign_product < 0.0 {
-                            *step = (*step * eta_minus).max(step_min);
+                            eta_minus
+                        } else {
+                            1.0
+                        };
+                        // PyTorch clamps on every applied step, including the
+                        // first update, zero gradients and restored buffers.
+                        *step = (*step * factor).clamp(step_min, step_max);
+                        if sign_product < 0.0 {
                             *prv = 0.0; // skip update; do NOT set prev = g
                         } else {
                             *p -= if g > 0.0 {
@@ -7899,9 +7951,18 @@ impl Optimizer for SparseAdam {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-
-        let num_params = self.params.len();
-        for i in 0..num_params {
+        let updates = preflight_adaptive_updates(
+            session,
+            &self.params,
+            &self.step_counts,
+            &self.m,
+            &self.v,
+            "sparse_adam step counter overflow",
+        )?;
+        for (i, update) in updates.into_iter().enumerate() {
+            let Some((grad_len, t)) = update else {
+                continue;
+            };
             let param = self.params[i];
 
             // The tape owns accumulated support. The latest report may omit a
@@ -7915,31 +7976,12 @@ impl Optimizer for SparseAdam {
                 None => continue,
             };
 
-            let t = advance_param_step_count(
-                &mut self.step_counts,
-                i,
-                "sparse_adam step counter overflow",
-            )?;
             let bias_correction1 = adam_bias_correction(self.beta1, t);
             let bias_correction2 = adam_bias_correction(self.beta2, t);
             let step_size = self.lr * bias_correction2.sqrt() / bias_correction1;
 
-            let param_len = session.tensor_values_len(param)?;
-            ensure_grad_len_matches_param(param, param_len, grad.len())?;
-
-            let m = self.m[i].get_or_insert_with(|| vec![0.0; grad.len()]);
-            ensure_state_len(
-                grad.len(),
-                m.len(),
-                "sparse_adam first-moment state length mismatch",
-            )?;
-
-            let v = self.v[i].get_or_insert_with(|| vec![0.0; grad.len()]);
-            ensure_state_len(
-                grad.len(),
-                v.len(),
-                "sparse_adam second-moment state length mismatch",
-            )?;
+            let m = self.m[i].get_or_insert_with(|| vec![0.0; grad_len]);
+            let v = self.v[i].get_or_insert_with(|| vec![0.0; grad_len]);
 
             // Only update at non-zero gradient indices
             let mut update = vec![0.0; grad.len()];
@@ -7955,6 +7997,7 @@ impl Optimizer for SparseAdam {
             }
 
             apply_param_update(session, param, &update)?;
+            self.step_counts[i] = t;
         }
         Ok(())
     }
@@ -9808,7 +9851,7 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_checkpoint_rprop_accepts_unclamped_initial_steps() {
+    fn optimizer_checkpoint_rprop_preserves_clamped_initial_steps() {
         for lr in [0.0, 1e-8, 100.0] {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let parameter = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
@@ -9819,10 +9862,166 @@ mod tests {
             let OptimizerState::Rprop(state) = &saved.state else {
                 unreachable!()
             };
-            assert_eq!(state.parameters[0].as_ref().unwrap().step_size, vec![lr]);
+            assert_eq!(
+                state.parameters[0].as_ref().unwrap().step_size,
+                vec![lr.clamp(1e-6, 50.0)]
+            );
             let mut restored = Rprop::new(vec![parameter], 0.03);
             restored.load_state_dict(&session, &saved).unwrap();
             assert_eq!(restored.state_dict(&session).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_rprop_clamps_every_sign_case_after_restore() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let parameter = session
+            .tensor_variable(vec![2.0; 4], vec![4], true)
+            .unwrap();
+        let report = session.tensor_backward(parameter).unwrap();
+        let mut optimizer = Rprop::new(vec![parameter], 0.5)
+            .etas(0.5, 2.0)
+            .step_sizes(0.25, 1.0);
+        optimizer.step(&mut session, &report).unwrap();
+        let mut saved = optimizer.state_dict(&session).unwrap();
+        let OptimizerState::Rprop(state) = &mut saved.state else {
+            unreachable!()
+        };
+        let state = state.parameters[0].as_mut().unwrap();
+        state.step_size = vec![0.0625, 4.0, 0.125, 2.0];
+        state.prev = vec![1.0; 4];
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        optimizer
+            .load_state_dict(&session, &serde_json::from_slice(&bytes).unwrap())
+            .unwrap();
+        session
+            .tensor_set_accumulated_gradient(parameter, vec![1.0, -1.0, 0.0, 0.0])
+            .unwrap();
+        optimizer.step(&mut session, &report).unwrap();
+        // Positive, negative and zero sign products all use both bounds, as
+        // torch.optim.rprop._single_tensor_rprop's unconditional clamp_ does.
+        assert_eq!(optimizer.step_sizes[0], Some(vec![0.25, 1.0, 0.25, 1.0]));
+        assert_eq!(optimizer.prev_grad[0], Some(vec![1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(
+            session.tensor_values(parameter).unwrap(),
+            vec![1.25, 1.5, 1.5, 1.5]
+        );
+    }
+
+    #[test]
+    fn optimizer_checkpoint_sparse_and_nadam_overflow_rejects_entire_step() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                // NAdam, SparseAdam's dense fallback and actual sparse support.
+                for algorithm in 0..3 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let params: Vec<_> = [1.5, -0.75]
+                        .into_iter()
+                        .map(|value| {
+                            if dtype == ft_core::DType::F32 {
+                                session.tensor_variable_f32(vec![value as f32; 6], vec![3, 2], true)
+                            } else {
+                                session.tensor_variable(vec![value; 6], vec![3, 2], true)
+                            }
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut optimizer: Box<dyn Optimizer> = if algorithm == 0 {
+                        Box::new(NAdam::new(params.clone(), 0.03))
+                    } else {
+                        Box::new(SparseAdam::new(params.clone(), 0.03))
+                    };
+                    for &param in &params {
+                        if algorithm == 2 {
+                            let loss = sparse_optimizer_weighted_loss(
+                                &mut session,
+                                param,
+                                &[1.0],
+                                &[1.0, -0.5],
+                            );
+                            session.tensor_backward(loss).unwrap();
+                            assert!(
+                                session
+                                    .tensor_accumulated_sparse_gradient(param)
+                                    .unwrap()
+                                    .is_some()
+                            );
+                        } else {
+                            session
+                                .tensor_set_accumulated_gradient(param, vec![1.0; 6])
+                                .unwrap();
+                        }
+                    }
+                    let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                    let report = session.tensor_backward(dummy).unwrap();
+                    optimizer.step(&mut session, &report).unwrap();
+                    let mut saved = optimizer.state_dict(&session).unwrap();
+                    let first_step = (1u64 << 53) + 7;
+                    match &mut saved.state {
+                        OptimizerState::NAdam(state) => {
+                            state.parameters[0].as_mut().unwrap().step = first_step;
+                            state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                        }
+                        OptimizerState::SparseAdam(state) => {
+                            state.parameters[0].as_mut().unwrap().step = first_step;
+                            state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                        }
+                        _ => unreachable!(),
+                    }
+                    let bytes = serde_json::to_vec(&saved).unwrap();
+                    let decoded = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(saved, decoded);
+                    optimizer.load_state_dict(&session, &decoded).unwrap();
+                    let values: Vec<_> = params
+                        .iter()
+                        .map(|&param| session.tensor_values_lossy_f64(param).unwrap())
+                        .collect();
+                    let gradients: Vec<_> = params
+                        .iter()
+                        .map(|&param| session.tensor_grad(param).unwrap())
+                        .collect();
+                    let identity = Arc::clone(&optimizer.identity().0);
+                    let error = optimizer.step(&mut session, &report).unwrap_err();
+                    assert!(error.to_string().contains("step counter overflow"));
+                    assert_eq!(optimizer.state_dict(&session).unwrap(), saved);
+                    assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+                    for (index, &param) in params.iter().enumerate() {
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(param).unwrap(),
+                            values[index]
+                        );
+                        assert_eq!(session.tensor_grad(param).unwrap(), gradients[index]);
+                    }
+                    // Absent gradients skip the exhausted clock. The same
+                    // optimizer remains usable immediately after rejection.
+                    session.tensor_requires_grad_(params[1], false).unwrap();
+                    session.tensor_requires_grad_(params[1], true).unwrap();
+                    optimizer.step(&mut session, &report).unwrap();
+                    let after = optimizer.state_dict(&session).unwrap();
+                    let steps = match after.state {
+                        OptimizerState::NAdam(state) => state
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.as_ref().unwrap().step)
+                            .collect::<Vec<_>>(),
+                        OptimizerState::SparseAdam(state) => state
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.as_ref().unwrap().step)
+                            .collect::<Vec<_>>(),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(steps, vec![first_step + 1, u64::MAX]);
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(params[1]).unwrap(),
+                        values[1]
+                    );
+                    assert_ne!(
+                        session.tensor_values_lossy_f64(params[0]).unwrap(),
+                        values[0]
+                    );
+                }
+            }
         }
     }
 
@@ -18212,6 +18411,109 @@ mod tests {
     }
 
     // ---- Rprop tests ----
+
+    #[test]
+    fn rprop_bounded_steps_follow_fixed_trajectory_across_checkpoint_resume() {
+        // Binary-exact trajectories from PyTorch's Rprop rule: multiply by the
+        // sign factor, clamp every entry, then suppress sign-flipping updates.
+        let gradients = [
+            [1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [-1.0, 1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [-1.0, 1.0, -1.0],
+        ];
+        let lower = [
+            [1.75, -2.75, 1.0],
+            [1.25, -2.25, 1.0],
+            [1.25, -2.25, 0.75],
+            [1.5, -2.5, 0.75],
+            [1.5, -2.5, 1.0],
+            [1.75, -2.75, 1.5],
+        ];
+        let upper = [
+            [1.0, -2.0, 1.0],
+            [0.0, -1.0, 1.0],
+            [0.0, -1.0, 0.0],
+            [0.5, -1.5, 0.0],
+            [0.5, -1.5, 0.5],
+            [1.0, -2.0, 1.5],
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for maximize in [false, true] {
+                    for lr in [0.0, 0.125, 2.0] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let initial = [2.0, -3.0, 1.0];
+                        let mut parameter = if dtype == ft_core::DType::F32 {
+                            session.tensor_variable_f32(
+                                initial.iter().map(|&value| value as f32).collect(),
+                                vec![3],
+                                true,
+                            )
+                        } else {
+                            session.tensor_variable(initial.to_vec(), vec![3], true)
+                        }
+                        .unwrap();
+                        let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                        let mut report = session.tensor_backward(dummy).unwrap();
+                        let mut optimizer = Rprop::new(vec![parameter], lr)
+                            .etas(0.5, 2.0)
+                            .step_sizes(0.25, 1.0)
+                            .maximize(maximize);
+                        for (round, gradient) in gradients.iter().enumerate() {
+                            if round == 2 {
+                                let saved = optimizer.state_dict(&session).unwrap();
+                                let encoded = serde_json::to_vec(&saved).unwrap();
+                                let mut next = FrankenTorchSession::new(mode);
+                                let dummy = next.tensor_variable(vec![1.0], vec![], true).unwrap();
+                                let remapped = next.tensor_variable_from_storage(
+                                    session.tensor_snapshot(parameter).unwrap(),
+                                    true,
+                                );
+                                assert_ne!(remapped, parameter);
+                                parameter = remapped;
+                                optimizer = Rprop::new(vec![parameter], 0.03);
+                                optimizer
+                                    .load_state_dict(
+                                        &next,
+                                        &serde_json::from_slice(&encoded).unwrap(),
+                                    )
+                                    .unwrap();
+                                assert_eq!(optimizer.state_dict(&next).unwrap(), saved);
+                                report = next.tensor_backward(dummy).unwrap();
+                                session = next;
+                            }
+                            session
+                                .tensor_set_accumulated_gradient(parameter, gradient.to_vec())
+                                .unwrap();
+                            optimizer.step(&mut session, &report).unwrap();
+                            let expected = if lr <= 0.125 {
+                                lower[round]
+                            } else {
+                                upper[round]
+                            };
+                            let expected: Vec<_> = expected
+                                .iter()
+                                .zip(initial)
+                                .map(
+                                    |(&value, start)| {
+                                        if maximize { 2.0 * start - value } else { value }
+                                    },
+                                )
+                                .collect();
+                            assert_eq!(
+                                session.tensor_values_lossy_f64(parameter).unwrap(),
+                                expected,
+                                "{mode:?} {dtype:?} maximize={maximize} lr={lr} round={round}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn rprop_basic_step_reduces_loss() {
