@@ -3381,6 +3381,30 @@ impl EmbeddingBag {
         mode: EmbeddingBagMode,
         padding_idx: Option<usize>,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            num_embeddings,
+            embedding_dim,
+            mode,
+            padding_idx,
+            DType::F64,
+        )
+    }
+
+    /// Create a bag reduction with a trainable F32 or F64 embedding table.
+    ///
+    /// Initialization consumes the same random stream as [`Self::new`]. The
+    /// weight remains a trainable leaf when constructed inside `with_no_grad`.
+    /// Unsupported dtypes and invalid dimensions are rejected before allocation.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        num_embeddings: usize,
+        embedding_dim: usize,
+        mode: EmbeddingBagMode,
+        padding_idx: Option<usize>,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if num_embeddings == 0 || embedding_dim == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -3397,6 +3421,11 @@ impl EmbeddingBag {
                 },
             )));
         }
+        checked_mul(
+            num_embeddings,
+            embedding_dim,
+            "EmbeddingBag weight size overflow",
+        )?;
 
         let weight_init = session.randn(vec![num_embeddings, embedding_dim], false)?;
         let mut weight_values = session.tensor_values(weight_init)?;
@@ -3405,8 +3434,12 @@ impl EmbeddingBag {
                 *v = 0.0;
             }
         }
-        let weight =
-            session.tensor_variable(weight_values, vec![num_embeddings, embedding_dim], true)?;
+        let weight = initialized_parameter(
+            session,
+            weight_values,
+            vec![num_embeddings, embedding_dim],
+            dtype,
+        )?;
 
         Ok(Self {
             weight,
@@ -3478,6 +3511,15 @@ impl EmbeddingBag {
         let dim = self.embedding_dim;
         let n_indices = indices_vals.len();
         let num_emb = self.num_embeddings;
+        let output_numel = checked_mul(num_bags, dim, "EmbeddingBag output size overflow")?;
+        let dtype = session.tensor_dtype(self.weight)?;
+        let device = session.tensor_device(self.weight)?;
+        validate_parameter_dtype(dtype)?;
+        if session.tensor_shape(self.weight)? != [num_emb, dim] {
+            return Err(incompatible_error(
+                "EmbeddingBag weight shape must match num_embeddings and embedding_dim",
+            ));
+        }
 
         if num_bags == 0 && n_indices > 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -3512,13 +3554,18 @@ impl EmbeddingBag {
                     },
                 )));
             }
+            if session.tensor_dtype(w)? != dtype || session.tensor_device(w)? != device {
+                return Err(incompatible_error(
+                    "EmbeddingBag: per_sample_weights must match the weight dtype and device",
+                ));
+            }
         }
 
         // Pre-compute (start, end) per bag and validate offsets.
         let mut bag_ranges = Vec::with_capacity(num_bags);
         for bag in 0..num_bags {
             let start_f = offsets_vals[bag];
-            if start_f < 0.0 || start_f != start_f.trunc() {
+            if !start_f.is_finite() || start_f < 0.0 || start_f != start_f.trunc() {
                 return Err(AutogradError::Dispatch(DispatchError::Key(
                     DispatchKeyError::IncompatibleSet {
                         reason: "EmbeddingBag: offset value must be a non-negative integer",
@@ -3542,7 +3589,7 @@ impl EmbeddingBag {
             }
             let end = if bag + 1 < num_bags {
                 let end_f = offsets_vals[bag + 1];
-                if end_f < 0.0 || end_f != end_f.trunc() {
+                if !end_f.is_finite() || end_f < 0.0 || end_f != end_f.trunc() {
                     return Err(AutogradError::Dispatch(DispatchError::Key(
                         DispatchKeyError::IncompatibleSet {
                             reason: "EmbeddingBag: offset value must be a non-negative integer",
@@ -3575,7 +3622,7 @@ impl EmbeddingBag {
         // out-of-range — even silently — because index_select would
         // catch it later but we want the same error message).
         for &iv in &indices_vals {
-            if iv < 0.0 || iv != iv.trunc() {
+            if !iv.is_finite() || iv < 0.0 || iv != iv.trunc() {
                 return Err(AutogradError::Dispatch(DispatchError::Key(
                     DispatchKeyError::IncompatibleSet {
                         reason: "EmbeddingBag: index value must be a non-negative integer",
@@ -3595,110 +3642,70 @@ impl EmbeddingBag {
             }
         }
 
-        // Compose via autograd-aware primitives so gradients flow back
-        // to weight + per_sample_weights. Tracked under
-        // frankentorch-y8le. Previous body extracted tensor_values
-        // and rebuilt a non-grad leaf, severing autograd through every
-        // EmbeddingBag layer.
-        //
-        // For Sum/Mean: emb = index_select(weight, 0, indices); apply
-        // padding mask + per-sample weights; scatter_add into a zeros
-        // [num_bags, dim] tensor along dim 0 with index = bag_id_per_token.
-        // Mean divides by bag size after.
-        //
-        // For Max: capture argmax positions in plain f64 (non-diff op),
-        // then gather rows from emb. PyTorch routes the gradient only
-        // through the argmax position, which gather replicates.
-
-        // Empty inputs short-circuit to zeros (still autograd-aware:
-        // the result is a non-grad leaf, but with no upstream grad
-        // source there's nothing to break).
-        if n_indices == 0 || num_bags == 0 {
-            return session.tensor_variable(vec![0.0; num_bags * dim], vec![num_bags, dim], false);
-        }
-
-        // 1. emb_rows: index_select(weight, 0, indices) → [N, D].
-        // We replace any padding_idx with 0 in the lookup so the row
-        // is well-defined, and zero out the contribution via mask.
-        let safe_indices_vals: Vec<f64> = indices_vals
-            .iter()
-            .map(|&iv| {
-                let idx = iv as usize;
-                if Some(idx) == self.padding_idx {
-                    0.0
-                } else {
-                    iv
-                }
-            })
-            .collect();
-        let safe_idx_t = session.tensor_variable(safe_indices_vals, vec![n_indices], false)?;
-        let emb_rows = session.tensor_index_select(self.weight, 0, safe_idx_t)?; // [N, D]
-
-        // 2. Padding mask (1 where token is real, 0 where padding).
-        let pad_mask_vals: Vec<f64> = indices_vals
-            .iter()
-            .map(|&iv| {
-                let idx = iv as usize;
-                if Some(idx) == self.padding_idx {
-                    0.0
-                } else {
-                    1.0
-                }
-            })
-            .collect();
-        let pad_mask = session.tensor_variable(pad_mask_vals, vec![n_indices], false)?;
-        let pad_mask_kd = session.tensor_unsqueeze(pad_mask, 1)?;
-        let pad_mask_b = session.tensor_expand(pad_mask_kd, vec![n_indices, dim])?;
-        let masked_rows = session.tensor_mul(emb_rows, pad_mask_b)?;
-
-        // 3. Apply per-sample weights (autograd-aware).
-        let weighted_rows = if let Some(psw) = per_sample_weights {
-            let psw_kd = session.tensor_unsqueeze(psw, 1)?;
-            let psw_b = session.tensor_expand(psw_kd, vec![n_indices, dim])?;
-            session.tensor_mul(masked_rows, psw_b)?
-        } else {
-            masked_rows
-        };
-
-        // 4. Build per-token bag-id and per-bag size tables.
-        let mut bag_id_per_token: Vec<f64> = vec![0.0; n_indices];
-        let mut bag_size: Vec<f64> = vec![0.0; num_bags];
+        // Exclude padding from the lookup and from per-sample weighting. A
+        // multiply-by-zero mask still reads the excluded row and turns NaN or
+        // infinity into NaN; it can also poison gradients through that product.
+        // Empty gathers retain the weight / per-sample-weight gradient edges,
+        // including for empty input and batches made entirely of padding.
+        let mut live_indices = Vec::with_capacity(n_indices);
+        let mut live_positions = Vec::with_capacity(n_indices);
+        let mut live_bags = Vec::with_capacity(n_indices);
+        let mut live_ranges = Vec::with_capacity(num_bags);
         for (bag, &(start, end)) in bag_ranges.iter().enumerate() {
-            for i in start..end {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    bag_id_per_token[i] = bag as f64;
-                }
-                let idx = indices_vals[i] as usize;
-                if Some(idx) != self.padding_idx {
-                    bag_size[bag] += 1.0;
+            let live_start = live_indices.len();
+            for (position, &index) in indices_vals.iter().enumerate().take(end).skip(start) {
+                if Some(index as usize) != self.padding_idx {
+                    live_indices.push(index);
+                    live_positions.push(position as f64);
+                    live_bags.push(bag as f64);
                 }
             }
+            live_ranges.push((live_start, live_indices.len()));
         }
+        let live_count = live_indices.len();
+        let live_numel = checked_mul(live_count, dim, "EmbeddingBag lookup size overflow")?;
+        let live_idx = session.tensor_variable(live_indices, vec![live_count], false)?;
+        let emb_rows = session.tensor_index_select(self.weight, 0, live_idx)?;
+
+        let weighted_rows = if let Some(psw) = per_sample_weights {
+            let positions = session.tensor_variable(live_positions, vec![live_count], false)?;
+            let selected = session.tensor_index_select(psw, 0, positions)?;
+            let selected = session.tensor_unsqueeze(selected, 1)?;
+            let selected = session.tensor_expand(selected, vec![live_count, dim])?;
+            session.tensor_mul(emb_rows, selected)?
+        } else {
+            emb_rows
+        };
 
         match self.mode {
             EmbeddingBagMode::Sum | EmbeddingBagMode::Mean => {
-                // scatter_add along dim 0 needs an index tensor of the
-                // same shape as src ([n_indices, dim]) where each entry
-                // tells the destination row.
-                let mut bag_id_2d: Vec<f64> = Vec::with_capacity(n_indices * dim);
-                for &bag_id in &bag_id_per_token {
+                // The index and source have shape [live_count, dim]; repeated
+                // bag IDs accumulate each retained row into its own output bag.
+                let mut bag_id_2d = Vec::with_capacity(live_numel);
+                for &bag_id in &live_bags {
                     bag_id_2d.extend(std::iter::repeat_n(bag_id, dim));
                 }
                 let bag_id_2d_t =
-                    session.tensor_variable(bag_id_2d, vec![n_indices, dim], false)?;
-                let zeros = session.full(vec![num_bags, dim], 0.0, false)?;
+                    session.tensor_variable(bag_id_2d, vec![live_count, dim], false)?;
+                let zeros = DenseTensor::from_contiguous_values(
+                    vec![0.0; output_numel],
+                    vec![num_bags, dim],
+                    device,
+                )?
+                .to_dtype(dtype)?;
+                let zeros = session.tensor_variable_from_storage(zeros, false);
                 let summed = session.tensor_scatter_add(zeros, 0, bag_id_2d_t, weighted_rows)?;
                 if matches!(self.mode, EmbeddingBagMode::Mean) {
-                    // Divide by bag_size, with bag_size clamped to 1 to
-                    // avoid division by zero on empty bags (PyTorch
-                    // returns 0 for those — div by 1 of a zero summed
-                    // row also gives 0).
-                    let safe_bag_size: Vec<f64> = bag_size
+                    // Empty bags divide their zero sum by one; padding is not
+                    // part of the denominator, even with a loaded nonzero row.
+                    let safe_bag_size: Vec<f64> = live_ranges
                         .iter()
-                        .map(|&n| if n > 0.0 { n } else { 1.0 })
+                        .map(|&(start, end)| (end - start).max(1) as f64)
                         .collect();
-                    let bs_t = session.tensor_variable(safe_bag_size, vec![num_bags], false)?;
+                    let counts =
+                        DenseTensor::from_contiguous_values(safe_bag_size, vec![num_bags], device)?
+                            .to_dtype(dtype)?;
+                    let bs_t = session.tensor_variable_from_storage(counts, false);
                     let bs_kd = session.tensor_unsqueeze(bs_t, 1)?;
                     let bs_b = session.tensor_expand(bs_kd, vec![num_bags, dim])?;
                     return session.tensor_div(summed, bs_b);
@@ -3706,51 +3713,38 @@ impl EmbeddingBag {
                 Ok(summed)
             }
             EmbeddingBagMode::Max => {
-                // Capture argmax positions per (bag, d) by extracting
-                // values once. Argmax itself is non-differentiable;
-                // routing the gradient through tensor_gather to the
-                // argmax position matches PyTorch's autograd semantics.
-                let weighted_vals = session.tensor_values(weighted_rows)?;
-                let mut argmax_per_bag: Vec<usize> = vec![0; num_bags * dim];
-                let mut bag_has_real: Vec<bool> = vec![false; num_bags];
-                for (bag, &(start, end)) in bag_ranges.iter().enumerate() {
-                    let mut best = vec![f64::NEG_INFINITY; dim];
-                    for i in start..end {
-                        let idx = indices_vals[i] as usize;
-                        if Some(idx) == self.padding_idx {
-                            continue;
-                        }
-                        bag_has_real[bag] = true;
-                        for d in 0..dim {
-                            let v = weighted_vals[i * dim + d];
-                            if v > best[d] {
-                                best[d] = v;
-                                argmax_per_bag[bag * dim + d] = i;
+                // Seed each nonempty bag from its first retained row, matching
+                // PyTorch's first-winner rule even when every value is -inf.
+                // Starting at -inf would leave such a bag pointing at row zero
+                // of a different bag. NaNs follow the same strict-comparison
+                // rule as the CPU EmbeddingBag maximum kernel.
+                let values = session.tensor_values_lossy_f64(weighted_rows)?;
+                let mut argmax = vec![live_count as f64; output_numel];
+                for (bag, &(start, end)) in live_ranges.iter().enumerate() {
+                    if start == end {
+                        continue;
+                    }
+                    for d in 0..dim {
+                        let mut best = start;
+                        for row in start + 1..end {
+                            if values[row * dim + d] > values[best * dim + d] {
+                                best = row;
                             }
                         }
+                        argmax[bag * dim + d] = best as f64;
                     }
                 }
-                // For empty bags (all padding), point argmax to row 0
-                // and zero out via real_mask after gather.
-                let argmax_f64: Vec<f64> = argmax_per_bag
-                    .iter()
-                    .map(|&v| {
-                        #[allow(clippy::cast_precision_loss)]
-                        let r = v as f64;
-                        r
-                    })
-                    .collect();
-                let argmax_t = session.tensor_variable(argmax_f64, vec![num_bags, dim], false)?;
-                // gather over dim 0: output[bag, d] = weighted_rows[argmax[bag, d], d].
-                let gathered = session.tensor_gather(weighted_rows, 0, argmax_t)?;
-                let real_mask_vals: Vec<f64> = bag_has_real
-                    .iter()
-                    .map(|&b| if b { 1.0 } else { 0.0 })
-                    .collect();
-                let real_mask = session.tensor_variable(real_mask_vals, vec![num_bags], false)?;
-                let real_kd = session.tensor_unsqueeze(real_mask, 1)?;
-                let real_b = session.tensor_expand(real_kd, vec![num_bags, dim])?;
-                session.tensor_mul(gathered, real_b)
+
+                // Empty bags gather a genuine zero row, never an arbitrary
+                // embedding multiplied by zero. Concatenating the live lookup
+                // preserves a zero weight gradient when every bag is empty.
+                let zero =
+                    DenseTensor::from_contiguous_values(vec![0.0; dim], vec![1, dim], device)?
+                        .to_dtype(dtype)?;
+                let zero = session.tensor_variable_from_storage(zero, false);
+                let rows = session.tensor_cat(&[weighted_rows, zero], 0)?;
+                let argmax = session.tensor_variable(argmax, vec![num_bags, dim], false)?;
+                session.tensor_gather(rows, 0, argmax)
             }
         }
     }
@@ -3771,6 +3765,10 @@ impl Module for EmbeddingBag {
 
     fn parameters(&self) -> Vec<TensorNodeId> {
         vec![self.weight]
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        vec![("weight", self.weight)]
     }
 }
 
@@ -9071,9 +9069,7 @@ impl Module for AvgPool2d {
                     (patch, flat_len)
                 };
                 let flat = session.tensor_reshape(patch, vec![nc, flat_len])?;
-                let sum = session.tensor_sum_dim(flat, 1)?;
-                let divisor = session.full(vec![nc], flat_len as f64, false)?;
-                let avg = session.tensor_div(sum, divisor)?;
+                let avg = session.tensor_mean_dim(flat, 1)?;
                 let shaped = session.tensor_reshape(avg, vec![n, c, 1])?;
                 patches.push(shaped);
             }
@@ -28591,6 +28587,179 @@ mod tests {
     // ---- AvgPool1d tests ----
 
     #[test]
+    fn typed_pooling_preserves_values_gradients_and_no_grad() {
+        struct Case {
+            pool: Box<dyn Module>,
+            input: Vec<f64>,
+            spatial: Vec<usize>,
+            output_spatial: Vec<usize>,
+            expected: Vec<f64>,
+            gradient: Vec<f64>,
+        }
+        // Independent window averages/maxima and their summed-output adjoints.
+        let cases = [
+            Case {
+                pool: Box::new(AvgPool1d::new(2, 1)),
+                input: vec![1.0, 3.0, 5.0, 7.0],
+                spatial: vec![4],
+                output_spatial: vec![3],
+                expected: vec![2.0, 4.0, 6.0],
+                gradient: vec![0.5, 1.0, 1.0, 0.5],
+            },
+            Case {
+                pool: Box::new(MaxPool1d::new(2, 1)),
+                input: vec![1.0, 3.0, 5.0, 7.0],
+                spatial: vec![4],
+                output_spatial: vec![3],
+                expected: vec![3.0, 5.0, 7.0],
+                gradient: vec![0.0, 1.0, 1.0, 1.0],
+            },
+            Case {
+                pool: Box::new(AvgPool2d::new((3, 3), (1, 1), (1, 1), false, false)),
+                input: vec![1.0, 2.0, 3.0, 4.0],
+                spatial: vec![2, 2],
+                output_spatial: vec![2, 2],
+                expected: vec![2.5; 4],
+                gradient: vec![1.0; 4],
+            },
+            Case {
+                pool: Box::new(AvgPool2d::new((3, 3), (1, 1), (1, 1), false, true)),
+                input: vec![1.0, 2.0, 3.0, 4.0],
+                spatial: vec![2, 2],
+                output_spatial: vec![2, 2],
+                expected: vec![10.0 / 9.0; 4],
+                gradient: vec![4.0 / 9.0; 4],
+            },
+            Case {
+                pool: Box::new(AvgPool2d::new((2, 2), (2, 2), (0, 0), true, true)),
+                input: (1..=9).map(f64::from).collect(),
+                spatial: vec![3, 3],
+                output_spatial: vec![2, 2],
+                expected: vec![3.0, 4.5, 7.5, 9.0],
+                gradient: vec![0.25, 0.25, 0.5, 0.25, 0.25, 0.5, 0.5, 0.5, 1.0],
+            },
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let tolerance = if dtype == DType::F32 { 2e-6 } else { 1e-12 };
+                for batched in [false, true] {
+                    for case in &cases {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let prefix = if batched { vec![1, 1] } else { vec![1] };
+                        let mut shape = prefix.clone();
+                        shape.extend_from_slice(&case.spatial);
+                        let mut output_shape = prefix;
+                        output_shape.extend_from_slice(&case.output_spatial);
+                        let input = if dtype == DType::F32 {
+                            session.tensor_variable_f32(
+                                case.input.iter().map(|&value| value as f32).collect(),
+                                shape,
+                                true,
+                            )
+                        } else {
+                            session.tensor_variable(case.input.clone(), shape, true)
+                        }
+                        .unwrap();
+                        let output = case.pool.forward(&mut session, input).unwrap();
+                        assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                        assert_eq!(session.tensor_shape(output).unwrap(), output_shape);
+                        let values = session.tensor_values_lossy_f64(output).unwrap();
+                        for (&actual, &expected) in values.iter().zip(&case.expected) {
+                            assert!((actual - expected).abs() < tolerance);
+                        }
+                        let loss = session.tensor_sum(output).unwrap();
+                        let report = session.tensor_backward(loss).unwrap();
+                        let gradient = session.tensor_gradient(&report, input).unwrap();
+                        assert_eq!(gradient.len(), case.gradient.len());
+                        for (&actual, &expected) in gradient.iter().zip(&case.gradient) {
+                            assert!((actual - expected).abs() < tolerance);
+                        }
+                        let detached = session
+                            .with_no_grad(|session| case.pool.forward(session, input))
+                            .unwrap();
+                        assert_eq!(session.tensor_dtype(detached).unwrap(), dtype);
+                        assert!(!session.tensor_requires_grad(detached).unwrap());
+                        assert_eq!(session.tensor_values_lossy_f64(detached).unwrap(), values);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_pooling_connects_convolution_to_trainable_classifier() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let conv =
+                    Conv2d::new_with_dtype(&mut session, 1, 1, (1, 1), (1, 1), (0, 0), true, dtype)
+                        .unwrap();
+                let linear = Linear::new_with_dtype(&mut session, 4, 1, true, dtype).unwrap();
+                session
+                    .tensor_update_param_values(conv.weight, vec![2.0])
+                    .unwrap();
+                session
+                    .tensor_update_param_values(conv.bias.unwrap(), vec![0.5])
+                    .unwrap();
+                session
+                    .tensor_update_param_values(linear.weight, vec![1.0, -2.0, 0.5, 3.0])
+                    .unwrap();
+                session
+                    .tensor_update_param_values(linear.bias.unwrap(), vec![-1.0])
+                    .unwrap();
+                let input = if dtype == DType::F32 {
+                    session.tensor_variable_f32(
+                        (1..=9).map(|i| i as f32).collect(),
+                        vec![1, 1, 3, 3],
+                        false,
+                    )
+                } else {
+                    session.tensor_variable(
+                        (1..=9).map(f64::from).collect(),
+                        vec![1, 1, 3, 3],
+                        false,
+                    )
+                }
+                .unwrap();
+                let features = conv.forward(&mut session, input).unwrap();
+                let pooled = AvgPool2d::new((2, 2), (2, 2), (0, 0), true, true)
+                    .forward(&mut session, features)
+                    .unwrap();
+                let flattened = session.tensor_reshape(pooled, vec![1, 4]).unwrap();
+                let output = linear.forward(&mut session, flattened).unwrap();
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                assert_eq!(
+                    session.tensor_values_lossy_f64(output).unwrap(),
+                    vec![49.75]
+                );
+                let loss = session.tensor_sum(output).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                assert!(session.tensor_gradient(&report, input).is_none());
+                assert_eq!(
+                    session.tensor_gradient(&report, conv.weight).unwrap(),
+                    &[24.75]
+                );
+                assert_eq!(
+                    session
+                        .tensor_gradient(&report, conv.bias.unwrap())
+                        .unwrap(),
+                    &[2.5]
+                );
+                assert_eq!(
+                    session.tensor_gradient(&report, linear.weight).unwrap(),
+                    &[6.5, 9.5, 15.5, 18.5]
+                );
+                assert_eq!(
+                    session
+                        .tensor_gradient(&report, linear.bias.unwrap())
+                        .unwrap(),
+                    &[1.0]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn avgpool1d_forward_basic() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let pool = AvgPool1d::new(2, 2);
@@ -42058,6 +42227,485 @@ mod tests {
     }
 
     // ── EmbeddingBag Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn embedding_bag_typed_construction_preserves_initialization_and_trainable_leaves() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let baseline = FrankenTorchSession::new(mode);
+            let mut original = baseline.clone();
+            let default =
+                EmbeddingBag::new(&mut original, 4, 3, EmbeddingBagMode::Sum, Some(1)).unwrap();
+            let expected = original.tensor_values(default.weight()).unwrap();
+            let next = original.rand(vec![4], false).unwrap();
+            let next_values = original.tensor_values(next).unwrap();
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = baseline.clone();
+                let model = session
+                    .with_no_grad(|session| {
+                        EmbeddingBag::new_with_dtype(
+                            session,
+                            4,
+                            3,
+                            EmbeddingBagMode::Sum,
+                            Some(1),
+                            dtype,
+                        )
+                    })
+                    .unwrap();
+                assert!(session.is_grad_enabled());
+                assert!(session.tensor_is_leaf(model.weight()).unwrap());
+                assert!(session.tensor_requires_grad(model.weight()).unwrap());
+                assert_eq!(session.tensor_dtype(model.weight()).unwrap(), dtype);
+                let expected: Vec<_> = expected
+                    .iter()
+                    .map(|&value| {
+                        if dtype == DType::F32 {
+                            f64::from(value as f32)
+                        } else {
+                            value
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    session.tensor_values_lossy_f64(model.weight()).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    named_parameters(&model, ""),
+                    vec![("weight".to_string(), model.weight())]
+                );
+                let next = session.rand(vec![4], false).unwrap();
+                assert_eq!(session.tensor_values(next).unwrap(), next_values);
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_bag_typed_reductions_and_weighted_gradients_exclude_padding() {
+        for execution in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for mode in [
+                    EmbeddingBagMode::Sum,
+                    EmbeddingBagMode::Mean,
+                    EmbeddingBagMode::Max,
+                ] {
+                    for weighted in [false, true] {
+                        if weighted && mode != EmbeddingBagMode::Sum {
+                            continue;
+                        }
+                        let mut session = FrankenTorchSession::new(execution);
+                        let model =
+                            EmbeddingBag::new_with_dtype(&mut session, 4, 2, mode, Some(0), dtype)
+                                .unwrap();
+                        session
+                            .tensor_update_param_values(
+                                model.weight(),
+                                vec![f64::NAN, f64::INFINITY, 1.0, 2.0, 3.0, -4.0, 2.0, 5.0],
+                            )
+                            .unwrap();
+                        let indices = session
+                            .tensor_variable(
+                                vec![1.0, 0.0, 2.0, 1.0, 0.0, 3.0, 2.0, 3.0],
+                                vec![8],
+                                false,
+                            )
+                            .unwrap();
+                        let offsets = session
+                            .tensor_variable(vec![0.0, 4.0, 4.0, 5.0], vec![4], false)
+                            .unwrap();
+                        let psw = weighted.then(|| {
+                            packed_recurrent_test_leaf(
+                                &mut session,
+                                vec![0.5, f64::NAN, 2.0, -1.0, f64::INFINITY, -2.0, 0.25, 3.0],
+                                vec![8],
+                                dtype,
+                                true,
+                            )
+                        });
+                        let output = model
+                            .forward_with_offsets(&mut session, indices, offsets, psw)
+                            .unwrap();
+                        assert_eq!(session.tensor_shape(output).unwrap(), vec![4, 2]);
+                        assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                        let (expected_output, expected_gradient) = if weighted {
+                            (
+                                vec![5.5, -9.0, 0.0, 0.0, 0.0, 0.0, 2.75, 4.0],
+                                vec![0.0, 0.0, -0.5, -1.0, 3.75, 6.0, 7.0, 8.0],
+                            )
+                        } else {
+                            match mode {
+                                EmbeddingBagMode::Sum => (
+                                    vec![5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 6.0],
+                                    vec![0.0, 0.0, 2.0, 4.0, 8.0, 10.0, 14.0, 16.0],
+                                ),
+                                EmbeddingBagMode::Mean => (
+                                    vec![5.0 / 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0 / 3.0, 2.0],
+                                    vec![
+                                        0.0,
+                                        0.0,
+                                        2.0 / 3.0,
+                                        4.0 / 3.0,
+                                        8.0 / 3.0,
+                                        10.0 / 3.0,
+                                        14.0 / 3.0,
+                                        16.0 / 3.0,
+                                    ],
+                                ),
+                                EmbeddingBagMode::Max => (
+                                    vec![3.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 5.0],
+                                    vec![0.0, 0.0, 0.0, 2.0, 8.0, 0.0, 0.0, 8.0],
+                                ),
+                            }
+                        };
+                        let tolerance = if dtype == DType::F32 { 2e-6 } else { 1e-12 };
+                        let actual = session.tensor_values_lossy_f64(output).unwrap();
+                        for (&actual, &expected) in actual.iter().zip(&expected_output) {
+                            assert!(
+                                (actual - expected).abs() < tolerance,
+                                "{mode:?} {dtype:?}: {actual} != {expected}"
+                            );
+                        }
+                        let upstream = packed_recurrent_test_leaf(
+                            &mut session,
+                            (1..=8).map(f64::from).collect(),
+                            vec![4, 2],
+                            dtype,
+                            false,
+                        );
+                        let weighted_output = session.tensor_mul(output, upstream).unwrap();
+                        let loss = session.tensor_sum(weighted_output).unwrap();
+                        let report = session.tensor_backward(loss).unwrap();
+                        let gradient = session.tensor_gradient(&report, model.weight()).unwrap();
+                        for (&actual, &expected) in gradient.iter().zip(&expected_gradient) {
+                            assert!(
+                                (actual - expected).abs() < tolerance,
+                                "{mode:?} {dtype:?}: gradient {actual} != {expected}"
+                            );
+                        }
+                        if let Some(psw) = psw {
+                            assert_eq!(
+                                session.tensor_gradient(&report, psw).unwrap(),
+                                &vec![5.0, 0.0, -5.0, 5.0, 0.0, 54.0, -11.0, 54.0]
+                            );
+                        }
+                        let untracked = session
+                            .with_no_grad(|s| model.forward_with_offsets(s, indices, offsets, psw))
+                            .unwrap();
+                        assert!(!session.tensor_requires_grad(untracked).unwrap());
+                        assert_eq!(session.tensor_values_lossy_f64(untracked).unwrap(), actual);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_bag_max_nonfinite_winners_and_empty_bags_match_cpu_semantics() {
+        // PyTorch EmbeddingBag.cpp initializes each bag from its first retained
+        // row, then updates only for a strict greater comparison. This differs
+        // from a reduction seeded at -inf and from a NaN-propagating maximum.
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let model = EmbeddingBag::new_with_dtype(
+                &mut session,
+                4,
+                2,
+                EmbeddingBagMode::Max,
+                Some(0),
+                dtype,
+            )
+            .unwrap();
+            session
+                .tensor_update_param_values(
+                    model.weight(),
+                    vec![
+                        f64::NAN,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        5.0,
+                        9.0,
+                        4.0,
+                        f64::NAN,
+                        f64::NEG_INFINITY,
+                    ],
+                )
+                .unwrap();
+            let indices = session
+                .tensor_variable(
+                    vec![2.0, 0.0, 1.0, 1.0, 0.0, 3.0, 1.0, 1.0, 3.0],
+                    vec![9],
+                    false,
+                )
+                .unwrap();
+            let offsets = session
+                .tensor_variable(vec![0.0, 1.0, 2.0, 4.0, 5.0, 7.0], vec![6], false)
+                .unwrap();
+            let output = model
+                .forward_with_offsets(&mut session, indices, offsets, None)
+                .unwrap();
+            let actual = session.tensor_values_lossy_f64(output).unwrap();
+            let expected = [
+                9.0,
+                4.0,
+                0.0,
+                0.0,
+                f64::NEG_INFINITY,
+                5.0,
+                0.0,
+                0.0,
+                f64::NAN,
+                5.0,
+                f64::NEG_INFINITY,
+                5.0,
+            ];
+            for (&actual, expected) in actual.iter().zip(expected) {
+                assert!(actual == expected || (actual.is_nan() && expected.is_nan()));
+            }
+            let upstream = packed_recurrent_test_leaf(
+                &mut session,
+                (1..=12).map(f64::from).collect(),
+                vec![6, 2],
+                dtype,
+                false,
+            );
+            let seeded = session.tensor_mul(output, upstream).unwrap();
+            let loss = session.tensor_sum(seeded).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            assert_eq!(
+                session.tensor_gradient(&report, model.weight()).unwrap(),
+                &vec![0.0, 0.0, 16.0, 28.0, 1.0, 2.0, 9.0, 0.0]
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_bag_empty_inputs_and_all_padding_keep_zero_gradient_edges() {
+        for dtype in [DType::F32, DType::F64] {
+            for mode in [
+                EmbeddingBagMode::Sum,
+                EmbeddingBagMode::Mean,
+                EmbeddingBagMode::Max,
+            ] {
+                for (indices_values, offset_values) in [
+                    (vec![], vec![]),
+                    (vec![], vec![0.0, 0.0]),
+                    (vec![0.0, 0.0], vec![0.0, 0.0, 1.0, 2.0]),
+                ] {
+                    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let model =
+                        EmbeddingBag::new_with_dtype(&mut session, 2, 2, mode, Some(0), dtype)
+                            .unwrap();
+                    session
+                        .tensor_update_param_values(
+                            model.weight(),
+                            vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::NAN],
+                        )
+                        .unwrap();
+                    let n_indices = indices_values.len();
+                    let n_bags = offset_values.len();
+                    let indices = session
+                        .tensor_variable(indices_values, vec![n_indices], false)
+                        .unwrap();
+                    let offsets = session
+                        .tensor_variable(offset_values, vec![n_bags], false)
+                        .unwrap();
+                    let psw = (mode == EmbeddingBagMode::Sum).then(|| {
+                        packed_recurrent_test_leaf(
+                            &mut session,
+                            vec![f64::NAN; n_indices],
+                            vec![n_indices],
+                            dtype,
+                            true,
+                        )
+                    });
+                    let output = model
+                        .forward_with_offsets(&mut session, indices, offsets, psw)
+                        .unwrap();
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert_eq!(session.tensor_shape(output).unwrap(), vec![n_bags, 2]);
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(output).unwrap(),
+                        vec![0.0; n_bags * 2]
+                    );
+                    assert!(session.tensor_requires_grad(output).unwrap());
+                    let loss = session.tensor_sum(output).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert_eq!(
+                        session.tensor_gradient(&report, model.weight()).unwrap(),
+                        &vec![0.0; 4]
+                    );
+                    if let Some(psw) = psw {
+                        assert_eq!(
+                            session.tensor_gradient(&report, psw).unwrap(),
+                            &vec![0.0; n_indices]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_bag_typed_preflight_does_not_mutate_graph_or_rng() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut untouched = session.clone();
+        let before = session.autograd_graph_node_count();
+        for (rows, dim, padding, dtype) in [
+            (4, 2, None, DType::F16),
+            (4, 2, None, DType::BF16),
+            (0, 2, None, DType::F32),
+            (4, 0, None, DType::F64),
+            (usize::MAX, 2, None, DType::F32),
+            (4, 2, Some(4), DType::F32),
+        ] {
+            assert!(
+                EmbeddingBag::new_with_dtype(
+                    &mut session,
+                    rows,
+                    dim,
+                    EmbeddingBagMode::Sum,
+                    padding,
+                    dtype
+                )
+                .is_err()
+            );
+            assert_eq!(session.autograd_graph_node_count(), before);
+        }
+        let next = session.rand(vec![4], false).unwrap();
+        let expected = untouched.rand(vec![4], false).unwrap();
+        assert_eq!(
+            session.tensor_values(next).unwrap(),
+            untouched.tensor_values(expected).unwrap()
+        );
+
+        let model = EmbeddingBag::new_with_dtype(
+            &mut session,
+            3,
+            2,
+            EmbeddingBagMode::Sum,
+            None,
+            DType::F32,
+        )
+        .unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.5, 3.0] {
+            let indices = session
+                .tensor_variable(vec![value], vec![1], false)
+                .unwrap();
+            let before = session.autograd_graph_node_count();
+            assert!(
+                model
+                    .forward_with_offsets(&mut session, indices, offsets, None)
+                    .is_err()
+            );
+            assert_eq!(session.autograd_graph_node_count(), before);
+        }
+        let indices = session.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let wrong_dtype = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let before = session.autograd_graph_node_count();
+        assert!(
+            model
+                .forward_with_offsets(&mut session, indices, offsets, Some(wrong_dtype))
+                .is_err()
+        );
+        assert_eq!(session.autograd_graph_node_count(), before);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.5] {
+            let invalid_offsets = session
+                .tensor_variable(vec![value], vec![1], false)
+                .unwrap();
+            let before = session.autograd_graph_node_count();
+            assert!(
+                model
+                    .forward_with_offsets(&mut session, indices, invalid_offsets, None)
+                    .is_err()
+            );
+            assert_eq!(session.autograd_graph_node_count(), before);
+        }
+    }
+
+    #[test]
+    fn embedding_bag_typed_checkpoints_resume_training() {
+        fn step(session: &mut FrankenTorchSession, model: &EmbeddingBag, dtype: DType) -> Vec<f64> {
+            let indices = session
+                .tensor_variable(vec![0.0, 1.0, 2.0, 1.0], vec![4], false)
+                .unwrap();
+            let offsets = session
+                .tensor_variable(vec![0.0, 2.0], vec![2], false)
+                .unwrap();
+            let output = model
+                .forward_with_offsets(session, indices, offsets, None)
+                .unwrap();
+            let upstream = packed_recurrent_test_leaf(
+                session,
+                vec![1.0, -2.0, 3.0, 4.0],
+                vec![2, 2],
+                dtype,
+                false,
+            );
+            let seeded = session.tensor_mul(output, upstream).unwrap();
+            let loss = session.tensor_sum(seeded).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            let values = session.tensor_values_lossy_f64(model.weight()).unwrap();
+            let gradient = session.tensor_gradient(&report, model.weight()).unwrap();
+            let updated = values
+                .iter()
+                .zip(gradient)
+                .map(|(&value, &grad)| value - 0.01 * grad)
+                .collect();
+            session
+                .tensor_update_param_values(model.weight(), updated)
+                .unwrap();
+            session.tensor_values_lossy_f64(output).unwrap()
+        }
+        for dtype in [DType::F32, DType::F64] {
+            for mode in [
+                EmbeddingBagMode::Sum,
+                EmbeddingBagMode::Mean,
+                EmbeddingBagMode::Max,
+            ] {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let model =
+                    EmbeddingBag::new_with_dtype(&mut session, 3, 2, mode, Some(0), dtype).unwrap();
+                step(&mut session, &model, dtype);
+                let state = model.state_dict(&session).unwrap();
+                assert_eq!(state.keys().cloned().collect::<Vec<_>>(), vec!["weight"]);
+                let typed = state
+                    .iter()
+                    .map(|(name, tensor)| {
+                        (
+                            name.clone(),
+                            ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                        )
+                    })
+                    .collect();
+                let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+                let saved = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+
+                let mut resumed = FrankenTorchSession::new(ExecutionMode::Strict);
+                resumed.tensor_variable(vec![9.0], vec![1], false).unwrap();
+                let restored = resumed
+                    .with_no_grad(|s| EmbeddingBag::new_with_dtype(s, 3, 2, mode, Some(0), dtype))
+                    .unwrap();
+                assert_ne!(model.weight(), restored.weight());
+                let parameters = restored.parameters();
+                let report = restored
+                    .load_state_dict(&mut resumed, &saved, true)
+                    .unwrap();
+                assert!(report.missing_keys.is_empty() && report.unexpected_keys.is_empty());
+                assert_eq!(restored.parameters(), parameters);
+                for _ in 0..2 {
+                    assert_eq!(
+                        step(&mut session, &model, dtype),
+                        step(&mut resumed, &restored, dtype)
+                    );
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(model.weight()).unwrap(),
+                        resumed.tensor_values_lossy_f64(restored.weight()).unwrap()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn embedding_bag_sum_mode() {
