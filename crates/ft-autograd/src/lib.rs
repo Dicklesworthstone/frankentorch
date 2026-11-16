@@ -15141,6 +15141,22 @@ impl TensorTape {
                         rule: "d(cumsum(x))/dx = reverse_cumsum(grad)",
                     });
                 }
+                TensorNodeOp::CumProd { input, dim }
+                    if self.nodes[input.0].tensor.meta().numel() <= 1
+                        || self.nodes[input.0].tensor.meta().shape()[dim] == 1 =>
+                {
+                    // A singleton scan is the identity, even for NaN/Inf inputs.
+                    // Match ReduceOps.cpp's shortcut before forming grad*x/x.
+                    let input_numel = self.nodes[input.0].tensor.meta().numel();
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &incoming)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(cumprod(x))/dx=grad (singleton/empty)",
+                    });
+                }
                 TensorNodeOp::CumProd { input, dim } => {
                     // Backward of cumprod uses: grad_input[i] = sum_{j>=i} grad_output[j] * output[j] / input[i]
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
@@ -17764,6 +17780,20 @@ impl TensorTape {
                         rule: "d(index_put(x,v))/d:x=passthrough_or_masked,v=gather (cg)",
                     });
                 }
+                TensorNodeOp::CumProd { input, dim }
+                    if self.nodes[input.0].tensor.meta().numel() <= 1
+                        || self.nodes[input.0].tensor.meta().shape()[dim] == 1 =>
+                {
+                    // Keep the incoming gradient's graph without introducing
+                    // canceling quotients into singleton suffix derivatives.
+                    self.cg_accumulate(input, &mut grad_nodes, incoming_id)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(cumprod(x))/dx=grad (cg, singleton/empty)",
+                    });
+                }
                 TensorNodeOp::CumProd { input, dim } => {
                     // The quotient rule is valid only when every input is nonzero.
                     // At a zero, build the polynomial's omitted products instead:
@@ -17820,18 +17850,31 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Pow { input, exponent } => {
-                    // d(x^n)/dx = n * x^(n-1) * grad
-                    let exp_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let exp_numel = Self::checked_shape_numel(
-                        &exp_shape,
-                        "pow backward exponent shape overflow",
-                    )?;
-                    let exp_node = self.leaf(vec![exponent; exp_numel], exp_shape, false)?;
-                    // frankentorch-ut5sy: cg_pow takes the scalar directly now; the uniform
-                    // exp_m1 leaf that used to carry it was a numel-sized allocation for one value.
-                    let x_pow = self.cg_pow(input, exponent - 1.0)?;
-                    let n_x_pow = self.cg_mul(exp_node, x_pow)?;
-                    let grad_in = self.cg_mul(incoming_id, n_x_pow)?;
+                    // PyTorch's scalar pow_backward returns detached zeros for
+                    // exponent zero. Evaluating 0*x^-1 would instead introduce
+                    // NaNs at zero/NaN inputs and in polynomial derivative chains.
+                    let grad_in = if exponent == 0.0 {
+                        let meta = self.nodes[input.0].tensor.meta();
+                        let zeros = DenseTensor::from_storage(
+                            TensorMeta::from_shape(
+                                meta.shape().to_vec(),
+                                DType::F64,
+                                meta.device(),
+                            ),
+                            vec![0.0; meta.numel()],
+                        )?;
+                        self.leaf_tensor(zeros, false)
+                    } else {
+                        let exp_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                        let exp_numel = Self::checked_shape_numel(
+                            &exp_shape,
+                            "pow backward exponent shape overflow",
+                        )?;
+                        let exp_node = self.leaf(vec![exponent; exp_numel], exp_shape, false)?;
+                        let x_pow = self.cg_pow(input, exponent - 1.0)?;
+                        let n_x_pow = self.cg_mul(exp_node, x_pow)?;
+                        self.cg_mul(incoming_id, n_x_pow)?
+                    };
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -19457,177 +19500,26 @@ impl TensorTape {
                         rule: "d(norm0(x))/dx=undefined (cg)",
                     });
                 }
-                TensorNodeOp::Norm {
-                    input,
-                    p,
-                    input_numel,
-                } => {
-                    // Second-order norm backward, p in {1, 2}. Other p (inf,
-                    // general, 0) fall through to a fail-loud error rather than a
-                    // silently-zero detached leaf.
-                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let incoming_val = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()
-                        .map_err(AutogradError::DenseTensor)?[0];
-                    if p == 2.0 {
-                        // d/dx_i = grad * x_i / ||x||. Reuse the Norm output node
-                        // (node_id) as the divisor so the second backward routes
-                        // d||x||/dx through Norm's own backward, yielding the exact
-                        // Hessian (I - x x^T / ||x||^2) / ||x||.
-                        let norm_val = self.nodes[node_id.0]
-                            .tensor
-                            .contiguous_values_as_f64()
-                            .map_err(AutogradError::DenseTensor)?[0];
-                        let grad_in = if norm_val == 0.0 {
-                            // ||x|| = 0: gradient is zero (non-differentiable at origin).
-                            self.leaf(vec![0.0; input_numel], input_shape, false)?
-                        } else {
-                            let inc_exp = self.cg_expand(
-                                incoming_id,
-                                vec![incoming_val; input_numel],
-                                input_shape.clone(),
-                            )?;
-                            let numerator = self.cg_mul(inc_exp, input)?;
-                            let norm_exp =
-                                self.cg_expand(node_id, vec![norm_val; input_numel], input_shape)?;
-                            self.cg_div(numerator, norm_exp)?
-                        };
-                        self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
-                        Self::complete_dependency(&mut pending, input, &mut queue)?;
-                        steps.push(TensorBackwardStep {
-                            node: node_id,
-                            incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                            rule: "d(norm2(x))/dx=grad*x/||x|| (cg)",
-                        });
-                    } else if p == 1.0 {
-                        // d/dx_i = grad * sign(x_i); sign is piecewise-constant so
-                        // the second derivative is zero a.e. Gate the incoming
-                        // gradient by a constant sign leaf.
-                        let input_values = self.nodes[input.0]
-                            .tensor
-                            .contiguous_values_as_f64()
-                            .map_err(AutogradError::DenseTensor)?;
-                        let signs: Vec<f64> =
-                            input_values.iter().map(|&v| Self::torch_sign(v)).collect();
-                        let inc_exp = self.cg_expand(
-                            incoming_id,
-                            vec![incoming_val; input_numel],
-                            input_shape.clone(),
-                        )?;
-                        let sign_leaf = self.leaf(signs, input_shape, false)?;
-                        let grad_in = self.cg_mul(inc_exp, sign_leaf)?;
-                        self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
-                        Self::complete_dependency(&mut pending, input, &mut queue)?;
-                        steps.push(TensorBackwardStep {
-                            node: node_id,
-                            incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                            rule: "d(norm1(x))/dx=grad*sign(x) (cg)",
-                        });
-                    } else {
-                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "create_graph for norm supports only p=1 and p=2",
-                            },
-                        )));
-                    }
+                TensorNodeOp::Norm { input, p, .. } => {
+                    let grad_in = self.cg_norm_backward(input, node_id, incoming_id, p, None)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(norm_p(x))/dx=masked_p_norm_adjoint (cg)",
+                    });
                 }
-                TensorNodeOp::NormDim {
-                    input,
-                    p,
-                    dim,
-                    ref input_shape,
-                } => {
-                    // Per-slice norm along `dim`, p in {1, 2}. Broadcast the
-                    // (reduced) incoming gradient back along `dim` via the same
-                    // reshape-to-size-1 + Expand mechanism as SumDim, so the
-                    // Expand backward re-sums the broadcast dim on a further pass.
-                    let reduce_size = input_shape[dim];
-                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
-                        input_shape,
-                        dim,
-                        "norm_dim cg backward shape volume overflow",
-                    )?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()
-                        .map_err(AutogradError::DenseTensor)?;
-                    let mut bshape = input_shape.clone();
-                    bshape[dim] = 1;
-                    // Broadcast incoming along dim.
-                    let reshaped_inc = self.cg_reshape(incoming_id, bshape.clone())?;
-                    let mut inc_expanded = vec![0.0; input_numel];
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let g = incoming_vals[outer * inner_size + inner];
-                            for r in 0..reduce_size {
-                                inc_expanded
-                                    [outer * reduce_size * inner_size + r * inner_size + inner] = g;
-                            }
-                        }
-                    }
-                    let inc_full =
-                        self.cg_expand(reshaped_inc, inc_expanded, input_shape.clone())?;
-                    if p == 2.0 {
-                        // d/dx_i = grad_slice * x_i / norm_slice. Reuse the NormDim
-                        // output node as the divisor (broadcast along dim) so the
-                        // second backward routes d(norm)/dx through NormDim's own
-                        // backward, giving the exact per-slice Hessian.
-                        let norm_vals = self.nodes[node_id.0]
-                            .tensor
-                            .contiguous_values_as_f64()
-                            .map_err(AutogradError::DenseTensor)?;
-                        let reshaped_norm = self.cg_reshape(node_id, bshape)?;
-                        // Substitute 1.0 for zero-norm slices to avoid div-by-zero;
-                        // those slices have x=0 so the numerator is 0 and grad=0,
-                        // matching the first-order backward.
-                        let mut norm_expanded = vec![1.0; input_numel];
-                        for outer in 0..outer_size {
-                            for inner in 0..inner_size {
-                                let nv = norm_vals[outer * inner_size + inner];
-                                let safe = if nv == 0.0 { 1.0 } else { nv };
-                                for r in 0..reduce_size {
-                                    norm_expanded[outer * reduce_size * inner_size
-                                        + r * inner_size
-                                        + inner] = safe;
-                                }
-                            }
-                        }
-                        let norm_full =
-                            self.cg_expand(reshaped_norm, norm_expanded, input_shape.clone())?;
-                        let numerator = self.cg_mul(inc_full, input)?;
-                        let grad_in = self.cg_div(numerator, norm_full)?;
-                        self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
-                        Self::complete_dependency(&mut pending, input, &mut queue)?;
-                        steps.push(TensorBackwardStep {
-                            node: node_id,
-                            incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                            rule: "d(norm_dim2(x))/dx=grad*x/norm (cg)",
-                        });
-                    } else if p == 1.0 {
-                        // d/dx_i = grad_slice * sign(x_i), gated by a constant sign leaf.
-                        let input_values = self.nodes[input.0]
-                            .tensor
-                            .contiguous_values_as_f64()
-                            .map_err(AutogradError::DenseTensor)?;
-                        let signs: Vec<f64> =
-                            input_values.iter().map(|&v| Self::torch_sign(v)).collect();
-                        let sign_leaf = self.leaf(signs, input_shape.clone(), false)?;
-                        let grad_in = self.cg_mul(inc_full, sign_leaf)?;
-                        self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
-                        Self::complete_dependency(&mut pending, input, &mut queue)?;
-                        steps.push(TensorBackwardStep {
-                            node: node_id,
-                            incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                            rule: "d(norm_dim1(x))/dx=grad*sign(x) (cg)",
-                        });
-                    } else {
-                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "create_graph for norm_dim supports only p=1 and p=2",
-                            },
-                        )));
-                    }
+                TensorNodeOp::NormDim { input, p, dim, .. } => {
+                    let grad_in =
+                        self.cg_norm_backward(input, node_id, incoming_id, p, Some(dim))?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(norm_dim_p(x))/dx=masked_p_norm_adjoint (cg)",
+                    });
                 }
                 TensorNodeOp::VarDim {
                     input,
@@ -20036,6 +19928,186 @@ impl TensorTape {
             op: TensorNodeOp::Where { condition, x, y },
         });
         Ok(out)
+    }
+
+    /// Record the real p-norm adjoint used by both full and per-dimension
+    /// reductions. The operation order and zero masks follow PyTorch's
+    /// FunctionsManual.cpp::norm_backward, including its singular higher
+    /// derivatives. In particular, replacing a zero denominator with one
+    /// changes the Hessian even when the first derivative happens to agree.
+    #[allow(clippy::too_many_lines)]
+    fn cg_norm_backward(
+        &mut self,
+        input: TensorNodeId,
+        output: TensorNodeId,
+        incoming: TensorNodeId,
+        p: f64,
+        dim: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_node = self.node(input)?;
+        let shape = input_node.tensor.meta().shape().to_vec();
+        let numel = input_node.tensor.meta().numel();
+        let requires_grad = input_node.requires_grad;
+        let meta =
+            TensorMeta::from_shape(shape.clone(), DType::F64, input_node.tensor.meta().device());
+        let input_values = input_node.tensor.contiguous_values_as_f64()?;
+        let norm_values = self.node(output)?.tensor.contiguous_values_as_f64()?;
+        let (grad_full, norm_full) = if let Some(dim) = dim {
+            (
+                self.cg_broadcast_along_dim(incoming, dim, &shape)?,
+                self.cg_broadcast_along_dim(output, dim, &shape)?,
+            )
+        } else {
+            // Full norms have shape [1], including for a rank-zero input.
+            // Reshape to scalar before expansion so its adjoint can reduce
+            // back from every input rank, including the rank-zero case.
+            let gradient = self.node(incoming)?.tensor.contiguous_values_as_f64()?[0];
+            let grad_scalar = self.cg_reshape(incoming, vec![])?;
+            let norm_scalar = self.cg_reshape(output, vec![])?;
+            (
+                self.cg_expand(grad_scalar, vec![gradient; numel], shape.clone())?,
+                self.cg_expand(norm_scalar, vec![norm_values[0]; numel], shape.clone())?,
+            )
+        };
+
+        if p < 2.0 || p.is_infinite() {
+            // Sign has a real (zero) derivative, so keep its input edge. A
+            // detached sign leaf would turn a valid zero Hessian into a
+            // missing input gradient for L1/infinity norms.
+            let sign = TensorNodeId(self.nodes.len());
+            self.nodes.push(TensorNode {
+                tensor: DenseTensor::from_storage(
+                    meta.clone(),
+                    input_values.iter().map(|&x| Self::torch_sign(x)).collect(),
+                )?,
+                requires_grad,
+                op: TensorNodeOp::Sign { input },
+            });
+            if p == 1.0 {
+                return self.cg_mul(sign, grad_full);
+            }
+            if p.is_infinite() {
+                let (reduce_size, inner_size, lanes) = if let Some(dim) = dim {
+                    let (_, inner, _) = Self::checked_dim_loop_sizes(
+                        &shape,
+                        dim,
+                        "norm cg backward shape volume overflow",
+                    )?;
+                    (shape[dim], inner, norm_values.len())
+                } else {
+                    (numel, 1, 1)
+                };
+                let lane = |index: usize| {
+                    (index / inner_size / reduce_size) * inner_size + index % inner_size
+                };
+                let mut counts = vec![0.0; lanes];
+                let selected: Vec<f64> = input_values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &value)| {
+                        let lane = lane(index);
+                        if value.abs() == norm_values[lane] || value.is_nan() {
+                            counts[lane] += 1.0;
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let count = self.leaf_tensor(
+                    DenseTensor::from_storage(
+                        meta.clone(),
+                        (0..numel).map(|index| counts[lane(index)]).collect(),
+                    )?,
+                    false,
+                );
+                let mask = self.leaf_tensor(DenseTensor::from_storage(meta, selected)?, false);
+                let divided = self.cg_div(grad_full, count)?;
+                let selected_gradient = self.cg_mul(divided, mask)?;
+                return self.cg_mul(sign, selected_gradient);
+            }
+            let absolute = TensorNodeId(self.nodes.len());
+            self.nodes.push(TensorNode {
+                tensor: DenseTensor::from_storage(
+                    meta.clone(),
+                    input_values.iter().map(|x| x.abs()).collect(),
+                )?,
+                requires_grad,
+                op: TensorNodeOp::Abs { input },
+            });
+            let power = self.cg_pow(absolute, p - 1.0)?;
+            if p < 1.0 {
+                let mask = self.leaf_tensor(
+                    DenseTensor::from_storage(
+                        meta.clone(),
+                        input_values
+                            .iter()
+                            .map(|&x| if x == 0.0 { 1.0 } else { 0.0 })
+                            .collect(),
+                    )?,
+                    false,
+                );
+                let zero =
+                    self.leaf_tensor(DenseTensor::from_storage(meta, vec![0.0; numel])?, false);
+                let masked_power = self.cg_where(mask, zero, power)?;
+                let scaled_input = self.cg_mul(sign, masked_power)?;
+                let weighted_input = self.cg_mul(scaled_input, grad_full)?;
+                let norm_power = self.cg_pow(norm_full, 1.0 - p)?;
+                return self.cg_mul(weighted_input, norm_power);
+            }
+            let scaled_input = self.cg_mul(sign, power)?;
+            let norm_power = self.cg_pow(norm_full, p - 1.0)?;
+            let scale = self.cg_div(grad_full, norm_power)?;
+            let scale = self.cg_mask_zero_norm(scale, norm_full)?;
+            return self.cg_mul(scaled_input, scale);
+        }
+
+        if p == 2.0 {
+            let ratio = self.cg_div(input, norm_full)?;
+            let masked_ratio = self.cg_mask_zero_norm(ratio, norm_full)?;
+            return self.cg_mul(grad_full, masked_ratio);
+        }
+        let absolute = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                meta,
+                input_values.iter().map(|x| x.abs()).collect(),
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Abs { input },
+        });
+        let power = self.cg_pow(absolute, p - 2.0)?;
+        let scaled_input = self.cg_mul(input, power)?;
+        let norm_power = self.cg_pow(norm_full, p - 1.0)?;
+        let scale = self.cg_div(grad_full, norm_power)?;
+        let scale = self.cg_mask_zero_norm(scale, norm_full)?;
+        self.cg_mul(scaled_input, scale)
+    }
+
+    /// Mask a norm adjoint *after* its division/power, preserving both
+    /// first-order subgradients and PyTorch's higher-order singularities.
+    fn cg_mask_zero_norm(
+        &mut self,
+        value: TensorNodeId,
+        norm: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let norm_tensor = self.node(norm)?.tensor.clone();
+        let values = norm_tensor.contiguous_values_as_f64()?;
+        let mask = self.leaf_tensor(
+            DenseTensor::from_storage(
+                norm_tensor.meta().clone(),
+                values
+                    .iter()
+                    .map(|&x| if x == 0.0 { 1.0 } else { 0.0 })
+                    .collect(),
+            )?,
+            false,
+        );
+        let zero = self.leaf_tensor(
+            DenseTensor::from_storage(norm_tensor.meta().clone(), vec![0.0; values.len()])?,
+            false,
+        );
+        self.cg_where(mask, zero, value)
     }
 
     /// Reduce one dimension and broadcast it back, recording both operations.
@@ -31219,6 +31291,71 @@ mod tests {
     }
 
     #[test]
+    fn cumprod_singleton_backward_is_identity_for_nonfinite_values() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for seed_values in [
+                    [0.25, -2.0, 3.0, 1.5, -0.75, 2.0],
+                    [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, 1.0],
+                ] {
+                    for create_graph in [false, true] {
+                        let mut tape = TensorTape::new();
+                        let values =
+                            vec![0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 3.0];
+                        let shape = vec![2, 1, 3];
+                        let tensor = DenseTensor::from_typed_storage(
+                            TensorMeta::from_shape(shape.clone(), dtype, Device::Cpu),
+                            TensorTape::reduction_values_storage(dtype, values),
+                        )
+                        .unwrap();
+                        let x = tape.leaf_tensor(tensor, true);
+                        let y = tape.cumprod(x, 1, mode).unwrap().0;
+                        let y = tape.to_f64(y).unwrap();
+                        let seed = tape.leaf(seed_values.to_vec(), shape, true).unwrap();
+                        let weighted = tape.mul(y, seed, mode).unwrap().0;
+                        let report = tape
+                            .grad_with_options(weighted, routing_options(mode, create_graph))
+                            .unwrap();
+                        for (&actual, expected) in
+                            report.gradient(x).unwrap().iter().zip(seed_values)
+                        {
+                            assert!(
+                                actual == expected || (actual.is_nan() && expected.is_nan()),
+                                "{mode:?}/{dtype:?}, create_graph={create_graph}: {actual} != {expected}"
+                            );
+                        }
+                        if create_graph {
+                            let mixed = tape
+                                .grad_with_options(
+                                    report.gradient_node(x).unwrap(),
+                                    routing_options(mode, false),
+                                )
+                                .unwrap();
+                            assert_eq!(mixed.gradient(seed).unwrap(), &[1.0; 6]);
+                        }
+                    }
+                }
+                for dim in [1, 2] {
+                    let mut tape = TensorTape::new();
+                    let tensor = DenseTensor::from_typed_storage(
+                        TensorMeta::from_shape(vec![2, 0, 3], dtype, Device::Cpu),
+                        TensorTape::reduction_values_storage(dtype, vec![]),
+                    )
+                    .unwrap();
+                    let x = tape.leaf_tensor(tensor, true);
+                    let y = tape.cumprod(x, dim, mode).unwrap().0;
+                    for create_graph in [false, true] {
+                        let report = tape
+                            .grad_with_options(y, routing_options(mode, create_graph))
+                            .unwrap();
+                        assert_eq!(report.gradient(x).unwrap(), &[]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn create_graph_cumprod_zeros_have_polynomial_derivatives() {
         // f(a,b,c)=a+ab+abc. A zero can occur anywhere, and two zeros may
         // erase a first derivative while leaving mixed higher derivatives.
@@ -31257,7 +31394,11 @@ mod tests {
                             routing_options(mode, false),
                         )
                         .expect("cumprod third derivative at zero");
-                    assert_eq!(third.gradient(x).unwrap(), [2.0, 2.0, 2.0]);
+                    assert_eq!(
+                        third.gradient(x).unwrap(),
+                        [2.0, 2.0, 2.0],
+                        "{mode:?}/{dtype:?}, input={values:?}",
+                    );
                 }
             }
         }
@@ -37888,6 +38029,425 @@ mod tests {
             )
             .expect("backward");
         assert_eq!(report.gradient(x).expect("gx"), &[1.0, -1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn create_graph_pow_zero_has_constant_zero_derivative() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                let mut tape = TensorTape::new();
+                let values = vec![0.0, -0.0, f64::NAN, f64::INFINITY, -2.0];
+                let tensor = DenseTensor::from_typed_storage(
+                    TensorMeta::from_shape(vec![5], dtype, Device::Cpu),
+                    TensorTape::reduction_values_storage(dtype, values),
+                )
+                .unwrap();
+                let x = tape.leaf_tensor(tensor, true);
+                let y = tape.pow(x, 0.0, mode).unwrap().0;
+                let y = tape.to_f64(y).unwrap();
+                let seed = tape
+                    .leaf(vec![1.0, f64::INFINITY, f64::NAN, -1.0, 0.0], vec![5], true)
+                    .unwrap();
+                let loss = tape.mul(y, seed, mode).unwrap().0;
+                let report = tape
+                    .grad_with_options(loss, routing_options(mode, true))
+                    .unwrap();
+                // Upstream pow_backward returns zeros_like(self) for exponent
+                // zero, without evaluating a reciprocal or multiplying a seed.
+                assert_eq!(report.gradient(x).unwrap(), &[0.0; 5]);
+                let gradient = report.gradient_node(x).unwrap();
+                assert!(!tape.nodes[gradient.0].requires_grad);
+                assert!(tape.tensor_accumulated_gradient(x).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_general_norm_matches_analytic_hessian_and_third_derivative() {
+        // Independent derivatives of S(t)^(1/p), where
+        // S(t) = sum_i |x_i + t*v_i|^p. The Hessian-vector formula also
+        // checks each coordinate, rather than only one scalar contraction.
+        let values = [1.5_f64, -2.0, 3.5];
+        let direction = [0.4_f64, -0.7, 1.2];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for p in [-3.0_f64, -1.0, 0.5, 1.5, 2.0, 3.0, 4.0] {
+                let sum: f64 = values.iter().map(|x| x.abs().powf(p)).sum();
+                let n = sum.powf(1.0 / p);
+                let a = values.map(|x| x.signum() * x.abs().powf(p - 1.0));
+                let av: f64 = a.iter().zip(direction).map(|(a, v)| a * v).sum();
+                let gradient = a.map(|a| a * n.powf(1.0 - p));
+                let hv: Vec<_> = values
+                    .iter()
+                    .zip(direction)
+                    .zip(a)
+                    .map(|((&x, v), a)| {
+                        (p - 1.0)
+                            * (n.powf(1.0 - p) * x.abs().powf(p - 2.0) * v
+                                - n.powf(1.0 - 2.0 * p) * a * av)
+                    })
+                    .collect();
+                let s1 = p * av;
+                let s2: f64 = p
+                    * (p - 1.0)
+                    * values
+                        .iter()
+                        .zip(direction)
+                        .map(|(x, v)| x.abs().powf(p - 2.0) * v * v)
+                        .sum::<f64>();
+                let s3: f64 = p
+                    * (p - 1.0)
+                    * (p - 2.0)
+                    * values
+                        .iter()
+                        .zip(direction)
+                        .map(|(x, v)| x.signum() * x.abs().powf(p - 3.0) * v.powi(3))
+                        .sum::<f64>();
+                let q = 1.0 / p;
+                let third = q * (q - 1.0) * (q - 2.0) * sum.powf(q - 3.0) * s1.powi(3)
+                    + 3.0 * q * (q - 1.0) * sum.powf(q - 2.0) * s1 * s2
+                    + q * sum.powf(q - 1.0) * s3;
+                let first_directional: f64 =
+                    gradient.iter().zip(direction).map(|(g, v)| g * v).sum();
+                let second_directional: f64 = hv.iter().zip(direction).map(|(g, v)| g * v).sum();
+
+                for squared_loss in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let x = tape.leaf(values.to_vec(), vec![3], true).unwrap();
+                    let norm = tape.norm(x, p, mode).unwrap().0;
+                    let loss = if squared_loss {
+                        tape.mul(norm, norm, mode).unwrap().0
+                    } else {
+                        norm
+                    };
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .unwrap();
+                    for (&actual, expected) in first.gradient(x).unwrap().iter().zip(gradient) {
+                        let expected = if squared_loss {
+                            2.0 * n * expected
+                        } else {
+                            expected
+                        };
+                        assert!(
+                            (actual - expected).abs() <= 1e-10 * (1.0 + expected.abs()),
+                            "first p={p}, squared={squared_loss}: {actual} != {expected}"
+                        );
+                    }
+                    let first_contraction = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).unwrap(),
+                        &direction,
+                        mode,
+                    );
+                    let second = tape
+                        .grad_with_options(first_contraction, routing_options(mode, true))
+                        .unwrap();
+                    for ((&actual, &h), g) in
+                        second.gradient(x).unwrap().iter().zip(&hv).zip(gradient)
+                    {
+                        let expected = if squared_loss {
+                            2.0 * (g * first_directional + n * h)
+                        } else {
+                            h
+                        };
+                        assert!(
+                            (actual - expected).abs() <= 1e-9 * (1.0 + expected.abs()),
+                            "HVP p={p}, squared={squared_loss}: {actual} != {expected}"
+                        );
+                    }
+                    let second_contraction = routing_contract(
+                        &mut tape,
+                        second.gradient_node(x).unwrap(),
+                        &direction,
+                        mode,
+                    );
+                    let third_report = tape
+                        .grad_with_options(second_contraction, routing_options(mode, false))
+                        .unwrap();
+                    let actual: f64 = third_report
+                        .gradient(x)
+                        .unwrap()
+                        .iter()
+                        .zip(direction)
+                        .map(|(g, v)| g * v)
+                        .sum();
+                    let expected = if squared_loss {
+                        6.0 * first_directional * second_directional + 2.0 * n * third
+                    } else {
+                        third
+                    };
+                    assert!(
+                        (actual - expected).abs() <= 1e-8 * (1.0 + expected.abs()),
+                        "third p={p}, squared={squared_loss}: {actual} != {expected}"
+                    );
+                    assert!(tape.tensor_accumulated_gradient(x).unwrap().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_norm_dim_general_routes_typed_offset_lanes_and_upstream() {
+        let values = [1.5_f64, -1.0, 2.0, -2.5, 3.5, 4.0];
+        let direction = [0.4_f64, -0.5, -0.7, 0.3, 1.2, -1.1];
+        let weights = [-0.7_f64, 1.25];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for p in [-1.0_f64, 0.5, 1.5, 3.0, 4.0] {
+                    let mut tape = TensorTape::new();
+                    let mut storage = vec![99.0];
+                    storage.extend(values);
+                    storage.push(-99.0);
+                    let tensor = DenseTensor::from_typed_storage(
+                        TensorMeta::from_shape(vec![3, 2], dtype, Device::Cpu)
+                            .with_storage_offset(1),
+                        TensorTape::reduction_values_storage(dtype, storage),
+                    )
+                    .unwrap();
+                    let x = tape.leaf_tensor(tensor, true);
+                    let norm = tape.norm_dim(x, p, 0, mode).unwrap().0;
+                    let norm = tape.to_f64(norm).unwrap();
+                    let upstream = tape.leaf(weights.to_vec(), vec![2], true).unwrap();
+                    let weighted = tape.mul(norm, upstream, mode).unwrap().0;
+                    let loss = tape.sum(weighted, mode).unwrap().0;
+                    // Backward graph construction must work inside no_grad.
+                    tape.grad_enabled = false;
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .unwrap();
+                    assert!(!tape.grad_enabled);
+                    tape.grad_enabled = true;
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).unwrap(),
+                        &direction,
+                        mode,
+                    );
+                    let second = tape
+                        .grad_with_options(objective, routing_options(mode, false))
+                        .unwrap();
+                    for lane in 0..2 {
+                        let n = (0..3)
+                            .map(|r| values[2 * r + lane].abs().powf(p))
+                            .sum::<f64>()
+                            .powf(1.0 / p);
+                        let av: f64 = (0..3)
+                            .map(|r| {
+                                let i = 2 * r + lane;
+                                values[i].signum() * values[i].abs().powf(p - 1.0) * direction[i]
+                            })
+                            .sum();
+                        let tolerance = if dtype == DType::F64 { 1e-10 } else { 2e-6 };
+                        for r in 0..3 {
+                            let i = 2 * r + lane;
+                            let a = values[i].signum() * values[i].abs().powf(p - 1.0);
+                            let expected_first = weights[lane] * a * n.powf(1.0 - p);
+                            let expected_second = weights[lane]
+                                * (p - 1.0)
+                                * (n.powf(1.0 - p) * values[i].abs().powf(p - 2.0) * direction[i]
+                                    - n.powf(1.0 - 2.0 * p) * a * av);
+                            for (actual, expected) in [
+                                (first.gradient(x).unwrap()[i], expected_first),
+                                (second.gradient(x).unwrap()[i], expected_second),
+                            ] {
+                                assert!(
+                                    (actual - expected).abs() <= tolerance * (1.0 + expected.abs()),
+                                    "p={p}, dtype={dtype:?}, lane={lane}: {actual} != {expected}"
+                                );
+                            }
+                        }
+                        let actual = second.gradient(upstream).unwrap()[lane];
+                        let expected = n.powf(1.0 - p) * av;
+                        assert!((actual - expected).abs() <= tolerance * (1.0 + expected.abs()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_norm_piecewise_linear_orders_keep_second_gradient_paths() {
+        let direction = [1.0_f64, 2.0, -3.0];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (p, values, derivative) in [
+                (1.0, [2.0, -2.0, 1.0], [1.0, -1.0, 1.0]),
+                (f64::INFINITY, [2.0, -2.0, 1.0], [0.5, -0.5, 0.0]),
+                (f64::NEG_INFINITY, [2.0, -2.0, 4.0], [0.5, -0.5, 0.0]),
+                (1.0, [0.0; 3], [0.0; 3]),
+                (f64::INFINITY, [0.0; 3], [0.0; 3]),
+                (f64::NEG_INFINITY, [0.0; 3], [0.0; 3]),
+            ] {
+                for by_dim in [false, true] {
+                    let mut tape = TensorTape::new();
+                    let x = tape.leaf(values.to_vec(), vec![3], true).unwrap();
+                    let norm = if by_dim {
+                        tape.norm_dim(x, p, 0, mode).unwrap().0
+                    } else {
+                        tape.norm(x, p, mode).unwrap().0
+                    };
+                    let n = tape.tensor(norm).unwrap().contiguous_values().unwrap()[0];
+                    let loss = tape.mul(norm, norm, mode).unwrap().0;
+                    let first = tape
+                        .grad_with_options(loss, routing_options(mode, true))
+                        .unwrap();
+                    assert_eq!(
+                        first.gradient(x).unwrap(),
+                        &derivative.map(|value| 2.0 * n * value)
+                    );
+                    let objective = routing_contract(
+                        &mut tape,
+                        first.gradient_node(x).unwrap(),
+                        &direction,
+                        mode,
+                    );
+                    let second = tape
+                        .grad_with_options(objective, routing_options(mode, false))
+                        .unwrap();
+                    let contraction: f64 =
+                        derivative.iter().zip(direction).map(|(d, v)| d * v).sum();
+                    assert_eq!(
+                        second.gradient(x).unwrap(),
+                        &derivative.map(|value| 2.0 * contraction * value)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_norm_preserves_zero_masks_and_nonfinite_vjps() {
+        // These values follow upstream FunctionsManual.cpp::norm_backward.
+        // Comparing both modes also prevents higher-order recording from
+        // changing an otherwise ordinary first-order training gradient.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for (p, values) in [
+                    (0.5, [0.0, 1.0, 4.0]),
+                    (-1.0, [0.0, 1.0, 4.0]),
+                    (1.5, [0.0, 0.0, 0.0]),
+                    (2.0, [0.0, 0.0, 0.0]),
+                    (3.0, [0.0, 2.0, -0.0]),
+                    (4.0, [0.0, 0.0, 0.0]),
+                    (1.0, [f64::NAN, 1.0, -1.0]),
+                    (f64::INFINITY, [f64::NAN, 1.0, -1.0]),
+                    (f64::NEG_INFINITY, [0.0, 1.0, 4.0]),
+                ] {
+                    for seed in [1.0, f64::INFINITY] {
+                        for by_dim in [false, true] {
+                            let mut tape = TensorTape::new();
+                            let tensor = DenseTensor::from_typed_storage(
+                                TensorMeta::from_shape(vec![3], dtype, Device::Cpu),
+                                TensorTape::reduction_values_storage(dtype, values.to_vec()),
+                            )
+                            .unwrap();
+                            let x = tape.leaf_tensor(tensor, true);
+                            let norm = if by_dim {
+                                tape.norm_dim(x, p, 0, mode).unwrap().0
+                            } else {
+                                tape.norm(x, p, mode).unwrap().0
+                            };
+                            let norm = tape.to_f64(norm).unwrap();
+                            let seed = tape.leaf(vec![seed], vec![1], false).unwrap();
+                            let loss = tape.mul(norm, seed, mode).unwrap().0;
+                            let ordinary = tape
+                                .grad_with_options(loss, routing_options(mode, false))
+                                .unwrap();
+                            let recorded = tape
+                                .grad_with_options(loss, routing_options(mode, true))
+                                .unwrap();
+                            for (&actual, &expected) in recorded
+                                .gradient(x)
+                                .unwrap()
+                                .iter()
+                                .zip(ordinary.gradient(x).unwrap())
+                            {
+                                assert!(
+                                    actual == expected || (actual.is_nan() && expected.is_nan()),
+                                    "p={p}, dtype={dtype:?}, dim={by_dim}: {actual} != {expected}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Multiplying by the large seed before division used to overflow
+            // even though the derivative of norm([x]) is exactly one.
+            let mut tape = TensorTape::new();
+            let x = tape.leaf(vec![1e100], vec![1], true).unwrap();
+            let norm = tape.norm(x, 2.0, mode).unwrap().0;
+            let seed = tape.leaf(vec![1e250], vec![1], false).unwrap();
+            let loss = tape.mul(norm, seed, mode).unwrap().0;
+            let report = tape
+                .grad_with_options(loss, routing_options(mode, true))
+                .unwrap();
+            assert_eq!(report.gradient(x).unwrap(), &[1e250]);
+        }
+    }
+
+    #[test]
+    fn create_graph_norm_handles_empty_scalar_and_zero_origin_curvature() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for p in [0.5_f64, 1.0, 1.5, 2.0, 3.0, 4.0] {
+                let mut tape = TensorTape::new();
+                let empty = tape.leaf(vec![], vec![2, 0, 3], true).unwrap();
+                for dim in [None, Some(1)] {
+                    let norm = if let Some(dim) = dim {
+                        tape.norm_dim(empty, p, dim, mode).unwrap().0
+                    } else {
+                        tape.norm(empty, p, mode).unwrap().0
+                    };
+                    let report = tape
+                        .grad_with_options(norm, routing_options(mode, true))
+                        .unwrap();
+                    assert_eq!(report.gradient(empty).unwrap(), &[]);
+                    assert_eq!(
+                        tape.tensor_meta(report.gradient_node(empty).unwrap())
+                            .unwrap()
+                            .shape(),
+                        &[2, 0, 3]
+                    );
+                }
+
+                let mut tape = TensorTape::new();
+                let scalar = tape.leaf(vec![-2.0], vec![], true).unwrap();
+                let norm = tape.norm(scalar, p, mode).unwrap().0;
+                let loss = tape.mul(norm, norm, mode).unwrap().0;
+                let first = tape
+                    .grad_with_options(loss, routing_options(mode, true))
+                    .unwrap();
+                assert!((first.gradient(scalar).unwrap()[0] + 4.0).abs() < 1e-12);
+                let second = tape
+                    .grad_with_options(
+                        first.gradient_node(scalar).unwrap(),
+                        routing_options(mode, false),
+                    )
+                    .unwrap();
+                assert!((second.gradient(scalar).unwrap()[0] - 2.0).abs() < 1e-12);
+            }
+            for by_dim in [false, true] {
+                let mut tape = TensorTape::new();
+                let zero = tape.leaf(vec![0.0; 2], vec![2], true).unwrap();
+                let norm = if by_dim {
+                    tape.norm_dim(zero, 2.0, 0, mode).unwrap().0
+                } else {
+                    tape.norm(zero, 2.0, mode).unwrap().0
+                };
+                let first = tape
+                    .grad_with_options(norm, routing_options(mode, true))
+                    .unwrap();
+                assert_eq!(first.gradient(zero).unwrap(), &[0.0; 2]);
+                let second = tape
+                    .grad_with_options(
+                        first.gradient_node(zero).unwrap(),
+                        routing_options(mode, false),
+                    )
+                    .unwrap();
+                // PyTorch masks the first derivative after division, so its
+                // derivative at the singular origin is NaN, not an invented
+                // zero Hessian (full norm) or identity Hessian (norm_dim).
+                assert!(second.gradient(zero).unwrap().iter().all(|x| x.is_nan()));
+            }
+        }
     }
 
     #[test]

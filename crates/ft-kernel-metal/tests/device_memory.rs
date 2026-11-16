@@ -26,11 +26,13 @@ fn the_device_counts_a_buffer_while_it_lives() -> Result<(), Error> {
     for bytes in [1_usize, 4_097, 16_384, 16_385, 1 << 20, 64 << 20] {
         let wide = u64::try_from(bytes).unwrap_or(u64::MAX);
         let before = gateway.allocated_bytes();
-        let buffer = gateway.buffer_zeroed(bytes)?;
-        let during = gateway.allocated_bytes();
-        // Every gateway names the one device.
-        assert_eq!(Gateway::open()?.allocated_bytes(), during);
-        drop(buffer);
+        let during = {
+            let _buffer = gateway.buffer_zeroed(bytes)?;
+            let during = gateway.allocated_bytes();
+            // Every gateway names the one device.
+            assert_eq!(Gateway::open()?.allocated_bytes(), during);
+            during
+        };
         let after = gateway.allocated_bytes();
         let grew = during.saturating_sub(before);
         println!("{bytes} bytes: the device held {grew} more while it lived");
