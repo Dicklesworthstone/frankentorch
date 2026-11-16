@@ -916,13 +916,8 @@ fn hermitian_fft_wrappers_preserve_batches_precision_and_training() {
                         &values.iter().map(|value| 2.0 * value).collect::<Vec<_>>(),
                         tolerance,
                     );
-                    let inferred_even = session
-                        .tensor_hfftn(spectrum, None, Some(dims))
-                        .unwrap();
-                    assert_eq!(
-                        session.tensor_shape(inferred_even).unwrap(),
-                        vec![2, 3, 4]
-                    );
+                    let inferred_even = session.tensor_hfftn(spectrum, None, Some(dims)).unwrap();
+                    assert_eq!(session.tensor_shape(inferred_even).unwrap(), vec![2, 3, 4]);
                 }
             }
         }
@@ -963,9 +958,7 @@ fn hermitian_fft_real_input_and_no_grad_match_direct_dft() {
                     if dtype == DType::F32 { 1e-6 } else { 1e-9 },
                 );
                 let inverse = session
-                    .with_no_grad(|session| {
-                        session.tensor_ihfftn_norm(x, Some(&[4]), None, norm)
-                    })
+                    .with_no_grad(|session| session.tensor_ihfftn_norm(x, Some(&[4]), None, norm))
                     .unwrap();
                 assert!(!session.tensor_requires_grad(inverse).unwrap());
                 assert_eq!(session.tensor_shape(inverse).unwrap(), vec![2, 3]);

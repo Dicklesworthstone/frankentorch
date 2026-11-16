@@ -3995,8 +3995,9 @@ impl Tape {
                     let lhs_val = self.nodes[lhs.0].tensor.value();
                     let rhs_val = self.nodes[rhs.0].tensor.value();
                     if lhs_val.is_nan() || rhs_val.is_nan() {
-                        grads[lhs.0] += f64::NAN;
-                        grads[rhs.0] += f64::NAN;
+                        // Neither strict comparison masks an unordered operand.
+                        grads[lhs.0] += incoming;
+                        grads[rhs.0] += incoming;
                     } else if lhs_val < rhs_val {
                         grads[lhs.0] += incoming;
                     } else if lhs_val > rhs_val {
@@ -4019,8 +4020,9 @@ impl Tape {
                     let lhs_val = self.nodes[lhs.0].tensor.value();
                     let rhs_val = self.nodes[rhs.0].tensor.value();
                     if lhs_val.is_nan() || rhs_val.is_nan() {
-                        grads[lhs.0] += f64::NAN;
-                        grads[rhs.0] += f64::NAN;
+                        // Neither strict comparison masks an unordered operand.
+                        grads[lhs.0] += incoming;
+                        grads[rhs.0] += incoming;
                     } else if lhs_val > rhs_val {
                         grads[lhs.0] += incoming;
                     } else if lhs_val < rhs_val {
@@ -14265,14 +14267,12 @@ impl TensorTape {
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
                         .map(|(grad, (a, b))| {
-                            if a.is_nan() || b.is_nan() {
-                                f64::NAN
-                            } else if a < b {
-                                *grad
-                            } else if a == b {
+                            if a == b {
                                 *grad * 0.5
-                            } else {
+                            } else if a > b {
                                 0.0
+                            } else {
+                                *grad
                             }
                         })
                         .collect();
@@ -14280,14 +14280,12 @@ impl TensorTape {
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
                         .map(|(grad, (a, b))| {
-                            if a.is_nan() || b.is_nan() {
-                                f64::NAN
-                            } else if b < a {
-                                *grad
-                            } else if a == b {
+                            if a == b {
                                 *grad * 0.5
-                            } else {
+                            } else if b > a {
                                 0.0
+                            } else {
+                                *grad
                             }
                         })
                         .collect();
@@ -14312,14 +14310,12 @@ impl TensorTape {
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
                         .map(|(grad, (a, b))| {
-                            if a.is_nan() || b.is_nan() {
-                                f64::NAN
-                            } else if a > b {
-                                *grad
-                            } else if a == b {
+                            if a == b {
                                 *grad * 0.5
-                            } else {
+                            } else if a < b {
                                 0.0
+                            } else {
+                                *grad
                             }
                         })
                         .collect();
@@ -14327,14 +14323,12 @@ impl TensorTape {
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
                         .map(|(grad, (a, b))| {
-                            if a.is_nan() || b.is_nan() {
-                                f64::NAN
-                            } else if b > a {
-                                *grad
-                            } else if a == b {
+                            if a == b {
                                 *grad * 0.5
-                            } else {
+                            } else if b < a {
                                 0.0
+                            } else {
+                                *grad
                             }
                         })
                         .collect();
@@ -18723,37 +18717,35 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Min { lhs, rhs } | TensorNodeOp::Max { lhs, rhs } => {
-                    // d/dx = grad where x <= y (min) or x >= y (max), else 0.
-                    // d/dy = grad where y < x (min) or y > x (max), else 0.
+                    // PyTorch splits ties, then masks only strictly losing
+                    // operands. With NaNs neither comparison is true, so both
+                    // operands receive the incoming gradient. Use selection:
+                    // multiplying an inactive infinite/NaN gradient by zero
+                    // would contaminate the losing operand.
                     let is_min = matches!(op, TensorNodeOp::Min { .. });
                     let lhs_vals = self.nodes[lhs.0].tensor.contiguous_values_as_f64()?;
                     let rhs_vals = self.nodes[rhs.0].tensor.contiguous_values_as_f64()?;
                     let shape = self.nodes[lhs.0].tensor.meta().shape().to_vec();
                     let numel = Self::checked_shape_numel(&shape, "min/max backward overflow")?;
-                    let mut lhs_mask = vec![0.0; numel];
-                    let mut rhs_mask = vec![0.0; numel];
+                    let mut ties = vec![0.0; numel];
+                    let mut lhs_loses = vec![0.0; numel];
+                    let mut rhs_loses = vec![0.0; numel];
                     for i in 0..numel {
                         let (l, r) = (lhs_vals[i], rhs_vals[i]);
-                        if is_min {
-                            if l <= r {
-                                lhs_mask[i] = 1.0;
-                            }
-                            if r < l {
-                                rhs_mask[i] = 1.0;
-                            }
-                        } else {
-                            if l >= r {
-                                lhs_mask[i] = 1.0;
-                            }
-                            if r > l {
-                                rhs_mask[i] = 1.0;
-                            }
-                        }
+                        ties[i] = if l == r { 1.0 } else { 0.0 };
+                        let exclude_lhs = if is_min { l > r } else { l < r };
+                        let exclude_rhs = if is_min { r > l } else { r < l };
+                        lhs_loses[i] = if exclude_lhs { 1.0 } else { 0.0 };
+                        rhs_loses[i] = if exclude_rhs { 1.0 } else { 0.0 };
                     }
-                    let lhs_mask_node = self.leaf(lhs_mask, shape.clone(), false)?;
-                    let rhs_mask_node = self.leaf(rhs_mask, shape, false)?;
-                    let grad_lhs = self.cg_mul(incoming_id, lhs_mask_node)?;
-                    let grad_rhs = self.cg_mul(incoming_id, rhs_mask_node)?;
+                    let ties = self.leaf(ties, shape.clone(), false)?;
+                    let lhs_loses = self.leaf(lhs_loses, shape.clone(), false)?;
+                    let rhs_loses = self.leaf(rhs_loses, shape.clone(), false)?;
+                    let zero = self.leaf(vec![0.0; numel], shape, false)?;
+                    let half = self.cg_mul_scalar(incoming_id, 0.5)?;
+                    let shared = self.cg_where(ties, half, incoming_id)?;
+                    let grad_lhs = self.cg_where(lhs_loses, zero, shared)?;
+                    let grad_rhs = self.cg_where(rhs_loses, zero, shared)?;
                     self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
                     self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -18761,7 +18753,7 @@ impl TensorTape {
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                        rule: "d(min/max(x,y)) (cg)",
+                        rule: "d(min/max(x,y))=masked tie-split gradient (cg)",
                     });
                 }
                 TensorNodeOp::Softmax { input, dim } => {
@@ -36731,6 +36723,206 @@ mod tests {
     }
 
     #[test]
+    fn min_max_backward_matches_pytorch_ties_nan_and_nonfinite_upstreams() {
+        // Independent goldens from PyTorch's minimum/maximum derivatives:
+        // split equal operands, then zero only a strictly losing operand.
+        let lhs = [
+            1.0,
+            5.0,
+            3.0,
+            f64::NAN,
+            2.0,
+            f64::NAN,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.0,
+            5.0,
+        ];
+        let rhs = [
+            2.0,
+            3.0,
+            3.0,
+            2.0,
+            f64::NAN,
+            f64::NAN,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2.0,
+            3.0,
+        ];
+        let upstream = [
+            2.0,
+            -4.0,
+            6.0,
+            8.0,
+            10.0,
+            12.0,
+            14.0,
+            16.0,
+            18.0,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        let min_lhs = [
+            2.0,
+            0.0,
+            3.0,
+            8.0,
+            10.0,
+            12.0,
+            7.0,
+            8.0,
+            9.0,
+            f64::INFINITY,
+            0.0,
+        ];
+        let min_rhs = [
+            0.0,
+            -4.0,
+            3.0,
+            8.0,
+            10.0,
+            12.0,
+            7.0,
+            8.0,
+            9.0,
+            0.0,
+            f64::NAN,
+        ];
+        let max_lhs = min_rhs;
+        let max_rhs = min_lhs;
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for f32_leaf in [false, true] {
+                for create_graph in [false, true] {
+                    for minimum in [false, true] {
+                        let mut tape = TensorTape::new();
+                        let mut leaf = |values: &[f64], requires_grad| {
+                            if f32_leaf {
+                                tape.leaf_f32(
+                                    values.iter().map(|&value| value as f32).collect(),
+                                    vec![values.len()],
+                                    requires_grad,
+                                )
+                            } else {
+                                tape.leaf(values.to_vec(), vec![values.len()], requires_grad)
+                            }
+                            .unwrap()
+                        };
+                        let x = leaf(&lhs, true);
+                        let y = leaf(&rhs, true);
+                        let weights = leaf(&upstream, false);
+                        let (selected, _) = if minimum {
+                            tape.tensor_min(x, y, mode)
+                        } else {
+                            tape.tensor_max(x, y, mode)
+                        }
+                        .unwrap();
+                        let (weighted, _) = tape.mul(selected, weights, mode).unwrap();
+                        let (loss, _) = tape.sum(weighted, mode).unwrap();
+                        let report = tape
+                            .backward_with_options(
+                                loss,
+                                BackwardOptions {
+                                    create_graph,
+                                    ..BackwardOptions::strict_default()
+                                },
+                            )
+                            .unwrap();
+                        let (want_x, want_y) = if minimum {
+                            (&min_lhs, &min_rhs)
+                        } else {
+                            (&max_lhs, &max_rhs)
+                        };
+                        for (node, expected) in [(x, want_x), (y, want_y)] {
+                            for (index, (&actual, &want)) in report
+                                .gradient(node)
+                                .unwrap()
+                                .iter()
+                                .zip(expected)
+                                .enumerate()
+                            {
+                                assert!(
+                                    (actual.is_nan() && want.is_nan()) || actual == want,
+                                    "mode={mode:?} f32={f32_leaf} cg={create_graph} min={minimum} node={node:?} index={index}: {actual} != {want}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_min_max_ties_preserve_cross_hessian() {
+        // For L=sum(minimum(x,y)^2), PyTorch differentiates through the
+        // half-weight selector at a tie. d(sum(gx))/dx and /dy are both 0.5
+        // there, rather than 2 and 0 or a detached zero gradient.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for minimum in [false, true] {
+                let mut tape = TensorTape::new();
+                let x = tape.leaf(vec![1.0, 5.0, 3.0], vec![3], true).unwrap();
+                let y = tape.leaf(vec![2.0, 3.0, 3.0], vec![3], true).unwrap();
+                let (selected, _) = if minimum {
+                    tape.tensor_min(x, y, mode)
+                } else {
+                    tape.tensor_max(x, y, mode)
+                }
+                .unwrap();
+                let (squared, _) = tape.square(selected, mode).unwrap();
+                let (loss, _) = tape.sum(squared, mode).unwrap();
+                let first = tape
+                    .backward_with_options(
+                        loss,
+                        BackwardOptions {
+                            create_graph: true,
+                            ..BackwardOptions::strict_default()
+                        },
+                    )
+                    .unwrap();
+                let (gx, gy, hxx) = if minimum {
+                    ([2.0, 0.0, 3.0], [0.0, 6.0, 3.0], [2.0, 0.0, 0.5])
+                } else {
+                    ([0.0, 10.0, 3.0], [4.0, 0.0, 3.0], [0.0, 2.0, 0.5])
+                };
+                assert_eq!(first.gradient(x).unwrap(), &gx);
+                assert_eq!(first.gradient(y).unwrap(), &gy);
+                let gradient = first.gradient_node(x).unwrap();
+                let (gradient_sum, _) = tape.sum(gradient, mode).unwrap();
+                let second = tape.backward(gradient_sum).unwrap();
+                assert_eq!(second.gradient(x).unwrap(), &hxx);
+                assert_eq!(second.gradient(y).unwrap(), &[0.0, 0.0, 0.5]);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_min_max_nan_operands_preserve_incoming_gradient() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for maximum in [false, true] {
+                for (a, b) in [(f64::NAN, 2.0), (2.0, f64::NAN), (f64::NAN, f64::NAN)] {
+                    let mut tape = Tape::new();
+                    let x = tape.leaf(a, true);
+                    let y = tape.leaf(b, true);
+                    let weight = tape.leaf(-3.0, false);
+                    let (selected, _) = if maximum {
+                        tape.max(x, y, mode)
+                    } else {
+                        tape.min(x, y, mode)
+                    }
+                    .unwrap();
+                    let (loss, _) = tape.mul(selected, weight, mode).unwrap();
+                    let report = tape.backward(loss).unwrap();
+                    assert_eq!(report.gradient(x), Some(-3.0));
+                    assert_eq!(report.gradient(y), Some(-3.0));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn create_graph_min_max_gradients() {
         // min/max: gradient flows to the arg that won
         let mut tape = TensorTape::new();
@@ -36747,9 +36939,9 @@ mod tests {
                 },
             )
             .expect("backward");
-        // min([1,5,3], [2,3,3]) = [1,3,3] -> x wins at [0], y wins at [1], tie at [2] -> x gets it
-        assert_eq!(report.gradient(x).expect("gx"), &[1.0, 0.0, 1.0]);
-        assert_eq!(report.gradient(y).expect("gy"), &[0.0, 1.0, 0.0]);
+        // min([1,5,3], [2,3,3]) = [1,3,3]; equal inputs split the subgradient.
+        assert_eq!(report.gradient(x).expect("gx"), &[1.0, 0.0, 0.5]);
+        assert_eq!(report.gradient(y).expect("gy"), &[0.0, 1.0, 0.5]);
     }
 
     #[test]
