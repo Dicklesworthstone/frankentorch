@@ -179,6 +179,9 @@ pub struct SparseAdamState {
     pub lr: f64,
     pub betas: [f64; 2],
     pub eps: f64,
+    /// Older checkpoints always minimize the objective.
+    #[serde(default)]
+    pub maximize: bool,
     /// `None` distinguishes an untouched parameter from initialized zero moments.
     pub parameters: Vec<Option<SparseAdamParameterState>>,
 }
@@ -7987,9 +7990,9 @@ impl Optimizer for Rprop {
 
 /// SparseAdam optimizer for sparse gradients (Kingma & Ba, 2015 — sparse variant).
 ///
-/// Equivalent to `torch.optim.SparseAdam`. Only updates moment estimates
-/// for gradient entries that are non-zero, making it efficient for sparse
-/// embedding layers in NLP models.
+/// Equivalent to `torch.optim.SparseAdam`, including objective maximization.
+/// Updates moment estimates only at stored gradient coordinates, making it
+/// suitable for sparse embedding layers in NLP models.
 ///
 /// The key difference from dense Adam: moment estimates `m` and `v` are only
 /// updated at stored sparse coordinates, including explicitly stored zeros;
@@ -8003,6 +8006,7 @@ pub struct SparseAdam {
     beta1: f64,
     beta2: f64,
     eps: f64,
+    maximize: bool,
     step_counts: Vec<u64>,
     m: Vec<Option<Vec<f64>>>,
     v: Vec<Option<Vec<f64>>>,
@@ -8011,7 +8015,7 @@ pub struct SparseAdam {
 impl SparseAdam {
     /// Create a new SparseAdam optimizer.
     ///
-    /// Defaults: lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8
+    /// Defaults: beta1=0.9, beta2=0.999, eps=1e-8, maximize=false.
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
@@ -8021,6 +8025,7 @@ impl SparseAdam {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
+            maximize: false,
             step_counts: vec![0; n],
             m: vec![None; n],
             v: vec![None; n],
@@ -8039,6 +8044,16 @@ impl SparseAdam {
     #[must_use]
     pub fn eps(mut self, eps: f64) -> Self {
         self.eps = eps;
+        self
+    }
+
+    /// Maximize the objective instead of minimizing it (default: false).
+    ///
+    /// Negates gradients before coalescing sparse coordinates and updating
+    /// moments, without changing the session's accumulated gradients.
+    #[must_use]
+    pub fn maximize(mut self, maximize: bool) -> Self {
+        self.maximize = maximize;
         self
     }
 
@@ -8139,6 +8154,7 @@ impl Optimizer for SparseAdam {
                 lr: self.lr,
                 betas: [self.beta1, self.beta2],
                 eps: self.eps,
+                maximize: self.maximize,
                 parameters,
             }),
         )
@@ -8156,7 +8172,8 @@ impl Optimizer for SparseAdam {
         validate_sparse_adam_state_buffers(saved, &sizes)?;
         let mut restored = Self::new(self.params.clone(), saved.lr)
             .betas(saved.betas[0], saved.betas[1])
-            .eps(saved.eps);
+            .eps(saved.eps)
+            .maximize(saved.maximize);
         restored.validate_hyperparams()?;
         for (index, parameter) in saved.parameters.iter().enumerate() {
             if let Some(parameter) = parameter {
@@ -8230,9 +8247,10 @@ impl Optimizer for SparseAdam {
                 if grad[j] == 0.0 {
                     continue;
                 }
+                let gradient = if self.maximize { -grad[j] } else { grad[j] };
                 // Update moments only at sparse indices
-                m[j] += (grad[j] - m[j]) * (1.0 - self.beta1);
-                v[j] += (grad[j] * grad[j] - v[j]) * (1.0 - self.beta2);
+                m[j] += (gradient - m[j]) * (1.0 - self.beta1);
+                v[j] += (gradient * gradient - v[j]) * (1.0 - self.beta2);
                 // SparseAdam adds epsilon to the uncorrected second moment.
                 update[j] = step_size * m[j] / (v[j].sqrt() + self.eps);
             }
@@ -8328,7 +8346,7 @@ impl SparseAdam {
                 .or_insert_with(|| vec![0.0; dense_inner]);
             let start = nz_idx * dense_inner;
             for (total, &value) in row.iter_mut().zip(&grad_values[start..start + dense_inner]) {
-                *total += value;
+                *total += if self.maximize { -value } else { value };
             }
         }
 
@@ -10571,13 +10589,18 @@ mod tests {
 
     #[test]
     fn optimizer_checkpoint_sparse_adam_resume_preserves_dense_fallback() {
-        assert_optimizer_checkpoint_resume(|params, configured| {
-            Box::new(if configured {
-                SparseAdam::new(params, 0.03).betas(0.7, 0.8).eps(1e-4)
-            } else {
-                SparseAdam::new(params, 0.9)
-            })
-        });
+        for maximize in [false, true] {
+            assert_optimizer_checkpoint_resume(|params, configured| {
+                Box::new(if configured {
+                    SparseAdam::new(params, 0.03)
+                        .betas(0.7, 0.8)
+                        .eps(1e-4)
+                        .maximize(maximize)
+                } else {
+                    SparseAdam::new(params, 0.9).maximize(!maximize)
+                })
+            });
+        }
     }
 
     fn sparse_checkpoint_training_step(
@@ -10704,7 +10727,14 @@ mod tests {
 
     #[test]
     fn optimizer_checkpoint_sparse_adam_resume_preserves_sparse_rows_and_lazy_state() {
-        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for (mode, maximize, legacy) in [
+            (ExecutionMode::Strict, false, false),
+            (ExecutionMode::Strict, true, false),
+            (ExecutionMode::Strict, false, true),
+            (ExecutionMode::Hardened, false, false),
+            (ExecutionMode::Hardened, true, false),
+            (ExecutionMode::Hardened, false, true),
+        ] {
             for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
                 let mut uninterrupted = FrankenTorchSession::new(mode);
                 let params: Vec<_> = [6, 5]
@@ -10730,7 +10760,8 @@ mod tests {
                     .collect();
                 let mut optimizer = SparseAdam::new(params.clone(), 0.03)
                     .betas(0.7, 0.8)
-                    .eps(1e-4);
+                    .eps(1e-4)
+                    .maximize(maximize);
                 for round in 0..2 {
                     sparse_checkpoint_training_step(&mut uninterrupted, &mut optimizer, round);
                 }
@@ -10740,7 +10771,23 @@ mod tests {
                 };
                 assert_eq!(sparse.parameters[0].as_ref().unwrap().step, 2);
                 assert!(sparse.parameters[1].is_none());
-                let encoded = serde_json::to_vec(&saved).unwrap();
+                assert_eq!(sparse.maximize, maximize);
+                let mut encoded = serde_json::to_vec(&saved).unwrap();
+                if legacy {
+                    // Version 1 checkpoints written before maximization have
+                    // no direction field; they must restore minimization even
+                    // when the receiving optimizer was configured to ascend.
+                    let mut legacy_state: serde_json::Value =
+                        serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(
+                        legacy_state["state"]["SparseAdam"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("maximize"),
+                        Some(serde_json::Value::Bool(false))
+                    );
+                    encoded = serde_json::to_vec(&legacy_state).unwrap();
+                }
                 let decoded: OptimizerStateDict = serde_json::from_slice(&encoded).unwrap();
                 assert_eq!(decoded, saved);
                 let mut resumed = FrankenTorchSession::new(mode);
@@ -10755,7 +10802,8 @@ mod tests {
                     })
                     .collect();
                 assert_ne!(params[0], restored_params[0]);
-                let mut restored = SparseAdam::new(restored_params.clone(), 0.9);
+                let mut restored =
+                    SparseAdam::new(restored_params.clone(), 0.9).maximize(!maximize);
                 let identity = Arc::clone(&restored.identity().0);
                 restored.load_state_dict(&resumed, &decoded).unwrap();
                 assert!(Arc::ptr_eq(&identity, &restored.identity().0));
@@ -10770,7 +10818,7 @@ mod tests {
                         assert_eq!(
                             bits(uninterrupted.tensor_values_lossy_f64(original).unwrap()),
                             bits(resumed.tensor_values_lossy_f64(copy).unwrap()),
-                            "dtype {dtype:?}, round {round}"
+                            "mode {mode:?}, dtype {dtype:?}, maximize {maximize}, legacy {legacy}, round {round}"
                         );
                         assert_eq!(resumed.tensor_dtype(copy).unwrap(), dtype);
                     }
@@ -19773,7 +19821,12 @@ mod tests {
                 5.9579604042956955,
             ],
         ];
-        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for (mode, maximize) in [
+            (ExecutionMode::Strict, false),
+            (ExecutionMode::Strict, true),
+            (ExecutionMode::Hardened, false),
+            (ExecutionMode::Hardened, true),
+        ] {
             for dtype in [ft_core::DType::F64, ft_core::DType::F32] {
                 let mut session = FrankenTorchSession::new(mode);
                 let parameter = if dtype == ft_core::DType::F32 {
@@ -19788,7 +19841,8 @@ mod tests {
                 .unwrap();
                 let mut optimizer = SparseAdam::new(vec![parameter], 0.2)
                     .betas(0.5, 0.75)
-                    .eps(0.5);
+                    .eps(0.5)
+                    .maximize(maximize);
                 let tolerance = if dtype == ft_core::DType::F32 {
                     2e-6
                 } else {
@@ -19824,27 +19878,147 @@ mod tests {
                         );
                     }
                     optimizer.step(&mut session, &report).unwrap();
-                    for (&actual, &expected) in session
+                    assert_eq!(
+                        session
+                            .tensor_accumulated_gradient(parameter)
+                            .unwrap()
+                            .as_deref(),
+                        report.gradient(parameter),
+                        "maximization must not negate the stored gradient"
+                    );
+                    assert_eq!(
+                        session
+                            .tensor_accumulated_sparse_gradient(parameter)
+                            .unwrap()
+                            .unwrap()
+                            .values()
+                            .contiguous_values_as_f64()
+                            .unwrap(),
+                        sparse.values().contiguous_values_as_f64().unwrap()
+                    );
+                    for (index, (&actual, &expected)) in session
                         .tensor_values_lossy_f64(parameter)
                         .unwrap()
                         .iter()
                         .zip(&expected_values[round])
+                        .enumerate()
                     {
+                        // Constant linear gradients make ascent the exact
+                        // reflection of this independent descent trajectory.
+                        let expected = if maximize {
+                            2.0 * (index + 1) as f64 - expected
+                        } else {
+                            expected
+                        };
                         assert!(
                             (actual - expected).abs() <= tolerance,
-                            "{mode:?} {dtype:?} step {round}: got {actual}, expected {expected}"
+                            "{mode:?} {dtype:?} maximize {maximize} step {round}: got {actual}, expected {expected}"
                         );
                     }
                 }
                 assert_eq!(optimizer.step_counts, vec![4]);
                 assert_eq!(
                     optimizer.m[0].as_ref().unwrap(),
-                    &vec![-0.25, 1.25, 0.25, 0.5, 0.625, -0.125]
+                    &[-0.25, 1.25, 0.25, 0.5, 0.625, -0.125]
+                        .into_iter()
+                        .map(|moment| if maximize { -moment } else { moment })
+                        .collect::<Vec<_>>()
                 );
                 assert_eq!(
                     optimizer.v[0].as_ref().unwrap(),
                     &vec![0.8125, 3.9375, 0.1875, 1.75, 2.265625, 0.328125]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_adam_dense_fallback_maximize_preserves_zero_support_and_gradients() {
+        // Scalar masked updates with beta1=.5, beta2=.75, eps=.5, lr=.2.
+        // The first coordinate has a zero gradient on the second step, so
+        // its existing moment must stay unchanged in the dense fallback.
+        let expected_values = [
+            [1.8666666666666667, 3.0, 4.16],
+            [1.8666666666666667, 2.8677124344467706, 4.103929636104023],
+        ];
+        for (mode, maximize) in [
+            (ExecutionMode::Strict, false),
+            (ExecutionMode::Strict, true),
+            (ExecutionMode::Hardened, false),
+            (ExecutionMode::Hardened, true),
+        ] {
+            for dtype in [ft_core::DType::F64, ft_core::DType::F32] {
+                let mut session = FrankenTorchSession::new(mode);
+                let parameter = if dtype == ft_core::DType::F32 {
+                    session.tensor_variable_f32(vec![2.0, 3.0, 4.0], vec![3], true)
+                } else {
+                    session.tensor_variable(vec![2.0, 3.0, 4.0], vec![3], true)
+                }
+                .unwrap();
+                let mut optimizer = SparseAdam::new(vec![parameter], 0.2)
+                    .betas(0.5, 0.75)
+                    .eps(0.5)
+                    .maximize(maximize);
+                for (round, gradient) in [[2.0, 0.0, -4.0], [0.0, 3.0, 4.0]].into_iter().enumerate()
+                {
+                    optimizer.zero_grad(&mut session).unwrap();
+                    let coefficients = if dtype == ft_core::DType::F32 {
+                        session.tensor_variable_f32(
+                            gradient.iter().map(|&value| value as f32).collect(),
+                            vec![3],
+                            false,
+                        )
+                    } else {
+                        session.tensor_variable(gradient.to_vec(), vec![3], false)
+                    }
+                    .unwrap();
+                    let weighted = session.tensor_mul(parameter, coefficients).unwrap();
+                    let loss = session.tensor_sum(weighted).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert!(!report.is_sparse_gradient(parameter));
+                    optimizer.step(&mut session, &report).unwrap();
+                    assert_eq!(
+                        session.tensor_accumulated_gradient(parameter).unwrap(),
+                        Some(gradient.to_vec())
+                    );
+                    assert!(
+                        session
+                            .tensor_accumulated_sparse_gradient(parameter)
+                            .unwrap()
+                            .is_none()
+                    );
+                    let tolerance = if dtype == ft_core::DType::F32 {
+                        2e-6
+                    } else {
+                        2e-15
+                    };
+                    for (index, (&actual, &expected)) in session
+                        .tensor_values_lossy_f64(parameter)
+                        .unwrap()
+                        .iter()
+                        .zip(&expected_values[round])
+                        .enumerate()
+                    {
+                        let expected = if maximize {
+                            2.0 * (index + 2) as f64 - expected
+                        } else {
+                            expected
+                        };
+                        assert!(
+                            (actual - expected).abs() <= tolerance,
+                            "{mode:?} {dtype:?} maximize {maximize} round {round}: {actual} != {expected}"
+                        );
+                    }
+                }
+                assert_eq!(optimizer.step_counts, vec![2]);
+                assert_eq!(
+                    optimizer.m[0].as_ref().unwrap(),
+                    &[1.0, 1.5, 1.0]
+                        .into_iter()
+                        .map(|moment| if maximize { -moment } else { moment })
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(optimizer.v[0].as_deref(), Some([1.0, 2.25, 7.0].as_slice()));
             }
         }
     }
