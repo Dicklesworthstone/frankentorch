@@ -481,6 +481,9 @@ enum TensorNodeOp {
     CumProd {
         input: TensorNodeId,
         dim: usize,
+        /// Auxiliary scans in a product adjoint must stay polynomial at every
+        /// derivative order, even when their particular input slice is nonzero.
+        polynomial_backward: bool,
     },
     Where {
         condition: TensorNodeId,
@@ -8663,7 +8666,11 @@ impl TensorTape {
                 outcome.storage,
             )?,
             requires_grad,
-            op: TensorNodeOp::CumProd { input, dim },
+            op: TensorNodeOp::CumProd {
+                input,
+                dim,
+                polynomial_backward: false,
+            },
         });
 
         Ok((
@@ -15141,7 +15148,7 @@ impl TensorTape {
                         rule: "d(cumsum(x))/dx = reverse_cumsum(grad)",
                     });
                 }
-                TensorNodeOp::CumProd { input, dim }
+                TensorNodeOp::CumProd { input, dim, .. }
                     if self.nodes[input.0].tensor.meta().numel() <= 1
                         || self.nodes[input.0].tensor.meta().shape()[dim] == 1 =>
                 {
@@ -15157,7 +15164,11 @@ impl TensorTape {
                         rule: "d(cumprod(x))/dx=grad (singleton/empty)",
                     });
                 }
-                TensorNodeOp::CumProd { input, dim } => {
+                TensorNodeOp::CumProd {
+                    input,
+                    dim,
+                    polynomial_backward,
+                } => {
                     // Backward of cumprod uses: grad_input[i] = sum_{j>=i} grad_output[j] * output[j] / input[i]
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let dim_size = shape[dim];
@@ -15178,23 +15189,22 @@ impl TensorTape {
                                 let idx = outer * dim_size * inner_size + d * inner_size + inner;
                                 acc += incoming[idx] * output_values[idx];
                                 let inp = input_values[idx];
-                                if inp.abs() > f64::EPSILON {
+                                if !polynomial_backward && inp.abs() > f64::EPSILON {
                                     cumprod_grad[idx] = acc / inp;
                                 } else {
-                                    // Handle zero input: compute gradient by direct summation
+                                    // Omitted products also differentiate nonzero
+                                    // auxiliary scans without canceling quotients.
+                                    // Extend each suffix in the original order;
+                                    // multiply the prefix only after the suffix.
                                     let mut sum = 0.0;
+                                    let mut suffix = 1.0;
                                     for j in d..dim_size {
                                         let j_idx =
                                             outer * dim_size * inner_size + j * inner_size + inner;
-                                        let mut prod = 1.0;
-                                        for k in d..=j {
-                                            if k != d {
-                                                let k_idx = outer * dim_size * inner_size
-                                                    + k * inner_size
-                                                    + inner;
-                                                prod *= input_values[k_idx];
-                                            }
+                                        if j > d {
+                                            suffix *= input_values[j_idx];
                                         }
+                                        let mut prod = suffix;
                                         if d > 0 {
                                             let prev_idx = outer * dim_size * inner_size
                                                 + (d - 1) * inner_size
@@ -15215,7 +15225,11 @@ impl TensorTape {
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: incoming.len(),
-                        rule: "d(cumprod(x))/dx = reverse_cumsum(grad*output)/input",
+                        rule: if polynomial_backward {
+                            "d(cumprod(x))/dx=sum(grad*omitted_products) (polynomial auxiliary)"
+                        } else {
+                            "d(cumprod(x))/dx = reverse_cumsum(grad*output)/input"
+                        },
                     });
                 }
                 TensorNodeOp::Where { condition, x, y } => {
@@ -17780,7 +17794,7 @@ impl TensorTape {
                         rule: "d(index_put(x,v))/d:x=passthrough_or_masked,v=gather (cg)",
                     });
                 }
-                TensorNodeOp::CumProd { input, dim }
+                TensorNodeOp::CumProd { input, dim, .. }
                     if self.nodes[input.0].tensor.meta().numel() <= 1
                         || self.nodes[input.0].tensor.meta().shape()[dim] == 1 =>
                 {
@@ -17794,15 +17808,19 @@ impl TensorTape {
                         rule: "d(cumprod(x))/dx=grad (cg, singleton/empty)",
                     });
                 }
-                TensorNodeOp::CumProd { input, dim } => {
+                TensorNodeOp::CumProd {
+                    input,
+                    dim,
+                    polynomial_backward,
+                } => {
                     // The quotient rule is valid only when every input is nonzero.
                     // At a zero, build the polynomial's omitted products instead:
                     // masking a division by zero would lose mixed higher derivatives.
                     let x_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let (grad_x, rule) = if x_vals.contains(&0.0) {
+                    let (grad_x, rule) = if polynomial_backward || x_vals.contains(&0.0) {
                         (
-                            self.cg_cumprod_backward_with_zeros(input, incoming_id, dim)?,
-                            "d(cumprod(x))/dx=sum(grad*omitted_products) (cg, zeros)",
+                            self.cg_cumprod_polynomial_backward(input, incoming_id, dim)?,
+                            "d(cumprod(x))/dx=sum(grad*omitted_products) (cg, polynomial)",
                         )
                     } else {
                         let gy_y = self.cg_mul(incoming_id, node_id)?;
@@ -20873,7 +20891,10 @@ impl TensorTape {
         Ok(out)
     }
 
-    /// Helper: cumulative product along `dim` for create_graph backward in F64 gradient space.
+    /// Helper: cumulative product along `dim` for create_graph backward in F64
+    /// gradient space. Record its polynomial adjoint rather than the quotient
+    /// rule: these scans build omitted products, whose higher derivatives must
+    /// not introduce division and cancellation at nonzero suffixes.
     fn cg_cumprod(
         &mut self,
         input: TensorNodeId,
@@ -20894,12 +20915,16 @@ impl TensorTape {
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(meta, result)?,
             requires_grad,
-            op: TensorNodeOp::CumProd { input, dim },
+            op: TensorNodeOp::CumProd {
+                input,
+                dim,
+                polynomial_backward: true,
+            },
         });
         Ok(out)
     }
 
-    /// Differentiable cumprod adjoint for inputs containing zeros. For position
+    /// Differentiable polynomial cumprod adjoint. For position
     /// k, dy[j]/dx[k] is the product of x[..=j] with x[k] omitted (j >= k).
     /// Prefix products and suffix cumprods keep this polynomial on the tape,
     /// including mixed derivatives that are nonzero at multiple zero inputs.
@@ -20907,8 +20932,9 @@ impl TensorTape {
     /// This follows PyTorch's higher-order omitted-products path. It deliberately
     /// uses O(n^2) work along the scan axis: factoring into a weighted reverse
     /// recurrence changes IEEE behavior for zeros mixed with infinity/overflow.
-    /// The existing O(n) quotient path remains in use for nonzero inputs.
-    fn cg_cumprod_backward_with_zeros(
+    /// The existing O(n) quotient path remains in use for nonzero public inputs;
+    /// scans recorded inside this adjoint keep the polynomial rule at every order.
+    fn cg_cumprod_polynomial_backward(
         &mut self,
         input: TensorNodeId,
         incoming: TensorNodeId,
@@ -31399,6 +31425,78 @@ mod tests {
                         [2.0, 2.0, 2.0],
                         "{mode:?}/{dtype:?}, input={values:?}",
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_cumprod_zeros_preserve_weighted_fourth_derivatives() {
+        // Independent derivatives of f(a,b,c,d) = a + 2ab - abc + 3abcd.
+        // Successive vector roots contract each preceding derivative with
+        // ones. In particular, the fourth derivative is exactly [18; 4].
+        // Nonzero suffixes inside a zero-aware adjoint must retain that
+        // polynomial: introducing quotients can lose exactness or produce
+        // spurious same-variable terms at subsequent derivative orders.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for [a, b, c, d] in [
+                    [0.0, 3.0, 4.0, 5.0],
+                    [2.0, 0.0, 4.0, 5.0],
+                    [2.0, 3.0, 0.0, 5.0],
+                    [0.0, 3.0, 4.0, 0.0],
+                    [0.0, 0.0, 4.0, 5.0],
+                ] {
+                    let expected = [
+                        [
+                            1.0 + 2.0 * b - b * c + 3.0 * b * c * d,
+                            2.0 * a - a * c + 3.0 * a * c * d,
+                            -a * b + 3.0 * a * b * d,
+                            3.0 * a * b * c,
+                        ],
+                        [
+                            2.0 - b - c + 3.0 * (c * d + b * d + b * c),
+                            2.0 - a - c + 3.0 * (c * d + a * d + a * c),
+                            -a - b + 3.0 * (b * d + a * d + a * b),
+                            3.0 * (b * c + a * c + a * b),
+                        ],
+                        [
+                            6.0 * (b + c + d) - 2.0,
+                            6.0 * (a + c + d) - 2.0,
+                            6.0 * (a + b + d) - 2.0,
+                            6.0 * (a + b + c),
+                        ],
+                        [18.0; 4],
+                    ];
+                    let tensor =
+                        DenseTensor::from_contiguous_values(vec![a, b, c, d], vec![4], Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let mut tape = TensorTape::new();
+                    let x = tape.leaf_tensor(tensor, true);
+                    let y = tape.cumprod(x, 0, mode).unwrap().0;
+                    let y = tape.to_f64(y).unwrap();
+                    let mut objective =
+                        routing_contract(&mut tape, y, &[1.0, 2.0, -1.0, 3.0], mode);
+                    for (order, expected) in expected.iter().enumerate() {
+                        let ordinary = tape
+                            .grad_with_options(objective, routing_options(mode, false))
+                            .unwrap();
+                        assert_eq!(
+                            ordinary.gradient(x).unwrap(),
+                            expected,
+                            "{mode:?}/{dtype:?}, input={:?}, order={order}",
+                            [a, b, c, d],
+                        );
+                        if order < 3 {
+                            let recorded = tape
+                                .grad_with_options(objective, routing_options(mode, true))
+                                .unwrap();
+                            assert_eq!(recorded.gradient(x).unwrap(), expected);
+                            objective = recorded.gradient_node(x).unwrap();
+                        }
+                    }
                 }
             }
         }
