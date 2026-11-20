@@ -3421,7 +3421,9 @@ impl Tape {
                     let lhs_value = self.nodes[lhs.0].tensor.value();
                     let rhs_value = self.nodes[rhs.0].tensor.value();
                     grads[lhs.0] += incoming / rhs_value;
-                    grads[rhs.0] -= incoming * lhs_value / (rhs_value * rhs_value);
+                    // Match PyTorch's division order: neither the denominator
+                    // square nor incoming*lhs needs to be representable.
+                    grads[rhs.0] -= incoming * ((lhs_value / rhs_value) / rhs_value);
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
                     Self::complete_dependency(&mut pending, rhs, &mut queue)?;
@@ -12998,10 +13000,12 @@ impl TensorTape {
                     Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
                     Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
 
-                    // d(a/b)/da = 1/b ; d(a/b)/db = -a/b^2. Same per-element f64
-                    // expressions and ascending order as before, accumulated inline
-                    // (no lhs/rhs contrib Vecs; operands borrowed zero-copy for f64) and
-                    // fanned over Rayon (bit-identical). frankentorch-binop-bwd-par.
+                    // d(a/b)/da = 1/b ; d(a/b)/db = -((a/b)/b).
+                    // PyTorch divides before multiplying by the incoming gradient;
+                    // squaring b or multiplying grad*a first can overflow or
+                    // underflow even when the resulting derivative is finite.
+                    // Accumulate inline with borrowed f64 operands and no
+                    // intermediate contribution vectors.
                     Self::accumulate_tensor_gradient_par_with(
                         lhs,
                         &mut grads[lhs.0],
@@ -13013,8 +13017,8 @@ impl TensorTape {
                         &mut grads[rhs.0],
                         incoming.len(),
                         |index| {
-                            -incoming[index] * lhs_values[index]
-                                / (rhs_values[index] * rhs_values[index])
+                            -incoming[index]
+                                * ((lhs_values[index] / rhs_values[index]) / rhs_values[index])
                         },
                     )?;
 
@@ -17841,12 +17845,14 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Div { lhs, rhs } => {
-                    // d(a/b)/da = grad/b, d(a/b)/db = -a*grad/b^2
+                    // Keep the same sequential divisions as ordinary backward
+                    // at every derivative order; a squared denominator can lose
+                    // finite gradients to overflow or underflow.
                     let grad_lhs = self.cg_div(incoming_id, rhs)?;
                     let neg_in = self.cg_neg(incoming_id)?;
-                    let neg_a_grad = self.cg_mul(neg_in, lhs)?;
-                    let b_sq = self.cg_mul(rhs, rhs)?;
-                    let grad_rhs = self.cg_div(neg_a_grad, b_sq)?;
+                    let quotient = self.cg_div(lhs, rhs)?;
+                    let quotient_over_rhs = self.cg_div(quotient, rhs)?;
+                    let grad_rhs = self.cg_mul(neg_in, quotient_over_rhs)?;
                     self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
                     self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -24430,6 +24436,207 @@ mod tests {
 
         assert!((x_grad - (1.0 / 3.0)).abs() <= 1e-12);
         assert!((y_grad - (-2.0 / 3.0)).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn div_backward_preserves_extreme_gradients_and_nonfinite_contracts() {
+        // Independent powers-of-two derivatives of g*a/b. Every finite
+        // expected value is exactly representable, including derivatives lost
+        // by forming b*b or g*a before dividing. The final cases lock IEEE
+        // behavior rather than masking undefined derivatives to zero.
+        let p = |exponent| 2.0_f64.powi(exponent);
+        let cases = [
+            (p(1000), p(700), 1.0, p(-700), -p(-400)),
+            (p(-700), p(-700), p(-700), 1.0, -1.0),
+            (p(1000), p(500), p(500), 1.0, -p(500)),
+            (p(-1000), p(-700), 1.0, p(700), -p(400)),
+            (0.0, p(-700), 1.0, p(700), 0.0),
+            (-p(1000), p(700), 1.0, p(-700), p(-400)),
+            (p(1000), -p(700), 1.0, -p(-700), -p(-400)),
+            (f64::INFINITY, p(700), 1.0, p(-700), f64::NEG_INFINITY),
+            (f64::INFINITY, f64::INFINITY, 1.0, 0.0, f64::NAN),
+            (1.0, 0.0, 1.0, f64::INFINITY, f64::NEG_INFINITY),
+            (0.0, 0.0, 1.0, f64::INFINITY, f64::NAN),
+            (1.0, f64::INFINITY, f64::INFINITY, f64::NAN, f64::NAN),
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (index, &(a, b, weight, expected_a, expected_b)) in cases.iter().enumerate() {
+                let mut tape = Tape::new();
+                let a = tape.leaf(a, true);
+                let b = tape.leaf(b, true);
+                let weight = tape.leaf(weight, false);
+                let quotient = tape.div(a, b, mode).unwrap().0;
+                let root = tape.mul(quotient, weight, mode).unwrap().0;
+                let report = tape
+                    .backward_with_options(root, BackwardOptions::for_mode(mode))
+                    .unwrap();
+                for (node, expected) in [(a, expected_a), (b, expected_b)] {
+                    let actual = report.gradient(node).unwrap();
+                    if expected.is_nan() {
+                        assert!(actual.is_nan(), "scalar {mode:?}, case {index}: {actual}");
+                    } else {
+                        assert_eq!(actual, expected, "scalar {mode:?}, case {index}");
+                    }
+                }
+            }
+            for create_graph in [false, true] {
+                let mut tape = TensorTape::new();
+                let a = tape
+                    .leaf(
+                        cases.iter().map(|case| case.0).collect(),
+                        vec![cases.len()],
+                        true,
+                    )
+                    .unwrap();
+                let b = tape
+                    .leaf(
+                        cases.iter().map(|case| case.1).collect(),
+                        vec![cases.len()],
+                        true,
+                    )
+                    .unwrap();
+                let weight = tape
+                    .leaf(
+                        cases.iter().map(|case| case.2).collect(),
+                        vec![cases.len()],
+                        false,
+                    )
+                    .unwrap();
+                let quotient = tape.div(a, b, mode).unwrap().0;
+                let root = tape.mul(quotient, weight, mode).unwrap().0;
+                let report = tape
+                    .grad_with_options(root, routing_options(mode, create_graph))
+                    .unwrap();
+                for (index, case) in cases.iter().enumerate() {
+                    for (node, expected) in [(a, case.3), (b, case.4)] {
+                        let actual = report.gradient(node).unwrap()[index];
+                        if expected.is_nan() {
+                            assert!(
+                                actual.is_nan(),
+                                "tensor {mode:?}, create_graph={create_graph}, case {index}: {actual}"
+                            );
+                        } else {
+                            assert_eq!(
+                                actual, expected,
+                                "tensor {mode:?}, create_graph={create_graph}, case {index}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_div_preserves_extreme_higher_derivatives() {
+        // d^n(a/b)/db^n = (-1)^n n! a / b^(n+1). Evaluate
+        // expected powers independently so even tiny nonzero derivatives
+        // must match exactly instead of passing an absolute tolerance.
+        let p = |exponent| 2.0_f64.powi(exponent);
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (a_value, b_value, expected) in [
+                (p(1000), p(600), vec![-p(-200), p(-799)]),
+                (
+                    p(-600),
+                    p(-300),
+                    vec![-1.0, p(301), -6.0 * p(600), 24.0 * p(900)],
+                ),
+            ] {
+                let mut tape = TensorTape::new();
+                let a = tape.leaf(vec![a_value], vec![1], false).unwrap();
+                let b = tape.leaf(vec![b_value], vec![1], true).unwrap();
+                let mut root = tape.div(a, b, mode).unwrap().0;
+                for (order, &expected_value) in expected.iter().enumerate() {
+                    let ordinary = tape
+                        .grad_with_options(root, routing_options(mode, false))
+                        .unwrap();
+                    assert_eq!(
+                        ordinary.gradient(b).unwrap(),
+                        &[expected_value],
+                        "{mode:?}, a={a_value}, b={b_value}, derivative {}",
+                        order + 1
+                    );
+                    if order + 1 < expected.len() {
+                        let recorded = tape
+                            .grad_with_options(root, routing_options(mode, true))
+                            .unwrap();
+                        assert_eq!(recorded.gradient(b).unwrap(), &[expected_value]);
+                        root = recorded.gradient_node(b).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_graph_div_preserves_typed_offset_mixed_derivatives() {
+        // f=sum(u*(a/b)^2), with independently trainable upstream u.
+        // Contract df/db with h=[2,-.5], then differentiate once more.
+        // All forward values and analytic derivatives are dyadic rationals.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (a_dtype, b_dtype) in [
+                (DType::F64, DType::F64),
+                (DType::F32, DType::F32),
+                (DType::F16, DType::F16),
+                (DType::BF16, DType::BF16),
+                (DType::F64, DType::F32),
+                (DType::F32, DType::F64),
+            ] {
+                let mut tape = TensorTape::new();
+                let offset_leaf = |tape: &mut TensorTape, values: [f64; 2], dtype| {
+                    let tensor = DenseTensor::from_typed_storage(
+                        TensorMeta::from_shape(vec![2], dtype, Device::Cpu).with_storage_offset(1),
+                        TensorTape::reduction_values_storage(
+                            dtype,
+                            vec![f64::NAN, values[0], values[1], f64::NAN],
+                        ),
+                    )
+                    .unwrap();
+                    tape.leaf_tensor(tensor, true)
+                };
+                let a = offset_leaf(&mut tape, [2.0, -4.0], a_dtype);
+                let b = offset_leaf(&mut tape, [4.0, 2.0], b_dtype);
+                let u = tape.leaf(vec![3.0, -2.0], vec![2], true).unwrap();
+                let quotient = tape.div(a, b, mode).unwrap().0;
+                let quotient = tape.to_f64(quotient).unwrap();
+                let square = tape.mul(quotient, quotient, mode).unwrap().0;
+                let root = tape.mul(square, u, mode).unwrap().0;
+                tape.set_grad_enabled(false);
+                let first = tape
+                    .grad_with_options(root, routing_options(mode, true))
+                    .unwrap();
+                assert!(!tape.is_grad_enabled());
+                tape.set_grad_enabled(true);
+                assert_eq!(first.gradient(a).unwrap(), &[0.75, 4.0]);
+                assert_eq!(first.gradient(b).unwrap(), &[-0.375, 8.0]);
+                assert_eq!(first.gradient(u).unwrap(), &[0.25, 4.0]);
+                let weighted = routing_contract(
+                    &mut tape,
+                    first.gradient_node(b).unwrap(),
+                    &[2.0, -0.5],
+                    mode,
+                );
+                for create_graph in [false, true] {
+                    let second = tape
+                        .grad_with_options(weighted, routing_options(mode, create_graph))
+                        .unwrap();
+                    assert_eq!(second.gradient(a).unwrap(), &[-0.75, 2.0]);
+                    assert_eq!(second.gradient(b).unwrap(), &[0.5625, 6.0]);
+                    assert_eq!(second.gradient(u).unwrap(), &[-0.25, 2.0]);
+                    if create_graph {
+                        let third = tape
+                            .grad_with_options(
+                                second.gradient_node(b).unwrap(),
+                                routing_options(mode, false),
+                            )
+                            .unwrap();
+                        assert_eq!(third.gradient(a).unwrap(), &[0.5625, -3.0]);
+                        assert_eq!(third.gradient(b).unwrap(), &[-0.5625, -12.0]);
+                        assert_eq!(third.gradient(u).unwrap(), &[0.1875, -3.0]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
