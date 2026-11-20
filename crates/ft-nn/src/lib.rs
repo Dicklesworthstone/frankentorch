@@ -17792,6 +17792,39 @@ pub enum Reduction {
     Sum,
 }
 
+/// Label-derived constants belong to the prediction's dtype and device. Labels
+/// themselves remain non-differentiable and may use a different float storage.
+fn loss_constant_like(
+    session: &mut FrankenTorchSession,
+    input: TensorNodeId,
+    values: Vec<f64>,
+    shape: Vec<usize>,
+) -> Result<TensorNodeId, AutogradError> {
+    let tensor = DenseTensor::from_contiguous_values(values, shape, session.tensor_device(input)?)?
+        .to_dtype(session.tensor_dtype(input)?)?;
+    Ok(session.tensor_variable_from_storage(tensor, false))
+}
+
+fn validate_classification_loss_tensors(
+    session: &FrankenTorchSession,
+    input: TensorNodeId,
+    target: TensorNodeId,
+) -> Result<(), AutogradError> {
+    if !session.tensor_dtype(input)?.is_floating_point()
+        || !session.tensor_dtype(target)?.is_floating_point()
+    {
+        return Err(incompatible_error(
+            "classification losses require floating-point predictions and label storage",
+        ));
+    }
+    if session.tensor_device(input)? != session.tensor_device(target)? {
+        return Err(incompatible_error(
+            "classification loss input and target must have the same device",
+        ));
+    }
+    Ok(())
+}
+
 // ── Loss Function Modules ──────────────────────────────────────────────
 
 /// Mean Squared Error loss module.
@@ -19032,11 +19065,12 @@ impl LossModule for FocalLoss {
                 "FocalLoss: target shape must match input shape without the class dimension",
             ));
         }
+        validate_classification_loss_tensors(session, input, target)?;
 
-        // Validate target indices via session.tensor_values (target is
+        // Validate target indices before recording any graph nodes (target is
         // a non-differentiable label tensor). We still rebuild a
         // non-grad index leaf below for tensor_gather.
-        let target_vals = session.tensor_values(target)?;
+        let target_vals = session.tensor_values_lossy_f64(target)?;
         for &t in &target_vals {
             let class_idx = t as usize;
             if !t.is_finite() || t < 0.0 || t.fract() != 0.0 || class_idx >= num_classes {
@@ -19060,15 +19094,20 @@ impl LossModule for FocalLoss {
         // per sample.
         let mut index_shape = input_shape.clone();
         index_shape[last_dim] = 1;
-        let index = session.tensor_variable(target_vals, index_shape.clone(), false)?;
+        let index_tensor = DenseTensor::from_contiguous_values(
+            target_vals,
+            index_shape,
+            session.tensor_device(input)?,
+        )?;
+        let index = session.tensor_variable_from_storage(index_tensor, false);
         let gathered = session.tensor_gather(log_probs, last_dim, index)?;
         let log_pt = session.tensor_squeeze(gathered, last_dim)?; // sample_shape
         let pt = session.tensor_exp(log_pt)?;
-        let ones = session.full(sample_shape.clone(), 1.0, false)?;
+        let ones = session.full_like(pt, 1.0, false)?;
         let one_minus_pt = session.tensor_sub(ones, pt)?;
         let focal_factor = session.tensor_pow(one_minus_pt, self.gamma)?;
         let weighted = session.tensor_mul(focal_factor, log_pt)?;
-        let alpha_t = session.full(sample_shape, -self.alpha, false)?;
+        let alpha_t = session.full_like(weighted, -self.alpha, false)?;
         let per_sample = session.tensor_mul(alpha_t, weighted)?; // sample_shape
 
         match self.reduction {
@@ -19127,30 +19166,50 @@ impl LossModule for MultiMarginLoss {
                 "MultiMarginLoss: class dimension must be greater than zero",
             ));
         }
+        if session.tensor_shape(target)? != [n] {
+            return Err(incompatible_error(
+                "MultiMarginLoss: target shape must be [N]",
+            ));
+        }
+        validate_classification_loss_tensors(session, input, target)?;
+        let target_values = session.tensor_values_lossy_f64(target)?;
+        let mut other_classes = vec![1.0; checked_mul(n, c, "MultiMarginLoss shape overflow")?];
+        for (row, &label) in target_values.iter().enumerate() {
+            if !label.is_finite() || label < 0.0 || label.fract() != 0.0 || label >= c as f64 {
+                return Err(incompatible_error(
+                    "MultiMarginLoss: target class index out of range",
+                ));
+            }
+            other_classes[row * c + label as usize] = 0.0;
+        }
 
-        // Compose through autograd primitives (mirrors the session
-        // multi_margin_loss fix in frankentorch-x9cr).
-        // Tracked under frankentorch-1s4q (child of cq0b).
-        let mask_y = session.one_hot(target, c)?;
-        let ones = session.full(vec![n, c], 1.0, false)?;
-        let mask_others = session.tensor_sub(ones, mask_y)?;
-
-        let score_y_per_elem = session.tensor_mul(input, mask_y)?;
-        let score_y = session.tensor_sum_dim(score_y_per_elem, 1)?; // [n]
-        let score_y_kd = session.tensor_unsqueeze(score_y, 1)?; // [n, 1]
-        let score_y_b = session.tensor_expand(score_y_kd, vec![n, c])?;
-
-        let margin_t = session.full(vec![n, c], self.margin, false)?;
-        let x_minus_y = session.tensor_sub(input, score_y_b)?;
-        let diff = session.tensor_add(x_minus_y, margin_t)?;
-
-        let clamped = session.tensor_relu(diff)?;
-        let masked = session.tensor_mul(clamped, mask_others)?;
-
-        let powered = session.tensor_pow(masked, self.p)?;
+        // Gather the selected score: multiplying by a one-hot mask would let
+        // an unselected NaN or infinity contaminate every class in the row.
+        let indices = DenseTensor::from_contiguous_values(
+            target_values,
+            vec![n, 1],
+            session.tensor_device(input)?,
+        )?;
+        let indices = session.tensor_variable_from_storage(indices, false);
+        let score_y = session.tensor_gather(input, 1, indices)?;
+        let margin_t = session.full_like(score_y, self.margin, false)?;
+        let margin_minus_y = session.tensor_sub(margin_t, score_y)?;
+        let diff = session.tensor_add(margin_minus_y, input)?;
+        let zeros = session.full_like(diff, 0.0, false)?;
+        // The upstream hinge is active only for z > 0, including when z is
+        // unordered. Selection also keeps ignored infinite terms exactly zero.
+        let positive = session.tensor_gt(diff, zeros)?;
+        let clamped = session.tensor_where(positive, diff, zeros)?;
+        let mask_others = loss_constant_like(session, input, other_classes, vec![n, c])?;
+        let masked = session.tensor_where(mask_others, clamped, zeros)?;
+        let powered = if p_bits == 1.0_f64.to_bits() {
+            masked
+        } else {
+            session.tensor_mul(masked, masked)?
+        };
 
         let per_sample_sum = session.tensor_sum_dim(powered, 1)?; // [n]
-        let classes_t = session.full(vec![n], c as f64, false)?;
+        let classes_t = session.full_like(per_sample_sum, c as f64, false)?;
         let per_sample = session.tensor_div(per_sample_sum, classes_t)?; // [n]
 
         match self.reduction {
@@ -19183,27 +19242,17 @@ impl LossModule for SoftMarginLoss {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // Compose through autograd-aware primitives. Tracked under
-        // frankentorch-fjao (child of cq0b). Math: with z = -t * x,
-        //   soft_margin_loss = log1p(exp(z))
-        //                    = relu(z) + log1p(exp(-|z|))
-        // (numerically stable form, matching the session
-        // soft_margin_loss fix under tr2a). Previously this body
-        // extracted values, computed per-element loss in plain f64,
-        // and rebuilt a non-grad leaf — silently severing autograd.
-        let neg_target = session.tensor_neg(target)?;
-        let z = session.tensor_mul(neg_target, input)?;
-        let relu_z = session.tensor_relu(z)?;
-        let abs_z = session.tensor_abs(z)?;
-        let neg_abs_z = session.tensor_neg(abs_z)?;
-        let exp_neg_abs = session.tensor_exp(neg_abs_z)?;
-        let log_term = session.tensor_log1p(exp_neg_abs)?;
-        let per_elem = session.tensor_add(relu_z, log_term)?;
-        match self.reduction {
-            Reduction::None => Ok(per_elem),
-            Reduction::Mean => session.tensor_mean(per_elem),
-            Reduction::Sum => session.tensor_sum(per_elem),
-        }
+        // Keep the module on the same differentiable path as the functional
+        // API. The relu/abs identity has the wrong derivative at zero logits.
+        session.tensor_soft_margin_loss(
+            input,
+            target,
+            match self.reduction {
+                Reduction::None => "none",
+                Reduction::Mean => "mean",
+                Reduction::Sum => "sum",
+            },
+        )
     }
 }
 
@@ -19266,78 +19315,79 @@ impl LossModule for MultiLabelMarginLoss {
         let batch_size = checked_shape_numel(
             &shape[..shape.len() - 1],
             "MultiLabelMarginLoss batch shape overflow",
-        )?
-        .max(1);
-
-        // Compose through autograd primitives. Tracked under
-        // frankentorch-r38w (child of cq0b).
-        // Reshape input and target to [batch, c] and build the pair-
-        // wise difference tensor [batch, c, c] via broadcasting
-        // unsqueeze + sub. Mask by target_mask outer non_target_mask,
-        // apply relu and divide by C.
-        let input_flat = session.tensor_reshape(input, vec![batch_size, c])?;
-        let target_flat = session.tensor_reshape(target, vec![batch_size, c])?;
-
-        let target_vals = session.tensor_values(target_flat)?;
-        let mut target_mask_vals = vec![0.0; batch_size * c];
-        for batch in 0..batch_size {
-            for slot in 0..c {
-                let target_value = target_vals[batch * c + slot];
-                if !target_value.is_finite() || target_value.fract().abs() > f64::EPSILON {
-                    return Err(incompatible_error(
-                        "MultiLabelMarginLoss: target entries must be integer class indices or -1",
-                    ));
-                }
-                if target_value.to_bits().eq(&(-1.0_f64).to_bits()) {
-                    continue;
-                }
-                if target_value < 0.0 || target_value >= c as f64 {
-                    return Err(incompatible_error(
-                        "MultiLabelMarginLoss: target class index out of range",
-                    ));
-                }
-                target_mask_vals[batch * c + target_value as usize] = 1.0;
+        )?;
+        validate_classification_loss_tensors(session, input, target)?;
+        let entries = checked_mul(batch_size, c, "MultiLabelMarginLoss shape overflow")?;
+        checked_mul(entries, c, "MultiLabelMarginLoss pair shape overflow")?;
+        let target_vals = session.tensor_values_lossy_f64(target)?;
+        // PyTorch validates every slot, but only the prefix before the first
+        // -1 contributes. Validate before even recording a reshape operation.
+        for &label in &target_vals {
+            if !label.is_finite() || label.fract() != 0.0 {
+                return Err(incompatible_error(
+                    "MultiLabelMarginLoss: target entries must be integer class indices or -1",
+                ));
+            }
+            if label < -1.0 || label >= c as f64 {
+                return Err(incompatible_error(
+                    "MultiLabelMarginLoss: target class index out of range",
+                ));
             }
         }
-        let non_target_mask_vals: Vec<f64> = target_mask_vals.iter().map(|&v| 1.0 - v).collect();
-        let target_mask = session.tensor_variable(target_mask_vals, vec![batch_size, c], false)?;
+        let mut indices = vec![0.0; entries];
+        let mut valid_slots = vec![0.0; entries];
+        let mut other_classes = vec![1.0; entries];
+        for batch in 0..batch_size {
+            for slot in 0..c {
+                let offset = batch * c + slot;
+                let label = target_vals[offset];
+                if label < 0.0 {
+                    break;
+                }
+                indices[offset] = label;
+                valid_slots[offset] = 1.0;
+                other_classes[batch * c + label as usize] = 0.0;
+            }
+        }
+        let input_flat = session.tensor_reshape(input, vec![batch_size, c])?;
+        let indices = DenseTensor::from_contiguous_values(
+            indices,
+            vec![batch_size, c],
+            session.tensor_device(input)?,
+        )?;
+        let indices = session.tensor_variable_from_storage(indices, false);
+        // Keep target slots distinct: repeated labels each contribute a hinge
+        // term and a gradient, rather than being collapsed into a set of labels.
+        let selected = session.tensor_gather(input_flat, 1, indices)?;
+        let target_mask = loss_constant_like(session, input, valid_slots, vec![batch_size, c])?;
         let non_target_mask =
-            session.tensor_variable(non_target_mask_vals, vec![batch_size, c], false)?;
+            loss_constant_like(session, input, other_classes, vec![batch_size, c])?;
 
-        // x_i has shape [batch, c, 1]; x_j has shape [batch, 1, c].
-        let x_i = session.tensor_unsqueeze(input_flat, 2)?;
+        // Broadcast [batch, target_slot, 1] against [batch, 1, class].
+        let x_i = session.tensor_unsqueeze(selected, 2)?;
         let x_j = session.tensor_unsqueeze(input_flat, 1)?;
-        let x_i_b = session.tensor_expand(x_i, vec![batch_size, c, c])?;
-        let x_j_b = session.tensor_expand(x_j, vec![batch_size, c, c])?;
-        let pair_diff = session.tensor_sub(x_i_b, x_j_b)?;
-        // margin_ij = 1 - (x_i - x_j)
-        let ones3d = session.full(vec![batch_size, c, c], 1.0, false)?;
-        let margin_pair = session.tensor_sub(ones3d, pair_diff)?;
-        let relu_margin = session.tensor_relu(margin_pair)?;
+        let ones = session.full_like(x_i, 1.0, false)?;
+        let margin_i = session.tensor_sub(ones, x_i)?;
+        let margin_pair = session.tensor_add(margin_i, x_j)?;
+        let zeros = session.full_like(margin_pair, 0.0, false)?;
+        let positive = session.tensor_gt(margin_pair, zeros)?;
+        let hinge = session.tensor_where(positive, margin_pair, zeros)?;
         // pair_mask = target_mask_i * non_target_mask_j
         let t_i = session.tensor_unsqueeze(target_mask, 2)?;
         let nt_j = session.tensor_unsqueeze(non_target_mask, 1)?;
-        let t_i_b = session.tensor_expand(t_i, vec![batch_size, c, c])?;
-        let nt_j_b = session.tensor_expand(nt_j, vec![batch_size, c, c])?;
-        let pair_mask = session.tensor_mul(t_i_b, nt_j_b)?;
-        let masked = session.tensor_mul(relu_margin, pair_mask)?;
+        let pair_mask = session.tensor_mul(t_i, nt_j)?;
+        let masked = session.tensor_where(pair_mask, hinge, zeros)?;
 
         // Sum over j (dim=2) then over i (dim=1) → [batch]; divide by C.
         let sum_j = session.tensor_sum_dim(masked, 2)?; // [batch, c]
         let sum_ij = session.tensor_sum_dim(sum_j, 1)?; // [batch]
-        let c_t = session.full(vec![batch_size], c as f64, false)?;
+        let c_t = session.full_like(sum_ij, c as f64, false)?;
         let per_sample = session.tensor_div(sum_ij, c_t)?;
 
         match self.reduction {
             Reduction::None => {
-                if shape.len() == 1 {
-                    // Match the prior behavior: return a [1] tensor
-                    // since the input was a single sample.
-                    Ok(per_sample)
-                } else {
-                    let out_shape = shape[..shape.len() - 1].to_vec();
-                    session.tensor_reshape(per_sample, out_shape)
-                }
+                let out_shape = shape[..shape.len() - 1].to_vec();
+                session.tensor_reshape(per_sample, out_shape)
             }
             Reduction::Mean => session.tensor_mean(per_sample),
             Reduction::Sum => session.tensor_sum(per_sample),
@@ -43961,6 +44011,151 @@ mod tests {
 
     // ── FocalLoss Tests ────────────────────────────────────────────────
 
+    fn loss_test_tensor(
+        session: &mut FrankenTorchSession,
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        dtype: DType,
+        requires_grad: bool,
+    ) -> TensorNodeId {
+        let tensor = DenseTensor::from_contiguous_values(values, shape, Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        session.tensor_variable_from_storage(tensor, requires_grad)
+    }
+
+    fn assert_loss_values(actual: &[f64], expected: &[f64], dtype: DType) {
+        assert_eq!(actual.len(), expected.len());
+        let tolerance = if dtype == DType::F32 { 4e-6 } else { 2e-12 };
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "expected NaN, got {actual}");
+            } else if expected.is_infinite() {
+                assert_eq!(actual, expected);
+            } else {
+                assert!(
+                    (actual - expected).abs() <= tolerance * (1.0 + expected.abs()),
+                    "{dtype:?}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    fn weighted_loss_test_root(
+        session: &mut FrankenTorchSession,
+        loss: TensorNodeId,
+        weights: &[f64],
+        reduction: Reduction,
+        dtype: DType,
+    ) -> TensorNodeId {
+        if reduction == Reduction::None {
+            let shape = session.tensor_shape(loss).unwrap();
+            let weights = loss_test_tensor(session, weights.to_vec(), shape, dtype, false);
+            let weighted = session.tensor_mul(loss, weights).unwrap();
+            session.tensor_sum(weighted).unwrap()
+        } else {
+            loss
+        }
+    }
+
+    #[test]
+    fn focal_loss_typed_reductions_and_weighted_gradients_match_scalar_reference() {
+        let logits = [
+            0.25_f64, -0.5, 0.75, -1.0, 0.5, -0.25, 1.5, 0.25, -0.75, -0.5, 0.75, 0.25,
+        ];
+        let labels = [0_usize, 2, 1, 0];
+        let weights = [1.25, -0.5, 2.0, 0.75];
+        let alpha = 0.3;
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for gamma in [0.0_f64, 0.5, 2.0] {
+                    for reduction in [Reduction::None, Reduction::Mean, Reduction::Sum] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let input = loss_test_tensor(
+                            &mut session,
+                            logits.to_vec(),
+                            vec![2, 2, 3],
+                            dtype,
+                            true,
+                        );
+                        // Labels do not need the prediction's storage precision.
+                        let label_dtype = if dtype == DType::F32 {
+                            DType::F64
+                        } else {
+                            DType::F32
+                        };
+                        let target = loss_test_tensor(
+                            &mut session,
+                            labels.iter().map(|&label| label as f64).collect(),
+                            vec![2, 2],
+                            label_dtype,
+                            true,
+                        );
+                        let module = FocalLoss::new(alpha, gamma, reduction);
+                        let loss = module.forward(&mut session, input, target).unwrap();
+                        assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                        let mut expected_loss = Vec::new();
+                        let mut expected_gradient = vec![0.0; logits.len()];
+                        for (sample, row) in logits.chunks_exact(3).enumerate() {
+                            let denominator: f64 = row.iter().map(|value| value.exp()).sum();
+                            let probabilities: Vec<_> =
+                                row.iter().map(|value| value.exp() / denominator).collect();
+                            let pt = probabilities[labels[sample]];
+                            expected_loss.push(-alpha * (1.0 - pt).powf(gamma) * pt.ln());
+                            let focal_derivative = if gamma == 0.0 {
+                                alpha
+                            } else {
+                                alpha
+                                    * ((1.0 - pt).powf(gamma)
+                                        - gamma * pt * (1.0 - pt).powf(gamma - 1.0) * pt.ln())
+                            };
+                            let upstream = match reduction {
+                                Reduction::None => weights[sample],
+                                Reduction::Mean => 0.25,
+                                Reduction::Sum => 1.0,
+                            };
+                            for (class, &probability) in probabilities.iter().enumerate() {
+                                let selected = if class == labels[sample] { 1.0 } else { 0.0 };
+                                expected_gradient[sample * 3 + class] =
+                                    upstream * focal_derivative * (probability - selected);
+                            }
+                        }
+                        let expected_loss = match reduction {
+                            Reduction::None => expected_loss,
+                            Reduction::Mean => vec![expected_loss.iter().sum::<f64>() / 4.0],
+                            Reduction::Sum => vec![expected_loss.iter().sum()],
+                        };
+                        assert_loss_values(
+                            &session.tensor_values_lossy_f64(loss).unwrap(),
+                            &expected_loss,
+                            dtype,
+                        );
+                        let root =
+                            weighted_loss_test_root(&mut session, loss, &weights, reduction, dtype);
+                        let report = session.tensor_backward(root).unwrap();
+                        assert_loss_values(
+                            session.tensor_gradient(&report, input).unwrap(),
+                            &expected_gradient,
+                            dtype,
+                        );
+                        assert!(session.tensor_gradient(&report, target).is_none());
+                        let inferred = session
+                            .with_no_grad(|session| module.forward(session, input, target))
+                            .unwrap();
+                        assert_eq!(session.tensor_dtype(inferred).unwrap(), dtype);
+                        assert!(!session.tensor_requires_grad(inferred).unwrap());
+                        assert_loss_values(
+                            &session.tensor_values_lossy_f64(inferred).unwrap(),
+                            &expected_loss,
+                            dtype,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn focal_loss_gamma_zero_equals_ce() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -44078,6 +44273,155 @@ mod tests {
     // ── MultiMarginLoss Tests ──────────────────────────────────────────
 
     #[test]
+    fn multi_margin_loss_typed_gradients_and_hessian_match_analytic_hinges() {
+        let values = [0.25, -0.5, 1.0, -2.0, -1.0, 0.5, 0.25, -0.75];
+        let weights = [2.0, -0.5];
+        let direction = [1.0, -2.0, 0.5, 3.0, -1.0, 2.0, -0.5, 1.0];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for p in [1.0_f64, 2.0] {
+                    for reduction in [Reduction::None, Reduction::Mean, Reduction::Sum] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let input = loss_test_tensor(
+                            &mut session,
+                            values.to_vec(),
+                            vec![2, 4],
+                            dtype,
+                            true,
+                        );
+                        let target =
+                            loss_test_tensor(&mut session, vec![0.0, 3.0], vec![2], dtype, true);
+                        let module = MultiMarginLoss::new(p, 0.75, reduction);
+                        let loss = module.forward(&mut session, input, target).unwrap();
+                        assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                        // Row 0 has one active margin, 1.5; a second is exactly
+                        // zero. Row 1 has margins 0.5, 2, and 1.75.
+                        let (rows, mut gradient) = if p == 1.0 {
+                            (
+                                [0.375, 1.0625],
+                                [-0.25, 0.0, 0.25, 0.0, 0.25, 0.25, 0.25, -0.75],
+                            )
+                        } else {
+                            (
+                                [0.5625, 1.828125],
+                                [-0.75, 0.0, 0.75, 0.0, 0.25, 1.0, 0.875, -2.125],
+                            )
+                        };
+                        let expected_values = match reduction {
+                            Reduction::None => rows.to_vec(),
+                            Reduction::Mean => vec![(rows[0] + rows[1]) / 2.0],
+                            Reduction::Sum => vec![rows[0] + rows[1]],
+                        };
+                        assert_loss_values(
+                            &session.tensor_values_lossy_f64(loss).unwrap(),
+                            &expected_values,
+                            dtype,
+                        );
+                        let scales = match reduction {
+                            Reduction::None => weights,
+                            Reduction::Mean => [0.5; 2],
+                            Reduction::Sum => [1.0; 2],
+                        };
+                        for (sample, row) in gradient.chunks_exact_mut(4).enumerate() {
+                            for value in row {
+                                *value *= scales[sample];
+                            }
+                        }
+                        let root =
+                            weighted_loss_test_root(&mut session, loss, &weights, reduction, dtype);
+                        let first = session
+                            .tensor_autograd_grad_report(&[root], &[input], None, true, p == 2.0)
+                            .unwrap();
+                        assert_loss_values(first.gradient(input).unwrap(), &gradient, dtype);
+                        assert!(first.gradient(target).is_none());
+                        if p == 2.0 {
+                            let gradient_node = first.gradient_node(input).unwrap();
+                            let second = session
+                                .tensor_autograd_grad_report(
+                                    &[gradient_node],
+                                    &[input],
+                                    Some(&[direction.to_vec()]),
+                                    true,
+                                    false,
+                                )
+                                .unwrap();
+                            // Every active edge (y,j) contributes
+                            // (2/C) * (v[j]-v[y]) to j and its negative to y.
+                            let mut hessian_vector =
+                                [0.25, 0.0, -0.25, 0.0, -1.0, 0.5, -0.75, 1.25];
+                            for (sample, row) in hessian_vector.chunks_exact_mut(4).enumerate() {
+                                for value in row {
+                                    *value *= scales[sample];
+                                }
+                            }
+                            assert_loss_values(
+                                second.gradient(input).unwrap(),
+                                &hessian_vector,
+                                dtype,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_margin_loss_nonfinite_scores_do_not_poison_unselected_terms() {
+        let values = [
+            f64::INFINITY,
+            0.0,
+            1.0,
+            0.0,
+            f64::NAN,
+            2.0,
+            0.0,
+            f64::INFINITY,
+            2.0,
+            f64::NAN,
+            0.0,
+            1.0,
+        ];
+        let expected_gradient = [
+            0.0,
+            0.0,
+            0.0,
+            -1.0 / 3.0,
+            0.0,
+            1.0 / 3.0,
+            -2.0 / 3.0,
+            1.0 / 3.0,
+            1.0 / 3.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let input =
+                    loss_test_tensor(&mut session, values.to_vec(), vec![4, 3], dtype, true);
+                let target = loss_test_tensor(&mut session, vec![0.0; 4], vec![4], dtype, false);
+                let loss = MultiMarginLoss::new(1.0, 1.0, Reduction::None)
+                    .forward(&mut session, input, target)
+                    .unwrap();
+                assert_loss_values(
+                    &session.tensor_values_lossy_f64(loss).unwrap(),
+                    &[0.0, 1.0, f64::INFINITY, 0.0],
+                    dtype,
+                );
+                let total = session.tensor_sum(loss).unwrap();
+                let report = session.tensor_backward(total).unwrap();
+                assert_loss_values(
+                    session.tensor_gradient(&report, input).unwrap(),
+                    &expected_gradient,
+                    dtype,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn multi_margin_loss_perfect_classification() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let mml = MultiMarginLoss::new(1.0, 1.0, Reduction::Mean);
@@ -44181,6 +44525,258 @@ mod tests {
             val > 4.0,
             "wrong predictions should have high loss, got {val}"
         );
+    }
+
+    #[test]
+    fn soft_margin_loss_zero_logits_preserve_weighted_gradients_and_curvature() {
+        let labels = [1.0, -1.0, 1.0, -1.0];
+        let weights = [2.0, -3.0, 1.5, -0.5];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for reduction in [Reduction::None, Reduction::Mean, Reduction::Sum] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let input =
+                        loss_test_tensor(&mut session, vec![0.0; 4], vec![2, 2], dtype, true);
+                    let target =
+                        loss_test_tensor(&mut session, labels.to_vec(), vec![2, 2], dtype, false);
+                    let loss = SoftMarginLoss::new(reduction)
+                        .forward(&mut session, input, target)
+                        .unwrap();
+                    assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                    let root =
+                        weighted_loss_test_root(&mut session, loss, &weights, reduction, dtype);
+                    let first = session
+                        .tensor_autograd_grad_report(&[root], &[input], None, true, true)
+                        .unwrap();
+                    let scales: Vec<_> = match reduction {
+                        Reduction::None => weights.to_vec(),
+                        Reduction::Mean => vec![0.25; 4],
+                        Reduction::Sum => vec![1.0; 4],
+                    };
+                    let expected_first: Vec<_> = scales
+                        .iter()
+                        .zip(labels)
+                        .map(|(&scale, label)| -scale * label * 0.5)
+                        .collect();
+                    assert_loss_values(first.gradient(input).unwrap(), &expected_first, dtype);
+                    let first_node = first.gradient_node(input).unwrap();
+                    let second = session
+                        .tensor_autograd_grad_report(
+                            &[first_node],
+                            &[input],
+                            Some(&[vec![1.0; 4]]),
+                            true,
+                            false,
+                        )
+                        .unwrap();
+                    let expected_second: Vec<_> = scales.iter().map(|scale| scale * 0.25).collect();
+                    assert_loss_values(second.gradient(input).unwrap(), &expected_second, dtype);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn soft_margin_loss_typed_nonfinite_evaluation_matches_exponential_semantics() {
+        let values = [
+            0.0,
+            1.0,
+            -1.0,
+            40.0,
+            -40.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        let expected: Vec<_> = values.iter().map(|&value| (-value).exp().ln_1p()).collect();
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for requires_grad in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let input = loss_test_tensor(
+                        &mut session,
+                        values.to_vec(),
+                        vec![values.len()],
+                        dtype,
+                        requires_grad,
+                    );
+                    let target = loss_test_tensor(
+                        &mut session,
+                        vec![1.0; values.len()],
+                        vec![values.len()],
+                        dtype,
+                        false,
+                    );
+                    let loss = SoftMarginLoss::new(Reduction::None)
+                        .forward(&mut session, input, target)
+                        .unwrap();
+                    assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                    assert_loss_values(
+                        &session.tensor_values_lossy_f64(loss).unwrap(),
+                        &expected,
+                        dtype,
+                    );
+                    assert!(session.tensor_values_lossy_f64(loss).unwrap()[3] > 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classification_loss_modules_preserve_empty_batches_and_zero_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for reduction in [Reduction::None, Reduction::Mean, Reduction::Sum] {
+                    for kind in 0..4 {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let input =
+                            loss_test_tensor(&mut session, Vec::new(), vec![0, 3], dtype, true);
+                        let target_shape = if kind < 2 { vec![0] } else { vec![0, 3] };
+                        let target =
+                            loss_test_tensor(&mut session, Vec::new(), target_shape, dtype, false);
+                        let module: Box<dyn LossModule> = match kind {
+                            0 => Box::new(FocalLoss::new(0.25, 2.0, reduction)),
+                            1 => Box::new(MultiMarginLoss::new(2.0, 1.0, reduction)),
+                            2 => Box::new(MultiLabelMarginLoss::new(reduction)),
+                            _ => Box::new(SoftMarginLoss::new(reduction)),
+                        };
+                        let loss = module.forward(&mut session, input, target).unwrap();
+                        assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                        assert!(session.tensor_requires_grad(loss).unwrap());
+                        let expected = match reduction {
+                            Reduction::None => Vec::new(),
+                            Reduction::Mean => vec![f64::NAN],
+                            Reduction::Sum => vec![0.0],
+                        };
+                        assert_loss_values(
+                            &session.tensor_values_lossy_f64(loss).unwrap(),
+                            &expected,
+                            dtype,
+                        );
+                        if reduction == Reduction::None {
+                            let expected_shape = if kind == 3 { vec![0, 3] } else { vec![0] };
+                            assert_eq!(session.tensor_shape(loss).unwrap(), expected_shape);
+                        }
+                        let root = session.tensor_sum(loss).unwrap();
+                        let report = session.tensor_backward(root).unwrap();
+                        assert_eq!(session.tensor_gradient(&report, input), Some([].as_slice()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classification_loss_modules_validate_labels_before_recording_graph_nodes() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for kind in 0..3 {
+                    let module: Box<dyn LossModule> = match kind {
+                        0 => Box::new(FocalLoss::new(0.25, 2.0, Reduction::Mean)),
+                        1 => Box::new(MultiMarginLoss::new(1.0, 1.0, Reduction::Mean)),
+                        _ => Box::new(MultiLabelMarginLoss::new(Reduction::Mean)),
+                    };
+                    for bad_label in [0.5, -2.0, 3.0, f64::NAN, f64::INFINITY] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let input =
+                            loss_test_tensor(&mut session, vec![0.0; 6], vec![2, 3], dtype, true);
+                        let (values, shape) = if kind == 2 {
+                            // Even ignored suffixes must contain valid storage
+                            // values; the first -1 only stops loss contributions.
+                            (vec![0.0, -1.0, bad_label, 1.0, -1.0, -1.0], vec![2, 3])
+                        } else {
+                            (vec![0.0, bad_label], vec![2])
+                        };
+                        let target = loss_test_tensor(&mut session, values, shape, dtype, false);
+                        let before = session.autograd_graph_node_count();
+                        assert!(module.forward(&mut session, input, target).is_err());
+                        assert_eq!(session.autograd_graph_node_count(), before);
+                    }
+                    let mut session = FrankenTorchSession::new(mode);
+                    let input =
+                        loss_test_tensor(&mut session, vec![0.0; 6], vec![2, 3], dtype, true);
+                    let malformed =
+                        loss_test_tensor(&mut session, vec![0.0; 6], vec![6], dtype, false);
+                    let before = session.autograd_graph_node_count();
+                    assert!(module.forward(&mut session, input, malformed).is_err());
+                    assert_eq!(session.autograd_graph_node_count(), before);
+                    let shape = if kind == 2 { vec![2, 3] } else { vec![2] };
+                    let count: usize = shape.iter().product();
+                    let wrong_device =
+                        DenseTensor::from_contiguous_values(vec![0.0; count], shape, Device::Metal)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let target = session.tensor_variable_from_storage(wrong_device, false);
+                    let before = session.autograd_graph_node_count();
+                    assert!(module.forward(&mut session, input, target).is_err());
+                    assert_eq!(session.autograd_graph_node_count(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classification_loss_modules_train_f32_linear_models_from_frozen_inputs() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for kind in 0..4 {
+                let mut session = FrankenTorchSession::new(mode);
+                let model = Linear::new_with_dtype(&mut session, 2, 3, true, DType::F32).unwrap();
+                session
+                    .tensor_update_param_values(
+                        model.weight(),
+                        vec![0.2, -0.1, -0.3, 0.15, 0.1, 0.25],
+                    )
+                    .unwrap();
+                session
+                    .tensor_update_param_values(model.bias().unwrap(), vec![0.0; 3])
+                    .unwrap();
+                let input = loss_test_tensor(
+                    &mut session,
+                    vec![1.0, 0.0, 0.0, 1.0],
+                    vec![2, 2],
+                    DType::F32,
+                    false,
+                );
+                let (target_values, target_shape) = match kind {
+                    0 | 1 => (vec![0.0, 2.0], vec![2]),
+                    2 => (vec![0.0, -1.0, -1.0, 2.0, -1.0, -1.0], vec![2, 3]),
+                    _ => (vec![1.0, -1.0, -1.0, -1.0, -1.0, 1.0], vec![2, 3]),
+                };
+                let target =
+                    loss_test_tensor(&mut session, target_values, target_shape, DType::F32, false);
+                let module: Box<dyn LossModule> = match kind {
+                    0 => Box::new(FocalLoss::new(0.25, 2.0, Reduction::Mean)),
+                    1 => Box::new(MultiMarginLoss::new(2.0, 1.0, Reduction::Mean)),
+                    2 => Box::new(MultiLabelMarginLoss::new(Reduction::Mean)),
+                    _ => Box::new(SoftMarginLoss::new(Reduction::Mean)),
+                };
+                let logits = model.forward(&mut session, input).unwrap();
+                let loss = module.forward(&mut session, logits, target).unwrap();
+                assert_eq!(session.tensor_dtype(loss).unwrap(), DType::F32);
+                let before = session.tensor_values_lossy_f64(loss).unwrap()[0];
+                let report = session.tensor_backward(loss).unwrap();
+                for parameter in model.parameters() {
+                    let gradient = session.tensor_gradient(&report, parameter).unwrap();
+                    assert!(gradient.iter().all(|value| value.is_finite()));
+                    assert!(gradient.iter().any(|value| value.abs() > 1e-8));
+                    let updated = session
+                        .tensor_values_lossy_f64(parameter)
+                        .unwrap()
+                        .iter()
+                        .zip(gradient)
+                        .map(|(&value, &gradient)| value - 0.05 * gradient)
+                        .collect();
+                    session
+                        .tensor_update_param_values(parameter, updated)
+                        .unwrap();
+                }
+                let logits = model.forward(&mut session, input).unwrap();
+                let loss = module.forward(&mut session, logits, target).unwrap();
+                let after = session.tensor_values_lossy_f64(loss).unwrap()[0];
+                assert!(after < before, "loss kind {kind}: {before} -> {after}");
+            }
+        }
     }
 
     // ── PixelShuffle / PixelUnshuffle / ChannelShuffle Module Tests ─────
@@ -44480,6 +45076,171 @@ mod tests {
     }
 
     // ── MultiLabelMarginLoss Tests ──────────────────────────────────────
+
+    #[test]
+    fn multi_label_margin_loss_preserves_typed_prefixes_duplicates_and_weighted_gradients() {
+        let values = [
+            0.1,
+            0.2,
+            0.4,
+            0.8,
+            0.25,
+            -0.5,
+            0.75,
+            -1.0,
+            f64::INFINITY,
+            f64::NAN,
+            f64::NEG_INFINITY,
+            0.0,
+        ];
+        let labels = [
+            3.0, 0.0, -1.0, 1.0, 1.0, 1.0, -1.0, 2.0, -1.0, 2.0, 3.0, 0.0,
+        ];
+        let weights = [1.5, -0.75, 2.0];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for reduction in [Reduction::None, Reduction::Mean, Reduction::Sum] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let input =
+                        loss_test_tensor(&mut session, values.to_vec(), vec![3, 4], dtype, true);
+                    let label_dtype = if dtype == DType::F32 {
+                        DType::F64
+                    } else {
+                        DType::F32
+                    };
+                    let target = loss_test_tensor(
+                        &mut session,
+                        labels.to_vec(),
+                        vec![3, 4],
+                        label_dtype,
+                        true,
+                    );
+                    let module = MultiLabelMarginLoss::new(reduction);
+                    let loss = module.forward(&mut session, input, target).unwrap();
+                    assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                    // The first row is PyTorch's documented 0.85 example;
+                    // label 1 after -1 is ignored. The second row counts each
+                    // occurrence of label 1. The empty prefix masks all NaNs.
+                    let expected_values = match reduction {
+                        Reduction::None => vec![0.85, 2.25, 0.0],
+                        Reduction::Mean => vec![3.1 / 3.0],
+                        Reduction::Sum => vec![3.1],
+                    };
+                    assert_loss_values(
+                        &session.tensor_values_lossy_f64(loss).unwrap(),
+                        &expected_values,
+                        dtype,
+                    );
+                    let mut gradient = [
+                        -0.5, 0.5, 0.5, -0.5, 0.5, -1.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0,
+                    ];
+                    let scales = match reduction {
+                        Reduction::None => weights,
+                        Reduction::Mean => [1.0 / 3.0; 3],
+                        Reduction::Sum => [1.0; 3],
+                    };
+                    for (sample, row) in gradient.chunks_exact_mut(4).enumerate() {
+                        for value in row {
+                            *value *= scales[sample];
+                        }
+                    }
+                    let root =
+                        weighted_loss_test_root(&mut session, loss, &weights, reduction, dtype);
+                    let report = session.tensor_backward(root).unwrap();
+                    assert_loss_values(
+                        session.tensor_gradient(&report, input).unwrap(),
+                        &gradient,
+                        dtype,
+                    );
+                    assert!(session.tensor_gradient(&report, target).is_none());
+                    let inferred = session
+                        .with_no_grad(|session| module.forward(session, input, target))
+                        .unwrap();
+                    assert!(!session.tensor_requires_grad(inferred).unwrap());
+                    assert_eq!(session.tensor_dtype(inferred).unwrap(), dtype);
+                    assert_loss_values(
+                        &session.tensor_values_lossy_f64(inferred).unwrap(),
+                        &expected_values,
+                        dtype,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_label_margin_loss_keeps_incoming_gradient_differentiable() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let input = loss_test_tensor(
+                    &mut session,
+                    vec![0.1, 0.2, 0.4, 0.8, 0.25, -0.5, 0.75, -1.0],
+                    vec![2, 4],
+                    dtype,
+                    true,
+                );
+                let target = loss_test_tensor(
+                    &mut session,
+                    vec![3.0, 0.0, -1.0, 1.0, 1.0, 1.0, -1.0, 2.0],
+                    vec![2, 4],
+                    dtype,
+                    false,
+                );
+                let weights = loss_test_tensor(&mut session, vec![2.0, -0.5], vec![2], dtype, true);
+                let loss = MultiLabelMarginLoss::new(Reduction::None)
+                    .forward(&mut session, input, target)
+                    .unwrap();
+                let weighted = session.tensor_mul(loss, weights).unwrap();
+                let root = session.tensor_sum(weighted).unwrap();
+                let first = session
+                    .tensor_autograd_grad_report(&[root], &[input], None, true, true)
+                    .unwrap();
+                let gradient = first.gradient_node(input).unwrap();
+                let second = session
+                    .tensor_autograd_grad_report(
+                        &[gradient],
+                        &[weights],
+                        Some(&[vec![1.0, -2.0, 0.5, 3.0, -1.0, 2.0, -0.5, 1.0]]),
+                        true,
+                        false,
+                    )
+                    .unwrap();
+                assert_loss_values(second.gradient(weights).unwrap(), &[-2.75, -3.25], dtype);
+            }
+        }
+    }
+
+    #[test]
+    fn multi_label_margin_loss_unbatched_none_returns_scalar() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input =
+                loss_test_tensor(&mut session, vec![0.1, 0.2, 0.4, 0.8], vec![4], dtype, true);
+            let target = loss_test_tensor(
+                &mut session,
+                vec![3.0, 0.0, -1.0, 1.0],
+                vec![4],
+                dtype,
+                false,
+            );
+            let loss = MultiLabelMarginLoss::new(Reduction::None)
+                .forward(&mut session, input, target)
+                .unwrap();
+            assert!(session.tensor_shape(loss).unwrap().is_empty());
+            assert_loss_values(
+                &session.tensor_values_lossy_f64(loss).unwrap(),
+                &[0.85],
+                dtype,
+            );
+            let report = session.tensor_backward(loss).unwrap();
+            assert_loss_values(
+                session.tensor_gradient(&report, input).unwrap(),
+                &[-0.5, 0.5, 0.5, -0.5],
+                dtype,
+            );
+        }
+    }
 
     #[test]
     fn multi_label_margin_loss_perfect_classification() {
