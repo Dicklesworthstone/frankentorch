@@ -943,6 +943,54 @@ fn advance_param_step_count(
     Ok(next)
 }
 
+/// Check the complete update batch without reading or cloning parameter values.
+/// A failure on a later parameter must not leave earlier weights, moments or
+/// clocks one step ahead. Absent gradients still skip all per-parameter state.
+fn preflight_optimizer_updates(
+    session: &FrankenTorchSession,
+    params: &[TensorNodeId],
+    buffers: &[(&[Option<Vec<f64>>], &'static str)],
+    step_counts: Option<(&[u64], &'static str)>,
+) -> Result<(), AutogradError> {
+    for &(buffer, _) in buffers {
+        ensure_state_len(
+            params.len(),
+            buffer.len(),
+            "optimizer state parameter count mismatch",
+        )?;
+    }
+    if let Some((steps, _)) = step_counts {
+        ensure_state_len(
+            params.len(),
+            steps.len(),
+            "optimizer step state length mismatch",
+        )?;
+    }
+    for (index, &param) in params.iter().enumerate() {
+        let Some(grad_len) = session.tensor_accumulated_gradient_len(param)? else {
+            continue;
+        };
+        if !matches!(
+            session.tensor_dtype(param)?,
+            ft_core::DType::F32 | ft_core::DType::F64
+        ) {
+            return Err(optimizer_state_error(
+                "optimizer requires F32 or F64 parameters",
+            ));
+        }
+        ensure_grad_len_matches_param(param, session.tensor_values_len(param)?, grad_len)?;
+        for &(buffer, mismatch_reason) in buffers {
+            if let Some(values) = &buffer[index] {
+                ensure_state_len(grad_len, values.len(), mismatch_reason)?;
+            }
+        }
+        if let Some((steps, overflow_reason)) = step_counts {
+            checked_next_step_count(steps[index], overflow_reason)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate all active adaptive-optimizer parameters before any update. A
 /// restored late parameter can exhaust its clock even while earlier ones are
 /// valid; checking during the update loop would partially apply that step.
@@ -954,13 +1002,15 @@ fn preflight_adaptive_updates(
     second: &[Option<Vec<f64>>],
     overflow_reason: &'static str,
 ) -> Result<Vec<Option<(usize, u64)>>, AutogradError> {
-    for count in [step_counts.len(), first.len(), second.len()] {
-        ensure_state_len(
-            params.len(),
-            count,
-            "adaptive optimizer state parameter count mismatch",
-        )?;
-    }
+    preflight_optimizer_updates(
+        session,
+        params,
+        &[
+            (first, "adaptive optimizer moment state length mismatch"),
+            (second, "adaptive optimizer moment state length mismatch"),
+        ],
+        Some((step_counts, overflow_reason)),
+    )?;
     params
         .iter()
         .enumerate()
@@ -968,22 +1018,6 @@ fn preflight_adaptive_updates(
             let Some(grad_len) = session.tensor_accumulated_gradient_len(param)? else {
                 return Ok(None);
             };
-            if !matches!(
-                session.tensor_dtype(param)?,
-                ft_core::DType::F32 | ft_core::DType::F64
-            ) {
-                return Err(optimizer_state_error(
-                    "adaptive optimizer requires F32 or F64 parameters",
-                ));
-            }
-            ensure_grad_len_matches_param(param, session.tensor_values_len(param)?, grad_len)?;
-            for moment in [&first[index], &second[index]].into_iter().flatten() {
-                ensure_state_len(
-                    grad_len,
-                    moment.len(),
-                    "adaptive optimizer moment state length mismatch",
-                )?;
-            }
             Ok(Some((
                 grad_len,
                 checked_next_step_count(step_counts[index], overflow_reason)?,
@@ -1421,6 +1455,15 @@ impl Optimizer for SGD {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[(
+                &self.velocity,
+                "sgd optimizer state length mismatch with gradient length",
+            )],
+            None,
+        )?;
         for (i, &param) in self.params.iter().enumerate() {
             let grad_len = match session.tensor_accumulated_gradient_len(param)? {
                 Some(len) => len,
@@ -1721,6 +1764,25 @@ impl Optimizer for Adam {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[
+                (
+                    &self.m,
+                    "adam first-moment state length mismatch with gradient length",
+                ),
+                (
+                    &self.v,
+                    "adam second-moment state length mismatch with gradient length",
+                ),
+                (
+                    &self.v_max,
+                    "adam max-second-moment state length mismatch with gradient length",
+                ),
+            ],
+            Some((&self.step_counts, "adam step counter overflow")),
+        )?;
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad_len = match session.tensor_accumulated_gradient_len(param)? {
@@ -2076,6 +2138,25 @@ impl Optimizer for AdamW {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[
+                (
+                    &self.m,
+                    "adamw first-moment state length mismatch with gradient length",
+                ),
+                (
+                    &self.v,
+                    "adamw second-moment state length mismatch with gradient length",
+                ),
+                (
+                    &self.v_max,
+                    "adamw max-second-moment state length mismatch with gradient length",
+                ),
+            ],
+            Some((&self.step_counts, "adamw step counter overflow")),
+        )?;
 
         for (i, &param) in self.params.iter().enumerate() {
             // Zero-clone gradient access: read the gradient length via the cheap
@@ -2496,6 +2577,25 @@ impl Optimizer for RMSprop {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[
+                (
+                    &self.square_avg,
+                    "rmsprop square_avg state length mismatch with gradient length",
+                ),
+                (
+                    &self.grad_avg,
+                    "rmsprop grad_avg state length mismatch with gradient length",
+                ),
+                (
+                    &self.momentum_buffer,
+                    "rmsprop momentum_buffer state length mismatch with gradient length",
+                ),
+            ],
+            Some((&self.step_counts, "rmsprop step counter overflow")),
+        )?;
 
         // Fused parallel fast path for the DEFAULT config (centered=false,
         // momentum=0 — torch defaults, the dominant case): one in-place traversal
@@ -2847,6 +2947,15 @@ impl Optimizer for Adagrad {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[(
+                &self.sum_sq,
+                "adagrad sum_sq state length mismatch with gradient length",
+            )],
+            Some((&self.step_counts, "adagrad step counter overflow")),
+        )?;
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad_len = match session.tensor_accumulated_gradient_len(param)? {
@@ -3138,6 +3247,21 @@ impl Optimizer for RAdam {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[
+                (
+                    &self.m,
+                    "radam first-moment state length mismatch with gradient length",
+                ),
+                (
+                    &self.v,
+                    "radam second-moment state length mismatch with gradient length",
+                ),
+            ],
+            Some((&self.step_counts, "radam step counter overflow")),
+        )?;
 
         // Maximum length of the approximated SMA
         let rho_inf = 2.0 / (1.0 - self.beta2) - 1.0;
@@ -6858,6 +6982,18 @@ impl Optimizer for Adadelta {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[
+                (
+                    &self.square_avg,
+                    "adadelta square_avg state length mismatch",
+                ),
+                (&self.acc_delta, "adadelta acc_delta state length mismatch"),
+            ],
+            None,
+        )?;
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad_len = match session.tensor_accumulated_gradient_len(param)? {
@@ -7749,6 +7885,15 @@ impl Optimizer for Rprop {
         _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
+        preflight_optimizer_updates(
+            session,
+            &self.params,
+            &[
+                (&self.step_sizes, "rprop step_sizes state length mismatch"),
+                (&self.prev_grad, "rprop prev_grad state length mismatch"),
+            ],
+            None,
+        )?;
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad_len = match session.tensor_accumulated_gradient_len(param)? {
@@ -9880,6 +10025,202 @@ mod tests {
                     let mut json = serde_json::to_value(&before).unwrap();
                     json["state"][algorithm_key]["parameters"][1]["unexpected"] = true.into();
                     assert!(serde_json::from_value::<OptimizerStateDict>(json).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_checkpoint_later_clock_overflow_preserves_complete_batch() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F32, ft_core::DType::F64] {
+                for algorithm in 0..8 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let params: Vec<_> = [1.5, -0.75]
+                        .into_iter()
+                        .map(|value| {
+                            if dtype == ft_core::DType::F32 {
+                                session.tensor_variable_f32(vec![value as f32], vec![1], true)
+                            } else {
+                                session.tensor_variable(vec![value], vec![1], true)
+                            }
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                        0 | 1 => Box::new(Adam::new(params.clone(), 0.03).amsgrad(algorithm == 1)),
+                        2 | 3 => Box::new(AdamW::new(params.clone(), 0.03).amsgrad(algorithm == 3)),
+                        4 => Box::new(RMSprop::new(params.clone(), 0.03)),
+                        5 => Box::new(
+                            RMSprop::new(params.clone(), 0.03)
+                                .centered(true)
+                                .momentum(0.8),
+                        ),
+                        6 => Box::new(Adagrad::new(params.clone(), 0.03).lr_decay(0.2)),
+                        _ => Box::new(RAdam::new(params.clone(), 0.03)),
+                    };
+                    for &param in &params {
+                        session
+                            .tensor_set_accumulated_gradient(param, vec![1.0])
+                            .unwrap();
+                    }
+                    let dummy = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+                    let report = session.tensor_backward(dummy).unwrap();
+                    optimizer.step(&mut session, &report).unwrap();
+                    let mut saved = optimizer.state_dict(&session).unwrap();
+                    match &mut saved.state {
+                        OptimizerState::Adam(state) | OptimizerState::AdamW(state) => {
+                            state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                        }
+                        OptimizerState::Rmsprop(state) => {
+                            state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                        }
+                        OptimizerState::Adagrad(state) => {
+                            state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                        }
+                        OptimizerState::RAdam(state) => {
+                            state.parameters[1].as_mut().unwrap().step = u64::MAX;
+                        }
+                        _ => unreachable!(),
+                    }
+                    let encoded = serde_json::to_vec(&saved).unwrap();
+                    let restored = serde_json::from_slice(&encoded).unwrap();
+                    optimizer.load_state_dict(&session, &restored).unwrap();
+                    let before: Vec<_> = params
+                        .iter()
+                        .map(|&param| {
+                            (
+                                session.tensor_values_lossy_f64(param).unwrap(),
+                                session.tensor_snapshot(param).unwrap().version(),
+                                session.tensor_grad(param).unwrap(),
+                            )
+                        })
+                        .collect();
+                    let identity = Arc::clone(&optimizer.identity().0);
+                    let error = optimizer.step(&mut session, &report).unwrap_err();
+                    assert!(error.to_string().contains("step counter overflow"));
+                    assert_eq!(
+                        optimizer.state_dict(&session).unwrap(),
+                        saved,
+                        "algorithm={algorithm} mode={mode:?} dtype={dtype:?}"
+                    );
+                    assert!(Arc::ptr_eq(&identity, &optimizer.identity().0));
+                    for (index, &param) in params.iter().enumerate() {
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(param).unwrap(),
+                            before[index].0
+                        );
+                        assert_eq!(
+                            session.tensor_snapshot(param).unwrap().version(),
+                            before[index].1
+                        );
+                        assert_eq!(session.tensor_grad(param).unwrap(), before[index].2);
+                    }
+
+                    // Skipping the exhausted parameter immediately permits a
+                    // legitimate update, without resetting either saved clock.
+                    session.tensor_requires_grad_(params[1], false).unwrap();
+                    session.tensor_requires_grad_(params[1], true).unwrap();
+                    optimizer.step(&mut session, &report).unwrap();
+                    let after = optimizer.state_dict(&session).unwrap();
+                    let steps: Vec<_> = match &after.state {
+                        OptimizerState::Adam(state) | OptimizerState::AdamW(state) => state
+                            .parameters
+                            .iter()
+                            .map(|p| p.as_ref().unwrap().step)
+                            .collect(),
+                        OptimizerState::Rmsprop(state) => state
+                            .parameters
+                            .iter()
+                            .map(|p| p.as_ref().unwrap().step)
+                            .collect(),
+                        OptimizerState::Adagrad(state) => state
+                            .parameters
+                            .iter()
+                            .map(|p| p.as_ref().unwrap().step)
+                            .collect(),
+                        OptimizerState::RAdam(state) => state
+                            .parameters
+                            .iter()
+                            .map(|p| p.as_ref().unwrap().step)
+                            .collect(),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(steps, vec![2, u64::MAX]);
+                    assert_ne!(
+                        session.tensor_values_lossy_f64(params[0]).unwrap(),
+                        before[0].0
+                    );
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(params[1]).unwrap(),
+                        before[1].0
+                    );
+                    assert_eq!(
+                        session.tensor_snapshot(params[1]).unwrap().version(),
+                        before[1].1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimizer_invalid_later_dtype_does_not_advance_weights_or_lazy_state() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [ft_core::DType::F16, ft_core::DType::BF16] {
+                for algorithm in 0..14 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let first = session.tensor_variable(vec![1.5], vec![1], true).unwrap();
+                    let low_precision =
+                        DenseTensor::from_contiguous_values(vec![-0.75], vec![1], Device::Cpu)
+                            .unwrap()
+                            .to_dtype(dtype)
+                            .unwrap();
+                    let later = session.tensor_variable_from_storage(low_precision, true);
+                    let params = vec![first, later];
+                    let mut optimizer: Box<dyn Optimizer> = match algorithm {
+                        0 => Box::new(SGD::new(params, 0.03)),
+                        1 => Box::new(SGD::new(params, 0.03).momentum(0.8)),
+                        2 | 3 => Box::new(Adam::new(params, 0.03).amsgrad(algorithm == 3)),
+                        4 | 5 => Box::new(AdamW::new(params, 0.03).amsgrad(algorithm == 5)),
+                        6 => Box::new(RMSprop::new(params, 0.03)),
+                        7 => Box::new(RMSprop::new(params, 0.03).centered(true).momentum(0.8)),
+                        8 => Box::new(Adagrad::new(params, 0.03)),
+                        9 => Box::new(RAdam::new(params, 0.03)),
+                        10 => Box::new(Adadelta::new(params, 0.03)),
+                        11 => Box::new(Rprop::new(params, 0.03)),
+                        12 => Box::new(NAdam::new(params, 0.03)),
+                        _ => Box::new(Adamax::new(params, 0.03)),
+                    };
+                    let report = session.tensor_backward(first).unwrap();
+                    // A parameter without a gradient is still skipped even if
+                    // its storage dtype cannot be used for optimizer updates.
+                    optimizer.step(&mut session, &report).unwrap();
+                    session
+                        .tensor_set_accumulated_gradient(later, vec![1.0])
+                        .unwrap();
+                    let saved = optimizer.state_dict(&session).unwrap();
+                    let value = session.tensor_values(first).unwrap();
+                    let version = session.tensor_snapshot(first).unwrap().version();
+                    let error = optimizer.step(&mut session, &report).unwrap_err();
+                    assert!(error.to_string().contains("F32 or F64"));
+                    assert_eq!(
+                        optimizer.state_dict(&session).unwrap(),
+                        saved,
+                        "algorithm={algorithm} mode={mode:?} dtype={dtype:?}"
+                    );
+                    assert_eq!(session.tensor_values(first).unwrap(), value);
+                    assert_eq!(session.tensor_snapshot(first).unwrap().version(), version);
+                    assert_eq!(session.tensor_values_lossy_f64(later).unwrap(), vec![-0.75]);
+                    assert_eq!(session.tensor_snapshot(later).unwrap().version(), 0);
+                    assert_eq!(
+                        session.tensor_accumulated_gradient(first).unwrap(),
+                        Some(vec![1.0])
+                    );
+                    assert_eq!(
+                        session.tensor_accumulated_gradient(later).unwrap(),
+                        Some(vec![1.0])
+                    );
                 }
             }
         }
