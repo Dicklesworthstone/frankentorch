@@ -20403,9 +20403,16 @@ pub fn gaussian_nll_backward_f64(
             let d = target[i] - input[i];
             let v = var[i];
             let dl = dloss[i];
-            *dii = dl * (-d) / v;
-            *dti = dl * d / v;
-            *dvi = dl * 0.5 * (1.0 / v - d * d / (v * v));
+            // Divide the incoming half-gradient before multiplying by the
+            // squared-residual derivative, as in the composed PyTorch graph.
+            // Multiplying dl*d first can overflow for a finite final adjoint.
+            let half_grad = dl * 0.5;
+            let scaled_half_grad = half_grad / v;
+            *dii = scaled_half_grad * (-2.0 * d);
+            *dti = -*dii;
+            // Match the division adjoint's sequential quotients. v*v can
+            // overflow even when d*d/v/v and the complete gradient are finite.
+            *dvi = scaled_half_grad - half_grad * ((d * d / v) / v);
         });
     (di, dt, dv)
 }

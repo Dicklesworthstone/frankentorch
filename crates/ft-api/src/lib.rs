@@ -17696,12 +17696,17 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        // No-grad fast path: the composed mul + neg + exp + full + add + log (~6 passes)
-        // measured 2.02x SLOWER than torch. For no-grad equal-shape contiguous f64, borrow
-        // both and compute log(1 + exp(-target*input)) in ONE parallel pass, then reduce.
-        // Bit-exact with the composed path (same target*input, exp, 1+exp, libm ln, and the
-        // same tensor_mean/sum reduction). grad / non-f64 / non-contiguous / bad-reduction
-        // fall through.
+        if !matches!(reduction, "none" | "mean" | "sum") {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "soft_margin_loss: reduction must be 'none', 'mean', or 'sum'",
+                },
+            )));
+        }
+        // Fuse PyTorch's neg/mul/exp/log1p evaluation for contiguous no-grad
+        // inputs. log1p preserves small positive losses when exp(-target*input)
+        // is too small to change 1.0 in the input dtype. The composed training
+        // path below uses the same evaluation, including overflow behavior.
         if matches!(reduction, "none" | "mean" | "sum")
             && !self.tensor_requires_grad(input)?
             && !self.tensor_requires_grad(target)?
@@ -17721,7 +17726,7 @@ impl FrankenTorchSession {
                         let out: Vec<f64> = xd
                             .par_iter()
                             .zip(td.par_iter())
-                            .map(|(&x, &t)| (1.0 + (-(t * x)).exp()).ln())
+                            .map(|(&x, &t)| ((-x) * t).exp().ln_1p())
                             .collect();
                         Some(out)
                     } else {
@@ -17763,7 +17768,7 @@ impl FrankenTorchSession {
                         let out: Vec<f32> = xd
                             .par_iter()
                             .zip(td.par_iter())
-                            .map(|(&x, &t)| (1.0_f32 + (-(t * x)).exp()).ln())
+                            .map(|(&x, &t)| ((-x) * t).exp().ln_1p())
                             .collect();
                         Some(out)
                     } else {
@@ -17782,12 +17787,10 @@ impl FrankenTorchSession {
                 };
             }
         }
-        let prod = self.tensor_mul(target, input)?;
-        let neg_prod = self.tensor_neg(prod)?;
+        let neg_input = self.tensor_neg(input)?;
+        let neg_prod = self.tensor_mul(neg_input, target)?;
         let exp_term = self.tensor_exp(neg_prod)?;
-        let ones = self.full_like(exp_term, 1.0, false)?;
-        let one_plus_exp = self.tensor_add(ones, exp_term)?;
-        let loss = self.tensor_log(one_plus_exp)?;
+        let loss = self.tensor_log1p(exp_term)?;
         match reduction {
             "none" => Ok(loss),
             "mean" => self.tensor_mean(loss),
@@ -17817,16 +17820,181 @@ impl FrankenTorchSession {
         reduction: &str,
         full: bool,
     ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gaussian_nll_loss_with_eps(input, target, var, reduction, full, 1e-6)
+    }
+
+    /// Gaussian NLL with an explicit variance floor and reduction.
+    ///
+    /// The variance floor changes forward values but has an identity derivative,
+    /// matching PyTorch's clone followed by a clamp under `no_grad`. Variances
+    /// may match the input, omit its last axis, or broadcast one singleton axis.
+    pub fn tensor_gaussian_nll_loss_with_eps(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        var: TensorNodeId,
+        reduction: &str,
+        full: bool,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let invalid = |reason| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+            ))
+        };
+        if !matches!(reduction, "none" | "mean" | "sum") {
+            return Err(invalid(
+                "gaussian_nll_loss: reduction must be 'none', 'mean', or 'sum'",
+            ));
+        }
+        // Validate every operand before creating graph nodes. In particular,
+        // invalid variances must not partially append a training graph.
+        let input_meta = self.tensor_tape.tensor_meta(input)?;
+        let target_meta = self.tensor_tape.tensor_meta(target)?;
+        let var_meta = self.tensor_tape.tensor_meta(var)?;
+        let var_dtype = var_meta.dtype();
+        if [input_meta.dtype(), target_meta.dtype(), var_dtype]
+            .iter()
+            .any(|dtype| !dtype.is_floating_point())
+            || target_meta.device() != input_meta.device()
+            || var_meta.device() != input_meta.device()
+        {
+            return Err(invalid(
+                "gaussian_nll_loss: inputs must share a device and have floating-point dtypes",
+            ));
+        }
+        let in_shape = input_meta.shape().to_vec();
+        let mut var_shape = var_meta.shape().to_vec();
+        if var_shape != in_shape {
+            if in_shape.split_last().map(|(_, prefix)| prefix) == Some(var_shape.as_slice()) {
+                var_shape.push(1);
+            } else if var_shape.len() != in_shape.len()
+                || var_shape
+                    .iter()
+                    .zip(&in_shape)
+                    .filter(|(v, x)| v != x)
+                    .count()
+                    != 1
+                || var_shape
+                    .iter()
+                    .zip(&in_shape)
+                    .any(|(&v, &x)| v != x && v != 1)
+            {
+                return Err(invalid("gaussian_nll_loss: var is of incorrect size"));
+            }
+        }
+        let difference_shape = Self::broadcast_shape(&in_shape, target_meta.shape())?;
+        Self::broadcast_shape(&difference_shape, &var_shape)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let floor = match var_dtype {
+            DType::F32 => f64::from(eps as f32),
+            DType::F16 | DType::BF16 => {
+                DenseTensor::from_contiguous_values(vec![eps], vec![], var_meta.device())?
+                    .to_dtype(var_dtype)?
+                    .contiguous_values_as_f64()?[0]
+            }
+            _ => eps,
+        };
+        let variance = self.tensor_tape.tensor(var)?;
+        let inspect = |values: &mut dyn Iterator<Item = f64>| {
+            values.fold((false, floor.is_nan()), |(negative, clamp), value| {
+                (negative || value < 0.0, clamp || value < floor)
+            })
+        };
+        let (negative, needs_clamp) = if variance.meta().is_contiguous() {
+            match var_dtype {
+                DType::F32 => inspect(
+                    &mut variance
+                        .contiguous_values_f32()?
+                        .iter()
+                        .map(|&v| f64::from(v)),
+                ),
+                DType::F64 => inspect(&mut variance.contiguous_values()?.iter().copied()),
+                _ => inspect(&mut variance.contiguous_values_as_f64()?.into_iter()),
+            }
+        } else {
+            inspect(&mut variance.contiguous_values_as_f64()?.into_iter())
+        };
+        if negative {
+            return Err(invalid("gaussian_nll_loss: var has negative entries"));
+        }
+        let var = if self.tensor_shape(var)? == var_shape {
+            var
+        } else {
+            self.tensor_reshape(var, var_shape)?
+        };
+        let needs_variance_copy = needs_clamp
+            || (self.is_grad_enabled()
+                && (self.tensor_requires_grad(input)?
+                    || self.tensor_requires_grad(target)?
+                    || self.tensor_requires_grad(var)?));
+        let var = if needs_variance_copy {
+            // Mutate only this fresh identity node, before any consumer exists.
+            // Its identity edges retain d(clamped_var)/d(var) = 1 at every
+            // derivative order, without inf-inf straight-through arithmetic or
+            // changing the caller's tensor, version, or gradient mode.
+            let copy = self.tensor_mul_scalar(var, 1.0)?;
+            // MulScalar promotes half storage to F32. Restore the original
+            // variance precision before replacing its freshly copied values;
+            // the differentiable cast also has an identity backward edge.
+            let copy = self.tensor_to_dtype(copy, var_dtype)?;
+            if needs_clamp && var_dtype == DType::F32 {
+                #[allow(clippy::cast_possible_truncation)]
+                let floor = floor as f32;
+                self.tensor_tape
+                    .update_tensor_values_f32_with(copy, |values| {
+                        for value in values {
+                            if floor.is_nan() || *value < floor {
+                                *value = floor;
+                            }
+                        }
+                    })?;
+            } else if needs_clamp && var_dtype == DType::F64 {
+                self.tensor_tape.update_tensor_values_with(copy, |values| {
+                    for value in values {
+                        if floor.is_nan() || *value < floor {
+                            *value = floor;
+                        }
+                    }
+                })?;
+            } else if needs_clamp {
+                let tensor = self.tensor_tape.tensor(copy)?;
+                let values = tensor
+                    .contiguous_values_as_f64()?
+                    .into_iter()
+                    .map(|value| {
+                        if floor.is_nan() || value < floor {
+                            floor
+                        } else {
+                            value
+                        }
+                    })
+                    .collect();
+                let clamped = DenseTensor::from_contiguous_values(
+                    values,
+                    tensor.meta().shape().to_vec(),
+                    tensor.meta().device(),
+                )?
+                .to_dtype(var_dtype)?;
+                self.tensor_tape
+                    .copy_tensors_from_storage(&[(copy, clamped)])?;
+            }
+            copy
+        } else {
+            var
+        };
         // Fused fast path (f64, same-shape input/target/var): per-element Gaussian
         // NLL in one pass, then the reduction — never the ~7 op-graph intermediates.
         // Broadcast / non-f64 fall through.
-        let in_shape = self.tensor_shape(input)?;
         if matches!(reduction, "none" | "mean" | "sum")
             && self.tensor_dtype(input)? == DType::F64
             && self.tensor_dtype(target)? == DType::F64
             && self.tensor_dtype(var)? == DType::F64
             && self.tensor_shape(target)? == in_shape
             && self.tensor_shape(var)? == in_shape
+            && self.tensor_tape.tensor_meta(input)?.is_contiguous()
+            && self.tensor_tape.tensor_meta(target)?.is_contiguous()
+            && self.tensor_tape.tensor_meta(var)?.is_contiguous()
         {
             let needs_grad = self.tensor_tape.tensor_requires_grad(input)?
                 || self.tensor_tape.tensor_requires_grad(target)?
@@ -17871,26 +18039,49 @@ impl FrankenTorchSession {
                 // into the ctx via save_for_backward (3x full-size clones per
                 // call — the dominant grad-path cost for large losses; the
                 // session tape never frees them, frankentorch-gmuml/3jmy3).
-                self.tensor_apply_function_f64_borrowed_inputs(
-                    &[input, target, var],
-                    move |_ctx, ins| {
-                        let (xv, xs) = ins[0];
-                        let (tv, _) = ins[1];
-                        let (vv, _) = ins[2];
-                        let out = ft_kernel_cpu::gaussian_nll_forward_f64(xv, tv, vv, fl);
-                        Ok((out, xs.to_vec()))
-                    },
-                    move |_ctx, grad_outputs, borrowed| {
-                        let dl = grad_outputs[0];
-                        let (di, dt, dv) = ft_kernel_cpu::gaussian_nll_backward_f64(
-                            dl,
-                            borrowed[0].0,
-                            borrowed[1].0,
-                            borrowed[2].0,
-                        );
-                        Ok(vec![Some(di), Some(dt), Some(dv)])
-                    },
-                )?
+                self.tensor_tape
+                    .apply_function_with_create_graph_borrowed_inputs(
+                        &[input, target, var],
+                        move |_ctx, ins| {
+                            let (xv, xs) = ins[0];
+                            let (tv, _) = ins[1];
+                            let (vv, _) = ins[2];
+                            let out = ft_kernel_cpu::gaussian_nll_forward_f64(xv, tv, vv, fl);
+                            Ok((out, xs.to_vec()))
+                        },
+                        move |_ctx, grad_outputs, borrowed| {
+                            let dl = grad_outputs[0];
+                            let (di, dt, dv) = ft_kernel_cpu::gaussian_nll_backward_f64(
+                                dl,
+                                borrowed[0].0,
+                                borrowed[1].0,
+                                borrowed[2].0,
+                            );
+                            Ok(vec![Some(di), Some(dt), Some(dv)])
+                        },
+                        move |ctx, grad_outputs, inputs, tape| {
+                            let mode = ExecutionMode::Strict;
+                            let difference = tape.sub(inputs[0], inputs[1], mode)?.0;
+                            let half_grad = tape.mul_scalar(grad_outputs[0], 0.5)?.0;
+                            let log_grad = tape.div(half_grad, inputs[2], mode)?.0;
+                            let twice_difference = tape.mul_scalar(difference, 2.0)?.0;
+                            let di = tape.mul(log_grad, twice_difference, mode)?.0;
+                            let dt = tape.neg(di, mode)?.0;
+                            let difference_squared = tape.mul(difference, difference, mode)?.0;
+                            // Keep the two divisions in PyTorch's denominator
+                            // adjoint. Squaring a large finite variance overflows
+                            // and silently removes this gradient contribution.
+                            let ratio = tape.div(difference_squared, inputs[2], mode)?.0;
+                            let ratio = tape.div(ratio, inputs[2], mode)?.0;
+                            let ratio_grad = tape.mul(half_grad, ratio, mode)?.0;
+                            let dv = tape.sub(log_grad, ratio_grad, mode)?.0;
+                            Ok([di, dt, dv]
+                                .into_iter()
+                                .zip(ctx.needs_input_grad())
+                                .map(|(node, &needed)| needed.then_some(node))
+                                .collect())
+                        },
+                    )?
             } else {
                 // Borrow the three contiguous inputs (the kernel only READS them);
                 // tensor_values CLONES 3x full-size buffers, which dominated the no-grad
@@ -17997,15 +18188,14 @@ impl FrankenTorchSession {
         let scaled = self.tensor_div(diff_sq, var)?;
         let log_var = self.tensor_log(var)?;
         let term = self.tensor_add(log_var, scaled)?;
+        let term_dtype = self.tensor_dtype(term)?;
+        let loss = self.tensor_mul_scalar(term, 0.5)?;
+        let loss = self.tensor_to_dtype(loss, term_dtype)?;
         let loss = if full {
-            let shape = self.tensor_shape(term)?;
-            let log_2pi = self.full(shape, (2.0 * std::f64::consts::PI).ln(), false)?;
-            let with_const = self.tensor_add(term, log_2pi)?;
-            let half = self.full(self.tensor_shape(with_const)?, 0.5, false)?;
-            self.tensor_mul(half, with_const)?
+            let offset = self.full_like(loss, 0.5 * (2.0 * std::f64::consts::PI).ln(), false)?;
+            self.tensor_add(loss, offset)?
         } else {
-            let half = self.full(self.tensor_shape(term)?, 0.5, false)?;
-            self.tensor_mul(half, term)?
+            loss
         };
         match reduction {
             "none" => Ok(loss),
@@ -66494,31 +66684,7 @@ impl FrankenTorchSession {
         full: bool,
         eps: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = self.tensor_shape(input)?;
-        // Compose through autograd primitives so gradients flow to
-        // input / target / var. Tracked under frankentorch-vjow
-        // (child of frankentorch-2med). Math:
-        //   v'      = max(var, eps)
-        //   diff    = input - target
-        //   loss_i  = 0.5 * (log(v') + diff^2 / v')
-        //   loss    = mean(loss_i) [+ 0.5 * log(2π) if full]
-        let v_clamped = self.tensor_clamp_min(var, eps)?;
-        let log_v = self.tensor_log(v_clamped)?;
-        let diff = self.tensor_sub(input, target)?;
-        let diff_sq = self.tensor_mul(diff, diff)?;
-        let ratio = self.tensor_div(diff_sq, v_clamped)?;
-        let sum_term = self.tensor_add(log_v, ratio)?;
-        let half = self.full(shape, 0.5, false)?;
-        let per_elem = self.tensor_mul(sum_term, half)?;
-        let main = self.tensor_mean(per_elem)?;
-
-        if full {
-            let const_offset = 0.5 * (2.0 * std::f64::consts::PI).ln();
-            let offset_t = self.full(vec![1], const_offset, false)?;
-            self.tensor_add(main, offset_t)
-        } else {
-            Ok(main)
-        }
+        self.tensor_gaussian_nll_loss_with_eps(input, target, var, "mean", full, eps)
     }
 
     /// Soft margin loss.
@@ -66530,27 +66696,10 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // Compose through autograd-aware primitives so gradients flow
-        // to input (target is typically constant ±1 but the formula
-        // treats it as a tensor for full generality).
-        // Math: with z = -t * x,
-        //     soft_margin = log1p(exp(z))
-        //                 = max(0, z) + log1p(exp(-|z|))
-        //                 = relu(z) + log1p(exp(-abs(z)))
-        // Same numerical-stability form as the prior body. Tracked
-        // under frankentorch-tr2a — previously this body extracted
-        // values, computed the per-element loss in plain f64, and
-        // built a requires_grad=false leaf, silently severing the
-        // tape.
-        let neg_target = self.tensor_neg(target)?;
-        let z = self.tensor_mul(neg_target, input)?;
-        let relu_z = self.tensor_relu(z)?;
-        let abs_z = self.tensor_abs(z)?;
-        let neg_abs_z = self.tensor_neg(abs_z)?;
-        let exp_neg_abs = self.tensor_exp(neg_abs_z)?;
-        let log_term = self.tensor_log1p(exp_neg_abs)?;
-        let loss_per_elem = self.tensor_add(relu_z, log_term)?;
-        self.tensor_mean(loss_per_elem)
+        // Share the smooth logistic derivative and PyTorch's exp/log1p
+        // evaluation with the reduction-aware entry point. Differentiating
+        // relu(z) + log1p(exp(-abs(z))) gives the wrong derivative at z = 0.
+        self.tensor_soft_margin_loss(input, target, "mean")
     }
 
     /// Multi-class margin (hinge) loss.
@@ -143003,6 +143152,584 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_nll_clamped_variance_retains_four_derivative_orders() {
+        // For d=x-t and v=max(raw_v, eps), PyTorch differentiates the
+        // clamped value as an identity: L_v=.5/v-.5*d²/v²,
+        // L_vv=-.5/v²+d²/v³, L_vvv=1/v³-3*d²/v⁴.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for raw_variance in [0.0, 0.25, 0.5, 2.0] {
+                    for full in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let x = probability_bce_tensor(&mut session, &[2.0], vec![1], dtype, true);
+                        let target =
+                            probability_bce_tensor(&mut session, &[1.0], vec![1], dtype, true);
+                        let variance = probability_bce_tensor(
+                            &mut session,
+                            &[raw_variance],
+                            vec![1],
+                            dtype,
+                            true,
+                        );
+                        let version = session.tensor_tape.tensor(variance).unwrap().version();
+                        let loss = session
+                            .gaussian_nll_loss(x, target, variance, full, 0.5)
+                            .unwrap();
+                        let v = raw_variance.max(0.5);
+                        let constant = if full {
+                            0.5 * (2.0 * std::f64::consts::PI).ln()
+                        } else {
+                            0.0
+                        };
+                        let expected_loss = 0.5 * (v.ln() + 1.0 / v) + constant;
+                        assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                        assert!(
+                            (session.tensor_values_lossy_f64(loss).unwrap()[0] - expected_loss)
+                                .abs()
+                                < 2e-7
+                        );
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(variance).unwrap(),
+                            [raw_variance]
+                        );
+                        assert_eq!(
+                            session.tensor_tape.tensor(variance).unwrap().version(),
+                            version
+                        );
+                        let options = BackwardOptions::for_mode(mode)
+                            .with_create_graph(true)
+                            .with_retain_graph(true);
+                        let first = session.tensor_backward_with_options(loss, options).unwrap();
+                        assert_eq!(first.gradient(x).unwrap(), &[1.0 / v]);
+                        assert_eq!(first.gradient(target).unwrap(), &[-1.0 / v]);
+                        let expected = [
+                            0.5 / v - 0.5 / v.powi(2),
+                            -0.5 / v.powi(2) + 1.0 / v.powi(3),
+                            1.0 / v.powi(3) - 3.0 / v.powi(4),
+                            -3.0 / v.powi(4) + 12.0 / v.powi(5),
+                        ];
+                        assert_eq!(first.gradient(variance).unwrap(), &[expected[0]]);
+                        let mut root = first.gradient_node(variance).unwrap();
+                        for (order, &expected) in expected.iter().enumerate().skip(1) {
+                            let report = session
+                                .tensor_backward_with_options(
+                                    root,
+                                    options.with_create_graph(order < 3),
+                                )
+                                .unwrap();
+                            let actual = report.gradient(variance).unwrap()[0];
+                            assert!(
+                                (actual - expected).abs() <= 1e-10 * expected.abs().max(1.0),
+                                "{mode:?}/{dtype:?}, variance={raw_variance}, order={}: {actual} != {expected}",
+                                order + 1
+                            );
+                            if order < 3 {
+                                root = report.gradient_node(variance).unwrap();
+                            }
+                        }
+                        let mixed = session
+                            .tensor_backward_with_options(first.gradient_node(x).unwrap(), options)
+                            .unwrap();
+                        assert_eq!(mixed.gradient(x).unwrap(), &[1.0 / v]);
+                        assert_eq!(mixed.gradient(target).unwrap(), &[-1.0 / v]);
+                        assert_eq!(mixed.gradient(variance).unwrap(), &[-1.0 / v.powi(2)]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_half_variance_floor_preserves_weighted_identity_gradients() {
+        // eps rounds to .5 in both half formats. With differences [1, 2],
+        // clamped variances [.5, 2], and weights [2, -.5], the gradients
+        // and variance curvature below are exact dyadic values.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F16, DType::BF16] {
+                for full in [false, true] {
+                    for create_graph in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let x =
+                            probability_bce_tensor(&mut session, &[2.0, 3.0], vec![2], dtype, true);
+                        let target =
+                            probability_bce_tensor(&mut session, &[1.0, 1.0], vec![2], dtype, true);
+                        let variance = probability_bce_tensor(
+                            &mut session,
+                            &[0.25, 2.0],
+                            vec![2],
+                            dtype,
+                            true,
+                        );
+                        let weights = probability_bce_tensor(
+                            &mut session,
+                            &[2.0, -0.5],
+                            vec![2],
+                            dtype,
+                            true,
+                        );
+                        let version = session.tensor_tape.tensor(variance).unwrap().version();
+                        let loss = session
+                            .tensor_gaussian_nll_loss_with_eps(
+                                x, target, variance, "none", full, 0.5001,
+                            )
+                            .unwrap();
+                        assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                        assert_eq!(session.tensor_shape(loss).unwrap(), [2]);
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(variance).unwrap(),
+                            [0.25, 2.0]
+                        );
+                        assert_eq!(
+                            session.tensor_tape.tensor(variance).unwrap().version(),
+                            version
+                        );
+                        let constant = if full {
+                            0.5 * (2.0 * std::f64::consts::PI).ln()
+                        } else {
+                            0.0
+                        };
+                        let expected = [
+                            1.0 + 0.5 * 0.5_f64.ln() + constant,
+                            1.0 + 0.5 * 2.0_f64.ln() + constant,
+                        ];
+                        let tolerance = if dtype == DType::F16 { 2e-3 } else { 2e-2 };
+                        for (&actual, &expected) in session
+                            .tensor_values_lossy_f64(loss)
+                            .unwrap()
+                            .iter()
+                            .zip(&expected)
+                        {
+                            assert!((actual - expected).abs() < tolerance);
+                        }
+                        let root = session.tensor_mul(loss, weights).unwrap();
+                        let options = BackwardOptions::for_mode(mode)
+                            .with_create_graph(create_graph)
+                            .with_retain_graph(true);
+                        let report = session.tensor_backward_with_options(root, options).unwrap();
+                        assert_eq!(report.gradient(x).unwrap(), &[4.0, -0.5]);
+                        assert_eq!(report.gradient(target).unwrap(), &[-4.0, 0.5]);
+                        assert_eq!(report.gradient(variance).unwrap(), &[-2.0, 0.125]);
+                        if create_graph {
+                            let second = session
+                                .tensor_backward_with_options(
+                                    report.gradient_node(variance).unwrap(),
+                                    options,
+                                )
+                                .unwrap();
+                            assert_eq!(second.gradient(variance).unwrap(), &[12.0, -0.1875]);
+                        }
+                        session.no_grad_enter();
+                        let evaluation = session
+                            .tensor_gaussian_nll_loss_with_eps(
+                                x, target, variance, "none", full, 0.5001,
+                            )
+                            .unwrap();
+                        session.no_grad_exit();
+                        assert_eq!(session.tensor_dtype(evaluation).unwrap(), dtype);
+                        assert!(!session.tensor_requires_grad(evaluation).unwrap());
+                        assert_eq!(
+                            session.tensor_values_lossy_f64(evaluation).unwrap(),
+                            session.tensor_values_lossy_f64(loss).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_broadcasts_homoscedastic_variance_and_weighted_gradients() {
+        // Two observations per variance, with independently weighted losses.
+        // Targets broadcast by row; variances may omit the final axis.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for variance_shape in [vec![2], vec![2, 1]] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = probability_bce_tensor(
+                        &mut session,
+                        &[2.0, 3.0, 4.0, 5.0],
+                        vec![2, 2],
+                        dtype,
+                        true,
+                    );
+                    let target =
+                        probability_bce_tensor(&mut session, &[1.0, 2.0], vec![2, 1], dtype, true);
+                    let variance = probability_bce_tensor(
+                        &mut session,
+                        &[0.0, 2.0],
+                        variance_shape.clone(),
+                        dtype,
+                        true,
+                    );
+                    let weights = probability_bce_tensor(
+                        &mut session,
+                        &[1.0, -0.5, 2.0, 1.0],
+                        vec![2, 2],
+                        dtype,
+                        true,
+                    );
+                    let per = session
+                        .tensor_gaussian_nll_loss_with_eps(x, target, variance, "none", true, 0.5)
+                        .unwrap();
+                    assert_eq!(session.tensor_shape(per).unwrap(), [2, 2]);
+                    assert_eq!(session.tensor_dtype(per).unwrap(), dtype);
+                    let root = session.tensor_mul(per, weights).unwrap();
+                    let options = BackwardOptions::for_mode(mode)
+                        .with_create_graph(true)
+                        .with_retain_graph(true);
+                    let first = session.tensor_backward_with_options(root, options).unwrap();
+                    assert_eq!(first.gradient(x).unwrap(), &[2.0, -2.0, 2.0, 1.5]);
+                    assert_eq!(first.gradient(target).unwrap(), &[0.0, -3.5]);
+                    assert_eq!(first.gradient(variance).unwrap(), &[2.5, -1.375]);
+                    let second = session
+                        .tensor_backward_with_options(
+                            first.gradient_node(variance).unwrap(),
+                            options,
+                        )
+                        .unwrap();
+                    assert_eq!(second.gradient(variance).unwrap(), &[-9.0, 1.75]);
+                    let mixed = session
+                        .tensor_backward_with_options(first.gradient_node(x).unwrap(), options)
+                        .unwrap();
+                    assert_eq!(mixed.gradient(weights).unwrap(), &[2.0, 4.0, 1.0, 1.5]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_default_floor_and_empty_reductions_match_across_routes() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for requires_grad in [false, true] {
+                    for reduction in ["none", "mean", "sum"] {
+                        for empty in [false, true] {
+                            let mut session = FrankenTorchSession::new(mode);
+                            let (values, variances, shape) = if empty {
+                                (vec![], vec![], vec![0, 2])
+                            } else {
+                                (vec![0.0, 0.0], vec![0.0, 0.5], vec![2])
+                            };
+                            let x = probability_bce_tensor(
+                                &mut session,
+                                &values,
+                                shape.clone(),
+                                dtype,
+                                requires_grad,
+                            );
+                            let target = probability_bce_tensor(
+                                &mut session,
+                                &values,
+                                shape.clone(),
+                                dtype,
+                                false,
+                            );
+                            let variance = probability_bce_tensor(
+                                &mut session,
+                                &variances,
+                                shape,
+                                dtype,
+                                requires_grad,
+                            );
+                            let result = session
+                                .tensor_gaussian_nll_loss(x, target, variance, reduction, false)
+                                .unwrap();
+                            assert_eq!(session.tensor_dtype(result).unwrap(), dtype);
+                            assert_eq!(
+                                session.tensor_requires_grad(result).unwrap(),
+                                requires_grad
+                            );
+                            let actual = session.tensor_values_lossy_f64(result).unwrap();
+                            if empty {
+                                match reduction {
+                                    "none" => assert!(actual.is_empty()),
+                                    "mean" => assert!(actual[0].is_nan()),
+                                    _ => assert_eq!(actual, [0.0]),
+                                }
+                            } else {
+                                let expected = [0.5 * 1e-6_f64.ln(), 0.5 * 0.5_f64.ln()];
+                                let expected = match reduction {
+                                    "none" => expected.to_vec(),
+                                    "mean" => vec![(expected[0] + expected[1]) / 2.0],
+                                    _ => vec![expected[0] + expected[1]],
+                                };
+                                for (&actual, expected) in actual.iter().zip(expected) {
+                                    assert!((actual - expected).abs() < 1e-6);
+                                }
+                            }
+                            if requires_grad {
+                                let report = session
+                                    .tensor_backward_with_options(
+                                        result,
+                                        BackwardOptions::for_mode(mode).with_create_graph(true),
+                                    )
+                                    .unwrap();
+                                assert_eq!(report.gradient(x).unwrap().len(), values.len());
+                                assert_eq!(
+                                    report.gradient(variance).unwrap().len(),
+                                    variances.len()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_variance_clamp_preserves_nonfinite_values_and_strided_inputs() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for requires_grad in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let meta = TensorMeta::from_shape_and_strides(
+                        vec![2, 2],
+                        vec![1, 2],
+                        1,
+                        dtype,
+                        Device::Cpu,
+                    )
+                    .unwrap();
+                    let values = vec![99.0, 2.0, 4.0, 3.0, 5.0, 99.0];
+                    let tensor = if dtype == DType::F32 {
+                        DenseTensor::from_storage_f32(
+                            meta,
+                            values.iter().map(|&v| v as f32).collect(),
+                        )
+                        .unwrap()
+                    } else {
+                        DenseTensor::from_storage(meta, values).unwrap()
+                    };
+                    let x = session.tensor_variable_from_storage(tensor, requires_grad);
+                    let target =
+                        probability_bce_tensor(&mut session, &[1.0; 4], vec![2, 2], dtype, false);
+                    let variance = probability_bce_tensor(
+                        &mut session,
+                        &[0.0, 0.5, 2.0, 4.0],
+                        vec![2, 2],
+                        dtype,
+                        requires_grad,
+                    );
+                    let loss = session
+                        .tensor_gaussian_nll_loss_with_eps(x, target, variance, "none", false, 0.5)
+                        .unwrap();
+                    let expected = [
+                        1.0 + 0.5 * 0.5_f64.ln(),
+                        4.0 + 0.5 * 0.5_f64.ln(),
+                        2.25 + 0.5 * 2.0_f64.ln(),
+                        2.0 + 0.5 * 4.0_f64.ln(),
+                    ];
+                    for (&actual, expected) in session
+                        .tensor_values_lossy_f64(loss)
+                        .unwrap()
+                        .iter()
+                        .zip(expected)
+                    {
+                        assert!(
+                            (actual - expected).abs() < 5e-7,
+                            "{dtype:?}: {actual} != {expected}"
+                        );
+                    }
+                    if requires_grad {
+                        let report = session
+                            .tensor_backward_with_options(
+                                loss,
+                                BackwardOptions::for_mode(mode).with_create_graph(true),
+                            )
+                            .unwrap();
+                        assert_eq!(report.gradient(x).unwrap(), &[2.0, 4.0, 1.5, 1.0]);
+                    }
+
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = probability_bce_tensor(
+                        &mut session,
+                        &[1.0; 3],
+                        vec![3],
+                        dtype,
+                        requires_grad,
+                    );
+                    let target =
+                        probability_bce_tensor(&mut session, &[0.0; 3], vec![3], dtype, false);
+                    let variance = probability_bce_tensor(
+                        &mut session,
+                        &[0.0, f64::INFINITY, f64::NAN],
+                        vec![3],
+                        dtype,
+                        requires_grad,
+                    );
+                    let loss = session
+                        .tensor_gaussian_nll_loss_with_eps(x, target, variance, "none", false, 0.5)
+                        .unwrap();
+                    let actual = session.tensor_values_lossy_f64(loss).unwrap();
+                    assert!(actual[0].is_finite());
+                    assert_eq!(actual[1], f64::INFINITY);
+                    assert!(actual[2].is_nan());
+                    let original = session.tensor_values_lossy_f64(variance).unwrap();
+                    assert_eq!(original[0], 0.0);
+                    assert_eq!(original[1], f64::INFINITY);
+                    assert!(original[2].is_nan());
+                    if requires_grad {
+                        let report = session.tensor_backward(loss).unwrap();
+                        assert_eq!(&report.gradient(x).unwrap()[..2], &[2.0, 0.0]);
+                        assert_eq!(&report.gradient(variance).unwrap()[..2], &[-1.0, 0.0]);
+                        assert!(report.gradient(variance).unwrap()[2].is_nan());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_large_finite_variance_uses_sequential_quotients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for create_graph in [false, true] {
+                let mut session = FrankenTorchSession::new(mode);
+                let x = session.tensor_variable(vec![1e154], vec![1], true).unwrap();
+                let target = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+                let variance = session.tensor_variable(vec![1e308], vec![1], true).unwrap();
+                let loss = session
+                    .tensor_gaussian_nll_loss(x, target, variance, "sum", false)
+                    .unwrap();
+                assert!(session.tensor_values(loss).unwrap()[0].is_finite());
+                let report = session
+                    .tensor_backward_with_options(
+                        loss,
+                        BackwardOptions::for_mode(mode).with_create_graph(create_graph),
+                    )
+                    .unwrap();
+                // At x²=v the two variance contributions cancel. Forming
+                // v*v instead of (x²/v)/v silently loses one contribution.
+                let dx = report.gradient(x).unwrap()[0];
+                assert!((dx / 1e-154 - 1.0).abs() < 1e-14);
+                assert!(
+                    report.gradient(variance).unwrap()[0].abs() < 1e-322,
+                    "{mode:?}, create_graph={create_graph}: {:?}",
+                    report.gradient(variance)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_large_incoming_gradient_preserves_finite_input_adjoint() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for create_graph in [false, true] {
+                let mut session = FrankenTorchSession::new(mode);
+                let x = session
+                    .tensor_variable(vec![2.0_f64.powi(500)], vec![1], true)
+                    .unwrap();
+                let target = session.tensor_variable(vec![0.0], vec![1], true).unwrap();
+                let variance = session
+                    .tensor_variable(vec![2.0_f64.powi(1000)], vec![1], true)
+                    .unwrap();
+                let weight = session
+                    .tensor_variable(vec![2.0_f64.powi(700)], vec![1], true)
+                    .unwrap();
+                let loss = session
+                    .tensor_gaussian_nll_loss(x, target, variance, "none", false)
+                    .unwrap();
+                let weighted_loss = session.tensor_mul(loss, weight).unwrap();
+                assert!(session.tensor_values(weighted_loss).unwrap()[0].is_finite());
+                let report = session
+                    .tensor_backward_with_options(
+                        weighted_loss,
+                        BackwardOptions::for_mode(mode).with_create_graph(create_graph),
+                    )
+                    .unwrap();
+                assert_eq!(report.gradient(x).unwrap(), &[2.0_f64.powi(200)]);
+                assert_eq!(report.gradient(target).unwrap(), &[-2.0_f64.powi(200)]);
+                assert_eq!(report.gradient(variance).unwrap(), &[0.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_mixed_dtypes_and_variance_snapshot_preserve_gradients() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for (input_dtype, variance_dtype) in [
+                (DType::F64, DType::F32),
+                (DType::F32, DType::F64),
+                (DType::F64, DType::F64),
+            ] {
+                let mut session = FrankenTorchSession::new(mode);
+                let x = probability_bce_tensor(&mut session, &[2.0], vec![1], input_dtype, true);
+                let target =
+                    probability_bce_tensor(&mut session, &[1.0], vec![1], input_dtype, false);
+                let variance =
+                    probability_bce_tensor(&mut session, &[2.0], vec![1], variance_dtype, true);
+                let loss = session
+                    .tensor_gaussian_nll_loss(x, target, variance, "mean", false)
+                    .unwrap();
+                assert_eq!(session.tensor_dtype(loss).unwrap(), DType::F64);
+                // Upstream clones the variance before clamping even when the
+                // floor is inactive. A later user mutation must not change the
+                // value used by this already-recorded loss or its derivatives.
+                session.no_grad_enter();
+                session.tensor_fill_(variance, 8.0).unwrap();
+                session.no_grad_exit();
+                let report = session
+                    .tensor_backward_with_options(
+                        loss,
+                        BackwardOptions::for_mode(mode).with_create_graph(true),
+                    )
+                    .unwrap();
+                assert_eq!(report.gradient(x).unwrap(), &[0.5]);
+                assert_eq!(report.gradient(variance).unwrap(), &[0.125]);
+                let second = session
+                    .tensor_backward_with_options(
+                        report.gradient_node(variance).unwrap(),
+                        BackwardOptions::for_mode(mode).with_create_graph(true),
+                    )
+                    .unwrap();
+                assert_eq!(second.gradient(variance).unwrap(), &[0.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nll_invalid_inputs_do_not_append_graph_nodes() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let x = session
+                .tensor_variable(vec![1.0; 4], vec![2, 2], true)
+                .unwrap();
+            let target = session
+                .tensor_variable(vec![0.0; 4], vec![2, 2], false)
+                .unwrap();
+            let good = session
+                .tensor_variable(vec![0.0; 2], vec![2, 1], true)
+                .unwrap();
+            let negative = session
+                .tensor_variable(vec![0.0, -0.25], vec![2], true)
+                .unwrap();
+            let wrong_shape = session
+                .tensor_variable(vec![1.0], vec![1, 1], true)
+                .unwrap();
+            let bad_target = session
+                .tensor_variable(vec![0.0; 3], vec![3], false)
+                .unwrap();
+            for (target, variance, reduction) in [
+                (target, negative, "mean"),
+                (target, wrong_shape, "mean"),
+                (bad_target, good, "mean"),
+                (target, good, "batchmean"),
+                (target, TensorNodeId(usize::MAX), "sum"),
+            ] {
+                let count = session.tensor_tape.node_count();
+                assert!(
+                    session
+                        .tensor_gaussian_nll_loss_with_eps(
+                            x, target, variance, reduction, false, 0.5
+                        )
+                        .is_err()
+                );
+                assert_eq!(session.tensor_tape.node_count(), count);
+            }
+        }
+    }
+
+    #[test]
     fn gaussian_nll_loss_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // Perfect prediction with variance 1: loss = 0.5 * log(1) + 0 = 0
@@ -143064,6 +143791,82 @@ mod tests {
             "grad_var[0] = {}",
             grad_var[0]
         );
+    }
+
+    #[test]
+    fn soft_margin_public_routes_preserve_zero_logit_curvature() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+                for route in 0..3 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = probability_bce_tensor(&mut session, &[0.0, 0.0], vec![2], dtype, true);
+                    let target =
+                        probability_bce_tensor(&mut session, &[1.0, -1.0], vec![2], dtype, false);
+                    let root = match route {
+                        0 => session.soft_margin_loss(x, target),
+                        1 => session.soft_margin_loss_tensor(x, target, "mean"),
+                        _ => session.tensor_soft_margin_loss(x, target, "mean"),
+                    }
+                    .unwrap();
+                    assert_eq!(session.tensor_dtype(root).unwrap(), dtype);
+                    let options = BackwardOptions::for_mode(mode)
+                        .with_create_graph(true)
+                        .with_retain_graph(true);
+                    let first = session.tensor_backward_with_options(root, options).unwrap();
+                    assert_eq!(first.gradient(x).unwrap(), &[-0.25, 0.25]);
+                    let second = session
+                        .tensor_backward_with_options(first.gradient_node(x).unwrap(), options)
+                        .unwrap();
+                    assert_eq!(second.gradient(x).unwrap(), &[0.125, 0.125]);
+                    let third = session
+                        .tensor_backward_with_options(second.gradient_node(x).unwrap(), options)
+                        .unwrap();
+                    assert_eq!(third.gradient(x).unwrap(), &[0.0, 0.0]);
+                    let fourth = session
+                        .tensor_backward_with_options(
+                            third.gradient_node(x).unwrap(),
+                            options.with_create_graph(false),
+                        )
+                        .unwrap();
+                    assert_eq!(fourth.gradient(x).unwrap(), &[-0.0625, -0.0625]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn soft_margin_log1p_retains_small_losses_and_rejects_invalid_reductions_atomically() {
+        // PyTorch Loss.cpp evaluates exp then log1p. log(1+exp(-40))
+        // rounds to zero in both dtypes, while the actual loss is positive.
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F64, DType::F32] {
+                for requires_grad in [false, true] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let x = probability_bce_tensor(
+                        &mut session,
+                        &[40.0, -1000.0],
+                        vec![2],
+                        dtype,
+                        requires_grad,
+                    );
+                    let target =
+                        probability_bce_tensor(&mut session, &[1.0; 2], vec![2], dtype, false);
+                    let loss = session.tensor_soft_margin_loss(x, target, "none").unwrap();
+                    let actual = session.tensor_values_lossy_f64(loss).unwrap();
+                    let expected = (-40.0_f64).exp().ln_1p();
+                    assert!(actual[0] > 0.0);
+                    assert!((actual[0] / expected - 1.0).abs() < 1e-6);
+                    assert_eq!(actual[1], f64::INFINITY);
+                    let before = session.tensor_tape.node_count();
+                    assert!(
+                        session
+                            .tensor_soft_margin_loss(x, target, "batchmean")
+                            .is_err()
+                    );
+                    assert_eq!(session.tensor_tape.node_count(), before);
+                }
+            }
+        }
     }
 
     #[test]
@@ -143139,12 +143942,10 @@ mod tests {
             let t = composed
                 .tensor_variable_f32(target.clone(), vec![target.len()], false)
                 .unwrap();
-            let prod = composed.tensor_mul(t, x).unwrap();
-            let neg_prod = composed.tensor_neg(prod).unwrap();
+            let neg_input = composed.tensor_neg(x).unwrap();
+            let neg_prod = composed.tensor_mul(neg_input, t).unwrap();
             let exp_term = composed.tensor_exp(neg_prod).unwrap();
-            let ones = composed.full_like(exp_term, 1.0, false).unwrap();
-            let one_plus_exp = composed.tensor_add(ones, exp_term).unwrap();
-            let per = composed.tensor_log(one_plus_exp).unwrap();
+            let per = composed.tensor_log1p(exp_term).unwrap();
             let expected = match reduction {
                 "none" => per,
                 "mean" => composed.tensor_mean(per).unwrap(),
