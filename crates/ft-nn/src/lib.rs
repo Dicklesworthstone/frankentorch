@@ -18391,7 +18391,7 @@ pub enum CTCReduction {
     None,
     /// Sum all per-sample losses.
     Sum,
-    /// Mean: sum of per-sample losses divided by sum of target lengths.
+    /// Mean of per-sample losses divided by their target lengths (clamped to one).
     Mean,
 }
 
@@ -18444,11 +18444,17 @@ impl CTCLoss {
 
     /// Compute the CTC loss.
     ///
-    /// * `log_probs` - Log-probabilities of shape `[T, N, C]` (time, batch, classes)
-    /// * `targets` - Target sequences of shape `[N, S]` (batch, max target length),
-    ///   padded with any value for samples with shorter targets
+    /// * `log_probs` - F32 or F64 log-probabilities of shape `[T, N, C]`
+    ///   (time, batch, classes), or `[T, C]` for an unbatched sequence.
+    /// * `targets` - Padded target sequences of shape `[N, S]`, or concatenated
+    ///   targets of shape `[sum(target_lengths)]`. Unused padding is ignored.
     /// * `input_lengths` - Actual input lengths per batch element, shape `[N]`
-    /// * `target_lengths` - Actual target lengths per batch element, shape `[N]`
+    ///   (a scalar is also accepted for an unbatched sequence).
+    /// * `target_lengths` - Actual target lengths, with the same shape convention.
+    ///
+    /// The module and functional API share their validation, dynamic program,
+    /// reduction, and PyTorch-compatible backward rule. `zero_infinity` masks
+    /// both an impossible alignment's loss and its gradients.
     pub fn forward_ctc(
         &self,
         session: &mut FrankenTorchSession,
@@ -18457,371 +18463,18 @@ impl CTCLoss {
         input_lengths: TensorNodeId,
         target_lengths: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let blank = self.blank;
-        let reduction = self.reduction;
-        let zero_infinity = self.zero_infinity;
-
-        // Read shapes for validation
-        let lp_shape = session.tensor_shape(log_probs)?;
-        if lp_shape.len() != 3 {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "CTCLoss: log_probs must be 3-D [T, N, C]",
-                },
-            )));
-        }
-        let t_max = lp_shape[0];
-        let batch_size = lp_shape[1];
-        let num_classes = lp_shape[2];
-
-        if blank >= num_classes {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "CTCLoss: blank index must be < num_classes",
-                },
-            )));
-        }
-
-        let tgt_shape = session.tensor_shape(targets)?;
-        if tgt_shape.len() != 2 || tgt_shape[0] != batch_size {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "CTCLoss: targets must be 2-D [N, S]",
-                },
-            )));
-        }
-        let s_max = tgt_shape[1];
-
-        let il_shape = session.tensor_shape(input_lengths)?;
-        if il_shape != [batch_size] {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "CTCLoss: input_lengths must be 1-D [N]",
-                },
-            )));
-        }
-        let tl_shape = session.tensor_shape(target_lengths)?;
-        if tl_shape != [batch_size] {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "CTCLoss: target_lengths must be 1-D [N]",
-                },
-            )));
-        }
-
-        session.tensor_apply_function(
-            &[log_probs, targets, input_lengths, target_lengths],
-            // Forward function
-            move |ctx: &mut FunctionCtx, inputs: &[(&[f64], &[usize])]| {
-                let (lp_data, _) = inputs[0]; // [T, N, C]
-                let (tgt_data, _) = inputs[1]; // [N, S]
-                let (il_data, _) = inputs[2]; // [N]
-                let (tl_data, _) = inputs[3]; // [N]
-
-                let neg_inf = f64::NEG_INFINITY;
-                let mut losses = vec![0.0f64; batch_size];
-
-                for b in 0..batch_size {
-                    let input_len = il_data[b] as usize;
-                    let target_len = tl_data[b] as usize;
-
-                    // Validate lengths are within tensor bounds
-                    if input_len > t_max {
-                        return Err(AutogradError::Dispatch(DispatchError::Key(
-                            DispatchKeyError::IncompatibleSet {
-                                reason: "CTCLoss: input_lengths[b] exceeds T dimension of log_probs",
-                            },
-                        )));
-                    }
-                    if target_len > s_max {
-                        return Err(AutogradError::Dispatch(DispatchError::Key(
-                            DispatchKeyError::IncompatibleSet {
-                                reason: "CTCLoss: target_lengths[b] exceeds S dimension of targets",
-                            },
-                        )));
-                    }
-
-                    if target_len == 0 {
-                        // Empty target: loss = -sum of log P(blank) at each timestep
-                        let mut loss = 0.0;
-                        for t in 0..input_len {
-                            loss -= lp_data[t * batch_size * num_classes + b * num_classes + blank];
-                        }
-                        losses[b] = loss;
-                        continue;
-                    }
-
-                    // Build CTC lattice labels: interleave blanks with target symbols
-                    // Target 'abc' -> [blank, a, blank, b, blank, c, blank]
-                    let lattice_len = 2 * target_len + 1;
-                    let mut labels = vec![blank; lattice_len];
-                    for i in 0..target_len {
-                        let label = tgt_data[b * s_max + i] as usize;
-                        if label >= num_classes {
-                            return Err(AutogradError::Dispatch(DispatchError::Key(
-                                DispatchKeyError::IncompatibleSet {
-                                    reason: "CTCLoss: target label >= num_classes",
-                                },
-                            )));
-                        }
-                        labels[2 * i + 1] = label;
-                    }
-
-                    // Check feasibility: input must be long enough
-                    if input_len < target_len {
-                        losses[b] = f64::INFINITY;
-                        continue;
-                    }
-
-                    // The forward result only consumes the final alpha row. Keep the
-                    // previous and current rows rather than allocating an O(T * S)
-                    // lattice for every batch element.
-                    let mut alpha = vec![neg_inf; lattice_len];
-                    let mut next_alpha = vec![neg_inf; lattice_len];
-
-                    // t=0 initialization: can only be in state 0 (blank) or state 1 (first label)
-                    alpha[0] = lp_data[b * num_classes + labels[0]];
-                    if lattice_len > 1 {
-                        alpha[1] = lp_data[b * num_classes + labels[1]];
-                    }
-
-                    // Forward recursion
-                    for t in 1..input_len {
-                        let lp_offset = t * batch_size * num_classes + b * num_classes;
-                        for s in 0..lattice_len {
-                            let emit = lp_data[lp_offset + labels[s]];
-
-                            // Can stay in same state
-                            let mut log_sum = alpha[s];
-
-                            // Can come from previous state
-                            if s >= 1 {
-                                log_sum = log_sum_exp(log_sum, alpha[s - 1]);
-                            }
-
-                            // Can skip a blank if current and two-back are different non-blank labels
-                            if s >= 2 && labels[s] != blank && labels[s] != labels[s - 2] {
-                                log_sum = log_sum_exp(log_sum, alpha[s - 2]);
-                            }
-
-                            next_alpha[s] = log_sum + emit;
-                        }
-                        std::mem::swap(&mut alpha, &mut next_alpha);
-                    }
-
-                    // Total log probability
-                    let log_prob = log_sum_exp(alpha[lattice_len - 1], alpha[lattice_len - 2]);
-
-                    losses[b] = -log_prob;
-                }
-
-                // Handle zero_infinity
-                if zero_infinity {
-                    for loss in &mut losses {
-                        if loss.is_infinite() {
-                            *loss = 0.0;
-                        }
-                    }
-                }
-
-                // Save data for backward
-                ctx.save_for_backward(lp_data.to_vec(), vec![t_max, batch_size, num_classes]);
-                ctx.save_for_backward(tgt_data.to_vec(), vec![batch_size, s_max]);
-                ctx.save_for_backward(il_data.to_vec(), vec![batch_size]);
-                ctx.save_for_backward(tl_data.to_vec(), vec![batch_size]);
-                // Save per-sample losses for reduction gradient
-                ctx.save_for_backward(losses.clone(), vec![batch_size]);
-
-                // Apply reduction
-                let output = match reduction {
-                    CTCReduction::None => {
-                        return Ok((losses, vec![batch_size]));
-                    }
-                    CTCReduction::Sum => {
-                        vec![losses.iter().sum::<f64>()]
-                    }
-                    CTCReduction::Mean => {
-                        let total_loss: f64 = losses.iter().sum();
-                        let total_target_len: f64 = tl_data.iter().sum();
-                        if total_target_len > 0.0 {
-                            vec![total_loss / total_target_len]
-                        } else {
-                            vec![0.0]
-                        }
-                    }
-                };
-                Ok((output, vec![1]))
+        session.tensor_ctc_loss(
+            log_probs,
+            targets,
+            input_lengths,
+            target_lengths,
+            self.blank,
+            match self.reduction {
+                CTCReduction::None => "none",
+                CTCReduction::Sum => "sum",
+                CTCReduction::Mean => "mean",
             },
-            // Backward function
-            move |ctx: &FunctionCtx, grad_outputs: &[&[f64]]| {
-                let grad_out = grad_outputs[0]; // scalar or [N]
-                let lp_data = &ctx.saved_tensors()[0];
-                let tgt_data = &ctx.saved_tensors()[1];
-                let il_data = &ctx.saved_tensors()[2];
-                let tl_data = &ctx.saved_tensors()[3];
-                let per_sample_losses = &ctx.saved_tensors()[4];
-
-                let lp_shapes = &ctx.saved_shapes()[0]; // [T, N, C]
-                let t_max_b = lp_shapes[0];
-                let batch_size_b = lp_shapes[1];
-                let num_classes_b = lp_shapes[2];
-                let s_max_b = ctx.saved_shapes()[1][1]; // max target length
-
-                let neg_inf = f64::NEG_INFINITY;
-
-                // Gradient w.r.t. log_probs: shape [T, N, C]
-                let total_elems = t_max_b * batch_size_b * num_classes_b;
-                let mut grad_lp = vec![0.0f64; total_elems];
-
-                // Per-sample gradient scale from reduction
-                let total_target_len: f64 = tl_data.iter().sum();
-
-                for b in 0..batch_size_b {
-                    let input_len = il_data[b] as usize;
-                    let target_len = tl_data[b] as usize;
-
-                    // Determine per-sample grad scale
-                    let grad_scale = if grad_out.len() == 1 {
-                        // Scalar output (Sum or Mean reduction)
-                        match reduction {
-                            CTCReduction::Mean => {
-                                if total_target_len > 0.0 {
-                                    grad_out[0] / total_target_len
-                                } else {
-                                    0.0
-                                }
-                            }
-                            CTCReduction::Sum => grad_out[0],
-                            CTCReduction::None => grad_out[b],
-                        }
-                    } else {
-                        grad_out[b]
-                    };
-
-                    // Skip if loss was infinite and zero_infinity is on
-                    if zero_infinity && per_sample_losses[b].is_infinite() {
-                        continue;
-                    }
-                    // Skip infeasible
-                    if per_sample_losses[b].is_infinite() {
-                        continue;
-                    }
-
-                    if target_len == 0 {
-                        // Empty target: grad is -1 at blank positions
-                        for t in 0..input_len {
-                            let offset = t * batch_size_b * num_classes_b + b * num_classes_b;
-                            grad_lp[offset + blank] = -grad_scale;
-                        }
-                        continue;
-                    }
-
-                    // Rebuild lattice
-                    let lattice_len = 2 * target_len + 1;
-                    let mut labels = vec![blank; lattice_len];
-                    for i in 0..target_len {
-                        labels[2 * i + 1] = tgt_data[b * s_max_b + i] as usize;
-                    }
-
-                    // Keep the full forward/backward tables contiguous. The gradient
-                    // needs every timestep, but it does not need a separate heap
-                    // allocation for every row.
-                    let table_len = input_len * lattice_len;
-                    let mut alpha = vec![neg_inf; table_len];
-                    alpha[0] = lp_data[b * num_classes_b + labels[0]];
-                    if lattice_len > 1 {
-                        alpha[1] = lp_data[b * num_classes_b + labels[1]];
-                    }
-                    for t in 1..input_len {
-                        let lp_offset = t * batch_size_b * num_classes_b + b * num_classes_b;
-                        let prev_offset = (t - 1) * lattice_len;
-                        let row_offset = t * lattice_len;
-                        for s in 0..lattice_len {
-                            let emit = lp_data[lp_offset + labels[s]];
-                            let mut log_sum = alpha[prev_offset + s];
-                            if s >= 1 {
-                                log_sum = log_sum_exp(log_sum, alpha[prev_offset + s - 1]);
-                            }
-                            if s >= 2 && labels[s] != blank && labels[s] != labels[s - 2] {
-                                log_sum = log_sum_exp(log_sum, alpha[prev_offset + s - 2]);
-                            }
-                            alpha[row_offset + s] = log_sum + emit;
-                        }
-                    }
-
-                    // Backward pass (beta)
-                    let mut beta = vec![neg_inf; table_len];
-                    let last_row_offset = (input_len - 1) * lattice_len;
-                    beta[last_row_offset + lattice_len - 1] = 0.0;
-                    if lattice_len >= 2 {
-                        beta[last_row_offset + lattice_len - 2] = 0.0;
-                    }
-                    for t in (0..input_len - 1).rev() {
-                        let lp_offset_next = (t + 1) * batch_size_b * num_classes_b + b * num_classes_b;
-                        let next_row_offset = (t + 1) * lattice_len;
-                        let row_offset = t * lattice_len;
-                        for s in 0..lattice_len {
-                            let mut log_sum = beta[next_row_offset + s]
-                                + lp_data[lp_offset_next + labels[s]];
-                            if s + 1 < lattice_len {
-                                log_sum = log_sum_exp(
-                                    log_sum,
-                                    beta[next_row_offset + s + 1]
-                                        + lp_data[lp_offset_next + labels[s + 1]],
-                                );
-                            }
-                            if s + 2 < lattice_len
-                                && labels[s] != blank
-                                && labels[s] != labels[s + 2]
-                            {
-                                log_sum = log_sum_exp(
-                                    log_sum,
-                                    beta[next_row_offset + s + 2]
-                                        + lp_data[lp_offset_next + labels[s + 2]],
-                                );
-                            }
-                            beta[row_offset + s] = log_sum;
-                        }
-                    }
-
-                    // Total log probability
-                    let log_prob = log_sum_exp(
-                        alpha[last_row_offset + lattice_len - 1],
-                        alpha[last_row_offset + lattice_len - 2],
-                    );
-
-                    // Compute gradient: for each (t, c), accumulate alpha[t][s] + beta[t][s]
-                    // for all states s where labels[s] == c.
-                    // grad[t][c] = -exp(ab_sum[c] - log_prob)
-                    // This is the derivative of -log P w.r.t. log_probs[t][c].
-                    let mut ab_sum = vec![neg_inf; num_classes_b];
-                    for t in 0..input_len {
-                        let lp_offset = t * batch_size_b * num_classes_b + b * num_classes_b;
-                        // For each class, collect alpha*beta contributions
-                        ab_sum.fill(neg_inf);
-                        let row_offset = t * lattice_len;
-                        for s in 0..lattice_len {
-                            let c = labels[s];
-                            ab_sum[c] = log_sum_exp(
-                                ab_sum[c],
-                                alpha[row_offset + s] + beta[row_offset + s],
-                            );
-                        }
-
-                        for c in 0..num_classes_b {
-                            let posterior = if ab_sum[c] == neg_inf {
-                                0.0
-                            } else {
-                                (ab_sum[c] - log_prob).exp()
-                            };
-                            grad_lp[lp_offset + c] = -grad_scale * posterior;
-                        }
-                    }
-                }
-
-                // Gradients: only w.r.t. log_probs (input 0), none for targets/lengths
-                Ok(vec![Some(grad_lp), None, None, None])
-            },
+            self.zero_infinity,
         )
     }
 }
@@ -18830,18 +18483,6 @@ impl Default for CTCLoss {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Log-sum-exp of two values: log(exp(a) + exp(b)), numerically stable.
-fn log_sum_exp(a: f64, b: f64) -> f64 {
-    if a == f64::NEG_INFINITY {
-        return b;
-    }
-    if b == f64::NEG_INFINITY {
-        return a;
-    }
-    let max = a.max(b);
-    max + ((a - max).exp() + (b - max).exp()).ln()
 }
 
 // ── Container Modules ──────────────────────────────────────────────────
@@ -43328,6 +42969,228 @@ mod tests {
     }
 
     #[test]
+    fn ctc_loss_typed_mixed_lengths_match_alignment_oracle() {
+        // Independent enumeration: sample 0 has paths [1,0], [0,1], [1,1]
+        // with probability .39; sample 1 has only [1,0,1], probability .045;
+        // sample 2 has an empty target and one timestep, probability .5.
+        let probabilities = [0.5_f64, 0.3, 0.2];
+        let per_sample = [-0.39_f64.ln(), -0.045_f64.ln(), -0.5_f64.ln()];
+        let weights = [2.0, -0.5, 1.5];
+        let posterior_gradient = [
+            0.5 - 5.0 / 13.0,
+            0.3 - 8.0 / 13.0,
+            0.2,
+            0.5,
+            -0.7,
+            0.2,
+            -0.5,
+            0.3,
+            0.2,
+            0.5 - 5.0 / 13.0,
+            0.3 - 8.0 / 13.0,
+            0.2,
+            -0.5,
+            0.3,
+            0.2,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            -0.7,
+            0.2,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                for reduction in [CTCReduction::None, CTCReduction::Sum, CTCReduction::Mean] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let lp = loss_test_tensor(
+                        &mut session,
+                        (0..9).flat_map(|_| probabilities.map(f64::ln)).collect(),
+                        vec![3, 3, 3],
+                        dtype,
+                        true,
+                    );
+                    // Out-of-range and nonfinite values outside each active
+                    // target prefix must not affect the loss or validation.
+                    let targets = session
+                        .tensor_variable(
+                            vec![1.0, 99.0, 1.0, 1.0, f64::NAN, f64::INFINITY],
+                            vec![3, 2],
+                            true,
+                        )
+                        .unwrap();
+                    let input_lengths = session
+                        .tensor_variable(vec![2.0, 3.0, 1.0], vec![3], true)
+                        .unwrap();
+                    let target_lengths = session
+                        .tensor_variable(vec![1.0, 2.0, 0.0], vec![3], true)
+                        .unwrap();
+                    let module = CTCLoss::new().with_reduction(reduction);
+                    let loss = module
+                        .forward_ctc(&mut session, lp, targets, input_lengths, target_lengths)
+                        .unwrap();
+                    assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                    let (expected, scales) = match reduction {
+                        CTCReduction::None => (per_sample.to_vec(), weights),
+                        CTCReduction::Sum => (vec![per_sample.iter().sum()], [1.0; 3]),
+                        CTCReduction::Mean => (
+                            vec![(per_sample[0] + per_sample[1] / 2.0 + per_sample[2]) / 3.0],
+                            [1.0 / 3.0, 1.0 / 6.0, 1.0 / 3.0],
+                        ),
+                    };
+                    assert_loss_values(
+                        &session.tensor_values_lossy_f64(loss).unwrap(),
+                        &expected,
+                        dtype,
+                    );
+                    let root = if reduction == CTCReduction::None {
+                        assert_eq!(session.tensor_shape(loss).unwrap(), [3]);
+                        let incoming =
+                            loss_test_tensor(&mut session, weights.to_vec(), vec![3], dtype, false);
+                        let weighted = session.tensor_mul(loss, incoming).unwrap();
+                        session.tensor_sum(weighted).unwrap()
+                    } else {
+                        assert!(session.tensor_shape(loss).unwrap().is_empty());
+                        loss
+                    };
+                    let report = session.tensor_backward(root).unwrap();
+                    let expected_gradient: Vec<_> = posterior_gradient
+                        .iter()
+                        .enumerate()
+                        .map(|(i, value)| value * scales[(i / 3) % 3])
+                        .collect();
+                    assert_loss_values(
+                        report.gradient(lp).unwrap(),
+                        &expected_gradient,
+                        dtype,
+                    );
+                    for label in [targets, input_lengths, target_lengths] {
+                        assert!(report.gradient(label).is_none());
+                    }
+                    let inferred = session
+                        .with_no_grad(|session| {
+                            module.forward_ctc(session, lp, targets, input_lengths, target_lengths)
+                        })
+                        .unwrap();
+                    assert!(!session.tensor_requires_grad(inferred).unwrap());
+                    assert_eq!(session.tensor_dtype(inferred).unwrap(), dtype);
+                    assert_loss_values(
+                        &session.tensor_values_lossy_f64(inferred).unwrap(),
+                        &expected,
+                        dtype,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ctc_loss_unbatched_custom_blank_matches_functional_api() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let lp = loss_test_tensor(
+                &mut session,
+                [0.4_f64.ln(), 0.35_f64.ln(), 0.25_f64.ln()].repeat(3),
+                vec![3, 3],
+                dtype,
+                true,
+            );
+            let concatenated = session.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+            let padded = session.tensor_variable(vec![0.0, 0.0], vec![1, 2], false).unwrap();
+            let il = session.tensor_variable(vec![3.0], vec![], false).unwrap();
+            let tl = session.tensor_variable(vec![2.0], vec![], false).unwrap();
+            let module = CTCLoss::new()
+                .with_blank(2)
+                .with_reduction(CTCReduction::None);
+            let loss = module.forward_ctc(&mut session, lp, concatenated, il, tl).unwrap();
+            let functional = session.tensor_ctc_loss(lp, padded, il, tl, 2, "none", false).unwrap();
+            assert!(session.tensor_shape(loss).unwrap().is_empty());
+            assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+            assert_eq!(
+                session.tensor_values_lossy_f64(loss).unwrap(),
+                session.tensor_values_lossy_f64(functional).unwrap(),
+            );
+            // The unique alignment is [0,2,0], with probability .4*.25*.4.
+            assert_loss_values(
+                &session.tensor_values_lossy_f64(loss).unwrap(),
+                &[-0.04_f64.ln()],
+                dtype,
+            );
+            let report = session.tensor_backward(loss).unwrap();
+            assert_loss_values(
+                report.gradient(lp).unwrap(),
+                &[-0.6, 0.35, 0.25, 0.4, 0.35, -0.75, -0.6, 0.35, 0.25],
+                dtype,
+            );
+        }
+    }
+
+    #[test]
+    fn ctc_loss_zero_infinity_masks_infeasible_typed_backward() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let lp = loss_test_tensor(
+                    &mut session,
+                    vec![-3.0_f64.ln(); 18],
+                    vec![2, 3, 3],
+                    dtype,
+                    true,
+                );
+                let targets = session
+                    .tensor_variable(vec![1.0, 99.0, 1.0, 2.0, 1.0, 1.0], vec![3, 2], false)
+                    .unwrap();
+                let il = session.tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false).unwrap();
+                let tl = session.tensor_variable(vec![1.0, 2.0, 2.0], vec![3], false).unwrap();
+                let loss = CTCLoss::new()
+                    .with_zero_infinity(true)
+                    .forward_ctc(&mut session, lp, targets, il, tl)
+                    .unwrap();
+                assert_eq!(session.tensor_values_lossy_f64(loss).unwrap(), [0.0]);
+                let report = session.tensor_backward(loss).unwrap();
+                assert_eq!(report.gradient(lp).unwrap(), &vec![0.0; 18]);
+            }
+        }
+    }
+
+    #[test]
+    fn ctc_loss_typed_log_softmax_training_reduces_loss() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let logits = loss_test_tensor(&mut session, vec![0.0; 9], vec![3, 1, 3], dtype, true);
+                let targets = session.tensor_variable(vec![1.0, 1.0], vec![1, 2], false).unwrap();
+                let il = session.tensor_variable(vec![3.0], vec![1], false).unwrap();
+                let tl = session.tensor_variable(vec![2.0], vec![1], false).unwrap();
+                let module = CTCLoss::new();
+                let lp = session.tensor_log_softmax(logits, 2).unwrap();
+                let loss = module.forward_ctc(&mut session, lp, targets, il, tl).unwrap();
+                let initial = session.tensor_values_lossy_f64(loss).unwrap()[0];
+                assert_loss_values(&[initial], &[1.5 * 3.0_f64.ln()], dtype);
+                let report = session.tensor_backward(loss).unwrap();
+                let expected = [
+                    1.0 / 6.0, -1.0 / 3.0, 1.0 / 6.0,
+                    -1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0,
+                    1.0 / 6.0, -1.0 / 3.0, 1.0 / 6.0,
+                ];
+                let gradient = report.gradient(logits).unwrap();
+                assert_loss_values(gradient, &expected, dtype);
+                let updated = gradient.iter().map(|value| -0.3 * value).collect();
+                session.with_no_grad(|session| session.tensor_update_param_values(logits, updated)).unwrap();
+                let next_lp = session.tensor_log_softmax(logits, 2).unwrap();
+                let next = module.forward_ctc(&mut session, next_lp, targets, il, tl).unwrap();
+                assert!(session.tensor_values_lossy_f64(next).unwrap()[0] < initial);
+            }
+        }
+    }
+
+    #[test]
     fn ctc_loss_single_char_target() {
         // T=2, N=1, C=3 (blank=0, classes: 0=blank, 1=a, 2=b)
         // Target: [1] (just 'a')
@@ -43747,7 +43610,7 @@ mod tests {
             .unwrap();
         let mean_val = session.tensor_values(loss_mean).unwrap()[0];
 
-        // Mean = Sum / sum(target_lengths) = Sum / 1.0
+        // A single sample with target length one has identical sum and mean.
         assert!(
             (mean_val - sum_val).abs() < 1e-10,
             "mean={mean_val}, sum={sum_val}"
@@ -43756,18 +43619,16 @@ mod tests {
 
     #[test]
     fn ctc_loss_gradient_finite_difference() {
-        // Verify gradient correctness via finite differences
+        // PyTorch's CTC adjoint assumes normalized probabilities. Differentiate
+        // logits through log_softmax, rather than perturbing unconstrained
+        // log-probabilities, to test the actual training contract.
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
 
         // T=2, N=1, C=3, target=[1]
         // Use valid log-probabilities
-        let logits_base = [
-            vec![0.5, 1.0, 0.3], // t=0
-            vec![0.2, 0.8, 0.5], // t=1
-        ];
-        let lp_base: Vec<f64> = logits_base.iter().flat_map(|l| log_softmax(l)).collect();
-
-        let log_probs = make_log_probs(&mut session, lp_base.clone(), 2, 1, 3);
+        let logits_base = vec![0.5, 1.0, 0.3, 0.2, 0.8, 0.5];
+        let logits = make_log_probs(&mut session, logits_base.clone(), 2, 1, 3);
+        let log_probs = session.tensor_log_softmax(logits, 2).unwrap();
         let targets = session
             .tensor_variable(vec![1.0], vec![1, 1], false)
             .unwrap();
@@ -43787,27 +43648,29 @@ mod tests {
 
         // Run backward
         let report = session.tensor_backward(loss).unwrap();
-        let grad = report.gradient(log_probs).unwrap().to_vec();
+        let grad = report.gradient(logits).unwrap().to_vec();
 
         // Finite difference check for each element
         let eps = 1e-5;
-        for i in 0..lp_base.len() {
-            let mut perturbed = lp_base.clone();
+        for i in 0..logits_base.len() {
+            let mut perturbed = logits_base.clone();
             perturbed[i] += eps;
 
             let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
-            let lp2 = make_log_probs(&mut s2, perturbed.clone(), 2, 1, 3);
+            let logits2 = make_log_probs(&mut s2, perturbed, 2, 1, 3);
+            let lp2 = s2.tensor_log_softmax(logits2, 2).unwrap();
             let t2 = s2.tensor_variable(vec![1.0], vec![1, 1], false).unwrap();
             let il2 = s2.tensor_variable(vec![2.0], vec![1], false).unwrap();
             let tl2 = s2.tensor_variable(vec![1.0], vec![1], false).unwrap();
             let l_plus = loss_mod.forward_ctc(&mut s2, lp2, t2, il2, tl2).unwrap();
             let v_plus = s2.tensor_values(l_plus).unwrap()[0];
 
-            let mut perturbed_m = lp_base.clone();
+            let mut perturbed_m = logits_base.clone();
             perturbed_m[i] -= eps;
 
             let mut s3 = FrankenTorchSession::new(ExecutionMode::Strict);
-            let lp3 = make_log_probs(&mut s3, perturbed_m, 2, 1, 3);
+            let logits3 = make_log_probs(&mut s3, perturbed_m, 2, 1, 3);
+            let lp3 = s3.tensor_log_softmax(logits3, 2).unwrap();
             let t3 = s3.tensor_variable(vec![1.0], vec![1, 1], false).unwrap();
             let il3 = s3.tensor_variable(vec![2.0], vec![1], false).unwrap();
             let tl3 = s3.tensor_variable(vec![1.0], vec![1], false).unwrap();
