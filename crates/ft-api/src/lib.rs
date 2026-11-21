@@ -9959,8 +9959,8 @@ impl FrankenTorchSession {
 
     /// Einstein summation.
     ///
-    /// Supports 1- and 2-operand equations via compact index notation.
-    /// Decomposes into permute/reshape/matmul/sum operations for backward compatibility.
+    /// Supports scalar, diagonal, broadcast and multi-operand contractions.
+    /// Lowers to differentiable gather/permute/reshape/matmul/sum operations.
     ///
     /// Examples:
     /// - `"ij,jk->ik"` — matrix multiply
@@ -9970,32 +9970,54 @@ impl FrankenTorchSession {
     /// - `"i,i->"` — dot product
     /// - `"bij,bjk->bik"` — batch matmul
     ///
-    /// Expand torch.einsum ellipsis (`...`) into explicit fresh lowercase
-    /// letters so the letter-only einsum core handles batched/broadcast forms.
-    /// Each operand's `...` covers `ndim - explicit_letters` dims; the broadcast
-    /// rank is the max across operands, and shorter operands take the RIGHTMOST
-    /// letters (numpy/torch right-alignment). The output `...` (explicit or
-    /// implicit) expands to the full broadcast letter set, placed first for the
-    /// implicit case. frankentorch-s3iig.
+    /// Validate the complete equation before lowering it, then replace ellipses
+    /// with private labels. Private labels leave all 52 ASCII labels available
+    /// to the caller and right-align ellipsis dimensions across operands.
     fn expand_einsum_ellipsis(equation: &str, ndims: &[usize]) -> Result<String, &'static str> {
-        let (input_part, output_part) = match equation.find("->") {
-            Some(p) => (&equation[..p], Some(&equation[p + 2..])),
-            None => (equation, None),
-        };
+        let mut parts = equation.split("->");
+        let input_part = parts.next().unwrap_or_default();
+        let output_part = parts.next();
+        if parts.next().is_some() {
+            return Err("einsum: equation must contain at most one output arrow");
+        }
         let input_subs: Vec<&str> = input_part.split(',').collect();
         if input_subs.len() != ndims.len() {
             return Err("einsum: number of subscripts must match number of tensors");
         }
-        let used: std::collections::HashSet<char> = equation
-            .chars()
-            .filter(|c| c.is_ascii_lowercase())
-            .collect();
-        // Per-operand ellipsis rank + the broadcast (max) rank.
+
+        // Do not strip invalid punctuation (including separated dots) into a
+        // different valid equation. A None token represents one intact `...`.
+        let parse_sub = |sub: &str| -> Result<Vec<Option<char>>, &'static str> {
+            let mut tokens = Vec::new();
+            let mut chars = sub.chars();
+            let mut has_ellipsis = false;
+            while let Some(ch) = chars.next() {
+                if ch.is_ascii_alphabetic() {
+                    tokens.push(Some(ch));
+                } else if ch.is_ascii_whitespace() {
+                    continue;
+                } else if ch == '.' {
+                    if has_ellipsis || chars.next() != Some('.') || chars.next() != Some('.') {
+                        return Err("einsum: each subscript may contain at most one ellipsis");
+                    }
+                    has_ellipsis = true;
+                    tokens.push(None);
+                } else {
+                    return Err("einsum: subscripts must be ASCII letters or an ellipsis");
+                }
+            }
+            Ok(tokens)
+        };
+        let inputs = input_subs
+            .iter()
+            .map(|sub| parse_sub(sub))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = output_part.map(parse_sub).transpose()?;
         let mut ell_ranks = Vec::with_capacity(input_subs.len());
         let mut max_ell = 0usize;
-        for (i, sub) in input_subs.iter().enumerate() {
-            let n_letters = sub.chars().filter(|c| c.is_ascii_lowercase()).count();
-            if sub.contains("...") {
+        for (i, sub) in inputs.iter().enumerate() {
+            let n_letters = sub.iter().flatten().count();
+            if sub.contains(&None) {
                 if ndims[i] < n_letters {
                     return Err("einsum: too many subscripts for operand");
                 }
@@ -10003,39 +10025,38 @@ impl FrankenTorchSession {
                 ell_ranks.push(r);
                 max_ell = max_ell.max(r);
             } else {
+                if ndims[i] != n_letters {
+                    return Err("einsum: subscript length must match tensor ndim");
+                }
                 ell_ranks.push(0);
             }
         }
-        let pool: Vec<char> = ('a'..='z').filter(|c| !used.contains(c)).collect();
-        if pool.len() < max_ell {
-            return Err("einsum: not enough free letters to expand ellipsis");
-        }
-        let ell_letters = &pool[..max_ell];
-        let expand_sub = |sub: &str, rank: usize| -> String {
-            if sub.contains("...") {
-                // right-aligned subset of the broadcast letters
-                let ell: String = ell_letters[max_ell - rank..].iter().collect();
-                sub.replace("...", &ell)
-                    .chars()
-                    .filter(|c| c.is_ascii_lowercase())
-                    .collect()
-            } else {
-                sub.chars().filter(|c| c.is_ascii_lowercase()).collect()
+        let ell_letters: Vec<char> = (0..max_ell)
+            .map(|i| {
+                u32::try_from(i)
+                    .ok()
+                    .and_then(|i| 0xe000_u32.checked_add(i))
+                    .and_then(char::from_u32)
+                    .ok_or("einsum: too many ellipsis dimensions")
+            })
+            .collect::<Result<_, _>>()?;
+        let expand_sub = |sub: &[Option<char>], rank: usize| -> String {
+            let mut expanded = String::new();
+            for token in sub {
+                match token {
+                    Some(ch) => expanded.push(*ch),
+                    None => expanded.extend(&ell_letters[max_ell - rank..]),
+                }
             }
+            expanded
         };
-        let new_inputs: Vec<String> = input_subs
+        let new_inputs: Vec<String> = inputs
             .iter()
             .enumerate()
             .map(|(i, sub)| expand_sub(sub, ell_ranks[i]))
             .collect();
-        let new_output: String = match output_part {
-            Some(out) => {
-                let ell: String = ell_letters.iter().collect();
-                out.replace("...", &ell)
-                    .chars()
-                    .filter(|c| c.is_ascii_lowercase())
-                    .collect()
-            }
+        let new_output: String = match output {
+            Some(out) => expand_sub(&out, max_ell),
             None => {
                 // implicit output: broadcast (ellipsis) dims first, then the
                 // non-ellipsis indices appearing exactly once, sorted.
@@ -10073,21 +10094,16 @@ impl FrankenTorchSession {
             ))
         };
 
-        // torch.einsum ellipsis ('...'): expand to fresh unused letters
-        // (right-aligned across operands for broadcasting) so the letter-based
-        // logic below runs unchanged. No-op when '...' is absent.
-        // frankentorch-s3iig.
-        let expanded_eq;
-        let equation: &str = if equation.contains("...") {
-            let ndims: Vec<usize> = tensors
-                .iter()
-                .map(|&t| self.tensor_shape(t).map(|s| s.len()))
-                .collect::<Result<_, _>>()?;
-            expanded_eq = Self::expand_einsum_ellipsis(equation, &ndims).map_err(make_err)?;
-            expanded_eq.as_str()
-        } else {
-            equation
-        };
+        if tensors.is_empty() {
+            return Err(make_err("einsum: expected at least one operand"));
+        }
+        let shapes: Vec<Vec<usize>> = tensors
+            .iter()
+            .map(|&t| self.tensor_shape(t))
+            .collect::<Result<_, _>>()?;
+        let ndims: Vec<usize> = shapes.iter().map(Vec::len).collect();
+        let expanded_eq = Self::expand_einsum_ellipsis(equation, &ndims).map_err(make_err)?;
+        let equation = expanded_eq.as_str();
 
         // Parse equation: "subscripts -> output" or just "subscripts" (implicit output)
         let (input_part, output_part) = if let Some(pos) = equation.find("->") {
@@ -10103,24 +10119,14 @@ impl FrankenTorchSession {
             ));
         }
 
-        // Validate characters: only lowercase ASCII letters
-        for ch in equation.chars() {
-            if ch != ',' && ch != '-' && ch != '>' && ch != ' ' && !ch.is_ascii_lowercase() {
-                return Err(make_err(
-                    "einsum: only lowercase ASCII letters allowed in subscripts",
-                ));
-            }
-        }
-
-        // Parse subscripts into index lists
-        let input_indices: Vec<Vec<char>> = input_subs
-            .iter()
-            .map(|s| s.chars().filter(|c| c.is_ascii_lowercase()).collect())
-            .collect();
+        // The parser has already validated syntax; private ellipsis labels must
+        // remain distinct from caller-provided ASCII letters.
+        let input_indices: Vec<Vec<char>> =
+            input_subs.iter().map(|s| s.chars().collect()).collect();
 
         // Validate shapes match subscripts
         for (i, indices) in input_indices.iter().enumerate() {
-            let shape = self.tensor_shape(tensors[i])?;
+            let shape = &shapes[i];
             if shape.len() != indices.len() {
                 return Err(make_err("einsum: subscript length must match tensor ndim"));
             }
@@ -10130,12 +10136,22 @@ impl FrankenTorchSession {
         let mut dim_sizes: std::collections::HashMap<char, usize> =
             std::collections::HashMap::new();
         for (i, indices) in input_indices.iter().enumerate() {
-            let shape = self.tensor_shape(tensors[i])?;
+            let shape = &shapes[i];
+            let mut local_sizes = std::collections::HashMap::new();
             for (d, &idx) in indices.iter().enumerate() {
+                if let Some(previous) = local_sizes.insert(idx, shape[d])
+                    && previous != shape[d]
+                {
+                    return Err(make_err(
+                        "einsum: repeated dimensions in an operand must match",
+                    ));
+                }
                 if let Some(&existing) = dim_sizes.get(&idx) {
-                    if existing != shape[d] {
+                    if existing == 1 {
+                        dim_sizes.insert(idx, shape[d]);
+                    } else if shape[d] != 1 && existing != shape[d] {
                         return Err(make_err(
-                            "einsum: dimension size mismatch for repeated index",
+                            "einsum: dimensions with the same label must broadcast",
                         ));
                     }
                 } else {
@@ -10146,7 +10162,7 @@ impl FrankenTorchSession {
 
         // Determine output indices
         let output_indices: Vec<char> = if let Some(out) = output_part {
-            out.chars().filter(|c| c.is_ascii_lowercase()).collect()
+            out.chars().collect()
         } else {
             // Implicit: sorted unique indices that appear exactly once across all inputs
             let mut counts: std::collections::HashMap<char, usize> =
@@ -10164,6 +10180,42 @@ impl FrankenTorchSession {
             out.sort();
             out
         };
+
+        let mut seen_output = std::collections::HashSet::new();
+        for &label in &output_indices {
+            if !seen_output.insert(label) {
+                return Err(make_err("einsum: duplicate output index"));
+            }
+            if !dim_sizes.contains_key(&label) {
+                return Err(make_err("einsum: output index not found in input"));
+            }
+        }
+        // Preflight every operand before creating diagonal/broadcast nodes.
+        let dtype = self.tensor_dtype(tensors[0])?;
+        let device = self.tensor_tape.tensor(tensors[0])?.meta().device();
+        for &tensor in tensors {
+            let meta = self.tensor_tape.tensor(tensor)?.meta();
+            if meta.dtype() != dtype || meta.device() != device {
+                return Err(make_err(
+                    "einsum: operands must have matching dtype and device",
+                ));
+            }
+        }
+        let output_shape: Vec<usize> = output_indices.iter().map(|ch| dim_sizes[ch]).collect();
+        Self::checked_shape_numel(&output_shape, "einsum: output shape volume overflow")?;
+
+        // Diagonalize repeated labels once per operand. Gather only the unique
+        // coordinates instead of scanning the (potentially enormous) full
+        // repeated-axis volume, and retain the gather's higher-order VJP.
+        let mut normalized = Vec::with_capacity(tensors.len());
+        let mut normalized_indices = Vec::with_capacity(tensors.len());
+        for (&tensor, indices) in tensors.iter().zip(&input_indices) {
+            let (tensor, indices) = self.einsum_diagonalize(tensor, indices)?;
+            normalized.push(tensor);
+            normalized_indices.push(indices);
+        }
+        let tensors = normalized.as_slice();
+        let input_indices = normalized_indices;
 
         // Handle based on number of operands
         match tensors.len() {
@@ -10235,41 +10287,8 @@ impl FrankenTorchSession {
             ))
         };
 
-        // Check for trace pattern: repeated index in input
-        let mut repeated: Vec<char> = Vec::new();
-        {
-            let mut seen = std::collections::HashSet::new();
-            for &ch in input_idx {
-                if !seen.insert(ch) && !repeated.contains(&ch) {
-                    repeated.push(ch);
-                }
-            }
-        }
-
-        if !repeated.is_empty() {
-            // Trace-like: extract diagonal(s) then sum/permute
-            if repeated.len() == 1 {
-                let repeated_ch = repeated[0];
-                let repeated_positions: Vec<usize> = input_idx
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, &ch)| (ch == repeated_ch).then_some(position))
-                    .collect();
-                if repeated_positions.len() == 2 {
-                    return self.einsum_unary_single_repeated_index(
-                        input_idx,
-                        output_idx,
-                        tensor,
-                        &repeated_positions,
-                    );
-                }
-            }
-            return Err(make_err(
-                "einsum: unsupported repeated-index pattern for single operand",
-            ));
-        }
-
-        // No repeated indices: transpose + sum over contracted dims
+        // Repeated indices were diagonalized before contraction planning.
+        // Transpose + sum over contracted dimensions keeps higher derivatives.
         // First, figure out which input dims map to which output dims
         let contract_dims: Vec<usize> = input_idx
             .iter()
@@ -10280,12 +10299,13 @@ impl FrankenTorchSession {
 
         let mut current = tensor;
 
-        if output_idx.is_empty() && contract_dims.len() == input_idx.len() {
+        if output_idx.is_empty() && !contract_dims.is_empty() {
             // Sum all elements
             let shape = self.tensor_shape(current)?;
             let total = Self::checked_shape_numel(&shape, "einsum: input shape volume overflow")?;
             let flat = self.tensor_reshape(current, vec![total])?;
-            return self.tensor_sum_dim(flat, 0);
+            let sum = self.tensor_sum_dim(flat, 0)?;
+            return self.tensor_reshape(sum, Vec::new());
         }
 
         // Permute to bring output indices first, then contracted dims
@@ -10317,124 +10337,56 @@ impl FrankenTorchSession {
         }
 
         // If output is scalar, ensure shape
-        if output_idx.is_empty() {
-            let shape = self.tensor_shape(current)?;
-            if shape != [1] {
-                current = self.tensor_reshape(current, vec![1])?;
-            }
+        if output_idx.is_empty() && !self.tensor_shape(current)?.is_empty() {
+            current = self.tensor_reshape(current, Vec::new())?;
         }
 
         Ok(current)
     }
 
-    fn einsum_unary_single_repeated_index(
+    fn einsum_diagonalize(
         &mut self,
-        input_idx: &[char],
-        output_idx: &[char],
         tensor: TensorNodeId,
-        repeated_positions: &[usize],
-    ) -> Result<TensorNodeId, AutogradError> {
-        let make_err = |reason: &'static str| {
-            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
-            ))
-        };
-
-        let mut seen_output = std::collections::HashSet::new();
-        for &ch in output_idx {
-            if !seen_output.insert(ch) {
-                return Err(make_err("einsum: duplicate output index"));
-            }
-            if !input_idx.contains(&ch) {
-                return Err(make_err("einsum: output index not found in input"));
-            }
-        }
-
+        input_idx: &[char],
+    ) -> Result<(TensorNodeId, Vec<char>), AutogradError> {
         let shape = self.tensor_shape(tensor)?;
-        let first_repeated = repeated_positions[0];
-        let second_repeated = repeated_positions[1];
-        if shape[first_repeated] != shape[second_repeated] {
-            return Err(make_err(
-                "einsum: dimension size mismatch for repeated index",
-            ));
+        let mut unique = Vec::new();
+        let mut output_shape = Vec::new();
+        let mut diagonal_strides = Vec::new();
+        let input_strides = contiguous_strides(&shape);
+        for (axis, &label) in input_idx.iter().enumerate() {
+            if let Some(position) = unique.iter().position(|&ch| ch == label) {
+                diagonal_strides[position] = Self::checked_add(
+                    diagonal_strides[position],
+                    input_strides[axis],
+                    "einsum: diagonal stride overflow",
+                )?;
+            } else {
+                unique.push(label);
+                output_shape.push(shape[axis]);
+                diagonal_strides.push(input_strides[axis]);
+            }
         }
-
-        let output_positions: Vec<usize> = output_idx
-            .iter()
-            .map(|&ch| {
-                input_idx
-                    .iter()
-                    .position(|&input_ch| input_ch == ch)
-                    .expect("output index membership validated above")
-            })
-            .collect();
-        let output_shape = if output_positions.is_empty() {
-            vec![1]
-        } else {
-            output_positions
-                .iter()
-                .map(|&position| shape[position])
-                .collect()
-        };
+        if unique.len() == input_idx.len() {
+            return Ok((tensor, unique));
+        }
         let output_len =
             Self::checked_shape_numel(&output_shape, "einsum: output shape volume overflow")?;
         let input_len = Self::checked_shape_numel(&shape, "einsum: input shape volume overflow")?;
-        let input_strides = contiguous_strides(&shape);
         let output_strides = contiguous_strides(&output_shape);
-        let mut input_to_output = Vec::new();
-
-        for input_linear in 0..input_len {
-            let first_coord =
-                (input_linear / input_strides[first_repeated]) % shape[first_repeated];
-            let second_coord =
-                (input_linear / input_strides[second_repeated]) % shape[second_repeated];
-            if first_coord != second_coord {
-                continue;
+        let mut indices = Vec::with_capacity(output_len);
+        for linear in 0..output_len {
+            let mut input_linear = 0usize;
+            for axis in 0..unique.len() {
+                let coordinate = (linear / output_strides[axis]) % output_shape[axis];
+                input_linear += coordinate * diagonal_strides[axis];
             }
-
-            let mut output_linear = 0usize;
-            for (output_dim, &input_dim) in output_positions.iter().enumerate() {
-                let coord = (input_linear / input_strides[input_dim]) % shape[input_dim];
-                let offset = Self::checked_mul(
-                    coord,
-                    output_strides[output_dim],
-                    "einsum: output index overflow",
-                )?;
-                output_linear =
-                    Self::checked_add(output_linear, offset, "einsum: output index overflow")?;
-            }
-            input_to_output.push((input_linear, output_linear));
+            indices.push(input_linear as f64);
         }
-
-        match self.tensor_dtype(tensor)? {
-            DType::F64 | DType::F32 => {
-                let forward_map = input_to_output.clone();
-                let backward_map = input_to_output;
-                let output_shape_for_forward = output_shape.clone();
-                self.tensor_apply_function(
-                    &[tensor],
-                    move |_ctx, inputs| {
-                        let (values, _shape) = inputs[0];
-                        let mut output = vec![0.0_f64; output_len];
-                        for &(input_linear, output_linear) in &forward_map {
-                            output[output_linear] += values[input_linear];
-                        }
-                        Ok((output, output_shape_for_forward.clone()))
-                    },
-                    move |_ctx, grad_outputs| {
-                        let grad_output = grad_outputs[0];
-                        let mut grad_input = vec![0.0_f64; input_len];
-                        for &(input_linear, output_linear) in &backward_map {
-                            grad_input[input_linear] += grad_output[output_linear];
-                        }
-                        Ok(vec![Some(grad_input)])
-                    },
-                )
-            }
-            _ => Err(make_err(
-                "einsum: repeated-index unary requires f32 or f64 tensor",
-            )),
-        }
+        let flat = self.tensor_reshape(tensor, vec![input_len])?;
+        let diagonal = self.tensor_tape.index_select(flat, 0, &indices)?;
+        let diagonal = self.tensor_reshape(diagonal, output_shape)?;
+        Ok((diagonal, unique))
     }
 
     fn einsum_binary(
@@ -10451,6 +10403,84 @@ impl FrankenTorchSession {
                 ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
             ))
         };
+
+        // Sum labels needed by neither the other operand nor the output before
+        // multiplying. This also bounds intermediates for `ab,c->a` and chains.
+        let lhs_kept: Vec<char> = lhs_idx
+            .iter()
+            .copied()
+            .filter(|ch| rhs_idx.contains(ch) || output_idx.contains(ch))
+            .collect();
+        let rhs_kept: Vec<char> = rhs_idx
+            .iter()
+            .copied()
+            .filter(|ch| lhs_idx.contains(ch) || output_idx.contains(ch))
+            .collect();
+        let mut lhs = if lhs_kept.len() != lhs_idx.len() {
+            self.einsum_unary(lhs_idx, &lhs_kept, lhs, _dim_sizes)?
+        } else {
+            lhs
+        };
+        let mut rhs = if rhs_kept.len() != rhs_idx.len() {
+            self.einsum_unary(rhs_idx, &rhs_kept, rhs, _dim_sizes)?
+        } else {
+            rhs
+        };
+        let lhs_idx = lhs_kept.as_slice();
+        let rhs_idx = rhs_kept.as_slice();
+        let mut lhs_shape = self.tensor_shape(lhs)?;
+        let mut rhs_shape = self.tensor_shape(rhs)?;
+
+        // Contracted singletons broadcast by summing the other operand, not by
+        // materializing copies along the contraction axis. Only shared output
+        // (batch) dimensions need expansion before batched matmul.
+        for (left_axis, label) in lhs_idx.iter().enumerate() {
+            let Some(right_axis) = rhs_idx.iter().position(|ch| ch == label) else {
+                continue;
+            };
+            let left_size = lhs_shape[left_axis];
+            let right_size = rhs_shape[right_axis];
+            if left_size == right_size {
+                continue;
+            }
+            if left_size != 1 && right_size != 1 {
+                return Err(make_err(
+                    "einsum: dimensions with the same label must broadcast",
+                ));
+            }
+            if !output_idx.contains(label) {
+                if left_size == 1 {
+                    rhs = self.tensor_sum_dim(rhs, right_axis)?;
+                    rhs_shape[right_axis] = 1;
+                    rhs = self.tensor_reshape(rhs, rhs_shape.clone())?;
+                } else {
+                    lhs = self.tensor_sum_dim(lhs, left_axis)?;
+                    lhs_shape[left_axis] = 1;
+                    lhs = self.tensor_reshape(lhs, lhs_shape.clone())?;
+                }
+            }
+        }
+        let mut lhs_target = lhs_shape.clone();
+        let mut rhs_target = rhs_shape.clone();
+        for (left_axis, label) in lhs_idx.iter().enumerate() {
+            if let Some(right_axis) = rhs_idx.iter().position(|ch| ch == label) {
+                let size = if lhs_shape[left_axis] == 1 {
+                    rhs_shape[right_axis]
+                } else {
+                    lhs_shape[left_axis]
+                };
+                lhs_target[left_axis] = size;
+                rhs_target[right_axis] = size;
+            }
+        }
+        Self::checked_shape_numel(&lhs_target, "einsum: broadcast lhs shape overflow")?;
+        Self::checked_shape_numel(&rhs_target, "einsum: broadcast rhs shape overflow")?;
+        if lhs_shape != lhs_target {
+            lhs = self.tensor_expand(lhs, lhs_target)?;
+        }
+        if rhs_shape != rhs_target {
+            rhs = self.tensor_expand(rhs, rhs_target)?;
+        }
 
         // Categorize indices:
         // - batch: appear in both inputs AND in output
@@ -10586,13 +10616,16 @@ impl FrankenTorchSession {
                 let (rhs_values, rhs_meta) = self.tensor_values_meta(rhs)?;
                 let lhs_contiguous = lhs_meta.strides() == contiguous_strides(lhs_meta.shape());
                 let rhs_contiguous = rhs_meta.strides() == contiguous_strides(rhs_meta.shape());
-                let m = free_lhs_size.max(1);
-                let k = contract_size.max(1);
-                let n = free_rhs_size.max(1);
+                let m = free_lhs_size;
+                let k = contract_size;
+                let n = free_rhs_size;
                 let lhs_start = lhs_meta.storage_offset();
                 let rhs_start = rhs_meta.storage_offset();
                 if lhs_contiguous
                     && rhs_contiguous
+                    && m > 0
+                    && k > 0
+                    && n > 0
                     && lhs_values.len() >= lhs_start + m * k
                     && rhs_values.len() >= rhs_start + n * k
                 {
@@ -10610,9 +10643,6 @@ impl FrankenTorchSession {
                     }
                     for ch in &free_rhs_chars {
                         out_shape.push(rhs_shape[rhs_pos(ch)?]);
-                    }
-                    if out_shape.is_empty() {
-                        out_shape.push(1);
                     }
                     return self.tensor_variable(out, out_shape, false);
                 }
@@ -10714,9 +10744,6 @@ impl FrankenTorchSession {
                     for ch in &free_rhs_chars {
                         out_shape.push(rhs_shape[rhs_pos(ch)?]);
                     }
-                    if out_shape.is_empty() {
-                        out_shape.push(1);
-                    }
                     return self.tensor_variable(out, out_shape, false);
                 }
             }
@@ -10732,54 +10759,11 @@ impl FrankenTorchSession {
             rhs_p = self.tensor_permute(rhs_p, rhs_perm)?;
         }
 
-        // Handle the case where there are no contractions (element-wise or outer product)
-        if contract_chars.is_empty() && batch_chars.is_empty() {
-            // Outer product case: reshape lhs to [M, 1], rhs to [1, N], matmul
-            let m = free_lhs_size.max(1);
-            let n = free_rhs_size.max(1);
-            let lhs_2d = self.tensor_reshape(lhs_p, vec![m, 1])?;
-            let rhs_2d = self.tensor_reshape(rhs_p, vec![1, n])?;
-            let result = self.tensor_matmul(lhs_2d, rhs_2d)?;
-            // Reshape to output shape
-            let mut out_shape: Vec<usize> = Vec::new();
-            for &ch in output_idx {
-                if free_lhs_chars.contains(&ch) {
-                    out_shape.push(lhs_shape[lhs_pos(&ch)?]);
-                } else if free_rhs_chars.contains(&ch) {
-                    out_shape.push(rhs_shape[rhs_pos(&ch)?]);
-                }
-            }
-            if out_shape.is_empty() {
-                out_shape.push(1);
-            }
-            return self.tensor_reshape(result, out_shape);
-        }
-
-        if contract_chars.is_empty() {
-            // Batch + free only: element-wise multiply with broadcasting
-            let m = free_lhs_size.max(1);
-            let n = free_rhs_size.max(1);
-            let lhs_3d = self.tensor_reshape(lhs_p, vec![batch_size, m, 1])?;
-            let rhs_3d = self.tensor_reshape(rhs_p, vec![batch_size, 1, n])?;
-            let result = self.tensor_bmm(lhs_3d, rhs_3d)?;
-            let mut out_shape: Vec<usize> = Vec::new();
-            for &ch in output_idx {
-                if batch_chars.contains(&ch) || free_lhs_chars.contains(&ch) {
-                    out_shape.push(lhs_shape[lhs_pos(&ch)?]);
-                } else if free_rhs_chars.contains(&ch) {
-                    out_shape.push(rhs_shape[rhs_pos(&ch)?]);
-                }
-            }
-            if out_shape.is_empty() {
-                out_shape.push(1);
-            }
-            return self.tensor_reshape(result, out_shape);
-        }
-
-        // General case with contraction
-        let m = free_lhs_size.max(1);
-        let k = contract_size.max(1);
-        let n = free_rhs_size.max(1);
+        // An absent contraction axis has product 1; an actual zero-size axis
+        // has product 0. Keep that distinction for empty tensors.
+        let m = free_lhs_size;
+        let k = contract_size;
+        let n = free_rhs_size;
 
         let result = if batch_chars.is_empty() {
             // No batch: 2D matmul [M, K] @ [K, N] -> [M, N]
@@ -10794,26 +10778,39 @@ impl FrankenTorchSession {
             self.tensor_bmm(lhs_3d, rhs_3d)?
         };
 
-        // Reshape to output shape
-        let mut out_shape: Vec<usize> = Vec::new();
-        for &ch in output_idx {
-            if batch_chars.contains(&ch)
-                || free_lhs_chars.contains(&ch)
-                || contract_chars.contains(&ch)
-            {
-                out_shape.push(lhs_shape[lhs_pos(&ch)?]);
-            } else if free_rhs_chars.contains(&ch) {
-                out_shape.push(rhs_shape[rhs_pos(&ch)?]);
-            }
+        // Matmul returns [batch, left-free, right-free]. Reshape in that order,
+        // then permute: reshaping directly to the equation's output shape
+        // scrambles even `ij,jk->ki` and `i,j->ji` contractions.
+        let natural_indices: Vec<char> = batch_chars
+            .iter()
+            .chain(&free_lhs_chars)
+            .chain(&free_rhs_chars)
+            .copied()
+            .collect();
+        let natural_shape: Vec<usize> = natural_indices
+            .iter()
+            .map(|ch| {
+                if let Some(axis) = lhs_idx.iter().position(|label| label == ch) {
+                    Ok(lhs_shape[axis])
+                } else {
+                    rhs_pos(ch).map(|axis| rhs_shape[axis])
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let result = self.tensor_reshape(result, natural_shape)?;
+        if natural_indices == output_idx {
+            return Ok(result);
         }
-
-        if out_shape.is_empty() {
-            // Scalar output: already [B, M, N] = [1, 1, 1]
-            let flat = self.tensor_reshape(result, vec![1])?;
-            return Ok(flat);
-        }
-
-        self.tensor_reshape(result, out_shape)
+        let permutation = output_idx
+            .iter()
+            .map(|ch| {
+                natural_indices
+                    .iter()
+                    .position(|label| label == ch)
+                    .ok_or_else(|| make_err("einsum: output index not found in contraction"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.tensor_permute(result, permutation)
     }
 
     /// Apply a custom autograd function.
@@ -165434,8 +165431,10 @@ mod tests {
         let b = s.tensor_variable(vec![1.0; 4], vec![2, 2], false).unwrap();
         // Too many subscripts
         assert!(s.tensor_einsum("ij,jk,kl->il", &[a, b]).is_err());
-        // Invalid characters
-        assert!(s.tensor_einsum("IJ,JK->IK", &[a, b]).is_err());
+        // Non-ASCII labels are invalid; uppercase ASCII labels are valid.
+        assert!(s.tensor_einsum("i1,1k->ik", &[a, b]).is_err());
+        let uppercase = s.tensor_einsum("IJ,JK->IK", &[a, b]).unwrap();
+        assert_eq!(s.tensor_values(uppercase).unwrap(), vec![2.0; 4]);
     }
 
     #[test]
